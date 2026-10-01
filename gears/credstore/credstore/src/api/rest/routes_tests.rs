@@ -17,7 +17,7 @@ use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
 use crate::domain::secret::model::PutPrecondition;
 use crate::domain::secret::repo::SecretRepo;
-use crate::domain::secret::service::{GcSettings, ListSettings, Service};
+use crate::domain::secret::service::{ListSettings, Service};
 use crate::domain::secret::test_support::{
     FakeDir, FakeMetrics, FakePlugin, FakePluginSelector, FakeSecretRepo, action_deny_enforcer,
     catalog_type_resolver, make_ctx, mock_enforcer,
@@ -45,6 +45,7 @@ fn test_ctx() -> SecurityContext {
 struct TestHarness {
     router: Router,
     svc: Arc<Service>,
+    repo: Arc<FakeSecretRepo>,
 }
 
 fn build_harness() -> TestHarness {
@@ -64,10 +65,6 @@ fn build_harness_with_enforcer(enforcer: authz_resolver_sdk::PolicyEnforcer) -> 
         selector as Arc<dyn PluginSelector>,
         catalog_type_resolver(),
         metrics as Arc<dyn CredStoreMetricsPort>,
-        GcSettings {
-            pending_max_age_secs: 3600,
-            batch_size: 256,
-        },
         ListSettings {
             max_limit: 200,
             secret_mode_cap: 25,
@@ -75,7 +72,7 @@ fn build_harness_with_enforcer(enforcer: authz_resolver_sdk::PolicyEnforcer) -> 
     ));
     let openapi = OpenApiRegistryImpl::new();
     let router = register_routes(Router::new(), &openapi, Arc::clone(&svc));
-    TestHarness { router, svc }
+    TestHarness { router, svc, repo }
 }
 
 /// Build a JSON request (`Content-Type: application/json`) with the
@@ -150,10 +147,9 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 // ── Seed helpers ─────────────────────────────────────────────────────────────
 
 /// Create an active `Tenant`-shared credential through the real write
-/// protocol (`Service::put`) — the value's fingerprint must match the fence
-/// key the service lazily bootstraps, so seeding through the same path the
-/// router uses (rather than fabricating a row/plugin entry by hand) is what
-/// keeps `GET` able to verify it. Returns the strong validator
+/// protocol (`Service::put`) - seeding through the same path the router uses
+/// (rather than fabricating a row/plugin entry by hand) keeps the row's
+/// `value_version` pointing at a real stored version. Returns the strong validator
 /// (`id`, `version`) the `If-Match` tests build against.
 async fn seed_credential(harness: &TestHarness, reference: &str, value: &str) -> (Uuid, i64) {
     let key = SecretRef::new(reference).expect("valid ref");
@@ -1113,4 +1109,174 @@ async fn list_credentials_unsupported_orderby_field_returns_400() {
     let req = json_request("GET", &list_uri("%24orderby=updated_at"), None, test_ctx());
     let resp = h.router.oneshot(req).await.expect("router");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── expiry applies to the secret, not to the record ─────────────────────────
+
+/// Seed `reference` and force the stored row past its expiry.
+async fn seed_expired_credential(harness: &TestHarness, reference: &str) -> (Uuid, i64) {
+    let (id, version) = seed_credential(harness, reference, "stale").await;
+    harness.repo.force_expire(id);
+    (id, version)
+}
+
+#[tokio::test]
+async fn get_with_the_secret_of_an_expired_credential_returns_409_secret_expired() {
+    let h = build_harness();
+    seed_expired_credential(&h, "exp").await;
+
+    for select in [
+        "%24select=reference%2Ctype%2Cexpires_at%2Csecret",
+        "%24select=status%2Csecret",
+    ] {
+        let req = json_request(
+            "GET",
+            &format!("/credstore/v1/credentials/exp?{select}"),
+            None,
+            test_ctx(),
+        );
+        let resp = h.router.clone().oneshot(req).await.expect("router");
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["context"]["violations"][0]["type"], "SECRET_EXPIRED",
+            "body: {body}"
+        );
+        assert!(
+            body["type"]
+                .as_str()
+                .unwrap()
+                .contains("failed_precondition"),
+            "canonical category stays FAILED_PRECONDITION: {body}"
+        );
+        assert_eq!(body["status"], 409, "body: {body}");
+        assert!(!body.to_string().contains("stale"), "no secret in the body");
+    }
+}
+
+#[tokio::test]
+async fn get_without_the_secret_of_an_expired_credential_shows_status_expired() {
+    let h = build_harness();
+    let (id, version) = seed_expired_credential(&h, "exp").await;
+
+    let req = json_request("GET", "/credstore/v1/credentials/exp", None, test_ctx());
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag = resp
+        .headers()
+        .get(axum::http::header::ETAG)
+        .expect("ETag")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(etag, format!("\"{id}.{version}\""), "the normal validator");
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], "expired", "body: {body}");
+    assert!(body.get("secret").is_none());
+}
+
+#[tokio::test]
+async fn list_shows_status_expired_and_secret_mode_omits_only_the_secret() {
+    let h = build_harness();
+    seed_credential(&h, "live", "live-value").await;
+    seed_expired_credential(&h, "old").await;
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            "/credstore/v1/credentials",
+            None,
+            test_ctx(),
+        ))
+        .await
+        .expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let statuses: Vec<(String, String)> = body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|i| {
+            (
+                i["reference"].as_str().unwrap().to_owned(),
+                i["status"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![
+            ("live".to_owned(), "active".to_owned()),
+            ("old".to_owned(), "expired".to_owned())
+        ],
+        "body: {body}"
+    );
+
+    let resp = h
+        .router
+        .oneshot(json_request(
+            "GET",
+            "/credstore/v1/credentials?%24select=reference%2Cstatus%2Csecret&%24filter=reference%20in%20(%27live%27%2C%27old%27)",
+            None,
+            test_ctx(),
+        ))
+        .await
+        .expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let items = body["items"].as_array().expect("items");
+    assert_eq!(items.len(), 2, "body: {body}");
+    assert_eq!(items[0]["secret"], "live-value");
+    assert_eq!(items[1]["status"], "expired");
+    assert!(items[1].get("secret").is_none(), "body: {body}");
+}
+
+#[tokio::test]
+async fn put_create_only_over_an_expired_credential_returns_409_already_exists() {
+    let h = build_harness();
+    let (id, _) = seed_expired_credential(&h, "exp").await;
+
+    let req = json_request_preconditioned(
+        "PUT",
+        "/credstore/v1/credentials/exp",
+        Some(serde_json::json!({
+            "type": SecretType::generic().gts_id(),
+            "sharing": "tenant",
+            "secret": "fresh"
+        })),
+        Some("*"),
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp).await;
+    assert!(
+        body["type"].as_str().unwrap().contains("already_exists"),
+        "body: {body}"
+    );
+    assert_eq!(h.repo.rows()[0].id, id, "the expired record is untouched");
+}
+
+#[tokio::test]
+async fn expired_credential_without_read_secret_is_the_usual_404() {
+    let h = build_harness_with_enforcer(
+        action_deny_enforcer(
+            SecretType::generic().gts_id().to_owned(),
+            actions::READ_SECRET,
+        )
+        .0,
+    );
+    seed_expired_credential(&h, "exp").await;
+
+    let req = json_request(
+        "GET",
+        "/credstore/v1/credentials/exp?%24select=reference%2Csecret",
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

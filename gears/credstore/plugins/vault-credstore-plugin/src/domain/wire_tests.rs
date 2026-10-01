@@ -55,17 +55,40 @@ fn decode_value_error_never_echoes_payload() {
 }
 
 #[test]
-fn put_request_body_serializes_cas_zero() {
-    let body = PutRequestBody::create_only("aGVsbG8=".to_owned());
+fn destroy_path_matches_kv_v2_shape() {
+    assert_eq!(
+        destroy_path("secret", "credstore", "tenant-1", "rec-1"),
+        "secret/destroy/credstore/tenant-1/rec-1"
+    );
+}
+
+#[test]
+fn put_request_body_has_no_cas() {
+    let body = PutRequestBody::new("aGVsbG8=".to_owned());
     let json = serde_json::to_string(&body).expect("serialize");
-    assert_eq!(json, r#"{"options":{"cas":0},"data":{"value":"aGVsbG8="}}"#);
+    assert_eq!(json, r#"{"data":{"value":"aGVsbG8="}}"#);
+}
+
+#[test]
+fn destroy_request_body_lists_versions() {
+    let json = serde_json::to_string(&DestroyRequestBody {
+        versions: vec![1, 2],
+    })
+    .expect("serialize");
+    assert_eq!(json, r#"{"versions":[1,2]}"#);
 }
 
 #[test]
 fn parse_get_body_extracts_and_decodes_value() {
     let body = r#"{"data":{"data":{"value":"aGVsbG8="},"metadata":{"version":1}}}"#;
     let bytes = parse_get_body(body).expect("parses");
-    assert_eq!(bytes, b"hello");
+    assert_eq!(bytes, Some(b"hello".to_vec()));
+}
+
+#[test]
+fn parse_get_body_null_data_is_none() {
+    let body = r#"{"data":{"data":null,"metadata":{"version":1,"deletion_time":"x"}}}"#;
+    assert_eq!(parse_get_body(body).expect("parses"), None);
 }
 
 #[test]
@@ -76,21 +99,24 @@ fn parse_get_body_rejects_unexpected_shape() {
 }
 
 #[test]
-fn is_cas_conflict_body_matches_vault_wire_format() {
-    let body = r#"{"errors":["check-and-set parameter did not match the current version"]}"#;
-    assert!(is_cas_conflict_body(body));
+fn parse_put_body_returns_version_as_string() {
+    let body = r#"{"data":{"version":7,"created_time":"x"}}"#;
+    assert_eq!(parse_put_body(body).expect("parses"), "7");
+    assert!(parse_put_body("{}").is_err());
 }
 
 #[test]
-fn is_cas_conflict_body_is_case_insensitive() {
-    let body = r#"{"errors":["Check-And-Set parameter did not match"]}"#;
-    assert!(is_cas_conflict_body(body));
+fn parse_live_versions_skips_destroyed_and_sorts() {
+    let body = r#"{"data":{"versions":{
+        "3":{"destroyed":false},"1":{"destroyed":true},"2":{"destroyed":false,"deletion_time":"t"}}}}"#;
+    assert_eq!(parse_live_versions(body).expect("parses"), vec![2, 3]);
 }
 
 #[test]
-fn is_cas_conflict_body_rejects_unrelated_errors() {
-    let body = r#"{"errors":["permission denied"]}"#;
-    assert!(!is_cas_conflict_body(body));
+fn parse_version_accepts_numbers_only() {
+    assert_eq!(parse_version("12").expect("ok"), 12);
+    assert!(parse_version("abc").is_err());
+    assert!(parse_version("").is_err());
 }
 
 #[test]
@@ -120,29 +146,41 @@ fn classify_get_response_403_is_internal_not_unavailable() {
 }
 
 #[test]
-fn classify_put_response_2xx_is_ok() {
-    classify_put_response(StatusCode::OK, "").expect("ok");
-    classify_put_response(StatusCode::NO_CONTENT, "").expect("ok");
-}
-
-#[test]
-fn classify_put_response_cas_mismatch_is_conflict() {
-    let body = r#"{"errors":["check-and-set parameter did not match the current version"]}"#;
-    let err = classify_put_response(StatusCode::BAD_REQUEST, body).unwrap_err();
-    assert!(matches!(err, CredStoreError::Conflict));
-}
-
-#[test]
-fn classify_put_response_other_400_is_not_conflict() {
-    let body = r#"{"errors":["missing client token"]}"#;
-    let err = classify_put_response(StatusCode::BAD_REQUEST, body).unwrap_err();
-    assert!(!matches!(err, CredStoreError::Conflict));
+fn classify_put_response_2xx_returns_version() {
+    let got = classify_put_response(StatusCode::OK, r#"{"data":{"version":3}}"#).expect("ok");
+    assert_eq!(got, "3");
 }
 
 #[test]
 fn classify_put_response_5xx_is_unavailable() {
     let err = classify_put_response(StatusCode::SERVICE_UNAVAILABLE, "").unwrap_err();
     assert!(err.is_unavailable());
+}
+
+#[test]
+fn classify_put_response_400_is_internal() {
+    let err = classify_put_response(StatusCode::BAD_REQUEST, "{}").unwrap_err();
+    assert!(matches!(err, CredStoreError::Internal(_)));
+}
+
+#[test]
+fn classify_metadata_response_404_is_empty() {
+    assert!(
+        classify_metadata_response(StatusCode::NOT_FOUND, "")
+            .expect("ok")
+            .is_empty()
+    );
+}
+
+#[test]
+fn classify_destroy_response_404_and_204_are_ok() {
+    classify_destroy_response(StatusCode::NO_CONTENT).expect("ok");
+    classify_destroy_response(StatusCode::NOT_FOUND).expect("ok");
+    assert!(
+        classify_destroy_response(StatusCode::BAD_GATEWAY)
+            .unwrap_err()
+            .is_unavailable()
+    );
 }
 
 #[test]

@@ -1,12 +1,12 @@
 //! `ToolKit` gear registration for the Vault / `OpenBao` credential backend.
 //!
 //! Loads and validates configuration, registers its GTS plugin instance, and
-//! publishes a scoped `CredStorePluginClientV1` through `ClientHub`.
+//! publishes a scoped `CredStorePluginClientV2` through `ClientHub`.
 
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use credstore_sdk::{CredStorePluginClientV1, CredStorePluginSpecV1};
+use credstore_sdk::{CredStorePluginClientV2, CredStorePluginSpecV1};
 use toolkit::Gear;
 use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
@@ -74,9 +74,9 @@ impl Gear for VaultCredStorePlugin {
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
         // Register scoped client in ClientHub
-        let api: Arc<dyn CredStorePluginClientV1> = service;
+        let api: Arc<dyn CredStorePluginClientV2> = service;
         ctx.client_hub()
-            .register_scoped::<dyn CredStorePluginClientV1>(ClientScope::gts_id(&instance_id), api);
+            .register_scoped::<dyn CredStorePluginClientV2>(ClientScope::gts_id(&instance_id), api);
 
         info!(instance_id = %instance_id);
         Ok(())

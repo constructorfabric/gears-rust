@@ -22,9 +22,11 @@ pub(crate) struct Reduced<'a> {
     /// row still "holds" the reference, ADR-0004). Two-phase priority:
     /// `private` beats non-`private` at the caller's own tenant.
     pub own: Option<&'a SecretRow>,
-    /// The nearest row that actually resolves — `active` and not expired, or
-    /// `declared` with `fallback: none` (a suppressing row that competes and
-    /// blocks). `None` iff nothing in `candidates` resolves.
+    /// The nearest row that actually resolves — `active` (an expired one
+    /// included: expiry applies to the secret, so the expired record stays
+    /// decisive and nothing behind it is consulted), or `declared` with
+    /// `fallback: none` (a suppressing row that competes and blocks). `None`
+    /// iff nothing in `candidates` resolves.
     pub winner: Option<&'a SecretRow>,
     /// `own.or(winner)`: the row whose `sharing`/`expires_at`/
     /// `secret_type_uuid` describe the reference's effective record.
@@ -36,11 +38,14 @@ pub(crate) struct Reduced<'a> {
 }
 
 impl Reduced<'_> {
-    /// The caller's own-row `status` (`none`/`declared`/`active`) — never a
-    /// property of the effective row (ADR-0004, "Two representations").
+    /// The caller's own-row `status` (`none`/`declared`/`active`/`expired`) —
+    /// never a property of the effective row (ADR-0004, "Two
+    /// representations"). `expired` is derived from `expires_at` here, at
+    /// read time.
     #[must_use]
     pub(crate) fn own_status(&self) -> CredentialStatus {
         match self.own {
+            Some(o) if o.is_expired(OffsetDateTime::now_utc()) => CredentialStatus::Expired,
             Some(o) if o.status == SecretStatus::Active => CredentialStatus::Active,
             Some(_) => CredentialStatus::Declared,
             None => CredentialStatus::None,
@@ -48,15 +53,15 @@ impl Reduced<'_> {
     }
 }
 
-/// A row is a resolution candidate (ADR-0004, Suppression): `active` and not
-/// expired, or `declared` with `fallback: none` (a suppressing row that
-/// competes and, when nearest, wins). A `declared`/`inherit` row never
-/// competes. Mirrors
+/// A row is a resolution candidate (ADR-0004, Suppression): `active` (expired
+/// or not — an expired record is still the decisive one), or `declared` with
+/// `fallback: none` (a suppressing row that competes and, when nearest,
+/// wins). A `declared`/`inherit` row never competes. Mirrors
 /// `infra::storage::repo_impl::reads::resolution_eligible_condition`, which
 /// applies the same predicate in SQL.
-fn resolvable(r: &SecretRow, now: OffsetDateTime) -> bool {
+fn resolvable(r: &SecretRow) -> bool {
     match r.status {
-        SecretStatus::Active => r.expires_at.is_none_or(|at| at > now),
+        SecretStatus::Active => true,
         SecretStatus::Declared => r.fallback == Fallback::None,
     }
 }
@@ -96,16 +101,12 @@ pub(crate) fn reduce_reference<'a>(
         .filter(|r| r.tenant_id == req)
         .min_by_key(|r| i32::from(r.sharing != SharingMode::Private));
 
-    let now = OffsetDateTime::now_utc();
     let pos = |t: TenantId| chain.iter().position(|c| *c == t.0).unwrap_or(usize::MAX);
-    let winner = candidates
-        .iter()
-        .filter(|r| resolvable(r, now))
-        .min_by(|a, b| {
-            pos(a.tenant_id)
-                .cmp(&pos(b.tenant_id))
-                .then((a.sharing != SharingMode::Private).cmp(&(b.sharing != SharingMode::Private)))
-        });
+    let winner = candidates.iter().filter(|r| resolvable(r)).min_by(|a, b| {
+        pos(a.tenant_id)
+            .cmp(&pos(b.tenant_id))
+            .then((a.sharing != SharingMode::Private).cmp(&(b.sharing != SharingMode::Private)))
+    });
 
     let effective = own.or(winner)?;
 
@@ -126,8 +127,8 @@ pub(crate) fn reduce_reference<'a>(
             InheritanceStatus::Inherited
         }
     } else {
-        // Nothing resolves; the caller has an own row (declared/inherit, or
-        // an expired-active row with nothing behind it) — reported as `Own`
+        // Nothing resolves; the caller has an own `declared`/`inherit` row
+        // with nothing behind it — reported as `Own`
         // (ADR-0004: "choose Own and document").
         InheritanceStatus::Own
     };

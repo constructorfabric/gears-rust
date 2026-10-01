@@ -1,22 +1,21 @@
-// Updated: 2026-09-10 — rewritten for the `tenant_id/value_id` immutable
-// value store (ADR-0006); out-of-band seeding withdrawn.
 use uuid::Uuid;
 
-use credstore_sdk::{CredStoreError, SecretValue, TenantId, ValueId};
+use credstore_sdk::{DestroySelector, SecretValue, StoreKey, TenantId, ValueVersion};
 
 use crate::config::StaticCredStorePluginConfig;
 
 use super::Service;
 
-fn tid() -> TenantId {
-    TenantId(Uuid::new_v4())
-}
-fn vid() -> ValueId {
-    ValueId::new_v4()
+fn key() -> StoreKey {
+    StoreKey::new(TenantId(Uuid::new_v4()), Uuid::new_v4())
 }
 
 fn svc() -> Service {
     Service::from_config(&StaticCredStorePluginConfig::default()).expect("config builds")
+}
+
+fn vv(s: &str) -> ValueVersion {
+    ValueVersion::new(s)
 }
 
 #[track_caller]
@@ -30,77 +29,88 @@ fn assert_value(v: Option<SecretValue>, expected: &str) {
 
 #[test]
 fn starts_empty() {
-    let s = svc();
-    assert!(s.get_value(&tid(), &vid()).is_none());
+    assert!(svc().get_value(&key(), &vv("1")).is_none());
 }
 
 #[test]
-fn put_then_get_roundtrips() {
+fn put_returns_increasing_versions_and_roundtrips() {
     let s = svc();
-    let (t, v) = (tid(), vid());
-    s.put_value(&t, &v, SecretValue::from("hello"))
-        .expect("first put");
-    assert_value(s.get_value(&t, &v), "hello");
+    let k = key();
+    let v1 = s.put_value(&k, SecretValue::from("a"));
+    let v2 = s.put_value(&k, SecretValue::from("b"));
+    assert_eq!(v1, vv("1"));
+    assert_eq!(v2, vv("2"));
+    assert_value(s.get_value(&k, &v1), "a");
+    assert_value(s.get_value(&k, &v2), "b");
 }
 
 #[test]
-fn put_is_scoped_to_its_tenant_and_id() {
+fn counters_are_per_key_and_keys_are_isolated() {
     let s = svc();
-    let (t1, t2, v) = (tid(), tid(), vid());
-    s.put_value(&t1, &v, SecretValue::from("t1-val"))
-        .expect("put");
-    // Same value_id under a different tenant is a distinct entry.
-    assert!(s.get_value(&t2, &v).is_none());
-    assert!(s.get_value(&t1, &vid()).is_none());
+    let (k1, k2) = (key(), key());
+    assert_eq!(s.put_value(&k1, SecretValue::from("x")), vv("1"));
+    assert_eq!(s.put_value(&k2, SecretValue::from("y")), vv("1"));
+    assert_value(s.get_value(&k1, &vv("1")), "x");
+    assert_value(s.get_value(&k2, &vv("1")), "y");
+    // Same record id under another tenant is a different key.
+    let other = StoreKey::new(TenantId(Uuid::new_v4()), k1.record_id);
+    assert!(s.get_value(&other, &vv("1")).is_none());
 }
 
 #[test]
-fn put_on_existing_id_is_conflict() {
-    // Immutability guard: the gear never reissues a value_id it already
-    // wrote, so a second `put` at the same id is a contract violation the
-    // plugin rejects defensively.
+fn get_of_unknown_or_garbage_version_is_none() {
     let s = svc();
-    let (t, v) = (tid(), vid());
-    s.put_value(&t, &v, SecretValue::from("first"))
-        .expect("first put succeeds");
-    let err = s
-        .put_value(&t, &v, SecretValue::from("second"))
-        .expect_err("second put at the same id must conflict");
-    assert!(matches!(err, CredStoreError::Conflict));
-    // The original value is untouched.
-    assert_value(s.get_value(&t, &v), "first");
+    let k = key();
+    s.put_value(&k, SecretValue::from("a"));
+    assert!(s.get_value(&k, &vv("2")).is_none());
+    assert!(s.get_value(&k, &vv("not-a-number")).is_none());
 }
 
 #[test]
-fn delete_removes_value() {
+fn destroy_below_removes_older_versions_only() {
     let s = svc();
-    let (t, v) = (tid(), vid());
-    s.put_value(&t, &v, SecretValue::from("v")).expect("put");
-    s.delete_value(&t, &v);
-    assert!(s.get_value(&t, &v).is_none());
+    let k = key();
+    for v in ["a", "b", "c"] {
+        s.put_value(&k, SecretValue::from(v));
+    }
+    s.destroy_value(&k, &DestroySelector::Below(vv("3")));
+    assert!(s.get_value(&k, &vv("1")).is_none());
+    assert!(s.get_value(&k, &vv("2")).is_none());
+    assert_value(s.get_value(&k, &vv("3")), "c");
 }
 
 #[test]
-fn delete_missing_is_noop() {
+fn destroy_exactly_removes_one_version() {
     let s = svc();
-    let (t, v) = (tid(), vid());
-    s.delete_value(&t, &v);
-    assert!(s.get_value(&t, &v).is_none());
+    let k = key();
+    for v in ["a", "b", "c"] {
+        s.put_value(&k, SecretValue::from(v));
+    }
+    s.destroy_value(&k, &DestroySelector::Exactly(vv("2")));
+    assert_value(s.get_value(&k, &vv("1")), "a");
+    assert!(s.get_value(&k, &vv("2")).is_none());
+    assert_value(s.get_value(&k, &vv("3")), "c");
 }
 
 #[test]
-fn delete_then_put_a_fresh_id_succeeds() {
-    // Deleting one version never blocks writing a different (fresh) id —
-    // there is no shared key to collide on (ADR-0006).
+fn destroy_is_idempotent_and_never_reissues_numbers() {
     let s = svc();
-    let t = tid();
-    let old = vid();
-    s.put_value(&t, &old, SecretValue::from("old"))
-        .expect("put old");
-    s.delete_value(&t, &old);
-    let new = vid();
-    s.put_value(&t, &new, SecretValue::from("new"))
-        .expect("put new (fresh id) after deleting the old one");
-    assert_value(s.get_value(&t, &new), "new");
-    assert!(s.get_value(&t, &old).is_none());
+    let k = key();
+    s.put_value(&k, SecretValue::from("a"));
+    s.destroy_value(&k, &DestroySelector::Exactly(vv("1")));
+    s.destroy_value(&k, &DestroySelector::Exactly(vv("1")));
+    s.destroy_value(&key(), &DestroySelector::Below(vv("9")));
+    assert_eq!(s.put_value(&k, SecretValue::from("b")), vv("2"));
+}
+
+#[test]
+fn delete_key_removes_all_versions_and_is_idempotent() {
+    let s = svc();
+    let k = key();
+    s.put_value(&k, SecretValue::from("a"));
+    s.put_value(&k, SecretValue::from("b"));
+    s.delete_key_value(&k);
+    assert!(s.get_value(&k, &vv("1")).is_none());
+    assert!(s.get_value(&k, &vv("2")).is_none());
+    s.delete_key_value(&k);
 }

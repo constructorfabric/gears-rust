@@ -168,7 +168,7 @@ fn parse_gts_type(field: &'static str, raw: &str) -> Result<GtsId, DomainError> 
 /// `$select` switches to secret mode (ADR-0004, "Bulk secret read"), whose
 /// items additionally carry the decrypted value — audited per item exactly
 /// like the point read's `$select=…,value`, since both paths share
-/// `Service::read_value_for_row`'s retry/fence-verification/metrics.
+/// `Service::read_value_for_row`'s re-read/metrics.
 ///
 /// # Errors
 ///

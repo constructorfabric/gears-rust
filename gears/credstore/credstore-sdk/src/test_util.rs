@@ -17,10 +17,7 @@
 //! double is read-oriented, for consumers that only resolve credentials.
 //! `list` returns every stored reference as one unfiltered, unpaginated item
 //! (it does not model the `OData` allowlist or cursor semantics a real server
-//! enforces); [`MockCredStoreClient`] also implements
-//! [`crate::CredStoreMaintenanceV1`], whose `run_gc` mirrors the write
-//! half's success/failure behaviour and reports an all-zero
-//! [`crate::GcReport`].
+//! enforces).
 
 use std::collections::HashMap;
 
@@ -30,10 +27,10 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::{
-    CredStoreClientV1, CredStoreError, CredStoreMaintenanceV1, Credential, CredentialListItem,
-    CredentialPatch, CredentialStatus, CredentialWrite, Fallback, GcReport, InheritanceStatus,
-    OwnerId, PutOutcome, PutPrecondition, Secret, SecretRef, SecretType, SecretValue, SharingMode,
-    Validator, WritePrecondition,
+    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
+    CredentialStatus, CredentialWrite, Fallback, InheritanceStatus, OwnerId, PutOutcome,
+    PutPrecondition, Secret, SecretRef, SecretType, SecretValue, SharingMode, Validator,
+    WritePrecondition,
 };
 
 enum Behavior {
@@ -48,6 +45,9 @@ enum Behavior {
     /// implementation that reports the not-found surface as an error instead
     /// of `Ok(None)`.
     NotFound,
+    /// `get` returns the record; `get_secret` fails with
+    /// [`CredStoreError::SecretExpired`] for any reference.
+    SecretExpired,
 }
 
 /// Configurable in-process [`CredStoreClientV1`] test double. See the module
@@ -111,6 +111,16 @@ impl MockCredStoreClient {
         }
     }
 
+    /// `get_secret` fails with [`CredStoreError::SecretExpired`] for any
+    /// reference (and `get` returns the record) — for consumers exercising
+    /// the expired-secret path.
+    #[must_use]
+    pub fn with_expired_secret() -> Self {
+        Self {
+            behavior: Behavior::SecretExpired,
+        }
+    }
+
     /// Build a canned [`Credential`] record with placeholder metadata (nil
     /// generation id, `generic` type, version 1, own/active, no expiry).
     fn credential(reference: &SecretRef) -> Credential {
@@ -150,7 +160,10 @@ impl MockCredStoreClient {
     fn write_result(&self) -> Result<(), CredStoreError> {
         match self.behavior {
             Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
-            Behavior::Store(_) | Behavior::AnyValue(_) | Behavior::NotFound => Ok(()),
+            Behavior::Store(_)
+            | Behavior::AnyValue(_)
+            | Behavior::NotFound
+            | Behavior::SecretExpired => Ok(()),
         }
     }
 }
@@ -166,7 +179,7 @@ impl CredStoreClientV1 for MockCredStoreClient {
             Behavior::Store(store) => Ok(store
                 .contains_key(key.as_ref())
                 .then(|| Self::credential(key))),
-            Behavior::AnyValue(_) => Ok(Some(Self::credential(key))),
+            Behavior::AnyValue(_) | Behavior::SecretExpired => Ok(Some(Self::credential(key))),
             Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
             Behavior::NotFound => Err(CredStoreError::NotFound),
         }
@@ -185,6 +198,7 @@ impl CredStoreClientV1 for MockCredStoreClient {
             Behavior::AnyValue(value) => Ok(Some(Self::secret(key, value.clone()))),
             Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
             Behavior::NotFound => Err(CredStoreError::NotFound),
+            Behavior::SecretExpired => Err(CredStoreError::SecretExpired),
         }
     }
 
@@ -236,7 +250,9 @@ impl CredStoreClientV1 for MockCredStoreClient {
             .is_some_and(|fields| fields.iter().any(|f| f.eq_ignore_ascii_case("secret")));
         match &self.behavior {
             Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
-            Behavior::NotFound | Behavior::AnyValue(_) => Ok(Page::empty(limit)),
+            Behavior::NotFound | Behavior::AnyValue(_) | Behavior::SecretExpired => {
+                Ok(Page::empty(limit))
+            }
             Behavior::Store(store) => {
                 let mut items: Vec<CredentialListItem> = store
                     .iter()
@@ -264,12 +280,5 @@ impl CredStoreClientV1 for MockCredStoreClient {
                 ))
             }
         }
-    }
-}
-
-#[async_trait]
-impl CredStoreMaintenanceV1 for MockCredStoreClient {
-    async fn run_gc(&self, _ctx: &SecurityContext) -> Result<GcReport, CredStoreError> {
-        self.write_result().map(|()| GcReport::default())
     }
 }

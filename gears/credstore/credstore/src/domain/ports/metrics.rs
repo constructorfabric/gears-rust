@@ -1,10 +1,10 @@
 //! Metrics vocabulary and recording port for credential-store operations.
 //!
-//! Defines bounded labels for outcomes, dependencies, value-fingerprint
-//! verification, and the maintenance job's garbage-collection counters
-//! (ADR-0006). No inventory gauges: the shipped reaper's per-status row-count
-//! and gc-queue-depth gauges were `COUNT … GROUP BY` queries, forbidden by
-//! the platform's no-`COUNT` rule, and are withdrawn rather than reimplemented.
+//! Defines bounded labels for outcomes and dependencies, plus the three
+//! lifecycle counters of ADR-0006 (`destroy_failed`, `outbox_purge_failed`,
+//! `read_retry`). No inventory gauges: the shipped reaper's per-status
+//! row-count gauges were `COUNT … GROUP BY` queries, forbidden by the
+//! platform's no-`COUNT` rule, and are withdrawn rather than reimplemented.
 
 use toolkit_macros::domain_model;
 
@@ -14,6 +14,8 @@ pub enum ReadOutcome {
     HitOwn,
     HitInherited,
     Miss,
+    /// The decisive record's secret has expired (`SecretExpired`).
+    Expired,
 }
 impl ReadOutcome {
     #[must_use]
@@ -22,6 +24,7 @@ impl ReadOutcome {
             Self::HitOwn => "hit_own",
             Self::HitInherited => "hit_inherited",
             Self::Miss => "miss",
+            Self::Expired => "expired",
         }
     }
 }
@@ -52,7 +55,8 @@ pub enum DepOp {
     GetAncestors,
     PluginGet,
     PluginPut,
-    PluginDelete,
+    PluginDeleteKey,
+    PluginDestroy,
     Evaluate,
     GetTypeSchemaByUuid,
 }
@@ -63,29 +67,28 @@ impl DepOp {
             Self::GetAncestors => "get_ancestors",
             Self::PluginGet => "plugin_get",
             Self::PluginPut => "plugin_put",
-            Self::PluginDelete => "plugin_delete",
+            Self::PluginDeleteKey => "plugin_delete_key",
+            Self::PluginDestroy => "plugin_destroy",
             Self::Evaluate => "evaluate",
             Self::GetTypeSchemaByUuid => "get_type_schema_by_uuid",
         }
     }
 }
 
-/// Value-fingerprint fence verdict for a read (ADR-0003, narrowed by
-/// ADR-0006 to an integrity check only — no more out-of-band-seeded
-/// "legacy" case). `Mismatch` is the fail-closed anti-enumeration miss — the
-/// alertable signal.
+/// Outcome of a secret read that found its version gone and re-read the row
+/// once (ADR-0006, DESIGN section 4.6). `SecondMiss` is the 503 case.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FenceVerify {
-    Ok,
-    Mismatch,
+pub enum ReadRetryOutcome {
+    Recovered,
+    SecondMiss,
 }
-impl FenceVerify {
+impl ReadRetryOutcome {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Ok => "ok",
-            Self::Mismatch => "mismatch",
+            Self::Recovered => "recovered",
+            Self::SecondMiss => "second_miss",
         }
     }
 }
@@ -113,19 +116,15 @@ pub trait CredStoreMetricsPort: Send + Sync + 'static {
     fn walkup_depth(&self, depth: u64);
     fn dependency(&self, dep: Dep, op: DepOp, outcome: Outcome, secs: f64);
     fn cross_tenant_denied(&self);
-    /// Records the fence verdict of a read (`ok`/`mismatch`); `mismatch` is
-    /// the fail-closed 404 worth alerting on.
-    fn fence_verify(&self, outcome: FenceVerify);
-    /// Maintenance job (`credstore gc`): versions deleted by the gc drain
-    /// (`reason != pending`: superseded/removed/aborted).
-    fn gc_deleted(&self, n: u64);
-    /// Maintenance job: orphaned `pending` versions reclaimed (older than
-    /// `gc.pending_max_age_secs` and unreferenced by any row) — a sustained
-    /// climb here means writes are crashing or timing out before commit.
-    fn gc_pending_reclaimed(&self, n: u64);
-    /// Maintenance job: expired `active` rows removed (and their versions
-    /// enqueued for collection).
-    fn expired_deleted(&self, n: u64);
+    /// A best-effort `destroy` (after a write, a lost CAS or a secret
+    /// removal) failed; the next successful write to the record retries it
+    /// implicitly.
+    fn destroy_failed(&self);
+    /// An outbox `delete_key` delivery attempt failed and will be retried; a
+    /// persistently rising value means a key purge is stuck.
+    fn outbox_purge_failed(&self);
+    /// A secret read found its version gone and re-read the row once.
+    fn read_retry(&self, outcome: ReadRetryOutcome);
     /// Collection read (ADR-0005): a reference's reduced winner named a
     /// `secret_type_uuid` outside the set the request authorized per
     /// distinct type found in the candidate-reference query. The reference
@@ -136,6 +135,11 @@ pub trait CredStoreMetricsPort: Send + Sync + 'static {
     /// that reference, which should never happen if every write went
     /// through the write path's own check.
     fn list_type_invariant_violation(&self);
+    /// An audit event for a secret read or write could not be published
+    /// (event broker absent, unavailable, slow or rejecting); the operation
+    /// itself was unaffected (`cpt-cf-credstore-nfr-audit`). A persistently
+    /// rising value means audit events are being lost.
+    fn audit_publish_failed(&self);
 }
 
 #[domain_model]
@@ -146,11 +150,11 @@ impl CredStoreMetricsPort for NoopMetrics {
     fn walkup_depth(&self, _: u64) {}
     fn dependency(&self, _: Dep, _: DepOp, _: Outcome, _: f64) {}
     fn cross_tenant_denied(&self) {}
-    fn fence_verify(&self, _: FenceVerify) {}
-    fn gc_deleted(&self, _: u64) {}
-    fn gc_pending_reclaimed(&self, _: u64) {}
-    fn expired_deleted(&self, _: u64) {}
+    fn destroy_failed(&self) {}
+    fn outbox_purge_failed(&self) {}
+    fn read_retry(&self, _: ReadRetryOutcome) {}
     fn list_type_invariant_violation(&self) {}
+    fn audit_publish_failed(&self) {}
 }
 
 #[cfg(test)]
@@ -173,7 +177,8 @@ mod tests {
         assert_eq!(Dep::TypesRegistry.as_str(), "types_registry");
         assert_eq!(DepOp::GetAncestors.as_str(), "get_ancestors");
         assert_eq!(DepOp::PluginPut.as_str(), "plugin_put");
-        assert_eq!(DepOp::PluginDelete.as_str(), "plugin_delete");
+        assert_eq!(DepOp::PluginDeleteKey.as_str(), "plugin_delete_key");
+        assert_eq!(DepOp::PluginDestroy.as_str(), "plugin_destroy");
         assert_eq!(DepOp::Evaluate.as_str(), "evaluate");
         assert_eq!(
             DepOp::GetTypeSchemaByUuid.as_str(),
@@ -181,8 +186,8 @@ mod tests {
         );
         assert_eq!(Outcome::Success.as_str(), "success");
         assert_eq!(Outcome::Error.as_str(), "error");
-        assert_eq!(FenceVerify::Ok.as_str(), "ok");
-        assert_eq!(FenceVerify::Mismatch.as_str(), "mismatch");
+        assert_eq!(ReadRetryOutcome::Recovered.as_str(), "recovered");
+        assert_eq!(ReadRetryOutcome::SecondMiss.as_str(), "second_miss");
     }
 
     #[test]
@@ -192,10 +197,10 @@ mod tests {
         noop.walkup_depth(3);
         noop.dependency(Dep::Pdp, DepOp::Evaluate, Outcome::Success, 0.1);
         noop.cross_tenant_denied();
-        noop.fence_verify(FenceVerify::Ok);
-        noop.gc_deleted(2);
-        noop.gc_pending_reclaimed(1);
-        noop.expired_deleted(4);
+        noop.destroy_failed();
+        noop.outbox_purge_failed();
+        noop.read_retry(ReadRetryOutcome::Recovered);
         noop.list_type_invariant_violation();
+        noop.audit_publish_failed();
     }
 }

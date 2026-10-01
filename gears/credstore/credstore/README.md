@@ -18,8 +18,8 @@ The `cf-gears-credstore` module provides:
 
 - **Local metadata** — a gear-owned `credstore_secrets` table (`SecureORM` /
   sea-orm, migrations `m0001` + `m0002`) holding sharing, owner, status,
-  `version`, `fallback`, a `value_id` pointer to the row's current
-  immutable backend version, and the value-fingerprint fence
+  `version`, `fallback`, and a `value_version` pointer to the row's current
+  immutable backend version (ADR-0006)
 - **One item shape for the record and its secret** — the point read and the
   collection return the same shape; `secret` is present only when the
   caller's `$select` names it, under `read_secret`; a credential can be
@@ -35,22 +35,30 @@ The `cf-gears-credstore` module provides:
   is fail-closed (canonical 404, anti-enumeration)
 - **Hierarchical resolution** — a single indexed query over the ancestor chain
   (TTL+LRU cached, barriers ignored — `shared` inherits through them); the backend is read once for the winner's value
-- **Value-fingerprint fence** — every read verifies the backend value against a
-  per-row `HMAC-SHA256` (key auto-stored in the backend, never on the wire), so
-  a metadata/value desync from a concurrent write fails closed instead of
-  disclosing a value under a foreign sharing label (DESIGN §4.10, ADR-0003);
-  an integrity check with no healing path — recovery is an ordinary new write
 - **Versioning** — strong generation-bound `ETag` (`"<id>.<version>"`) on `GET`,
   mandatory `If-Match` on `PUT`/`DELETE` (a validator, or `*` for explicit
   last-writer-wins; no ABA across recreation)
-- **Crash-safe writes** — each value is a new immutable version under a fresh
-  id; the row's pointer switches in one transaction after the bytes are
-  written; old versions are deleted by the writer right after the switch —
-  that is the cleanup path; leftovers (a failed writer-side delete, or a
-  crash) and expired records are removed by a periodic maintenance job, not
-  an in-process reaper
-- **Backend plugin** — value-only store discovered via the types registry (vendor)
-- **`ClientHub` + REST** — registers `CredStoreClientV1` and `CredStoreMaintenanceV1`; exposes `/credstore/v1/credentials`
+- **Crash-safe writes** — each value is written with `put(key, value)`, which
+  returns an immutable version; the row's `value_version` pointer switches to
+  it in one transaction after the bytes are durable, and older versions are
+  destroyed best effort afterwards (only if the plugin declares
+  `supports_destroy`; a failure is counted in `destroy_failed` and retried
+  implicitly by the next write). No resident reaper, no maintenance job
+- **Delete and purge** — deleting a record is one row transaction that also
+  enqueues a key purge on the platform transactional outbox; the outbox
+  handler calls the plugin's `delete_key(key)` (retried until it succeeds,
+  `outbox_purge_failed` counts failed attempts). The reference is free at
+  once, so delete-then-recreate works immediately
+- **Audit** — every secret read and write is published to the credstore audit
+  topic through the `event-broker` gear, best effort: a failure logs an error
+  (never the secret) and counts `audit_publish_failed`, and the operation is
+  unaffected
+- **Metrics** — `read_outcome`, `walkup_depth`, dependency latency/health,
+  `cross_tenant_denied`, `destroy_failed`, `outbox_purge_failed`, `read_retry`,
+  `list_type_invariant_violation`, `audit_publish_failed` (`credstore_*`
+  OpenTelemetry instruments); no inventory gauge
+- **Backend plugin** — a versioned value store (`CredStorePluginClientV2`: `put`, `get`, `delete_key`, optional `destroy`) keyed by `(tenant_id, record_id)`, discovered via the types registry (vendor)
+- **`ClientHub` + REST** — registers `CredStoreClientV1`; exposes `/credstore/v1/credentials`
 
 This module depends on `types-registry`, `tenant-resolver`, and `authz-resolver`,
 and **requires a database**. The secret value is stored in a plugin (e.g.
@@ -65,13 +73,16 @@ is also how a tenant suppresses an inherited credential without a row of
 its own. A merge-`PATCH` on the same address edits metadata or
 rotates/removes the secret without touching the rest of the record; and the
 secret is read by naming it in `$select` on that same address or on the
-collection — there is no dedicated secret address. Every value write mints
-a fresh version id, switches the row's pointer to it in one transaction,
-and deletes the version it replaced right after — the model of Vault KV v2
-and the cloud secret managers, shadow paging with a `git gc`-style
-collector; a periodic maintenance job, run on an operator-chosen schedule
-outside the gear (no resident reaper), collects whatever that best-effort
-delete missed.
+collection — there is no dedicated secret address. Every value write stores a new immutable version in the backend under the
+record key `(tenant_id, record_id)`, switches the row's `value_version`
+pointer to it in one transaction, and destroys the replaced versions best
+effort afterwards — the model of Vault KV v2 and the cloud secret managers.
+Expiry applies to the secret, not to the record. Nothing sweeps expired rows:
+an expired record stays visible (status `expired`, normal validator) but its
+secret is never served — a read of it fails `409 SECRET_EXPIRED`, without
+falling through to an ancestor's value. The owner renews it in place with a
+`PATCH` of `expires_at` or a replace; a create-only `PUT` over it is
+`409 ALREADY_EXISTS`.
 
 ## Usage
 
@@ -111,13 +122,13 @@ credstore:
     vendor: "constructorfabric" # GTS vendor used to discover the value-store plugin
     hierarchy:
       ancestor_cache_ttl_secs: 300
-    gc:                          # settings of the maintenance job (ADR-0006); no resident reaper
-      pending_max_age_secs: 3600 # a pending write intent older than this is reclaimed by the job
-      batch_size: 256            # rows per batch in the job's expiry and gc passes
     list:
       max_limit: 200             # metadata-mode page-size cap
       secret_mode_cap: 25        # secret-mode ($select=…,secret) match-set cap
 ```
+
+The config is `deny_unknown_fields`: the withdrawn `reaper:` and `gc:` blocks
+are rejected at startup.
 
 ## License
 

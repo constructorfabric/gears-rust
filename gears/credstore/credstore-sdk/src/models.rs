@@ -27,31 +27,57 @@ pub use tenant_resolver_sdk::TenantId;
 #[serde(transparent)]
 pub struct OwnerId(pub Uuid);
 
-/// Opaque backend-value identifier (ADR-0006 "immutable value versions").
+/// Key of one record in the value store (ADR-0006): `(tenant_id, record_id)`.
 ///
-/// Every value write mints a fresh `ValueId` (a UUID v4) and writes the bytes
-/// to the backend under `(tenant_id, value_id)` — never `reference` or a
-/// sharing-derived key class. A `credstore_secrets` row's `value_id` column
-/// points at the version it currently serves; `value_id` is unique across the
-/// whole store, so the row alone knows which value belongs to which
-/// reference, and the backend needs neither `reference` nor `owner_id` to do
-/// its job. See [`crate::plugin_api`] and
-/// [`FENCE_KEY_VALUE_ID`](crate::types::FENCE_KEY_VALUE_ID).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ValueId(pub Uuid);
+/// `record_id` is the `id` of the record's metadata row, minted at create and
+/// never reused. The gear chooses the key; the plugin only maps it to a
+/// physical location under its installation prefix. The reference, type and
+/// sharing are not part of the key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StoreKey {
+    /// Tenant that owns the record.
+    pub tenant_id: TenantId,
+    /// The record's identity (the metadata row `id`).
+    pub record_id: Uuid,
+}
 
-impl ValueId {
-    /// Mint a fresh, store-wide-unique value id for a new write.
+impl StoreKey {
+    /// Builds the key of record `record_id` of tenant `tenant_id`.
     #[must_use]
-    pub fn new_v4() -> Self {
-        Self(Uuid::new_v4())
+    pub fn new(tenant_id: TenantId, record_id: Uuid) -> Self {
+        Self {
+            tenant_id,
+            record_id,
+        }
     }
 }
 
-impl fmt::Display for ValueId {
+/// Opaque provider-assigned identifier of one stored value version
+/// (ADR-0006): a Vault/OpenBao `version`, a GCP secret version, an AWS
+/// `VersionId`. The provider chooses it, `put` returns it, the gear stores it
+/// verbatim in the row's `value_version` and passes it back to `get` and
+/// `destroy`. The gear never parses or compares it; ordering is a plugin-internal
+/// guarantee (required only together with `destroy`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ValueVersion(pub String);
+
+impl ValueVersion {
+    /// Wraps a provider version string.
+    #[must_use]
+    pub fn new(v: impl Into<String>) -> Self {
+        Self(v.into())
+    }
+
+    /// The provider version string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ValueVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+        f.write_str(&self.0)
     }
 }
 
@@ -218,11 +244,8 @@ pub enum SharingMode {
 /// [`Self::Exists`] is the deliberate, visible-in-code opt-out for blind
 /// create-or-replace flows that cannot hold a version (rotation /
 /// provisioning, where the new value is not derived from the stored one).
-/// It is also what a caller recovering a fence-poisoned reference (ADR-0003)
-/// uses, since a fenced `GET` fails closed with 404 and yields no validator
-/// to hold — but under immutable value versions (ADR-0006) that recovery is
-/// an ordinary new write like any other, not a special healing path;
-/// `Exists` carries no meaning beyond RFC 9110 last-writer-wins.
+/// Under immutable value versions (ADR-0006) it has no healing role: it
+/// carries no meaning beyond RFC 9110 last-writer-wins.
 ///
 /// `put` uses the distinct [`PutPrecondition`] instead, which additionally
 /// carries the create-only intent (`If-None-Match: *`, ADR-0004).
@@ -234,9 +257,8 @@ pub enum WritePrecondition {
     /// under its own immutable value version (ADR-0006), so the race
     /// resolves into two intact versions and one pointer, never a corrupted
     /// value. Reserve it for writers that own their references outright
-    /// (rotation, provisioning) and for a caller with no version to hold (a
-    /// fenced `GET` fails closed with no validator to read); read-modify-write
-    /// callers must use [`Self::Matches`].
+    /// (rotation, provisioning) and for a caller with no version to hold;
+    /// read-modify-write callers must use [`Self::Matches`].
     Exists,
     /// Compare-and-set: the current generation must still be `(id, version)`
     /// (REST `If-Match: "<id>.<version>"`). `id` is the row UUID — fresh per
@@ -319,7 +341,7 @@ pub enum Fallback {
 /// representations"): never a saga state, never `provisioning` or
 /// `deprovisioning` — those are invisible to every read.
 ///
-/// Wire form: lowercase `"none"` / `"declared"` / `"active"`.
+/// Wire form: lowercase `"none"` / `"declared"` / `"active"` / `"expired"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialStatus {
@@ -330,6 +352,12 @@ pub enum CredentialStatus {
     Declared,
     /// The caller's own row exists and carries a value.
     Active,
+    /// The caller's own row is `active` but its `expires_at` has passed.
+    /// Derived from `expires_at` at read time, never stored: the record and
+    /// its metadata stay visible, its secret is never served (reads of the
+    /// secret fail with [`crate::CredStoreError::SecretExpired`]) until the
+    /// record is renewed.
+    Expired,
 }
 
 /// The state of the **effective row** a reference resolves to (ADR-0004,
@@ -370,7 +398,7 @@ pub struct Credential {
     /// Suppression policy of the caller's **own** row; `None` when the
     /// caller's tenant holds no row under the reference (`status: none`).
     pub fallback: Option<Fallback>,
-    /// State of the caller's own row: `none`/`declared`/`active`.
+    /// State of the caller's own row: `none`/`declared`/`active`/`expired`.
     pub status: CredentialStatus,
     /// State of the effective row this reference resolves to.
     pub inheritance: InheritanceStatus,
@@ -539,21 +567,6 @@ pub struct CredentialListItem {
     pub secret: Option<SecretValue>,
 }
 
-/// Outcome of one [`CredStoreMaintenanceV1::run_gc`](crate::CredStoreMaintenanceV1::run_gc)
-/// invocation (ADR-0006). Mirrors the gear-internal report the domain service
-/// returns; the gear's `ClientHub` adapter converts between the two.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct GcReport {
-    /// Expired `active` rows removed (maintenance job pass 1).
-    pub expired_deleted: u64,
-    /// Versions deleted by the gc drain (`reason != pending`: superseded,
-    /// removed, or aborted).
-    pub gc_deleted: u64,
-    /// Orphaned `pending` versions reclaimed (older than
-    /// `gc.pending_max_age_secs` and unreferenced by any row).
-    pub gc_pending_reclaimed: u64,
-}
-
 #[cfg(test)]
 mod models_tests {
     use super::*;
@@ -609,12 +622,20 @@ mod models_tests {
     }
 
     #[test]
-    fn value_id_new_v4_is_random_and_displays_as_uuid() {
-        let a = ValueId::new_v4();
-        let b = ValueId::new_v4();
-        assert_ne!(a, b, "each mint must be store-wide unique");
-        assert_eq!(a.0.get_version_num(), 4);
-        assert_eq!(a.to_string(), a.0.to_string());
+    fn value_version_is_opaque_and_displays_verbatim() {
+        let v = ValueVersion::new("7");
+        assert_eq!(v.as_str(), "7");
+        assert_eq!(v.to_string(), "7");
+        assert_eq!(v, ValueVersion("7".to_owned()));
+    }
+
+    #[test]
+    fn store_key_is_a_hashable_value() {
+        let k = StoreKey::new(TenantId::nil(), Uuid::nil());
+        assert_eq!(k, k.clone());
+        let mut set = std::collections::HashSet::new();
+        set.insert(k.clone());
+        assert!(set.contains(&k));
     }
 
     #[test]
@@ -656,6 +677,7 @@ mod models_tests {
             (CredentialStatus::None, "\"none\""),
             (CredentialStatus::Declared, "\"declared\""),
             (CredentialStatus::Active, "\"active\""),
+            (CredentialStatus::Expired, "\"expired\""),
         ] {
             let json = serde_json::to_string(&s).expect("serialize");
             assert_eq!(json, expected);
@@ -709,14 +731,6 @@ mod models_tests {
             }
             .is_empty()
         );
-    }
-
-    #[test]
-    fn gc_report_default_is_all_zeros() {
-        let report = GcReport::default();
-        assert_eq!(report.expired_deleted, 0);
-        assert_eq!(report.gc_deleted, 0);
-        assert_eq!(report.gc_pending_reclaimed, 0);
     }
 
     #[test]

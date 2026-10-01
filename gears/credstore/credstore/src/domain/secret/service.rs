@@ -1,19 +1,20 @@
 //! Credential-store domain service (ADR-0006: immutable value versions).
 //!
-//! Orchestrates authorization, typed-secret validation, hierarchy resolution,
-//! the immutable-value write/read/delete protocols, fingerprint verification,
-//! and the periodic maintenance job's garbage-collection logic.
+//! Orchestrates authorization, typed-secret validation, hierarchy resolution
+//! and the immutable-value write/read/delete protocols: put the bytes under
+//! the record's key, switch the row's pointer in one compare-and-set, then
+//! (where the plugin supports it) destroy older versions best effort.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use credstore_sdk::{
-    CredStoreError, CredStorePluginClientV1, Credential, CredentialPatch, CredentialStatus,
-    CredentialWrite, Fallback as SdkFallback, InheritanceStatus, OwnerId, PatchField, PutOutcome,
-    Secret, SecretRef, SecretValue, SharingMode, TenantId, Validator, ValueId,
+    CredStoreError, CredStorePluginClientV2, Credential, CredentialPatch, CredentialStatus,
+    CredentialWrite, DestroySelector, Fallback as SdkFallback, InheritanceStatus, OwnerId,
+    PatchField, PutOutcome, Secret, SecretRef, SecretValue, SharingMode, StoreKey, TenantId,
+    Validator, ValueVersion,
 };
-use tokio::time::sleep;
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
@@ -22,18 +23,18 @@ use authz_resolver_sdk::pep::ResourceType;
 
 use crate::domain::authz::{self, actions, scope_for};
 use crate::domain::error::DomainError;
+use crate::domain::ports::audit::{AuditEvent, AuditOperation, AuditOutcome, AuditSink, NoopAudit};
 use crate::domain::ports::metrics::{
-    CredStoreMetricsPort, Dep, DepOp, FenceVerify, Outcome, ReadOutcome,
+    CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome,
 };
 use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
 use time::OffsetDateTime;
 
-use crate::domain::secret::fence;
 use crate::domain::secret::list_filter;
 use crate::domain::secret::model::{
-    Fallback, GcEntry, GcReason, NewDeclaredSecret, NewSecret, PutPrecondition, SecretRow,
-    SecretStatus, WritePrecondition,
+    Fallback, NewDeclaredSecret, NewSecret, PutPrecondition, SecretRow, SecretStatus,
+    WritePrecondition,
 };
 use crate::domain::secret::repo::SecretRepo;
 use crate::domain::secret::type_resolver::{ResolvedSecretType, SecretTypeResolver};
@@ -76,6 +77,13 @@ pub fn map_plugin_err(e: CredStoreError) -> DomainError {
             cause: None,
         },
         CredStoreError::Conflict => DomainError::Conflict,
+        // Expiry is the gear's own read-time verdict, never a plugin's: a
+        // plugin only stores versioned bytes. Treat it as a contract
+        // violation.
+        CredStoreError::SecretExpired => DomainError::Internal {
+            diagnostic: "plugin returned SecretExpired".to_owned(),
+            cause: None,
+        },
         // These are plugin contract violations (a plugin should never return
         // them for get/put/delete on this SPI). Their free-text payloads
         // originate in the plugin, and — like the `ServiceUnavailable` detail
@@ -121,18 +129,6 @@ pub fn map_plugin_err(e: CredStoreError) -> DomainError {
     }
 }
 
-/// Garbage-collection settings for the periodic maintenance job (`credstore
-/// gc`), from `GcCfg`. The gear's own lifecycle runs no timer of any kind
-/// (ADR-0006 D7): these settings only bound [`Service::run_gc`]'s batches and
-/// its pending-reclaim age threshold, whenever an operator or scheduler
-/// invokes it.
-#[domain_model]
-#[derive(Debug, Clone, Copy)]
-pub struct GcSettings {
-    pub pending_max_age_secs: u64,
-    pub batch_size: u64,
-}
-
 /// Collection-read settings (`Service::list`, ADR-0005/ADR-0004), from
 /// `ListCfg`: the metadata-mode page-size cap (`limit`/`$top`) and the
 /// secret-mode (`$select` containing `secret`) match-set cap.
@@ -141,49 +137,6 @@ pub struct GcSettings {
 pub struct ListSettings {
     pub max_limit: u64,
     pub secret_mode_cap: u64,
-}
-
-/// Outcome of one [`Service::run_gc`] invocation.
-#[domain_model]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct GcReport {
-    /// Expired `active` rows removed (§6.4 pass 1).
-    pub expired_deleted: u64,
-    /// Versions deleted by the gc drain (`reason != pending`).
-    pub gc_deleted: u64,
-    /// Orphaned `pending` versions reclaimed (older than
-    /// `pending_max_age_secs`, unreferenced by any row).
-    pub gc_pending_reclaimed: u64,
-}
-
-/// Re-read the cached fence key at least this often. Bounds the window in which
-/// a replica that adopted a losing key during a bootstrap race keeps using it:
-/// it converges on the stored key within this TTL even if it never hits a
-/// verify mismatch. The backend read is cheap and the key almost never changes.
-const FENCE_KEY_CACHE_TTL: Duration = Duration::from_mins(1);
-
-/// Minimum spacing between fingerprint-mismatch–triggered backend re-reads of
-/// the fence key. Under ADR-0006 a mismatch means the backend entry the row
-/// points to was altered or corrupted out of band — a by-design, fail-closed
-/// poison until a fresh write recovers it — so without this every read of
-/// such a row would re-read the key from the backend. The cooldown bounds
-/// those forced reloads to one per window per replica. It gates on the *last
-/// forced reload* (not cache age), so the first mismatch after a quiet window
-/// always re-reads and heals a genuinely stale key; only the repeated,
-/// never-healing poison reads are suppressed.
-const FENCE_KEY_REFRESH_COOLDOWN: Duration = Duration::from_secs(15);
-
-/// The in-process fence key, shared out of the cache. Zeroizing so the
-/// process's single highest-value secret is wiped from the heap on drop.
-type FenceKey = Arc<zeroize::Zeroizing<Vec<u8>>>;
-
-/// Cached fence key plus when it was loaded, so [`Service::fence_key`] can
-/// re-read it from the backend after [`FENCE_KEY_CACHE_TTL`] and converge on
-/// the stored key even without a verify mismatch to trigger a refresh.
-#[domain_model]
-struct CachedFenceKey {
-    key: FenceKey,
-    loaded_at: Instant,
 }
 
 /// `CredStore` domain service — get / put / delete with walk-up, the
@@ -196,31 +149,17 @@ pub struct Service {
     plugins: Arc<dyn PluginSelector>,
     types: Arc<dyn SecretTypeResolver>,
     metrics: Arc<dyn CredStoreMetricsPort>,
-    gc: GcSettings,
+    audit: Arc<dyn AuditSink>,
     list: ListSettings,
-    /// In-process cache of the value-fingerprint fence key (auto-generated,
-    /// stored in the value-store backend under `(TenantId::nil(),
-    /// FENCE_KEY_VALUE_ID)`). A fingerprint mismatch triggers a
-    /// cooldown-gated, single-flighted backend re-read (swapped in place,
-    /// never evicted to `None`) so a replica holding a stale key self-heals
-    /// without a poisoned row thrashing the cache. Never logged, never on the
-    /// wire. Wrapped in [`zeroize::Zeroizing`] so the process's single
-    /// highest-value secret (it fingerprints every stored value) is wiped
-    /// from the heap when the cache is replaced or the process exits,
-    /// matching how every `SecretValue` in the system zeroizes on drop.
-    fence_key: std::sync::RwLock<Option<CachedFenceKey>>,
-    /// Serialises fence-key (re)load on a single replica so concurrent first
-    /// writers don't each run the bootstrap and race one another locally; the
-    /// jitter protocol in [`Service::load_fence_key`] then only has to defend
-    /// against *inter*-replica races.
-    bootstrap_lock: tokio::sync::Mutex<()>,
-    /// When the last fingerprint-mismatch–triggered *forced* reload of the
-    /// fence key ran, gating the next one to [`FENCE_KEY_REFRESH_COOLDOWN`].
-    /// `None` until the first forced reload, so the first mismatch always
-    /// re-reads (healing a stale key); thereafter a poisoned row cannot drive
-    /// more than one backend re-read per window. Independent of the cache's own
-    /// load time.
-    last_fence_refresh: std::sync::Mutex<Option<Instant>>,
+}
+
+/// What a write is about to do to a secret, known once the write is
+/// authorized. Carried out of `put_once`/`patch_once` so the one final
+/// outcome (after any `If-Match: *` retry) is audited exactly once.
+#[domain_model]
+struct AuditTarget {
+    operation: AuditOperation,
+    secret_type: String,
 }
 
 /// Selection-aware answer to the point read (`Service::get_item`, ADR-0004
@@ -247,7 +186,7 @@ impl Service {
     #[allow(
         clippy::too_many_arguments,
         reason = "one dependency/settings value per collaborator the domain service wires \
-                  together; a builder would only move the same eight names into a second type"
+                  together; a builder would only move the same seven names into a second type"
     )]
     pub fn new(
         repo: Arc<dyn SecretRepo>,
@@ -256,7 +195,6 @@ impl Service {
         plugins: Arc<dyn PluginSelector>,
         types: Arc<dyn SecretTypeResolver>,
         metrics: Arc<dyn CredStoreMetricsPort>,
-        gc: GcSettings,
         list: ListSettings,
     ) -> Self {
         Self {
@@ -266,11 +204,57 @@ impl Service {
             plugins,
             types,
             metrics,
-            gc,
+            audit: Arc::new(NoopAudit),
             list,
-            fence_key: std::sync::RwLock::new(None),
-            bootstrap_lock: tokio::sync::Mutex::new(()),
-            last_fence_refresh: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Route secret read/write audit events to `audit` (default: discard).
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<dyn AuditSink>) -> Self {
+        self.audit = audit;
+        self
+    }
+
+    /// Report one audited secret operation. Infallible by contract: the sink
+    /// owns its timeout, logging and metric, and nothing here can alter the
+    /// reply of the operation being audited.
+    async fn audit_event(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        secret_type: &str,
+        operation: AuditOperation,
+        outcome: AuditOutcome,
+    ) {
+        self.audit
+            .record(AuditEvent {
+                subject_id: ctx.subject_id(),
+                tenant_id: ctx.subject_tenant_id(),
+                reference: key.as_ref().to_owned(),
+                secret_type: secret_type.to_owned(),
+                operation,
+                outcome,
+            })
+            .await;
+    }
+
+    /// Audit the final result of a write whose target is known.
+    async fn audit_write<T>(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        target: Option<AuditTarget>,
+        result: &Result<T, DomainError>,
+    ) {
+        if let Some(t) = target {
+            let outcome = if result.is_ok() {
+                AuditOutcome::Success
+            } else {
+                AuditOutcome::Failure
+            };
+            self.audit_event(ctx, key, &t.secret_type, t.operation, outcome)
+                .await;
         }
     }
 
@@ -325,216 +309,6 @@ impl Service {
             }
             other => other,
         }
-    }
-
-    // ── Value-fingerprint fence (ADR-0003, narrowed by ADR-0006) ────────────
-
-    /// Internal service context for fence-key backend operations. Nil subject
-    /// and nil tenant: plugins are pure value stores keyed by the explicit
-    /// arguments, and no external caller ever carries the nil tenant, which is
-    /// what keeps the reserved key unreachable through the API.
-    fn fence_ctx() -> Result<(SecurityContext, TenantId, ValueId), DomainError> {
-        let ctx = SecurityContext::builder()
-            .subject_id(Uuid::nil())
-            .subject_tenant_id(Uuid::nil())
-            .build()
-            .map_err(|e| {
-                DomainError::internal(format!("fence: failed to build service context: {e}"))
-            })?;
-        Ok((ctx, TenantId::nil(), credstore_sdk::FENCE_KEY_VALUE_ID))
-    }
-
-    /// The cached fence key, loading (and on first boot generating) it from the
-    /// value-store backend when the cache is cold or older than
-    /// [`FENCE_KEY_CACHE_TTL`]. The TTL re-read lets a replica that adopted a
-    /// losing key during a bootstrap race converge on the stored key without
-    /// waiting for a verify mismatch.
-    async fn fence_key(
-        &self,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
-    ) -> Result<FenceKey, DomainError> {
-        {
-            let guard = self
-                .fence_key
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(cached) = guard.as_ref()
-                && cached.loaded_at.elapsed() < FENCE_KEY_CACHE_TTL
-            {
-                return Ok(Arc::clone(&cached.key));
-            }
-        }
-        self.load_fence_key(plugin, false).await
-    }
-
-    /// Re-read the fence key from the backend — the self-heal a fingerprint
-    /// mismatch triggers, so a replica whose cache went stale (key re-created
-    /// under it) converges without restart.
-    async fn refresh_fence_key(
-        &self,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
-    ) -> Result<FenceKey, DomainError> {
-        self.load_fence_key(plugin, true).await
-    }
-
-    /// Whether a forced fence-key reload ran within [`FENCE_KEY_REFRESH_COOLDOWN`].
-    /// `false` until the first forced reload, so an initial mismatch is never
-    /// suppressed.
-    fn fence_refresh_within_cooldown(&self) -> bool {
-        self.last_fence_refresh
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some_and(|at| at.elapsed() < FENCE_KEY_REFRESH_COOLDOWN)
-    }
-
-    /// (Re)load the fence key from the backend's reserved entry
-    /// `(TenantId::nil(), FENCE_KEY_VALUE_ID)`.
-    ///
-    /// The plugin port has no atomic create-if-absent, so first-boot generation
-    /// cannot be a true single-writer operation. Instead we make a bootstrap
-    /// race both **unlikely** and **low-impact**:
-    ///
-    /// * A per-replica [`Self::bootstrap_lock`] serialises this so concurrent
-    ///   first writers on one replica don't race each other locally.
-    /// * When the key is absent we jitter, re-check, and only then generate and
-    ///   `put`. Under ADR-0006 a plugin may reject a `put` to an id it already
-    ///   holds with `Conflict` — that is exactly "another replica won; re-read",
-    ///   not an error, since the fence key's `value_id` is a fixed constant a
-    ///   concurrent bootstrap on another replica may have just claimed.
-    /// * After publishing (or losing the race to a `Conflict`) we jitter again
-    ///   and **adopt whatever is stored** — ours if we won, a racing writer's
-    ///   if theirs landed first — rather than re-`put`ting. The cache is
-    ///   populated only from this settle read, so no value is ever stamped
-    ///   with a candidate that hasn't survived it.
-    ///
-    /// The key has no metadata row, so it is invisible to every API path. Any
-    /// residual divergence is fail-closed: a wrong key only ever yields a
-    /// fingerprint mismatch (404, healed by the next ordinary write), never a
-    /// value served under foreign metadata.
-    async fn load_fence_key(
-        &self,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
-        force: bool,
-    ) -> Result<FenceKey, DomainError> {
-        let _bootstrap = self.bootstrap_lock.lock().await;
-        // Reuse the cache rather than re-reading the backend when: a non-forced
-        // load finds it still within the TTL, or a forced refresh finds a prior
-        // forced reload within the cooldown (re-reading sooner cannot heal a
-        // poisoned row). A concurrent caller may also have just reloaded while
-        // we waited on the lock — this same check picks that up.
-        {
-            let guard = self
-                .fence_key
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(cached) = guard.as_ref() {
-                let reuse = if force {
-                    self.fence_refresh_within_cooldown()
-                } else {
-                    cached.loaded_at.elapsed() < FENCE_KEY_CACHE_TTL
-                };
-                if reuse {
-                    return Ok(Arc::clone(&cached.key));
-                }
-            }
-        }
-        // About to re-read on a mismatch: stamp the forced-reload clock now so
-        // repeated poisoned mismatches (and concurrent ones behind the lock)
-        // coalesce, even if the read below fails.
-        if force {
-            *self
-                .last_fence_refresh
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
-        }
-
-        let (ctx, tenant, value_id) = Self::fence_ctx()?;
-        // Fast path: the key already exists (every start after the first, and
-        // most concurrent cold starts once one replica has written it).
-        if let Some(v) = plugin
-            .get(&ctx, &tenant, &value_id)
-            .await
-            .map_err(map_plugin_err)?
-        {
-            return Ok(self.store_fence_key(zeroize::Zeroizing::new(v.as_bytes().to_vec())));
-        }
-
-        // Cold-start bootstrap. Jitter, then re-check: a peer may have won.
-        Self::bootstrap_jitter().await;
-        if let Some(v) = plugin
-            .get(&ctx, &tenant, &value_id)
-            .await
-            .map_err(map_plugin_err)?
-        {
-            return Ok(self.store_fence_key(zeroize::Zeroizing::new(v.as_bytes().to_vec())));
-        }
-
-        // Still absent: publish a candidate, settle, then adopt what landed.
-        // Keep the material in zeroizing buffers so no plain `Vec<u8>` copy
-        // lingers on the heap after this scope.
-        let candidate = zeroize::Zeroizing::new(fence::generate_key()?);
-        match plugin
-            .put(
-                &ctx,
-                &tenant,
-                &value_id,
-                SecretValue::new(candidate.to_vec()),
-            )
-            .await
-        {
-            // A `Conflict` here means a stricter plugin's immutability guard
-            // rejected our put because another replica's candidate landed
-            // first between our re-check and this call — exactly the
-            // residual race `load_fence_key`'s docs describe. Not an error:
-            // fall through to the settle read either way.
-            Ok(()) | Err(CredStoreError::Conflict) => {}
-            Err(e) => return Err(map_plugin_err(e)),
-        }
-        Self::bootstrap_jitter().await;
-        let stored = plugin
-            .get(&ctx, &tenant, &value_id)
-            .await
-            .map_err(map_plugin_err)?
-            // Our own write vanishing is not expected; fall back to the
-            // candidate so bootstrap still makes progress (fail-closed).
-            .map_or(candidate, |v| {
-                zeroize::Zeroizing::new(v.as_bytes().to_vec())
-            });
-        Ok(self.store_fence_key(stored))
-    }
-
-    /// Publish `key_bytes` as the cached fence key, timestamped for the TTL
-    /// re-read, and hand back the shared handle.
-    fn store_fence_key(&self, key_bytes: zeroize::Zeroizing<Vec<u8>>) -> FenceKey {
-        let key: FenceKey = Arc::new(key_bytes);
-        *self
-            .fence_key
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CachedFenceKey {
-            key: Arc::clone(&key),
-            loaded_at: Instant::now(),
-        });
-        key
-    }
-
-    /// Sleep a random `0..=FENCE_BOOTSTRAP_JITTER_MAX_MS` to de-synchronise
-    /// replicas racing the first-boot fence-key generation.
-    async fn bootstrap_jitter() {
-        use rand::RngExt as _;
-        let ms = rand::rng().random_range(0..=fence::BOOTSTRAP_JITTER_MAX_MS);
-        sleep(Duration::from_millis(ms)).await;
-    }
-
-    /// Fingerprint `value` under the current fence key (write-path stamping).
-    /// Computed from a borrow so the caller can still move `value` into
-    /// `plugin.put` afterward (`SecretValue` is not `Clone` by design).
-    async fn stamp_fp(
-        &self,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
-        value: &SecretValue,
-    ) -> Result<Vec<u8>, DomainError> {
-        let key = self.fence_key(plugin).await?;
-        Ok(fence::compute_fp(key.as_slice(), value.as_bytes()))
     }
 
     /// Retrieve the credential **record** (ADR-0004). See [`Self::get_item`]
@@ -593,7 +367,7 @@ impl Service {
     /// type — `read` when `fields` is `None` or names any administrative
     /// record field (`sharing`/`status`/`fallback`/`inheritance`/`version`/
     /// `updated_at`/`owner_id`), `read_secret` when `fields` names `secret`,
-    /// both when both — and reads the value via the fence-checked
+    /// both when both — and reads the value via
     /// [`Self::read_value_for_row`] only when `secret` is selected and the
     /// winner has one. A denial on either required action is the canonical
     /// 404 (`Ok(None)`), before either representation is assembled. A
@@ -610,6 +384,11 @@ impl Service {
     /// Returns [`DomainError::NotFound`] or [`DomainError::ServiceUnavailable`]
     /// from the value read, exactly as [`Self::get_secret`] documents, when
     /// `secret` is selected and the winner has one.
+    /// Returns [`DomainError::SecretExpired`] when `secret` is selected and the
+    /// decisive record is an expired `active` row (own override or inherited
+    /// `shared` record) — only after the caller passed `read_secret`; a caller
+    /// without it gets the usual miss. The metadata projection never fails
+    /// because of expiry: it reports status `expired`.
     #[allow(
         clippy::cognitive_complexity,
         reason = "resolve -> reduce -> authorize(s) -> assemble -> conditionally read is \
@@ -658,14 +437,15 @@ impl Service {
             .filter(|r| r.tenant_id == req)
             .min_by_key(|r| i32::from(r.sharing != SharingMode::Private));
 
-        // The winner: nearest row that actually resolves — `active` and not
-        // expired, or `declared` with `fallback: none` (a suppressing row
-        // that competes and blocks). A `declared`/`inherit` row never
-        // competes (ADR-0004, Suppression; ADR-0005, "Reducing a reference
-        // to one item").
+        // The winner: nearest row that actually resolves — `active` (expired
+        // or not: expiry applies to the secret, so an expired record stays
+        // the decisive one), or `declared` with `fallback: none` (a
+        // suppressing row that competes and blocks). A `declared`/`inherit`
+        // row never competes (ADR-0004, Suppression; ADR-0005, "Reducing a
+        // reference to one item").
         let now = OffsetDateTime::now_utc();
         let resolvable = |r: &&SecretRow| match r.status {
-            SecretStatus::Active => r.expires_at.is_none_or(|at| at > now),
+            SecretStatus::Active => true,
             SecretStatus::Declared => r.fallback == Fallback::None,
         };
         let pos = |t: TenantId| chain.iter().position(|c| *c == t.0).unwrap_or(usize::MAX);
@@ -700,73 +480,51 @@ impl Service {
                 InheritanceStatus::Inherited
             }
         } else {
-            // Nothing resolves; the caller has an own row (declared/inherit,
-            // or an expired-active row with nothing behind it) — reported as
-            // `Own` (ADR-0004: "choose Own and document").
+            // Nothing resolves; the caller has an own `declared`/`inherit`
+            // row with nothing behind it — reported as `Own` (ADR-0004:
+            // "choose Own and document").
             InheritanceStatus::Own
         };
 
-        let resolved = self.resolve_stored(effective.secret_type_uuid).await?;
-
-        // Evaluate whichever of `read`/`read_secret` the projection needs,
-        // gated on the caller's own tenant, before either representation is
-        // assembled (mirrors `authorize_write_actions`). A PDP denial or an
-        // out-of-scope tenant is indistinguishable from a missing record
-        // (anti-enumeration 404); a PDP or registry *outage* propagates.
+        // Evaluate whichever of `read`/`read_secret` the projection needs -
+        // ONE PDP evaluation per action on the base credential type, never
+        // one per type - gated on the caller's own tenant, before either
+        // representation is assembled (mirrors the write paths). The PDP's
+        // type constraint must admit the effective record's type. A PDP
+        // denial, an out-of-scope tenant or an unadmitted type is
+        // indistinguishable from a missing record (anti-enumeration 404); a
+        // PDP or registry *outage* propagates.
+        let mut required: Vec<&str> = Vec::with_capacity(2);
         if need_read {
-            match self
-                .scope_for_timed(
-                    ctx,
-                    &authz::credential_type_resource(&resolved.gts_id),
-                    actions::READ,
-                )
-                .await
-            {
-                Ok(scope) => {
-                    if !self.repo.scope_includes_tenant(&scope, req.0).await? {
-                        self.metrics.cross_tenant_denied();
-                        if need_read_secret {
-                            self.metrics.read_outcome(ReadOutcome::Miss);
-                        }
-                        return Ok(None);
-                    }
-                }
-                Err(DomainError::AccessDenied { .. }) => {
-                    if need_read_secret {
-                        self.metrics.read_outcome(ReadOutcome::Miss);
-                    }
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
-            }
+            required.push(actions::READ);
         }
         if need_read_secret {
-            match self
-                .scope_for_timed(
-                    ctx,
-                    &authz::credential_type_resource(&resolved.gts_id),
-                    actions::READ_SECRET,
-                )
-                .await
-            {
-                Ok(scope) => {
-                    if !self.repo.scope_includes_tenant(&scope, req.0).await? {
-                        self.metrics.cross_tenant_denied();
-                        self.metrics.read_outcome(ReadOutcome::Miss);
-                        return Ok(None);
-                    }
-                }
-                Err(DomainError::AccessDenied { .. }) => {
-                    self.metrics.read_outcome(ReadOutcome::Miss);
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
-            }
+            required.push(actions::READ_SECRET);
         }
+        let scope = match self.authorize_actions(ctx, req, &required).await {
+            Ok(scope) => scope,
+            Err(DomainError::AccessDenied { .. }) => {
+                if need_read_secret {
+                    self.metrics.read_outcome(ReadOutcome::Miss);
+                }
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        if !authz::row_clamp(&scope, req.0).admits(effective.secret_type_uuid, &effective.reference)
+        {
+            if need_read_secret {
+                self.metrics.read_outcome(ReadOutcome::Miss);
+            }
+            return Ok(None);
+        }
+        let resolved = self.resolve_stored(effective.secret_type_uuid).await?;
 
         let (status, fallback, version, updated_at, owner_id, validator) = match own {
             Some(o) => (
-                if o.status == SecretStatus::Active {
+                if o.is_expired(now) {
+                    CredentialStatus::Expired
+                } else if o.status == SecretStatus::Active {
                     CredentialStatus::Active
                 } else {
                     CredentialStatus::Declared
@@ -815,33 +573,12 @@ impl Service {
         // its `Secret::validator` is the row the value actually came from,
         // which a concurrent switch can make momentarily different from the
         // `winner` snapshot taken above.
-        let mut secret = None;
-        if need_read_secret {
-            let value_row = self.repo.resolve_for_get(req, subject, key, &chain).await?;
-            match &value_row {
-                Some(row) if row.value_id.is_some() => {
-                    let plugin = self.plugins.resolve().await?;
-                    secret = self
-                        .read_value_for_row(
-                            &plugin,
-                            ctx,
-                            req,
-                            subject,
-                            key,
-                            &chain,
-                            row,
-                            &credential.secret_type,
-                        )
-                        .await?;
-                }
-                _ => {
-                    // No winning row, or a value-less (declared/suppressed)
-                    // one: nothing to read, and `read_value_for_row` was
-                    // never called, so the miss is not yet recorded.
-                    self.metrics.read_outcome(ReadOutcome::Miss);
-                }
-            }
-        }
+        let secret = if need_read_secret {
+            self.read_secret_audited(ctx, req, subject, key, &chain, &credential.secret_type)
+                .await?
+        } else {
+            None
+        };
 
         if need_read_secret && !need_read && secret.is_none() {
             // A pure value request (no administrative field rode along) that
@@ -861,6 +598,73 @@ impl Service {
         }))
     }
 
+    /// The authorized value read of a point read: re-resolve the winning
+    /// row, read its value, and report the result to the audit sink. A
+    /// secret actually returned is audited as a success; an error after
+    /// authorization that follows a resolved record as a failure. A miss
+    /// (nothing, a value-less winner, or a re-read that finds the row gone or
+    /// another record - 404) discloses nothing and is not audited.
+    async fn read_secret_audited(
+        &self,
+        ctx: &SecurityContext,
+        req: TenantId,
+        subject: OwnerId,
+        key: &SecretRef,
+        chain: &[Uuid],
+        secret_type: &str,
+    ) -> Result<Option<Secret>, DomainError> {
+        let read = async {
+            let value_row = self.repo.resolve_for_get(req, subject, key, chain).await?;
+            // Expiry applies to the secret: the decisive record is expired,
+            // so its secret is never served and resolution does not continue
+            // to an ancestor's value. The caller is already authorized, so
+            // this is safe to disclose (and is audited as a failed read).
+            if value_row
+                .as_ref()
+                .is_some_and(|row| row.is_expired(OffsetDateTime::now_utc()))
+            {
+                self.metrics.read_outcome(ReadOutcome::Expired);
+                return Err(DomainError::SecretExpired);
+            }
+            match &value_row {
+                Some(row) if row.value_version.is_some() => {
+                    let plugin = self.plugins.resolve().await?;
+                    self.read_value_for_row(
+                        &plugin,
+                        ctx,
+                        req,
+                        subject,
+                        key,
+                        chain,
+                        row,
+                        secret_type,
+                    )
+                    .await
+                }
+                _ => {
+                    // No winning row, or a value-less (declared/suppressed)
+                    // one: nothing to read, and `read_value_for_row` was
+                    // never called, so the miss is not yet recorded.
+                    self.metrics.read_outcome(ReadOutcome::Miss);
+                    Ok(None)
+                }
+            }
+        }
+        .await;
+        let outcome = match &read {
+            Ok(Some(_)) => Some(AuditOutcome::Success),
+            // `NotFound`: the re-read found the row gone or another record -
+            // nothing resolved, nothing disclosed, nothing audited.
+            Ok(None) | Err(DomainError::NotFound) => None,
+            Err(_) => Some(AuditOutcome::Failure),
+        };
+        if let Some(outcome) = outcome {
+            self.audit_event(ctx, key, secret_type, AuditOperation::Read, outcome)
+                .await;
+        }
+        read
+    }
+
     /// Retrieve the resolved **value** (ADR-0004), walking up the tenant
     /// hierarchy. A winning record with no value (`declared`, including the
     /// suppression case) is the canonical miss. Thin wrapper over
@@ -872,11 +676,13 @@ impl Service {
     /// # Errors
     ///
     /// Returns [`DomainError::AccessDenied`] if the caller is out of scope.
+    /// Returns [`DomainError::SecretExpired`] if the decisive record is an
+    /// expired `active` row (the answer never falls through to an ancestor).
     /// Returns [`DomainError::NotFound`] if the reference resolves to nothing
     /// (including a re-read that finds a different generation) after one
     /// retry.
     /// Returns [`DomainError::ServiceUnavailable`] if the plugin still has no
-    /// value for a row's current `value_id` on the retry — by protocol a
+    /// value for a row's current `value_version` on the retry — by protocol a
     /// live pointer always names bytes that were durably written first, so
     /// this is a backend inconsistency, not absence.
     pub async fn get_secret(
@@ -909,30 +715,30 @@ impl Service {
         }))
     }
 
-    /// Read and fingerprint-verify the backend value named by `row.value_id`
-    /// (ADR-0003, narrowed by ADR-0006), retrying once against a freshly
-    /// re-resolved row if the backend reports the pointer missing — the
-    /// shared tail of [`Self::get_secret`] and, per reduced winner, the
-    /// collection read's secret mode (ADR-0005 "Bulk secret read"), so both
-    /// apply the identical retry-once-and-verify-fingerprint protocol.
+    /// Read the store value named by `row.value_version` (ADR-0006, DESIGN
+    /// section 4.6): `plugin.get(key, value_version)`; found -> reply; not
+    /// found (a concurrent write switched the pointer and destroyed the old
+    /// version) -> re-read the row once and, if `value_version` changed, `get`
+    /// again; a second miss is 503. The shared tail of [`Self::get_secret`]
+    /// and, per reduced winner, the collection read's secret mode (ADR-0005
+    /// "Bulk secret read").
     ///
-    /// Callers MUST have already checked `row.value_id.is_some()` (a
-    /// `declared`/suppressed row has nothing to read) and authorized
-    /// `resolved_gts_id` — this method performs neither the resolution nor
-    /// the PDP gate, only the read.
+    /// Callers MUST have already checked `row.value_version.is_some()` (a
+    /// `declared`/suppressed row has nothing to read, and never causes a store
+    /// call) and authorized `resolved_gts_id` - this method performs neither
+    /// the resolution nor the PDP gate, only the read.
     ///
-    /// Returns `Ok(None)` (with the corresponding metric already recorded)
-    /// on a legitimate miss: the retry finds the reference gone or switched
-    /// to a value-less generation, or the fingerprint fails to verify even
-    /// after a one-shot fence-key refresh.
+    /// Returns `Ok(None)` (with the corresponding metric already recorded) on
+    /// a legitimate miss: the retry finds the reference gone or switched to a
+    /// value-less generation.
     #[allow(
         clippy::too_many_arguments,
-        reason = "carries every field the retry + fence-verification protocol needs: identity, \
-                  the row being read, and the type name for the returned Secret"
+        reason = "carries every field the retry protocol needs: identity, the row being read, \
+                  and the type name for the returned Secret"
     )]
     async fn read_value_for_row(
         &self,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
+        plugin: &Arc<dyn CredStorePluginClientV2>,
         ctx: &SecurityContext,
         req: TenantId,
         subject: OwnerId,
@@ -941,11 +747,11 @@ impl Service {
         row: &SecretRow,
         resolved_gts_id: &str,
     ) -> Result<Option<Secret>, DomainError> {
-        let Some(value_id) = row.value_id else {
+        if row.value_version.is_none() {
             // Defensive: callers already filter out a value-less row before
             // calling this (nothing to authorize or read for it).
             return Ok(None);
-        };
+        }
 
         let depth = chain
             .iter()
@@ -954,51 +760,12 @@ impl Service {
         self.metrics.walkup_depth(depth as u64);
 
         let Some((value, served_row)) = self
-            .fetch_with_retry(plugin, ctx, req, subject, key, chain, row, value_id)
+            .fetch_with_retry(plugin, ctx, req, subject, key, chain, row)
             .await?
         else {
             self.metrics.read_outcome(ReadOutcome::Miss);
             return Ok(None);
         };
-
-        // Fence verification: the value is served only when its fingerprint
-        // matches the row that names it. Under immutable versions a mismatch
-        // can only mean the backend entry the row points to was altered or
-        // corrupted out of band (the torn-write cause is structurally
-        // impossible: step 3 of a write — the backend put — always precedes
-        // step 4 — the row CAS — so a row never points at a value_id until
-        // the bytes under it are already fully written).
-        let stored_fp = served_row.value_fp.as_ref().ok_or_else(|| {
-            // A row with a value_id but no fingerprint cannot exist by
-            // construction (`ck_credstore_fp_with_value`); treat it as
-            // corruption, never a panic.
-            DomainError::Internal {
-                diagnostic: "row has value_id but no value_fp (constraint invariant broken)"
-                    .to_owned(),
-                cause: None,
-            }
-        })?;
-        let fkey = self.fence_key(plugin).await?;
-        let mut fp_ok = fence::verify_fp(fkey.as_slice(), value.as_bytes(), stored_fp);
-        if !fp_ok {
-            // One-shot key refresh: a replica whose cached key went stale
-            // (key re-created under it) self-heals before failing closed.
-            let fkey = self.refresh_fence_key(plugin).await?;
-            fp_ok = fence::verify_fp(fkey.as_slice(), value.as_bytes(), stored_fp);
-        }
-        if fp_ok {
-            self.metrics.fence_verify(FenceVerify::Ok);
-        } else {
-            self.metrics.fence_verify(FenceVerify::Mismatch);
-            self.metrics.read_outcome(ReadOutcome::Miss);
-            tracing::warn!(
-                tenant = %served_row.tenant_id.0,
-                key = %key.as_ref(),
-                "credstore: value fingerprint mismatch; failing closed (the backend entry the \
-                 row points to was altered or corrupted out of band; a fresh write recovers it)"
-            );
-            return Ok(None);
-        }
 
         let is_inherited = served_row.tenant_id != req;
         self.metrics.read_outcome(if is_inherited {
@@ -1019,49 +786,48 @@ impl Service {
         }))
     }
 
-    /// Read the backend value for `row`'s `value_id`, retrying once against a
-    /// freshly re-resolved row if the plugin reports `NotFound` — the read
-    /// landed a moment before a concurrent write switched the pointer and
-    /// cleaned up the old version. A second consecutive `NotFound` for a
-    /// `value_id` the fresh row still references is a backend inconsistency,
-    /// not absence — by protocol the backend `put` always precedes the row
-    /// CAS that names it (ADR-0006 §6.2), so a live pointer to missing bytes
-    /// can only mean the backend entry was corrupted or lost out of band —
-    /// mapped onto [`DomainError::ServiceUnavailable`] (retryable), not a
-    /// 404. A row found `declared` on the retry (suppressed/removed
-    /// concurrently) is a legitimate miss instead — `Ok(None)`.
+    /// Read the store value for `row`'s `value_version`, re-reading the row
+    /// once if the plugin reports it gone - the read landed a moment before a
+    /// concurrent write switched the pointer and destroyed the old version.
+    /// If the re-read row carries a *changed* `value_version`, `get` again; a
+    /// second consecutive miss (or a re-read row still naming the version that
+    /// was just reported gone) is a store inconsistency, not absence - by
+    /// protocol the `put` always precedes the CAS that names it, and a
+    /// version is destroyed only after the pointer left it - mapped onto
+    /// [`DomainError::ServiceUnavailable`] (retryable), never a stale or empty
+    /// value. A row found `declared` on the re-read (suppressed/removed
+    /// concurrently) is a legitimate miss instead - `Ok(None)`.
     ///
-    /// The retry re-runs the *same* `resolve_for_get` call (same requesting
-    /// tenant/subject/key/chain) rather than looking up the row by id, per
-    /// ADR-0006's read protocol. If it comes back with a **different** row
-    /// (a different generation entirely — the original was deleted and a
-    /// different secret now resolves), this fails closed as `NotFound`
-    /// instead of serving a value the type/PDP check above never authorized:
-    /// the retry is for "the pointer moved", not "authorize a new row
-    /// mid-read". Since a row's type is immutable for its lifetime, a
-    /// matching id means the caller's earlier type resolution and PDP scope
-    /// still apply to the retried read.
+    /// The re-read re-runs the *same* `resolve_for_get` call (same requesting
+    /// tenant/subject/key/chain) rather than looking up the row by id. If it
+    /// comes back with a **different** row (a different generation entirely -
+    /// the original was deleted and a different secret now resolves), this
+    /// fails closed as `NotFound` instead of serving a value the type/PDP
+    /// check above never authorized. Since a row's type is immutable for its
+    /// lifetime, a matching id means the caller's earlier type resolution and
+    /// PDP scope still apply to the re-read.
     ///
-    /// Returns `Ok(None)` (with the plugin dependency metric already
-    /// recorded) when the *final* attempt reports `AccessDenied` — folded
-    /// into the anti-enumeration miss like a PDP denial.
+    /// Returns `Ok(None)` when the *final* attempt reports `AccessDenied`,
+    /// folded into the anti-enumeration miss like a PDP denial.
     #[allow(
         clippy::too_many_arguments,
-        reason = "carries the full resolve_for_get key plus the row/value_id being retried"
+        reason = "carries the full resolve_for_get key plus the row being retried"
     )]
     async fn fetch_with_retry(
         &self,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
+        plugin: &Arc<dyn CredStorePluginClientV2>,
         ctx: &SecurityContext,
         req: TenantId,
         subject: OwnerId,
         key: &SecretRef,
         chain: &[Uuid],
         row: &SecretRow,
-        value_id: ValueId,
     ) -> Result<Option<(SecretValue, SecretRow)>, DomainError> {
+        let Some(version) = row.value_version.as_ref() else {
+            return Ok(None);
+        };
         match self
-            .plugin_get_timed(plugin, ctx, &row.tenant_id, value_id)
+            .plugin_get_timed(plugin, ctx, &row.store_key(), version)
             .await
         {
             Ok(Some(v)) => Ok(Some((v, row.clone()))),
@@ -1071,7 +837,7 @@ impl Service {
                 let fresh = self.repo.resolve_for_get(req, subject, key, chain).await?;
                 let Some(fresh) = fresh else {
                     // The reference itself is gone (deleted, not merely
-                    // rotated) — a genuine miss.
+                    // rotated) - a genuine miss.
                     return Err(DomainError::NotFound);
                 };
                 if fresh.id != row.id {
@@ -1079,28 +845,28 @@ impl Service {
                     // type/PDP authorization does not necessarily apply.
                     return Err(DomainError::NotFound);
                 }
-                let Some(fresh_value_id) = fresh.value_id else {
-                    // The row was suppressed/declared concurrently — a
-                    // legitimate miss (ADR-0004), not a backend
-                    // inconsistency.
+                let Some(fresh_version) = fresh.value_version.as_ref() else {
+                    // The row was suppressed/declared concurrently - a
+                    // legitimate miss (ADR-0004), not a store inconsistency.
                     return Ok(None);
                 };
+                if fresh_version == version {
+                    // The pointer did not move, yet its version is gone.
+                    self.metrics.read_retry(ReadRetryOutcome::SecondMiss);
+                    return Err(Self::version_missing());
+                }
                 match self
-                    .plugin_get_timed(plugin, ctx, &fresh.tenant_id, fresh_value_id)
+                    .plugin_get_timed(plugin, ctx, &fresh.store_key(), fresh_version)
                     .await
                 {
-                    Ok(Some(v)) => Ok(Some((v, fresh))),
-                    // By protocol the backend `put` always precedes the row
-                    // CAS that names it (ADR-0006 §6.2 steps 3-4), so a row
-                    // that still references this `value_id` after a
-                    // committed CAS names bytes that must exist; a second
-                    // consecutive miss here is a backend inconsistency, not
-                    // absence — fail as a retryable outage, not a 404.
-                    Ok(None) => Err(DomainError::ServiceUnavailable {
-                        detail: "value version missing in backend; retry".to_owned(),
-                        retry_after: None,
-                        cause: None,
-                    }),
+                    Ok(Some(v)) => {
+                        self.metrics.read_retry(ReadRetryOutcome::Recovered);
+                        Ok(Some((v, fresh)))
+                    }
+                    Ok(None) => {
+                        self.metrics.read_retry(ReadRetryOutcome::SecondMiss);
+                        Err(Self::version_missing())
+                    }
                     Err(DomainError::AccessDenied { .. }) => Ok(None),
                     Err(e) => Err(e),
                 }
@@ -1108,19 +874,24 @@ impl Service {
         }
     }
 
+    fn version_missing() -> DomainError {
+        DomainError::ServiceUnavailable {
+            detail: "value version missing in the store; retry".to_owned(),
+            retry_after: None,
+            cause: None,
+        }
+    }
+
     /// Timed `plugin.get`, recording the dependency metric.
     async fn plugin_get_timed(
         &self,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
+        plugin: &Arc<dyn CredStorePluginClientV2>,
         ctx: &SecurityContext,
-        tenant: &TenantId,
-        value_id: ValueId,
+        key: &StoreKey,
+        version: &ValueVersion,
     ) -> Result<Option<SecretValue>, DomainError> {
         let t0 = Instant::now();
-        let result = plugin
-            .get(ctx, tenant, &value_id)
-            .await
-            .map_err(map_plugin_err);
+        let result = plugin.get(ctx, key, version).await.map_err(map_plugin_err);
         let secs = t0.elapsed().as_secs_f64();
         let outcome = match &result {
             Ok(Some(_)) => Outcome::Success,
@@ -1143,17 +914,23 @@ impl Service {
     /// a write of one class never affects the other.
     ///
     /// `value: Some(_)` follows ADR-0006's single protocol regardless of
-    /// precondition: mint a fresh `value_id`, record its intent, write the
-    /// backend, then one transaction switches the row's pointer
-    /// (`insert_active` on create, `switch_value` on overwrite) — the plugin
-    /// is resolved (fail-fast) only on this path. `value: None` never
+    /// precondition: `plugin.put` the bytes under the record's key, then one
+    /// compare-and-set switches the row's pointer (`insert_active` on create,
+    /// `switch_value` on overwrite), then — where the plugin supports it —
+    /// older versions are destroyed best effort. The plugin is resolved
+    /// (fail-fast) only on this path. A lost compare-and-set under an
+    /// `If-Match: *` precondition re-reads the row and retries once from the
+    /// start before returning `VersionConflict`. A create-only `PUT` over an
+    /// expired own row is a conflict like any other existing row (the expired
+    /// record is visible: renew or delete it). `value: None` never
     /// touches the plugin at all on create (`insert_declared`, a plain
     /// `INSERT`) or on replace of an already-`declared` row (metadata-only,
     /// `update_metadata`, itself skipped when nothing would change — ADR-0004
     /// "A metadata-only write that changes nothing bumps nothing"); on
     /// replace of an `active` row it removes the value in the same one
-    /// transaction `PATCH {"secret": null}` uses (`remove_value`), and the
-    /// plugin is then resolved for the old version's best-effort cleanup.
+    /// compare-and-set `PATCH {"secret": null}` uses (`remove_value`), and
+    /// the plugin is then resolved for the old version's best-effort
+    /// `destroy`.
     ///
     /// `write` is always required; `write_secret` is additionally required
     /// when `value` is `Some(_)`, or when a `None` removes an existing value
@@ -1162,22 +939,21 @@ impl Service {
     ///
     /// # Errors
     ///
+    /// Returns [`DomainError::AccessDenied`] if the caller is not permitted the
+    /// needed actions on the named type (or, naming none, on any type) —
+    /// decided before any row is read, so the same whether or not the record
+    /// exists.
     /// Returns [`DomainError::Conflict`] if [`PutPrecondition::CreateOnly`] and
-    /// the caller's own tenant already holds a row (of any status) under the
-    /// reference.
+    /// the caller's own tenant already holds a row (of any status, of any
+    /// type) under the reference.
     /// Returns [`DomainError::VersionConflict`] if a replace precondition
-    /// names no own row, or a version/generation mismatch.
+    /// names no own row, or one of a type the caller may not write
+    /// (indistinguishable), or a version/generation mismatch.
     /// Returns [`DomainError::TypeViolation`] on a trait violation, an
     /// unresolvable type, a differing type on replace (`TYPE_IMMUTABLE`), a
     /// missing type on create (`TYPE_REQUIRED`), or a create over a reference
     /// that currently resolves to an ancestor's `shared` record of a
     /// different type (`TYPE_MISMATCH_WITH_INHERITED`).
-    #[allow(
-        clippy::cognitive_complexity,
-        clippy::too_many_lines,
-        reason = "saga orchestration (validate -> scope -> resolve -> backend -> commit) is \
-                  inherently branchy; kept as one function for readability of the flow"
-    )]
     pub async fn put(
         &self,
         ctx: &SecurityContext,
@@ -1185,83 +961,236 @@ impl Service {
         write: CredentialWrite,
         precondition: PutPrecondition,
     ) -> Result<PutOutcome, DomainError> {
-        let CredentialWrite {
-            secret_type,
-            sharing,
-            fallback,
-            expires_at,
-            secret: value,
-        } = write;
-        let fallback = Fallback::from(fallback);
+        let mut audit = None;
+        let result = self
+            .put_attempts(ctx, key, &write, &precondition, &mut audit)
+            .await;
+        self.audit_write(ctx, key, audit, &result).await;
+        result
+    }
+
+    /// The `put` attempt loop; `audit` is set once the write is authorized
+    /// and known to create, replace or remove a secret.
+    async fn put_attempts(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        write: &CredentialWrite,
+        precondition: &PutPrecondition,
+        audit: &mut Option<AuditTarget>,
+    ) -> Result<PutOutcome, DomainError> {
+        // `If-Match: *` is last-writer-wins: a lost pointer switch re-reads
+        // the row and retries once from step 1 (the value is re-copied for
+        // the second `plugin.put`, as `SecretValue` is not `Clone`).
+        let attempts = if matches!(precondition, PutPrecondition::Exists) {
+            2
+        } else {
+            1
+        };
+        for _ in 0..attempts {
+            if let Some(outcome) = self.put_once(ctx, key, write, precondition, audit).await? {
+                return Ok(outcome);
+            }
+        }
+        Err(DomainError::VersionConflict)
+    }
+
+    /// One pass of steps 1-5 of the write protocol. `Ok(None)` is a definite
+    /// loss of the pointer-switch compare-and-set on an existing row.
+    #[allow(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "write orchestration (validate -> scope -> resolve -> put -> commit -> destroy) \
+                  is inherently branchy; kept as one function for readability of the flow"
+    )]
+    async fn put_once(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        write: &CredentialWrite,
+        precondition: &PutPrecondition,
+        audit: &mut Option<AuditTarget>,
+    ) -> Result<Option<PutOutcome>, DomainError> {
+        let secret_type = write.secret_type.as_ref();
+        let sharing = write.sharing;
+        let fallback = Fallback::from(write.fallback);
+        let expires_at = write.expires_at;
+        let value = write.secret.as_ref();
         let tenant = TenantId(ctx.subject_tenant_id());
         let owner = OwnerId(ctx.subject_id());
 
-        // Prefetch the target row of this sharing class (own-tenant, keyed by
-        // tenant+owner+key+sharing, of either resting status — a `declared`
-        // row still "holds" the reference, ADR-0004) with `allow_all`; the
-        // single PDP evaluation runs once the credential's concrete type is
-        // known.
-        if let Some(existing) = self
-            .repo
-            .find_for_write(&AccessScope::allow_all(), tenant, owner, key, sharing)
-            .await?
-        {
-            let resolved = self.resolve_stored(existing.secret_type_uuid).await?;
-            // `write_secret` is needed whenever a value is named, or a
-            // `null` removes one this row already holds (Amendment B); never
-            // when `null` replaces an already value-less row.
-            let need_write_secret = value.is_some() || existing.status == SecretStatus::Active;
-            // Authorize on the concrete type BEFORE any 4xx that would reveal
-            // the row exists.
-            let scope = self
-                .authorize_write_actions(ctx, &resolved.gts_id, tenant, true, need_write_secret)
-                .await?;
+        let create_only = matches!(precondition, PutPrecondition::CreateOnly);
 
-            if matches!(precondition, PutPrecondition::CreateOnly) {
-                return Err(DomainError::Conflict);
+        // Request-only checks first: they depend on the request alone, never
+        // on whether a row exists. A create must name its type (ADR-0004 — no
+        // default-to-generic); a named type must be registered.
+        let named = match secret_type {
+            Some(t) => {
+                let type_uuid = t.to_uuid();
+                Some((type_uuid, self.types.resolve(type_uuid).await?))
             }
-            if let Some(requested) = secret_type.as_ref()
-                && requested.to_uuid() != existing.secret_type_uuid
+            None if create_only => {
+                return Err(DomainError::InvalidRequest {
+                    field: "type",
+                    reason: typing::reasons::TYPE_REQUIRED,
+                    detail: "type is required to create a credential".to_owned(),
+                });
+            }
+            None => None,
+        };
+        if create_only && let Some((_, resolved)) = &named {
+            typing::validate_metadata(&resolved.gts_id, &resolved.traits, sharing, expires_at)?;
+            if let Some(v) = value {
+                typing::validate_value(&resolved.gts_id, &resolved.traits, v)?;
+            }
+        }
+
+        // Authorize BEFORE any row lookup (anti-enumeration): `write` (plus
+        // `write_secret` when a value is named), one PDP evaluation per
+        // action regardless of how many credential types exist. A create
+        // evaluates the requested concrete type; a replace evaluates the
+        // base type and gets the type predicate back in the scope. A caller
+        // the PDP refuses is answered 403 here, whether or not the record
+        // exists.
+        let required: &[&str] = if value.is_some() {
+            &[actions::WRITE, actions::WRITE_SECRET]
+        } else {
+            &[actions::WRITE]
+        };
+        let mut scope = if create_only {
+            let Some((requested_uuid, resolved)) = &named else {
+                return Err(DomainError::InvalidRequest {
+                    field: "type",
+                    reason: typing::reasons::TYPE_REQUIRED,
+                    detail: "type is required to create a credential".to_owned(),
+                });
+            };
+            let create_scope = self
+                .authorize_on(
+                    ctx,
+                    tenant,
+                    &authz::credential_type_resource(&resolved.gts_id),
+                    required,
+                )
+                .await?;
+            // No row exists yet: the PDP's row predicates are evaluated in
+            // memory against the would-be row (requested type + reference).
+            // Refused exactly like a PDP denial, before any lookup.
+            if !authz::row_clamp(&create_scope, tenant.0).admits(*requested_uuid, key.as_ref()) {
+                return Err(DomainError::AccessDenied { cause: None });
+            }
+            create_scope
+        } else {
+            self.authorize_actions(ctx, tenant, required).await?
+        };
+
+        // Look up the caller's own row of this sharing class (own-tenant,
+        // keyed by tenant+owner+key+sharing, of either resting status — a
+        // `declared` row still "holds" the reference, ADR-0004). A create
+        // looks it up unscoped: the unique key does not include the type, so
+        // every collision answers the same 409. A replace looks it up WITH
+        // the PDP scope, so a row of a type the caller may not write is not
+        // found.
+        let found = if create_only {
+            self.repo
+                .find_for_write(&AccessScope::allow_all(), tenant, owner, key, sharing)
+                .await?
+        } else {
+            self.repo
+                .find_for_write(&scope, tenant, owner, key, sharing)
+                .await?
+        };
+        // An expired own row still holds the reference: a create-only `PUT`
+        // over it is a plain conflict (409) — renew or delete it instead.
+        let existing = found;
+
+        if create_only && existing.is_some() {
+            // The name is taken: a create cannot succeed whatever the row
+            // holds, and the unique key does not include the type, so every
+            // collision answers the same 409 — a row of a type the caller may
+            // not write is not told apart from one it may.
+            if let (Some((_, resolved)), true) = (&named, value.is_some()) {
+                *audit = Some(AuditTarget {
+                    operation: AuditOperation::Create,
+                    secret_type: resolved.gts_id.clone(),
+                });
+            }
+            return Err(DomainError::Conflict);
+        }
+
+        if !create_only {
+            // Replace: a row that is absent, or of a type the PDP scope
+            // excludes, is answered exactly as an absent target.
+            let Some(existing) = existing else {
+                return Err(DomainError::VersionConflict);
+            };
+            let resolved = self.resolve_stored(existing.secret_type_uuid).await?;
+            // `write_secret` is also needed when a `null` removes a value
+            // this row already holds (Amendment B); never when `null`
+            // replaces an already value-less row. The caller already holds
+            // `write` on this type, so the row's state is its to learn: a
+            // refusal here is a plain 403.
+            if value.is_none() && existing.status == SecretStatus::Active {
+                let secret_scope = self
+                    .authorize_actions(ctx, tenant, &[actions::WRITE_SECRET])
+                    .await?;
+                if !authz::row_clamp(&secret_scope, tenant.0)
+                    .admits(existing.secret_type_uuid, &existing.reference)
+                {
+                    return Err(DomainError::AccessDenied { cause: None });
+                }
+                scope = authz::intersect_scopes(&scope, &secret_scope);
+            }
+            if value.is_some() {
+                *audit = Some(AuditTarget {
+                    operation: AuditOperation::Replace,
+                    secret_type: resolved.gts_id.clone(),
+                });
+            } else if existing.status == SecretStatus::Active {
+                *audit = Some(AuditTarget {
+                    operation: AuditOperation::Remove,
+                    secret_type: resolved.gts_id.clone(),
+                });
+            }
+
+            if let Some((requested_uuid, requested)) = &named
+                && *requested_uuid != existing.secret_type_uuid
             {
                 return Err(DomainError::TypeViolation {
                     field: "type",
                     reason: typing::reasons::TYPE_IMMUTABLE,
                     detail: format!(
                         "credential is of type '{}'; changing it to '{}' is not supported",
-                        resolved.gts_id, requested
+                        resolved.gts_id, requested.gts_id
                     ),
                 });
             }
             typing::validate_metadata(&resolved.gts_id, &resolved.traits, sharing, expires_at)?;
-            if let Some(v) = value.as_ref() {
+            if let Some(v) = value {
                 typing::validate_value(&resolved.gts_id, &resolved.traits, v)?;
             }
-            let expected_version = Self::precheck_put_version(&precondition, &existing)?;
+            let expected_version = Self::precheck_put_version(precondition, &existing)?;
 
             let validator = match value {
                 Some(v) => {
                     let plugin = self.plugins.resolve().await?;
-                    self.overwrite_existing(
-                        ctx,
-                        &plugin,
-                        tenant,
-                        &scope,
-                        existing.id,
-                        sharing,
-                        fallback,
-                        expected_version,
-                        expires_at,
-                        v,
-                    )
-                    .await?
+                    let Some(validator) = self
+                        .overwrite_existing(
+                            ctx, &plugin, &scope, &existing, sharing, fallback, expires_at, v,
+                        )
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    validator
                 }
                 None if existing.status == SecretStatus::Active => {
                     // Replace of an active row with an explicit `null`:
-                    // remove the value in the same one transaction
-                    // `PATCH {"secret": null}` uses, then best-effort clean up
-                    // the version it superseded.
+                    // remove the value in the same one compare-and-set
+                    // `PATCH {"secret": null}` uses, then best-effort destroy
+                    // the version it left behind.
                     let plugin = self.plugins.resolve().await?;
-                    let (row, old_value_id) = self
+                    let (row, old_version) = self
                         .repo
                         .remove_value(
                             &scope,
@@ -1273,10 +1202,8 @@ impl Service {
                         )
                         .await?
                         .ok_or(DomainError::VersionConflict)?;
-                    if let Some(old_id) = old_value_id {
-                        self.cleanup_replaced_value(ctx, &plugin, &tenant, old_id)
-                            .await;
-                    }
+                    self.destroy_removed(ctx, &plugin, &row.store_key(), old_version.as_ref())
+                        .await;
                     Validator {
                         id: row.id,
                         version: row.version,
@@ -1317,43 +1244,27 @@ impl Service {
                     }
                 }
             };
-            return Ok(PutOutcome {
+            return Ok(Some(PutOutcome {
                 created: false,
                 validator,
-            });
+            }));
         }
 
-        // The target does not exist. A replace precondition never creates.
-        if !matches!(precondition, PutPrecondition::CreateOnly) {
-            return Err(DomainError::VersionConflict);
-        }
-
-        // Create path: `secret_type` is required (ADR-0004 — no
-        // default-to-generic as there was pre-ADR-0004); traits + per-type
-        // access validated before any side effect.
-        let Some(requested_type) = secret_type.as_ref() else {
+        // Create: `named` is the requested type (checked above) and the
+        // PDP evaluation on it above allowed it.
+        let Some((type_uuid, resolved)) = named else {
             return Err(DomainError::InvalidRequest {
                 field: "type",
                 reason: typing::reasons::TYPE_REQUIRED,
                 detail: "type is required to create a credential".to_owned(),
             });
         };
-        let type_uuid = requested_type.to_uuid();
-        let resolved = self.types.resolve(type_uuid).await?;
-        typing::validate_metadata(&resolved.gts_id, &resolved.traits, sharing, expires_at)?;
-        if let Some(v) = value.as_ref() {
-            typing::validate_value(&resolved.gts_id, &resolved.traits, v)?;
+        if value.is_some() {
+            *audit = Some(AuditTarget {
+                operation: AuditOperation::Create,
+                secret_type: resolved.gts_id.clone(),
+            });
         }
-
-        // Authorize on the requested concrete type BEFORE the inherited-type
-        // check below: its 409 detail names the inherited type, which a
-        // caller without `write`/`write_secret` on this type must not learn.
-        // `write_secret` is never evaluated for a `null` create — nothing
-        // about a value is being changed, there being none on either side of
-        // the request (ADR-0004 Amendment B).
-        let scope = self
-            .authorize_write_actions(ctx, &resolved.gts_id, tenant, true, value.is_some())
-            .await?;
 
         // If the reference currently resolves to an ancestor's `shared`
         // record of a different type, creating here would silently diverge
@@ -1380,14 +1291,24 @@ impl Service {
         let validator = if let Some(v) = value {
             let plugin = self.plugins.resolve().await?;
             self.create_new(
-                ctx, &plugin, tenant, owner, key, sharing, fallback, type_uuid, expires_at, v,
+                ctx,
+                &plugin,
+                NewRecordParams {
+                    tenant,
+                    owner,
+                    key,
+                    sharing,
+                    fallback,
+                    secret_type_uuid: type_uuid,
+                    expires_at,
+                },
+                v,
                 &scope,
             )
             .await?
         } else {
             // Explicit `null` on create: insert the row `declared` directly —
-            // no `value_id`, no fence, no gc entry, no backend call
-            // (ADR-0004 Amendment B).
+            // no `value_version`, no backend call (ADR-0004 Amendment B).
             let id = Uuid::new_v4();
             let new = NewDeclaredSecret {
                 id,
@@ -1402,10 +1323,10 @@ impl Service {
             self.repo.insert_declared(&scope, &new).await?;
             Validator { id, version: 1 }
         };
-        Ok(PutOutcome {
+        Ok(Some(PutOutcome {
             created: true,
             validator,
-        })
+        }))
     }
 
     /// Apply a partial change to the record, the value, or both (ADR-0004,
@@ -1413,8 +1334,10 @@ impl Service {
     ///
     /// # Errors
     ///
+    /// Returns [`DomainError::AccessDenied`] if the caller is not permitted the
+    /// needed actions on the named type (or, naming none, on any type).
     /// Returns [`DomainError::NotFound`] if the caller holds no own record
-    /// under the reference.
+    /// under the reference, or one of a type it may not write.
     /// Returns [`DomainError::InvalidRequest`] (`EMPTY_PATCH`) if the patch
     /// touches nothing at all.
     /// Returns [`DomainError::TypeViolation`] (`TYPE_IMMUTABLE`) if
@@ -1423,12 +1346,9 @@ impl Service {
     /// Returns [`DomainError::UnsupportedTransition`] if `sharing` would move
     /// the record between the private and tenant/shared key classes.
     /// Returns [`DomainError::VersionConflict`] on a failed precondition.
-    #[allow(
-        clippy::cognitive_complexity,
-        clippy::too_many_lines,
-        reason = "body-derived authorization and RFC 7396 merge semantics are inherently \
-                  branchy; kept as one function for readability of the flow"
-    )]
+    /// Returns [`DomainError::VersionConflict`] on a failed precondition, or
+    /// when the pointer switch loses its compare-and-set (under `If-Match: *`
+    /// only after one retry from the start).
     pub async fn patch(
         &self,
         ctx: &SecurityContext,
@@ -1436,18 +1356,62 @@ impl Service {
         patch: CredentialPatch,
         precondition: WritePrecondition,
     ) -> Result<Validator, DomainError> {
+        let mut audit = None;
+        let result = self
+            .patch_attempts(ctx, key, &patch, &precondition, &mut audit)
+            .await;
+        self.audit_write(ctx, key, audit, &result).await;
+        result
+    }
+
+    /// The `patch` attempt loop; `audit` is set once the patch is authorized
+    /// and known to set or remove a secret.
+    async fn patch_attempts(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        patch: &CredentialPatch,
+        precondition: &WritePrecondition,
+        audit: &mut Option<AuditTarget>,
+    ) -> Result<Validator, DomainError> {
+        // `If-Match: *` is last-writer-wins: a lost pointer switch re-reads
+        // the row and retries once from step 1.
+        let attempts = if matches!(precondition, WritePrecondition::Exists) {
+            2
+        } else {
+            1
+        };
+        for _ in 0..attempts {
+            if let Some(validator) = self
+                .patch_once(ctx, key, patch, precondition, audit)
+                .await?
+            {
+                return Ok(validator);
+            }
+        }
+        Err(DomainError::VersionConflict)
+    }
+
+    /// One pass of a `PATCH`. `Ok(None)` is a definite loss of the
+    /// pointer-switch compare-and-set.
+    #[allow(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "body-derived authorization and RFC 7396 merge semantics are inherently \
+                  branchy; kept as one function for readability of the flow"
+    )]
+    async fn patch_once(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        patch: &CredentialPatch,
+        precondition: &WritePrecondition,
+        audit: &mut Option<AuditTarget>,
+    ) -> Result<Option<Validator>, DomainError> {
         let tenant = TenantId(ctx.subject_tenant_id());
         let owner = OwnerId(ctx.subject_id());
 
-        // Own row required — reveals own-tenant existence, the same accepted
-        // part of the threat model as `delete` (cross-tenant existence stays
-        // hidden by the read path's anti-enumeration 404).
-        let existing = self
-            .repo
-            .find_own(&AccessScope::allow_all(), tenant, owner, key)
-            .await?
-            .ok_or(DomainError::NotFound)?;
-
+        // Request-only check: independent of whether a row exists.
         if patch.is_empty() {
             return Err(DomainError::InvalidRequest {
                 field: "patch",
@@ -1462,21 +1426,48 @@ impl Service {
             || patch.secret_type.is_some();
         let value_present = !patch.secret.is_absent();
 
-        // Both required actions are evaluated — and must both allow — before
-        // any side effect AND before any response that would reveal a detail
-        // of the caller's row (its type, its version, its sharing class)
-        // (ADR-0004, "Why the value has its own read address, and why writes
-        // do not").
+        // Request-only check: a named type must be registered.
+        if let Some(t) = patch.secret_type.as_ref() {
+            self.types.resolve(t.to_uuid()).await?;
+        }
+
+        // Authorize BEFORE any row lookup (anti-enumeration): both required
+        // actions must allow - one PDP evaluation per action on the base
+        // credential type, whatever the number of types. A caller the PDP
+        // refuses is answered 403 here, whether or not the record exists.
+        let mut required: Vec<&str> = Vec::with_capacity(2);
+        if metadata_present {
+            required.push(actions::WRITE);
+        }
+        if value_present {
+            required.push(actions::WRITE_SECRET);
+        }
+        let scope = self.authorize_actions(ctx, tenant, &required).await?;
+
+        // Own row required, looked up WITH the PDP scope (tenant and type
+        // predicates in SQL). A missing row and a row of a type the scope
+        // excludes are the same 404.
+        let existing = self
+            .repo
+            .find_own(&scope, tenant, owner, key)
+            .await?
+            .ok_or(DomainError::NotFound)?;
         let resolved = self.resolve_stored(existing.secret_type_uuid).await?;
-        let scope = self
-            .authorize_write_actions(
-                ctx,
-                &resolved.gts_id,
-                tenant,
-                metadata_present,
-                value_present,
-            )
-            .await?;
+        match &patch.secret {
+            PatchField::Set(_) => {
+                *audit = Some(AuditTarget {
+                    operation: AuditOperation::Replace,
+                    secret_type: resolved.gts_id.clone(),
+                });
+            }
+            PatchField::Null if existing.status == SecretStatus::Active => {
+                *audit = Some(AuditTarget {
+                    operation: AuditOperation::Remove,
+                    secret_type: resolved.gts_id.clone(),
+                });
+            }
+            _ => {}
+        }
 
         if let Some(requested) = patch.secret_type.as_ref()
             && requested.to_uuid() != existing.secret_type_uuid
@@ -1494,7 +1485,7 @@ impl Service {
                 detail: "cannot move between private and tenant/shared".into(),
             });
         }
-        let expected_version = Self::precheck_version(Some(&precondition), &existing)?;
+        let expected_version = Self::precheck_version(Some(precondition), &existing)?;
 
         let merged_sharing = patch.sharing.unwrap_or(existing.sharing);
         let merged_fallback = patch.fallback.map_or(existing.fallback, Fallback::from);
@@ -1513,7 +1504,7 @@ impl Service {
             )?;
         }
 
-        match patch.secret {
+        match &patch.secret {
             PatchField::Absent => {
                 if merged_sharing == existing.sharing
                     && merged_fallback == existing.fallback
@@ -1521,10 +1512,10 @@ impl Service {
                 {
                     // No-op: metadata unchanged, no `value` key — return the
                     // current validator without bumping anything.
-                    return Ok(Validator {
+                    return Ok(Some(Validator {
                         id: existing.id,
                         version: existing.version,
-                    });
+                    }));
                 }
                 let row = self
                     .repo
@@ -1538,22 +1529,20 @@ impl Service {
                     )
                     .await?
                     .ok_or(DomainError::VersionConflict)?;
-                Ok(Validator {
+                Ok(Some(Validator {
                     id: row.id,
                     version: row.version,
-                })
+                }))
             }
             PatchField::Set(new_value) => {
-                typing::validate_value(&resolved.gts_id, &resolved.traits, &new_value)?;
+                typing::validate_value(&resolved.gts_id, &resolved.traits, new_value)?;
                 self.overwrite_existing(
                     ctx,
                     &self.plugins.resolve().await?,
-                    tenant,
                     &scope,
-                    existing.id,
+                    &existing,
                     merged_sharing,
                     merged_fallback,
-                    expected_version,
                     merged_expires_at,
                     new_value,
                 )
@@ -1561,7 +1550,7 @@ impl Service {
             }
             PatchField::Null => {
                 let plugin = self.plugins.resolve().await?;
-                let removed = self
+                let (row, old_version) = self
                     .repo
                     .remove_value(
                         &scope,
@@ -1573,69 +1562,60 @@ impl Service {
                     )
                     .await?
                     .ok_or(DomainError::VersionConflict)?;
-                let (row, old_value_id) = removed;
-                if let Some(old_id) = old_value_id {
-                    self.cleanup_replaced_value(ctx, &plugin, &tenant, old_id)
-                        .await;
-                }
-                Ok(Validator {
+                self.destroy_removed(ctx, &plugin, &row.store_key(), old_version.as_ref())
+                    .await;
+                Ok(Some(Validator {
                     id: row.id,
                     version: row.version,
-                })
+                }))
             }
         }
     }
 
-    /// Evaluate whichever of `write`/`write_secret` the caller's operation
-    /// needs, gated on the caller's own tenant, before any side effect.
-    /// Returns the scope to clamp the subsequent repo write with (the
-    /// `write` scope when evaluated, else `write_secret`'s — both target the
-    /// same tenant, so either is a sound SQL clamp).
-    async fn authorize_write_actions(
+    /// Evaluate every action in `actions` **once each** on `resource` and
+    /// return the intersection of the resulting scopes, after gating each on
+    /// the caller's own tenant. The number of PDP calls is the number of
+    /// actions - never a function of how many credential types exist or which
+    /// ones the tenant holds (ADR-0010).
+    ///
+    /// # Errors
+    ///
+    /// `AccessDenied` when the PDP denies any action or a scope excludes the
+    /// caller's own tenant (a property of the decision, never of the data);
+    /// `ServiceUnavailable` when the PDP cannot be reached.
+    async fn authorize_on(
         &self,
         ctx: &SecurityContext,
-        resolved_gts_id: &str,
         tenant: TenantId,
-        need_write: bool,
-        need_write_secret: bool,
+        resource: &ResourceType,
+        actions: &[&str],
     ) -> Result<AccessScope, DomainError> {
-        let scope = if need_write {
-            let s = self
-                .scope_for_timed(
-                    ctx,
-                    &authz::credential_type_resource(resolved_gts_id),
-                    actions::WRITE,
-                )
-                .await?;
-            if !self.repo.scope_includes_tenant(&s, tenant.0).await? {
+        let mut combined: Option<AccessScope> = None;
+        for action in actions {
+            let scope = self.scope_for_timed(ctx, resource, action).await?;
+            if !self.repo.scope_includes_tenant(&scope, tenant.0).await? {
                 self.metrics.cross_tenant_denied();
                 return Err(DomainError::AccessDenied { cause: None });
             }
-            Some(s)
-        } else {
-            None
-        };
-        let scope = if need_write_secret {
-            let s = self
-                .scope_for_timed(
-                    ctx,
-                    &authz::credential_type_resource(resolved_gts_id),
-                    actions::WRITE_SECRET,
-                )
-                .await?;
-            if !self.repo.scope_includes_tenant(&s, tenant.0).await? {
-                self.metrics.cross_tenant_denied();
-                return Err(DomainError::AccessDenied { cause: None });
-            }
-            scope.or(Some(s))
-        } else {
-            scope
-        };
-        // At least one of need_write/need_write_secret is always true at
-        // every call site (`put` always needs both; `patch` is reached only
-        // when `metadata_present || value_present`, guaranteed by
-        // `CredentialPatch::is_empty` having already been rejected).
-        Ok(scope.unwrap_or_else(AccessScope::deny_all))
+            combined = Some(match combined {
+                None => scope,
+                Some(prev) => authz::intersect_scopes(&prev, &scope),
+            });
+        }
+        Ok(combined.unwrap_or_else(AccessScope::deny_all))
+    }
+
+    /// [`Self::authorize_on`] for the base credential type: the returned
+    /// scope carries the PDP's credential-type predicate, ready to filter
+    /// the row lookup in SQL.
+    async fn authorize_actions(
+        &self,
+        ctx: &SecurityContext,
+        tenant: TenantId,
+        actions: &[&str],
+    ) -> Result<AccessScope, DomainError> {
+        self.authorize_on(ctx, tenant, &authz::CREDENTIAL_RESOURCE, actions)
+            .await
     }
 
     /// Optimistic-concurrency pre-check before any backend write: returns the
@@ -1698,154 +1678,130 @@ impl Service {
         }
     }
 
-    /// Create-path write protocol (ADR-0006 §6.2 steps 2-4, `insert_active`
-    /// variant): mint a fresh `value_id`, record its intent, write the
-    /// backend, then insert the row `active` pointing at it. A create-only
-    /// uniqueness conflict on step 4 aborts the just-written version
-    /// (best-effort) and returns `Conflict`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "carries every field a create needs: identity, sharing, fallback, type, expiry, \
-                  value, scope"
-    )]
+    /// Create-path write protocol (ADR-0006 section 6.2 steps 2-4,
+    /// `insert_active` variant): `plugin.put` the value under the key of a
+    /// freshly minted record id, then insert the row `active` pointing at the
+    /// returned value version, then best-effort `destroy(Below)`. A create-only uniqueness conflict is a
+    /// definite loss: the just-put version is destroyed (best effort, where
+    /// supported) and `Conflict` returned. Any other repo failure is
+    /// ambiguous (the commit may have happened): the version is kept.
     async fn create_new(
         &self,
         ctx: &SecurityContext,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
-        tenant: TenantId,
-        owner: OwnerId,
-        key: &SecretRef,
-        sharing: SharingMode,
-        fallback: Fallback,
-        secret_type_uuid: Uuid,
-        expires_at: Option<OffsetDateTime>,
-        value: SecretValue,
+        plugin: &Arc<dyn CredStorePluginClientV2>,
+        params: NewRecordParams<'_>,
+        value: &SecretValue,
         scope: &AccessScope,
     ) -> Result<Validator, DomainError> {
-        let value_fp = self.stamp_fp(plugin, &value).await?;
-        let new_id = ValueId::new_v4();
-        self.repo.gc_insert_pending(new_id, tenant).await?;
-
-        if let Err(e) = self
-            .plugin_put_timed(plugin, ctx, &tenant, new_id, value)
-            .await
-        {
-            self.abandon_pending(new_id).await;
-            return Err(e);
-        }
-
         let id = Uuid::new_v4();
+        let store_key = StoreKey::new(params.tenant, id);
+        let value_version = self
+            .plugin_put_timed(plugin, ctx, &store_key, value)
+            .await?;
         let new = NewSecret {
             id,
-            tenant_id: tenant,
-            reference: key.clone(),
-            sharing,
-            owner_id: owner,
-            secret_type_uuid,
-            expires_at,
-            value_id: new_id,
-            value_fp,
-            fp_key_id: fence::CURRENT_FENCE_KEY_ID,
-            fallback,
+            tenant_id: params.tenant,
+            reference: params.key.clone(),
+            sharing: params.sharing,
+            owner_id: params.owner,
+            secret_type_uuid: params.secret_type_uuid,
+            expires_at: params.expires_at,
+            value_version: value_version.clone(),
+            fallback: params.fallback,
         };
         match self.repo.insert_active(scope, &new).await {
-            Ok(()) => Ok(Validator { id, version: 1 }),
+            Ok(()) => {
+                self.destroy_below(ctx, plugin, &store_key, &value_version)
+                    .await;
+                Ok(Validator { id, version: 1 })
+            }
             Err(DomainError::Conflict) => {
-                self.abort_new_value(ctx, plugin, &tenant, new_id).await;
+                self.destroy_exactly(ctx, plugin, &store_key, &value_version)
+                    .await;
                 Err(DomainError::Conflict)
             }
-            // Any other failure (e.g. DB unreachable) leaves new_id `pending`
-            // in gc; the maintenance job's pending-reclaim pass resolves it
-            // once it is older than `gc.pending_max_age_secs`.
+            // Ambiguous (PG unavailable or timed out): the row may point at
+            // this version, so it is NOT destroyed.
             Err(e) => Err(e),
         }
     }
 
-    /// Overwrite-path write protocol (ADR-0006 §6.2 steps 2-5, `switch_value`
-    /// variant): mint a fresh `value_id`, record its intent, write the
-    /// backend, then one transaction switches the row's pointer. A lost CAS
-    /// (version mismatch, or the row vanished) aborts the just-written
-    /// version (best-effort) and returns `VersionConflict`; a won CAS
-    /// best-effort cleans up the version it just superseded. Shared by
-    /// `put`'s replace leg and `patch {"secret": …}` (ADR-0004: the
-    /// value-write half of `PATCH` is the same protocol as `PUT`'s) —
-    /// accepts a `declared` row too, switching it back to `active`.
+    /// Overwrite-path write protocol (ADR-0006 section 6.2 steps 2-4,
+    /// `switch_value` variant): `plugin.put` the value under the record's
+    /// key, then one compare-and-set on the row version read in step 1
+    /// switches the pointer. Returns `Ok(None)` on a definite loss (0 rows:
+    /// the row changed or vanished concurrently) after a best-effort
+    /// `destroy(Exactly(own))`; on a win, best-effort `destroy(Below(new))`.
+    /// Any other repo failure is ambiguous: the version is kept and the error
+    /// returned. Shared by `put`'s replace leg and `patch {"secret": ...}`
+    /// (ADR-0004); accepts a `declared` row too, switching it back to
+    /// `active`.
     #[allow(
         clippy::too_many_arguments,
-        reason = "carries every field an overwrite's CAS needs: identity, precondition, sharing, \
+        reason = "carries every field an overwrite's CAS needs: the row read in step 1, sharing, \
                   fallback, expiry, value"
     )]
     async fn overwrite_existing(
         &self,
         ctx: &SecurityContext,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
-        tenant: TenantId,
+        plugin: &Arc<dyn CredStorePluginClientV2>,
         scope: &AccessScope,
-        existing_id: Uuid,
+        existing: &SecretRow,
         sharing: SharingMode,
         fallback: Fallback,
-        expected_version: Option<i64>,
         expires_at: Option<OffsetDateTime>,
-        value: SecretValue,
-    ) -> Result<Validator, DomainError> {
-        let value_fp = self.stamp_fp(plugin, &value).await?;
-        let new_id = ValueId::new_v4();
-        self.repo.gc_insert_pending(new_id, tenant).await?;
+        value: &SecretValue,
+    ) -> Result<Option<Validator>, DomainError> {
+        let store_key = existing.store_key();
+        let value_version = self
+            .plugin_put_timed(plugin, ctx, &store_key, value)
+            .await?;
 
-        if let Err(e) = self
-            .plugin_put_timed(plugin, ctx, &tenant, new_id, value)
-            .await
-        {
-            self.abandon_pending(new_id).await;
-            return Err(e);
-        }
-
+        // The compare-and-set is always on the version read in step 1,
+        // whatever the client precondition: `destroy(Below)` is safe only for
+        // a writer whose base is the row it read before its `put`.
         let switched = self
             .repo
             .switch_value(
                 scope,
-                existing_id,
-                expected_version,
+                existing.id,
+                existing.version,
                 sharing,
                 fallback,
                 expires_at,
-                new_id,
-                value_fp,
-                fence::CURRENT_FENCE_KEY_ID,
+                value_version.clone(),
             )
             .await?;
 
-        let Some((row, old_value_id)) = switched else {
-            // Lost the CAS: version mismatch, or the row vanished
-            // concurrently (delete won). The just-written backend bytes are
-            // unreferenced; abort them best-effort.
-            self.abort_new_value(ctx, plugin, &tenant, new_id).await;
-            return Err(DomainError::VersionConflict);
+        let Some(row) = switched else {
+            // Definite loss: another writer's committed row stands; this
+            // version is unreferenced.
+            self.destroy_exactly(ctx, plugin, &store_key, &value_version)
+                .await;
+            return Ok(None);
         };
 
-        if let Some(old_id) = old_value_id {
-            self.cleanup_replaced_value(ctx, plugin, &tenant, old_id)
-                .await;
-        }
-        Ok(Validator {
+        self.destroy_below(ctx, plugin, &store_key, &value_version)
+            .await;
+        Ok(Some(Validator {
             id: row.id,
             version: row.version,
-        })
+        }))
     }
 
     /// Timed `plugin.put`, mapping the error and recording the dependency
-    /// metric.
+    /// metric. The value is copied for the call (`SecretValue` is not `Clone`
+    /// by design) so a retried write can put it again.
     async fn plugin_put_timed(
         &self,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
+        plugin: &Arc<dyn CredStorePluginClientV2>,
         ctx: &SecurityContext,
-        tenant: &TenantId,
-        value_id: ValueId,
-        value: SecretValue,
-    ) -> Result<(), DomainError> {
+        key: &StoreKey,
+        value: &SecretValue,
+    ) -> Result<ValueVersion, DomainError> {
         let t0 = Instant::now();
         let result = plugin
-            .put(ctx, tenant, &value_id, value)
+            .put(ctx, key, SecretValue::new(value.as_bytes().to_vec()))
             .await
             .map_err(map_plugin_err);
         let secs = t0.elapsed().as_secs_f64();
@@ -1862,25 +1818,25 @@ impl Service {
         result
     }
 
-    /// Timed best-effort `plugin.delete`. `NotFound` counts as success
-    /// (idempotent delete).
-    async fn plugin_delete_timed(
+    /// Best-effort `destroy`, only when the plugin declares support. A
+    /// failure is ignored (counted and logged): older versions stay until the
+    /// next successful write to the record destroys them.
+    async fn destroy_best_effort(
         &self,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
         ctx: &SecurityContext,
-        tenant: &TenantId,
-        value_id: ValueId,
-    ) -> Result<(), DomainError> {
+        plugin: &Arc<dyn CredStorePluginClientV2>,
+        key: &StoreKey,
+        selector: DestroySelector,
+    ) {
+        if !plugin.supports_destroy() {
+            return;
+        }
         let t0 = Instant::now();
-        let result = plugin.delete(ctx, tenant, &value_id).await;
+        let result = plugin.destroy(ctx, key, selector).await;
         let secs = t0.elapsed().as_secs_f64();
-        let result = match result {
-            Ok(()) | Err(CredStoreError::NotFound) => Ok(()),
-            Err(e) => Err(map_plugin_err(e)),
-        };
         self.metrics.dependency(
             Dep::Plugin,
-            DepOp::PluginDelete,
+            DepOp::PluginDestroy,
             if result.is_ok() {
                 Outcome::Success
             } else {
@@ -1888,90 +1844,83 @@ impl Service {
             },
             secs,
         );
-        result
-    }
-
-    /// Step-3-failure cleanup: `plugin.put` reported an error, but its ack
-    /// may have been lost after the bytes were actually persisted — so the
-    /// intent row is marked `Aborted` (best-effort) rather than deleted: the
-    /// job's drain then issues a `plugin.delete` for it (`NotFound` =
-    /// success) and only then drops the row, so a persisted-but-unacked
-    /// write is never left as an untracked orphan.
-    async fn abandon_pending(&self, new_id: ValueId) {
-        if let Err(e) = self.repo.gc_mark(new_id, GcReason::Aborted).await {
-            Self::warn_gc_step_failed(new_id, "abandon_pending", &e);
+        if let Err(e) = result {
+            self.metrics.destroy_failed();
+            // The plugin's error text is not logged: it is not curated for
+            // the credstore boundary.
+            tracing::warn!(
+                record = %key.record_id,
+                unavailable = e.is_unavailable(),
+                "credstore: best-effort destroy failed; the next successful write retries it"
+            );
         }
     }
 
-    /// Log one best-effort gc-cleanup step's failure. Every such failure is
-    /// benign by design — the gc row (or the version it names) simply stays
-    /// for the maintenance job's next run — so this only warns, never
-    /// propagates.
-    fn warn_gc_step_failed(value_id: ValueId, step: &str, err: &DomainError) {
-        tracing::warn!(
-            value_id = %value_id,
-            step,
-            err = %err,
-            "credstore: best-effort gc cleanup step failed; drained later by the maintenance job"
-        );
-    }
-
-    /// CAS-lost cleanup (best-effort): mark the orphaned version `aborted`,
-    /// then try to delete its backend entry and drop the gc row. Any step
-    /// failing leaves the gc entry for the maintenance job's drain.
-    async fn abort_new_value(
+    /// Step 4: after a committed write, destroy every version older than the
+    /// one just committed.
+    async fn destroy_below(
         &self,
         ctx: &SecurityContext,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
-        tenant: &TenantId,
-        new_id: ValueId,
+        plugin: &Arc<dyn CredStorePluginClientV2>,
+        key: &StoreKey,
+        committed: &ValueVersion,
     ) {
-        if let Err(e) = self.repo.gc_mark(new_id, GcReason::Aborted).await {
-            Self::warn_gc_step_failed(new_id, "mark_aborted", &e);
-        }
-        if let Err(e) = self.plugin_delete_timed(plugin, ctx, tenant, new_id).await {
-            Self::warn_gc_step_failed(new_id, "backend_delete", &e);
-            return;
-        }
-        if let Err(e) = self.repo.gc_delete(new_id).await {
-            Self::warn_gc_step_failed(new_id, "gc_delete", &e);
-        }
+        self.destroy_best_effort(ctx, plugin, key, DestroySelector::Below(committed.clone()))
+            .await;
     }
 
-    /// Ordinary-write success cleanup (best-effort, step 5 / delete's third
-    /// step): delete the superseded/removed version's backend entry, then
-    /// drop its gc row. A failure leaves it enqueued for the maintenance
-    /// job's drain — never retried by the caller.
-    async fn cleanup_replaced_value(
+    /// After a definite CAS loss: destroy this writer's own, unreferenced
+    /// version.
+    async fn destroy_exactly(
         &self,
         ctx: &SecurityContext,
-        plugin: &Arc<dyn CredStorePluginClientV1>,
-        tenant: &TenantId,
-        old_id: ValueId,
+        plugin: &Arc<dyn CredStorePluginClientV2>,
+        key: &StoreKey,
+        own: &ValueVersion,
     ) {
-        if let Err(e) = self.plugin_delete_timed(plugin, ctx, tenant, old_id).await {
-            Self::warn_gc_step_failed(old_id, "backend_delete", &e);
-            return;
-        }
-        if let Err(e) = self.repo.gc_delete(old_id).await {
-            Self::warn_gc_step_failed(old_id, "gc_delete", &e);
-        }
+        self.destroy_best_effort(ctx, plugin, key, DestroySelector::Exactly(own.clone()))
+            .await;
     }
 
-    /// Delete an owned secret.
+    /// After a secret removal committed: `destroy(Below(old))` then
+    /// `destroy(Exactly(old))`, never `delete_key` (a concurrent writer may
+    /// already have put a newer version under the same key).
+    async fn destroy_removed(
+        &self,
+        ctx: &SecurityContext,
+        plugin: &Arc<dyn CredStorePluginClientV2>,
+        key: &StoreKey,
+        old: Option<&ValueVersion>,
+    ) {
+        let Some(old) = old else {
+            return;
+        };
+        self.destroy_best_effort(ctx, plugin, key, DestroySelector::Below(old.clone()))
+            .await;
+        self.destroy_best_effort(ctx, plugin, key, DestroySelector::Exactly(old.clone()))
+            .await;
+    }
+
+    /// Delete an owned secret (section 6.3).
     ///
-    /// One database transaction ([`SecretRepo::delete_by_id`]) removes the
-    /// row and enqueues its version for collection; the reference is free to
-    /// reuse the instant that transaction commits (ADR-0006: no name
-    /// retention — a successor mints its own `value_id`, so it can never
-    /// collide with this delete's lagging backend cleanup). That cleanup
-    /// then runs best-effort, exactly like an ordinary write's step 5.
+    /// One database transaction ([`SecretRepo::delete_by_id`]) deletes the row
+    /// and enqueues the purge of its store key in the platform transactional
+    /// outbox; the reference is free to reuse the instant that transaction
+    /// commits (ADR-0006: no name retention - a successor mints its own record
+    /// id and key, so it can never collide with this delete's lagging purge).
+    /// The outbox handler calls `plugin.delete_key` and retries until it
+    /// succeeds. No plugin call happens on this path.
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::NotFound`] if no own-tenant row exists for the key.
+    /// Returns [`DomainError::AccessDenied`] if the caller is permitted `delete`
+    /// on no type — decided before any row is read, so the same whether or not
+    /// the record exists.
+    /// Returns [`DomainError::NotFound`] if no own-tenant row exists for the key
+    /// **or** its type is one the caller may not delete (indistinguishable).
     /// Returns [`DomainError::VersionConflict`] if the current version does not
-    /// satisfy a version-validator `precondition`. The precondition is
+    /// satisfy a version-validator `precondition` (evaluated only after
+    /// authorization, on a row the caller may delete). The precondition is
     /// mandatory: [`WritePrecondition::Exists`] is the explicit
     /// delete-whatever-is-there form (REST `If-Match: *`).
     pub async fn delete(
@@ -1983,278 +1932,64 @@ impl Service {
         let tenant = TenantId(ctx.subject_tenant_id());
         let owner = OwnerId(ctx.subject_id());
 
-        let Some(row) = self
-            .repo
-            .find_own(&AccessScope::allow_all(), tenant, owner, key)
-            .await?
-        else {
+        // Authorize BEFORE any row lookup (anti-enumeration, DESIGN 7.1): ONE
+        // PDP evaluation of `delete` on the base credential type, whatever
+        // the number of types. A caller the PDP refuses is answered 403 here,
+        // whether or not the record exists.
+        let scope = self
+            .authorize_actions(ctx, tenant, &[actions::DELETE])
+            .await?;
+
+        // Then the caller's own row, looked up WITH the PDP scope (tenant and
+        // type predicates in SQL). A missing row and a row of a type the
+        // caller may not delete are the same 404, so a caller without
+        // permission on a record cannot tell whether it exists.
+        let Some(row) = self.repo.find_own(&scope, tenant, owner, key).await? else {
             return Err(DomainError::NotFound);
         };
+        let resolved = self.resolve_stored(row.secret_type_uuid).await?;
 
-        // Optimistic-concurrency pre-check, mirroring the put path: both the
-        // row id (a validator minted for a recreated secret's earlier
-        // generation must never match, no ABA) and the version.
+        // Only now the optimistic-concurrency pre-check, mirroring the put
+        // path: both the row id (a validator minted for a recreated secret's
+        // earlier generation must never match, no ABA) and the version.
         let expected_version = Self::precheck_version(Some(&precondition), &row)?;
 
-        // Single PDP evaluation on the secret's full concrete type, gated on the
-        // caller's tenant. Delete reveals reference existence within the caller's
-        // own tenant — the 404-before-PDP (no row) vs 403-after-PDP (row present,
-        // denied) split is an own-tenant existence signal available to any member
-        // of the tenant. This is an accepted part of the module's threat model;
-        // cross-tenant existence stays hidden by the anti-enumeration 404 on the
-        // read path.
-        let resolved = self.resolve_stored(row.secret_type_uuid).await?;
-        let scope = self
-            .scope_for_timed(
-                ctx,
-                &authz::credential_type_resource(&resolved.gts_id),
-                actions::DELETE,
-            )
-            .await?;
-        if !self.repo.scope_includes_tenant(&scope, tenant.0).await? {
-            self.metrics.cross_tenant_denied();
-            return Err(DomainError::AccessDenied { cause: None });
-        }
-
-        // Fail fast if no plugin is available before the row transaction —
-        // symmetric with put (which resolves the plugin before touching
-        // metadata). A missing plugin here would otherwise commit the row
-        // delete and only then fail the (skippable) best-effort cleanup,
-        // which is harmless; resolving first just keeps the two failure
-        // shapes aligned across put/delete.
-        let plugin = self.plugins.resolve().await?;
-
-        // One transaction: delete the row, enqueue its version (if any) for
-        // collection. 0 rows (version mismatch, or a concurrent delete/write
-        // already moved the row) maps to the existing not-found/conflict
-        // semantics.
-        let old_value_id = match self
+        // One transaction: delete the row, enqueue the key purge. 0 rows
+        // (version mismatch, or a concurrent delete/write already moved the
+        // row) maps to the existing not-found/conflict semantics.
+        let result = match self
             .repo
-            .delete_by_id(&scope, row.id, expected_version)
+            .delete_by_id(&scope, &row.store_key(), expected_version)
             .await
         {
-            Ok(v) => v,
+            Ok(()) => Ok(()),
             Err(DomainError::NotFound) if expected_version.is_some() => {
-                return Err(DomainError::VersionConflict);
+                Err(DomainError::VersionConflict)
             }
-            Err(e) => return Err(e),
+            Err(e) => Err(e),
         };
-
-        if let Some(old_id) = old_value_id {
-            self.cleanup_replaced_value(ctx, &plugin, &tenant, old_id)
-                .await;
-        }
-        Ok(())
+        // Only a record that holds a secret is a secret write.
+        let target = row.value_version.is_some().then(|| AuditTarget {
+            operation: AuditOperation::Delete,
+            secret_type: resolved.gts_id.clone(),
+        });
+        self.audit_write(ctx, key, target, &result).await;
+        result
     }
+}
 
-    /// Run one pass of the periodic maintenance job (`credstore gc`): the
-    /// expired-row sweep and the gc drain/pending-reclaim, both in bounded
-    /// batches until a batch yields no progress. Idempotent — running it
-    /// twice in immediate succession is a no-op the second time. Errors on
-    /// one entry are logged and the loop continues to the next; the run
-    /// always returns its report.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only if listing a batch itself fails (a DB outage);
-    /// per-entry cleanup failures are logged and swallowed.
-    pub async fn run_gc(&self, ctx: &SecurityContext) -> Result<GcReport, DomainError> {
-        let mut report = GcReport::default();
-        self.run_gc_expired_pass(ctx, &mut report).await?;
-        self.run_gc_drain_pass(ctx, &mut report).await?;
-        Ok(report)
-    }
-
-    /// Pass 1: every `active` row past its `expires_at`, in bounded batches
-    /// until a batch is empty.
-    async fn run_gc_expired_pass(
-        &self,
-        ctx: &SecurityContext,
-        report: &mut GcReport,
-    ) -> Result<(), DomainError> {
-        loop {
-            let batch = self.repo.list_expired(self.gc.batch_size).await?;
-            if batch.is_empty() {
-                break;
-            }
-            let mut progressed = false;
-            for row in &batch {
-                match self.repo.delete_expired_row(row.id).await {
-                    Ok(Some(old_id)) => {
-                        if let Some(plugin) = self.gc_plugin(ctx).await {
-                            self.cleanup_replaced_value(ctx, &plugin, &row.tenant_id, old_id)
-                                .await;
-                        }
-                        report.expired_deleted += 1;
-                        progressed = true;
-                    }
-                    Ok(None) => {
-                        // Already gone (a client delete raced the job), or
-                        // was already declared with no value: nothing to
-                        // reconcile, but the row itself is accounted for.
-                        report.expired_deleted += 1;
-                        progressed = true;
-                    }
-                    Err(e) => {
-                        tracing::warn!(id = %row.id, err = %e, "credstore gc: delete_expired_row failed");
-                    }
-                }
-            }
-            if !progressed {
-                // Every row in this batch failed to delete (e.g. a
-                // persistent DB issue) — stop rather than refetch and spin
-                // on the same unchanged batch forever.
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    /// Pass 2: the gc drain (`reason != pending`) and the pending-reclaim
-    /// pass (`reason = pending` older than `pending_max_age_secs`), in
-    /// bounded batches until a batch yields no progress (nothing left to
-    /// drain and nothing eligible to reclaim).
-    async fn run_gc_drain_pass(
-        &self,
-        ctx: &SecurityContext,
-        report: &mut GcReport,
-    ) -> Result<(), DomainError> {
-        let cutoff = OffsetDateTime::now_utc()
-            - time::Duration::seconds(
-                i64::try_from(self.gc.pending_max_age_secs).unwrap_or(i64::MAX),
-            );
-        loop {
-            let batch = self.repo.gc_list(self.gc.batch_size).await?;
-            if batch.is_empty() {
-                break;
-            }
-            let mut progressed = false;
-            for entry in &batch {
-                let entry_progressed = match entry.reason {
-                    GcReason::Pending => {
-                        self.drain_pending_entry(
-                            ctx,
-                            entry,
-                            cutoff,
-                            &mut report.gc_pending_reclaimed,
-                        )
-                        .await?
-                    }
-                    GcReason::Superseded | GcReason::Removed | GcReason::Aborted => {
-                        self.drain_terminal_entry(
-                            ctx,
-                            &entry.tenant_id,
-                            entry.value_id,
-                            &mut report.gc_deleted,
-                        )
-                        .await?
-                    }
-                };
-                progressed |= entry_progressed;
-            }
-            if !progressed {
-                // Nothing in this batch could be advanced (e.g. every entry
-                // is young pending noise) — stop rather than spin forever on
-                // the same unchanged batch.
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    /// One `pending` gc entry: skip if too young, drop-without-touching-the-
-    /// backend if a live row still references it (the defensive branch), else
-    /// reclaim it — **claim first, then best-effort delete** (the opposite
-    /// order from [`Self::drain_terminal_entry`]): `gc_delete` runs before
-    /// `plugin.delete` so that if two runners race this same entry, the
-    /// loser's `gc_delete` reports `false` and it backs off rather than
-    /// double-counting or racing the backend call. A crash between the claim
-    /// and the backend delete leaves an untracked orphan — accepted, since
-    /// garbage is not the correctness property this ordering protects; a
-    /// live row can never be affected either way, because
-    /// `is_value_referenced` already gated this branch. Returns whether this
-    /// call advanced the batch.
-    async fn drain_pending_entry(
-        &self,
-        ctx: &SecurityContext,
-        entry: &GcEntry,
-        cutoff: OffsetDateTime,
-        counter: &mut u64,
-    ) -> Result<bool, DomainError> {
-        if entry.enqueued_at > cutoff {
-            // Too young: by protocol a committed pointer never leaves its
-            // intent behind, so a young pending entry is normal in-flight-
-            // write noise, not yet reclaimable.
-            return Ok(false);
-        }
-        if self.repo.is_value_referenced(entry.value_id).await? {
-            // Defensive branch (should be unreachable by protocol): a live
-            // reference to a still-pending id. Never touch the backend; just
-            // drop the stale intent row.
-            return self.repo.gc_delete(entry.value_id).await;
-        }
-        if !self.repo.gc_delete(entry.value_id).await? {
-            // Already claimed by another runner (or resolved by the
-            // writer's own step-5 cleanup) between our read and this call.
-            return Ok(false);
-        }
-        if let Some(plugin) = self.gc_plugin(ctx).await
-            && let Err(e) = self
-                .plugin_delete_timed(&plugin, ctx, &entry.tenant_id, entry.value_id)
-                .await
-        {
-            Self::warn_gc_step_failed(entry.value_id, "gc_pending_reclaim_delete", &e);
-        }
-        *counter += 1;
-        Ok(true)
-    }
-
-    /// One already-decided gc entry (`superseded`/`removed`/`aborted`, or a
-    /// `pending` entry that cleared the pending-only checks): best-effort
-    /// backend delete, then drop the gc row and count it on success. Returns
-    /// whether this call advanced the batch.
-    async fn drain_terminal_entry(
-        &self,
-        ctx: &SecurityContext,
-        tenant: &TenantId,
-        value_id: ValueId,
-        counter: &mut u64,
-    ) -> Result<bool, DomainError> {
-        let Some(plugin) = self.gc_plugin(ctx).await else {
-            return Ok(false);
-        };
-        match self
-            .plugin_delete_timed(&plugin, ctx, tenant, value_id)
-            .await
-        {
-            Ok(()) => {
-                if self.repo.gc_delete(value_id).await? {
-                    *counter += 1;
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            }
-            Err(e) => {
-                Self::warn_gc_step_failed(value_id, "gc_drain_delete", &e);
-                Ok(false)
-            }
-        }
-    }
-
-    /// Resolve the plugin for the maintenance job, logging (once per pass
-    /// iteration) and returning `None` if none is available — the job must
-    /// survive a transient/misconfigured backend and simply make no backend
-    /// progress this round.
-    async fn gc_plugin(&self, _ctx: &SecurityContext) -> Option<Arc<dyn CredStorePluginClientV1>> {
-        match self.plugins.resolve().await {
-            Ok(p) => Some(p),
-            Err(e) => {
-                tracing::warn!(err = %e, "credstore gc: no plugin available this pass");
-                None
-            }
-        }
-    }
+/// The fields of a new record that a create carries besides the value and
+/// the scope.
+#[domain_model]
+#[derive(Clone, Copy)]
+struct NewRecordParams<'a> {
+    tenant: TenantId,
+    owner: OwnerId,
+    key: &'a SecretRef,
+    sharing: SharingMode,
+    fallback: Fallback,
+    secret_type_uuid: Uuid,
+    expires_at: Option<OffsetDateTime>,
 }
 
 /// The collection read (`Service::list`, ADR-0005/ADR-0004) — a child module
@@ -2268,3 +2003,7 @@ mod list;
 #[cfg(test)]
 #[path = "service_tests.rs"]
 mod service_tests;
+
+#[cfg(test)]
+#[path = "audit_tests.rs"]
+mod audit_tests;

@@ -460,8 +460,16 @@ impl KeycloakAdminClientFactory {
                 .cs_reader
                 .get(r)
                 .await
-                .map_err(|e| PluginError::CredStoreRead {
-                    detail: e.to_string(),
+                .map_err(|e| match e {
+                    // The record exists but its secret has expired: the
+                    // client secret is not usable, so the token fetch fails
+                    // like an unreadable one (no fallback to anything else).
+                    credstore_sdk::CredStoreError::SecretExpired => PluginError::CredStoreRead {
+                        detail: format!("ref {} has an expired secret", r.as_ref()),
+                    },
+                    other => PluginError::CredStoreRead {
+                        detail: other.to_string(),
+                    },
                 })?
                 .ok_or_else(|| PluginError::CredStoreRead {
                     detail: format!("ref {} not found", r.as_ref()),

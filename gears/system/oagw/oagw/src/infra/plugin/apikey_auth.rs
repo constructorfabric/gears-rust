@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use credstore_sdk::{CredStoreClientV1, SecretRef};
+use credstore_sdk::{CredStoreClientV1, CredStoreError, SecretRef};
 use serde::Deserialize;
 
 use crate::domain::plugin::{AuthContext, AuthPlugin, PluginError};
@@ -46,12 +46,20 @@ impl AuthPlugin for ApiKeyAuthPlugin {
         let key = SecretRef::new(raw_ref)
             .map_err(|e| PluginError::Internal(format!("invalid secret ref '{raw_ref}': {e}")))?;
 
-        let response = self
-            .credstore
-            .get_secret(&ctx.security_context, &key)
-            .await
-            .map_err(|e| PluginError::Internal(format!("credstore error: {e}")))?
-            .ok_or_else(|| PluginError::SecretNotFound(config.secret_ref.clone()))?;
+        let response = match self.credstore.get_secret(&ctx.security_context, &key).await {
+            Ok(Some(response)) => response,
+            Ok(None) => return Err(PluginError::SecretNotFound(config.secret_ref.clone())),
+            // The record exists but its secret has expired: not usable, so
+            // the request fails closed exactly like a missing secret (never
+            // a fallback to another credential).
+            Err(CredStoreError::SecretExpired) => {
+                return Err(PluginError::SecretNotFound(format!(
+                    "{} (secret expired)",
+                    config.secret_ref
+                )));
+            }
+            Err(e) => return Err(PluginError::Internal(format!("credstore error: {e}"))),
+        };
 
         let secret_str = std::str::from_utf8(response.secret.as_bytes())
             .map_err(|_| PluginError::Internal("secret value is not valid UTF-8".into()))?
@@ -158,6 +166,21 @@ mod tests {
         let mut ctx = make_auth_ctx(make_config("x-api-key", "", "plain-key"));
         plugin.authenticate(&mut ctx).await.unwrap();
         assert_eq!(ctx.headers.get("x-api-key").unwrap(), "plain-value");
+    }
+
+    #[tokio::test]
+    async fn expired_secret_fails_closed_like_a_missing_one() {
+        let credstore = Arc::new(MockCredStoreClient::with_expired_secret());
+        let plugin = ApiKeyAuthPlugin::new(credstore);
+
+        let mut ctx = make_auth_ctx(make_config("authorization", "Bearer ", "cred://old"));
+
+        let err = plugin.authenticate(&mut ctx).await.unwrap_err();
+        assert!(
+            matches!(err, PluginError::SecretNotFound(ref s) if s.contains("cred://old") && s.contains("expired")),
+            "{err:?}"
+        );
+        assert!(ctx.headers.is_empty(), "no credential header was injected");
     }
 
     #[tokio::test]

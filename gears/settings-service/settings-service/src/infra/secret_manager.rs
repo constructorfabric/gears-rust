@@ -13,7 +13,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, SecretRef, SecretValue, SharingMode, WritePrecondition,
+    CredStoreClientV1, CredStoreError, CredentialWrite, Fallback, PutPrecondition, SecretRef,
+    SecretType, SecretValue, SharingMode, WritePrecondition,
 };
 use secrecy::SecretString;
 use serde_json::Value;
@@ -186,13 +187,15 @@ impl SecretManager for CredStoreSecretManager {
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-5
         // Create-only under the caller's fresh reference: nothing this write
         // does can touch the entry the row currently holds.
+        let write = CredentialWrite {
+            secret_type: Some(SecretType::generic().into()),
+            sharing: SharingMode::Private,
+            fallback: Fallback::Inherit,
+            expires_at: None,
+            secret: Some(SecretValue::new(bytes_of(plaintext))),
+        };
         self.client
-            .create(
-                &ctx,
-                &secret_ref,
-                SecretValue::new(bytes_of(plaintext)),
-                SharingMode::Private,
-            )
+            .put(&ctx, &secret_ref, write, PutPrecondition::CreateOnly)
             .await
             .map_err(|err| unavailable("store the secret", &err))?;
         Ok(())
@@ -208,9 +211,20 @@ impl SecretManager for CredStoreSecretManager {
     ) -> Result<SecretString, DomainError> {
         let reference = Self::parse_ref(secret_ref)?;
         let ctx = self.context(tenant)?;
-        let found = match self.client.get(&ctx, &reference).await {
+        let found = match self.client.get_secret(&ctx, &reference).await {
             Ok(found) => found,
             Err(CredStoreError::NotFound) => None,
+            // The record exists but its secret has expired: the plaintext is
+            // not usable. Settings secrets are written without an expiry, so
+            // this is not expected; it resolves like an absent value (the
+            // entry cannot be revealed), never to a stale or other value.
+            Err(CredStoreError::SecretExpired) => {
+                tracing::warn!(
+                    operation = "resolve the secret",
+                    "credential store reports the stored secret as expired"
+                );
+                None
+            }
             Err(err) => return Err(unavailable("resolve the secret", &err)),
         };
         let Some(entry) = found else {
@@ -221,7 +235,7 @@ impl SecretManager for CredStoreSecretManager {
         // From the store's wrapper straight into ours: the exact-length copy
         // becomes the boxed str without a second allocation, and the store's
         // value zeroes itself when it drops at the end of this scope.
-        String::from_utf8(entry.value.as_bytes().to_vec())
+        String::from_utf8(entry.secret.as_bytes().to_vec())
             .map(SecretString::from)
             .map_err(|_| DomainError::Internal {
                 diagnostic: "the stored secret is not UTF-8 text".to_owned(),

@@ -1,31 +1,30 @@
 # Static `CredStore` Plugin
 
 `CredStore` **value-store** backend for development and testing: an in-memory
-store of immutable secret versions. Implements the `CredStorePluginClientV1`
-contract (`get`/`put`/`delete`) so the stateful `credstore` gear can use it as
-a backend without a full secrets vault.
+versioned store. Implements the `CredStorePluginClientV2` contract
+(`put`/`get`/`delete_key` plus the optional `destroy`) so the stateful
+`credstore` gear can use it as a backend without a full secrets vault.
 
 ## Overview
 
 The `cf-gears-static-credstore-plugin` module provides:
 
-- **A dumb per-tenant key-value store** — entries are keyed by
-  `(tenant_id, value_id)`. The plugin knows nothing about references, owners,
-  sharing or hierarchy; all of that lives in the gear's metadata row, which
-  names the current version through its `value_id` (ADR-0006).
-- **Immutable entries** — a `put` on an id that already exists fails with
-  `Conflict`; the gear never issues one, and the fence-key bootstrap relies on
-  the refusal to settle a race between replicas. `delete` of a missing id is
-  a success (idempotent).
-- **Writable at runtime** — the gear's write protocol (`put` a fresh version,
-  switch the row, `delete` the superseded one) mutates the in-memory store, so
-  it works as a development backend, not just a fixture.
-- **No config seeding** — values enter the store only through the credstore
-  API (`PUT /credstore/v1/credentials/{ref}`), which mints the `value_id` and
-  writes the metadata row that makes the value reachable. A `secrets:` block
-  in this plugin's config is rejected at startup.
+- **A dumb per-tenant versioned key-value store** - entries are keyed by
+  `StoreKey { tenant_id, record_id }`; under each key every `put` creates a
+  new immutable version. The plugin knows nothing about references, owners,
+  sharing or hierarchy; the gear's metadata row names the current version
+  through its `value_version` (ADR-0006).
+- **Ordered versions** - a per-key monotonic counter: the n-th `put` under a
+  key returns `"n"` (destroyed numbers are never reissued).
+- **`destroy` supported** - `supports_destroy` is `true`; `Below(v)` removes
+  every version older than `v`, `Exactly(v)` removes that one. `destroy` and
+  `delete_key` of anything not held are successes (idempotent).
+- **Writable at runtime** - the gear's write protocol mutates the in-memory
+  store, so it works as a development backend, not just a fixture.
+- **No config seeding** - values enter the store only through the credstore
+  API. A `secrets:` block in this plugin's config is rejected at startup.
 
-The plugin registers itself via the types registry as a `CredStorePluginClientV1`
+The plugin registers itself via the types registry as a `CredStorePluginClientV2`
 implementation and is discovered by the `credstore` gear module.
 
 ## Rust usage
@@ -54,16 +53,13 @@ validation (`deny_unknown_fields`).
 
 ## Contract
 
-The gear calls the plugin with a tenant and an opaque version id:
-
 | Method | Behaviour |
 |---|---|
-| `get(ctx, tenant_id, value_id)` | Returns the bytes stored under `(tenant_id, value_id)`, or `None`. |
-| `put(ctx, tenant_id, value_id, value)` | Stores a new immutable entry; `Conflict` if the id already exists. |
-| `delete(ctx, tenant_id, value_id)` | Removes the entry; a missing id is `Ok(())`. |
-
-The reserved fence-key entry lives under the nil tenant and the SDK constant
-`FENCE_KEY_VALUE_ID`; no metadata row ever points at it.
+| `put(ctx, key, value)` | Stores a new immutable version under `key`; returns its version (`"1"`, `"2"`, ...). |
+| `get(ctx, key, version)` | Returns the bytes of that version, or `None`. |
+| `delete_key(ctx, key)` | Removes the key with all versions; a missing key is `Ok(())`. |
+| `supports_destroy()` | `true`. |
+| `destroy(ctx, key, selector)` | `Below(v)` / `Exactly(v)`; idempotent. |
 
 ## Architecture
 
@@ -71,8 +67,8 @@ The reserved fence-key entry lives under the nil tenant and the SDK constant
 gear.rs            ToolKit gear — initialization and GTS/ClientHub registration
 config.rs          Config model (vendor, priority)
 domain/
-  service.rs       In-memory (tenant_id, value_id) → bytes store
-  client.rs        CredStorePluginClientV1 adapter
+  service.rs       In-memory (tenant_id, record_id) → versions store
+  client.rs        CredStorePluginClientV2 adapter
   mod.rs           Domain exports
 ```
 
@@ -81,7 +77,7 @@ domain/
 1. Load `StaticCredStorePluginConfig` from module config
 2. Register GTS plugin instance in types-registry
 3. Store `Arc<Service>` in module state
-4. Register `CredStorePluginClientV1` scoped client in `ClientHub`
+4. Register `CredStorePluginClientV2` scoped client in `ClientHub`
 
 ## Testing
 
@@ -91,10 +87,10 @@ cargo test -p cf-gears-static-credstore-plugin
 
 The test suite covers:
 
-- `get`/`put`/`delete` round-trips and tenant isolation
-- Immutability (`put` on an existing id is `Conflict`) and idempotent `delete`
+- `put`/`get`/`delete_key` round-trips, per-key version counters and tenant isolation
+- `destroy` (`Below`/`Exactly`) and idempotent `delete_key`/`destroy`
 - Config validation (unknown keys, including a legacy `secrets:` block, are rejected)
-- The `CredStorePluginClientV1` trait impl
+- The `CredStorePluginClientV2` trait impl
 
 ## License
 

@@ -2,11 +2,10 @@
 //! immutable value versions).
 //!
 //! Models the two resting statuses (`active`/`declared`), the fallback
-//! policy, the version pointer, optimistic preconditions, and the
-//! garbage-collection intent/work-queue entries, all persisted separately
-//! from secret values.
+//! policy, the value-version pointer and optimistic preconditions, all
+//! persisted separately from secret values.
 
-use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId, ValueId};
+use credstore_sdk::{OwnerId, SecretRef, SharingMode, StoreKey, TenantId, ValueVersion};
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
@@ -23,9 +22,9 @@ use uuid::Uuid;
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretStatus {
-    /// The row resolves and points at a value (`value_id IS NOT NULL`).
+    /// The row resolves and points at a value (`value_version IS NOT NULL`).
     Active,
-    /// The row holds its reference but carries no value (`value_id IS
+    /// The row holds its reference but carries no value (`value_version IS
     /// NULL`), reached only via a value-removal write (`PATCH {"secret":
     /// null}`, or a `PATCH` that suppresses an active row in the same
     /// transaction). A resolution candidate only when its `fallback` is
@@ -110,6 +109,8 @@ impl From<Fallback> for credstore_sdk::Fallback {
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct SecretRow {
+    /// Record identity, minted at create and never reused; also the record
+    /// part of the store key.
     pub id: Uuid,
     pub tenant_id: TenantId,
     pub reference: String,
@@ -127,24 +128,30 @@ pub struct SecretRow {
     /// representation); immutable for the row's lifetime. Resolved to the
     /// type id + traits via the types-registry per operation.
     pub secret_type_uuid: Uuid,
-    /// Expiry instant for expirable types; expired rows do not resolve.
+    /// Expiry instant for expirable types. Expiry applies to the secret, not
+    /// to the record: an expired `active` row still resolves (it is the
+    /// decisive record) but its secret is never served.
     pub expires_at: Option<OffsetDateTime>,
-    /// Pointer to this row's current backend version. `None` iff `status =
-    /// Declared` (`ck_credstore_fp_with_value`): a row points at a version or
-    /// at nothing, never at a value with no fingerprint.
-    pub value_id: Option<ValueId>,
-    /// Value-fingerprint fence (`HMAC-SHA256(fence_key, value)`) of the
-    /// backend value `value_id` names. `Some` iff `value_id` is — a
-    /// fingerprint exists for every value and a value-less row has none;
-    /// out-of-band seeding (a value with no fingerprint) is withdrawn by
-    /// ADR-0006. Internal-only: never serialized to any API response or log.
-    pub value_fp: Option<Vec<u8>>,
-    /// Fence-key id `value_fp` was computed under; `Some` iff `value_fp` is.
-    pub fp_key_id: Option<i16>,
+    /// The value version the provider returned from `put` for the secret
+    /// this row serves (the pointer into the store). `None` iff `status =
+    /// Declared` (`credstore_secrets_value_version_check`). Opaque: never
+    /// parsed or compared by the gear, and distinct from [`Self::version`],
+    /// the row's optimistic-concurrency counter.
+    pub value_version: Option<ValueVersion>,
     /// Suppression policy of this row (ADR-0004): consulted only while the
     /// row is `Declared` — an `Active` row's own value always wins,
     /// `fallback` stays stored but not consulted.
     pub fallback: Fallback,
+}
+
+impl SecretRow {
+    /// `true` iff this is an `active` row whose `expires_at` has passed at
+    /// `now`. A `declared` row never expires (a suppression policy does not).
+    /// Derived at read time; never stored.
+    #[must_use]
+    pub fn is_expired(&self, now: OffsetDateTime) -> bool {
+        self.status == SecretStatus::Active && self.expires_at.is_some_and(|at| at <= now)
+    }
 }
 
 /// Optimistic-concurrency precondition for `patch`/`delete`, parsed from
@@ -199,7 +206,7 @@ pub enum PutPrecondition {
 }
 
 /// A new active row: a create always inserts `active`, pointing at the
-/// version its `plugin.put` already wrote.
+/// value version its `plugin.put` already returned.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct NewSecret {
@@ -211,12 +218,8 @@ pub struct NewSecret {
     /// Deterministic v5 UUID of the (registry-validated) GTS type id.
     pub secret_type_uuid: Uuid,
     pub expires_at: Option<OffsetDateTime>,
-    /// The fresh backend version this create's value was written to.
-    pub value_id: ValueId,
-    /// Fence fingerprint of the value this create wrote to the backend.
-    pub value_fp: Vec<u8>,
-    /// Fence-key id `value_fp` was computed under.
-    pub fp_key_id: i16,
+    /// The value version `plugin.put` returned for this create's value.
+    pub value_version: ValueVersion,
     /// Suppression policy carried into the row at create time (ADR-0004);
     /// `PUT`'s default is [`Fallback::Inherit`] when the body omits it.
     pub fallback: Fallback,
@@ -224,8 +227,7 @@ pub struct NewSecret {
 
 /// A new declared row (ADR-0004 Amendment B, "The value-less record: reached
 /// only on purpose"): a create whose `value` is an explicit `null` inserts
-/// the row `declared` directly — no `value_id`, no fingerprint, no gc entry,
-/// no backend call. Distinct from [`NewSecret`], which always carries a
+/// the row `declared` directly — no `value_version`, no backend call. Distinct from [`NewSecret`], which always carries a
 /// written value.
 #[domain_model]
 #[derive(Debug, Clone)]
@@ -242,64 +244,17 @@ pub struct NewDeclaredSecret {
     pub fallback: Fallback,
 }
 
-/// Why a `credstore_value_gc` entry was enqueued (`reason` column,
-/// `CHECK (reason IN (1, 2, 3, 4))`).
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GcReason {
-    /// A write's intent, recorded before the backend call — the durable
-    /// trace that lets the maintenance job reconcile a crash the plugin
-    /// cannot be asked to list its way out of.
-    Pending,
-    /// Replaced by a newer version at the same row (an ordinary overwrite).
-    Superseded,
-    /// The record (or its value) was removed — `DELETE` or a value-removal
-    /// write.
-    Removed,
-    /// The write that produced this version lost its CAS; the version was
-    /// written but no row ever points at it.
-    Aborted,
-}
-impl GcReason {
+impl SecretRow {
+    /// The store key of this record: `(tenant_id, id)`.
     #[must_use]
-    pub fn as_smallint(self) -> i16 {
-        match self {
-            Self::Pending => 1,
-            Self::Superseded => 2,
-            Self::Removed => 3,
-            Self::Aborted => 4,
-        }
+    pub fn store_key(&self) -> StoreKey {
+        StoreKey::new(self.tenant_id, self.id)
     }
-
-    /// Decode a stored reason code; out-of-domain values are storage
-    /// corruption, mapped by the caller onto `DomainError::Internal`.
-    #[must_use]
-    pub fn from_smallint(v: i16) -> Option<Self> {
-        match v {
-            1 => Some(Self::Pending),
-            2 => Some(Self::Superseded),
-            3 => Some(Self::Removed),
-            4 => Some(Self::Aborted),
-            _ => None,
-        }
-    }
-}
-
-/// One `credstore_value_gc` row: a version the maintenance job's gc drain (or
-/// pending-reclaim pass) must eventually resolve — reconcile a crashed write,
-/// or delete a backend entry nothing points to any more.
-#[domain_model]
-#[derive(Debug, Clone)]
-pub struct GcEntry {
-    pub value_id: ValueId,
-    pub tenant_id: TenantId,
-    pub reason: GcReason,
-    pub enqueued_at: OffsetDateTime,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Fallback, GcReason, SecretStatus};
+    use super::{Fallback, SecretStatus};
 
     #[test]
     fn secret_status_smallint_round_trips() {
@@ -334,27 +289,5 @@ mod tests {
     fn fallback_from_smallint_rejects_out_of_domain() {
         assert_eq!(Fallback::from_smallint(0), None);
         assert_eq!(Fallback::from_smallint(3), None);
-    }
-
-    #[test]
-    fn gc_reason_smallint_round_trips() {
-        for r in [
-            GcReason::Pending,
-            GcReason::Superseded,
-            GcReason::Removed,
-            GcReason::Aborted,
-        ] {
-            assert_eq!(GcReason::from_smallint(r.as_smallint()), Some(r));
-        }
-        assert_eq!(GcReason::Pending.as_smallint(), 1);
-        assert_eq!(GcReason::Superseded.as_smallint(), 2);
-        assert_eq!(GcReason::Removed.as_smallint(), 3);
-        assert_eq!(GcReason::Aborted.as_smallint(), 4);
-    }
-
-    #[test]
-    fn gc_reason_from_smallint_rejects_out_of_domain() {
-        assert_eq!(GcReason::from_smallint(0), None);
-        assert_eq!(GcReason::from_smallint(5), None);
     }
 }

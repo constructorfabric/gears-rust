@@ -28,11 +28,12 @@ use toolkit_gts::{gts_id, gts_type_schema};
 /// single source of truth for this string. Mirrored by [`CredentialV1`]'s
 /// `type_id` and the `#[resource_error(...)]` marker in
 /// `infra::sdk_error_mapping` (a unit test there pins that marker to this
-/// constant). Enforcement authorizes against the credential's full
-/// *concrete* type, not this base: the impl crate's
-/// `domain::authz::credential_type_resource(gts_id)` builds the per-operation
-/// PEP `ResourceType` from the type resolved out of the types-registry, and
-/// the resolver checks a type descends from this base id.
+/// constant). Every operation on an existing credential authorizes against
+/// this base type and receives the credential type back as a PDP constraint;
+/// a create authorizes the requested *concrete* type, which the impl crate's
+/// `domain::authz::credential_type_resource(gts_id)` builds from the type
+/// resolved out of the types-registry (the resolver checks a type descends
+/// from this base id).
 pub const CREDENTIAL_RESOURCE_TYPE: &str = gts_id!("cf.core.credstore.credential.v1~");
 
 #[derive(Default)]
@@ -47,11 +48,11 @@ pub struct CredStorePluginSpecV1;
 
 /// GTS type-schema for the credstore **credential** resource.
 ///
-/// This is the base of the PEP `ResourceType`s credstore enforces on: every
-/// operation authorizes against the credential's full concrete type via the
-/// impl crate's `domain::authz::credential_type_resource(gts_id)`, where
-/// `gts_id` is resolved from the types-registry and checked to descend from
-/// this base.
+/// This is the base of the PEP `ResourceType`s credstore enforces on: an
+/// operation on an existing credential authorizes against this base type, and
+/// a create against the requested concrete type via the impl crate's
+/// `domain::authz::credential_type_resource(gts_id)`, where `gts_id` is
+/// resolved from the types-registry and checked to descend from this base.
 /// Registering it (and its derived types) with the types-registry is what
 /// makes the resource types authorizable: the RBAC role-definitions API
 /// validates `target_type` against the registry, and the authz-resolver PDP

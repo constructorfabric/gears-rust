@@ -85,7 +85,9 @@ pub fn register_routes(
              when `secret` is named, both when both. Supersedes the withdrawn \
              `GET .../secret`: `GET .../{ref}?$select=reference,type,expires_at,secret` is its \
              equivalent, and a secret-only projection resolving to a value-less winner is the \
-             same canonical 404 that address gave.",
+             same canonical 404 that address gave. Selecting `secret` of a record whose expiry \
+             has passed fails 409 `SECRET_EXPIRED` (only for a caller who may read the secret); \
+             without `secret` the record is returned with `status` `expired`.",
         )
         .tag(TAG)
         .authenticated()
@@ -105,6 +107,7 @@ pub fn register_routes(
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
+        .error_409(openapi)
         .error_500(openapi)
         .error_503(openapi)
         .register(router, openapi);

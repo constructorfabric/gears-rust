@@ -1,6 +1,6 @@
 //! `DomainError` → [`CanonicalError`] boundary mapping for the credstore REST layer.
 
-use toolkit_canonical_errors::{CanonicalError, resource_error};
+use toolkit_canonical_errors::{CanonicalError, Http, resource_error};
 
 use crate::domain::error::DomainError;
 use crate::domain::secret::typing::reasons;
@@ -24,6 +24,20 @@ impl From<DomainError> for CanonicalError {
                 .create(),
             DomainError::NotFound => CredentialResource::not_found("credential not found")
                 .with_resource("credential")
+                .create(),
+            // The record is there and the caller may read its secret, but the
+            // secret has expired: a state precondition (renew the record),
+            // canonical `FailedPrecondition`. That category defaults to 400;
+            // the platform's explicit HTTP status override pins this
+            // occurrence to 409 Conflict — the same status a create over the
+            // very record answers — without changing the canonical category.
+            DomainError::SecretExpired => CredentialResource::failed_precondition()
+                .with_precondition_violation(
+                    "secret",
+                    "the credential's secret has expired; renew the credential",
+                    "SECRET_EXPIRED",
+                )
+                .with_override(Http::status_code(409))
                 .create(),
             DomainError::Conflict => {
                 CredentialResource::already_exists("credential already exists")
@@ -117,6 +131,7 @@ mod tests {
     fn every_variant_maps_to_a_client_or_server_error() {
         assert_eq!(status_of(DomainError::NotFound), 404);
         assert_eq!(status_of(DomainError::Conflict), 409);
+        assert_eq!(status_of(DomainError::SecretExpired), 409);
         assert_eq!(
             status_of(DomainError::InvalidSecretRef {
                 detail: "bad".to_owned()
@@ -148,6 +163,18 @@ mod tests {
             }),
             400
         );
+    }
+
+    #[test]
+    fn secret_expired_is_failed_precondition_with_status_409_and_reason() {
+        let err = CanonicalError::from(DomainError::SecretExpired);
+        assert!(matches!(err, CanonicalError::FailedPrecondition { .. }));
+        assert_eq!(err.status_code(), 409);
+        assert_eq!(err.http_status_override(), Some(409));
+        let problem = toolkit_canonical_errors::Problem::from(err);
+        let body = serde_json::to_string(&problem).expect("serialize");
+        assert!(body.contains("SECRET_EXPIRED"), "{body}");
+        assert!(body.contains("failed_precondition"), "{body}");
     }
 
     #[test]

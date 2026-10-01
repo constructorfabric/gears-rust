@@ -11,17 +11,16 @@
 //! semantics, a concrete type id covers everything derived from it, so one
 //! permission per action spans every built-in and customer credential type
 //! (`generic`, `api_key`, …, and any custom plugin-defined type). The PEP
-//! still evaluates each request against the concrete resolved type
-//! ([`crate::domain::authz::credential_type_resource`]), so type-scoped roles
-//! remain possible; this catalog only names the actions a role can be granted.
+//! evaluates an operation on an existing credential on this base type and
+//! the PDP returns the covered credential types as a constraint
+//! ([`crate::domain::authz::CREDENTIAL_RESOURCE`]); a create evaluates the
+//! requested concrete type ([`crate::domain::authz::credential_type_resource`]),
+//! so type-scoped roles remain possible; this catalog only names the actions
+//! a role can be granted.
 //!
 //! `action` values come from `crate::domain::authz::actions` — the same
 //! constants [`crate::domain::secret::service::Service`] passes to the PEP —
 //! so the catalog cannot drift from what the REST surface actually enforces.
-//!
-//! No permission is declared for `run_gc`: that is an in-process call made
-//! through the SDK trait from a system security context, not an operation
-//! roles are granted.
 //!
 //! Instance id layout:
 //! `gts.cf.toolkit.authz.permission.v1~cf.core.credstore.<name>.v1`.

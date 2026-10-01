@@ -1,149 +1,70 @@
-//! Write-path repo methods (ADR-0006): garbage-collection bookkeeping,
-//! `insert_active`, `switch_value`, `delete_by_id`, `list_expired` support,
-//! `delete_expired_row`.
+//! Write-path repo methods (ADR-0006): `insert_active`, `insert_declared`,
+//! `switch_value`, `update_metadata`, `remove_value`, `delete_by_id`.
 //!
-//! Every method that touches more than one row/table runs inside ONE
-//! [`toolkit_db::DBProvider::transaction`] call — see the module docs on
+//! Every pointer switch is one compare-and-set on the row `version`; a delete
+//! runs inside ONE
+//! [`toolkit_db::DBProvider::transaction`] together with the outbox enqueue of
+//! the key purge - see the module docs on
 //! [`crate::domain::secret::repo::SecretRepo`].
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
-use credstore_sdk::{SharingMode, TenantId, ValueId};
+use credstore_sdk::{SharingMode, StoreKey, ValueVersion};
 use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
-use sea_orm::{
-    ActiveValue, ColumnTrait, Condition, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect,
-};
+use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, QueryFilter, QuerySelect};
 use time::OffsetDateTime;
 use toolkit_db::secure::{
-    DbTx, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
+    DBRunner, DbTx, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::secret::model::{
-    Fallback, GcEntry, GcReason, NewDeclaredSecret, NewSecret, SecretRow, SecretStatus,
+    Fallback, NewDeclaredSecret, NewSecret, SecretRow, SecretStatus,
 };
+use crate::infra::outbox::PurgeEnqueuer;
 use crate::infra::storage::entity;
 use crate::infra::storage::repo_impl::helpers::{
-    SecretRepoImpl, entity_to_model, gc_entity_to_model, map_scope_err, sharing_to_i16,
+    SecretRepoImpl, entity_to_model, map_scope_err, sharing_to_i16,
 };
 
-// ── Garbage-collection bookkeeping (`credstore_value_gc`) ───────────────────
+// ── Creates ─────────────────────────────────────────────────────────────────
 
-pub(super) async fn gc_insert_pending(
-    repo: &SecretRepoImpl,
-    value_id: ValueId,
-    tenant_id: TenantId,
+/// Plain `INSERT` of a prepared row on `runner`. `scope_unchecked`: an INSERT
+/// cannot subtree-clamp on a row that doesn't exist yet.
+async fn insert_row<R: DBRunner + Sync>(
+    runner: &R,
+    scope: &AccessScope,
+    am: entity::secrets::ActiveModel,
 ) -> Result<(), DomainError> {
-    let conn = repo.db.conn()?;
-    let am = entity::value_gc::ActiveModel {
-        value_id: ActiveValue::Set(value_id.0),
-        tenant_id: ActiveValue::Set(tenant_id.0),
-        reason: ActiveValue::Set(GcReason::Pending.as_smallint()),
-        enqueued_at: ActiveValue::Set(OffsetDateTime::now_utc()),
-    };
-    entity::value_gc::Entity::insert(am)
+    entity::secrets::Entity::insert(am)
         .secure()
-        .scope_unchecked(&AccessScope::allow_all())
+        .scope_unchecked(scope)
         .map_err(map_scope_err)?
-        .exec(&conn)
+        .exec(runner)
         .await
         .map_err(map_scope_err)?;
     Ok(())
 }
 
-pub(super) async fn gc_delete(
+/// Runs `am`'s plain insert. A unique-index conflict maps to `Conflict`
+/// through the shared classification ladder: an expired own row still holds
+/// the reference, so a create over it is a conflict like any other.
+async fn create_row(
     repo: &SecretRepoImpl,
-    value_id: ValueId,
-) -> Result<bool, DomainError> {
+    scope: &AccessScope,
+    am: entity::secrets::ActiveModel,
+) -> Result<(), DomainError> {
     let conn = repo.db.conn()?;
-    let rows_affected = entity::value_gc::Entity::delete_many()
-        .filter(entity::value_gc::Column::ValueId.eq(value_id.0))
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .exec(&conn)
-        .await
-        .map_err(map_scope_err)?
-        .rows_affected;
-    Ok(rows_affected > 0)
+    insert_row(&conn, scope, am).await
 }
-
-pub(super) async fn gc_mark(
-    repo: &SecretRepoImpl,
-    value_id: ValueId,
-    reason: GcReason,
-) -> Result<bool, DomainError> {
-    let conn = repo.db.conn()?;
-    let rows_affected = entity::value_gc::Entity::update_many()
-        .col_expr(
-            entity::value_gc::Column::Reason,
-            Expr::value(reason.as_smallint()),
-        )
-        .filter(entity::value_gc::Column::ValueId.eq(value_id.0))
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .exec(&conn)
-        .await
-        .map_err(map_scope_err)?
-        .rows_affected;
-    Ok(rows_affected > 0)
-}
-
-pub(super) async fn gc_list(
-    repo: &SecretRepoImpl,
-    limit: u64,
-) -> Result<Vec<GcEntry>, DomainError> {
-    let conn = repo.db.conn()?;
-    let rows = entity::value_gc::Entity::find()
-        .order_by(entity::value_gc::Column::EnqueuedAt, Order::Asc)
-        .limit(limit)
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .all(&conn)
-        .await
-        .map_err(map_scope_err)?;
-    rows.iter().map(gc_entity_to_model).collect()
-}
-
-/// `EXISTS` via `SELECT … LIMIT 1` — never `COUNT` (platform rule).
-pub(super) async fn is_value_referenced(
-    repo: &SecretRepoImpl,
-    value_id: ValueId,
-) -> Result<bool, DomainError> {
-    let conn = repo.db.conn()?;
-    let row = entity::secrets::Entity::find()
-        .filter(entity::secrets::Column::ValueId.eq(value_id.0))
-        .limit(1)
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .one(&conn)
-        .await
-        .map_err(map_scope_err)?;
-    Ok(row.is_some())
-}
-
-// ── Write protocol (ADR-0006 §6.2) ──────────────────────────────────────────
 
 pub(super) async fn insert_active(
     repo: &SecretRepoImpl,
-    scope: &AccessScope,
-    new: &NewSecret,
-) -> Result<(), DomainError> {
-    let scope = scope.clone();
-    let new = new.clone();
-    repo.db
-        .transaction(move |tx: &DbTx<'_>| {
-            Box::pin(async move { insert_active_tx(tx, &scope, &new).await })
-                as Pin<Box<dyn Future<Output = Result<(), DomainError>> + Send + '_>>
-        })
-        .await
-}
-
-async fn insert_active_tx(
-    tx: &DbTx<'_>,
     scope: &AccessScope,
     new: &NewSecret,
 ) -> Result<(), DomainError> {
@@ -160,43 +81,41 @@ async fn insert_active_tx(
         version: ActiveValue::NotSet,
         secret_type_uuid: ActiveValue::Set(new.secret_type_uuid),
         expires_at: ActiveValue::Set(new.expires_at),
-        value_id: ActiveValue::Set(Some(new.value_id.0)),
-        value_fp: ActiveValue::Set(Some(new.value_fp.clone())),
-        fp_key_id: ActiveValue::Set(Some(new.fp_key_id)),
+        value_version: ActiveValue::Set(Some(new.value_version.0.clone())),
         fallback: ActiveValue::Set(new.fallback.as_smallint()),
     };
-    // scope_unchecked: INSERT cannot subtree-clamp on a row that doesn't exist yet.
-    entity::secrets::Entity::insert(am)
-        .secure()
-        .scope_unchecked(scope)
-        .map_err(map_scope_err)?
-        .exec(tx)
-        .await
-        .map_err(map_scope_err)?;
-
-    // The intent is now realized: drop the pending gc entry for this id. It
-    // MUST affect exactly one row — if it affects none, the maintenance job's
-    // pending-reclaim pass already decided this intent was stale and deleted
-    // the backend bytes we just pointed the row at; committing would leave a
-    // dangling pointer, so this rolls back the whole transaction (row insert
-    // included) instead, and the caller retries with a fresh `value_id`.
-    let claimed = entity::value_gc::Entity::delete_many()
-        .filter(entity::value_gc::Column::ValueId.eq(new.value_id.0))
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .exec(tx)
-        .await
-        .map_err(map_scope_err)?
-        .rows_affected;
-    if claimed == 0 {
-        return Err(DomainError::ServiceUnavailable {
-            detail: "write intent expired; retry".to_owned(),
-            retry_after: None,
-            cause: None,
-        });
-    }
-    Ok(())
+    create_row(repo, scope, am).await
 }
+
+/// Create-with-no-value path (ADR-0004 Amendment B): `status = declared`,
+/// `value_version` `NULL`; no plugin call is ever made. A unique-index
+/// conflict maps to `DomainError::Conflict` through the same
+/// `classify_db_err_to_domain` ladder every other write uses.
+pub(super) async fn insert_declared(
+    repo: &SecretRepoImpl,
+    scope: &AccessScope,
+    new: &NewDeclaredSecret,
+) -> Result<(), DomainError> {
+    let now = OffsetDateTime::now_utc();
+    let am = entity::secrets::ActiveModel {
+        id: ActiveValue::Set(new.id),
+        tenant_id: ActiveValue::Set(new.tenant_id.0),
+        reference: ActiveValue::Set(new.reference.as_ref().to_owned()),
+        sharing: ActiveValue::Set(sharing_to_i16(new.sharing)),
+        owner_id: ActiveValue::Set(new.owner_id.0),
+        status: ActiveValue::Set(SecretStatus::Declared.as_smallint()),
+        created_at: ActiveValue::Set(now),
+        updated_at: ActiveValue::Set(now),
+        version: ActiveValue::NotSet,
+        secret_type_uuid: ActiveValue::Set(new.secret_type_uuid),
+        expires_at: ActiveValue::Set(new.expires_at),
+        value_version: ActiveValue::Set(None),
+        fallback: ActiveValue::Set(new.fallback.as_smallint()),
+    };
+    create_row(repo, scope, am).await
+}
+
+// ── Pointer switch ──────────────────────────────────────────────────────────
 
 #[allow(
     clippy::too_many_arguments,
@@ -206,14 +125,12 @@ pub(super) async fn switch_value(
     repo: &SecretRepoImpl,
     scope: &AccessScope,
     id: Uuid,
-    expected_version: Option<i64>,
+    expected_version: i64,
     sharing: SharingMode,
     fallback: Fallback,
     expires_at: Option<OffsetDateTime>,
-    new_value_id: ValueId,
-    value_fp: Vec<u8>,
-    fp_key_id: i16,
-) -> Result<Option<(SecretRow, Option<ValueId>)>, DomainError> {
+    new_value_version: ValueVersion,
+) -> Result<Option<SecretRow>, DomainError> {
     let scope = scope.clone();
     repo.db
         .transaction(move |tx: &DbTx<'_>| {
@@ -226,20 +143,11 @@ pub(super) async fn switch_value(
                     sharing,
                     fallback,
                     expires_at,
-                    new_value_id,
-                    value_fp,
-                    fp_key_id,
+                    new_value_version,
                 )
                 .await
             })
-                as Pin<
-                    Box<
-                        dyn Future<
-                                Output = Result<Option<(SecretRow, Option<ValueId>)>, DomainError>,
-                            > + Send
-                            + '_,
-                    >,
-                >
+                as Pin<Box<dyn Future<Output = Result<Option<SecretRow>, DomainError>> + Send + '_>>
         })
         .await
 }
@@ -252,65 +160,23 @@ async fn switch_value_tx(
     tx: &DbTx<'_>,
     scope: &AccessScope,
     id: Uuid,
-    expected_version: Option<i64>,
+    expected_version: i64,
     sharing: SharingMode,
     fallback: Fallback,
     expires_at: Option<OffsetDateTime>,
-    new_value_id: ValueId,
-    value_fp: Vec<u8>,
-    fp_key_id: i16,
-) -> Result<Option<(SecretRow, Option<ValueId>)>, DomainError> {
+    new_value_version: ValueVersion,
+) -> Result<Option<SecretRow>, DomainError> {
     let now = OffsetDateTime::now_utc();
 
-    // Lock the row for the duration of this transaction (a no-op on SQLite,
-    // which serialises writers anyway) so a concurrent switch's own read of
-    // `value_id` can never observe a value between our read and our write.
+    // The compare-and-set: `version` is the one the caller read before its
+    // `plugin.put`, so a concurrent change of any kind matches nothing.
     // Accepts either resting status: a `declared` row switches to `active`
     // exactly like an `active` row being rotated (ADR-0004, "Writing a value
     // to a suppressed record is not a conflict").
-    let current = entity::secrets::Entity::find()
-        .lock_exclusive()
-        .secure()
-        .scope_with(scope)
-        .filter(
-            Condition::all()
-                .add(entity::secrets::Column::Id.eq(id))
-                .add(entity::secrets::Column::Status.is_in([
-                    SecretStatus::Active.as_smallint(),
-                    SecretStatus::Declared.as_smallint(),
-                ])),
-        )
-        .one(tx)
-        .await
-        .map_err(map_scope_err)?;
-
-    let Some(current) = current else {
-        return Ok(None);
-    };
-    if let Some(expected) = expected_version
-        && current.version != expected
-    {
-        return Ok(None);
-    }
-    let old_value_id = current.value_id;
-    // Belt-and-braces over `lock_exclusive` (a no-op on SQLite): the UPDATE
-    // itself is gated on the version just read under the lock, so a lost
-    // race still surfaces as 0 rows affected rather than a silent double
-    // apply.
-    let locked_version = current.version;
-
     let rows_affected = entity::secrets::Entity::update_many()
         .col_expr(
-            entity::secrets::Column::ValueId,
-            Expr::value(new_value_id.0),
-        )
-        .col_expr(
-            entity::secrets::Column::ValueFp,
-            Expr::value(Some(value_fp)),
-        )
-        .col_expr(
-            entity::secrets::Column::FpKeyId,
-            Expr::value(Some(fp_key_id)),
+            entity::secrets::Column::ValueVersion,
+            Expr::value(Some(new_value_version.0)),
         )
         .col_expr(
             entity::secrets::Column::Sharing,
@@ -333,7 +199,7 @@ async fn switch_value_tx(
         .filter(
             Condition::all()
                 .add(entity::secrets::Column::Id.eq(id))
-                .add(entity::secrets::Column::Version.eq(locked_version)),
+                .add(entity::secrets::Column::Version.eq(expected_version)),
         )
         .secure()
         .scope_with(scope)
@@ -342,47 +208,7 @@ async fn switch_value_tx(
         .map_err(map_scope_err)?
         .rows_affected;
     if rows_affected == 0 {
-        // Lost the race despite the lock (SQLite: `lock_exclusive` is a
-        // no-op there) — treat exactly like the pre-lock version check.
         return Ok(None);
-    }
-
-    // The intent is realized: drop the pending gc entry for the new id. It
-    // MUST affect exactly one row — see `insert_active_tx`'s matching check
-    // for why 0 rows means the maintenance job already reclaimed this
-    // intent and the whole transaction (row update included) must roll back
-    // rather than commit a dangling pointer.
-    let claimed = entity::value_gc::Entity::delete_many()
-        .filter(entity::value_gc::Column::ValueId.eq(new_value_id.0))
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .exec(tx)
-        .await
-        .map_err(map_scope_err)?
-        .rows_affected;
-    if claimed == 0 {
-        return Err(DomainError::ServiceUnavailable {
-            detail: "write intent expired; retry".to_owned(),
-            retry_after: None,
-            cause: None,
-        });
-    }
-
-    // The previous version, if any, is now unreferenced by this row.
-    if let Some(old_id) = old_value_id {
-        let am = entity::value_gc::ActiveModel {
-            value_id: ActiveValue::Set(old_id),
-            tenant_id: ActiveValue::Set(current.tenant_id),
-            reason: ActiveValue::Set(GcReason::Superseded.as_smallint()),
-            enqueued_at: ActiveValue::Set(now),
-        };
-        entity::value_gc::Entity::insert(am)
-            .secure()
-            .scope_unchecked(&AccessScope::allow_all())
-            .map_err(map_scope_err)?
-            .exec(tx)
-            .await
-            .map_err(map_scope_err)?;
     }
 
     let row = entity::secrets::Entity::find()
@@ -393,53 +219,11 @@ async fn switch_value_tx(
         .await
         .map_err(map_scope_err)?
         .ok_or_else(|| DomainError::internal("switch_value: row vanished after its own update"))?;
-    let row = entity_to_model(row)?;
-    Ok(Some((row, old_value_id.map(ValueId))))
-}
-
-/// Create-with-no-value path (ADR-0004 Amendment B): ONE plain `INSERT` —
-/// `status = declared`, `value_id`/`value_fp`/`fp_key_id` all `NULL`. No
-/// transaction is needed (unlike [`insert_active`], there is no paired
-/// `credstore_value_gc` row to delete atomically) and no plugin call is ever
-/// made. A unique-index conflict maps to `DomainError::Conflict` through the
-/// same `classify_db_err_to_domain` ladder every other write uses.
-pub(super) async fn insert_declared(
-    repo: &SecretRepoImpl,
-    scope: &AccessScope,
-    new: &NewDeclaredSecret,
-) -> Result<(), DomainError> {
-    let conn = repo.db.conn()?;
-    let now = OffsetDateTime::now_utc();
-    let am = entity::secrets::ActiveModel {
-        id: ActiveValue::Set(new.id),
-        tenant_id: ActiveValue::Set(new.tenant_id.0),
-        reference: ActiveValue::Set(new.reference.as_ref().to_owned()),
-        sharing: ActiveValue::Set(sharing_to_i16(new.sharing)),
-        owner_id: ActiveValue::Set(new.owner_id.0),
-        status: ActiveValue::Set(SecretStatus::Declared.as_smallint()),
-        created_at: ActiveValue::Set(now),
-        updated_at: ActiveValue::Set(now),
-        version: ActiveValue::NotSet,
-        secret_type_uuid: ActiveValue::Set(new.secret_type_uuid),
-        expires_at: ActiveValue::Set(new.expires_at),
-        value_id: ActiveValue::Set(None),
-        value_fp: ActiveValue::Set(None),
-        fp_key_id: ActiveValue::Set(None),
-        fallback: ActiveValue::Set(new.fallback.as_smallint()),
-    };
-    // scope_unchecked: INSERT cannot subtree-clamp on a row that doesn't exist yet.
-    entity::secrets::Entity::insert(am)
-        .secure()
-        .scope_unchecked(scope)
-        .map_err(map_scope_err)?
-        .exec(&conn)
-        .await
-        .map_err(map_scope_err)?;
-    Ok(())
+    Some(entity_to_model(row)).transpose()
 }
 
 /// Metadata-only update (ADR-0004 `PATCH` with no `value` key): never
-/// touches `value_id`/`value_fp`/`fp_key_id`/`status`. One transaction,
+/// touches `value_version`/`status`. One transaction,
 /// mirroring `switch_value_tx`/`remove_value_tx`: lock + read the row first,
 /// then gate the UPDATE on the version just read under that lock.
 pub(super) async fn update_metadata(
@@ -546,10 +330,10 @@ async fn update_metadata_tx(
     Some(entity_to_model(row)).transpose()
 }
 
-/// Value-removal write (ADR-0004 `PATCH {"secret": null}`, "How a record
-/// reaches it"): one transaction — nulls the pointer/fingerprint, moves the
-/// row to `declared`, applies the merged metadata, and enqueues the old
-/// version (if any) for garbage collection.
+/// Secret removal (ADR-0004 `PATCH {"secret": null}`): one compare-and-set -
+/// nulls the pointer, moves the row to `declared`, applies the merged
+/// metadata, and returns the value version the row held so the caller can
+/// best-effort `destroy` it. Never touches the store.
 pub(super) async fn remove_value(
     repo: &SecretRepoImpl,
     scope: &AccessScope,
@@ -558,7 +342,7 @@ pub(super) async fn remove_value(
     sharing: SharingMode,
     fallback: Fallback,
     expires_at: Option<OffsetDateTime>,
-) -> Result<Option<(SecretRow, Option<ValueId>)>, DomainError> {
+) -> Result<Option<(SecretRow, Option<ValueVersion>)>, DomainError> {
     let scope = scope.clone();
     repo.db
         .transaction(move |tx: &DbTx<'_>| {
@@ -577,7 +361,10 @@ pub(super) async fn remove_value(
                 as Pin<
                     Box<
                         dyn Future<
-                                Output = Result<Option<(SecretRow, Option<ValueId>)>, DomainError>,
+                                Output = Result<
+                                    Option<(SecretRow, Option<ValueVersion>)>,
+                                    DomainError,
+                                >,
                             > + Send
                             + '_,
                     >,
@@ -598,11 +385,11 @@ async fn remove_value_tx(
     sharing: SharingMode,
     fallback: Fallback,
     expires_at: Option<OffsetDateTime>,
-) -> Result<Option<(SecretRow, Option<ValueId>)>, DomainError> {
+) -> Result<Option<(SecretRow, Option<ValueVersion>)>, DomainError> {
     let now = OffsetDateTime::now_utc();
 
-    // Lock + read so the value_id we enqueue for gc is exactly the one this
-    // transaction nulls, atomically.
+    // Lock + read so the value version we hand back for destroy is exactly
+    // the one this transaction nulls, atomically.
     let current = entity::secrets::Entity::find()
         .lock_exclusive()
         .secure()
@@ -619,21 +406,13 @@ async fn remove_value_tx(
     {
         return Ok(None);
     }
-    let old_value_id = current.value_id;
+    let old_value_version = current.value_version.clone();
     let locked_version = current.version;
 
     let rows_affected = entity::secrets::Entity::update_many()
         .col_expr(
-            entity::secrets::Column::ValueId,
-            Expr::value::<Option<Uuid>>(None),
-        )
-        .col_expr(
-            entity::secrets::Column::ValueFp,
-            Expr::value::<Option<Vec<u8>>>(None),
-        )
-        .col_expr(
-            entity::secrets::Column::FpKeyId,
-            Expr::value::<Option<i16>>(None),
+            entity::secrets::Column::ValueVersion,
+            Expr::value::<Option<String>>(None),
         )
         .col_expr(
             entity::secrets::Column::Status,
@@ -669,22 +448,6 @@ async fn remove_value_tx(
         return Ok(None);
     }
 
-    if let Some(old_id) = old_value_id {
-        let am = entity::value_gc::ActiveModel {
-            value_id: ActiveValue::Set(old_id),
-            tenant_id: ActiveValue::Set(current.tenant_id),
-            reason: ActiveValue::Set(GcReason::Removed.as_smallint()),
-            enqueued_at: ActiveValue::Set(now),
-        };
-        entity::value_gc::Entity::insert(am)
-            .secure()
-            .scope_unchecked(&AccessScope::allow_all())
-            .map_err(map_scope_err)?
-            .exec(tx)
-            .await
-            .map_err(map_scope_err)?;
-    }
-
     let row = entity::secrets::Entity::find()
         .secure()
         .scope_with(scope)
@@ -694,119 +457,61 @@ async fn remove_value_tx(
         .map_err(map_scope_err)?
         .ok_or_else(|| DomainError::internal("remove_value: row vanished after its own update"))?;
     let row = entity_to_model(row)?;
-    Ok(Some((row, old_value_id.map(ValueId))))
+    Ok(Some((row, old_value_version.map(ValueVersion))))
 }
 
 pub(super) async fn delete_by_id(
     repo: &SecretRepoImpl,
     scope: &AccessScope,
-    id: Uuid,
+    key: &StoreKey,
     expected_version: Option<i64>,
-) -> Result<Option<ValueId>, DomainError> {
+) -> Result<(), DomainError> {
     let scope = scope.clone();
-    repo.db
+    let key = key.clone();
+    let purge = Arc::clone(&repo.purge);
+    let wake = repo
+        .db
         .transaction(move |tx: &DbTx<'_>| {
             Box::pin(async move {
-                delete_row_tx(tx, &scope, id, expected_version, GcReason::Removed, false).await
+                delete_row_tx(purge.as_ref(), tx, &scope, &key, expected_version).await
             })
-                as Pin<Box<dyn Future<Output = Result<Option<ValueId>, DomainError>> + Send + '_>>
+                as Pin<
+                    Box<
+                        dyn Future<Output = Result<toolkit_db::outbox::Wake, DomainError>>
+                            + Send
+                            + '_,
+                    >,
+                >
         })
-        .await
+        .await?;
+    // Committed: wake the sequencer.
+    wake.fire();
+    Ok(())
 }
 
-pub(super) async fn delete_expired_row(
-    repo: &SecretRepoImpl,
-    id: Uuid,
-) -> Result<Option<ValueId>, DomainError> {
-    repo.db
-        .transaction(move |tx: &DbTx<'_>| {
-            Box::pin(async move {
-                match delete_row_tx(
-                    tx,
-                    &AccessScope::allow_all(),
-                    id,
-                    None,
-                    GcReason::Removed,
-                    // Re-check `status = active AND expires_at <= now()`
-                    // under the lock: the row may have been extended or
-                    // removed between the job's `list_expired` and this
-                    // transaction. A row that no longer matches is skipped,
-                    // not counted (§6.4).
-                    true,
-                )
-                .await
-                {
-                    // The maintenance job runs without a caller and races
-                    // nothing that should surface as an error: a row already
-                    // gone (a concurrent client delete beat the job to it),
-                    // or no longer expired, is simply nothing left to do.
-                    Err(DomainError::NotFound) => Ok(None),
-                    other => other,
-                }
-            })
-                as Pin<Box<dyn Future<Output = Result<Option<ValueId>, DomainError>> + Send + '_>>
-        })
-        .await
-}
-
+/// One transaction: `DELETE` the row (CAS on `expected_version` when given;
+/// 0 rows affected is `NotFound`) and enqueue the key purge.
 async fn delete_row_tx(
+    purge: &dyn PurgeEnqueuer,
     tx: &DbTx<'_>,
     scope: &AccessScope,
-    id: Uuid,
+    key: &StoreKey,
     expected_version: Option<i64>,
-    reason: GcReason,
-    only_if_expired: bool,
-) -> Result<Option<ValueId>, DomainError> {
-    let now = OffsetDateTime::now_utc();
-    let mut filter = Condition::all().add(entity::secrets::Column::Id.eq(id));
+) -> Result<toolkit_db::outbox::Wake, DomainError> {
+    let mut filter = Condition::all().add(entity::secrets::Column::Id.eq(key.record_id));
     if let Some(v) = expected_version {
         filter = filter.add(entity::secrets::Column::Version.eq(v));
     }
-
-    // Lock + read so the value_id we enqueue for gc is exactly the one this
-    // transaction deletes, atomically.
-    let current = entity::secrets::Entity::find()
-        .lock_exclusive()
-        .secure()
-        .scope_with(scope)
+    let rows_affected = entity::secrets::Entity::delete_many()
         .filter(filter)
-        .one(tx)
-        .await
-        .map_err(map_scope_err)?;
-    let Some(current) = current else {
-        return Err(DomainError::NotFound);
-    };
-    if only_if_expired {
-        let still_expired = current.status == SecretStatus::Active.as_smallint()
-            && current.expires_at.is_some_and(|at| at <= now);
-        if !still_expired {
-            return Err(DomainError::NotFound);
-        }
-    }
-    let value_id = current.value_id;
-
-    entity::secrets::Entity::delete_many()
-        .filter(Condition::all().add(entity::secrets::Column::Id.eq(id)))
         .secure()
         .scope_with(scope)
         .exec(tx)
         .await
-        .map_err(map_scope_err)?;
-
-    if let Some(vid) = value_id {
-        let am = entity::value_gc::ActiveModel {
-            value_id: ActiveValue::Set(vid),
-            tenant_id: ActiveValue::Set(current.tenant_id),
-            reason: ActiveValue::Set(reason.as_smallint()),
-            enqueued_at: ActiveValue::Set(now),
-        };
-        entity::value_gc::Entity::insert(am)
-            .secure()
-            .scope_unchecked(&AccessScope::allow_all())
-            .map_err(map_scope_err)?
-            .exec(tx)
-            .await
-            .map_err(map_scope_err)?;
+        .map_err(map_scope_err)?
+        .rows_affected;
+    if rows_affected == 0 {
+        return Err(DomainError::NotFound);
     }
-    Ok(value_id.map(ValueId))
+    purge.enqueue_purge(tx, key).await
 }

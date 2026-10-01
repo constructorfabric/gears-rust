@@ -15,6 +15,15 @@ pub enum CredStoreError {
     NotFound,
     #[error("secret already exists")]
     Conflict,
+    /// The record resolved and the caller may read its secret, but the
+    /// decisive `active` record's `expires_at` has passed: the secret is never
+    /// served and resolution does not continue to an ancestor's value. The
+    /// record's metadata stays readable (lifecycle status `expired`); renewing
+    /// it (`patch` of `expires_at` or a new `secret`) restores the secret.
+    /// Surfaced only to a caller authorized to read the secret of that type;
+    /// everyone else gets [`Self::NotFound`].
+    #[error("secret expired")]
+    SecretExpired,
     #[error("no plugin available")]
     NoPluginAvailable,
     #[error("service unavailable: {detail}")]
@@ -85,6 +94,12 @@ impl CredStoreError {
     #[must_use]
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::NotFound)
+    }
+
+    /// `true` when the decisive record's secret has expired.
+    #[must_use]
+    pub fn is_secret_expired(&self) -> bool {
+        matches!(self, Self::SecretExpired)
     }
 
     /// `true` for any transient infrastructure outage where retry is appropriate.
@@ -184,6 +199,7 @@ mod error_tests {
     fn display_redacts_nothing_but_is_stable() {
         assert_eq!(CredStoreError::NotFound.to_string(), "secret not found");
         assert_eq!(CredStoreError::AccessDenied.to_string(), "access denied");
+        assert_eq!(CredStoreError::SecretExpired.to_string(), "secret expired");
         assert_eq!(
             CredStoreError::Conflict.to_string(),
             "secret already exists"
@@ -195,6 +211,10 @@ mod error_tests {
         assert!(CredStoreError::NotFound.is_not_found());
         assert!(CredStoreError::Conflict.is_already_exists());
         assert!(CredStoreError::AccessDenied.is_permission_denied());
+        assert!(CredStoreError::SecretExpired.is_secret_expired());
+        assert!(!CredStoreError::NotFound.is_secret_expired());
+        assert!(!CredStoreError::SecretExpired.is_not_found());
+        assert!(!CredStoreError::SecretExpired.is_retryable());
         assert!(CredStoreError::invalid_ref("x").is_validation_error());
         assert!(
             CredStoreError::TypeViolation {

@@ -1,9 +1,8 @@
 //! Secret lifecycle domain.
 //!
 //! Defines metadata models, persistence and type-resolution ports, hierarchical
-//! lookup, crash-safe writes, expiry, and the value-fingerprint fence.
+//! lookup, crash-safe writes (immutable value versions) and expiry.
 
-pub mod fence;
 pub mod list_filter;
 pub mod model;
 pub mod reduce;

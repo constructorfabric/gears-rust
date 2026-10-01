@@ -2,7 +2,7 @@
 //! restates from `resolve_credential` and requires the collection read to
 //! reuse verbatim.
 
-use credstore_sdk::{InheritanceStatus, OwnerId, SecretType, SharingMode, TenantId, ValueId};
+use credstore_sdk::{InheritanceStatus, OwnerId, SecretType, SharingMode, TenantId, ValueVersion};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -32,18 +32,8 @@ fn row(
         updated_at: OffsetDateTime::now_utc(),
         secret_type_uuid: SecretType::generic().uuid(),
         expires_at: None,
-        value_id: if status == SecretStatus::Active {
-            Some(ValueId::new_v4())
-        } else {
-            None
-        },
-        value_fp: if status == SecretStatus::Active {
-            Some(vec![1u8; 32])
-        } else {
-            None
-        },
-        fp_key_id: if status == SecretStatus::Active {
-            Some(1)
+        value_version: if status == SecretStatus::Active {
+            Some(ValueVersion::new("1"))
         } else {
             None
         },
@@ -223,7 +213,9 @@ fn private_beats_tenant_at_the_same_own_tenant() {
 }
 
 #[test]
-fn expired_active_row_does_not_compete_as_winner() {
+fn expired_own_row_stays_decisive_and_shadows_the_ancestor() {
+    use credstore_sdk::CredentialStatus;
+
     let own = Uuid::new_v4();
     let parent = Uuid::new_v4();
     let mut expired_own = row(
@@ -245,11 +237,62 @@ fn expired_active_row_does_not_compete_as_winner() {
         ),
     ];
     let reduced = reduce(&candidates, own, &[own, parent]).expect("reduces");
-    // The expired own row still counts as `own` (it holds the reference),
-    // but it cannot win the reduction, so the ancestor's row does.
+    // Expiry applies to the secret, not to the record: the expired own row
+    // is still the decisive one, so the ancestor's row is not consulted.
     assert_eq!(reduced.own.map(|o| o.tenant_id.0), Some(own));
+    assert_eq!(reduced.winner.map(|w| w.tenant_id.0), Some(own));
+    assert_eq!(reduced.inheritance, InheritanceStatus::Overridden);
+    assert_eq!(reduced.own_status(), CredentialStatus::Expired);
+}
+
+#[test]
+fn expired_ancestor_shared_row_is_the_decisive_winner() {
+    use credstore_sdk::CredentialStatus;
+
+    let own = Uuid::new_v4();
+    let parent = Uuid::new_v4();
+    let grandparent = Uuid::new_v4();
+    let mut expired_parent = row(
+        parent,
+        "r",
+        SharingMode::Shared,
+        SecretStatus::Active,
+        Fallback::Inherit,
+    );
+    expired_parent.expires_at = Some(OffsetDateTime::now_utc() - time::Duration::seconds(5));
+    let candidates = [
+        expired_parent,
+        row(
+            grandparent,
+            "r",
+            SharingMode::Shared,
+            SecretStatus::Active,
+            Fallback::Inherit,
+        ),
+    ];
+    let reduced = reduce(&candidates, own, &[own, parent, grandparent]).expect("reduces");
     assert_eq!(reduced.winner.map(|w| w.tenant_id.0), Some(parent));
     assert_eq!(reduced.inheritance, InheritanceStatus::Inherited);
+    assert_eq!(reduced.own_status(), CredentialStatus::None);
+}
+
+#[test]
+fn a_declared_row_never_expires() {
+    use credstore_sdk::CredentialStatus;
+
+    let own = Uuid::new_v4();
+    let mut declared = row(
+        own,
+        "r",
+        SharingMode::Tenant,
+        SecretStatus::Declared,
+        Fallback::None,
+    );
+    declared.expires_at = Some(OffsetDateTime::now_utc() - time::Duration::seconds(5));
+    let candidates = [declared];
+    let reduced = reduce(&candidates, own, &[own]).expect("reduces");
+    assert_eq!(reduced.own_status(), CredentialStatus::Declared);
+    assert_eq!(reduced.inheritance, InheritanceStatus::Suppressed);
 }
 
 #[test]

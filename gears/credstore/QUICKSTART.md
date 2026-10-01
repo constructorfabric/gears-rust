@@ -22,10 +22,12 @@ in `$select` — there is no separate address for the secret alone.
   locally without touching the ancestor's credential
 - List credential records (`$filter`/`$orderby`/`limit`/`cursor`), or bulk-read
   several secrets at once by selecting `secret`
-- Immutable value versions: every write mints a fresh version and switches
-  the record's pointer to it; no in-place overwrite, no in-gear reaper —
-  a periodic maintenance job (`CredStoreMaintenanceV1::run_gc`) does the
-  collecting
+- Immutable value versions: every write stores a new version in the backend
+  and switches the record's pointer to it; no in-place overwrite, no reaper
+  and no maintenance job. Deleting a record frees the reference at once and
+  purges its backend key through the outbox
+- Best-effort audit of secret reads and writes through `event-broker`
+  (`audit_publish_failed` metric on failure)
 - Access denial returned as `404` (not an error) to prevent credential
   enumeration
 - Backend-agnostic: the secret is stored by a plugin selected by `vendor`
@@ -53,21 +55,23 @@ gears:
   credstore:
     config:
       vendor: "constructorfabric"  # selects backend plugin by vendor name (default: "constructorfabric"; "constructorfabric" -> static-credstore-plugin, "openbao" -> vault-credstore-plugin)
-      gc:
-        pending_max_age_secs: 3600 # pending-intent reclaim threshold (default: 3600)
-        batch_size: 256             # rows per batch in the maintenance job's passes (default: 256)
+      hierarchy:
+        ancestor_cache_ttl_secs: 300 # ancestor-chain cache TTL (default: 300)
       list:
         max_limit: 200              # cap for a metadata-mode page's `limit` (default: 200)
         secret_mode_cap: 25         # cap on how many references a secret-mode ($select=…,secret) request may match (default: 25)
 ```
 
-There is no `reaper:` block — the maintenance job (`gc:` above) runs on an
-operator-chosen schedule outside the gear, not on an in-gear timer.
+There is no `reaper:` or `gc:` block: the gear runs no resident loop and no
+maintenance job, and unknown config keys (including those two) are rejected
+at startup.
 
 **Secrets are provisioned only through this API.** A backend plugin (e.g.
-`static-credstore-plugin` for development) stores nothing but bytes keyed by
-an opaque version id, minted by the gear on write — there is no way to seed
-one directly in the plugin's own configuration. Always create/rotate a
+`static-credstore-plugin` for development) (`CredStorePluginClientV2`) is a versioned
+byte store keyed by `(tenant_id, record_id)`: `put` returns the version, `get`
+reads one, `delete_key` drops the key (called by the outbox after a record
+delete), and `destroy` is optional (`supports_destroy`). There is no way to
+seed a value directly in the plugin's own configuration. Always create/rotate a
 credential with `PUT`/`PATCH` below so a record exists.
 
 Two backend plugins currently exist: `static-credstore-plugin` (in-memory,
@@ -181,6 +185,17 @@ A winning record with no secret (`declared`, or `suppressed`) is the
 canonical **404** — indistinguishable from "does not exist". Requires
 `read_secret`; a `$select` naming both a record field and `secret` requires
 `read` and `read_secret` together.
+
+**Expired records.** Expiry applies to the secret, not to the record. Once an
+`active` record's `expires_at` has passed, a read without `secret` still
+returns it, with `status: "expired"` and its normal `ETag`; a read that
+selects `secret` fails **409** with reason `SECRET_EXPIRED` (only for a
+caller allowed to read the secret — anyone else gets the usual **404**), and
+the answer never falls through to an ancestor's value. In the collection's
+secret mode an expired item is returned with `status: "expired"` and no
+`secret`. Renew it in place with
+`PATCH` `{"expires_at": "<future RFC 3339 instant>"}` (or a replace); a
+create-only `PUT` over it is **409** `ALREADY_EXISTS`.
 
 ### Rotate the secret
 
@@ -339,7 +354,7 @@ always `null`; each item additionally carries the decrypted `secret`:
 be exactly `reference in (...)` or `type eq/in (...)` (**400**
 `SECRET_MODE_SELECTOR`). A match set over `list.secret_mode_cap` (default 25)
 fails the whole request with **400** `TOO_MANY_MATCHES` rather than
-truncating it. A refused, missing, or fingerprint-mismatched item is
+truncating it. A refused or missing item is
 omitted, never reported. Requires `read_secret`, evaluated per item.
 
 ### Delete a credential
@@ -351,8 +366,9 @@ curl -si -X DELETE "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-op
 ```
 
 Response: **204 No Content**. `If-Match` is mandatory: a version validator,
-or `*` to delete whatever is there. Removes the record and its secret
-together and releases the reference at once.
+or `*` to delete whatever is there. Removes the record in one transaction and releases the reference at once
+(a create-only `PUT` right after succeeds); the secret's backend key is purged
+asynchronously by the outbox.
 
 ## Using the SDK
 

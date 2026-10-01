@@ -3,7 +3,7 @@
 //! path/status logic and [`crate`]'s README for the backend key shape.
 use std::time::Duration;
 
-use credstore_sdk::{CredStoreError, SecretValue, TenantId, ValueId};
+use credstore_sdk::{CredStoreError, DestroySelector, SecretValue, StoreKey, ValueVersion};
 use reqwest::Client;
 
 use super::wire;
@@ -54,25 +54,29 @@ impl Service {
         }
     }
 
-    /// Reads the value stored at `(tenant_id, value_id)`, or `None` when no
-    /// entry exists (a `404` from the backend).
+    fn paths(&self, key: &StoreKey) -> (String, String) {
+        let (t, r) = (key.tenant_id.0.to_string(), key.record_id.to_string());
+        (
+            wire::data_path(&self.mount, &self.path_prefix, &t, &r),
+            wire::metadata_path(&self.mount, &self.path_prefix, &t, &r),
+        )
+    }
+
+    /// Reads version `version` of `key` (`GET ...?version=N`); `None` when it
+    /// is missing, deleted or destroyed (a `404`).
     ///
     /// # Errors
     /// [`CredStoreError::ServiceUnavailable`] on a network failure or a
     /// backend `5xx`; [`CredStoreError::Internal`] on an unexpected response
-    /// shape.
+    /// shape or a non-numeric version.
     pub async fn get_value(
         &self,
-        tenant_id: &TenantId,
-        value_id: &ValueId,
+        key: &StoreKey,
+        version: &ValueVersion,
     ) -> Result<Option<SecretValue>, CredStoreError> {
-        let path = wire::data_path(
-            &self.mount,
-            &self.path_prefix,
-            &tenant_id.0.to_string(),
-            &value_id.0.to_string(),
-        );
-        let url = wire::full_url(&self.address, &path);
+        let n = wire::parse_version(version.as_str())?;
+        let (data_path, _) = self.paths(key);
+        let url = format!("{}?version={n}", wire::full_url(&self.address, &data_path));
 
         let response = self
             .apply_headers(self.http.get(&url))
@@ -86,29 +90,20 @@ impl Service {
             .map(|maybe_bytes| maybe_bytes.map(SecretValue::new))
     }
 
-    /// Writes a brand-new, immutable entry at `(tenant_id, value_id)` using
-    /// a KV v2 create-only (`cas: 0`) write.
+    /// Writes a new version under `key` (no `cas`) and returns the version
+    /// number the backend assigned, as a string.
     ///
     /// # Errors
-    /// [`CredStoreError::Conflict`] if the backend already holds a version
-    /// at this path (the check-and-set guard rejects it) —
-    /// `CredStorePluginClientV1::put`'s required immutability guarantee.
     /// [`CredStoreError::ServiceUnavailable`] / [`CredStoreError::Internal`]
     /// as in [`Self::get_value`].
     pub async fn put_value(
         &self,
-        tenant_id: &TenantId,
-        value_id: &ValueId,
+        key: &StoreKey,
         value: SecretValue,
-    ) -> Result<(), CredStoreError> {
-        let path = wire::data_path(
-            &self.mount,
-            &self.path_prefix,
-            &tenant_id.0.to_string(),
-            &value_id.0.to_string(),
-        );
-        let url = wire::full_url(&self.address, &path);
-        let body = wire::PutRequestBody::create_only(wire::encode_value(value.as_bytes()));
+    ) -> Result<ValueVersion, CredStoreError> {
+        let (data_path, _) = self.paths(key);
+        let url = wire::full_url(&self.address, &data_path);
+        let body = wire::PutRequestBody::new(wire::encode_value(value.as_bytes()));
 
         let response = self
             .apply_headers(self.http.post(&url))
@@ -119,27 +114,18 @@ impl Service {
         let status = response.status();
         let response_body = response.text().await.unwrap_or_default();
 
-        wire::classify_put_response(status, &response_body)
+        wire::classify_put_response(status, &response_body).map(ValueVersion::new)
     }
 
-    /// Deletes all versions at `(tenant_id, value_id)` by removing the KV v2
-    /// metadata entry. Idempotent: a `404` (nothing to delete) is success.
+    /// Deletes the key with all versions by removing the KV v2 metadata
+    /// entry. Idempotent: a `404` (nothing to delete) is success.
     ///
     /// # Errors
     /// [`CredStoreError::ServiceUnavailable`] / [`CredStoreError::Internal`]
     /// as in [`Self::get_value`].
-    pub async fn delete_value(
-        &self,
-        tenant_id: &TenantId,
-        value_id: &ValueId,
-    ) -> Result<(), CredStoreError> {
-        let path = wire::metadata_path(
-            &self.mount,
-            &self.path_prefix,
-            &tenant_id.0.to_string(),
-            &value_id.0.to_string(),
-        );
-        let url = wire::full_url(&self.address, &path);
+    pub async fn delete_key_value(&self, key: &StoreKey) -> Result<(), CredStoreError> {
+        let (_, metadata_path) = self.paths(key);
+        let url = wire::full_url(&self.address, &metadata_path);
 
         let response = self
             .apply_headers(self.http.delete(&url))
@@ -148,6 +134,53 @@ impl Service {
             .map_err(|e| map_reqwest_err(&e))?;
 
         wire::classify_delete_response(response.status())
+    }
+
+    /// Destroys versions of `key`: `Below(N)` lists the live versions from
+    /// the metadata and destroys those older than `N`; `Exactly(N)` destroys
+    /// `[N]`. Idempotent; a missing key is success.
+    ///
+    /// # Errors
+    /// [`CredStoreError::ServiceUnavailable`] / [`CredStoreError::Internal`]
+    /// as in [`Self::get_value`].
+    pub async fn destroy_value(
+        &self,
+        key: &StoreKey,
+        selector: &DestroySelector,
+    ) -> Result<(), CredStoreError> {
+        let versions = match selector {
+            DestroySelector::Exactly(v) => vec![wire::parse_version(v.as_str())?],
+            DestroySelector::Below(v) => {
+                let n = wire::parse_version(v.as_str())?;
+                let (_, metadata_path) = self.paths(key);
+                let url = wire::full_url(&self.address, &metadata_path);
+                let response = self
+                    .apply_headers(self.http.get(&url))
+                    .send()
+                    .await
+                    .map_err(|e| map_reqwest_err(&e))?;
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                wire::classify_metadata_response(status, &body)?
+                    .into_iter()
+                    .filter(|x| *x < n)
+                    .collect()
+            }
+        };
+        if versions.is_empty() {
+            return Ok(());
+        }
+        let (t, r) = (key.tenant_id.0.to_string(), key.record_id.to_string());
+        let path = wire::destroy_path(&self.mount, &self.path_prefix, &t, &r);
+        let url = wire::full_url(&self.address, &path);
+        let response = self
+            .apply_headers(self.http.post(&url))
+            .json(&wire::DestroyRequestBody { versions })
+            .send()
+            .await
+            .map_err(|e| map_reqwest_err(&e))?;
+
+        wire::classify_destroy_response(response.status())
     }
 }
 

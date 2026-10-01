@@ -20,6 +20,11 @@ pub enum DomainError {
     NotFound,
     #[error("secret already exists")]
     Conflict,
+    /// The decisive record resolved and the caller may read its secret, but
+    /// the record's `expires_at` has passed: the secret is never served, and
+    /// resolution does not continue to an ancestor's value.
+    #[error("secret expired")]
+    SecretExpired,
     #[error("version precondition failed")]
     VersionConflict,
     #[error("invalid precondition: {detail}")]

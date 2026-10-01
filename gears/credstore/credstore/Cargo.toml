@@ -20,6 +20,9 @@ workspace = true
 
 [dependencies]
 credstore-sdk = { workspace = true }
+# Audit events for secret reads and writes (`cpt-cf-credstore-nfr-audit`).
+# Resolved lazily from the ClientHub; the broker is never a hard init dependency.
+event-broker-sdk = { workspace = true }
 toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
@@ -38,16 +41,9 @@ axum = { workspace = true }
 # Bounded-concurrency value reads in secret-mode list (ADR-0005 §4.6):
 # `stream::iter(...).buffer_unordered(SECRET_READ_CONCURRENCY)`.
 futures = { workspace = true }
-# Value-fingerprint fence (docs/features/001-value-fingerprint-fence.md):
-# HMAC-SHA256 over the backend value + fence-key generation via AWS-LC
-# (aws-lc-rs) — the workspace's FIPS-capable crypto backend, so the fence runs
-# through the validated module under a `--features fips` build (RustCrypto's
-# pure-Rust sha2/hmac, banned by the DE0708 FIPS-hasher lint, cannot).
+# SHA-256 for the weak ETag hash in the REST layer (AWS-LC, the workspace's
+# FIPS-capable crypto backend).
 aws-lc-rs = { workspace = true }
-# Non-crypto retry jitter only (fence-key bootstrap de-sync); not key material.
-rand = { workspace = true }
-# Zeroize the in-process cached fence key on drop (highest-value single secret).
-zeroize = { workspace = true }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
 serde = { workspace = true }
@@ -57,6 +53,8 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+# `Utc::now()` stamps the audit event's `occurred_at`.
+chrono = { workspace = true, features = ["clock"] }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 time = { workspace = true }

@@ -3,8 +3,9 @@
 //!
 //! Out-of-band value seeding (secrets keyed by tenant/reference/owner in this
 //! plugin's own config) is withdrawn by ADR-0006: a value now enters the
-//! store only through the gear's write protocol, which mints its own
-//! `value_id` and never has a `reference` or `owner_id` to hand the plugin.
+//! store only through the gear's write protocol, which puts the bytes
+//! under the record's key and never has a `reference` or `owner_id` to hand
+//! the plugin.
 //! What remains here is purely GTS-instance registration input (vendor,
 //! priority).
 use serde::Deserialize;

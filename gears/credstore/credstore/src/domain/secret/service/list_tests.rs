@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use credstore_sdk::{
     CredentialPatch, CredentialStatus, CredentialWrite, Fallback as SdkFallback, InheritanceStatus,
-    OwnerId, PatchField, SecretRef, SecretType, SecretValue, SharingMode, TenantId, ValueId,
+    OwnerId, PatchField, SecretRef, SecretType, SecretValue, SharingMode, TenantId, ValueVersion,
 };
 use time::OffsetDateTime;
 use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, SortDir};
@@ -16,7 +16,7 @@ use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
 use crate::domain::secret::model::{Fallback, SecretRow, SecretStatus};
 use crate::domain::secret::repo::SecretRepo;
-use crate::domain::secret::service::{GcSettings, ListSettings, Service};
+use crate::domain::secret::service::{ListSettings, Service};
 use crate::domain::secret::test_support::*;
 
 fn key(s: &str) -> SecretRef {
@@ -70,10 +70,6 @@ fn service_with(
         Arc::new(FakePluginSelector::new(plugin)) as Arc<dyn PluginSelector>,
         catalog_type_resolver(),
         Arc::new(NoopMetrics),
-        GcSettings {
-            pending_max_age_secs: 3600,
-            batch_size: 256,
-        },
         ListSettings {
             max_limit,
             secret_mode_cap,
@@ -102,10 +98,6 @@ fn service_with_metrics(
         Arc::new(FakePluginSelector::new(plugin)) as Arc<dyn PluginSelector>,
         catalog_type_resolver(),
         metrics,
-        GcSettings {
-            pending_max_age_secs: 3600,
-            batch_size: 256,
-        },
         ListSettings {
             max_limit: 200,
             secret_mode_cap: 25,
@@ -443,10 +435,17 @@ async fn full_page_reflects_only_the_permitted_types_step_1_clamp() {
 
     let clamps = repo.list_candidate_references_type_clamps();
     assert_eq!(clamps.len(), 1, "step 1 must run exactly once");
-    assert_eq!(
-        clamps[0],
-        Some(vec![generic_uuid]),
-        "step 1's type clamp must be exactly the PDP-permitted set"
+    // The PDP answered the base type once, with a `secret_type` constraint
+    // covering every catalog type but the denied one; step 1 received exactly
+    // that set as its SQL type predicate.
+    let clamp = clamps[0].clone().expect("step 1 carries a type predicate");
+    assert!(
+        clamp.contains(&generic_uuid),
+        "permitted type is in the clamp"
+    );
+    assert!(
+        !clamp.contains(&SecretType::from_name("api-key").expect("known").uuid()),
+        "denied type is not in the clamp"
     );
 }
 
@@ -573,9 +572,7 @@ async fn a_winner_of_an_unpermitted_type_is_an_invariant_violation_not_a_denial(
         updated_at: now,
         secret_type_uuid: denied_type_uuid,
         expires_at: None,
-        value_id: Some(ValueId::new_v4()),
-        value_fp: Some(vec![0u8; 32]),
-        fp_key_id: Some(1),
+        value_version: Some(ValueVersion::new("1")),
         fallback: Fallback::Inherit,
     });
     // Ancestor, shared row of the PERMITTED type — this is what makes the
@@ -591,9 +588,7 @@ async fn a_winner_of_an_unpermitted_type_is_an_invariant_violation_not_a_denial(
         updated_at: now,
         secret_type_uuid: permitted_type_uuid,
         expires_at: None,
-        value_id: Some(ValueId::new_v4()),
-        value_fp: Some(vec![0u8; 32]),
-        fp_key_id: Some(1),
+        value_version: Some(ValueVersion::new("1")),
         fallback: Fallback::Inherit,
     });
 
@@ -980,7 +975,7 @@ async fn secret_mode_reads_values_with_bounded_concurrency() {
     // 6 references leave headroom under SECRET_READ_CONCURRENCY (8) to
     // actually overlap rather than merely queueing.
     for row in repo.rows() {
-        plugin.set_delay_ms(&row.tenant_id, row.value_id.expect("value id"), 10);
+        plugin.set_delay_ms(&row.store_key(), 10);
     }
 
     let selector = refs
@@ -1032,7 +1027,7 @@ async fn secret_mode_value_reads_preserve_reference_order() {
             .position(|r| *r == row.reference)
             .expect("known reference");
         let delay_ms = (refs.len() - idx) as u64 * 5;
-        plugin.set_delay_ms(&row.tenant_id, row.value_id.expect("value id"), delay_ms);
+        plugin.set_delay_ms(&row.store_key(), delay_ms);
     }
 
     let selector = refs
@@ -1077,10 +1072,7 @@ async fn secret_mode_one_read_failure_fails_the_whole_request() {
         .into_iter()
         .find(|r| r.reference == "r2")
         .expect("r2 row");
-    plugin.fail_get_for(
-        &failing_row.tenant_id,
-        failing_row.value_id.expect("value id"),
-    );
+    plugin.fail_get_for(&failing_row.store_key());
 
     let query = secret_mode_query("reference in ('r1', 'r2', 'r3')");
     let err = svc
@@ -1117,10 +1109,7 @@ async fn secret_mode_refused_item_is_omitted_others_present() {
         .into_iter()
         .find(|r| r.reference == "r2")
         .expect("r2 row");
-    plugin.deny_get_for(
-        &refused_row.tenant_id,
-        refused_row.value_id.expect("value id"),
-    );
+    plugin.deny_get_for(&refused_row.store_key());
 
     let query = secret_mode_query("reference in ('r1', 'r2', 'r3')");
     let page = svc.list(&ctx, &query).await.expect("list");
@@ -1189,4 +1178,242 @@ fn odata_errors_map_onto_the_domain_rejection_the_rest_boundary_renders() {
             "{internal:?} must map to Internal"
         );
     }
+}
+
+// ── expiry applies to the secret, not to the record ─────────────────────────
+
+#[tokio::test]
+async fn metadata_list_shows_an_expired_record_with_status_expired() {
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir_parent = Arc::new(FakeDir::single(parent));
+    let dir_child = Arc::new(FakeDir::new(vec![child, parent]));
+    let svc_parent = service_with(
+        repo.clone(),
+        plugin.clone(),
+        dir_parent,
+        mock_enforcer(),
+        200,
+        25,
+    );
+    let svc_child = service_with(repo.clone(), plugin, dir_child, mock_enforcer(), 200, 25);
+    let parent_ctx = make_ctx(Uuid::new_v4(), parent);
+    let child_ctx = make_ctx(Uuid::new_v4(), child);
+
+    svc_parent
+        .put(
+            &parent_ctx,
+            &key("over"),
+            write_generic(SharingMode::Shared, "p"),
+            create_only(),
+        )
+        .await
+        .expect("parent shared");
+    svc_child
+        .put(
+            &child_ctx,
+            &key("over"),
+            write_generic(SharingMode::Tenant, "c"),
+            create_only(),
+        )
+        .await
+        .expect("child override");
+    svc_parent
+        .put(
+            &parent_ctx,
+            &key("inh"),
+            write_generic(SharingMode::Shared, "p"),
+            create_only(),
+        )
+        .await
+        .expect("parent shared");
+    svc_child
+        .put(
+            &child_ctx,
+            &key("live"),
+            write_generic(SharingMode::Tenant, "l"),
+            create_only(),
+        )
+        .await
+        .expect("child live");
+    for row in repo.rows() {
+        let expire = (row.reference == "over" && row.tenant_id == TenantId(child))
+            || (row.reference == "inh" && row.tenant_id == TenantId(parent));
+        if expire {
+            repo.force_expire(row.id);
+        }
+    }
+
+    let page = svc_child
+        .list(&child_ctx, &ODataQuery::new())
+        .await
+        .expect("list");
+    assert_eq!(references_of(&page), vec!["inh", "live", "over"]);
+    let by_ref = |name: &str| {
+        &page
+            .items
+            .iter()
+            .find(|i| i.credential.reference.as_ref() == name)
+            .expect("item")
+            .credential
+    };
+    // The caller's own expired override: status `expired`, normal validator,
+    // still an override (the ancestor's value is not consulted).
+    assert_eq!(by_ref("over").status, CredentialStatus::Expired);
+    assert_eq!(by_ref("over").inheritance, InheritanceStatus::Overridden);
+    assert!(by_ref("over").validator.is_some());
+    // An expired inherited record: no own row, `expires_at` in the past.
+    assert_eq!(by_ref("inh").status, CredentialStatus::None);
+    assert_eq!(by_ref("inh").inheritance, InheritanceStatus::Inherited);
+    assert!(by_ref("inh").expires_at.expect("expiry") <= OffsetDateTime::now_utc());
+    assert_eq!(by_ref("live").status, CredentialStatus::Active);
+    assert!(page.items.iter().all(|i| i.secret.is_none()));
+}
+
+#[tokio::test]
+async fn secret_mode_returns_an_expired_item_without_a_secret_and_does_not_fail() {
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir_parent = Arc::new(FakeDir::single(parent));
+    let dir_child = Arc::new(FakeDir::new(vec![child, parent]));
+    let svc_parent = service_with(
+        repo.clone(),
+        plugin.clone(),
+        dir_parent,
+        mock_enforcer(),
+        200,
+        25,
+    );
+    let svc_child = service_with(repo.clone(), plugin, dir_child, mock_enforcer(), 200, 25);
+    let parent_ctx = make_ctx(Uuid::new_v4(), parent);
+    let child_ctx = make_ctx(Uuid::new_v4(), child);
+
+    // r1 has a parent value and an expired child override; r0 and r2 are live.
+    svc_parent
+        .put(
+            &parent_ctx,
+            &key("r1"),
+            write_generic(SharingMode::Shared, "parent-value"),
+            create_only(),
+        )
+        .await
+        .expect("parent shared");
+    for name in ["r0", "r1", "r2"] {
+        svc_child
+            .put(
+                &child_ctx,
+                &key(name),
+                write_generic(SharingMode::Tenant, name),
+                create_only(),
+            )
+            .await
+            .expect("child create");
+    }
+    let expired = repo
+        .rows()
+        .into_iter()
+        .find(|r| r.reference == "r1" && r.tenant_id == TenantId(child))
+        .expect("child r1");
+    repo.force_expire(expired.id);
+
+    let query = secret_mode_query("reference in ('r0', 'r1', 'r2')");
+    let page = svc_child
+        .list(&child_ctx, &query)
+        .await
+        .expect("an expired item does not fail the request");
+
+    assert_eq!(references_of(&page), vec!["r0", "r1", "r2"]);
+    assert_eq!(
+        page.items[0].secret.as_ref().expect("secret").as_bytes(),
+        b"r0"
+    );
+    assert_eq!(page.items[1].credential.status, CredentialStatus::Expired);
+    assert!(
+        page.items[1].secret.is_none(),
+        "no secret for the expired item, and never the ancestor's value"
+    );
+    assert_eq!(
+        page.items[2].secret.as_ref().expect("secret").as_bytes(),
+        b"r2"
+    );
+}
+
+#[tokio::test]
+async fn secret_mode_with_only_expired_items_returns_them_without_secrets() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = default_service(repo.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    svc.put(
+        &ctx,
+        &key("only"),
+        write_generic(SharingMode::Tenant, "v"),
+        create_only(),
+    )
+    .await
+    .expect("create");
+    repo.force_expire(repo.rows()[0].id);
+
+    let page = svc
+        .list(&ctx, &secret_mode_query("reference eq 'only'"))
+        .await
+        .expect("list");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].credential.status, CredentialStatus::Expired);
+    assert!(page.items[0].secret.is_none());
+}
+
+// ── reference-scoped grants (ADR-0010) ───────────────────────────────────────
+
+#[tokio::test]
+async fn listing_omits_non_admitted_references_in_metadata_and_secret_mode() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    let setup = service_with(
+        repo.clone(),
+        plugin.clone(),
+        dir.clone(),
+        mock_enforcer(),
+        200,
+        25,
+    );
+    for name in ["smtp-password", "other", "third"] {
+        setup
+            .put(
+                &ctx,
+                &key(name),
+                write_generic(SharingMode::Tenant, name),
+                create_only(),
+            )
+            .await
+            .expect("create");
+    }
+
+    let svc = service_with(
+        repo,
+        plugin,
+        dir,
+        reference_enforcer(&["smtp-password"], None),
+        200,
+        25,
+    );
+    let page = svc.list(&ctx, &ODataQuery::new()).await.expect("list");
+    assert_eq!(references_of(&page), vec!["smtp-password"]);
+
+    let query = secret_mode_query("reference in ('smtp-password', 'other', 'third')");
+    let page = svc.list(&ctx, &query).await.expect("list secrets");
+    assert_eq!(references_of(&page), vec!["smtp-password"]);
+    assert_eq!(
+        page.items[0].secret.as_ref().expect("value").as_bytes(),
+        b"smtp-password"
+    );
 }

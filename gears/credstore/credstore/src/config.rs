@@ -1,12 +1,11 @@
 //! Validated credential-store configuration.
 //!
-//! Controls backend plugin selection, hierarchy-cache lifetime, and the
-//! periodic maintenance job's (`credstore gc`) batch size and pending-age
-//! threshold (ADR-0006). There is no in-gear resident timer any more: the
-//! `reaper` config block (`tick_secs`, `provisioning_timeout_secs`,
-//! `deprovisioning_timeout_secs`) is withdrawn outright, not renamed —
-//! `deny_unknown_fields` makes an old `reaper:` key a hard config-validation
-//! failure rather than a silently ignored no-op.
+//! Controls backend plugin selection, hierarchy-cache lifetime and the
+//! collection-read caps. ADR-0006 withdraws the `reaper` block (`tick_secs`,
+//! `provisioning_timeout_secs`, `deprovisioning_timeout_secs`) and there is
+//! no `gc` block either: the gear has no resident loop and no maintenance
+//! job. `deny_unknown_fields` makes an old `reaper:` or `gc:` key a hard
+//! config-validation failure rather than a silently ignored no-op.
 
 use serde::Deserialize;
 
@@ -15,7 +14,6 @@ use serde::Deserialize;
 pub struct CredStoreConfig {
     pub vendor: String,
     pub hierarchy: HierarchyCfg,
-    pub gc: GcCfg,
     pub list: ListCfg,
 }
 
@@ -24,7 +22,6 @@ impl Default for CredStoreConfig {
         Self {
             vendor: "constructorfabric".to_owned(),
             hierarchy: HierarchyCfg::default(),
-            gc: GcCfg::default(),
             list: ListCfg::default(),
         }
     }
@@ -44,36 +41,10 @@ impl Default for HierarchyCfg {
     }
 }
 
-/// Settings for the periodic maintenance job (`credstore gc`), read by that
-/// admin entrypoint (Phase 3), not by the gear's own `serve` lifecycle —
-/// nothing in the gear runs on a timer (ADR-0006 D7).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct GcCfg {
-    /// Age after which a `pending` gc entry with no row still referencing its
-    /// `value_id` is reclaimed (backend entry deleted, gc row dropped) — the
-    /// backstop for a write that crashed between its intent insert and its
-    /// row CAS.
-    pub pending_max_age_secs: u64,
-    /// Bounded batch size for both the expired-row sweep and the gc
-    /// drain/pending-reclaim passes.
-    pub batch_size: u64,
-}
-
-impl Default for GcCfg {
-    fn default() -> Self {
-        Self {
-            pending_max_age_secs: 3600,
-            batch_size: 256,
-        }
-    }
-}
-
 /// Settings for the collection read (`GET /credstore/v1/credentials`,
 /// ADR-0005/ADR-0004): the metadata-mode page-size cap and the secret-mode
-/// (`$select` containing `secret`) match-set cap. Neither is specified by a
-/// config key in the design docs; both are introduced here as the
-/// implementation's own knobs, named after the ADRs' proposed defaults.
+/// (`$select` containing `secret`) match-set cap. Both keys, `list.max_limit`
+/// and `list.secret_mode_cap`, are documented in DESIGN §4.3.2.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ListCfg {
@@ -104,12 +75,6 @@ impl CredStoreConfig {
         if self.vendor.trim().is_empty() {
             return Err("vendor must be non-empty".to_owned());
         }
-        if self.gc.pending_max_age_secs == 0 {
-            return Err("gc.pending_max_age_secs must be > 0".to_owned());
-        }
-        if self.gc.batch_size == 0 {
-            return Err("gc.batch_size must be > 0".to_owned());
-        }
         if self.hierarchy.ancestor_cache_ttl_secs == 0 {
             return Err("hierarchy.ancestor_cache_ttl_secs must be > 0".to_owned());
         }
@@ -135,8 +100,6 @@ mod tests {
         // resolves no backend plugin and 503s on every secret op.
         assert_eq!(cfg.vendor, "constructorfabric");
         assert_eq!(cfg.hierarchy.ancestor_cache_ttl_secs, 300);
-        assert_eq!(cfg.gc.pending_max_age_secs, 3600);
-        assert_eq!(cfg.gc.batch_size, 256);
         assert_eq!(cfg.list.max_limit, 200);
         assert_eq!(cfg.list.secret_mode_cap, 25);
         assert!(cfg.validate().is_ok());
@@ -145,12 +108,12 @@ mod tests {
     #[test]
     fn deserializes_partial_config_with_defaults() {
         let cfg: CredStoreConfig =
-            serde_json::from_str(r#"{"vendor":"acme","gc":{"batch_size":5}}"#)
+            serde_json::from_str(r#"{"vendor":"acme","list":{"max_limit":5}}"#)
                 .expect("deserialize");
         assert_eq!(cfg.vendor, "acme");
-        assert_eq!(cfg.gc.batch_size, 5);
+        assert_eq!(cfg.list.max_limit, 5);
         // Unspecified fields fall back to defaults.
-        assert_eq!(cfg.gc.pending_max_age_secs, 3600);
+        assert_eq!(cfg.list.secret_mode_cap, 25);
         assert_eq!(cfg.hierarchy.ancestor_cache_ttl_secs, 300);
     }
 
@@ -165,31 +128,13 @@ mod tests {
 
     #[test]
     fn validate_rejects_each_invalid_field() {
-        use super::{GcCfg, HierarchyCfg, ListCfg};
+        use super::{HierarchyCfg, ListCfg};
 
         let empty_vendor = CredStoreConfig {
             vendor: String::new(),
             ..Default::default()
         };
         assert!(empty_vendor.validate().is_err());
-
-        let zero_pending_age = CredStoreConfig {
-            gc: GcCfg {
-                pending_max_age_secs: 0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(zero_pending_age.validate().is_err());
-
-        let zero_batch = CredStoreConfig {
-            gc: GcCfg {
-                batch_size: 0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(zero_batch.validate().is_err());
 
         let zero_ttl = CredStoreConfig {
             hierarchy: HierarchyCfg {
@@ -228,5 +173,15 @@ mod tests {
         )
         .expect_err("reaper key must be rejected");
         assert!(err.to_string().contains("reaper"));
+    }
+
+    #[test]
+    fn rejects_the_withdrawn_gc_config_block() {
+        // ADR-0006 withdraws the maintenance job and its `gc` block.
+        let err = serde_json::from_str::<CredStoreConfig>(
+            r#"{"gc":{"pending_max_age_secs":3600,"batch_size":256}}"#,
+        )
+        .expect_err("gc key must be rejected");
+        assert!(err.to_string().contains("gc"));
     }
 }

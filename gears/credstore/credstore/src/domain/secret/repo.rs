@@ -1,22 +1,19 @@
-//! Persistence port for secret metadata, value-version switching, and
-//! garbage-collection bookkeeping (ADR-0006: immutable value versions).
+//! Persistence port for secret metadata and value-pointer switching
+//! (ADR-0006: immutable value versions).
 //!
-//! Every method that changes more than one row/table runs as ONE database
-//! transaction — that is not negotiable: [`Self::insert_active`],
-//! [`Self::switch_value`], [`Self::delete_by_id`], and
-//! [`Self::delete_expired_row`] each pair a `credstore_secrets` mutation with
-//! its `credstore_value_gc` bookkeeping atomically.
+//! Every pointer switch is ONE database compare-and-set on the row `version`.
+//! [`Self::delete_by_id`] pairs the
+//! `credstore_secrets` mutation with the enqueue of a key purge in the
+//! platform transactional outbox, atomically in the same transaction.
 
 use async_trait::async_trait;
-use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId, ValueId};
+use credstore_sdk::{OwnerId, SecretRef, SharingMode, StoreKey, TenantId, ValueVersion};
 use time::OffsetDateTime;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{
-    Fallback, GcEntry, GcReason, NewDeclaredSecret, NewSecret, SecretRow,
-};
+use crate::domain::secret::model::{Fallback, NewDeclaredSecret, NewSecret, SecretRow};
 
 #[async_trait]
 pub trait SecretRepo: Send + Sync {
@@ -81,7 +78,9 @@ pub trait SecretRepo: Send + Sync {
         sharing: SharingMode,
     ) -> Result<Option<SecretRow>, DomainError>;
 
-    /// True iff `tenant` is within the read `scope` (closure-backed for subtree).
+    /// True iff `tenant` is within `scope`, ignoring credential-type
+    /// predicates (the fail-closed own-tenant gate; type narrowing is
+    /// applied by the lookups themselves).
     async fn scope_includes_tenant(
         &self,
         scope: &AccessScope,
@@ -95,10 +94,11 @@ pub trait SecretRepo: Send + Sync {
     /// own tenant: every sharing-visible row of any status; ancestors:
     /// resolution-eligible `shared` rows only — clamped by an exact
     /// `reference` set when the caller's `$filter` named one, and by
-    /// `type_uuid_in`, which the caller (the collection-read service) has
-    /// already narrowed to the PDP-permitted types intersected with the
-    /// caller's own `$filter type in (…)` before calling this (ADR-0005,
-    /// ADR-0010) — both invariant across a reference's chain. `DISTINCT
+    /// `type_scope`, a type-only scope the caller (the collection-read
+    /// service) derived from one PDP decision on the base credential type
+    /// and intersected with the caller's own `$filter type in (…)` (ADR-0005,
+    /// ADR-0010), applied through the secure ORM — both invariant across a
+    /// reference's chain. `DISTINCT
     /// reference`, ordered by `reference` (`desc` when `desc`),
     /// keyset-paginated by `cursor` (exclusive); fetches at most `limit`
     /// references. Never a `COUNT`.
@@ -112,25 +112,11 @@ pub trait SecretRepo: Send + Sync {
         subject: OwnerId,
         chain: &[Uuid],
         reference_in: Option<&[String]>,
-        type_uuid_in: Option<&[Uuid]>,
+        type_scope: &AccessScope,
         cursor: Option<&str>,
         desc: bool,
         limit: u64,
     ) -> Result<Vec<String>, DomainError>;
-
-    /// Distinct `secret_type_uuid`s among every row visible to the caller
-    /// across `chain` (the collection read's visibility predicate), clamped
-    /// by `type_uuid_in` when the caller's `$filter` named types. Feeds the
-    /// per-type PDP evaluation whose permitted set becomes step 1's type
-    /// clamp (ADR-0005, ADR-0010). Backed by `idx_credstore_type`; never a
-    /// `COUNT`.
-    async fn list_visible_types(
-        &self,
-        req_tenant: TenantId,
-        subject: OwnerId,
-        chain: &[Uuid],
-        type_uuid_in: Option<&[Uuid]>,
-    ) -> Result<Vec<Uuid>, DomainError>;
 
     /// Step 2: every visible row of `references`, whole and unclamped by
     /// type — exactly what [`Self::resolve_candidates`] would return for
@@ -144,53 +130,18 @@ pub trait SecretRepo: Send + Sync {
         references: &[String],
     ) -> Result<Vec<SecretRow>, DomainError>;
 
-    // ── Garbage-collection bookkeeping (`credstore_value_gc`) ───────────────
+    // ── Write protocol (ADR-0006 section 6.2) ───────────────────────────────
 
-    /// Record a write's intent: `INSERT credstore_value_gc(value_id, tenant_id,
-    /// reason = pending)` — the durable trace that bytes were about to be
-    /// written, before the backend call. Unscoped: the gc table carries no
-    /// PDP-relevant data (§4.7's data-domain note).
-    async fn gc_insert_pending(
-        &self,
-        value_id: ValueId,
-        tenant_id: TenantId,
-    ) -> Result<(), DomainError>;
-
-    /// Delete a gc entry by id. Returns whether a row was removed (a
-    /// best-effort caller treats either outcome as done).
-    async fn gc_delete(&self, value_id: ValueId) -> Result<bool, DomainError>;
-
-    /// Mark an existing gc entry's `reason` (e.g. a CAS loser's version →
-    /// `Aborted`). Returns `false` if no entry exists for `value_id`.
-    async fn gc_mark(&self, value_id: ValueId, reason: GcReason) -> Result<bool, DomainError>;
-
-    /// Up to `limit` gc entries ordered by `enqueued_at` (oldest first) —
-    /// the maintenance job's batch source for both its gc-drain and
-    /// pending-reclaim passes.
-    async fn gc_list(&self, limit: u64) -> Result<Vec<GcEntry>, DomainError>;
-
-    /// `EXISTS` — via `SELECT … LIMIT 1`, never `COUNT` (platform rule) —
-    /// whether any row currently points at `value_id`. The maintenance job's
-    /// pending-reclaim pass uses this as its defensive backstop before ever
-    /// deleting a `pending` entry's backend bytes.
-    async fn is_value_referenced(&self, value_id: ValueId) -> Result<bool, DomainError>;
-
-    // ── Write protocol (ADR-0006 §6.2) ──────────────────────────────────────
-
-    /// Create step 4: ONE transaction — `INSERT` the row `active` pointing at
-    /// `new.value_id` (with its fence stamp and `new.fallback`), and `DELETE`
-    /// the matching `pending` gc entry (the intent is now realized). A
-    /// unique-index conflict on the reference's own create-only uniqueness
-    /// maps to the existing `Conflict` error; `new.value_id` is fresh, so it
-    /// never collides with `uq_credstore_value_id` itself.
+    /// Create step 3: `INSERT` the row `active`, pointing at
+    /// `new.value_version` (with `new.fallback`). A unique-index conflict on
+    /// the reference's own create-only uniqueness maps to the existing
+    /// `Conflict` error (a definite loss).
     async fn insert_active(&self, scope: &AccessScope, new: &NewSecret) -> Result<(), DomainError>;
 
     /// Create-with-no-value path (ADR-0004 Amendment B, "The value-less
     /// record: reached only on purpose"): ONE plain `INSERT` — `status =
-    /// declared`, `value_id`/`value_fp`/`fp_key_id` all `NULL`. No gc intent
-    /// is recorded and no plugin call is ever made — there is no backend
-    /// entry to protect. A unique-index conflict on the reference's own
-    /// create-only uniqueness maps to the existing `Conflict` error, exactly
+    /// declared`, `value_version` `NULL`. No plugin call is ever made. A
+    /// unique-index conflict maps to the existing `Conflict` error, exactly
     /// like [`Self::insert_active`].
     async fn insert_declared(
         &self,
@@ -198,21 +149,17 @@ pub trait SecretRepo: Send + Sync {
         new: &NewDeclaredSecret,
     ) -> Result<(), DomainError>;
 
-    /// Overwrite step 4: ONE transaction —
-    /// `UPDATE … SET value_id = new_value_id, value_fp, fp_key_id, sharing,
-    /// fallback, expires_at, version = version + 1, updated_at = now(),
-    /// status = active WHERE id = ? AND status IN (active, declared) [AND
-    /// version = ?]`; 0 rows affected → `Ok(None)` (the caller maps this to
-    /// `Conflict`/`VersionConflict`). Accepts a **`declared`** current row —
-    /// `PUT`'s replace leg and `PATCH {"secret": …}` both switch a `declared`
-    /// row to `active` this way (ADR-0004, "Writing a value to a suppressed
-    /// record is not a conflict"). On success, in the same transaction:
-    /// `DELETE` the `pending` entry for `new_value_id`, and — reading the
-    /// row's previous `value_id` inside the transaction (locked, so a
-    /// concurrent switch can't race the read) — if it was not `None`,
-    /// `INSERT` a `superseded` gc entry for it. Returns the post-write row
-    /// plus the previous `value_id` (for the caller's best-effort backend
-    /// cleanup).
+    /// Overwrite step 3: ONE compare-and-set —
+    /// `UPDATE … SET value_version = new_value_version, sharing, fallback,
+    /// expires_at, version = version + 1, updated_at = now(), status = active
+    /// WHERE id = ? AND version = expected_version`; 0 rows affected →
+    /// `Ok(None)` (a definite loss; the caller maps it to a conflict).
+    /// `expected_version` is always the row version the caller read in step 1,
+    /// whatever the client precondition: the ordering argument that makes
+    /// `destroy(Below)` safe holds only for a CAS on the version read before
+    /// the `put`. Accepts a **`declared`** current row — `PUT`'s replace leg
+    /// and `PATCH {"secret": …}` both switch a `declared` row to `active`
+    /// this way (ADR-0004). Returns the post-write row.
     #[allow(
         clippy::too_many_arguments,
         reason = "one CAS with every field it may update"
@@ -221,20 +168,18 @@ pub trait SecretRepo: Send + Sync {
         &self,
         scope: &AccessScope,
         id: Uuid,
-        expected_version: Option<i64>,
+        expected_version: i64,
         sharing: SharingMode,
         fallback: Fallback,
         expires_at: Option<OffsetDateTime>,
-        new_value_id: ValueId,
-        value_fp: Vec<u8>,
-        fp_key_id: i16,
-    ) -> Result<Option<(SecretRow, Option<ValueId>)>, DomainError>;
+        new_value_version: ValueVersion,
+    ) -> Result<Option<SecretRow>, DomainError>;
 
     /// Metadata-only update (ADR-0004 `PATCH` with no `value` key): ONE
     /// transaction — `UPDATE … SET sharing, fallback, expires_at, version =
     /// version + 1, updated_at = now() WHERE id = ? [AND version = ?]`;
-    /// never touches `value_id`/`value_fp`/`fp_key_id` or `status`. 0 rows
-    /// affected → `Ok(None)` (version mismatch or the row vanished).
+    /// never touches `value_version` or `status`. 0 rows affected →
+    /// `Ok(None)` (version mismatch or the row vanished).
     async fn update_metadata(
         &self,
         scope: &AccessScope,
@@ -245,15 +190,13 @@ pub trait SecretRepo: Send + Sync {
         expires_at: Option<OffsetDateTime>,
     ) -> Result<Option<SecretRow>, DomainError>;
 
-    /// Value-removal write (ADR-0004 `PATCH {"secret": null}`, "How a record
-    /// reaches it"): ONE transaction — `UPDATE … SET value_id = NULL, status
-    /// = declared, value_fp = NULL, fp_key_id = NULL, sharing, fallback,
-    /// expires_at, version = version + 1, updated_at = now() WHERE id = ?
-    /// [AND version = ?]`, plus `INSERT gc(old_value_id, removed)` in the
-    /// same transaction if the row held a value. 0 rows affected → `Ok(None)`.
-    /// Returns the post-write (now `declared`) row plus the value id the
-    /// caller best-effort deletes from the backend (`None` if the row was
-    /// already `declared`, e.g. an idempotent re-send).
+    /// Secret removal (ADR-0004 `PATCH {"secret": null}`): ONE compare-and-set
+    /// — `UPDATE … SET value_version = NULL, status = declared, sharing,
+    /// fallback, expires_at, version = version + 1, updated_at = now() WHERE
+    /// id = ? [AND version = ?]`. 0 rows affected → `Ok(None)`. Returns the
+    /// post-write (now `declared`) row plus the value version the row held
+    /// (read under the same lock; `None` if it was already `declared`) so the
+    /// caller can best-effort `destroy` it. Never touches the store.
     async fn remove_value(
         &self,
         scope: &AccessScope,
@@ -262,28 +205,17 @@ pub trait SecretRepo: Send + Sync {
         sharing: SharingMode,
         fallback: Fallback,
         expires_at: Option<OffsetDateTime>,
-    ) -> Result<Option<(SecretRow, Option<ValueId>)>, DomainError>;
+    ) -> Result<Option<(SecretRow, Option<ValueVersion>)>, DomainError>;
 
-    /// Delete step 2: ONE transaction — `DELETE` the row (0 rows affected →
-    /// the existing not-found/conflict semantics, i.e. `DomainError::NotFound`)
-    /// and, if it held a value, `INSERT` a `removed` gc entry for it. Returns
-    /// the row's `value_id` (`None` if it was already `declared`) for the
-    /// caller's best-effort backend cleanup.
+    /// Delete record (section 6.3): ONE transaction — `DELETE` the row (CAS
+    /// on `expected_version` when given; 0 rows affected →
+    /// `DomainError::NotFound`) and enqueue an outbox `purge(key)` message,
+    /// where `key = (tenant_id, id)`. The outbox wake is fired after the
+    /// commit.
     async fn delete_by_id(
         &self,
         scope: &AccessScope,
-        id: Uuid,
+        key: &StoreKey,
         expected_version: Option<i64>,
-    ) -> Result<Option<ValueId>, DomainError>;
-
-    // ── Maintenance job support (ADR-0006 §6.4) ─────────────────────────────
-
-    /// Up to `limit` `active` rows past their `expires_at` (unscoped — the
-    /// job runs without a caller).
-    async fn list_expired(&self, limit: u64) -> Result<Vec<SecretRow>, DomainError>;
-
-    /// The same one-transaction delete as [`Self::delete_by_id`] (row delete +
-    /// `removed` gc insert), unscoped and without a version gate — the
-    /// maintenance job owns the row outright once it is past `expires_at`.
-    async fn delete_expired_row(&self, id: Uuid) -> Result<Option<ValueId>, DomainError>;
+    ) -> Result<(), DomainError>;
 }

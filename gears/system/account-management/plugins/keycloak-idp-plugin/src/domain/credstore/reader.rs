@@ -38,6 +38,8 @@ impl CredStoreReader {
     ///
     /// # Errors
     ///
+    /// * [`CredStoreError::SecretExpired`] when the record exists but its
+    ///   secret has expired (never served; renew the credential).
     /// * Any infrastructure failure surfaced by the underlying client.
     /// * [`CredStoreError::Internal`] if the stored value is not valid UTF-8
     ///   (the plugin only stores UTF-8 client secrets — non-UTF-8 indicates

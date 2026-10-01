@@ -8,9 +8,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, CredStoreMaintenanceV1, Credential, CredentialListItem,
-    CredentialPatch, CredentialWrite, GcReport, PutOutcome, PutPrecondition, Secret, SecretRef,
-    Validator,
+    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
+    CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef, Validator,
 };
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
@@ -47,6 +46,7 @@ impl From<DomainError> for CredStoreError {
     fn from(err: DomainError) -> Self {
         match err {
             DomainError::NotFound => CredStoreError::NotFound,
+            DomainError::SecretExpired => CredStoreError::SecretExpired,
             // Both are 409-class; the SDK has no distinct optimistic-lock variant.
             DomainError::Conflict | DomainError::VersionConflict => CredStoreError::Conflict,
             DomainError::InvalidSecretRef { detail } => CredStoreError::invalid_ref(detail),
@@ -122,7 +122,7 @@ impl CredStoreClientV1 for CredStoreLocalClient {
             // `Ok(None)` covers "does not exist", "inaccessible", and
             // "suppressed" alike. The service's `NotFound` (a resolved row
             // whose backend value is missing even after the read protocol's
-            // one retry against its current `value_id` — ADR-0006) is the
+            // one re-read of its current `value_version` — ADR-0006) is the
             // same surface, so fold it rather than leak an error the
             // contract does not admit.
             Err(DomainError::NotFound) => Ok(None),
@@ -174,18 +174,6 @@ impl CredStoreClientV1 for CredStoreLocalClient {
         query: &ODataQuery,
     ) -> Result<Page<CredentialListItem>, CredStoreError> {
         self.svc.list(ctx, query).await.map_err(Into::into)
-    }
-}
-
-#[async_trait]
-impl CredStoreMaintenanceV1 for CredStoreLocalClient {
-    async fn run_gc(&self, ctx: &SecurityContext) -> Result<GcReport, CredStoreError> {
-        let report = self.svc.run_gc(ctx).await.map_err(CredStoreError::from)?;
-        Ok(GcReport {
-            expired_deleted: report.expired_deleted,
-            gc_deleted: report.gc_deleted,
-            gc_pending_reclaimed: report.gc_pending_reclaimed,
-        })
     }
 }
 

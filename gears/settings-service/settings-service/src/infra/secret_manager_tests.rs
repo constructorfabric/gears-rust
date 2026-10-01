@@ -8,11 +8,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, GetSecretResponse, SecretRef, SecretValue, SharingMode,
-    TenantId, WriteOptions, WritePrecondition,
+    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
+    CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, SharingMode,
+    Validator, WritePrecondition,
 };
 use secrecy::ExposeSecret;
 use serde_json::json;
+use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -40,6 +42,8 @@ struct MemoryCredStore {
     /// decides which principal type the grant is looked up for.
     presented_subject_types: Mutex<Vec<Option<String>>>,
     down: std::sync::atomic::AtomicBool,
+    /// When set, the store reports every stored secret as expired.
+    expired: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryCredStore {
@@ -88,64 +92,89 @@ impl MemoryCredStore {
 impl CredStoreClientV1 for MemoryCredStore {
     async fn get(
         &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+    ) -> Result<Option<Credential>, CredStoreError> {
+        // The gear reads values only; the record read is not part of its path.
+        Err(CredStoreError::Internal("record read not modelled".into()))
+    }
+
+    async fn get_secret(
+        &self,
         ctx: &SecurityContext,
         key: &SecretRef,
-    ) -> Result<Option<GetSecretResponse>, CredStoreError> {
+    ) -> Result<Option<Secret>, CredStoreError> {
         self.check()?;
         let slot = self.slot(ctx, key, SharingMode::Private);
+        if self.expired.load(std::sync::atomic::Ordering::SeqCst)
+            && self.entries.lock().expect("lock").contains_key(&slot)
+        {
+            return Err(CredStoreError::SecretExpired);
+        }
         Ok(self
             .entries
             .lock()
             .expect("lock")
             .get(&slot)
-            .map(|bytes| GetSecretResponse {
-                value: SecretValue::new(bytes.clone()),
-                id: Uuid::new_v4(),
-                owner_tenant_id: TenantId(slot.tenant),
-                sharing: SharingMode::Private,
-                is_inherited: false,
-                version: 1,
-                secret_type: "gts.cf.core.credstore.secret.v1~generic.v1~".to_owned(),
+            .map(|bytes| Secret {
+                reference: key.clone(),
+                secret_type: "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~"
+                    .to_owned(),
                 expires_at: None,
+                secret: SecretValue::new(bytes.clone()),
+                validator: Validator {
+                    id: Uuid::new_v4(),
+                    version: 1,
+                },
             }))
     }
 
-    async fn put_opts(
+    async fn put(
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-        precondition: WritePrecondition,
-        _opts: WriteOptions,
-    ) -> Result<(), CredStoreError> {
+        write: CredentialWrite,
+        precondition: PutPrecondition,
+    ) -> Result<PutOutcome, CredStoreError> {
         self.check()?;
-        let slot = self.slot(ctx, key, sharing);
+        let slot = self.slot(ctx, key, write.sharing);
+        let value = write
+            .secret
+            .map(|v| v.as_bytes().to_vec())
+            .unwrap_or_default();
         let mut entries = self.entries.lock().expect("lock");
-        if !entries.contains_key(&slot) {
-            return Err(CredStoreError::NotFound);
-        }
-        assert!(matches!(precondition, WritePrecondition::Exists));
-        entries.insert(slot, value.as_bytes().to_vec());
-        Ok(())
+        let created = match precondition {
+            PutPrecondition::CreateOnly => {
+                if entries.contains_key(&slot) {
+                    return Err(CredStoreError::Conflict);
+                }
+                true
+            }
+            PutPrecondition::Exists | PutPrecondition::Matches(_) => {
+                if !entries.contains_key(&slot) {
+                    return Err(CredStoreError::Conflict);
+                }
+                false
+            }
+        };
+        entries.insert(slot, value);
+        Ok(PutOutcome {
+            created,
+            validator: Validator {
+                id: Uuid::new_v4(),
+                version: 1,
+            },
+        })
     }
 
-    async fn create_opts(
+    async fn patch(
         &self,
-        ctx: &SecurityContext,
-        key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-        _opts: WriteOptions,
-    ) -> Result<(), CredStoreError> {
-        self.check()?;
-        let slot = self.slot(ctx, key, sharing);
-        let mut entries = self.entries.lock().expect("lock");
-        if entries.contains_key(&slot) {
-            return Err(CredStoreError::Conflict);
-        }
-        entries.insert(slot, value.as_bytes().to_vec());
-        Ok(())
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+        _patch: CredentialPatch,
+        _precondition: WritePrecondition,
+    ) -> Result<Validator, CredStoreError> {
+        Err(CredStoreError::Internal("patch not modelled".into()))
     }
 
     async fn delete(
@@ -162,6 +191,14 @@ impl CredStoreClientV1 for MemoryCredStore {
             .remove(&slot)
             .map(|_| ())
             .ok_or(CredStoreError::NotFound)
+    }
+
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        _query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        Err(CredStoreError::Internal("list not modelled".into()))
     }
 }
 
@@ -357,6 +394,26 @@ async fn an_absent_entry_is_not_found_on_the_value_and_a_down_store_is_unavailab
 }
 
 #[tokio::test]
+async fn an_expired_secret_is_not_revealed_and_never_falls_back() {
+    let (store, manager) = manager();
+    let tenant = Uuid::new_v4();
+    let reference = store_new(&manager, KEY, tenant, &json!("stale"))
+        .await
+        .expect("stored");
+    store
+        .expired
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = manager
+        .resolve_plaintext(KEY, tenant, &reference)
+        .await
+        .expect_err("expired");
+    assert!(
+        matches!(err, DomainError::NotFound { resource } if resource == settings_service_sdk::gts::VALUE_SCHEMA),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn delete_releases_the_entry_and_an_absent_entry_is_already_done() {
     let (store, manager) = manager();
     let tenant = Uuid::new_v4();
@@ -389,7 +446,7 @@ async fn another_principal_in_the_same_tenant_reads_nothing_back() {
         .build()
         .expect("context");
     let found = store
-        .get(&user, &SecretRef::new(reference).expect("ref"))
+        .get_secret(&user, &SecretRef::new(reference).expect("ref"))
         .await
         .expect("asked");
     assert!(found.is_none());

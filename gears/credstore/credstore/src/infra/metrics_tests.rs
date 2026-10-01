@@ -4,7 +4,7 @@
 use super::test_harness::MetricsHarness;
 #[cfg(feature = "test-support")]
 use crate::domain::ports::metrics::{
-    CredStoreMetricsPort, Dep, DepOp, FenceVerify, Outcome, ReadOutcome,
+    CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome,
 };
 
 /// Smoke test that exercises instrument construction and every recording
@@ -13,9 +13,9 @@ use crate::domain::ports::metrics::{
 #[test]
 fn global_meter_records_all_instruments() {
     use super::CredStoreMetricsMeter;
-    use crate::domain::ports::metrics::{CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome};
-
-    use crate::domain::ports::metrics::FenceVerify;
+    use crate::domain::ports::metrics::{
+        CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome,
+    };
 
     let m = CredStoreMetricsMeter::from_global();
     assert!(!format!("{m:?}").is_empty());
@@ -24,6 +24,7 @@ fn global_meter_records_all_instruments() {
         ReadOutcome::HitOwn,
         ReadOutcome::HitInherited,
         ReadOutcome::Miss,
+        ReadOutcome::Expired,
     ] {
         m.read_outcome(outcome);
     }
@@ -31,12 +32,12 @@ fn global_meter_records_all_instruments() {
     m.dependency(Dep::Plugin, DepOp::PluginGet, Outcome::Success, 0.01);
     m.dependency(Dep::Pdp, DepOp::Evaluate, Outcome::Error, 0.02);
     m.cross_tenant_denied();
-    m.fence_verify(FenceVerify::Ok);
-    m.fence_verify(FenceVerify::Mismatch);
-    m.gc_deleted(3);
-    m.gc_pending_reclaimed(1);
-    m.expired_deleted(2);
+    m.destroy_failed();
+    m.outbox_purge_failed();
+    m.read_retry(ReadRetryOutcome::Recovered);
+    m.read_retry(ReadRetryOutcome::SecondMiss);
     m.list_type_invariant_violation();
+    m.audit_publish_failed();
 }
 
 #[test]
@@ -89,39 +90,37 @@ fn dependency_emits_duration_and_health() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn fence_verify_emits_with_outcome_labels() {
+fn read_retry_emits_with_outcome_labels() {
     let h = MetricsHarness::new();
     let m = h.metrics();
-    m.fence_verify(FenceVerify::Ok);
-    m.fence_verify(FenceVerify::Mismatch);
-    m.fence_verify(FenceVerify::Mismatch);
+    m.read_retry(ReadRetryOutcome::Recovered);
+    m.read_retry(ReadRetryOutcome::SecondMiss);
+    m.read_retry(ReadRetryOutcome::SecondMiss);
     h.force_flush();
     assert_eq!(
-        h.counter_value("credstore_fence_verify_total", &[("outcome", "ok")]),
+        h.counter_value("credstore_read_retry_total", &[("outcome", "recovered")]),
         1
     );
     assert_eq!(
-        h.counter_value("credstore_fence_verify_total", &[("outcome", "mismatch")]),
+        h.counter_value("credstore_read_retry_total", &[("outcome", "second_miss")]),
         2
     );
 }
 
 #[test]
 #[cfg(feature = "test-support")]
-fn gc_counters_accumulate_independently() {
+fn destroy_and_purge_failure_counters_accumulate_independently() {
     let h = MetricsHarness::new();
     let m = h.metrics();
-    m.gc_deleted(3);
-    m.gc_deleted(2);
-    m.gc_pending_reclaimed(1);
-    m.expired_deleted(4);
+    m.destroy_failed();
+    m.destroy_failed();
+    m.outbox_purge_failed();
     h.force_flush();
-    assert_eq!(h.counter_value("credstore_gc_deleted_total", &[]), 5);
+    assert_eq!(h.counter_value("credstore_destroy_failed_total", &[]), 2);
     assert_eq!(
-        h.counter_value("credstore_gc_pending_reclaimed_total", &[]),
+        h.counter_value("credstore_outbox_purge_failed_total", &[]),
         1
     );
-    assert_eq!(h.counter_value("credstore_expired_deleted_total", &[]), 4);
 }
 
 #[test]
@@ -135,5 +134,20 @@ fn list_type_invariant_violation_accumulates() {
     assert_eq!(
         h.counter_value("credstore_list_type_invariant_violation_total", &[]),
         2
+    );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn audit_publish_failed_accumulates() {
+    let h = MetricsHarness::new();
+    let m = h.metrics();
+    m.audit_publish_failed();
+    m.audit_publish_failed();
+    m.audit_publish_failed();
+    h.force_flush();
+    assert_eq!(
+        h.counter_value("credstore_audit_publish_failed_total", &[]),
+        3
     );
 }

@@ -1,17 +1,15 @@
 //! Read-only repo methods: `resolve_for_get`, `find_own`, `find_for_write`,
 //! `scope_includes_tenant`, and the collection read's candidate queries
-//! (`list_visible_types`, `list_candidate_references`,
-//! `list_candidates_for_references` — ADR-0005, ADR-0010).
+//! (`list_candidate_references`, `list_candidates_for_references` —
+//! ADR-0005, ADR-0010).
 
 use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId};
-use sea_orm::{
-    ColumnTrait, Condition, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, QuerySelect,
-};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult, QueryOrder, QuerySelect};
 use toolkit_db::secure::{ScopeError, SecureEntityExt};
-use toolkit_security::access_scope::ScopeFilter;
-use toolkit_security::{AccessScope, pep_properties};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use crate::domain::authz::scope_admits_tenant;
 use crate::domain::error::DomainError;
 use crate::domain::secret::model::{Fallback, SecretRow, SecretStatus};
 use crate::infra::canonical_mapping::classify_db_err_to_domain;
@@ -27,8 +25,10 @@ fn scope_err_to_domain(e: ScopeError) -> DomainError {
     }
 }
 
-/// Resolution-eligible statuses (ADR-0004, Suppression): `active` and not
-/// expired, or `declared` with `fallback = none` (a suppressing row that
+/// Resolution-eligible statuses (ADR-0004, Suppression): `active` (expired
+/// or not — expiry applies to the secret, not to the record, so an expired
+/// record stays the decisive one and the service refuses to serve its
+/// secret), or `declared` with `fallback = none` (a suppressing row that
 /// competes and blocks regardless of any stale `expires_at` it carries — a
 /// suppression policy does not expire). A `declared`/`inherit` row is
 /// excluded by construction — it is simply not one of these two `(status,
@@ -37,14 +37,7 @@ fn resolution_eligible_condition() -> Condition {
     Condition::any()
         .add(
             Condition::all()
-                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint()))
-                .add(
-                    Condition::any()
-                        .add(entity::secrets::Column::ExpiresAt.is_null())
-                        .add(
-                            entity::secrets::Column::ExpiresAt.gt(time::OffsetDateTime::now_utc()),
-                        ),
-                ),
+                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint())),
         )
         .add(
             Condition::all()
@@ -92,10 +85,9 @@ pub(super) async fn resolve_for_get(
         .secure()
         .scope_with(&AccessScope::allow_all())
         .filter(Condition::all().add(entity::secrets::Column::Reference.eq(key.as_ref())))
-        // Expired `active` secrets resolve as not-found (write paths still
-        // see the row: overwrite refreshes it, delete revokes it, the
-        // maintenance job sweeps it); embedded in the eligibility condition
-        // so it never weakens `declared`/`none` suppression.
+        // An expired `active` row stays eligible: it is the decisive record
+        // and the service answers `SecretExpired` for its secret rather than
+        // walking on to an ancestor's value.
         .filter(resolution_eligible_condition())
         .filter(Condition::all().add(entity::secrets::Column::TenantId.is_in(chain.to_vec())))
         // Visibility by sharing class, within the ancestor `chain`:
@@ -200,47 +192,22 @@ struct ReferenceRow {
     reference: String,
 }
 
-/// Row-shape helper for a `SELECT DISTINCT secret_type_uuid` projection.
-#[derive(FromQueryResult)]
-struct SecretTypeUuidRow {
-    secret_type_uuid: Uuid,
-}
-
-/// Applies the caller's `reference`/`secret_type_uuid` clamps to `filter`
-/// when given — shared by [`list_candidate_references`] (both clamps) and
-/// [`list_visible_types`] (type clamp only, called with `reference_in =
-/// None`); both clamps are invariant across a reference's chain (ADR-0005
-/// §"Filter in SQL first…").
-fn apply_reference_and_type_clamps(
-    mut filter: Condition,
-    reference_in: Option<&[String]>,
-    type_uuid_in: Option<&[Uuid]>,
-) -> Condition {
-    if let Some(refs) = reference_in {
-        filter = filter.add(entity::secrets::Column::Reference.is_in(refs.to_vec()));
-    }
-    if let Some(types) = type_uuid_in {
-        filter = filter.add(entity::secrets::Column::SecretTypeUuid.is_in(types.to_vec()));
-    }
-    filter
-}
-
 /// Collection read, step 1 (ADR-0005): candidate **references** visible
 /// across `chain`, under [`chain_visibility_condition`], clamped by an exact
 /// `reference` set when the caller's `$filter` named one, and by
-/// `type_uuid_in` — by the time this runs, the service layer
-/// (`Service::permitted_types`, ADR-0010) has already narrowed that clamp to
-/// the PDP-permitted types intersected with the caller's own `$filter type
-/// in (…)`, so what reaches here is the type clamp this query actually
-/// enforces in SQL, not merely the caller's raw filter (both clamps are
-/// invariant across a reference's chain, so both are sound SQL clamps —
-/// ADR-0005 §"What stays out of the filter"). `DISTINCT reference`, ordered
+/// `type_scope` - a type-only scope (`secret_type IN (...)`) the service
+/// derived from ONE PDP decision on the base credential type, already
+/// intersected with the caller's own `$filter type in (…)` (ADR-0010). The
+/// scope is applied through the secure ORM, so the type predicate is
+/// compiled to SQL exactly like any other PDP constraint. Both clamps are
+/// invariant across a reference's chain, so both are sound SQL clamps
+/// (ADR-0005 §"What stays out of the filter"). `DISTINCT reference`, ordered
 /// by `reference` (`desc` when `desc`), keyset-paginated by `cursor`
 /// (exclusive: `reference > cursor` ascending, `reference < cursor`
 /// descending). Fetches at most `limit` references — the caller passes
 /// `page_limit + 1` in metadata mode to detect a next page, or
 /// `secret_mode_cap + 1` in secret mode (no cursor, always ascending); both
-/// counts now reflect only references admitted by the permitted-type clamp.
+/// counts reflect only references admitted by the permitted-type clamp.
 #[allow(
     clippy::too_many_arguments,
     reason = "every clamp the collection read's step 1 query supports, named rather than \
@@ -252,7 +219,7 @@ pub(super) async fn list_candidate_references(
     subject: OwnerId,
     chain: &[Uuid],
     reference_in: Option<&[String]>,
-    type_uuid_in: Option<&[Uuid]>,
+    type_scope: &AccessScope,
     cursor: Option<&str>,
     desc: bool,
     limit: u64,
@@ -265,7 +232,9 @@ pub(super) async fn list_candidate_references(
     let mut filter = Condition::all()
         .add(entity::secrets::Column::TenantId.is_in(chain.to_vec()))
         .add(visibility);
-    filter = apply_reference_and_type_clamps(filter, reference_in, type_uuid_in);
+    if let Some(refs) = reference_in {
+        filter = filter.add(entity::secrets::Column::Reference.is_in(refs.to_vec()));
+    }
     if let Some(after) = cursor {
         filter = filter.add(if desc {
             entity::secrets::Column::Reference.lt(after)
@@ -276,7 +245,7 @@ pub(super) async fn list_candidate_references(
 
     let rows: Vec<ReferenceRow> = entity::secrets::Entity::find()
         .secure()
-        .scope_with(&AccessScope::allow_all())
+        .scope_with(type_scope)
         .filter(filter)
         .project_all(&conn, |sel| {
             let sel = sel
@@ -294,49 +263,6 @@ pub(super) async fn list_candidate_references(
         .map_err(scope_err_to_domain)?;
 
     Ok(rows.into_iter().map(|r| r.reference).collect())
-}
-
-/// Collection read, the authorization side's query (ADR-0005/ADR-0010,
-/// **before** step 1 runs): the distinct `secret_type_uuid`s among every row
-/// visible to the caller across `chain` — the same
-/// [`chain_visibility_condition`] step 1 applies, clamped by
-/// `secret_type_uuid IN (…)` when the caller's `$filter` named a type set.
-/// Not restricted to any reference set: this feeds the per-type PDP
-/// evaluation (`Service::permitted_types`) whose permitted result becomes
-/// step 1's own `type_uuid_in` clamp, so step 1 never even sees a row of a
-/// type the caller may not see. Backed by `idx_credstore_type`; never a
-/// `COUNT`.
-pub(super) async fn list_visible_types(
-    repo: &SecretRepoImpl,
-    req_tenant: TenantId,
-    subject: OwnerId,
-    chain: &[Uuid],
-    type_uuid_in: Option<&[Uuid]>,
-) -> Result<Vec<Uuid>, DomainError> {
-    let conn = repo.db.conn()?;
-    let req = req_tenant.0;
-    let ancestors: Vec<Uuid> = chain.iter().copied().filter(|t| *t != req).collect();
-    let visibility = chain_visibility_condition(req, subject.0, &ancestors);
-
-    let filter = Condition::all()
-        .add(entity::secrets::Column::TenantId.is_in(chain.to_vec()))
-        .add(visibility);
-    let filter = apply_reference_and_type_clamps(filter, None, type_uuid_in);
-
-    let rows: Vec<SecretTypeUuidRow> = entity::secrets::Entity::find()
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .filter(filter)
-        .project_all(&conn, |sel| {
-            sel.select_only()
-                .column(entity::secrets::Column::SecretTypeUuid)
-                .distinct()
-                .into_model::<SecretTypeUuidRow>()
-        })
-        .await
-        .map_err(scope_err_to_domain)?;
-
-    Ok(rows.into_iter().map(|r| r.secret_type_uuid).collect())
 }
 
 /// Collection read, step 2 (ADR-0005): every visible row of `references`,
@@ -463,74 +389,8 @@ pub(super) async fn find_for_write(
     row.map(entity_to_model).transpose()
 }
 
-pub(super) async fn list_expired(
-    repo: &SecretRepoImpl,
-    limit: u64,
-) -> Result<Vec<SecretRow>, DomainError> {
-    let conn = repo.db.conn()?;
-    let rows = entity::secrets::Entity::find()
-        .filter(
-            Condition::all()
-                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint()))
-                .add(entity::secrets::Column::ExpiresAt.is_not_null())
-                .add(entity::secrets::Column::ExpiresAt.lte(time::OffsetDateTime::now_utc())),
-        )
-        .limit(limit)
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .all(&conn)
-        .await
-        .map_err(scope_err_to_domain)?;
-    rows.into_iter().map(entity_to_model).collect()
-}
-
 pub(super) fn scope_includes_tenant(scope: &AccessScope, tenant: Uuid) -> bool {
-    if scope.is_unconstrained() {
-        return true;
-    }
-    if scope.is_deny_all() {
-        return false;
-    }
-    // Fail-closed tenant-membership check. A scope's constraints are OR-ed
-    // (alternative grants) and the filters within a constraint are AND-ed, so
-    // a constraint admits `tenant` only when *every* one of its filters is a
-    // tenant-level predicate on `OWNER_TENANT_ID` satisfied by `tenant`. Any
-    // sibling filter that narrows below tenant granularity (`owner_id`,
-    // `resource_id`, group membership, …) or any filter this gate cannot
-    // evaluate makes the whole constraint non-admitting. That way a scope
-    // stricter than tenant granularity fails closed (403) instead of being
-    // silently widened to the whole tenant on a lone `OWNER_TENANT_ID` match.
-    'constraints: for constraint in scope.constraints() {
-        // A constraint always carries at least one filter: `ScopeConstraint`
-        // refuses to build an empty one, because an AND over nothing is TRUE
-        // and would match every row.
-        for filter in constraint.filters() {
-            // Only `OWNER_TENANT_ID` predicates can affirm tenant-level access.
-            if filter.property() != pep_properties::OWNER_TENANT_ID {
-                continue 'constraints;
-            }
-            let admits = match filter {
-                ScopeFilter::Eq(_) | ScopeFilter::In(_) => {
-                    filter.values().iter().any(|v| v.as_uuid() == Some(tenant))
-                }
-                // Fail closed on everything structured. Credstore advertises
-                // no PDP capabilities, so subtree grants arrive pre-expanded
-                // as flat `Eq`/`In` predicates (AUTHZ_USAGE_SCENARIOS
-                // S09–S11) — the gear projects no `tenant_closure` and cannot
-                // resolve a structured subtree predicate; receiving one is a
-                // capability-contract breach. Group membership over
-                // `OWNER_TENANT_ID` is likewise not a plain tenant predicate
-                // this gate resolves.
-                // ...and on any variant added later, for the same reason: a
-                // predicate this build cannot resolve is not one it may ignore.
-                _ => false,
-            };
-            if !admits {
-                continue 'constraints;
-            }
-        }
-        // Every filter affirmed `tenant` (or the constraint was empty).
-        return true;
-    }
-    false
+    // Fail-closed own-tenant gate shared with the domain's row clamp: row
+    // predicates (type, reference) narrow rows (applied by SQL), never the tenant.
+    scope_admits_tenant(scope, tenant)
 }

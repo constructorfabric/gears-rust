@@ -81,6 +81,9 @@ pub enum CredentialStatusDto {
     Declared,
     /// The caller's own row exists and carries a value.
     Active,
+    /// The caller's own row is `active` but its `expires_at` has passed; its
+    /// secret is not served until the record is renewed.
+    Expired,
 }
 
 impl From<CredentialStatus> for CredentialStatusDto {
@@ -89,6 +92,7 @@ impl From<CredentialStatus> for CredentialStatusDto {
             CredentialStatus::None => Self::None,
             CredentialStatus::Declared => Self::Declared,
             CredentialStatus::Active => Self::Active,
+            CredentialStatus::Expired => Self::Expired,
         }
     }
 }

@@ -174,10 +174,17 @@ impl ReqwestKcTransport {
                     detail: format!("invalid tls_ca_bundle_ref '{ref_id}': {e}"),
                 }
             })?;
-            let pem = cs_reader.get(&secret_ref).await.map_err(|e| {
-                crate::domain::error::PluginError::CredStoreRead {
-                    detail: format!("read tls_ca_bundle_ref '{ref_id}': {e}"),
+            let pem = cs_reader.get(&secret_ref).await.map_err(|e| match e {
+                // The record exists but its secret has expired: the CA bundle
+                // is not usable, so startup fails like an unreadable one.
+                credstore_sdk::CredStoreError::SecretExpired => {
+                    crate::domain::error::PluginError::CredStoreRead {
+                        detail: format!("tls_ca_bundle_ref '{ref_id}' has an expired secret"),
+                    }
                 }
+                other => crate::domain::error::PluginError::CredStoreRead {
+                    detail: format!("read tls_ca_bundle_ref '{ref_id}': {other}"),
+                },
             })?;
             let pem = pem.ok_or_else(|| crate::domain::error::PluginError::CredStoreRead {
                 detail: format!("tls_ca_bundle_ref '{ref_id}' not found"),

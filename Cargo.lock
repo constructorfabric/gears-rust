@@ -2421,6 +2421,7 @@ dependencies = [
  "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
  "cf-gears-credstore-sdk",
+ "cf-gears-event-broker-sdk",
  "cf-gears-tenant-resolver",
  "cf-gears-tenant-resolver-sdk",
  "cf-gears-toolkit",
@@ -2432,13 +2433,13 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
+ "chrono",
  "futures",
  "gts",
  "inventory",
  "jsonschema",
  "opentelemetry",
  "opentelemetry_sdk",
- "rand 0.10.1",
  "sea-orm",
  "sea-orm-migration",
  "serde",
@@ -2451,7 +2452,6 @@ dependencies = [
  "tracing",
  "utoipa",
  "uuid",
- "zeroize",
 ]
 
 [[package]]

@@ -43,6 +43,11 @@ pub trait CredStoreClientV1: Send + Sync {
     /// winning record with no value (`declared`, or `suppressed`) is the
     /// canonical miss — `Ok(None)`, identical to "does not exist".
     ///
+    /// A winning `active` record whose `expires_at` has passed fails with
+    /// [`CredStoreError::SecretExpired`] (only for a caller authorized to read
+    /// the secret of that type): resolution does not continue to an
+    /// ancestor's value, and `fallback` does not apply to expired records.
+    ///
     /// Requires the `read_secret` action.
     async fn get_secret(
         &self,
@@ -75,7 +80,8 @@ pub trait CredStoreClientV1: Send + Sync {
     /// # Errors
     ///
     /// Returns [`CredStoreError::Conflict`] on a failed precondition (create
-    /// found an existing row, or replace found none) or a lost CAS.
+    /// found an existing row — an expired own record included, renew or
+    /// delete it; or replace found none) or a lost CAS.
     /// Returns [`CredStoreError::TypeViolation`] on a trait violation, an
     /// unresolvable type, or an attempted type change (`TYPE_IMMUTABLE`) —
     /// including creating over a reference that currently resolves to an

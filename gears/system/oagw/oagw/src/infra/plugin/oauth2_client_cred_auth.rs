@@ -1,4 +1,4 @@
-use credstore_sdk::{CredStoreClientV1, SecretRef};
+use credstore_sdk::{CredStoreClientV1, CredStoreError, SecretRef};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -159,12 +159,22 @@ impl OAuth2ClientCredAuthPlugin {
         let raw = cred_ref.strip_prefix("cred://").unwrap_or(cred_ref);
         let secret_ref = SecretRef::new(raw)
             .map_err(|e| PluginError::Internal(format!("invalid secret ref '{raw}': {e}")))?;
-        let response = self
+        let response = match self
             .credstore
             .get_secret(security_context, &secret_ref)
             .await
-            .map_err(|e| PluginError::Internal(format!("credstore error: {e}")))?
-            .ok_or_else(|| PluginError::SecretNotFound(cred_ref.to_owned()))?;
+        {
+            Ok(Some(response)) => response,
+            Ok(None) => return Err(PluginError::SecretNotFound(cred_ref.to_owned())),
+            // The record exists but its secret has expired: not usable, so
+            // the token fetch fails closed exactly like a missing secret.
+            Err(CredStoreError::SecretExpired) => {
+                return Err(PluginError::SecretNotFound(format!(
+                    "{cred_ref} (secret expired)"
+                )));
+            }
+            Err(e) => return Err(PluginError::Internal(format!("credstore error: {e}"))),
+        };
         std::str::from_utf8(response.secret.as_bytes())
             .map(str::to_owned)
             .map_err(|_| PluginError::Internal(format!("secret '{cred_ref}' is not valid UTF-8")))

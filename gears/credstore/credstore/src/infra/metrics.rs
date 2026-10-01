@@ -10,7 +10,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 
 use crate::domain::ports::metrics::{
-    CredStoreMetricsPort, Dep, DepOp, FenceVerify, Outcome, ReadOutcome,
+    CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome,
 };
 
 /// Meter / instrumentation scope name.
@@ -22,12 +22,12 @@ const CREDSTORE_WALKUP_DEPTH: &str = "credstore_walkup_depth";
 const CREDSTORE_DEPENDENCY_QUERY_DURATION: &str = "credstore_dependency_query_duration_seconds";
 const CREDSTORE_DEPENDENCY_HEALTH: &str = "credstore_dependency_health_total";
 const CREDSTORE_CROSS_TENANT_DENIED: &str = "credstore_cross_tenant_denied_total";
-const CREDSTORE_FENCE_VERIFY: &str = "credstore_fence_verify_total";
-const CREDSTORE_GC_DELETED: &str = "credstore_gc_deleted_total";
-const CREDSTORE_GC_PENDING_RECLAIMED: &str = "credstore_gc_pending_reclaimed_total";
-const CREDSTORE_EXPIRED_DELETED: &str = "credstore_expired_deleted_total";
+const CREDSTORE_DESTROY_FAILED: &str = "credstore_destroy_failed_total";
+const CREDSTORE_OUTBOX_PURGE_FAILED: &str = "credstore_outbox_purge_failed_total";
+const CREDSTORE_READ_RETRY: &str = "credstore_read_retry_total";
 const CREDSTORE_LIST_TYPE_INVARIANT_VIOLATION: &str =
     "credstore_list_type_invariant_violation_total";
+const CREDSTORE_AUDIT_PUBLISH_FAILED: &str = "credstore_audit_publish_failed_total";
 
 /// OpenTelemetry-backed metrics handle for the credstore module.
 pub struct CredStoreMetricsMeter {
@@ -36,11 +36,11 @@ pub struct CredStoreMetricsMeter {
     dependency_query_duration: Histogram<f64>,
     dependency_health: Counter<u64>,
     cross_tenant_denied: Counter<u64>,
-    fence_verify: Counter<u64>,
-    gc_deleted: Counter<u64>,
-    gc_pending_reclaimed: Counter<u64>,
-    expired_deleted: Counter<u64>,
+    destroy_failed: Counter<u64>,
+    outbox_purge_failed: Counter<u64>,
+    read_retry: Counter<u64>,
     list_type_invariant_violation: Counter<u64>,
+    audit_publish_failed: Counter<u64>,
 }
 
 impl std::fmt::Debug for CredStoreMetricsMeter {
@@ -78,30 +78,26 @@ impl CredStoreMetricsMeter {
                 .u64_counter(CREDSTORE_CROSS_TENANT_DENIED)
                 .with_description("Cross-tenant secret access attempts that were denied")
                 .build(),
-            fence_verify: meter
-                .u64_counter(CREDSTORE_FENCE_VERIFY)
+            destroy_failed: meter
+                .u64_counter(CREDSTORE_DESTROY_FAILED)
                 .with_description(
-                    "Value-fingerprint fence verdicts on reads, by outcome \
-                     (mismatch = fail-closed 404, the alertable signal)",
+                    "Best-effort destroy of store versions (after a write, a lost CAS or a \
+                     secret removal) that failed; the next successful write retries implicitly",
                 )
                 .build(),
-            gc_deleted: meter
-                .u64_counter(CREDSTORE_GC_DELETED)
+            outbox_purge_failed: meter
+                .u64_counter(CREDSTORE_OUTBOX_PURGE_FAILED)
                 .with_description(
-                    "Maintenance job: backend versions deleted by the gc drain \
-                     (superseded/removed/aborted)",
+                    "Outbox delete_key delivery attempts that failed and will be retried (a \
+                     persistently rising value means a key purge is stuck)",
                 )
                 .build(),
-            gc_pending_reclaimed: meter
-                .u64_counter(CREDSTORE_GC_PENDING_RECLAIMED)
+            read_retry: meter
+                .u64_counter(CREDSTORE_READ_RETRY)
                 .with_description(
-                    "Maintenance job: orphaned pending versions reclaimed (a sustained climb \
-                     means writes are crashing or timing out before commit)",
+                    "Secret reads that found their version gone and re-read the row once, by \
+                     outcome (second_miss = 503)",
                 )
-                .build(),
-            expired_deleted: meter
-                .u64_counter(CREDSTORE_EXPIRED_DELETED)
-                .with_description("Maintenance job: expired active rows removed")
                 .build(),
             list_type_invariant_violation: meter
                 .u64_counter(CREDSTORE_LIST_TYPE_INVARIANT_VIOLATION)
@@ -109,6 +105,14 @@ impl CredStoreMetricsMeter {
                     "Collection read: a reduced reference's winner named a type outside the \
                      authorized set (override-type-consistency violated); the reference was \
                      dropped from the page",
+                )
+                .build(),
+            audit_publish_failed: meter
+                .u64_counter(CREDSTORE_AUDIT_PUBLISH_FAILED)
+                .with_description(
+                    "Audit events for secret reads and writes that the event broker could not \
+                     accept (absent, unavailable, slow or rejecting); the operation itself was \
+                     unaffected",
                 )
                 .build(),
         }
@@ -153,25 +157,25 @@ impl CredStoreMetricsPort for CredStoreMetricsMeter {
         self.cross_tenant_denied.add(1, &[]);
     }
 
-    fn fence_verify(&self, outcome: FenceVerify) {
-        self.fence_verify
+    fn destroy_failed(&self) {
+        self.destroy_failed.add(1, &[]);
+    }
+
+    fn outbox_purge_failed(&self) {
+        self.outbox_purge_failed.add(1, &[]);
+    }
+
+    fn read_retry(&self, outcome: ReadRetryOutcome) {
+        self.read_retry
             .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
-    }
-
-    fn gc_deleted(&self, n: u64) {
-        self.gc_deleted.add(n, &[]);
-    }
-
-    fn gc_pending_reclaimed(&self, n: u64) {
-        self.gc_pending_reclaimed.add(n, &[]);
-    }
-
-    fn expired_deleted(&self, n: u64) {
-        self.expired_deleted.add(n, &[]);
     }
 
     fn list_type_invariant_violation(&self) {
         self.list_type_invariant_violation.add(1, &[]);
+    }
+
+    fn audit_publish_failed(&self) {
+        self.audit_publish_failed.add(1, &[]);
     }
 }
 

@@ -1,40 +1,49 @@
-// Updated: 2026-09-10 by Constructor Tech — rebuilt as a pure `tenant_id/value_id`
-// immutable value store (ADR-0006); out-of-band seeding withdrawn.
-//! Thread-safe in-memory immutable-value store.
+//! Thread-safe in-memory versioned value store.
 //!
-//! Keyed by `(tenant_id, value_id)` (ADR-0006 "Backend key shape") — no
-//! `reference`, no sharing-derived key class, no `owner_id`. Every entry, once
-//! written, is immutable: `put` on an id already present is a contract
-//! violation the gear itself never issues, and this plugin defends against it
-//! by rejecting the call with [`CredStoreError::Conflict`]; `delete` of an id
-//! this store does not hold is success (idempotent).
-use std::collections::HashMap;
+//! Keyed by `StoreKey { tenant_id, record_id }` (ADR-0006). Per key the store
+//! keeps a map `version -> bytes` and a monotonic counter: the n-th `put`
+//! under a key returns the version `"n"`, so versions are ordered per key as
+//! `destroy(Below)` requires. Versions are immutable. `delete_key` and
+//! `destroy` of anything not held are successes (idempotent).
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
-use credstore_sdk::{CredStoreError, SecretValue, TenantId, ValueId};
+use credstore_sdk::{DestroySelector, SecretValue, StoreKey, ValueVersion};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::config::StaticCredStorePluginConfig;
 
-/// In-memory backend store: `(tenant_id, value_id) -> value`.
+/// All versions of one key plus its monotonic counter.
+#[domain_model]
+#[derive(Debug, Default)]
+struct KeyEntry {
+    /// Last version number handed out under this key.
+    last: u64,
+    versions: BTreeMap<u64, SecretValue>,
+}
+
+/// In-memory backend store: `(tenant_id, record_id) -> versions`.
 #[domain_model]
 #[derive(Debug, Default)]
 struct Store {
-    values: HashMap<(Uuid, Uuid), SecretValue>,
+    keys: HashMap<(Uuid, Uuid), KeyEntry>,
 }
 
 /// Static credstore backend.
 ///
-/// A pure per-tenant, per-version value store implementing the
-/// `CredStorePluginClientV1` contract: `get`/`put`/`delete` keyed by
-/// `(tenant_id, value_id)` only. No configuration seeds values any more
-/// (ADR-0006 withdraws out-of-band seeding) — the store starts empty and is
+/// A versioned in-memory value store implementing the
+/// `CredStorePluginClientV2` contract, including the optional `destroy`.
+/// No configuration seeds values (ADR-0006) - the store starts empty and is
 /// populated only through the gear's write protocol.
 #[domain_model]
 #[derive(Debug, Default)]
 pub struct Service {
     inner: RwLock<Store>,
+}
+
+fn map_key(key: &StoreKey) -> (Uuid, Uuid) {
+    (key.tenant_id.0, key.record_id)
 }
 
 impl Service {
@@ -59,9 +68,22 @@ impl Service {
         })
     }
 
-    /// Read the value stored at `(tenant_id, value_id)`, or `None` if absent.
+    /// Store a new immutable version under `key` and return its version.
+    pub fn put_value(&self, key: &StoreKey, value: SecretValue) -> ValueVersion {
+        let mut store = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = store.keys.entry(map_key(key)).or_default();
+        entry.last += 1;
+        entry.versions.insert(entry.last, value);
+        ValueVersion::new(entry.last.to_string())
+    }
+
+    /// Read the bytes of `version` under `key`, or `None` if absent.
     #[must_use]
-    pub fn get_value(&self, tenant_id: &TenantId, value_id: &ValueId) -> Option<SecretValue> {
+    pub fn get_value(&self, key: &StoreKey, version: &ValueVersion) -> Option<SecretValue> {
+        let n: u64 = version.as_str().parse().ok()?;
         let store = self
             .inner
             .read()
@@ -69,44 +91,46 @@ impl Service {
         // `SecretValue` is not `Clone` (it zeroizes on drop), so reconstruct
         // from the stored bytes.
         store
-            .values
-            .get(&(tenant_id.0, value_id.0))
+            .keys
+            .get(&map_key(key))?
+            .versions
+            .get(&n)
             .map(|v| SecretValue::new(v.as_bytes().to_vec()))
     }
 
-    /// Write a brand-new, immutable entry at `(tenant_id, value_id)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CredStoreError::Conflict`] if an entry already exists at
-    /// this id — immutability guard; the gear never reissues a `value_id` it
-    /// has already written.
-    pub fn put_value(
-        &self,
-        tenant_id: &TenantId,
-        value_id: &ValueId,
-        value: SecretValue,
-    ) -> Result<(), CredStoreError> {
+    /// Remove the key with all its versions (and its counter). A miss is a
+    /// no-op.
+    pub fn delete_key_value(&self, key: &StoreKey) {
         let mut store = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let key = (tenant_id.0, value_id.0);
-        if store.values.contains_key(&key) {
-            return Err(CredStoreError::Conflict);
-        }
-        store.values.insert(key, value);
-        Ok(())
+        store.keys.remove(&map_key(key));
     }
 
-    /// Remove the entry at `(tenant_id, value_id)`. A miss is a no-op — the
-    /// gear treats a missing backend value as success (idempotent delete).
-    pub fn delete_value(&self, tenant_id: &TenantId, value_id: &ValueId) {
+    /// Destroy the selected versions of `key`. A miss is a no-op; a version
+    /// string that is not one this store issued selects nothing. The counter
+    /// is kept, so destroyed version numbers are never reissued.
+    pub fn destroy_value(&self, key: &StoreKey, selector: &DestroySelector) {
         let mut store = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.values.remove(&(tenant_id.0, value_id.0));
+        let Some(entry) = store.keys.get_mut(&map_key(key)) else {
+            return;
+        };
+        match selector {
+            DestroySelector::Below(v) => {
+                if let Ok(n) = v.as_str().parse::<u64>() {
+                    entry.versions = entry.versions.split_off(&n);
+                }
+            }
+            DestroySelector::Exactly(v) => {
+                if let Ok(n) = v.as_str().parse::<u64>() {
+                    entry.versions.remove(&n);
+                }
+            }
+        }
     }
 }
 

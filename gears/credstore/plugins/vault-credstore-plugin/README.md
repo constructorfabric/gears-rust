@@ -1,6 +1,6 @@
 # Vault `CredStore` Plugin
 
-A `CredStorePluginClientV1` backend that stores secret bytes in a
+A `CredStorePluginClientV2` backend that stores secret bytes in a
 [HashiCorp Vault](https://www.vaultproject.io/) or
 [`OpenBao`](https://openbao.org/) KV v2 secrets engine, over Vault's HTTP API.
 
@@ -10,25 +10,40 @@ instance, not for production use. See Limitations below.
 
 ## Backend key shape
 
-Per `credstore_sdk::plugin_api`, the plugin is a pure per-tenant,
-per-version value store keyed by `(tenant_id, value_id)`. Every entry is
-addressed at a fixed KV v2 path:
+Per `credstore_sdk::plugin_api`, the plugin is a versioned value store keyed by
+`StoreKey { tenant_id, record_id }` (ADR-0006). All versions of a record live
+under one KV v2 path:
 
 ```text
-{mount}/data/{path_prefix}/{tenant_id}/{value_id}
+{mount}/data/{path_prefix}/{tenant_id}/{record_id}
 ```
 
-- `get` issues `GET {address}/v1/{mount}/data/{path_prefix}/{tenant_id}/{value_id}`.
-  A `200` yields the base64-decoded `data.data.value` field; a `404` maps to
+- `put` issues `POST {address}/v1/{mount}/data/{path_prefix}/{tenant_id}/{record_id}`
+  with body `{"data":{"value":"<base64>"}}` - **no `cas`** - and returns the
+  KV v2 `data.version` as the value version (a decimal string; KV v2 versions
+  are ordered integers).
+- `get` issues `GET .../data/...?version=N`. A `200` yields the base64-decoded
+  `data.data.value`; a `404` (missing, deleted or destroyed version) maps to
   `Ok(None)`.
-- `put` issues `POST` with body `{"options":{"cas":0},"data":{"value":"<base64>"}}`
-  — `cas: 0` means "only create if no version exists yet", which is exactly
-  the immutability guarantee `CredStorePluginClientV1::put` must provide. A
-  `400` whose error body mentions "check-and-set" maps to
-  `CredStoreError::Conflict`.
-- `delete` issues `DELETE {address}/v1/{mount}/metadata/{path_prefix}/{tenant_id}/{value_id}`,
-  which removes all versions (and the key's metadata) in one call. `204` and
-  `404` both map to `Ok(())` (idempotent).
+- `delete_key` issues `DELETE {address}/v1/{mount}/metadata/{path_prefix}/{tenant_id}/{record_id}`,
+  which removes the key with all its versions. `204` and `404` both map to
+  `Ok(())` (idempotent).
+- `supports_destroy` is `true`. `destroy(Below(N))` reads
+  `GET .../metadata/...`, takes the versions that are not yet destroyed and
+  are older than `N`, and issues `POST {address}/v1/{mount}/destroy/{path_prefix}/{tenant_id}/{record_id}`
+  with `{"versions":[...]}`; `destroy(Exactly(N))` posts `[N]` directly. An
+  empty selection makes no destroy call; a `404` is success (idempotent).
+
+## Mount requirements
+
+The plugin does not rely on KV v2 retention. The operator **MUST** configure
+the mount with `max_versions = 0` and `delete_version_after = 0s` (the store
+must never evict a version the gear references on its own) and
+`cas_required = false` (the plugin writes without `cas`; the gear's PG
+compare-and-set decides the winner). These are operator obligations: the
+plugin does not read `{mount}/config` and does not verify them at startup or
+later. A per-path metadata override of `max_versions` is likewise the
+operator's responsibility.
 
 ## Configuration
 
@@ -93,11 +108,11 @@ curl -s -X LIST -H "X-Vault-Token: root" "http://127.0.0.1:8200/v1/secret/metada
 ```
 
 List a level deeper, with the tenant id from the LIST output above, to get
-the `value_id`, then read it directly:
+the `record_id`, then read the current version directly:
 
 ```bash
 curl -s -H "X-Vault-Token: root" \
-  "http://127.0.0.1:8200/v1/secret/data/credstore/<tenant_id>/<value_id>" \
+  "http://127.0.0.1:8200/v1/secret/data/credstore/<tenant_id>/<record_id>" \
   | jq -r '.data.data.value' | base64 -d
 ```
 

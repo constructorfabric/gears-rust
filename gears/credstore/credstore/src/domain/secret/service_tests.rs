@@ -1,53 +1,35 @@
 //! Unit tests for the credential-store domain [`Service`] (ADR-0004: the
 //! credential surface; ADR-0006: immutable value versions).
 //!
-//! Saga/reaper/healing/out-of-band-seeding tests are gone along with the
-//! mechanisms they exercised; this file covers the credential/secret split
-//! (`get`/`get_secret`), the merged write surface (`put`/`patch`), suppression
-//! (`fallback`), the write protocol (create, overwrite, torn writes, lost CAS,
-//! concurrent last-writer-wins), the read-retry-once protocol, one-transaction
-//! delete, the fence's narrowed integrity-check role, and the maintenance job
-//! (`run_gc`).
+//! This file covers the credential/secret split (`get`/`get_secret`), the
+//! merged write surface (`put`/`patch`), suppression (`fallback`), the write
+//! protocol (create, overwrite, orphaned puts, lost and ambiguous CAS,
+//! concurrent last-writer-wins, with and without `destroy` support), the
+//! re-read-once read protocol, and delete with its outbox purge.
 
 use std::sync::Arc;
 
-use credstore_sdk::{
-    CredStorePluginClientV1, Fallback as SdkFallback, InheritanceStatus, OwnerId, PatchField,
-    SecretRef, SecretType, SecretValue, SharingMode, TenantId, ValueId,
-};
 use credstore_sdk::{CredentialPatch, CredentialStatus, CredentialWrite};
+use credstore_sdk::{
+    DestroySelector, Fallback as SdkFallback, InheritanceStatus, OwnerId, PatchField, SecretRef,
+    SecretType, SecretValue, SharingMode, TenantId, ValueVersion,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::ports::metrics::{
-    CredStoreMetricsPort, Dep, DepOp, FenceVerify, Outcome, ReadOutcome,
+    CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome,
 };
 use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
-use crate::domain::secret::model::{
-    Fallback, GcReason, PutPrecondition, SecretStatus, WritePrecondition,
-};
+use crate::domain::secret::model::{Fallback, PutPrecondition, SecretStatus, WritePrecondition};
 use crate::domain::secret::repo::SecretRepo;
-use crate::domain::secret::service::{GcSettings, ListSettings, Service};
+use crate::domain::secret::service::{ListSettings, Service};
 use crate::domain::secret::test_support::*;
 
 fn key(s: &str) -> SecretRef {
     SecretRef::new(s).expect("valid ref")
-}
-
-fn test_gc_settings() -> GcSettings {
-    GcSettings {
-        pending_max_age_secs: 3600,
-        batch_size: 256,
-    }
-}
-
-fn test_gc_settings_zero_age() -> GcSettings {
-    GcSettings {
-        pending_max_age_secs: 0,
-        batch_size: 256,
-    }
 }
 
 fn test_list_settings() -> ListSettings {
@@ -57,17 +39,12 @@ fn test_list_settings() -> ListSettings {
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "test builder threading every Service::new dependency plus gc settings through"
-)]
-fn make_service_with_gc(
+fn make_service(
     repo: Arc<dyn SecretRepo>,
     plugin: Arc<FakePlugin>,
     dir: Arc<dyn TenantDirectory>,
     enforcer: authz_resolver_sdk::PolicyEnforcer,
     metrics: Arc<dyn CredStoreMetricsPort>,
-    gc: GcSettings,
 ) -> Service {
     Service::new(
         repo,
@@ -76,19 +53,8 @@ fn make_service_with_gc(
         Arc::new(FakePluginSelector::new(plugin)) as Arc<dyn PluginSelector>,
         catalog_type_resolver(),
         metrics,
-        gc,
         test_list_settings(),
     )
-}
-
-fn make_service(
-    repo: Arc<dyn SecretRepo>,
-    plugin: Arc<FakePlugin>,
-    dir: Arc<dyn TenantDirectory>,
-    enforcer: authz_resolver_sdk::PolicyEnforcer,
-    metrics: Arc<dyn CredStoreMetricsPort>,
-) -> Service {
-    make_service_with_gc(repo, plugin, dir, enforcer, metrics, test_gc_settings())
 }
 
 fn make_service_noop(
@@ -507,7 +473,7 @@ async fn create_starts_at_version_one_then_overwrite_bumps() {
     let row1 = repo.rows()[0].clone();
     assert_eq!(row1.version, 1);
     assert_eq!(row1.status, SecretStatus::Active);
-    let value_id1 = row1.value_id.expect("value_id set");
+    assert_eq!(row1.value_version, Some(ValueVersion::new("1")));
 
     let outcome2 = svc
         .put(
@@ -522,8 +488,17 @@ async fn create_starts_at_version_one_then_overwrite_bumps() {
     assert_eq!(outcome2.validator.version, 2);
     let row2 = repo.rows()[0].clone();
     assert_eq!(row2.version, 2);
-    let value_id2 = row2.value_id.expect("value_id set");
-    assert_ne!(value_id1, value_id2, "each write mints a fresh value_id");
+    assert_eq!(row2.id, row1.id, "the record id (and store key) is stable");
+    assert_eq!(
+        row2.value_version,
+        Some(ValueVersion::new("2")),
+        "each write gets the next value version under the same key"
+    );
+    assert_eq!(
+        plugin.versions(&row2.store_key()),
+        vec!["2"],
+        "the rotated version was destroyed inline"
+    );
 
     let got = svc
         .get_secret(&ctx, &key("k"))
@@ -706,37 +681,40 @@ async fn put_if_match_on_missing_secret_conflicts() {
     assert!(matches!(err, DomainError::VersionConflict));
 }
 
-// ── torn writes / lost CAS / concurrent last-writer-wins (ADR-0006 core) ────
+// ── ADR-0006 core: orphaned puts, lost and ambiguous CAS, destroy ────────────
 
-#[tokio::test]
-async fn torn_write_leaves_old_value_serving_and_run_gc_reclaims_the_orphan() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = make_service_with_gc(
-        repo.clone(),
-        plugin.clone(),
-        dir,
-        mock_enforcer(),
-        Arc::new(NoopMetrics),
-        test_gc_settings_zero_age(),
-    );
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-
+/// Create `k` (tenant-shared, value `v1`) and return the stored row.
+async fn create_k(
+    svc: &Service,
+    repo: &FakeSecretRepo,
+    ctx: &toolkit_security::SecurityContext,
+    value: &str,
+) -> crate::domain::secret::model::SecretRow {
     svc.put(
-        &ctx,
+        ctx,
         &key("k"),
-        write_create(SharingMode::Tenant, "old"),
+        write_create(SharingMode::Tenant, value),
         create_only(),
     )
     .await
     .expect("create");
-    let row = repo.rows()[0].clone();
-    let old_value_id = row.value_id.expect("value_id");
+    repo.rows()[0].clone()
+}
 
-    // plugin.put will succeed, but the repo's CAS (switch_value) fails as if
-    // the DB were unreachable — step 4's DB-unreachable failure mode.
+#[tokio::test]
+async fn ambiguous_cas_failure_keeps_the_new_version_and_the_old_value_serves() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "old").await;
+    let key_k = row.store_key();
+    let destroys = plugin.destroy_calls().len();
+
+    // plugin.put succeeds, but the repo's CAS fails as if the DB were
+    // unreachable: the commit may or may not have happened.
     repo.fail_next_switch_value(1);
     let err = svc
         .put(
@@ -746,7 +724,7 @@ async fn torn_write_leaves_old_value_serving_and_run_gc_reclaims_the_orphan() {
             put_matches(row.id, row.version),
         )
         .await
-        .expect_err("CAS failure propagates");
+        .expect_err("ambiguous CAS failure propagates");
     assert!(matches!(err, DomainError::Internal { .. }));
 
     // Old value still serves; row untouched.
@@ -756,45 +734,105 @@ async fn torn_write_leaves_old_value_serving_and_run_gc_reclaims_the_orphan() {
         .expect("get_secret")
         .expect("some");
     assert_eq!(got.secret.as_bytes(), b"old");
-    assert_eq!(repo.rows()[0].value_id, Some(old_value_id));
+    assert_eq!(repo.rows()[0].value_version, Some(ValueVersion::new("1")));
 
-    // A pending gc row exists for the orphaned new value_id.
-    let pending: Vec<_> = repo
-        .gc_entries()
-        .into_iter()
-        .filter(|e| e.reason == GcReason::Pending)
-        .collect();
-    assert_eq!(pending.len(), 1);
-    let orphan_id = pending[0].value_id;
-    assert!(plugin.contains(&TenantId(tenant), orphan_id));
+    // The version is NOT destroyed: the row may point at it.
+    assert_eq!(plugin.versions(&key_k), vec!["1", "2"]);
+    assert_eq!(plugin.destroy_calls().len(), destroys, "no destroy at all");
 
-    // run_gc (pending_max_age = 0) reclaims it: backend entry deleted, gc row dropped.
-    let report = svc.run_gc(&ctx).await.expect("run_gc");
-    assert_eq!(report.gc_pending_reclaimed, 1);
-    assert!(!plugin.contains(&TenantId(tenant), orphan_id));
-    assert!(repo.gc_entries().iter().all(|e| e.value_id != orphan_id));
+    // The next successful write's destroy(Below) reclaims the orphan.
+    svc.put(
+        &ctx,
+        &key("k"),
+        write_replace(SharingMode::Tenant, "next"),
+        put_matches(row.id, row.version),
+    )
+    .await
+    .expect("next write");
+    assert_eq!(repo.rows()[0].value_version, Some(ValueVersion::new("3")));
+    assert_eq!(plugin.versions(&key_k), vec!["3"]);
 }
 
 #[tokio::test]
-async fn cas_lost_marks_uploaded_version_aborted_and_deletes_it_winner_serves() {
+async fn plugin_put_failure_leaves_the_row_untouched_and_destroys_nothing() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let dir = Arc::new(FakeDir::single(tenant));
     let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "old").await;
+    let destroys = plugin.destroy_calls().len();
+
+    plugin.fail_next_puts(1);
+    let err = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_replace(SharingMode::Tenant, "new"),
+            put_matches(row.id, row.version),
+        )
+        .await
+        .expect_err("put failure");
+    assert!(matches!(err, DomainError::Internal { .. }));
+    assert_eq!(repo.rows()[0].version, row.version);
+    assert_eq!(repo.rows()[0].value_version, row.value_version);
+    assert_eq!(plugin.destroy_calls().len(), destroys);
+}
+
+#[tokio::test]
+async fn put_whose_ack_is_lost_is_503_and_the_orphan_is_destroyed_by_the_next_write() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "old").await;
+    let key_k = row.store_key();
+
+    plugin.fail_next_puts_after_persisting(1);
+    let err = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_replace(SharingMode::Tenant, "lost-ack"),
+            put_exists(),
+        )
+        .await
+        .expect_err("lost ack");
+    assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
+    assert_eq!(
+        plugin.versions(&key_k),
+        vec!["1", "2"],
+        "orphan version above the pointer"
+    );
+    assert_eq!(repo.rows()[0].value_version, Some(ValueVersion::new("1")));
 
     svc.put(
         &ctx,
         &key("k"),
-        write_create(SharingMode::Tenant, "winner"),
-        create_only(),
+        write_replace(SharingMode::Tenant, "next"),
+        put_exists(),
     )
     .await
-    .expect("create");
-    let row = repo.rows()[0].clone();
+    .expect("next write");
+    assert_eq!(plugin.versions(&key_k), vec!["3"]);
+}
 
-    // Force this writer's CAS to report "lost" (Ok(None)) — models a
+#[tokio::test]
+async fn lost_cas_destroys_its_own_version_and_the_winner_serves() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "winner").await;
+    let key_k = row.store_key();
+    let destroys = plugin.destroy_calls().len();
+
+    // Force this writer's CAS to report "lost" (Ok(None)) - models a
     // concurrent writer's switch_value having already moved the row.
     repo.force_next_switch_value_none(1);
     let err = svc
@@ -808,14 +846,16 @@ async fn cas_lost_marks_uploaded_version_aborted_and_deletes_it_winner_serves() 
         .expect_err("lost CAS is a conflict");
     assert!(matches!(err, DomainError::VersionConflict));
 
-    // The loser's uploaded bytes were aborted: marked, then cleaned up
-    // (plugin delete + gc delete both succeed with the default FakePlugin).
-    assert!(
-        repo.gc_entries().is_empty(),
-        "the aborted version's gc row must be cleaned up by the best-effort abort path"
+    assert_eq!(
+        plugin.destroy_calls()[destroys..],
+        [(
+            key_k.clone(),
+            DestroySelector::Exactly(ValueVersion::new("2"))
+        )],
+        "the loser destroys exactly its own version"
     );
+    assert_eq!(plugin.versions(&key_k), vec!["1"]);
 
-    // The winner's value still serves.
     let got = svc
         .get_secret(&ctx, &key("k"))
         .await
@@ -825,23 +865,186 @@ async fn cas_lost_marks_uploaded_version_aborted_and_deletes_it_winner_serves() 
 }
 
 #[tokio::test]
-async fn two_exists_writers_sequentially_last_pointer_wins_earlier_collected() {
+async fn lost_cas_without_destroy_support_makes_no_destroy_call() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::without_destroy();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "winner").await;
+    let key_k = row.store_key();
+
+    repo.force_next_switch_value_none(1);
+    let err = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_replace(SharingMode::Tenant, "loser"),
+            put_matches(row.id, row.version),
+        )
+        .await
+        .expect_err("lost CAS is a conflict");
+    assert!(matches!(err, DomainError::VersionConflict));
+    assert!(plugin.destroy_calls().is_empty());
+    assert_eq!(
+        plugin.versions(&key_k),
+        vec!["1", "2"],
+        "without destroy the unreferenced version stays until record delete"
+    );
+    let got = svc
+        .get_secret(&ctx, &key("k"))
+        .await
+        .expect("get_secret")
+        .expect("some");
+    assert_eq!(got.secret.as_bytes(), b"winner");
+}
+
+#[tokio::test]
+async fn exists_writer_re_reads_and_retries_once_after_a_lost_cas() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let dir = Arc::new(FakeDir::single(tenant));
     let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "old").await;
+    let key_k = row.store_key();
 
+    repo.force_next_switch_value_none(1);
     svc.put(
         &ctx,
         &key("k"),
-        write_create(SharingMode::Tenant, "v1"),
-        create_only(),
+        write_replace(SharingMode::Tenant, "new"),
+        put_exists(),
     )
     .await
-    .expect("create");
-    let value_id1 = repo.rows()[0].value_id.expect("value_id");
+    .expect("the retry commits");
+
+    let got = svc
+        .get_secret(&ctx, &key("k"))
+        .await
+        .expect("get_secret")
+        .expect("some");
+    assert_eq!(got.secret.as_bytes(), b"new");
+    assert_eq!(repo.rows()[0].value_version, Some(ValueVersion::new("3")));
+    assert_eq!(
+        plugin.versions(&key_k),
+        vec!["3"],
+        "the lost put and the old version are destroyed"
+    );
+}
+
+#[tokio::test]
+async fn exists_writer_that_loses_twice_returns_a_conflict() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "old").await;
+    let key_k = row.store_key();
+
+    repo.force_next_switch_value_none(2);
+    let err = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_replace(SharingMode::Tenant, "new"),
+            put_exists(),
+        )
+        .await
+        .expect_err("second loss");
+    assert!(matches!(err, DomainError::VersionConflict));
+    assert_eq!(
+        plugin.versions(&key_k),
+        vec!["1"],
+        "both lost versions destroyed"
+    );
+}
+
+#[tokio::test]
+async fn exists_patch_with_a_secret_also_retries_once() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    create_k(&svc, &repo, &ctx, "old").await;
+
+    repo.force_next_switch_value_none(1);
+    svc.patch(&ctx, &key("k"), patch_value("patched"), exists())
+        .await
+        .expect("retry commits");
+    let got = svc
+        .get_secret(&ctx, &key("k"))
+        .await
+        .expect("get_secret")
+        .expect("some");
+    assert_eq!(got.secret.as_bytes(), b"patched");
+}
+
+#[tokio::test]
+async fn two_exists_writers_sequentially_last_pointer_wins_older_versions_destroyed() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "v1").await;
+    let key_k = row.store_key();
+
+    for v in ["v2", "v3"] {
+        svc.put(
+            &ctx,
+            &key("k"),
+            write_replace(SharingMode::Tenant, v),
+            put_exists(),
+        )
+        .await
+        .expect("Exists overwrite");
+    }
+
+    let got = svc
+        .get_secret(&ctx, &key("k"))
+        .await
+        .expect("get_secret")
+        .expect("some");
+    assert_eq!(got.secret.as_bytes(), b"v3", "last writer wins");
+    assert_eq!(repo.rows()[0].value_version, Some(ValueVersion::new("3")));
+    assert_eq!(plugin.versions(&key_k), vec!["3"]);
+    assert!(
+        plugin
+            .destroy_calls()
+            .iter()
+            .all(|(_, sel)| matches!(sel, DestroySelector::Below(_))),
+        "committed writes destroy by position only"
+    );
+}
+
+#[tokio::test]
+async fn failed_destroy_is_ignored_counted_and_the_next_write_cleans_up() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let metrics = FakeMetrics::new();
+    let svc = make_service(
+        repo.clone(),
+        plugin.clone(),
+        dir,
+        mock_enforcer(),
+        metrics.clone(),
+    );
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "v1").await;
+    let key_k = row.store_key();
+    // The create's own destroy(Below) already ran; fail the next one.
+    let before = metrics.destroy_failed_total();
+    plugin.fail_next_destroys(1);
 
     svc.put(
         &ctx,
@@ -850,8 +1053,13 @@ async fn two_exists_writers_sequentially_last_pointer_wins_earlier_collected() {
         put_exists(),
     )
     .await
-    .expect("first Exists overwrite");
-    let value_id2 = repo.rows()[0].value_id.expect("value_id");
+    .expect("overwrite succeeds despite the destroy failure");
+    assert_eq!(metrics.destroy_failed_total(), before + 1);
+    assert_eq!(
+        plugin.versions(&key_k),
+        vec!["1", "2"],
+        "old version stays below the pointer"
+    );
 
     svc.put(
         &ctx,
@@ -860,48 +1068,20 @@ async fn two_exists_writers_sequentially_last_pointer_wins_earlier_collected() {
         put_exists(),
     )
     .await
-    .expect("second Exists overwrite");
-    let value_id3 = repo.rows()[0].value_id.expect("value_id");
-
-    assert_ne!(value_id1, value_id2);
-    assert_ne!(value_id2, value_id3);
-
-    let got = svc
-        .get_secret(&ctx, &key("k"))
-        .await
-        .expect("get_secret")
-        .expect("some");
-    assert_eq!(got.secret.as_bytes(), b"v3", "last writer wins");
-
-    // Both superseded versions were collected by each write's own step-5
-    // cleanup (the default FakePlugin never fails delete).
-    assert!(!plugin.contains(&TenantId(tenant), value_id1));
-    assert!(!plugin.contains(&TenantId(tenant), value_id2));
-    assert!(plugin.contains(&TenantId(tenant), value_id3));
-    assert!(repo.gc_entries().is_empty());
+    .expect("next write");
+    assert_eq!(plugin.versions(&key_k), vec!["3"]);
 }
 
 #[tokio::test]
-async fn step5_delete_failure_leaves_a_superseded_gc_row_that_run_gc_drains() {
+async fn without_destroy_support_nothing_is_ever_destroyed_and_reads_still_work() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
+    let plugin = FakePlugin::without_destroy();
     let dir = Arc::new(FakeDir::single(tenant));
     let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
-
-    svc.put(
-        &ctx,
-        &key("k"),
-        write_create(SharingMode::Tenant, "v1"),
-        create_only(),
-    )
-    .await
-    .expect("create");
-    let old_value_id = repo.rows()[0].value_id.expect("value_id");
-
-    // The overwrite's own best-effort cleanup of the superseded version fails.
-    plugin.fail_next_deletes(1);
+    let row = create_k(&svc, &repo, &ctx, "v1").await;
+    let key_k = row.store_key();
 
     svc.put(
         &ctx,
@@ -910,72 +1090,123 @@ async fn step5_delete_failure_leaves_a_superseded_gc_row_that_run_gc_drains() {
         put_exists(),
     )
     .await
-    .expect("overwrite succeeds despite the cleanup failure");
+    .expect("rotate");
+    svc.patch(&ctx, &key("k"), patch_suppress(), exists())
+        .await
+        .expect("remove the secret");
+    svc.patch(&ctx, &key("k"), patch_value("v3"), exists())
+        .await
+        .expect("set it again");
 
-    let superseded: Vec<_> = repo
-        .gc_entries()
-        .into_iter()
-        .filter(|e| e.value_id == old_value_id)
-        .collect();
-    assert_eq!(superseded.len(), 1);
-    assert_eq!(superseded[0].reason, GcReason::Superseded);
+    assert!(plugin.destroy_calls().is_empty(), "destroy is never called");
+    assert!(plugin.delete_key_calls().is_empty(), "nor delete_key");
+    assert_eq!(
+        plugin.versions(&key_k),
+        vec!["1", "2", "3"],
+        "rotated and removed versions stay until the record is deleted"
+    );
+    let got = svc
+        .get_secret(&ctx, &key("k"))
+        .await
+        .expect("get_secret")
+        .expect("some");
+    assert_eq!(got.secret.as_bytes(), b"v3");
 
-    // The next maintenance run drains it (the queued failure was consumed).
-    let report = svc.run_gc(&ctx).await.expect("run_gc");
-    assert_eq!(report.gc_deleted, 1);
-    assert!(repo.gc_entries().iter().all(|e| e.value_id != old_value_id));
+    // Record deletion is unchanged: row delete plus an outbox purge.
+    svc.delete(&ctx, &key("k"), exists()).await.expect("delete");
+    assert_eq!(repo.purged_keys(), vec![key_k]);
 }
 
 #[tokio::test]
-async fn read_races_a_switch_retry_returns_the_current_version() {
+async fn removing_the_secret_destroys_below_and_exactly_old_and_never_delete_key() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let dir = Arc::new(FakeDir::single(tenant));
     let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
     let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "v1").await;
+    let key_k = row.store_key();
+    let before = plugin.destroy_calls().len();
 
-    svc.put(
+    svc.patch(&ctx, &key("k"), patch_suppress(), exists())
+        .await
+        .expect("remove the secret");
+
+    let calls = plugin.destroy_calls();
+    assert_eq!(
+        calls[before..],
+        [
+            (
+                key_k.clone(),
+                DestroySelector::Below(ValueVersion::new("1"))
+            ),
+            (
+                key_k.clone(),
+                DestroySelector::Exactly(ValueVersion::new("1"))
+            ),
+        ]
+    );
+    assert!(
+        plugin.delete_key_calls().is_empty(),
+        "never delete_key here"
+    );
+    assert!(plugin.versions(&key_k).is_empty());
+    assert_eq!(repo.rows()[0].status, SecretStatus::Declared);
+    assert_eq!(repo.rows()[0].value_version, None);
+}
+
+#[tokio::test]
+async fn metadata_only_patch_makes_no_store_call() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "v1").await;
+    let key_k = row.store_key();
+    let destroys = plugin.destroy_calls().len();
+
+    svc.patch(
         &ctx,
         &key("k"),
-        write_create(SharingMode::Tenant, "old"),
-        create_only(),
+        patch_sharing(SharingMode::Shared),
+        exists(),
     )
     .await
-    .expect("create");
-    let row = repo.rows()[0].clone();
-    let old_value_id = row.value_id.expect("value_id");
+    .expect("metadata patch");
 
-    // Read the (already-bootstrapped) fence key back out of the plugin so
-    // the simulated concurrent write's fingerprint is one `get_secret`'s
-    // fence verification will actually accept — a fabricated fp would just
-    // look like corruption and fail closed, which is not what this test is
-    // exercising.
-    let fence_key = plugin
-        .get(&ctx, &TenantId::nil(), &credstore_sdk::FENCE_KEY_VALUE_ID)
-        .await
-        .expect("fence key bootstrapped by the create above")
-        .expect("fence key present");
-    let new_fp = crate::domain::secret::fence::compute_fp(fence_key.as_bytes(), b"new");
+    assert_eq!(repo.rows()[0].version, row.version + 1);
+    assert_eq!(repo.rows()[0].value_version, row.value_version);
+    assert_eq!(plugin.versions(&key_k), vec!["1"]);
+    assert_eq!(plugin.destroy_calls().len(), destroys);
+    assert_eq!(plugin.get_calls(), 0);
+}
 
-    // A concurrent write already landed: switch the row to a new value_id
-    // (and put the new bytes) right after the *next* resolve, and remove the
-    // old backend entry (as its own step-5 cleanup would have).
-    let new_value_id = ValueId::new_v4();
-    repo.switch_after_next_resolve(row.id, new_value_id, new_fp);
-    plugin
-        .put(
-            &ctx,
-            &TenantId(tenant),
-            &new_value_id,
-            SecretValue::from("new"),
-        )
-        .await
-        .expect("seed new value");
-    plugin
-        .delete(&ctx, &TenantId(tenant), &old_value_id)
-        .await
-        .expect("simulate old cleanup");
+#[tokio::test]
+async fn read_re_reads_once_and_serves_the_current_version_when_the_pointer_moved() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let metrics = FakeMetrics::new();
+    let svc = make_service(
+        repo.clone(),
+        plugin.clone(),
+        dir,
+        mock_enforcer(),
+        metrics.clone(),
+    );
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "old").await;
+    let key_k = row.store_key();
+
+    // A concurrent write already landed: the pointer moves to a new version
+    // right after the *next* resolve, and the old version is destroyed.
+    let new_version = plugin.seed(&key_k, b"new");
+    repo.switch_after_next_resolve(row.id, new_version);
+    plugin.drop_version(&key_k, &ValueVersion::new("1"));
 
     let got = svc
         .get_secret(&ctx, &key("k"))
@@ -987,6 +1218,102 @@ async fn read_races_a_switch_retry_returns_the_current_version() {
         b"new",
         "the retry must serve the current (post-switch) version"
     );
+    assert_eq!(metrics.read_retries(), vec![ReadRetryOutcome::Recovered]);
+}
+
+#[tokio::test]
+async fn read_that_misses_twice_is_503_never_a_stale_or_empty_value() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let metrics = FakeMetrics::new();
+    let svc = make_service(
+        repo.clone(),
+        plugin.clone(),
+        dir,
+        mock_enforcer(),
+        metrics.clone(),
+    );
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "old").await;
+
+    // The pointer moved to a version that is gone too.
+    repo.switch_after_next_resolve(row.id, ValueVersion::new("99"));
+    plugin.fail_next_gets_with_not_found(1);
+    let err = svc
+        .get_secret(&ctx, &key("k"))
+        .await
+        .expect_err("second miss");
+    assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
+    assert_eq!(metrics.read_retries(), vec![ReadRetryOutcome::SecondMiss]);
+}
+
+#[tokio::test]
+async fn read_miss_on_an_unmoved_pointer_is_503() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    create_k(&svc, &repo, &ctx, "old").await;
+
+    plugin.fail_next_gets_with_not_found(1);
+    let err = svc
+        .get_secret(&ctx, &key("k"))
+        .await
+        .expect_err("the version is gone but the row still names it");
+    assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
+}
+
+#[tokio::test]
+async fn declared_row_reads_never_call_the_plugin() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    svc.put(
+        &ctx,
+        &key("d"),
+        write_create_null(SharingMode::Tenant, SdkFallback::None),
+        create_only(),
+    )
+    .await
+    .expect("declared create");
+
+    assert!(
+        svc.get_secret(&ctx, &key("d"))
+            .await
+            .expect("get_secret")
+            .is_none()
+    );
+    svc.get(&ctx, &key("d")).await.expect("get");
+    assert_eq!(plugin.get_calls(), 0);
+}
+
+#[tokio::test]
+async fn delete_enqueues_the_key_purge_and_makes_no_plugin_call() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "v1").await;
+    let destroys = plugin.destroy_calls().len();
+
+    svc.delete(&ctx, &key("k"), exists()).await.expect("delete");
+
+    assert!(repo.rows().is_empty());
+    assert_eq!(repo.purged_keys(), vec![row.store_key()]);
+    assert!(
+        plugin.delete_key_calls().is_empty(),
+        "the purge is the outbox handler's job, not the request path's"
+    );
+    assert_eq!(plugin.destroy_calls().len(), destroys);
 }
 
 #[tokio::test]
@@ -1006,7 +1333,7 @@ async fn delete_then_create_only_put_under_the_same_reference_succeeds() {
     )
     .await
     .expect("create");
-    let old_value_id = repo.rows()[0].value_id.expect("value_id");
+    let old = repo.rows()[0].clone();
 
     svc.delete(&ctx, &key("reused"), exists())
         .await
@@ -1022,14 +1349,399 @@ async fn delete_then_create_only_put_under_the_same_reference_succeeds() {
     .await
     .expect("recreate under the same reference succeeds immediately");
 
+    let new = repo.rows()[0].clone();
+    assert_ne!(new.id, old.id, "a re-create mints a new record id");
+    assert_ne!(new.store_key(), old.store_key());
     let got = svc
         .get_secret(&ctx, &key("reused"))
         .await
         .expect("get_secret")
         .expect("some");
     assert_eq!(got.secret.as_bytes(), b"new");
-    // The predecessor's version was collected by delete's own step-3 cleanup.
-    assert!(!plugin.contains(&TenantId(tenant), old_value_id));
+    // The lagging purge targets the old key only; the new value is untouched.
+    assert_eq!(repo.purged_keys(), vec![old.store_key()]);
+    assert_eq!(plugin.versions(&new.store_key()), vec!["1"]);
+}
+
+#[tokio::test]
+async fn create_over_an_expired_own_row_is_a_conflict_and_changes_nothing() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let old = create_k(&svc, &repo, &ctx, "old").await;
+    // `generic` is non-expirable, so expire the stored row directly.
+    repo.force_expire(old.id);
+
+    let err = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_create(SharingMode::Tenant, "fresh"),
+            create_only(),
+        )
+        .await
+        .expect_err("the expired record is visible: renew or delete it");
+    assert!(matches!(err, DomainError::Conflict));
+
+    let rows = repo.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, old.id, "the expired record is not replaced");
+    assert!(repo.purged_keys().is_empty(), "no purge is enqueued");
+}
+
+// ── expiry applies to the secret, not to the record ─────────────────────────
+
+#[tokio::test]
+async fn expired_own_override_is_secret_expired_not_the_ancestors_value() {
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::new(vec![child, parent]));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+
+    svc.put(
+        &make_ctx(Uuid::new_v4(), parent),
+        &key("k"),
+        write_create(SharingMode::Shared, "parent-value"),
+        create_only(),
+    )
+    .await
+    .expect("create at parent");
+    let child_ctx = make_ctx(Uuid::new_v4(), child);
+    svc.put(
+        &child_ctx,
+        &key("k"),
+        write_create(SharingMode::Tenant, "child-value"),
+        create_only(),
+    )
+    .await
+    .expect("create override at child");
+    let own = repo
+        .rows()
+        .into_iter()
+        .find(|r| r.tenant_id == TenantId(child))
+        .expect("child row");
+    repo.force_expire(own.id);
+
+    let err = svc
+        .get_secret(&child_ctx, &key("k"))
+        .await
+        .expect_err("the expired override is decisive");
+    assert!(matches!(err, DomainError::SecretExpired), "{err:?}");
+
+    // The metadata read still shows the record, with the derived status and
+    // its normal validator.
+    let cred = svc
+        .get(&child_ctx, &key("k"))
+        .await
+        .expect("get")
+        .expect("the record stays visible");
+    assert_eq!(cred.status, CredentialStatus::Expired);
+    assert_eq!(cred.inheritance, InheritanceStatus::Overridden);
+    assert!(cred.expires_at.is_some());
+    let validator = cred.validator.expect("normal validator");
+    assert_eq!((validator.id, validator.version), (own.id, own.version));
+
+    // The point read with the secret selected fails the same way, with or
+    // without an administrative field alongside it.
+    for fields in [
+        vec!["secret".to_owned()],
+        vec!["status".to_owned(), "secret".to_owned()],
+    ] {
+        let err = svc
+            .get_item(&child_ctx, &key("k"), Some(&fields))
+            .await
+            .expect_err("expired");
+        assert!(matches!(err, DomainError::SecretExpired), "{err:?}");
+    }
+}
+
+#[tokio::test]
+async fn expired_decisive_ancestor_shared_record_is_secret_expired() {
+    let grandparent = Uuid::new_v4();
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::new(vec![child, parent, grandparent]));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+
+    for (tenant, value) in [(grandparent, "gp-value"), (parent, "p-value")] {
+        svc.put(
+            &make_ctx(Uuid::new_v4(), tenant),
+            &key("k"),
+            write_create(SharingMode::Shared, value),
+            create_only(),
+        )
+        .await
+        .expect("create shared");
+    }
+    let parent_row = repo
+        .rows()
+        .into_iter()
+        .find(|r| r.tenant_id == TenantId(parent))
+        .expect("parent row");
+    repo.force_expire(parent_row.id);
+
+    let child_ctx = make_ctx(Uuid::new_v4(), child);
+    let err = svc
+        .get_secret(&child_ctx, &key("k"))
+        .await
+        .expect_err("the nearest shared record is expired");
+    assert!(
+        matches!(err, DomainError::SecretExpired),
+        "never the grandparent's value: {err:?}"
+    );
+
+    // Metadata: the inherited record is visible; the caller holds no own
+    // row, so its own-row status stays `none` and `expires_at` is the past
+    // instant.
+    let cred = svc
+        .get(&child_ctx, &key("k"))
+        .await
+        .expect("get")
+        .expect("visible");
+    assert_eq!(cred.inheritance, InheritanceStatus::Inherited);
+    assert_eq!(cred.status, CredentialStatus::None);
+    assert!(cred.expires_at.expect("expiry") <= OffsetDateTime::now_utc());
+}
+
+#[tokio::test]
+async fn expired_decisive_record_blocks_even_a_declared_own_row_with_inherit() {
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::new(vec![child, parent]));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    svc.put(
+        &make_ctx(Uuid::new_v4(), parent),
+        &key("k"),
+        write_create(SharingMode::Shared, "p"),
+        create_only(),
+    )
+    .await
+    .expect("create shared");
+    repo.force_expire(repo.rows()[0].id);
+
+    // A `declared`/`inherit` own row does not compete, so the expired
+    // ancestor remains decisive: `fallback` only governs `declared` records.
+    let child_ctx = make_ctx(Uuid::new_v4(), child);
+    svc.put(
+        &child_ctx,
+        &key("k"),
+        write_create_null(SharingMode::Tenant, SdkFallback::Inherit),
+        create_only(),
+    )
+    .await
+    .expect("declare at child");
+    let err = svc
+        .get_secret(&child_ctx, &key("k"))
+        .await
+        .expect_err("expired");
+    assert!(matches!(err, DomainError::SecretExpired), "{err:?}");
+}
+
+#[tokio::test]
+async fn secret_expired_is_only_disclosed_to_a_caller_who_may_read_the_secret() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let writer = make_service_noop(repo.clone(), plugin.clone(), dir.clone());
+    let row = create_k(&writer, &repo, &ctx, "v").await;
+    repo.force_expire(row.id);
+
+    let (enforcer, _) = action_deny_enforcer(
+        SecretType::generic().gts_id().to_owned(),
+        crate::domain::authz::actions::READ_SECRET,
+    );
+    let svc = make_service(repo.clone(), plugin, dir, enforcer, Arc::new(NoopMetrics));
+
+    // No `read_secret`: the usual not-found answer, never `SECRET_EXPIRED`.
+    assert!(
+        svc.get_secret(&ctx, &key("k"))
+            .await
+            .expect("not an error")
+            .is_none()
+    );
+    let fields = ["status".to_owned(), "secret".to_owned()];
+    assert!(
+        svc.get_item(&ctx, &key("k"), Some(&fields))
+            .await
+            .expect("not an error")
+            .is_none()
+    );
+    // The record itself is still readable with `read`.
+    let cred = svc
+        .get(&ctx, &key("k"))
+        .await
+        .expect("get")
+        .expect("visible");
+    assert_eq!(cred.status, CredentialStatus::Expired);
+}
+
+#[tokio::test]
+async fn patching_expires_at_renews_in_place_and_the_secret_is_served_again() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    // `personal-token` is expirable (and private-only).
+    let write = CredentialWrite {
+        expires_at: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+        ..write_create_typed(SharingMode::Private, "tok", "personal-token")
+    };
+    svc.put(&ctx, &key("pt"), write, create_only())
+        .await
+        .expect("create");
+    let row = repo.rows()[0].clone();
+    repo.force_expire(row.id);
+    assert!(matches!(
+        svc.get_secret(&ctx, &key("pt")).await,
+        Err(DomainError::SecretExpired)
+    ));
+    let expired = repo.rows()[0].clone();
+
+    let validator = svc
+        .patch(
+            &ctx,
+            &key("pt"),
+            CredentialPatch {
+                expires_at: PatchField::Set(OffsetDateTime::now_utc() + time::Duration::hours(2)),
+                ..empty_patch()
+            },
+            matches(expired.id, expired.version),
+        )
+        .await
+        .expect("renew the expired record in place");
+    assert_eq!(validator.id, row.id, "same record, not a new one");
+    assert_eq!(validator.version, expired.version + 1);
+
+    let got = svc
+        .get_secret(&ctx, &key("pt"))
+        .await
+        .expect("get_secret")
+        .expect("some");
+    assert_eq!(got.secret.as_bytes(), b"tok");
+    let cred = svc.get(&ctx, &key("pt")).await.expect("get").expect("some");
+    assert_eq!(cred.status, CredentialStatus::Active);
+}
+
+#[tokio::test]
+async fn put_with_if_match_star_renews_an_expired_record_in_place() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let old = create_k(&svc, &repo, &ctx, "old").await;
+    repo.force_expire(old.id);
+
+    // A replace of an expired record writes the whole record again; `generic`
+    // is non-expirable, so the replace carries no expiry and the stored
+    // instant is cleared.
+    svc.put(
+        &ctx,
+        &key("k"),
+        write_replace(SharingMode::Tenant, "new"),
+        put_exists(),
+    )
+    .await
+    .expect("replace the expired record");
+    assert_eq!(repo.rows()[0].id, old.id);
+    let got = svc
+        .get_secret(&ctx, &key("k"))
+        .await
+        .expect("get_secret")
+        .expect("some");
+    assert_eq!(got.secret.as_bytes(), b"new");
+}
+
+#[tokio::test]
+async fn create_over_a_live_own_row_is_still_a_conflict() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    create_k(&svc, &repo, &ctx, "old").await;
+
+    let err = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_create(SharingMode::Tenant, "again"),
+            create_only(),
+        )
+        .await
+        .expect_err("conflict");
+    assert!(matches!(err, DomainError::Conflict));
+    assert!(repo.purged_keys().is_empty());
+}
+
+#[tokio::test]
+async fn lost_create_race_destroys_the_loser_version_and_returns_conflict() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    // A concurrent create commits between this writer's read and its insert.
+    repo.conflict_next_insert_active(1);
+    let err = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_create(SharingMode::Tenant, "loser"),
+            create_only(),
+        )
+        .await
+        .expect_err("unique violation is a conflict");
+    assert!(matches!(err, DomainError::Conflict));
+
+    let calls = plugin.destroy_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, DestroySelector::Exactly(ValueVersion::new("1")));
+    assert!(!plugin.holds_key(&calls[0].0));
+}
+
+#[tokio::test]
+async fn ambiguous_create_failure_keeps_the_version() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    repo.fail_next_insert_active(1);
+    let err = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_create(SharingMode::Tenant, "v"),
+            create_only(),
+        )
+        .await
+        .expect_err("ambiguous failure");
+    assert!(matches!(err, DomainError::Internal { .. }));
+    assert!(
+        plugin.destroy_calls().is_empty(),
+        "the commit may have happened: the version is not destroyed"
+    );
 }
 
 // ── delete ────────────────────────────────────────────────────────────────────
@@ -1147,7 +1859,7 @@ async fn delete_if_match_race_maps_zero_rows_to_version_conflict() {
 }
 
 #[tokio::test]
-async fn delete_with_no_plugin_fails_without_deleting_the_row() {
+async fn delete_needs_no_plugin_because_the_purge_runs_from_the_outbox() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let dir = Arc::new(FakeDir::single(tenant));
@@ -1163,6 +1875,7 @@ async fn delete_with_no_plugin_fails_without_deleting_the_row() {
     )
     .await
     .expect("create");
+    let row = repo.rows()[0].clone();
 
     let svc_no_plugin = Service::new(
         repo.clone(),
@@ -1171,19 +1884,14 @@ async fn delete_with_no_plugin_fails_without_deleting_the_row() {
         Arc::new(NoPluginSelector),
         catalog_type_resolver(),
         Arc::new(NoopMetrics),
-        test_gc_settings(),
         test_list_settings(),
     );
-    let err = svc_no_plugin
+    svc_no_plugin
         .delete(&ctx, &key("k"), exists())
         .await
-        .expect_err("no plugin available");
-    assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
-    assert_eq!(
-        repo.rows().len(),
-        1,
-        "row must survive when no plugin resolves"
-    );
+        .expect("delete resolves no plugin: the outbox handler does, and retries");
+    assert!(repo.rows().is_empty());
+    assert_eq!(repo.purged_keys(), vec![row.store_key()]);
 }
 
 // ── PDP / scope gating ────────────────────────────────────────────────────────
@@ -1262,7 +1970,6 @@ async fn operations_return_service_unavailable_when_type_resolver_fails() {
         Arc::new(FakePluginSelector::new(plugin)),
         Arc::new(FailingTypeResolver),
         Arc::new(NoopMetrics),
-        test_gc_settings(),
         test_list_settings(),
     );
     let ctx = make_ctx(Uuid::new_v4(), tenant);
@@ -1348,6 +2055,237 @@ async fn create_only_conflict_is_authorized_before_it_leaks_existence() {
             .expect("lock")
             .is_empty()
     );
+}
+
+// ── reference-scoped grants (ADR-0010) ───────────────────────────────────────
+
+/// Seed `refs` as tenant-shared generic credentials via a permissive service.
+async fn seed_refs(
+    repo: &Arc<FakeSecretRepo>,
+    plugin: &Arc<FakePlugin>,
+    dir: &Arc<FakeDir>,
+    ctx: &toolkit_security::SecurityContext,
+    refs: &[&str],
+) {
+    let svc = make_service_noop(repo.clone(), plugin.clone(), dir.clone());
+    for r in refs {
+        svc.put(
+            ctx,
+            &key(r),
+            write_create(SharingMode::Tenant, "v"),
+            create_only(),
+        )
+        .await
+        .expect("seed");
+    }
+}
+
+#[tokio::test]
+async fn point_read_is_admitted_or_missing_by_reference() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    seed_refs(&repo, &plugin, &dir, &ctx, &["smtp-password", "other"]).await;
+
+    let svc = make_service(
+        repo,
+        plugin,
+        dir,
+        reference_enforcer(&["smtp-password"], None),
+        Arc::new(NoopMetrics),
+    );
+    let got = svc
+        .get_secret(&ctx, &key("smtp-password"))
+        .await
+        .expect("get_secret")
+        .expect("admitted");
+    assert_eq!(got.secret.as_bytes(), b"v");
+    assert!(
+        svc.get(&ctx, &key("smtp-password"))
+            .await
+            .expect("get")
+            .is_some()
+    );
+    assert!(
+        svc.get_secret(&ctx, &key("other"))
+            .await
+            .expect("get_secret")
+            .is_none()
+    );
+    assert!(svc.get(&ctx, &key("other")).await.expect("get").is_none());
+}
+
+#[tokio::test]
+async fn a_non_admitted_decisive_child_override_is_a_miss_never_the_ancestor_value() {
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::new(vec![child, parent]));
+    let ctx = make_ctx(owner, child);
+
+    let child_type = SecretType::generic();
+    let parent_type = SecretType::from_name("api-key").expect("known");
+    let now = OffsetDateTime::now_utc();
+    // The child's own (decisive, nearest) row is of a type the PDP excludes;
+    // the ancestor's shared row is of an admitted type.
+    for (tenant_id, sharing, ty) in [
+        (child, SharingMode::Tenant, &child_type),
+        (parent, SharingMode::Shared, &parent_type),
+    ] {
+        repo.seed(crate::domain::secret::model::SecretRow {
+            id: Uuid::new_v4(),
+            tenant_id: TenantId(tenant_id),
+            reference: "r".to_owned(),
+            sharing,
+            owner_id: OwnerId(owner),
+            status: SecretStatus::Active,
+            version: 1,
+            updated_at: now,
+            secret_type_uuid: ty.uuid(),
+            expires_at: None,
+            value_version: Some(ValueVersion::new("1")),
+            fallback: Fallback::Inherit,
+        });
+    }
+
+    let permissive = make_service_noop(repo.clone(), plugin.clone(), dir.clone());
+    assert!(
+        permissive
+            .get(&ctx, &key("r"))
+            .await
+            .expect("get")
+            .is_some()
+    );
+
+    let (enforcer, _) = type_deny_enforcer(vec![child_type.gts_id().to_owned()]);
+    let svc = make_service(repo, plugin, dir, enforcer, Arc::new(NoopMetrics));
+    assert!(svc.get(&ctx, &key("r")).await.expect("get").is_none());
+    assert!(
+        svc.get_secret(&ctx, &key("r"))
+            .await
+            .expect("get_secret")
+            .is_none(),
+        "the ancestor's value must not be served in place of the decisive row"
+    );
+}
+
+#[tokio::test]
+async fn create_is_denied_by_a_reference_constraint_that_does_not_admit_the_key() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let svc = make_service(
+        repo.clone(),
+        FakePlugin::new(),
+        Arc::new(FakeDir::single(tenant)),
+        reference_enforcer(&["smtp-password"], None),
+        Arc::new(NoopMetrics),
+    );
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    let err = svc
+        .put(
+            &ctx,
+            &key("other"),
+            write_create(SharingMode::Tenant, "v"),
+            create_only(),
+        )
+        .await
+        .expect_err("not admitted");
+    assert!(matches!(err, DomainError::AccessDenied { .. }));
+    assert!(repo.rows().is_empty());
+
+    svc.put(
+        &ctx,
+        &key("smtp-password"),
+        write_create(SharingMode::Tenant, "v"),
+        create_only(),
+    )
+    .await
+    .expect("admitted reference");
+    assert_eq!(repo.rows().len(), 1);
+}
+
+#[tokio::test]
+async fn replace_patch_and_delete_of_a_non_admitted_reference_answer_as_missing() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    seed_refs(&repo, &plugin, &dir, &ctx, &["other"]).await;
+    let svc = make_service(
+        repo.clone(),
+        plugin,
+        dir,
+        reference_enforcer(&["smtp-password"], None),
+        Arc::new(NoopMetrics),
+    );
+
+    let err = svc
+        .put(
+            &ctx,
+            &key("other"),
+            write_replace(SharingMode::Tenant, "v2"),
+            put_exists(),
+        )
+        .await
+        .expect_err("replace of a missing row");
+    assert!(matches!(err, DomainError::VersionConflict));
+
+    let err = svc
+        .patch(&ctx, &key("other"), patch_value("v3"), exists())
+        .await
+        .expect_err("patch of a missing row");
+    assert!(matches!(err, DomainError::NotFound));
+
+    let err = svc
+        .delete(&ctx, &key("other"), exists())
+        .await
+        .expect_err("delete of a missing row");
+    assert!(matches!(err, DomainError::NotFound));
+    assert_eq!(repo.rows().len(), 1, "the row is untouched");
+}
+
+#[tokio::test]
+async fn removing_the_secret_needs_write_secret_on_the_reference() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    seed_refs(&repo, &plugin, &dir, &ctx, &["smtp-password", "other"]).await;
+    // `write` is unrestricted; `write_secret` only covers smtp-password.
+    let svc = make_service(
+        repo.clone(),
+        plugin,
+        dir,
+        reference_enforcer(&["smtp-password"], Some(&["write_secret"])),
+        Arc::new(NoopMetrics),
+    );
+
+    let err = svc
+        .put(
+            &ctx,
+            &key("other"),
+            write_replace_null(SharingMode::Tenant, SdkFallback::Inherit),
+            put_exists(),
+        )
+        .await
+        .expect_err("write_secret does not cover this reference");
+    assert!(matches!(err, DomainError::AccessDenied { .. }));
+
+    svc.put(
+        &ctx,
+        &key("smtp-password"),
+        write_replace_null(SharingMode::Tenant, SdkFallback::Inherit),
+        put_exists(),
+    )
+    .await
+    .expect("write_secret covers smtp-password");
 }
 
 // ── plugin-error mapping ─────────────────────────────────────────────────────
@@ -1617,63 +2555,7 @@ async fn generic_secrets_evaluate_the_full_concrete_type() {
     );
 }
 
-// ── fence (ADR-0003, narrowed by ADR-0006) ───────────────────────────────────
-
-#[tokio::test]
-async fn clean_write_then_read_verifies_ok() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let metrics = FakeMetrics::new();
-    let svc = make_service(repo, plugin, dir, mock_enforcer(), metrics.clone());
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-    svc.put(
-        &ctx,
-        &key("k"),
-        write_create(SharingMode::Tenant, "v"),
-        create_only(),
-    )
-    .await
-    .expect("create");
-    svc.get_secret(&ctx, &key("k"))
-        .await
-        .expect("get_secret")
-        .expect("some");
-    assert_eq!(metrics.fence_verifies(), vec![FenceVerify::Ok]);
-}
-
-#[tokio::test]
-async fn overwrite_restamps_the_fingerprint() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = make_service_noop(repo.clone(), plugin, dir);
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-    svc.put(
-        &ctx,
-        &key("k"),
-        write_create(SharingMode::Tenant, "v1"),
-        create_only(),
-    )
-    .await
-    .expect("create");
-    let fp1 = repo.rows()[0].value_fp.clone();
-    svc.put(
-        &ctx,
-        &key("k"),
-        write_replace(SharingMode::Tenant, "v2"),
-        put_exists(),
-    )
-    .await
-    .expect("overwrite");
-    let fp2 = repo.rows()[0].value_fp.clone();
-    assert_ne!(
-        fp1, fp2,
-        "the fingerprint must be restamped for the new value"
-    );
-}
+// ── record generations (ADR-0006: no ABA) ────────────────────────────────────
 
 #[tokio::test]
 async fn aba_recreate_rejects_stale_generation_validator() {
@@ -1717,174 +2599,6 @@ async fn aba_recreate_rejects_stale_generation_validator() {
         .await
         .expect_err("stale generation validator rejected");
     assert!(matches!(err, DomainError::VersionConflict));
-}
-
-#[tokio::test]
-async fn fence_key_bootstrap_persists_the_key_in_the_backend() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = make_service_noop(repo, plugin.clone(), dir);
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-    svc.put(
-        &ctx,
-        &key("k"),
-        write_create(SharingMode::Tenant, "v"),
-        create_only(),
-    )
-    .await
-    .expect("create");
-    assert!(plugin.contains(&TenantId::nil(), credstore_sdk::FENCE_KEY_VALUE_ID));
-}
-
-#[tokio::test]
-async fn fence_key_bootstrap_conflict_is_treated_as_another_replica_won() {
-    // A stricter plugin's `put` immutability guard rejects the bootstrap
-    // write with Conflict when a peer already landed its own candidate —
-    // load_fence_key must treat that as "re-read", not an error.
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = make_service_noop(repo, plugin.clone(), dir);
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-
-    // Pre-seed the fence key as if a peer replica already won the race.
-    plugin
-        .put(
-            &ctx,
-            &TenantId::nil(),
-            &credstore_sdk::FENCE_KEY_VALUE_ID,
-            SecretValue::new(vec![9u8; 32]),
-        )
-        .await
-        .expect("preseed fence key");
-
-    svc.put(
-        &ctx,
-        &key("k"),
-        write_create(SharingMode::Tenant, "v"),
-        create_only(),
-    )
-    .await
-    .expect("create still succeeds, adopting the peer's key");
-}
-
-#[tokio::test]
-async fn fence_key_reference_is_unreachable_through_the_api() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = make_service_noop(repo, plugin, dir);
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-    svc.put(
-        &ctx,
-        &key("k"),
-        write_create(SharingMode::Tenant, "v"),
-        create_only(),
-    )
-    .await
-    .expect("create, bootstrapping the fence key");
-    // No external caller ever carries the nil tenant, so nothing about the
-    // reserved fence-key entry is reachable via get/put/delete under any
-    // real tenant — this is a structural property (nil tenant never equals
-    // a real `ctx.subject_tenant_id()`), asserted here for documentation.
-    assert_ne!(TenantId(tenant), TenantId::nil());
-}
-
-// ── maintenance job (`run_gc`) ────────────────────────────────────────────────
-
-#[tokio::test]
-async fn run_gc_deletes_an_expired_row_and_its_version() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-
-    let write = CredentialWrite {
-        expires_at: Some(OffsetDateTime::now_utc() + time::Duration::seconds(1)),
-        ..write_create_typed(SharingMode::Tenant, "v", "bearer-token")
-    };
-    svc.put(&ctx, &key("k"), write, create_only())
-        .await
-        .expect("create expirable");
-    let row = repo.rows()[0].clone();
-    let value_id = row.value_id.expect("value_id");
-
-    // Force it into the past directly (bypassing real time).
-    repo.force_expire(row.id);
-
-    let report = svc.run_gc(&ctx).await.expect("run_gc");
-    assert_eq!(report.expired_deleted, 1);
-    assert!(repo.rows().is_empty());
-    assert!(!plugin.contains(&TenantId(tenant), value_id));
-}
-
-#[tokio::test]
-async fn run_gc_twice_second_report_is_all_zeros() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = make_service_noop(repo, plugin, dir);
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-
-    let first = svc.run_gc(&ctx).await.expect("run_gc first");
-    assert_eq!(first, crate::domain::secret::service::GcReport::default());
-    let second = svc.run_gc(&ctx).await.expect("run_gc second");
-    assert_eq!(second, crate::domain::secret::service::GcReport::default());
-}
-
-#[tokio::test]
-async fn run_gc_never_deletes_a_referenced_pending_id() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = make_service_with_gc(
-        repo.clone(),
-        plugin.clone(),
-        dir,
-        mock_enforcer(),
-        Arc::new(NoopMetrics),
-        test_gc_settings_zero_age(),
-    );
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-
-    svc.put(
-        &ctx,
-        &key("k"),
-        write_create(SharingMode::Tenant, "v"),
-        create_only(),
-    )
-    .await
-    .expect("create");
-    let row = repo.rows()[0].clone();
-    let value_id = row.value_id.expect("value_id");
-
-    // Manually (mis)repair the gc table: a pending entry for a value_id a
-    // row still references — the defensive branch must hold even so.
-    repo.gc_insert_pending(value_id, TenantId(tenant))
-        .await
-        .expect("insert pending");
-
-    let report = svc.run_gc(&ctx).await.expect("run_gc");
-    assert_eq!(
-        report.gc_pending_reclaimed, 0,
-        "a referenced id must never be counted as reclaimed"
-    );
-    assert!(
-        plugin.contains(&TenantId(tenant), value_id),
-        "the backend entry a live row points to must never be deleted"
-    );
-    assert!(
-        repo.gc_entries().iter().all(|e| e.value_id != value_id),
-        "the stale (manually-repaired) pending row is still dropped"
-    );
 }
 
 // ── ADR-0004: walkthrough scenario (T1 shared, T2 overrides/rotates/
@@ -2285,7 +2999,10 @@ async fn patch_denied_action_writes_nothing() {
         .patch(&ctx, &key("k"), patch, matches(row.id, row.version))
         .await
         .expect_err("write_secret denied");
-    assert!(matches!(err, DomainError::AccessDenied { .. }));
+    // `write_secret` on the base type excludes the record's type from the
+    // PDP's type constraint, so the lookup under that scope does not find the
+    // row: the same 404 as a missing record (a flat PDP denial is the 403).
+    assert!(matches!(err, DomainError::NotFound));
     // Nothing was written: sharing and value both unchanged.
     assert_eq!(repo.rows()[0].sharing, SharingMode::Tenant);
     assert_eq!(repo.rows()[0].version, row.version);
@@ -2634,97 +3351,6 @@ async fn resolve_credential_carries_the_winner_identity_when_no_own_row() {
     assert_eq!(weak_source, Some((parent_row.id, parent_row.version)));
 }
 
-// ── hardening (lifecycle review addendum) ────────────────────────────────────
-
-#[tokio::test]
-async fn abandon_pending_marks_aborted_rather_than_deleting_the_intent() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-
-    // Bootstrap the fence key with an unrelated write first, so the failure
-    // armed below lands on the *value's* plugin.put (create_new's step 3),
-    // not on the fence-key bootstrap put.
-    svc.put(
-        &ctx,
-        &key("bootstrap"),
-        write_create(SharingMode::Tenant, "x"),
-        create_only(),
-    )
-    .await
-    .expect("bootstrap the fence key");
-    plugin.fail_next_puts(1);
-
-    let err = svc
-        .put(
-            &ctx,
-            &key("k"),
-            write_create(SharingMode::Tenant, "v"),
-            create_only(),
-        )
-        .await
-        .expect_err("plugin.put failure propagates");
-    assert!(matches!(err, DomainError::Internal { .. }));
-
-    let entries = repo.gc_entries();
-    assert_eq!(
-        entries.len(),
-        1,
-        "the intent row must survive, not be deleted"
-    );
-    assert_eq!(
-        entries[0].reason,
-        GcReason::Aborted,
-        "abandon_pending must mark Aborted, never delete the intent outright"
-    );
-}
-
-#[tokio::test]
-async fn run_gc_pending_reclaim_claims_before_deleting_from_the_backend() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let svc = make_service_with_gc(
-        repo.clone(),
-        plugin.clone(),
-        dir,
-        mock_enforcer(),
-        Arc::new(NoopMetrics),
-        test_gc_settings_zero_age(),
-    );
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-
-    // An unreferenced pending entry whose backend delete will fail.
-    let orphan = ValueId::new_v4();
-    plugin
-        .put(
-            &ctx,
-            &TenantId(tenant),
-            &orphan,
-            SecretValue::from("orphan-bytes"),
-        )
-        .await
-        .expect("seed orphan bytes");
-    repo.gc_insert_pending(orphan, TenantId(tenant))
-        .await
-        .expect("insert pending");
-    plugin.fail_next_deletes(1);
-
-    let report = svc.run_gc(&ctx).await.expect("run_gc");
-    // The claim (gc_delete) must have succeeded and counted even though the
-    // backend delete failed — "claim first" means the gc row is gone
-    // regardless of the backend outcome.
-    assert_eq!(report.gc_pending_reclaimed, 1);
-    assert!(
-        repo.gc_entries().iter().all(|e| e.value_id != orphan),
-        "the gc row must be claimed (removed) even when the backend delete fails"
-    );
-}
-
 // ── ADR-0004 Amendment A: Service::get_item (projection-aware point read) ───
 
 #[tokio::test]
@@ -2961,17 +3587,16 @@ async fn put_create_with_explicit_null_creates_a_declared_row_write_only() {
 
     let row = repo.rows()[0].clone();
     assert_eq!(row.status, SecretStatus::Declared);
-    assert!(row.value_id.is_none());
-    assert!(row.value_fp.is_none());
+    assert!(row.value_version.is_none());
     assert!(
-        repo.gc_entries().is_empty(),
-        "a value-less create must enqueue no gc intent"
+        repo.purged_keys().is_empty(),
+        "a value-less create touches no store key"
     );
-    assert_eq!(
-        plugin.fence_key_gets(),
-        0,
+    assert!(
+        plugin.destroy_calls().is_empty() && plugin.get_calls() == 0,
         "a value-less create must never call the plugin"
     );
+    assert!(!plugin.holds_key(&row.store_key()));
 
     let seen = resolver.seen_actions();
     assert!(seen.contains(&crate::domain::authz::actions::WRITE.to_owned()));
@@ -3106,7 +3731,7 @@ async fn put_null_on_active_row_removes_the_value_in_one_transaction_and_cleans_
         .await
         .expect("create");
     let row = repo.rows()[0].clone();
-    let old_value_id = row.value_id.expect("value_id");
+    let old_version = row.value_version.clone().expect("value_version");
 
     let (enforcer, resolver) = type_recording_enforcer();
     let svc = make_service(
@@ -3130,10 +3755,14 @@ async fn put_null_on_active_row_removes_the_value_in_one_transaction_and_cleans_
 
     let after = repo.rows()[0].clone();
     assert_eq!(after.status, SecretStatus::Declared);
-    assert!(after.value_id.is_none());
+    assert!(after.value_version.is_none());
     assert!(
-        !plugin.contains(&TenantId(tenant), old_value_id),
-        "the superseded version must be cleaned up"
+        !plugin.contains(&row.store_key(), &old_version),
+        "the removed version must be destroyed"
+    );
+    assert!(
+        plugin.delete_key_calls().is_empty(),
+        "removing a secret never deletes the key"
     );
 
     let seen = resolver.seen_actions();
@@ -3264,9 +3893,756 @@ fn seeded_row(
         updated_at: OffsetDateTime::now_utc(),
         secret_type_uuid: SecretType::generic().uuid(),
         expires_at: None,
-        value_id: Some(ValueId::new_v4()),
-        value_fp: Some(vec![7u8; 32]),
-        fp_key_id: Some(1),
+        value_version: Some(ValueVersion::new("1")),
         fallback: Fallback::Inherit,
     }
+}
+
+// ── anti-enumeration: authorize before any row lookup (DESIGN 7.1) ──────────
+//
+// A caller without permission on a record MUST NOT be able to tell whether it
+// exists: the PDP decision comes first, the caller's own row second, the
+// precondition last.
+
+/// One tenant with: `k` (generic, tenant-shared) and `a` (api-key). The
+/// enforcer denies the generic type only, so the caller is permitted for
+/// api-key but not for the type of `k`.
+fn partial_world() -> (Service, Arc<FakeSecretRepo>, SecurityContextPair) {
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let generic_gts = SecretType::generic().gts_id().to_owned();
+    let (enforcer, _) = type_deny_enforcer(vec![generic_gts]);
+    let repo = Arc::new(FakeSecretRepo::new());
+    repo.seed(seeded_row(tenant, owner, "k", SharingMode::Tenant));
+    let mut a = seeded_row(tenant, owner, "a", SharingMode::Tenant);
+    a.secret_type_uuid = SecretType::from_name("api-key").expect("type").uuid();
+    repo.seed(a);
+    let svc = make_service(
+        repo.clone(),
+        FakePlugin::new(),
+        Arc::new(FakeDir::single(tenant)),
+        enforcer,
+        Arc::new(NoopMetrics),
+    );
+    (svc, repo, (make_ctx(owner, tenant), tenant, owner))
+}
+
+type SecurityContextPair = (toolkit_security::SecurityContext, Uuid, Uuid);
+
+/// A world where the caller may do everything; `k` exists, `gone` does not.
+fn permitted_world() -> (Service, Arc<FakeSecretRepo>, SecurityContextPair) {
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    repo.seed(seeded_row(tenant, owner, "k", SharingMode::Tenant));
+    let svc = make_service_noop(
+        repo.clone(),
+        FakePlugin::new(),
+        Arc::new(FakeDir::single(tenant)),
+    );
+    (svc, repo, (make_ctx(owner, tenant), tenant, owner))
+}
+
+/// A world where the caller may do nothing; `k` exists, `gone` does not.
+fn denied_world() -> (Service, Arc<FakeSecretRepo>, SecurityContextPair) {
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    repo.seed(seeded_row(tenant, owner, "k", SharingMode::Tenant));
+    let svc = make_service(
+        repo.clone(),
+        FakePlugin::new(),
+        Arc::new(FakeDir::single(tenant)),
+        deny_enforcer(),
+        Arc::new(NoopMetrics),
+    );
+    (svc, repo, (make_ctx(owner, tenant), tenant, owner))
+}
+
+fn assert_denied<T: std::fmt::Debug>(r: &Result<T, DomainError>, what: &str) {
+    assert!(
+        matches!(r, Err(DomainError::AccessDenied { .. })),
+        "{what}: expected AccessDenied, got {r:?}"
+    );
+}
+
+// delete
+
+#[tokio::test]
+async fn delete_without_permission_answers_the_same_for_existing_and_missing() {
+    let (svc, repo, (ctx, ..)) = denied_world();
+    assert_denied(&svc.delete(&ctx, &key("k"), exists()).await, "existing");
+    assert_denied(&svc.delete(&ctx, &key("gone"), exists()).await, "missing");
+    // A precondition that would not match must not change the answer.
+    assert_denied(
+        &svc.delete(&ctx, &key("k"), matches(Uuid::new_v4(), 99))
+            .await,
+        "existing, wrong If-Match",
+    );
+    assert_eq!(repo.rows().len(), 1, "nothing deleted");
+}
+
+#[tokio::test]
+async fn delete_of_a_row_of_an_unpermitted_type_is_the_missing_answer() {
+    let (svc, repo, (ctx, ..)) = partial_world();
+    for (what, pre) in [
+        ("If-Match *", exists()),
+        ("wrong If-Match", matches(Uuid::new_v4(), 99)),
+    ] {
+        let on_unpermitted = svc.delete(&ctx, &key("k"), pre).await;
+        assert!(
+            matches!(on_unpermitted, Err(DomainError::NotFound)),
+            "{what}: {on_unpermitted:?}"
+        );
+    }
+    let on_missing = svc.delete(&ctx, &key("gone"), exists()).await;
+    assert!(matches!(on_missing, Err(DomainError::NotFound)));
+    assert_eq!(repo.rows().len(), 2, "nothing deleted");
+}
+
+#[tokio::test]
+async fn delete_by_a_permitted_caller_keeps_409_and_404() {
+    let (svc, repo, (ctx, ..)) = permitted_world();
+    let wrong = svc
+        .delete(&ctx, &key("k"), matches(Uuid::new_v4(), 99))
+        .await;
+    assert!(matches!(wrong, Err(DomainError::VersionConflict)));
+    let missing = svc.delete(&ctx, &key("gone"), exists()).await;
+    assert!(matches!(missing, Err(DomainError::NotFound)));
+    svc.delete(&ctx, &key("k"), exists()).await.expect("delete");
+    assert!(repo.rows().is_empty());
+}
+
+#[tokio::test]
+async fn denied_and_not_found_writes_are_not_audited() {
+    let (svc, _repo, (ctx, ..)) = partial_world();
+    let audit = RecordingAudit::new();
+    let svc = svc.with_audit(audit.clone());
+    assert!(svc.delete(&ctx, &key("k"), exists()).await.is_err());
+    assert!(svc.delete(&ctx, &key("gone"), exists()).await.is_err());
+    assert!(
+        svc.patch(&ctx, &key("k"), patch_value("x"), exists())
+            .await
+            .is_err()
+    );
+    assert!(audit.events().is_empty(), "{:?}", audit.events());
+}
+
+#[tokio::test]
+async fn pdp_outage_is_503_even_for_a_missing_target() {
+    let tenant = Uuid::new_v4();
+    let svc = make_service(
+        Arc::new(FakeSecretRepo::new()),
+        FakePlugin::new(),
+        Arc::new(FakeDir::single(tenant)),
+        failing_enforcer(),
+        Arc::new(NoopMetrics),
+    );
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let r = svc.delete(&ctx, &key("gone"), exists()).await;
+    assert!(matches!(r, Err(DomainError::ServiceUnavailable { .. })));
+    let r = svc
+        .put(
+            &ctx,
+            &key("gone"),
+            write_replace(SharingMode::Tenant, "v"),
+            put_exists(),
+        )
+        .await;
+    assert!(matches!(r, Err(DomainError::ServiceUnavailable { .. })));
+}
+
+// replace (PUT with If-Match)
+
+#[tokio::test]
+async fn replace_without_permission_answers_the_same_for_existing_and_missing() {
+    let (svc, repo, (ctx, ..)) = denied_world();
+    let before = repo.rows()[0].clone();
+    for (what, k, pre) in [
+        ("existing", "k", put_exists()),
+        ("missing", "gone", put_exists()),
+        (
+            "existing, wrong If-Match",
+            "k",
+            put_matches(Uuid::new_v4(), 99),
+        ),
+    ] {
+        let r = svc
+            .put(&ctx, &key(k), write_replace(SharingMode::Tenant, "v"), pre)
+            .await;
+        assert_denied(&r, what);
+    }
+    // The request names the type: authorized on it, whatever exists.
+    for k in ["k", "gone"] {
+        let r = svc
+            .put(
+                &ctx,
+                &key(k),
+                write_create_typed(SharingMode::Tenant, "v", "generic"),
+                put_exists(),
+            )
+            .await;
+        assert_denied(&r, "named type");
+    }
+    assert_eq!(repo.rows()[0].version, before.version);
+}
+
+#[tokio::test]
+async fn replace_of_a_row_of_an_unpermitted_type_is_the_missing_answer() {
+    let (svc, repo, (ctx, ..)) = partial_world();
+    let k = repo
+        .rows()
+        .into_iter()
+        .find(|r| r.reference == "k")
+        .expect("k");
+    let cases = [
+        ("If-Match *", put_exists()),
+        ("right If-Match", put_matches(k.id, k.version)),
+        ("wrong If-Match", put_matches(Uuid::new_v4(), 99)),
+    ];
+    for (what, pre) in cases {
+        let r = svc
+            .put(
+                &ctx,
+                &key("k"),
+                write_replace(SharingMode::Tenant, "v"),
+                pre,
+            )
+            .await;
+        assert!(
+            matches!(r, Err(DomainError::VersionConflict)),
+            "{what}: {r:?}"
+        );
+    }
+    let missing = svc
+        .put(
+            &ctx,
+            &key("gone"),
+            write_replace(SharingMode::Tenant, "v"),
+            put_exists(),
+        )
+        .await;
+    assert!(matches!(missing, Err(DomainError::VersionConflict)));
+    let after = repo
+        .rows()
+        .into_iter()
+        .find(|r| r.reference == "k")
+        .expect("k");
+    assert_eq!(after.version, k.version, "the row was not touched");
+}
+
+#[tokio::test]
+async fn replace_by_a_permitted_caller_keeps_its_409s() {
+    let (svc, repo, (ctx, ..)) = permitted_world();
+    let wrong = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_replace(SharingMode::Tenant, "v"),
+            put_matches(Uuid::new_v4(), 99),
+        )
+        .await;
+    assert!(matches!(wrong, Err(DomainError::VersionConflict)));
+    let missing = svc
+        .put(
+            &ctx,
+            &key("gone"),
+            write_replace(SharingMode::Tenant, "v"),
+            put_exists(),
+        )
+        .await;
+    assert!(matches!(missing, Err(DomainError::VersionConflict)));
+    let k = repo.rows()[0].clone();
+    svc.put(
+        &ctx,
+        &key("k"),
+        write_replace(SharingMode::Tenant, "v"),
+        put_matches(k.id, k.version),
+    )
+    .await
+    .expect("replace");
+}
+
+#[tokio::test]
+async fn replace_naming_a_different_type_is_type_immutable_only_when_permitted_on_both() {
+    // Permitted on generic and api-key: the stored type is the caller's to
+    // know, so the type change is reported as such.
+    let (svc, _repo, (ctx, ..)) = permitted_world();
+    let r = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_create_typed(SharingMode::Tenant, "v", "api-key"),
+            put_exists(),
+        )
+        .await;
+    assert!(matches!(r, Err(DomainError::TypeViolation { .. })), "{r:?}");
+    // Permitted on api-key only: the generic row is "missing".
+    let (svc, _repo, (ctx, ..)) = partial_world();
+    let r = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_create_typed(SharingMode::Tenant, "v", "api-key"),
+            put_exists(),
+        )
+        .await;
+    assert!(matches!(r, Err(DomainError::VersionConflict)), "{r:?}");
+}
+
+// patch
+
+#[tokio::test]
+async fn patch_without_permission_answers_the_same_for_existing_and_missing() {
+    let (svc, repo, (ctx, ..)) = denied_world();
+    for (what, k, pre) in [
+        ("existing", "k", exists()),
+        ("missing", "gone", exists()),
+        ("existing, wrong If-Match", "k", matches(Uuid::new_v4(), 99)),
+    ] {
+        let r = svc.patch(&ctx, &key(k), patch_value("x"), pre).await;
+        assert_denied(&r, what);
+        let r = svc
+            .patch(&ctx, &key(k), patch_sharing(SharingMode::Shared), exists())
+            .await;
+        assert_denied(&r, what);
+    }
+    assert_eq!(repo.rows()[0].version, 1);
+}
+
+#[tokio::test]
+async fn patch_of_a_row_of_an_unpermitted_type_is_the_missing_answer() {
+    let (svc, repo, (ctx, ..)) = partial_world();
+    for (what, k, pre) in [
+        ("unpermitted type", "k", exists()),
+        (
+            "unpermitted type, wrong If-Match",
+            "k",
+            matches(Uuid::new_v4(), 99),
+        ),
+        ("missing", "gone", exists()),
+    ] {
+        let r = svc.patch(&ctx, &key(k), patch_value("x"), pre).await;
+        assert!(matches!(r, Err(DomainError::NotFound)), "{what}: {r:?}");
+        let r = svc
+            .patch(&ctx, &key(k), patch_sharing(SharingMode::Shared), exists())
+            .await;
+        assert!(matches!(r, Err(DomainError::NotFound)), "{what}: {r:?}");
+    }
+    let k = repo
+        .rows()
+        .into_iter()
+        .find(|r| r.reference == "k")
+        .expect("k");
+    assert_eq!(k.version, 1, "the row was not touched");
+}
+
+#[tokio::test]
+async fn patch_by_a_permitted_caller_keeps_409_and_404() {
+    let (svc, _repo, (ctx, ..)) = permitted_world();
+    let wrong = svc
+        .patch(
+            &ctx,
+            &key("k"),
+            patch_value("x"),
+            matches(Uuid::new_v4(), 99),
+        )
+        .await;
+    assert!(matches!(wrong, Err(DomainError::VersionConflict)));
+    let missing = svc
+        .patch(&ctx, &key("gone"), patch_value("x"), exists())
+        .await;
+    assert!(matches!(missing, Err(DomainError::NotFound)));
+}
+
+#[tokio::test]
+async fn empty_patch_is_rejected_independently_of_existence() {
+    let (svc, _repo, (ctx, ..)) = denied_world();
+    for k in ["k", "gone"] {
+        let r = svc.patch(&ctx, &key(k), empty_patch(), exists()).await;
+        assert!(
+            matches!(r, Err(DomainError::InvalidRequest { .. })),
+            "{r:?}"
+        );
+    }
+}
+
+// create (PUT with If-None-Match: *)
+
+#[tokio::test]
+async fn create_without_permission_answers_the_same_over_an_existing_and_a_free_name() {
+    let (svc, repo, (ctx, ..)) = denied_world();
+    for k in ["k", "gone"] {
+        let r = svc
+            .put(
+                &ctx,
+                &key(k),
+                write_create(SharingMode::Tenant, "v"),
+                create_only(),
+            )
+            .await;
+        assert_denied(&r, k);
+    }
+    assert_eq!(repo.rows().len(), 1, "nothing created");
+}
+
+#[tokio::test]
+async fn create_over_a_row_of_an_unpermitted_type_answers_like_any_collision() {
+    let (svc, repo, (ctx, ..)) = partial_world();
+    // `k` is generic (not writable by the caller), `a` is api-key (writable):
+    // a name collision is the same 409 whatever the occupant is.
+    for k in ["k", "a"] {
+        let r = svc
+            .put(
+                &ctx,
+                &key(k),
+                write_create_typed(SharingMode::Tenant, "v", "api-key"),
+                create_only(),
+            )
+            .await;
+        assert!(matches!(r, Err(DomainError::Conflict)), "{k}: {r:?}");
+    }
+    // A free name still creates.
+    svc.put(
+        &ctx,
+        &key("free"),
+        write_create_typed(SharingMode::Tenant, "v", "api-key"),
+        create_only(),
+    )
+    .await
+    .expect("create");
+    assert_eq!(repo.rows().len(), 3);
+}
+
+#[tokio::test]
+async fn create_by_a_permitted_caller_keeps_409_and_201() {
+    let (svc, _repo, (ctx, ..)) = permitted_world();
+    let r = svc
+        .put(
+            &ctx,
+            &key("k"),
+            write_create(SharingMode::Tenant, "v"),
+            create_only(),
+        )
+        .await;
+    assert!(matches!(r, Err(DomainError::Conflict)));
+    let out = svc
+        .put(
+            &ctx,
+            &key("new"),
+            write_create(SharingMode::Tenant, "v"),
+            create_only(),
+        )
+        .await
+        .expect("create");
+    assert!(out.created);
+}
+
+#[tokio::test]
+async fn create_without_a_type_is_rejected_independently_of_existence() {
+    let (svc, _repo, (ctx, ..)) = denied_world();
+    for k in ["k", "gone"] {
+        let r = svc
+            .put(
+                &ctx,
+                &key(k),
+                write_replace(SharingMode::Tenant, "v"),
+                create_only(),
+            )
+            .await;
+        assert!(
+            matches!(r, Err(DomainError::InvalidRequest { .. })),
+            "{r:?}"
+        );
+    }
+}
+
+// ── one PDP evaluation per action, whatever the number of types (ADR-0010) ──
+//
+// The PDP answers the BASE credential type with a constraint on the type
+// property, which the secure ORM applies in SQL. The number of evaluations is
+// the number of actions the operation needs - never a function of how many
+// credential types exist or which ones the tenant holds.
+
+/// A tenant holding one tenant-shared row for EVERY built-in credential type
+/// (`t-<name>` references), served by a counting PDP.
+type ManyTypesWorld = (
+    Service,
+    Arc<FakeSecretRepo>,
+    Arc<CountingAuthZResolver>,
+    SecurityContextPair,
+    Vec<(String, Uuid)>,
+);
+
+fn many_types_world() -> ManyTypesWorld {
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let mut refs = Vec::new();
+    for d in credstore_sdk::SECRET_TYPE_CATALOG {
+        let Some(type_uuid) = credstore_sdk::types::type_uuid(d.gts_id) else {
+            continue;
+        };
+        let reference = format!("t-{}", refs.len());
+        let mut row = seeded_row(tenant, owner, &reference, SharingMode::Tenant);
+        row.secret_type_uuid = type_uuid;
+        repo.seed(row);
+        refs.push((reference, type_uuid));
+    }
+    assert!(refs.len() >= 5, "the catalog must hold several types");
+    let (enforcer, counter) = counting_enforcer();
+    let svc = make_service(
+        repo.clone(),
+        FakePlugin::new(),
+        Arc::new(FakeDir::single(tenant)),
+        enforcer,
+        Arc::new(NoopMetrics),
+    );
+    (
+        svc,
+        repo,
+        counter,
+        (make_ctx(owner, tenant), tenant, owner),
+        refs,
+    )
+}
+
+#[tokio::test]
+async fn one_pdp_call_per_action_for_delete_patch_and_replace_regardless_of_type_count() {
+    let (svc, repo, counter, (ctx, _, _), refs) = many_types_world();
+    let before = |c: &CountingAuthZResolver| c.calls();
+
+    // delete: ONE `delete` evaluation.
+    let base = before(&counter);
+    let (reference, _) = &refs[0];
+    let row = repo
+        .rows()
+        .into_iter()
+        .find(|r| &r.reference == reference)
+        .expect("row");
+    svc.delete(&ctx, &key(reference), matches(row.id, row.version))
+        .await
+        .expect("delete");
+    assert_eq!(counter.calls() - base, 1, "delete: one evaluation");
+
+    // patch, metadata only: ONE `write` evaluation.
+    let base = before(&counter);
+    let (reference, _) = &refs[1];
+    svc.patch(
+        &ctx,
+        &key(reference),
+        patch_sharing(SharingMode::Shared),
+        exists(),
+    )
+    .await
+    .expect("patch metadata");
+    assert_eq!(counter.calls() - base, 1, "patch metadata: one evaluation");
+
+    // patch, value only: ONE `write_secret` evaluation.
+    let base = before(&counter);
+    svc.patch(&ctx, &key(reference), patch_value("v2"), exists())
+        .await
+        .expect("patch value");
+    assert_eq!(counter.calls() - base, 1, "patch value: one evaluation");
+
+    // replace with a value: `write` + `write_secret`, one evaluation each.
+    let base = before(&counter);
+    svc.put(
+        &ctx,
+        &key(reference),
+        write_replace(SharingMode::Shared, "v3"),
+        put_exists(),
+    )
+    .await
+    .expect("replace");
+    assert_eq!(
+        counter.calls() - base,
+        2,
+        "replace: one evaluation per action"
+    );
+}
+
+#[tokio::test]
+async fn one_pdp_call_per_action_for_reads_and_lists_regardless_of_type_count() {
+    let (svc, _repo, counter, (ctx, _, _), refs) = many_types_world();
+
+    let base = counter.calls();
+    let page = svc
+        .list(&ctx, &toolkit_odata::ODataQuery::new())
+        .await
+        .expect("list");
+    assert_eq!(page.items.len(), refs.len(), "every type is listed");
+    assert_eq!(counter.calls() - base, 1, "list: one evaluation");
+
+    let base = counter.calls();
+    svc.get(&ctx, &key(&refs[2].0)).await.expect("get");
+    assert_eq!(counter.calls() - base, 1, "point read: one evaluation");
+}
+
+#[tokio::test]
+async fn existing_row_operations_evaluate_the_base_type_and_create_the_concrete_type() {
+    let (enforcer, resolver) = type_recording_enforcer();
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let svc = make_service(
+        repo,
+        FakePlugin::new(),
+        Arc::new(FakeDir::single(tenant)),
+        enforcer,
+        Arc::new(NoopMetrics),
+    );
+    let ctx = make_ctx(owner, tenant);
+    svc.put(
+        &ctx,
+        &key("k"),
+        write_create_typed(SharingMode::Tenant, "v", "api-key"),
+        create_only(),
+    )
+    .await
+    .expect("create");
+    svc.patch(
+        &ctx,
+        &key("k"),
+        patch_sharing(SharingMode::Shared),
+        exists(),
+    )
+    .await
+    .expect("patch");
+    let seen = resolver.seen_resource_types();
+    let base = credstore_sdk::CREDENTIAL_RESOURCE_TYPE;
+    let api_key = SecretType::from_name("api-key")
+        .expect("known")
+        .gts_id()
+        .to_owned();
+    // create: write + write_secret on the requested concrete type; patch: write on the base.
+    assert_eq!(seen, vec![api_key.clone(), api_key, base.to_owned()]);
+}
+
+#[tokio::test]
+async fn a_pdp_denial_is_403_for_every_target_whether_or_not_the_record_exists() {
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    repo.seed(seeded_row(tenant, owner, "present", SharingMode::Tenant));
+    let svc = make_service(
+        repo,
+        FakePlugin::new(),
+        Arc::new(FakeDir::single(tenant)),
+        deny_enforcer(),
+        Arc::new(NoopMetrics),
+    );
+    let ctx = make_ctx(owner, tenant);
+    for reference in ["present", "absent"] {
+        let k = key(reference);
+        let denied = |r: Result<(), DomainError>| {
+            assert!(
+                matches!(r, Err(DomainError::AccessDenied { .. })),
+                "{reference}: {r:?}"
+            );
+        };
+        denied(svc.delete(&ctx, &k, exists()).await);
+        denied(
+            svc.patch(&ctx, &k, patch_sharing(SharingMode::Shared), exists())
+                .await
+                .map(|_| ()),
+        );
+        denied(
+            svc.patch(&ctx, &k, patch_value("v"), exists())
+                .await
+                .map(|_| ()),
+        );
+        denied(
+            svc.put(
+                &ctx,
+                &k,
+                write_replace(SharingMode::Tenant, "v"),
+                put_exists(),
+            )
+            .await
+            .map(|_| ()),
+        );
+        denied(
+            svc.put(
+                &ctx,
+                &k,
+                write_create(SharingMode::Tenant, "v"),
+                create_only(),
+            )
+            .await
+            .map(|_| ()),
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_type_restricted_scope_hides_rows_of_other_types_and_leaves_them_untouched() {
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let api_key = SecretType::from_name("api-key").expect("known");
+    let repo = Arc::new(FakeSecretRepo::new());
+    let mut hidden = seeded_row(tenant, owner, "hidden", SharingMode::Tenant);
+    hidden.secret_type_uuid = api_key.uuid();
+    repo.seed(hidden);
+    repo.seed(seeded_row(tenant, owner, "visible", SharingMode::Tenant));
+    // The caller's grants cover every type but api-key.
+    let (enforcer, _) = type_deny_enforcer(vec![api_key.gts_id().to_owned()]);
+    let svc = make_service(
+        repo.clone(),
+        FakePlugin::new(),
+        Arc::new(FakeDir::single(tenant)),
+        enforcer,
+        Arc::new(NoopMetrics),
+    );
+    let ctx = make_ctx(owner, tenant);
+    let hidden_key = key("hidden");
+
+    assert!(matches!(
+        svc.delete(&ctx, &hidden_key, exists()).await,
+        Err(DomainError::NotFound)
+    ));
+    assert!(matches!(
+        svc.patch(
+            &ctx,
+            &hidden_key,
+            patch_sharing(SharingMode::Shared),
+            exists()
+        )
+        .await,
+        Err(DomainError::NotFound)
+    ));
+    assert!(matches!(
+        svc.put(
+            &ctx,
+            &hidden_key,
+            write_replace(SharingMode::Tenant, "v"),
+            put_exists()
+        )
+        .await,
+        Err(DomainError::VersionConflict)
+    ));
+    // A create over the taken name stays a plain 409 (the unique key has no
+    // type), not a leak of the other type's row.
+    assert!(matches!(
+        svc.put(
+            &ctx,
+            &hidden_key,
+            write_create(SharingMode::Tenant, "v"),
+            create_only()
+        )
+        .await,
+        Err(DomainError::Conflict)
+    ));
+    assert_eq!(repo.rows().len(), 2, "no row was deleted");
+    let still_there = repo
+        .rows()
+        .into_iter()
+        .find(|r| r.reference == "hidden")
+        .expect("row");
+    assert_eq!(still_there.version, 1);
+
+    // The row of a permitted type is reachable as before.
+    svc.delete(&ctx, &key("visible"), exists())
+        .await
+        .expect("delete visible");
 }

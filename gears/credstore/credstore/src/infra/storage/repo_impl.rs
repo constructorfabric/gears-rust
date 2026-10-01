@@ -8,7 +8,7 @@ mod writes;
 mod repo_tests;
 
 use async_trait::async_trait;
-use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId, ValueId};
+use credstore_sdk::{OwnerId, SecretRef, SharingMode, StoreKey, TenantId, ValueVersion};
 use time::OffsetDateTime;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -16,9 +16,7 @@ use uuid::Uuid;
 pub use helpers::{CredstoreDbProvider, SecretRepoImpl};
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{
-    Fallback, GcEntry, GcReason, NewDeclaredSecret, NewSecret, SecretRow,
-};
+use crate::domain::secret::model::{Fallback, NewDeclaredSecret, NewSecret, SecretRow};
 use crate::domain::secret::repo::SecretRepo;
 
 #[async_trait]
@@ -78,7 +76,7 @@ impl SecretRepo for SecretRepoImpl {
         subject: OwnerId,
         chain: &[Uuid],
         reference_in: Option<&[String]>,
-        type_uuid_in: Option<&[Uuid]>,
+        type_scope: &AccessScope,
         cursor: Option<&str>,
         desc: bool,
         limit: u64,
@@ -89,22 +87,12 @@ impl SecretRepo for SecretRepoImpl {
             subject,
             chain,
             reference_in,
-            type_uuid_in,
+            type_scope,
             cursor,
             desc,
             limit,
         )
         .await
-    }
-
-    async fn list_visible_types(
-        &self,
-        req_tenant: TenantId,
-        subject: OwnerId,
-        chain: &[Uuid],
-        type_uuid_in: Option<&[Uuid]>,
-    ) -> Result<Vec<Uuid>, DomainError> {
-        reads::list_visible_types(self, req_tenant, subject, chain, type_uuid_in).await
     }
 
     async fn list_candidates_for_references(
@@ -115,30 +103,6 @@ impl SecretRepo for SecretRepoImpl {
         references: &[String],
     ) -> Result<Vec<SecretRow>, DomainError> {
         reads::list_candidates_for_references(self, req_tenant, subject, chain, references).await
-    }
-
-    async fn gc_insert_pending(
-        &self,
-        value_id: ValueId,
-        tenant_id: TenantId,
-    ) -> Result<(), DomainError> {
-        writes::gc_insert_pending(self, value_id, tenant_id).await
-    }
-
-    async fn gc_delete(&self, value_id: ValueId) -> Result<bool, DomainError> {
-        writes::gc_delete(self, value_id).await
-    }
-
-    async fn gc_mark(&self, value_id: ValueId, reason: GcReason) -> Result<bool, DomainError> {
-        writes::gc_mark(self, value_id, reason).await
-    }
-
-    async fn gc_list(&self, limit: u64) -> Result<Vec<GcEntry>, DomainError> {
-        writes::gc_list(self, limit).await
-    }
-
-    async fn is_value_referenced(&self, value_id: ValueId) -> Result<bool, DomainError> {
-        writes::is_value_referenced(self, value_id).await
     }
 
     async fn insert_active(&self, scope: &AccessScope, new: &NewSecret) -> Result<(), DomainError> {
@@ -157,14 +121,12 @@ impl SecretRepo for SecretRepoImpl {
         &self,
         scope: &AccessScope,
         id: Uuid,
-        expected_version: Option<i64>,
+        expected_version: i64,
         sharing: SharingMode,
         fallback: Fallback,
         expires_at: Option<OffsetDateTime>,
-        new_value_id: ValueId,
-        value_fp: Vec<u8>,
-        fp_key_id: i16,
-    ) -> Result<Option<(SecretRow, Option<ValueId>)>, DomainError> {
+        new_value_version: ValueVersion,
+    ) -> Result<Option<SecretRow>, DomainError> {
         writes::switch_value(
             self,
             scope,
@@ -173,9 +135,7 @@ impl SecretRepo for SecretRepoImpl {
             sharing,
             fallback,
             expires_at,
-            new_value_id,
-            value_fp,
-            fp_key_id,
+            new_value_version,
         )
         .await
     }
@@ -209,7 +169,7 @@ impl SecretRepo for SecretRepoImpl {
         sharing: SharingMode,
         fallback: Fallback,
         expires_at: Option<OffsetDateTime>,
-    ) -> Result<Option<(SecretRow, Option<ValueId>)>, DomainError> {
+    ) -> Result<Option<(SecretRow, Option<ValueVersion>)>, DomainError> {
         writes::remove_value(
             self,
             scope,
@@ -225,17 +185,9 @@ impl SecretRepo for SecretRepoImpl {
     async fn delete_by_id(
         &self,
         scope: &AccessScope,
-        id: Uuid,
+        key: &StoreKey,
         expected_version: Option<i64>,
-    ) -> Result<Option<ValueId>, DomainError> {
-        writes::delete_by_id(self, scope, id, expected_version).await
-    }
-
-    async fn list_expired(&self, limit: u64) -> Result<Vec<SecretRow>, DomainError> {
-        reads::list_expired(self, limit).await
-    }
-
-    async fn delete_expired_row(&self, id: Uuid) -> Result<Option<ValueId>, DomainError> {
-        writes::delete_expired_row(self, id).await
+    ) -> Result<(), DomainError> {
+        writes::delete_by_id(self, scope, key, expected_version).await
     }
 }

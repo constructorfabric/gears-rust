@@ -8,10 +8,11 @@
 //! without exposing any of them beyond the `service` module subtree.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use credstore_sdk::{
-    CredStorePluginClientV1, Credential, CredentialListItem, OwnerId, Secret, SecretRef, TenantId,
+    CredStorePluginClientV2, Credential, CredentialListItem, OwnerId, Secret, SecretRef, TenantId,
     Validator,
 };
 use futures::stream::{self, StreamExt};
@@ -19,8 +20,9 @@ use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, Page, PageInfo
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::domain::authz::{self, actions};
+use crate::domain::authz::{self, RowClamp, actions};
 use crate::domain::error::DomainError;
+use crate::domain::ports::audit::{AuditOperation, AuditOutcome};
 use crate::domain::secret::list_filter::{self, ListDirection, ParsedFilter};
 use crate::domain::secret::model::SecretRow;
 use crate::domain::secret::reduce::{self, Reduced};
@@ -125,6 +127,18 @@ struct SecretReadJob {
     gts_id: String,
 }
 
+/// One finished secret-mode read: the credential, its reference and GTS type
+/// (for the audit record), and the secret if the read found one.
+type ReadResult = (Credential, SecretRef, String, Option<Secret>);
+
+/// One secret-mode result slot, in reference order: an item already complete
+/// (an expired record: metadata only, no secret) or the index of a value read
+/// still to land.
+enum Slot {
+    Ready(CredentialListItem),
+    Read(usize),
+}
+
 impl Service {
     /// The collection read (ADR-0005): one reduced item per reference,
     /// rooted at the caller's tenant and walking upward through its
@@ -208,15 +222,14 @@ impl Service {
         let subject = OwnerId(ctx.subject_id());
         let chain = self.dir.ancestor_chain(ctx, req).await?;
 
-        // Before step 1: the PDP-permitted type set becomes step 1's SQL
-        // clamp (ADR-0005, ADR-0010) — never a scan of every visible row
-        // followed by an in-memory authorization pass.
-        let allowed_types = self
-            .permitted_types(
+        // Before step 1: ONE PDP evaluation of `list` on the base credential
+        // type; its type constraint becomes step 1's SQL clamp (ADR-0005,
+        // ADR-0010) — never a scan of every visible row followed by an
+        // in-memory authorization pass, and never one evaluation per type.
+        let allowed = self
+            .permitted_rows(
                 ctx,
                 req,
-                subject,
-                &chain,
                 parsed_filter.type_uuid_in.as_deref(),
                 &[actions::LIST],
             )
@@ -225,7 +238,7 @@ impl Service {
         // (ADR-0005 §"How authorization applies to a collection", step 4):
         // there is no permitted type left to build a step 1 query from, so
         // step 1 never runs.
-        if allowed_types.is_empty() {
+        if allowed.is_empty() {
             return Ok(Page {
                 items: Vec::new(),
                 page_info: PageInfo {
@@ -235,7 +248,7 @@ impl Service {
                 },
             });
         }
-        let allowed_type_uuids: Vec<Uuid> = allowed_types.keys().copied().collect();
+        let type_scope = allowed.to_scope();
 
         let fetch_limit = limit
             .checked_add(1)
@@ -251,7 +264,7 @@ impl Service {
                 subject,
                 &chain,
                 parsed_filter.reference_in.as_deref(),
-                Some(&allowed_type_uuids),
+                &type_scope,
                 cursor_reference.as_deref(),
                 direction.is_desc(),
                 fetch_limit,
@@ -271,7 +284,7 @@ impl Service {
                 &chain,
                 &refs,
                 parsed_filter,
-                &allowed_types,
+                &allowed,
                 false,
             )
             .await?;
@@ -358,20 +371,19 @@ impl Service {
             required_actions.push(actions::LIST);
         }
 
-        // Before step 1: the PDP-permitted type set becomes step 1's SQL
+        // Before step 1: one PDP evaluation per required action on the base
+        // credential type; the resulting type constraint becomes step 1's SQL
         // clamp (ADR-0005, ADR-0010).
-        let allowed_types = self
-            .permitted_types(
+        let allowed = self
+            .permitted_rows(
                 ctx,
                 req,
-                subject,
-                &chain,
                 parsed_filter.type_uuid_in.as_deref(),
                 &required_actions,
             )
             .await?;
         let cap = self.list.secret_mode_cap;
-        if allowed_types.is_empty() {
+        if allowed.is_empty() {
             return Ok(Page {
                 items: Vec::new(),
                 page_info: PageInfo {
@@ -381,7 +393,7 @@ impl Service {
                 },
             });
         }
-        let allowed_type_uuids: Vec<Uuid> = allowed_types.keys().copied().collect();
+        let type_scope = allowed.to_scope();
 
         let cap_plus_one = cap
             .checked_add(1)
@@ -396,7 +408,7 @@ impl Service {
                 subject,
                 &chain,
                 parsed_filter.reference_in.as_deref(),
-                Some(&allowed_type_uuids),
+                &type_scope,
                 None,
                 false,
                 cap_plus_one,
@@ -419,7 +431,7 @@ impl Service {
                 &chain,
                 &refs,
                 parsed_filter,
-                &allowed_types,
+                &allowed,
                 true,
             )
             .await?;
@@ -434,71 +446,38 @@ impl Service {
         })
     }
 
-    /// The PDP-permitted type set (ADR-0005, ADR-0010) — computed **before**
-    /// step 1 so its result becomes step 1's own `type_uuid_in` SQL clamp,
-    /// rather than an in-memory filter applied after unpermitted rows have
-    /// already reached the process. Distinct `secret_type_uuid`s visible to
-    /// the caller across `chain` (`repo.list_visible_types`, already clamped
-    /// by `caller_type_in` when the caller's `$filter` named types), each
-    /// resolved and evaluated against the PDP for every action in
-    /// `required_actions` (all must permit and include the caller's tenant)
+    /// The PDP-permitted type clamp (ADR-0005, ADR-0010) — computed **before**
+    /// step 1 so it becomes step 1's own SQL type predicate, rather than an
+    /// in-memory filter applied after unpermitted rows have already reached
+    /// the process. ONE PDP evaluation per action in `required_actions` on the
+    /// base credential type (all must permit and include the caller's tenant)
     /// — metadata mode names `[list]`; secret mode names `[read_secret]`,
     /// plus `list` too when a record-only field is selected alongside
-    /// `secret` (ADR-0004 Amendment A). `AccessDenied` and a scope that
-    /// excludes the caller's tenant (counted via `cross_tenant_denied`) both
-    /// simply exclude the type from the returned map; any other PDP error
-    /// propagates.
-    async fn permitted_types(
+    /// `secret` (ADR-0004 Amendment A) — each answering with a constraint on
+    /// the credential type and/or reference; the scopes are intersected and
+    /// reduced to the row predicates admitted for the caller's tenant, then narrowed by the caller's
+    /// own `$filter type in (…)`. `AccessDenied` and a scope that excludes the
+    /// caller's tenant (counted via `cross_tenant_denied`) both yield an empty
+    /// clamp; any other PDP error propagates.
+    async fn permitted_rows(
         &self,
         ctx: &SecurityContext,
         req: TenantId,
-        subject: OwnerId,
-        chain: &[Uuid],
         caller_type_in: Option<&[Uuid]>,
         required_actions: &[&str],
-    ) -> Result<HashMap<Uuid, ResolvedSecretType>, DomainError> {
-        let type_uuids = self
-            .repo
-            .list_visible_types(req, subject, chain, caller_type_in)
-            .await?;
-
-        let mut allowed_types: HashMap<Uuid, ResolvedSecretType> = HashMap::new();
-        for type_uuid in type_uuids {
-            let resolved = self.resolve_stored(type_uuid).await?;
-            let mut denied = false;
-            for action in required_actions {
-                let scope = match self
-                    .scope_for_timed(
-                        ctx,
-                        &authz::credential_type_resource(&resolved.gts_id),
-                        action,
-                    )
-                    .await
-                {
-                    Ok(scope) => scope,
-                    Err(DomainError::AccessDenied { .. }) => {
-                        denied = true;
-                        break;
-                    }
-                    Err(e) => return Err(e),
-                };
-                if !self.repo.scope_includes_tenant(&scope, req.0).await? {
-                    self.metrics.cross_tenant_denied();
-                    denied = true;
-                    break;
-                }
-            }
-            if !denied {
-                allowed_types.insert(type_uuid, resolved);
-            }
-        }
-        Ok(allowed_types)
+    ) -> Result<RowClamp, DomainError> {
+        let scope = match self.authorize_actions(ctx, req, required_actions).await {
+            Ok(scope) => scope,
+            Err(DomainError::AccessDenied { .. }) => return Ok(RowClamp::Constraints(Vec::new())),
+            Err(e) => return Err(e),
+        };
+        Ok(authz::row_clamp(&scope, req.0).restrict_to(caller_type_in))
     }
 
     /// Shared tail of both modes (ADR-0005 steps 6-9): fetch `references`'
     /// rows whole (unclamped by type — see the comment at the call site
-    /// below), reduce each to one item, drop what `allowed_types` (computed
-    /// by [`Self::permitted_types`] before step 1) does not cover, apply the
+    /// below), reduce each to one item, drop what `allowed` (computed
+    /// by [`Self::permitted_rows`] before step 1) does not cover, apply the
     /// in-memory filters, and — in secret mode — read each winner's value.
     #[allow(
         clippy::too_many_arguments,
@@ -513,7 +492,7 @@ impl Service {
         chain: &[Uuid],
         references: &[String],
         parsed_filter: &ParsedFilter,
-        allowed_types: &HashMap<Uuid, ResolvedSecretType>,
+        allowed: &RowClamp,
         secret_mode: bool,
     ) -> Result<Vec<CredentialListItem>, DomainError> {
         if references.is_empty() {
@@ -540,7 +519,7 @@ impl Service {
                 .push(row);
         }
 
-        let plugin: Option<Arc<dyn CredStorePluginClientV1>> = if secret_mode {
+        let plugin: Option<Arc<dyn CredStorePluginClientV2>> = if secret_mode {
             Some(self.plugins.resolve().await?)
         } else {
             None
@@ -554,6 +533,9 @@ impl Service {
         // post-reduction filter miss, a `declared`/value-less winner).
         let mut items = Vec::with_capacity(references.len());
         let mut jobs: Vec<SecretReadJob> = Vec::new();
+        let mut slots: Vec<Slot> = Vec::new();
+        let now = time::OffsetDateTime::now_utc();
+        let mut resolved_types: HashMap<Uuid, ResolvedSecretType> = HashMap::new();
         for reference in references {
             let Some(group) = by_reference.get(reference) else {
                 // Step 1 selected this reference because a row matching its
@@ -566,16 +548,20 @@ impl Service {
             };
 
             let effective_type = reduced.effective.secret_type_uuid;
-            let Some(resolved) = allowed_types.get(&effective_type) else {
+            if !allowed.admits(effective_type, &reduced.effective.reference) {
                 // Step 1 admitted this reference only because a row of a
-                // permitted type existed for it; the winner's type is not in
-                // `allowed_types` regardless, so this is always the
+                // permitted type existed for it; the winner's type is not
+                // admitted regardless, so this is always the
                 // override-type-consistency invariant being violated
                 // (ADR-0005 §"Filter in SQL first…"), never an ordinary PDP
                 // denial — step 1's clamp already excluded every denied
                 // type before this reference was even fetched.
                 self.metrics.list_type_invariant_violation();
                 continue;
+            }
+            let resolved = match resolved_types.entry(effective_type) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(self.resolve_stored(effective_type).await?),
             };
 
             if !parsed_filter.matches_post_reduction(
@@ -602,9 +588,22 @@ impl Service {
             let Some(winner) = reduced.winner else {
                 continue;
             };
-            if winner.value_id.is_none() {
+            if winner.is_expired(now) {
+                // Expiry applies to the secret, not to the record: the item
+                // is returned with its metadata (status `expired` when the
+                // caller's own row is the expired one) and no secret. The
+                // request does not fail because of it, and no value read is
+                // attempted or audited.
+                slots.push(Slot::Ready(CredentialListItem {
+                    credential,
+                    secret: None,
+                }));
                 continue;
             }
+            if winner.value_version.is_none() {
+                continue;
+            }
+            slots.push(Slot::Read(jobs.len()));
             jobs.push(SecretReadJob {
                 credential,
                 key,
@@ -613,8 +612,17 @@ impl Service {
             });
         }
 
-        if !secret_mode || jobs.is_empty() {
+        if !secret_mode {
             return Ok(items);
+        }
+        if jobs.is_empty() {
+            return Ok(slots
+                .into_iter()
+                .filter_map(|slot| match slot {
+                    Slot::Ready(item) => Some(item),
+                    Slot::Read(_) => None,
+                })
+                .collect());
         }
 
         // Phase (b): the winners' value reads, fanned out with bounded
@@ -648,20 +656,29 @@ impl Service {
                     &job.gts_id,
                 )
                 .await;
-            (index, job.credential, outcome)
+            (index, job.credential, job.key, job.gts_id, outcome)
         }))
         .buffer_unordered(SECRET_READ_CONCURRENCY);
 
         // Item order in the response must match reference order regardless
         // of completion order, so results land by index rather than being
         // pushed as they arrive.
-        let mut read_results: Vec<Option<(Credential, Option<Secret>)>> =
-            (0..job_count).map(|_| None).collect();
+        let mut read_results: Vec<Option<ReadResult>> = (0..job_count).map(|_| None).collect();
         let mut first_err: Option<DomainError> = None;
-        while let Some((index, credential, outcome)) = reads.next().await {
+        while let Some((index, credential, key, gts_id, outcome)) = reads.next().await {
             match outcome {
-                Ok(secret) => read_results[index] = Some((credential, secret)),
+                Ok(secret) => read_results[index] = Some((credential, key, gts_id, secret)),
                 Err(err) => {
+                    // The failed read was authorized and attempted; no
+                    // secret is returned for it or for anything else.
+                    self.audit_event(
+                        ctx,
+                        &key,
+                        &gts_id,
+                        AuditOperation::Read,
+                        AuditOutcome::Failure,
+                    )
+                    .await;
                     // One backend failure fails the whole request: stop
                     // starting new reads (dropping `reads` below never polls
                     // its still-buffered futures again) without waiting for
@@ -676,11 +693,20 @@ impl Service {
             return Err(err);
         }
 
-        for result in read_results {
+        let mut returned: Vec<(SecretRef, String)> = Vec::new();
+        let mut items = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let index = match slot {
+                Slot::Ready(item) => {
+                    items.push(item);
+                    continue;
+                }
+                Slot::Read(index) => index,
+            };
             // `None` only if the loop above exited without an error before
             // visiting every index, which cannot happen: the only early
             // exit is the `Err` branch, which returns above.
-            let Some((credential, secret)) = result else {
+            let Some((credential, key, gts_id, secret)) = read_results[index].take() else {
                 continue;
             };
             let Some(secret) = secret else {
@@ -690,11 +716,25 @@ impl Service {
                 // relevant metric.
                 continue;
             };
+            returned.push((key, gts_id));
             items.push(CredentialListItem {
                 credential,
                 secret: Some(secret.secret),
             });
         }
+
+        // One audit record per secret returned, published together so the
+        // bounded wait is paid once, not once per item.
+        futures::future::join_all(returned.iter().map(|(key, gts_id)| {
+            self.audit_event(
+                ctx,
+                key,
+                gts_id,
+                AuditOperation::Read,
+                AuditOutcome::Success,
+            )
+        }))
+        .await;
 
         Ok(items)
     }
