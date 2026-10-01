@@ -1,7 +1,7 @@
 // Updated: 2026-04-07 by Constructor Tech
 //! vLLM Responses API adapter (`/v1/responses`).
 //!
-//! Implements [`LlmProvider`] for vLLM's OpenAI-compatible Responses API.
+//! Implements [`LlmProvider`](crate::infra::llm::LlmProvider) for vLLM's OpenAI-compatible Responses API.
 //! vLLM supports the same SSE event format as `OpenAI` but has stricter input
 //! validation: assistant messages must use plain string content (not the
 //! `output_text` array format), and tool-related fields are omitted.
@@ -312,10 +312,16 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
 
     // Inference params from the typed model-policy channel.
     if let Some(p) = request.api_params.as_ref() {
-        body["temperature"] = serde_json::json!(p.temperature);
-        body["top_p"] = serde_json::json!(p.top_p);
-        body["frequency_penalty"] = serde_json::json!(p.frequency_penalty);
-        body["presence_penalty"] = serde_json::json!(p.presence_penalty);
+        for (key, value) in [
+            ("temperature", p.temperature),
+            ("top_p", p.top_p),
+            ("frequency_penalty", p.frequency_penalty),
+            ("presence_penalty", p.presence_penalty),
+        ] {
+            if let Some(v) = value {
+                body[key] = serde_json::json!(v);
+            }
+        }
         if !p.stop.is_empty() {
             body["stop"] = serde_json::json!(&p.stop);
         }
@@ -324,12 +330,8 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
         }
         // `extra_body` carries vLLM-specific kwargs (e.g. `top_k`,
         // `chat_template_kwargs`); merged at the top level.
-        if let Some(ref extra) = p.extra_body
-            && let (Some(body_obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object())
-        {
-            for (k, v) in extra_obj {
-                body_obj.insert(k.clone(), v.clone());
-            }
+        if let Some(ref extra) = p.extra_body {
+            super::merge_extra_body(&mut body, extra);
         }
     }
 
@@ -433,6 +435,9 @@ impl crate::infra::llm::LlmProvider for VllmResponsesProvider {
             }
             ServerEventsResponse::Response(resp) => {
                 let (parts, body) = resp.into_parts();
+                if let Some(e) = crate::infra::llm::error_from_status(&parts) {
+                    return Err(e);
+                }
                 tracing::warn!(status = %parts.status, "provider returned non-SSE response");
                 match body.into_bytes().await {
                     Ok(bytes) => {
@@ -526,5 +531,6 @@ impl crate::infra::llm::LlmProvider for VllmResponsesProvider {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "vllm_responses_tests.rs"]
 mod vllm_responses_tests;

@@ -38,8 +38,8 @@ pub enum InternalCredential {
     /// Profile 1 (in-process): no credential — the process boundary is the
     /// trust root, so no header/metadata is attached.
     None,
-    /// Profile 2 (single-node): an ephemeral bootstrap token minted by the
-    /// Platform Host. Struct-only in the first phase; validation deferred to P2.
+    /// Profile 2 (single-node): an ephemeral bootstrap token minted by
+    /// Flight Control. Struct-only in the first phase; validation deferred to P2.
     BootstrapToken(SecretString),
     /// Profile 3 (K8s): a projected `ServiceAccount` JWT (auto-mounted,
     /// auto-rotated). `token_path` is the projected-volume path; `audience` is

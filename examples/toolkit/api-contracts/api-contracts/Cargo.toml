@@ -47,7 +47,6 @@ futures-core.workspace = true
 futures-util.workspace = true
 async-stream = "0.3"
 axum.workspace = true
-http.workspace = true
 
 tonic = { workspace = true, features = ["transport"], optional = true }
 toolkit-transport-grpc = { workspace = true, optional = true }
@@ -56,9 +55,7 @@ toolkit-transport-grpc = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
-toolkit-http.workspace = true
 toolkit-canonical-errors.workspace = true
-secrecy.workspace = true
 mockall.workspace = true
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

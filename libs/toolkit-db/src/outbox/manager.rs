@@ -339,6 +339,7 @@ impl OutboxBuilder {
             );
             let name = format!("sequencer-{i}");
             let mut builder = WorkerBuilder::<SequencerReport>::new(&name, ctx.cancel.clone())
+                .stop_grace(tuning.stop_grace)
                 .pacing(tuning)
                 .notifier(prioritizer.notifier())
                 .notifier(Arc::clone(ctx.start_notify))
@@ -396,6 +397,7 @@ impl OutboxBuilder {
             let name = format!("vacuum-{i}");
             let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
             let mut builder = WorkerBuilder::<VacuumReport>::new(&name, ctx.cancel.clone())
+                .stop_grace(tuning.stop_grace)
                 .pacing(tuning)
                 .notifier(poker_notify)
                 .notifier(Arc::clone(ctx.start_notify))
@@ -444,6 +446,7 @@ impl OutboxBuilder {
         let name = "trace-sweeper";
         let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
         let builder = WorkerBuilder::new(name, ctx.cancel.clone())
+            .stop_grace(tuning.stop_grace)
             .pacing(tuning)
             .notifier(collectable_traces.wakeup())
             .notifier(poker_notify)
@@ -469,11 +472,12 @@ impl OutboxBuilder {
         };
         let name = "notifier";
         let builder = WorkerBuilder::new(name, ctx.cancel.clone())
+            .stop_grace(tuning.stop_grace)
             .pacing(tuning)
             // No timer. It schedules itself while somebody is waiting, and
             // sleeps on this wakeup when nobody is - a subscription being
             // taken is the only event that gives it a reason to look.
-            .notifier(outbox.mailbox().subscriptions().arrivals())
+            .notifier(outbox.trace_mailbox().registry().arrivals())
             .notifier(Arc::clone(ctx.start_notify))
             .listener(TracingListener)
             .on_panic(PanicPolicy::CatchAndRetry);
@@ -500,6 +504,7 @@ impl OutboxBuilder {
         let name = "retry-reporter";
         let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
         let builder = WorkerBuilder::new(name, ctx.cancel.clone())
+            .stop_grace(tuning.stop_grace)
             .pacing(tuning)
             .notifier(poker_notify)
             .notifier(Arc::clone(ctx.start_notify))
@@ -524,6 +529,7 @@ impl OutboxBuilder {
         let name = "cold-reconciler";
         let (poker_notify, _poker_handle) = poker(tuning.idle_interval, ctx.cancel.clone());
         let worker = WorkerBuilder::new(name, ctx.cancel.clone())
+            .stop_grace(tuning.stop_grace)
             .pacing(tuning)
             .notifier(poker_notify)
             .notifier(Arc::clone(ctx.start_notify))
@@ -767,6 +773,6 @@ impl Drop for OutboxHandle {
         // since it necessarily holds the `Arc` that owns the registry and
         // nothing else would drop the senders. `close` is idempotent, so the
         // `stop` path closing here a second time is harmless.
-        self.outbox.mailbox().subscriptions().close();
+        self.outbox.trace_mailbox().registry().close();
     }
 }

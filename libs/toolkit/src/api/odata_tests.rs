@@ -188,6 +188,57 @@ mod tests {
         let _problem_response = result.unwrap_err();
     }
 
+    /// A filter of exactly `MAX_FILTER_LEN` bytes is accepted; the limit is
+    /// "longer than", not "at least".
+    #[tokio::test]
+    async fn test_extract_odata_query_filter_at_max_len_accepted() {
+        let prefix = "email eq '";
+        let filter = prefix.to_owned() + &"a".repeat(MAX_FILTER_LEN - prefix.len() - 1) + "'";
+        assert_eq!(filter.len(), MAX_FILTER_LEN);
+        let uri = format!("/?%24filter={}", urlencoding::encode(&filter));
+        let request = Request::builder().uri(uri).body(()).unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        assert!(extract_odata_query(&mut parts, &()).await.is_ok());
+    }
+
+    /// A filter with exactly `MAX_NODES` nodes is accepted, one more term is
+    /// rejected.
+    #[tokio::test]
+    async fn test_extract_odata_query_filter_at_max_nodes() {
+        let filter_of = |terms: usize| vec!["a eq 1"; terms].join(" or ");
+        let nodes = |terms: usize| {
+            toolkit_odata::parse_filter_string(&filter_of(terms))
+                .unwrap()
+                .node_count()
+        };
+        // Largest term count still within the budget.
+        let mut terms = 1;
+        while nodes(terms + 1) <= MAX_NODES {
+            terms += 1;
+        }
+        let extract = |filter: String| async move {
+            let uri = format!("/?%24filter={}", urlencoding::encode(&filter));
+            let request = Request::builder().uri(uri).body(()).unwrap();
+            let (mut parts, _body) = request.into_parts();
+            extract_odata_query(&mut parts, &()).await
+        };
+        assert!(
+            filter_of(terms).len() <= MAX_FILTER_LEN,
+            "length limit would hit first"
+        );
+        assert!(
+            extract(filter_of(terms)).await.is_ok(),
+            "{} nodes",
+            nodes(terms)
+        );
+        assert!(
+            extract(filter_of(terms + 1)).await.is_err(),
+            "{} nodes",
+            nodes(terms + 1)
+        );
+    }
+
     #[tokio::test]
     async fn test_extract_odata_query_invalid_filter() {
         let uri = "/?%24filter=invalid%20syntax%20here";

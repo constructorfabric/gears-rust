@@ -152,6 +152,28 @@ impl<
         Ok(Self::to_detail(chat, message_count))
     }
 
+    /// Model of a chat the caller sends a message to. Authorized with the
+    /// `send_message` action only, so sending does not also require `read`.
+    #[instrument(skip(self, ctx), fields(chat_id = %id))]
+    pub async fn chat_model_for_send(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+    ) -> Result<String, DomainError> {
+        let conn = self.db.conn().map_err(DomainError::from)?;
+        let chat_scope = self
+            .enforcer
+            .access_scope(ctx, &resources::CHAT, actions::SEND_MESSAGE, Some(id))
+            .await?
+            .ensure_owner(ctx.subject_id());
+        let chat = self
+            .chat_repo
+            .get(&conn, &chat_scope, id)
+            .await?
+            .ok_or_else(|| DomainError::chat_not_found(id))?;
+        Ok(chat.model)
+    }
+
     /// List chats with cursor-based pagination.
     #[instrument(skip(self, ctx, query))]
     pub async fn list_chats(
@@ -305,7 +327,7 @@ impl<
             match chat_opt {
                 Some(chat) => match self
                     .model_resolver
-                    .resolve_model(ctx.subject_id(), Some(chat.model.clone()))
+                    .resolve_chat_model(ctx.subject_id(), &chat.model)
                     .await
                 {
                     Ok(resolved)
@@ -422,5 +444,6 @@ fn validate_title(title: Option<&str>) -> Result<(), DomainError> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "chat_service_test.rs"]
 mod tests;

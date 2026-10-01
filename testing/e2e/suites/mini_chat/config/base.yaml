@@ -53,7 +53,7 @@ gears:
         description: "Mini-Chat development server"
       defaults:
         body_limit_bytes: 64000000
-      auth_disabled: true
+      auth_disabled: false
       # Throttling zones referenced by the mini-chat create_chat route
       # (ThrottlingSpec in gears/mini-chat/.../api/rest/routes/chats.rs).
       # These must be defined or gateway startup fails validation.
@@ -101,7 +101,49 @@ gears:
     config:
       vendor: "constructorfabric"
       priority: 100
-      mode: accept_all
+      # Three identities for authorization/isolation tests: user A and user B
+      # share the default tenant, user C lives in another tenant. The
+      # single-tenant resolver treats each tenant as its own root.
+      mode: static_tokens
+      tokens:
+        - token: "mini-chat-e2e"
+          identity:
+            subject_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "mini-chat-e2e-user-b"
+          identity:
+            subject_id: "44444444-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "mini-chat-e2e-tenant-b"
+          identity:
+            subject_id: "22222222-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        # Quota-policy users (test_quota_policy.py): their usage rows are
+        # rewritten in the DB, so they are kept apart from user A.
+        - token: "mini-chat-e2e-quota-1"
+          identity:
+            subject_id: "55555555-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "mini-chat-e2e-quota-2"
+          identity:
+            subject_id: "66666666-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "mini-chat-e2e-quota-3"
+          identity:
+            subject_id: "77777777-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
       s2s_credentials:
         - client_id: "mini-chat"
           client_secret: "mini-chat-dev-secret"
@@ -133,7 +175,12 @@ gears:
 
   oagw:
     config:
-      proxy_timeout_secs: 30
+      # Upstream read timeout (idle time between reads, also the wait for the
+      # response headers). Kept short so the provider_timeout test
+      # (test_error_mapping.py, mock `header_delay`) fits the test budget; it
+      # must stay above the longest idle gap of a normal mock stream (4 s in
+      # the ping test of test_streaming.py).
+      proxy_timeout_secs: 8
       allow_http_upstream: false
       ssrf_policy:
         enabled: false # Disabled for e2e tests (mock upstreams use 127.0.0.1)
@@ -151,15 +198,30 @@ gears:
       # Default (4) spawns too many concurrent writers for a single SQLite file.
       outbox:
         num_partitions: 2
-      # Orphan watchdog: use minimum allowed timeout (90s) and frequent scans
-      # to make e2e orphan detection tests feasible (default 300s is too slow).
+      # Minimum allowed ping interval, so the ping test needs only a short
+      # idle phase before the first delta.
+      streaming:
+        sse_ping_interval_seconds: 5
+      # Orphan watchdog: minimum allowed timeout (90s) and frequent scans. No
+      # E2E test waits for it (90s does not fit the test budget); orphan
+      # handling is unit-tested (E2E-SCENARIOS.md 19-06).
       orphan_watchdog:
         enabled: true
         scan_interval_secs: 2
         timeout_secs: 90
+      # Upload reaper: minimum allowed staleness (60s) and frequent scans, so
+      # an abandoned upload is failed about a minute after its last update
+      # (test_attachments.py TestUploadReaper). The upload's own indexing
+      # deadline (25s) keeps a live upload well under 60s.
+      upload_reaper:
+        enabled: true
+        scan_interval_secs: 2
+        stale_after_secs: 60
       thread_summary_worker:
         enabled: true
-        summary_model_id: ""
+        # A catalog model: the built-in fallback (gpt-4.1-mini) is not in this
+        # catalog, so summaries could not be generated with it.
+        summary_model_id: "gpt-5-mini"
         compression_threshold_pct: 60
         summary_system_prompt: "You are a conversation summarizer. Given a conversation (and optionally an existing summary), produce a detailed structured summary. Respond with an <analysis> block (your reasoning) followed by a <summary> block (the final summary). Only the <summary> content will be stored. Do not invent information not present in the conversation."
       # S2S credentials for obtaining SecurityContext
@@ -187,7 +249,6 @@ gears:
           api_path: "/openai/v1/responses"
           api_version: "2025-03-01-preview"
           storage_backend: "azure"
-          supports_file_search_filters: false
           auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
           auth_config:
             header: "api-key"
@@ -301,10 +362,7 @@ gears:
             available_from: "2025-01-01T00:00:00Z"
             max_file_size_mb: 50
             api_params:
-              temperature: 0.7
-              top_p: 1.0
-              frequency_penalty: 0.0
-              presence_penalty: 0.0
+              # Reasoning model: no sampling params (the API rejects them).
               stop: []
             features:
               streaming: true
@@ -357,6 +415,66 @@ gears:
           preference:
             is_default: false
             sort_order: 4
+          general_config:
+            type: "chat"
+            available_from: "2025-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              # Reasoning model: no sampling params (the API rejects them).
+              stop: []
+            features:
+              streaming: true
+              structured_output: true
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
+              mcp: false
+            supported_endpoints:
+              chat_completions: true
+              responses: true
+              embeddings: false
+              image_generation: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+
+        # Disabled model: must not be listed or accepted on POST /chats; a chat
+        # locked to it is downgraded with model_disabled (test_quota_policy.py).
+        - id: "gpt-4o-retired"
+          provider_model_id: "gpt-4o"
+          display_name: "GPT-4o (retired)"
+          tier: Standard
+          enabled: false
+          system_prompt: "You are a helpful assistant. IMPORTANT RULE: When the user says exactly 'PING', you MUST respond with exactly 'PONG' and nothing else."
+          thread_summary_prompt: ""
+          input_tokens_credit_multiplier_micro: 500000
+          output_tokens_credit_multiplier_micro: 1500000
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 64000
+          max_output_tokens: 4096
+          max_input_tokens: 56000
+          description: "Disabled catalog entry: model_disabled downgrade and INVALID_MODEL tests"
+          version: "2025-01"
+          icon: ""
+          provider_display_name: "OpenAI"
+          multiplier_display: "0.5x"
+          provider_id: "openai"
+          max_num_results: 5
+          max_tool_calls: 2
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 300
+            safety_margin_pct: 10
+            image_token_budget: 500
+            tool_surcharge_tokens: 150
+            web_search_surcharge_tokens: 300
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 100
+          preference:
+            is_default: false
+            sort_order: 5
           general_config:
             type: "chat"
             available_from: "2025-01-01T00:00:00Z"
@@ -436,6 +554,201 @@ gears:
               file_search: true
               image_generation: false
               code_interpreter: true
+              mcp: false
+            supported_endpoints:
+              chat_completions: true
+              responses: true
+              embeddings: false
+              image_generation: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+
+        # No system prompt and no tools: context assembly sends no
+        # `instructions` (test_context_assembly.py). Last in the catalog so the
+        # standard-tier fallback of a downgrade stays gpt-5.2.
+        - id: "gpt-5-bare"
+          provider_model_id: "gpt-5-bare"
+          display_name: "GPT-5 Bare"
+          tier: Standard
+          enabled: true
+          thread_summary_prompt: ""
+          input_tokens_credit_multiplier_micro: 500000
+          output_tokens_credit_multiplier_micro: 1500000
+          multimodal_capabilities: []
+          context_window: 64000
+          max_output_tokens: 4096
+          max_input_tokens: 56000
+          description: "Catalog entry without a system prompt"
+          version: "2025-01"
+          icon: ""
+          provider_display_name: "OpenAI"
+          multiplier_display: "0.5x"
+          provider_id: "openai"
+          max_num_results: 5
+          max_tool_calls: 2
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 300
+            safety_margin_pct: 10
+            image_token_budget: 500
+            tool_surcharge_tokens: 150
+            web_search_surcharge_tokens: 300
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 100
+          preference:
+            is_default: false
+            sort_order: 6
+          general_config:
+            type: "chat"
+            available_from: "2025-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              structured_output: true
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
+              mcp: false
+            supported_endpoints:
+              chat_completions: true
+              responses: true
+              embeddings: false
+              image_generation: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+
+        # Small context window, so the thread summary threshold
+        # (compression_threshold_pct of context_window - max_output_tokens) is
+        # reached after two short turns and INPUT_TOO_LONG /
+        # CONTEXT_BUDGET_EXCEEDED are reachable with small messages
+        # (test_thread_summary.py, test_streaming.py). Last in the
+        # catalog for the same reason as gpt-5-bare.
+        - id: "gpt-4.1-mini-tiny-ctx"
+          provider_model_id: "gpt-4.1-mini"
+          display_name: "GPT-4.1 Mini (tiny context)"
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful assistant. IMPORTANT RULE: When the user says exactly 'PING', you MUST respond with exactly 'PONG' and nothing else."
+          thread_summary_prompt: ""
+          input_tokens_credit_multiplier_micro: 500000
+          output_tokens_credit_multiplier_micro: 1500000
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 4096
+          max_output_tokens: 1024
+          max_input_tokens: 3000
+          description: "Test model with a 4096-token context window"
+          version: "2025-01"
+          icon: ""
+          provider_display_name: "OpenAI"
+          multiplier_display: "0.5x"
+          provider_id: "openai"
+          max_num_results: 5
+          max_tool_calls: 2
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 500
+            safety_margin_pct: 10
+            image_token_budget: 500
+            tool_surcharge_tokens: 150
+            web_search_surcharge_tokens: 300
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 100
+          preference:
+            is_default: false
+            sort_order: 7
+          general_config:
+            type: "chat"
+            available_from: "2025-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              structured_output: true
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
+              mcp: false
+            supported_endpoints:
+              chat_completions: true
+              responses: true
+              embeddings: false
+              image_generation: false
+              audio_speech_generation: false
+              audio_transcription: false
+              audio_translation: false
+
+        # gpt-4.1-mini-tiny-ctx with max_input_tokens 0 (no separate input
+        # limit): the context budget is context_window - max_output_tokens
+        # only (test_streaming.py TestStreamInputLimits). Last in the catalog
+        # for the same reason as gpt-5-bare.
+        - id: "gpt-4.1-mini-tiny-ctx-no-input-limit"
+          provider_model_id: "gpt-4.1-mini"
+          display_name: "GPT-4.1 Mini (tiny context, no input limit)"
+          tier: Standard
+          enabled: true
+          system_prompt: "You are a helpful assistant. IMPORTANT RULE: When the user says exactly 'PING', you MUST respond with exactly 'PONG' and nothing else."
+          thread_summary_prompt: ""
+          input_tokens_credit_multiplier_micro: 500000
+          output_tokens_credit_multiplier_micro: 1500000
+          multimodal_capabilities: ["VISION_INPUT"]
+          context_window: 4096
+          max_output_tokens: 1024
+          max_input_tokens: 0
+          description: "Test model with a 4096-token context window and no input token limit"
+          version: "2025-01"
+          icon: ""
+          provider_display_name: "OpenAI"
+          multiplier_display: "0.5x"
+          provider_id: "openai"
+          max_num_results: 5
+          max_tool_calls: 2
+          estimation_budgets:
+            bytes_per_token_conservative: 4
+            fixed_overhead_tokens: 500
+            safety_margin_pct: 10
+            image_token_budget: 500
+            tool_surcharge_tokens: 150
+            web_search_surcharge_tokens: 300
+            code_interpreter_surcharge_tokens: 1000
+            minimal_generation_floor: 100
+          preference:
+            is_default: false
+            sort_order: 8
+          general_config:
+            type: "chat"
+            available_from: "2025-01-01T00:00:00Z"
+            max_file_size_mb: 25
+            api_params:
+              temperature: 0.7
+              top_p: 1.0
+              frequency_penalty: 0.0
+              presence_penalty: 0.0
+              stop: []
+            features:
+              streaming: true
+              structured_output: true
+            tool_support:
+              web_search: false
+              file_search: false
+              image_generation: false
+              code_interpreter: false
               mcp: false
             supported_endpoints:
               chat_completions: true

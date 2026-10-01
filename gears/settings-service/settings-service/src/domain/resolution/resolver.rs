@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use super::cache::Generation;
 use super::{
-    EffectiveCache, EffectiveValue, OwnRow, ScopeTarget, TenantHierarchy, TrailEntry, scope_class,
-    scope_path,
+    EffectiveCache, EffectiveValue, OwnRow, ScopeTarget, Subtree, TenantHierarchy, TrailEntry,
+    scope_class, scope_path,
 };
 use crate::domain::access::{AccessRepository, EffectiveAccess, strictest};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
@@ -85,6 +85,19 @@ struct Walk {
     own_row: Option<OwnRow>,
 }
 
+/// One descendant's value, as a walk over a subtree resolved it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubtreeValue {
+    /// The descendant.
+    pub tenant_id: Uuid,
+    /// Its scope path.
+    pub scope: String,
+    /// Its effective value; for a secret row the opaque handle token.
+    pub value: Value,
+    /// The tenant whose row supplies it; absent for the Schema Default.
+    pub source_tenant: Option<Uuid>,
+}
+
 /// The resolver.
 // @cpt-dod:cpt-cf-settings-service-dod-tenant-access-effective:p1
 // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-operations:p1
@@ -118,6 +131,19 @@ fn value_of(row: &StoredValue) -> (Value, bool) {
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-resolve:p1:inst-vr-resolve-10
 }
 
+/// The row a walk serves among the scopes inspected, root to self: the
+/// deepest one not flagged for review. A flagged row is skipped without being
+/// served and without an error — the walk continues to the next nearest
+/// scope, which for a cascading setting is the next ancestor and for the
+/// others is nothing at all.
+fn winner<'r>(inspected: &[Uuid], rows: &'r HashMap<Uuid, StoredValue>) -> Option<&'r StoredValue> {
+    inspected
+        .iter()
+        .rev()
+        .filter_map(|t| rows.get(t))
+        .find(|row| !row.needs_review)
+}
+
 /// Pick the effective row among the scopes inspected and build the trail.
 ///
 /// `inspected` is ordered root to self; the deepest valid override wins.
@@ -132,15 +158,8 @@ fn select(
     // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-needs-review-fallthrough:p1:inst-vr-nrf-1
     // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-needs-review-fallthrough:p1:inst-vr-nrf-2
     // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-needs-review-fallthrough:p1:inst-vr-nrf-3
-    // Deepest first. A row flagged for review is skipped without being served
-    // and without an error: the walk simply continues to the next nearest
-    // scope, which for a cascading setting is the next ancestor and for the
-    // others is nothing at all.
-    let winner = inspected
-        .iter()
-        .rev()
-        .filter_map(|t| rows.get(t))
-        .find(|row| !row.needs_review);
+    // Deepest first, a flagged row skipped: see `winner`.
+    let winner = winner(inspected, rows);
     // @cpt-end:cpt-cf-settings-service-algo-value-resolution-needs-review-fallthrough:p1:inst-vr-nrf-3
     // @cpt-end:cpt-cf-settings-service-algo-value-resolution-needs-review-fallthrough:p1:inst-vr-nrf-2
     // @cpt-end:cpt-cf-settings-service-algo-value-resolution-needs-review-fallthrough:p1:inst-vr-nrf-1
@@ -469,6 +488,88 @@ where
             );
         }
         out
+    }
+
+    /// Resolve one setting at every descendant of a target in one pass — one
+    /// key at many tenants, the axis the impact walk needs, where
+    /// [`Self::resolve_bulk`] shares an ancestry across many keys at one.
+    ///
+    /// The target's chain is fetched once, the rows of the chain and of the
+    /// whole subtree are read with one set query, and each descendant's chain
+    /// is built in memory from the subtree's parent links: the tenant resolver
+    /// and the database are each asked a fixed number of times, whatever the
+    /// subtree holds. Each descendant is served under the same nearest-match
+    /// and review fallthrough as a single read of it. The cache is neither
+    /// read nor filled: a preview over thousands of scopes would only churn
+    /// it, and what it answers is what the rows say now.
+    ///
+    /// # Errors
+    /// [`DomainError::Retired`] for a retired declaration; [`DomainError::Unavailable`]
+    /// when the tenant resolver or the database cannot answer.
+    pub async fn resolve_subtree<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration: &Declaration,
+        target: ScopeTarget,
+        subtree: &Subtree,
+    ) -> Result<Vec<SubtreeValue>, DomainError> {
+        if declaration.status == "retired" {
+            return Err(DomainError::Retired {
+                key: declaration.key.clone(),
+            });
+        }
+        let root = self.platform.root_tenant().await?;
+        let mut ancestry = Ancestry::new(root, target);
+        let target_tenant = ancestry.tenant();
+        // The chain above the target, once; below it the links suffice.
+        let chain = ancestry.chain(self.hierarchy.as_ref()).await?.to_vec();
+        // Unscoped, as `dispatch` reads them: inheritance crosses tenant
+        // boundaries by design, and who may ask was decided at the door.
+        let mut ids = chain.clone();
+        ids.extend(subtree.order.iter().copied());
+        let rows = index(
+            self.values
+                .find_in_tenants(conn, &AccessScope::allow_all(), declaration.id, &ids)
+                .await?,
+        );
+        let mut out = Vec::with_capacity(subtree.order.len());
+        for descendant in &subtree.order {
+            // The scopes a read of this descendant would inspect, by class:
+            // the platform row alone, its own chain, or its own row alone.
+            let inspected: Vec<Uuid> = match declaration.scope_class.as_str() {
+                scope_class::GLOBAL => vec![root],
+                scope_class::CASCADING => chain
+                    .iter()
+                    .copied()
+                    .chain(
+                        subtree
+                            .path_from(target_tenant, *descendant)
+                            .into_iter()
+                            .skip(1),
+                    )
+                    .collect(),
+                scope_class::LOCAL => vec![*descendant],
+                other => {
+                    return Err(DomainError::Internal {
+                        diagnostic: format!(
+                            "declaration `{}` carries the unknown scope class `{other}`",
+                            declaration.key
+                        ),
+                    });
+                }
+            };
+            let (value, source_tenant) = match winner(&inspected, &rows) {
+                Some(row) => (value_of(row).0, Some(row.tenant_id)),
+                None => (declaration.default_value.clone(), None),
+            };
+            out.push(SubtreeValue {
+                tenant_id: *descendant,
+                scope: scope_path(*descendant, root),
+                value,
+                source_tenant,
+            });
+        }
+        Ok(out)
     }
 
     /// The declaration at a key, whatever its status, or nothing.

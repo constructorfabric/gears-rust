@@ -10,7 +10,7 @@
 
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, NotFoundEntity};
 use crate::domain::service::{MutationError, StreamError};
 
 // ---------------------------------------------------------------------------
@@ -65,17 +65,11 @@ impl From<DomainError> for CanonicalError {
             DomainError::NotFound { entity, id } => {
                 let detail = format!("{entity} not found: {id}");
                 let resource = id.to_string();
-                match entity.as_str() {
-                    "message" => MiniChatMessageError::not_found(detail)
+                match entity {
+                    NotFoundEntity::Attachment => MiniChatAttachmentError::not_found(detail)
                         .with_resource(resource)
                         .create(),
-                    "turn" => MiniChatTurnError::not_found(detail)
-                        .with_resource(resource)
-                        .create(),
-                    "attachment" => MiniChatAttachmentError::not_found(detail)
-                        .with_resource(resource)
-                        .create(),
-                    _ => MiniChatChatError::not_found(detail)
+                    NotFoundEntity::Chat => MiniChatChatError::not_found(detail)
                         .with_resource(resource)
                         .create(),
                 }
@@ -93,13 +87,23 @@ impl From<DomainError> for CanonicalError {
                 .with_format(message)
                 .create(),
 
+            // Same wire shape as `OData` errors raised by the query extractor.
+            DomainError::OData(e) => CanonicalError::from(e),
+
             DomainError::Forbidden => MiniChatChatError::permission_denied()
                 .with_reason("AUTHZ_DENIED")
                 .create(),
 
-            DomainError::Conflict { code, message } => MiniChatChatError::already_exists(message)
-                .with_resource(code)
-                .create(),
+            DomainError::AuthzUnavailable => authz_unavailable(),
+
+            DomainError::Conflict { code, message } => {
+                // `message` can carry driver constraint text or backend
+                // names; it goes to the log, never to the client.
+                tracing::warn!(conflict_code = %code, error_message = %message, "mini-chat conflict");
+                MiniChatChatError::already_exists(conflict_detail(&code))
+                    .with_resource(code)
+                    .create()
+            }
 
             DomainError::InvalidReactionTarget { id } => {
                 MiniChatMessageError::failed_precondition()
@@ -145,11 +149,13 @@ impl From<DomainError> for CanonicalError {
                 )
                 .create(),
 
-            DomainError::WebSearchCallsExceeded => {
-                MiniChatChatError::resource_exhausted("web search calls exceeded for this message")
-                    .with_quota_violation("web_search_calls", "max calls exceeded")
-                    .create()
-            }
+            DomainError::ImagesDisabled => MiniChatChatError::failed_precondition()
+                .with_precondition_violation(
+                    "images",
+                    "disabled via kill switch",
+                    "FEATURE_DISABLED",
+                )
+                .create(),
 
             DomainError::UnsupportedFileType { mime } => {
                 MiniChatAttachmentError::invalid_argument()
@@ -179,13 +185,6 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
 
-            DomainError::ServiceUnavailable { message } => {
-                tracing::warn!(reason = %message, "mini-chat service unavailable");
-                CanonicalError::service_unavailable()
-                    .with_retry_after_seconds(5)
-                    .create()
-            }
-
             DomainError::ProviderError {
                 code,
                 sanitized_message,
@@ -200,6 +199,38 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
         }
+    }
+}
+
+/// Client-facing detail for a `DomainError::Conflict` code.
+/// Seconds a client should wait before retrying after a PDP outage.
+const AUTHZ_RETRY_AFTER_SECS: u64 = 5;
+
+/// 503 for a PDP that could not evaluate the request: access is still
+/// refused (fail closed), but the client sees a retryable outage, not a
+/// denial. The detail is generic; the cause is only logged.
+fn authz_unavailable() -> CanonicalError {
+    CanonicalError::service_unavailable()
+        .with_retry_after_seconds(AUTHZ_RETRY_AFTER_SECS)
+        .create()
+}
+
+fn conflict_detail(code: &str) -> &'static str {
+    match code {
+        "provider_mismatch" => "chat vector store belongs to another provider",
+        "attachment_locked" => {
+            "Attachment is referenced by one or more messages and cannot be deleted"
+        }
+        _ => "resource already exists",
+    }
+}
+
+/// Client-facing detail for a `StreamError::Conflict` code.
+fn turn_conflict_detail(code: &str) -> &'static str {
+    match code {
+        "turn_already_running" => "Another turn is running in this chat",
+        "request_id_conflict" => "request_id is already used by another turn in this chat",
+        _ => "Turn conflict",
     }
 }
 
@@ -225,6 +256,8 @@ impl From<MutationError> for CanonicalError {
             MutationError::Forbidden => MiniChatTurnError::permission_denied()
                 .with_reason("AUTHZ_DENIED")
                 .create(),
+
+            MutationError::AuthzUnavailable => authz_unavailable(),
 
             MutationError::InvalidTurnState { state } => MiniChatTurnError::failed_precondition()
                 .with_precondition_violation(
@@ -267,17 +300,25 @@ impl From<StreamError> for CanonicalError {
                 .with_reason("REPLAY")
                 .create(),
 
-            StreamError::Conflict { code, message } => MiniChatTurnError::aborted(message)
-                .with_reason(code)
-                .create(),
+            StreamError::Conflict { code, message } => {
+                // `message` names turn ids or carries driver constraint text;
+                // it goes to the log, the client gets a fixed detail.
+                tracing::info!(conflict_code = %code, error_message = %message, "turn conflict");
+                MiniChatTurnError::aborted(turn_conflict_detail(&code))
+                    .with_reason(code)
+                    .create()
+            }
 
             StreamError::TurnCreationFailed { source } => {
                 tracing::warn!(error = %source, "pre-stream turn creation failed");
                 CanonicalError::from(source)
             }
 
-            // The source `DomainError::Forbidden` carries no extra detail
-            // worth preserving; map straight to the canonical AuthZ denial.
+            // A PDP outage is 503; every other enforcer failure is the
+            // canonical AuthZ denial (the source carries no extra detail).
+            StreamError::AuthorizationFailed {
+                source: DomainError::AuthzUnavailable,
+            } => authz_unavailable(),
             StreamError::AuthorizationFailed { .. } => MiniChatChatError::permission_denied()
                 .with_reason("AUTHZ_DENIED")
                 .create(),
@@ -321,7 +362,7 @@ impl From<StreamError> for CanonicalError {
             StreamError::UnsupportedMedia => MiniChatAttachmentError::invalid_argument()
                 .with_field_violation(
                     "content_type",
-                    "selected model does not support image input",
+                    "the effective model does not support image input",
                     "VISION_NOT_SUPPORTED",
                 )
                 .create(),
@@ -447,14 +488,20 @@ mod tests {
     #[test]
     fn attachment_not_found_uses_attachment_resource_scope() {
         let id = Uuid::new_v4();
-        let p: Problem = DomainError::NotFound {
-            entity: "attachment".into(),
-            id,
-        }
-        .into_test_problem();
+        let p: Problem = DomainError::attachment_not_found(id).into_test_problem();
         assert_eq!(p.status, Some(404));
         assert_eq!(p.problem_type, NOT_FOUND_TYPE);
         assert_eq!(p.context["resource_type"], ATTACHMENT_GTS);
+        assert_eq!(p.context["resource_name"], id.to_string());
+        assert_eq!(p.detail, format!("Attachment not found: {id}"));
+    }
+
+    #[test]
+    fn generic_chat_not_found_uses_chat_resource_scope() {
+        let id = Uuid::new_v4();
+        let p: Problem = DomainError::not_found(NotFoundEntity::Chat, id).into_test_problem();
+        assert_eq!(p.status, Some(404));
+        assert_eq!(p.context["resource_type"], CHAT_GTS);
         assert_eq!(p.context["resource_name"], id.to_string());
     }
 
@@ -619,6 +666,31 @@ mod tests {
         assert_eq!(p.context["reason"], "AUTHZ_DENIED");
     }
 
+    /// A PDP outage is a retryable 503, not a 403 denial, on every error
+    /// path that carries it.
+    #[test]
+    fn authz_unavailable_is_503_with_retry_after() {
+        let problems = [
+            DomainError::AuthzUnavailable.into_test_problem(),
+            crate::domain::service::MutationError::AuthzUnavailable.into_test_problem(),
+            crate::domain::service::StreamError::AuthorizationFailed {
+                source: DomainError::AuthzUnavailable,
+            }
+            .into_test_problem(),
+        ];
+        for p in problems {
+            assert_eq!(p.status, Some(503), "{p:?}");
+            assert_eq!(p.problem_type, SERVICE_UNAVAILABLE_TYPE);
+            assert_eq!(p.context["retry_after_seconds"].as_u64(), Some(5));
+        }
+        // A policy denial through the stream path stays 403.
+        let p = crate::domain::service::StreamError::AuthorizationFailed {
+            source: DomainError::Forbidden,
+        }
+        .into_test_problem();
+        assert_eq!(p.status, Some(403));
+    }
+
     #[test]
     fn validation_uses_format_variant_when_no_field_supplied() {
         let p: Problem = DomainError::Validation {
@@ -644,16 +716,51 @@ mod tests {
     }
 
     #[test]
-    fn web_search_calls_exceeded_emits_quota_violation() {
-        let p: Problem = DomainError::WebSearchCallsExceeded.into_test_problem();
-        assert_eq!(p.status, Some(429));
-        assert_eq!(p.problem_type, RESOURCE_EXHAUSTED_TYPE);
-        let v = p
-            .context
-            .get("violations")
-            .and_then(|v| v.as_array())
-            .expect("violations must be present");
-        assert_eq!(v[0]["subject"], "web_search_calls");
+    fn odata_errors_use_the_canonical_odata_mapping() {
+        const ODATA_GTS: &str = gts_id!("cf.core.odata.query.v1~");
+        for (err, field, reason) in [
+            (
+                toolkit_odata::Error::InvalidFilter("unknown field `nope`".into()),
+                "$filter",
+                "INVALID_FILTER",
+            ),
+            (
+                toolkit_odata::Error::InvalidOrderByField("nope".into()),
+                "$orderby",
+                "INVALID_ORDERBY_FIELD",
+            ),
+            (
+                toolkit_odata::Error::FilterMismatch,
+                "cursor",
+                "FILTER_MISMATCH",
+            ),
+            (
+                toolkit_odata::Error::OrderMismatch,
+                "cursor",
+                "ORDER_MISMATCH",
+            ),
+            (
+                toolkit_odata::Error::InvalidCursor,
+                "cursor",
+                "INVALID_CURSOR",
+            ),
+            (
+                toolkit_odata::Error::CursorInvalidJson,
+                "cursor",
+                "INVALID_CURSOR",
+            ),
+            (toolkit_odata::Error::InvalidLimit, "$top", "INVALID_LIMIT"),
+        ] {
+            let p: Problem = DomainError::OData(err).into_test_problem();
+            assert_eq!(p.status, Some(400), "{reason}");
+            assert_eq!(p.problem_type, INVALID_ARGUMENT_TYPE, "{reason}");
+            assert_eq!(p.context["resource_type"], ODATA_GTS, "{reason}");
+            let v = p.context["field_violations"]
+                .as_array()
+                .expect("field_violations must be present");
+            assert_eq!(v[0]["field"], field, "{reason}");
+            assert_eq!(v[0]["reason"], reason);
+        }
     }
 
     #[test]
@@ -690,14 +797,17 @@ mod tests {
     }
 
     #[test]
-    fn service_unavailable_carries_retry_after_seconds() {
-        let p: Problem = DomainError::ServiceUnavailable {
-            message: "downstream timeout".into(),
-        }
-        .into_test_problem();
-        assert_eq!(p.status, Some(503));
-        assert_eq!(p.problem_type, SERVICE_UNAVAILABLE_TYPE);
-        assert_eq!(p.context["retry_after_seconds"].as_u64(), Some(5));
+    fn images_disabled_emits_precondition_violation() {
+        let p: Problem = DomainError::ImagesDisabled.into_test_problem();
+        assert_eq!(p.status, Some(400));
+        assert_eq!(p.problem_type, FAILED_PRECONDITION_TYPE);
+        let v = p
+            .context
+            .get("violations")
+            .and_then(|v| v.as_array())
+            .expect("violations must be present");
+        assert_eq!(v[0]["subject"], "images");
+        assert_eq!(v[0]["type"], "FEATURE_DISABLED");
     }
 
     #[test]
@@ -726,6 +836,77 @@ mod tests {
         .into_test_problem();
         assert_eq!(p.status, Some(409));
         assert_eq!(p.context["resource_name"], "unique_violation");
+    }
+
+    #[test]
+    fn turn_conflict_detail_hides_raw_message() {
+        let chat_id = uuid::Uuid::new_v4();
+        let turn_id = uuid::Uuid::new_v4();
+        for (code, raw, detail) in [
+            (
+                "turn_already_running",
+                format!("Chat {chat_id} already has a running turn {turn_id}"),
+                "Another turn is running in this chat",
+            ),
+            (
+                "request_id_conflict",
+                format!("Turn for request_id {turn_id} exists with state Running"),
+                "request_id is already used by another turn in this chat",
+            ),
+            (
+                "turn_already_running",
+                "UNIQUE constraint failed: chat_turns.chat_id".to_owned(),
+                "Another turn is running in this chat",
+            ),
+        ] {
+            let p: Problem = StreamError::Conflict {
+                code: code.into(),
+                message: raw.clone(),
+            }
+            .into_test_problem();
+            assert_eq!(p.status, Some(409), "{code}");
+            assert_eq!(p.detail, detail, "{code}");
+            assert_eq!(p.context["reason"], code);
+            let wire = serde_json::to_string(&p).unwrap();
+            assert!(!wire.contains(&raw), "{code}: raw message leaked: {wire}");
+            assert!(
+                !wire.contains(&turn_id.to_string()),
+                "{code}: turn id leaked"
+            );
+        }
+    }
+
+    #[test]
+    fn conflict_detail_hides_raw_message() {
+        for (code, raw, detail) in [
+            (
+                "unique_violation",
+                "duplicate key value violates unique constraint \"uq_chat_vector_stores_chat\"",
+                "resource already exists",
+            ),
+            (
+                "provider_mismatch",
+                "vector store provider mismatch: existing='openai', current='azure_openai'",
+                "chat vector store belongs to another provider",
+            ),
+            (
+                "attachment_locked",
+                "internal text",
+                "Attachment is referenced by one or more messages and cannot be deleted",
+            ),
+            ("some_new_code", "internal text", "resource already exists"),
+        ] {
+            let p: Problem = DomainError::Conflict {
+                code: code.into(),
+                message: raw.into(),
+            }
+            .into_test_problem();
+            assert_eq!(p.status, Some(409), "{code}");
+            assert_eq!(p.detail, detail, "{code}");
+            assert_eq!(p.context["resource_name"], code);
+            let wire = serde_json::to_string(&p).unwrap();
+            assert!(!wire.contains(raw), "{code}: raw message leaked: {wire}");
+        }
     }
 
     // ── MutationError / StreamError dedicated coverage ───────────────────

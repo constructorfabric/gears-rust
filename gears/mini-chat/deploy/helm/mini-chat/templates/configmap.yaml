@@ -323,8 +323,10 @@ data:
               context_window: 40960
               max_output_tokens: 4096
               max_input_tokens: 40960
-              input_tokens_credit_multiplier_micro: 0
-              output_tokens_credit_multiplier_micro: 0
+              # Multipliers must be > 0; 1 micro-credit per 1M tokens is
+              # effectively free for this local development model.
+              input_tokens_credit_multiplier_micro: 1
+              output_tokens_credit_multiplier_micro: 1
               multiplier_display: "0x"
               estimation_budgets:
                 bytes_per_token_conservative: 4

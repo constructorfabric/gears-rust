@@ -7,6 +7,12 @@ description = "BSS Plan & Price Modeling gear: the catalog publish engine, Postg
 [lib]
 name = "bss_pricing"
 
+# `infra/storage/entity.rs` declares every entity module through its
+# `entities!` macro (`pub mod $module;`), which cargo-shear cannot follow, so it
+# reports the files as unlinked. They are compiled.
+[package.metadata.cargo-shear]
+ignored-paths = ["src/infra/storage/entity/*.rs"]
+
 [lints]
 workspace = true
 

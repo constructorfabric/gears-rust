@@ -32,7 +32,30 @@ impl StreamEvent {
     }
 }
 
-impl toolkit::api::api_dto::ResponseApiDto for StreamEvent {}
+/// `OpenAPI` description of one SSE event of the `messages:stream`, retry and
+/// edit responses. Each event is sent as `event: <name>` and `data: <payload>`
+/// (JSON); `event` below is the SSE event name and `data` its payload. This
+/// type only documents the wire format; `StreamEvent::into_sse_event` writes it.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
+#[allow(dead_code)] // documentation-only type, never constructed
+pub enum MiniChatSseEvent {
+    StreamStarted(crate::domain::stream_events::StreamStartedData),
+    Ping(PingData),
+    Delta(DeltaData),
+    Tool(ToolData),
+    Citations(CitationsData),
+    Done(crate::domain::stream_events::DoneData),
+    Error(crate::domain::stream_events::ErrorData),
+}
+
+/// Payload of the `ping` event: an empty JSON object (a unit struct would
+/// be documented as `null`).
+#[derive(serde::Serialize, utoipa::ToSchema)]
+#[allow(clippy::empty_structs_with_brackets)]
+pub struct PingData {}
+
+impl toolkit::api::api_dto::ResponseApiDto for MiniChatSseEvent {}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Provider → domain conversion
@@ -41,9 +64,10 @@ impl toolkit::api::api_dto::ResponseApiDto for StreamEvent {}
 impl From<ClientSseEvent> for StreamEvent {
     fn from(event: ClientSseEvent) -> Self {
         match event {
-            ClientSseEvent::Delta { r#type, content } => {
-                StreamEvent::Delta(DeltaData { r#type, content })
-            }
+            ClientSseEvent::Delta { r#type, content } => StreamEvent::Delta(DeltaData {
+                r#type: crate::domain::stream_events::DeltaKind::from_wire(r#type),
+                content,
+            }),
             ClientSseEvent::Tool {
                 phase,
                 name,
@@ -189,6 +213,7 @@ impl StreamPhase {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::domain::stream_events::{DoneData, ErrorData};
@@ -196,27 +221,39 @@ mod tests {
 
     // ── SSE serialization tests ──
 
-    #[test]
-    fn ping_converts_to_sse_event() {
-        assert!(StreamEvent::Ping.into_sse_event().is_ok());
+    /// The bytes `into_sse_event` produces on the wire, rendered through the
+    /// same `Sse` response the handlers return.
+    async fn wire(event: StreamEvent) -> String {
+        use axum::response::IntoResponse;
+        let event = event.into_sse_event().unwrap();
+        let stream = futures::stream::iter([Ok::<_, std::convert::Infallible>(event)]);
+        let body = axum::response::Sse::new(stream).into_response().into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
     }
 
-    #[test]
-    fn delta_converts_to_sse_event() {
-        assert!(
-            StreamEvent::Delta(DeltaData {
-                r#type: "text",
-                content: "hello".into(),
-            })
-            .into_sse_event()
-            .is_ok()
+    #[tokio::test]
+    async fn ping_wire_format() {
+        assert_eq!(wire(StreamEvent::Ping).await, "event: ping\ndata: {}\n\n");
+    }
+
+    #[tokio::test]
+    async fn delta_wire_format() {
+        let out = wire(StreamEvent::Delta(DeltaData {
+            r#type: crate::domain::stream_events::DeltaKind::Text,
+            content: "hello".into(),
+        }))
+        .await;
+        assert_eq!(
+            out,
+            "event: delta\ndata: {\"type\":\"text\",\"content\":\"hello\"}\n\n"
         );
     }
 
     #[test]
     fn delta_data_serializes_correctly() {
         let data = DeltaData {
-            r#type: "text",
+            r#type: crate::domain::stream_events::DeltaKind::Text,
             content: "hello".into(),
         };
         let json = serde_json::to_string(&data).unwrap();
@@ -227,10 +264,10 @@ mod tests {
     #[test]
     fn done_serializes_without_optional_fields() {
         let data = DoneData {
-            usage: None,
+            usage: Usage::default(),
             effective_model: "gpt-4o".into(),
             selected_model: "gpt-4o".into(),
-            quota_decision: "allow".into(),
+            quota_decision: crate::domain::stream_events::QuotaDecisionKind::Allow,
             downgrade_from: None,
             downgrade_reason: None,
             quota_warnings: None,
@@ -244,7 +281,7 @@ mod tests {
     #[test]
     fn done_serializes_with_downgrade() {
         let data = DoneData {
-            usage: Some(Usage {
+            usage: (Usage {
                 input_tokens: 100,
                 output_tokens: 50,
                 cache_read_input_tokens: 0,
@@ -253,7 +290,7 @@ mod tests {
             }),
             effective_model: "gpt-4o-mini".into(),
             selected_model: "gpt-4o".into(),
-            quota_decision: "downgrade".into(),
+            quota_decision: crate::domain::stream_events::QuotaDecisionKind::Downgrade,
             downgrade_from: Some("gpt-4o".into()),
             downgrade_reason: Some("premium_quota_exhausted".into()),
             quota_warnings: None,
@@ -263,28 +300,31 @@ mod tests {
         assert!(json.contains("\"downgrade_from\":\"gpt-4o\""));
     }
 
-    #[test]
-    fn done_converts_to_sse_event() {
-        assert!(
-            StreamEvent::Done(Box::new(DoneData {
-                usage: None,
-                effective_model: "gpt-4o".into(),
-                selected_model: "gpt-4o".into(),
-                quota_decision: "allow".into(),
-                downgrade_from: None,
-                downgrade_reason: None,
-                quota_warnings: None,
-            }))
-            .into_sse_event()
-            .is_ok()
+    #[tokio::test]
+    async fn done_wire_format() {
+        let data = DoneData {
+            usage: Usage::default(),
+            effective_model: "gpt-4o".into(),
+            selected_model: "gpt-4o".into(),
+            quota_decision: crate::domain::stream_events::QuotaDecisionKind::Allow,
+            downgrade_from: None,
+            downgrade_reason: None,
+            quota_warnings: None,
+        };
+        let expected = format!(
+            "event: done\ndata: {}\n\n",
+            serde_json::to_string(&data).unwrap()
         );
+        let out = wire(StreamEvent::Done(Box::new(data))).await;
+        assert_eq!(out, expected);
+        assert!(out.contains("\"quota_decision\":\"allow\""), "{out}");
     }
 
     #[test]
     fn done_serializes_with_quota_warnings() {
         use crate::domain::stream_events::QuotaWarning;
         let data = DoneData {
-            usage: Some(Usage {
+            usage: (Usage {
                 input_tokens: 50,
                 output_tokens: 20,
                 cache_read_input_tokens: 0,
@@ -293,7 +333,7 @@ mod tests {
             }),
             effective_model: "gpt-5.2".into(),
             selected_model: "gpt-5.2".into(),
-            quota_decision: "allow".into(),
+            quota_decision: crate::domain::stream_events::QuotaDecisionKind::Allow,
             downgrade_from: None,
             downgrade_reason: None,
             quota_warnings: Some(vec![QuotaWarning {
@@ -317,16 +357,51 @@ mod tests {
     #[test]
     fn done_omits_quota_warnings_when_none() {
         let data = DoneData {
-            usage: None,
+            usage: Usage::default(),
             effective_model: "gpt-4o".into(),
             selected_model: "gpt-4o".into(),
-            quota_decision: "allow".into(),
+            quota_decision: crate::domain::stream_events::QuotaDecisionKind::Allow,
             downgrade_from: None,
             downgrade_reason: None,
             quota_warnings: None,
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(!json.contains("quota_warnings"));
+    }
+
+    /// The typed fields keep the `snake_case` strings on the wire.
+    #[test]
+    fn typed_fields_keep_wire_values() {
+        use crate::domain::stream_events::{DeltaKind, QuotaDecisionKind};
+        assert_eq!(serde_json::to_value(DeltaKind::Text).unwrap(), "text");
+        assert_eq!(
+            serde_json::to_value(DeltaKind::Reasoning).unwrap(),
+            "reasoning"
+        );
+        assert_eq!(DeltaKind::from_wire("reasoning"), DeltaKind::Reasoning);
+        assert_eq!(DeltaKind::from_wire("text"), DeltaKind::Text);
+        // Unknown values fall back to plain text.
+        assert_eq!(DeltaKind::from_wire("bogus"), DeltaKind::Text);
+        assert_eq!(
+            serde_json::to_value(QuotaDecisionKind::Allow).unwrap(),
+            "allow"
+        );
+        assert_eq!(
+            serde_json::to_value(QuotaDecisionKind::Downgrade).unwrap(),
+            "downgrade"
+        );
+        assert_eq!(
+            QuotaDecisionKind::from_decision("downgrade"),
+            QuotaDecisionKind::Downgrade
+        );
+        assert_eq!(
+            QuotaDecisionKind::from_decision("allow"),
+            QuotaDecisionKind::Allow
+        );
+        assert_eq!(
+            QuotaDecisionKind::from_decision("bogus"),
+            QuotaDecisionKind::Allow
+        );
     }
 
     #[test]
@@ -340,15 +415,16 @@ mod tests {
         assert!(json.contains("\"message\":\"Something went wrong\""));
     }
 
-    #[test]
-    fn error_converts_to_sse_event() {
-        assert!(
-            StreamEvent::Error(ErrorData {
-                code: "provider_error".into(),
-                message: "Something went wrong".into(),
-            })
-            .into_sse_event()
-            .is_ok()
+    #[tokio::test]
+    async fn error_wire_format() {
+        let out = wire(StreamEvent::Error(ErrorData {
+            code: "provider_error".into(),
+            message: "Something went wrong".into(),
+        }))
+        .await;
+        assert_eq!(
+            out,
+            "event: error\ndata: {\"code\":\"provider_error\",\"message\":\"Something went wrong\"}\n\n"
         );
     }
 

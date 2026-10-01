@@ -152,6 +152,12 @@ gears:
       orphan_watchdog:
         scan_interval_secs: 10
         timeout_secs: 90
+      # Upload reaper (on by default): fails attachments left in pending/uploaded
+      # by a dropped upload request and schedules the provider file delete.
+      # upload_reaper:
+      #   enabled: true
+      #   scan_interval_secs: 60
+      #   stale_after_secs: 300    # 60-86400
       # S2S credentials for obtaining SecurityContext
       # that will be used for communication with other gears.
       client_credentials:
@@ -171,7 +177,6 @@ gears:
           host: "${AZURE_OPENAI_API_HOST}"
           api_path: "/openai/v1/responses"
           api_version: "2025-03-01-preview"
-          supports_file_search_filters: false
           auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
           auth_config:
             header: "api-key"
@@ -181,9 +186,11 @@ gears:
       # ── Azure OpenAI example (uncomment and set your endpoint) ──────────
       #   azure_openai:
       #     kind: openai_responses
+      #     storage_kind: azure                             # required; azure needs api_version
       #     host: "<your-resource>.openai.azure.com"       # Azure endpoint
       #     # upstream_alias: "custom-alias"               # optional, defaults to host
       #     api_path: "/openai/v1/responses"
+      #     api_version: "2025-03-01-preview"             # required for storage_kind: azure
       #     auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
       #     auth_config:
       #       header: "api-key"
@@ -197,8 +204,10 @@ gears:
       #
       #   azure_openai:
       #     kind: openai_responses
+      #     storage_kind: azure                             # required; azure needs api_version
       #     host: "default.openai.azure.com"
       #     api_path: "/openai/v1/responses"
+      #     api_version: "2025-03-01-preview"             # required for storage_kind: azure
       #     auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
       #     auth_config:
       #       header: "api-key"

@@ -58,6 +58,7 @@
 //!    A failed callback returns `502 Bad Gateway` — the client should retry
 //!    the upload (idempotent: the backend PUT is overwrite-safe).
 
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -485,7 +486,7 @@ async fn upload(
     // a pre-authorized upload (DESIGN §bind-service). `claims.request_id`
     // (P2 1.8) is echoed back as `x-request-id` so both planes' logs for this
     // upload can be correlated.
-    if let Err(resp) = finalize_with_control_plane(
+    if let Err(rejection) = finalize_with_control_plane(
         &state,
         &token,
         &claims.request_id,
@@ -496,23 +497,43 @@ async fn upload(
     )
     .await
     {
-        return resp;
+        return rejection.into_response();
     }
 
     (StatusCode::OK, "uploaded").into_response()
 }
 
+/// A failed upload step: the status and plain-text body the client receives.
+///
+/// The helpers below return this rather than a built `Response`, which at 128
+/// bytes would put each of their `Result`s past `clippy::result_large_err`.
+struct Rejection {
+    status: StatusCode,
+    body: Cow<'static, str>,
+}
+
+impl Rejection {
+    fn new(status: StatusCode, body: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+        }
+    }
+}
+
+impl IntoResponse for Rejection {
+    fn into_response(self) -> Response {
+        (self.status, self.body).into_response()
+    }
+}
+
 /// Build the finalize request body bytes (JSON `{size, hash_hex}`).
 ///
-/// Returns an internal-error `Response` (boxed) if JSON serialization fails,
-/// which is only possible if `serde_json` itself has a bug (our value is trivial).
-#[allow(clippy::result_large_err)]
-fn finalize_body(size: i64, hash_hex: &str) -> Result<Vec<u8>, Response> {
-    let body = serde_json::json!({ "size": size, "hash_hex": hash_hex });
-    serde_json::to_vec(&body).map_err(|e| {
-        tracing::error!(error = %e, "failed to serialize finalize request body");
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-    })
+/// Rendering a `serde_json::Value` cannot fail, so neither can this.
+fn finalize_body(size: i64, hash_hex: &str) -> Vec<u8> {
+    serde_json::json!({ "size": size, "hash_hex": hash_hex })
+        .to_string()
+        .into_bytes()
 }
 
 /// Interpret the HTTP response from the control-plane finalize call.
@@ -520,7 +541,7 @@ async fn interpret_finalize_response(
     resp: reqwest::Response,
     file_id: Uuid,
     version_id: Uuid,
-) -> Result<(), Response> {
+) -> Result<(), Rejection> {
     if resp.status().is_success() {
         tracing::debug!(%file_id, %version_id, "finalize callback succeeded");
         return Ok(());
@@ -536,7 +557,7 @@ async fn interpret_finalize_response(
     // P2 1.11: the detailed status/body stay in the server-side log above —
     // forwarding them to the client would leak the control plane's raw error
     // body (which can carry internal details) to an uploading client.
-    Err((StatusCode::BAD_GATEWAY, "finalize failed").into_response())
+    Err(Rejection::new(StatusCode::BAD_GATEWAY, "finalize failed"))
 }
 
 /// Maximum number of attempts (including the first) for a sidecar→control-plane
@@ -618,7 +639,7 @@ async fn post_with_retry(
 /// Call the control-plane finalize endpoint after a successful PUT.
 ///
 /// Returns `Ok(())` when the control plane accepted the finalize, or
-/// `Err(Response)` with a `502 Bad Gateway` response when the callback
+/// `Err(Rejection)` with a `502 Bad Gateway` when the callback
 /// fails (so the upload handler can surface the failure to the client).
 ///
 /// When `control_base_url` is empty, the callback is skipped (dev mode).
@@ -630,7 +651,7 @@ async fn finalize_with_control_plane(
     version_id: Uuid,
     size: i64,
     hash_hex: &str,
-) -> Result<(), Response> {
+) -> Result<(), Rejection> {
     if state.control_base_url.is_empty() {
         return Ok(());
     }
@@ -642,7 +663,7 @@ async fn finalize_with_control_plane(
         version_id,
     );
 
-    let body_bytes = finalize_body(size, hash_hex)?;
+    let body_bytes = finalize_body(size, hash_hex);
 
     match post_with_retry(
         &state.http,
@@ -663,26 +684,22 @@ async fn finalize_with_control_plane(
             // P2 1.11: `e` (a `reqwest::Error`) embeds the request URL, i.e.
             // the internal `FS_SIDECAR_CONTROL_URL` host:port — never forward
             // it to the client. The detail is already in the log above.
-            Err((StatusCode::BAD_GATEWAY, "finalize failed").into_response())
+            Err(Rejection::new(StatusCode::BAD_GATEWAY, "finalize failed"))
         }
     }
 }
 
 /// Build the report-part request body bytes (JSON `{backend_etag, hash_hex, size}`).
 ///
-/// Returns an internal-error `Response` (boxed) if JSON serialization fails,
-/// which is only possible if `serde_json` itself has a bug (our value is trivial).
-#[allow(clippy::result_large_err)]
-fn report_part_body(backend_etag: &str, hash_hex: &str, size: i64) -> Result<Vec<u8>, Response> {
-    let body = serde_json::json!({
+/// Rendering a `serde_json::Value` cannot fail, so neither can this.
+fn report_part_body(backend_etag: &str, hash_hex: &str, size: i64) -> Vec<u8> {
+    serde_json::json!({
         "backend_etag": backend_etag,
         "hash_hex": hash_hex,
         "size": size,
-    });
-    serde_json::to_vec(&body).map_err(|e| {
-        tracing::error!(error = %e, "failed to serialize report-part request body");
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
     })
+    .to_string()
+    .into_bytes()
 }
 
 /// Interpret the HTTP response from the control-plane report-part call.
@@ -690,7 +707,7 @@ async fn interpret_report_part_response(
     resp: reqwest::Response,
     upload_id: Uuid,
     part_number: u32,
-) -> Result<(), Response> {
+) -> Result<(), Rejection> {
     if resp.status().is_success() {
         tracing::debug!(%upload_id, part_number, "report-part callback succeeded");
         return Ok(());
@@ -705,7 +722,7 @@ async fn interpret_report_part_response(
     );
     // P2 1.11: same no-leak principle as `interpret_finalize_response` — the
     // detailed status/body stay server-side only.
-    Err((StatusCode::BAD_GATEWAY, "report failed").into_response())
+    Err(Rejection::new(StatusCode::BAD_GATEWAY, "report failed"))
 }
 
 /// Call the control-plane report-part endpoint after a successful part write.
@@ -715,7 +732,7 @@ async fn interpret_report_part_response(
 /// `complete_multipart_upload`'s `list_multipart_parts` is structurally empty
 /// in a real deployment. Mirrors `finalize_with_control_plane`'s contract:
 /// returns `Ok(())` when the control plane accepted the report, or
-/// `Err(Response)` with a `502 Bad Gateway` when the callback fails (the
+/// `Err(Rejection)` with a `502 Bad Gateway` when the callback fails (the
 /// client should retry — the part write and this report are both idempotent
 /// per `(upload_id, part_number)`).
 ///
@@ -732,7 +749,7 @@ async fn report_part_with_control_plane(
     backend_etag: &str,
     hash_hex: &str,
     size: i64,
-) -> Result<(), Response> {
+) -> Result<(), Rejection> {
     if state.control_base_url.is_empty() {
         return Ok(());
     }
@@ -746,7 +763,7 @@ async fn report_part_with_control_plane(
         part_number,
     );
 
-    let body_bytes = report_part_body(backend_etag, hash_hex, size)?;
+    let body_bytes = report_part_body(backend_etag, hash_hex, size);
 
     match post_with_retry(
         &state.http,
@@ -766,13 +783,13 @@ async fn report_part_with_control_plane(
             );
             // P2 1.11: same no-leak principle as `finalize_with_control_plane`
             // — `e` embeds the internal control-plane URL.
-            Err((StatusCode::BAD_GATEWAY, "report failed").into_response())
+            Err(Rejection::new(StatusCode::BAD_GATEWAY, "report failed"))
         }
     }
 }
 
 /// Writes one multipart part to `backend`, returning `(body_len, backend_etag,
-/// hash_hex)` on success or an early terminal `Response` on any client/backend
+/// hash_hex)` on success or an early terminal [`Rejection`] on any client/backend
 /// error.
 ///
 /// Two write models, chosen by the backend's own capabilities (P2 1.7 Stage 6
@@ -805,7 +822,7 @@ async fn write_multipart_part(
     claims: &Claims,
     part_number: u32,
     body: Body,
-) -> Result<(u64, String, String), Response> {
+) -> Result<(u64, String, String), Rejection> {
     if backend.capabilities().multipart_native {
         write_multipart_part_native(backend, claims, part_number, body).await
     } else {
@@ -820,7 +837,7 @@ async fn write_multipart_part_native(
     claims: &Claims,
     part_number: u32,
     body: Body,
-) -> Result<(u64, String, String), Response> {
+) -> Result<(u64, String, String), Rejection> {
     let max_size = claims.multipart.size;
     let mut stream = body.into_data_stream();
     let mut buf = bytes::BytesMut::new();
@@ -828,17 +845,16 @@ async fn write_multipart_part_native(
         match stream.next().await {
             Some(Ok(chunk)) => {
                 if (buf.len() as u64).saturating_add(chunk.len() as u64) > max_size {
-                    return Err((
+                    return Err(Rejection::new(
                         StatusCode::PAYLOAD_TOO_LARGE,
                         format!("part body length exceeds token size claim {max_size}"),
-                    )
-                        .into_response());
+                    ));
                 }
                 buf.extend_from_slice(&chunk);
             }
             Some(Err(e)) => {
                 tracing::error!(error = %e, part_number, "part body stream read failed");
-                return Err((StatusCode::BAD_REQUEST, "body read error").into_response());
+                return Err(Rejection::new(StatusCode::BAD_REQUEST, "body read error"));
             }
             None => break,
         }
@@ -855,11 +871,10 @@ async fn write_multipart_part_native(
     // `400 Bad Request` rather than `413 Payload Too Large`.
     // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-size-enforce
     if body_len != max_size {
-        return Err((
+        return Err(Rejection::new(
             StatusCode::BAD_REQUEST,
             format!("part body length {body_len} does not match token size claim {max_size}"),
-        )
-            .into_response());
+        ));
     }
     // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-size-enforce
     // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-write-native
@@ -878,7 +893,10 @@ async fn write_multipart_part_native(
         Ok((etag, hash)) => Ok((body_len, etag, hex::encode(hash))),
         Err(e) => {
             tracing::error!(error = %e, part_number, "backend native upload_part failed");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response())
+            Err(Rejection::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "backend error",
+            ))
         }
     }
     // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-write-native
@@ -891,7 +909,7 @@ async fn write_multipart_part_offset_object(
     claims: &Claims,
     part_number: u32,
     body: Body,
-) -> Result<(u64, String, String), Response> {
+) -> Result<(u64, String, String), Rejection> {
     // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-write-offset
     let part_path = format!("{}.part.{}", claims.backend_path, part_number);
     let byte_stream: futures::stream::BoxStream<'_, std::io::Result<bytes::Bytes>> = Box::pin(
@@ -904,18 +922,20 @@ async fn write_multipart_part_offset_object(
     {
         Ok(v) => v,
         Err(DomainError::Validation { .. }) => {
-            return Err((
+            return Err(Rejection::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
                     "part body length exceeds token size claim {}",
                     claims.multipart.size
                 ),
-            )
-                .into_response());
+            ));
         }
         Err(e) => {
             tracing::error!(error = %e, part_number, "backend part write failed");
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response());
+            return Err(Rejection::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "backend error",
+            ));
         }
     };
     // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-write-offset
@@ -931,14 +951,13 @@ async fn write_multipart_part_offset_object(
     // lingers as an orphaned backend object.
     if body_len != claims.multipart.size {
         drop(backend.delete(&part_path).await);
-        return Err((
+        return Err(Rejection::new(
             StatusCode::BAD_REQUEST,
             format!(
                 "part body length {} does not match token size claim {}",
                 body_len, claims.multipart.size
             ),
-        )
-            .into_response());
+        ));
     }
 
     let part_etag = hex::encode(part_hash);
@@ -1034,7 +1053,7 @@ async fn upload_multipart_part(
     let (body_len, backend_etag, hash_hex) =
         match write_multipart_part(backend.as_ref(), &claims, part_number, body).await {
             Ok(v) => v,
-            Err(resp) => return resp,
+            Err(rejection) => return rejection.into_response(),
         };
 
     // P2 1.8 remediation: ingress bytes for this part.
@@ -1047,7 +1066,7 @@ async fn upload_multipart_part(
     // `claims.request_id` (P2 1.8) is echoed back as `x-request-id` so both
     // planes' logs for this upload can be correlated.
     // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-report
-    if let Err(resp) = report_part_with_control_plane(
+    if let Err(rejection) = report_part_with_control_plane(
         &state,
         &token,
         &claims.request_id,
@@ -1061,7 +1080,7 @@ async fn upload_multipart_part(
     )
     .await
     {
-        return resp;
+        return rejection.into_response();
     }
     // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-report
 

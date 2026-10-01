@@ -62,10 +62,12 @@ impl Sequencer {
     }
 
     /// Process a single partition with a bounded inner drain loop.
-    /// Each iteration runs in its own transaction.
+    /// Each iteration runs in its own transaction, and shutdown is checked
+    /// before starting the next one.
     async fn process_partition(
         &self,
         partition_id: i64,
+        cancel: &CancellationToken,
     ) -> Result<PartitionProcessResult, PartitionError> {
         let conn = self.db.sea_internal();
         debug_assert_eq!(
@@ -78,6 +80,12 @@ impl Sequencer {
         let mut total_claimed: u32 = 0;
 
         for _iteration in 0..self.config.max_inner_iterations {
+            // Committed iterations stand; what is left stays in incoming.
+            if cancel.is_cancelled() {
+                drained = false;
+                break;
+            }
+
             let txn = conn.begin().await?;
 
             // Try to acquire row lock
@@ -185,7 +193,7 @@ impl WorkerAction for Sequencer {
 
     async fn execute(
         &mut self,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<Directive<SequencerReport>, OutboxError> {
         let Some(guard) = self.shared_prioritizer.take() else {
             return Ok(Directive::Idle(SequencerReport {
@@ -195,7 +203,7 @@ impl WorkerAction for Sequencer {
         };
 
         let pid = guard.partition_id();
-        match self.process_partition(pid).await {
+        match self.process_partition(pid, cancel).await {
             Ok(result) => {
                 let report = SequencerReport {
                     partition_id: pid,

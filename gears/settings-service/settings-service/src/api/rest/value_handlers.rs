@@ -29,7 +29,7 @@ use crate::api::rest::value_dto::{
 use crate::domain::category::{DomainVisibility, domain_visibility};
 use crate::domain::error::DomainError;
 use crate::domain::validation::guards;
-use crate::domain::writes::{Change, WriteActor};
+use crate::domain::writes::{Change, ImpactPage, WriteActor};
 use crate::field;
 use crate::infra::value_writes::{
     BATCH_LIMIT, BatchChange, RefusedEntry, WriteCoordinator, batch_too_large,
@@ -467,14 +467,13 @@ pub async fn validate_value(
     let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-2
     let actor = actor(&ctx, &headers, domain_visibility(&scope));
+    let page = if body.impact == Some(false) {
+        ImpactPage::Skipped
+    } else {
+        ImpactPage::Of(body.limit)
+    };
     let report = writes
-        .validate(
-            &actor,
-            &key,
-            tenant,
-            &checked_value(&body.value)?,
-            body.limit,
-        )
+        .validate(&actor, &key, tenant, &checked_value(&body.value)?, page)
         .await?;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-8
     let pii = may_read_pii(&enforcer, &ctx).await;

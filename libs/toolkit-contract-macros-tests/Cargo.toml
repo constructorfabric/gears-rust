@@ -9,6 +9,13 @@ rust-version.workspace = true
 description = "UI tests for toolkit-contract-macros (not published)"
 publish = false
 
+# The contract macros emit `#[::async_trait::async_trait]` and
+# `::secrecy::ExposeSecret`, so the UI cases that expand them need both crates.
+# cargo-shear sees neither: `tests/ui/**` is in the workspace `ignored-paths`,
+# and `--expand` expands the `async_trait` attribute away before it scans.
+[package.metadata.cargo-shear]
+ignored = ["async-trait", "secrecy"]
+
 [lints]
 workspace = true
 
@@ -21,7 +28,6 @@ workspace = true
 # it — which `valid_grpc_projection.rs` never revealed, because that contract
 # takes no context at all.
 toolkit-contract = { workspace = true, features = ["rest-client", "grpc-client"] }
-toolkit-contract-macros = { workspace = true }
 
 # Test framework
 trybuild = { workspace = true }
@@ -32,7 +38,6 @@ async-trait = { workspace = true }
 # case that names that type needs the crate in scope.
 futures-core = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["full"] }
 thiserror = { workspace = true }
 toolkit-security = { workspace = true }
 secrecy = { workspace = true }

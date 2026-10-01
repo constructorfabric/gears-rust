@@ -169,9 +169,7 @@ impl SlidingWindowBucket {
             return;
         }
         if steps >= self.num_sub_windows {
-            for c in &mut self.counters {
-                *c = 0;
-            }
+            self.counters.fill(0);
             self.total_count = 0;
             self.current_index = 0;
             self.current_start = now();

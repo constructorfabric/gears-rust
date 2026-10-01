@@ -730,6 +730,15 @@ fn parse_sqlite_path_from_dsn(dsn: &str) -> Result<std::path::PathBuf> {
 }
 
 /// Resolve password from environment variable if it starts with ${VAR}.
+///
+/// The name is whatever sits between the braces, handed to `std::env::var`
+/// as it is: the process environment is the authority on what a variable
+/// name can be, and a shell's identifier rule is narrower than it (a name
+/// like `DB-PASSWORD` is set by a container runtime and read by this
+/// function without complaint). When the lookup fails the name is printed
+/// in `DbError::EnvVar`, escaped by the error's own rendering, so a newline
+/// in it cannot split the log line -- the escaping sits on the type, and
+/// reaches every caller that builds the variant.
 fn resolve_password(password: &str) -> Result<String> {
     if password.starts_with("${") && password.ends_with('}') {
         let var_name = &password[2..password.len() - 1];
@@ -846,6 +855,76 @@ pub fn redact_credentials_in_dsn(dsn: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A well-formed placeholder resolves to the variable's value, and an
+    /// unset one is `DbError::EnvVar` naming the variable. The value and
+    /// the names are generated rather than written as literals: nothing
+    /// depends on what they are, and a string literal handed to something
+    /// named `password` is, to `CodeQL`'s hard-coded-credential rule, a
+    /// credential committed to the repository (the redis-cluster-plugin
+    /// tests generate their throwaway ACL password for the same reason).
+    #[test]
+    fn a_placeholder_resolves_to_its_variable_or_names_it() {
+        let value = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("TOOLKIT_DB_TEST_{}", uuid::Uuid::new_v4().simple());
+        temp_env::with_var(&name, Some(&value), || {
+            assert_eq!(
+                resolve_password(&format!("${{{name}}}")).expect("a set variable resolves"),
+                value
+            );
+        });
+        temp_env::with_var_unset(&name, || {
+            let error = resolve_password(&format!("${{{name}}}"))
+                .expect_err("an unset variable is an error, not an empty password");
+            assert!(
+                matches!(&error, DbError::EnvVar { name: named, .. } if *named == name),
+                "the error names the variable: {error}"
+            );
+            assert!(
+                error.to_string().contains(&name),
+                "and so does its message: {error}"
+            );
+        });
+        assert_eq!(
+            resolve_password(&value).expect("a value that is not a placeholder passes through"),
+            value
+        );
+    }
+
+    /// The environment, not a shell, decides what a name is: a name a
+    /// container runtime sets and a POSIX shell could not export resolves
+    /// like any other.
+    #[test]
+    fn a_name_that_is_not_a_shell_identifier_resolves_too() {
+        let value = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("TOOLKIT-DB-TEST-{}", uuid::Uuid::new_v4().simple());
+        temp_env::with_var(&name, Some(&value), || {
+            assert_eq!(
+                resolve_password(&format!("${{{name}}}")).expect("the environment holds it"),
+                value
+            );
+        });
+    }
+
+    /// The name is printed when the lookup fails, and it comes from
+    /// configuration: a newline in it used to split the log line in two,
+    /// with the second half sitting where a reader expects a record. The
+    /// error's rendering escapes it, on the type, for every caller.
+    #[test]
+    fn a_newline_in_the_name_does_not_split_the_error_line() {
+        let generated = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("TOOLKIT_DB_TEST_{generated}\nERROR forged line");
+        let error = temp_env::with_var_unset(&name, || {
+            resolve_password(&format!("${{{name}}}"))
+                .expect_err("a variable with a newline in its name is not set")
+        });
+        let text = error.to_string();
+        assert!(!text.contains('\n'), "one line: {text:?}");
+        assert!(
+            text.contains("\\nERROR forged line"),
+            "escaped, not dropped: {text}"
+        );
+    }
 
     #[test]
     fn determine_engine_requires_engine_when_dsn_missing() {

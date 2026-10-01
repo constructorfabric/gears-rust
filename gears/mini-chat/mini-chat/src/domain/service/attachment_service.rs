@@ -8,12 +8,15 @@ use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use crate::config::{RagConfig, ThumbnailConfig};
-use crate::domain::error::DomainError;
+use crate::domain::error::{DomainError, NotFoundEntity};
 use crate::domain::mime_validation::{AttachmentKind, AttachmentPurpose};
 use crate::domain::ports::MiniChatMetricsPort;
-use crate::domain::ports::metric_labels::{kind as kind_label, upload_result};
+use crate::domain::ports::metric_labels::{
+    background_indexing_result, kind as kind_label, upload_result,
+};
 use crate::domain::ports::{
-    AddFileToVectorStoreParams, FileStorageProvider, UploadFileParams, VectorStoreProvider,
+    AddFileToVectorStoreParams, FileStorageError, FileStorageProvider, UploadFileParams,
+    VectorStoreFileStatus, VectorStoreProvider,
 };
 use crate::domain::repos::{
     AttachmentRepository, ChatRepository, InsertVectorStoreParams, ModelResolver, OutboxEnqueuer,
@@ -85,8 +88,6 @@ pub enum CodeInterpreterStatus {
     Allowed,
     /// Model does not support CI or kill switch is on.
     Denied,
-    /// Model resolution failed transiently — cannot determine CI support.
-    Unknown,
 }
 
 /// Information needed to perform the parallel "secondary" upload to
@@ -113,7 +114,6 @@ pub struct UploadContext {
     pub allow_csv_upload: bool,
     /// Whether the resolved model supports `code_interpreter` and the kill
     /// switch is not active. Pre-resolved to avoid duplicate model lookups.
-    /// `Unknown` when model resolution failed transiently.
     pub code_interpreter_status: CodeInterpreterStatus,
     /// `Some` when the chat's LLM provider is Anthropic — the upload code
     /// will perform a secondary parallel upload to Anthropic's Files API
@@ -161,6 +161,363 @@ fn unwrap_mutation_err(e: toolkit_db::DbError) -> DomainError {
     }
 }
 
+/// A `chat_vector_stores` placeholder still NULL after this long is treated
+/// as abandoned. Provider vector-store creation takes seconds.
+const STALE_VECTOR_STORE_PLACEHOLDER: time::Duration = time::Duration::seconds(120);
+
+/// Time from the start of an upload during which the request waits for the
+/// vector store to index the document. The upload runs inside the request and
+/// api-gateway ends every request after 30 s, so the request stops waiting
+/// here; a document still `in_progress` is returned as `uploaded` and a
+/// background task finishes the wait ([`BACKGROUND_INDEXING_TIMEOUT`]).
+const UPLOAD_INDEXING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(25);
+/// First and maximum interval between indexing status polls (doubling).
+const INDEXING_POLL_INITIAL: std::time::Duration = std::time::Duration::from_millis(250);
+const INDEXING_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+/// Total time the background task keeps waiting for indexing after the
+/// upload returned `uploaded`.
+const BACKGROUND_INDEXING_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(10);
+/// The background task refreshes `updated_at` at least this often; well below
+/// the upload reaper's minimum `stale_after_secs` (60 s).
+const BACKGROUND_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+// A heartbeat round plus the `mark_ready` retries must fit well inside the
+// reaper's minimum stale window, or the reaper fails rows still indexing.
+const _: () = assert!(
+    BACKGROUND_HEARTBEAT_INTERVAL.as_secs() * 2
+        <= crate::config::background::UploadReaperConfig::MIN_STALE_AFTER_SECS
+);
+/// Attempts to set a background-indexed row `ready`, and the first delay
+/// between them (doubling): 1 + 2 + 4 s in total.
+const MARK_READY_ATTEMPTS: u32 = 4;
+const MARK_READY_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Maximum interval between background status polls.
+const BACKGROUND_POLL_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Outcome of waiting for vector store indexing until a deadline.
+#[domain_model]
+#[derive(Debug, PartialEq, Eq)]
+enum IndexingWait {
+    Completed,
+    /// `failed` / `cancelled`, or a status read error that is not transient.
+    Failed(String),
+    /// Still `in_progress` at the deadline.
+    Pending,
+}
+
+/// Poll the vector store file status until it leaves `in_progress` or the
+/// deadline passes. Waits 250 ms doubling to `poll_max` between reads; each
+/// read is bounded by the deadline; a transient read error (5xx, gateway
+/// failure) keeps polling and is kept in `last_error`, so a timeout can name
+/// it. The first transient error is logged at `warn`, later ones at `debug`.
+async fn wait_for_indexing(
+    vector_store: &dyn VectorStoreProvider,
+    ctx: &SecurityContext,
+    deadline: tokio::time::Instant,
+    poll_max: std::time::Duration,
+    ids: (&str, &str, &str),
+    mut status: VectorStoreFileStatus,
+    last_error: &mut Option<String>,
+) -> IndexingWait {
+    let (provider_id, vector_store_id, provider_file_id) = ids;
+    let mut delay = INDEXING_POLL_INITIAL;
+    loop {
+        match status {
+            VectorStoreFileStatus::Completed => return IndexingWait::Completed,
+            VectorStoreFileStatus::Failed { message } => return IndexingWait::Failed(message),
+            VectorStoreFileStatus::InProgress => {}
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return IndexingWait::Pending;
+        }
+        tokio::time::sleep(delay.min(deadline - now)).await;
+        delay = (delay * 2).min(poll_max);
+        let read = tokio::time::timeout_at(
+            deadline,
+            vector_store.get_vector_store_file_status(
+                ctx.clone(),
+                provider_id,
+                vector_store_id,
+                provider_file_id,
+            ),
+        )
+        .await;
+        status = match read {
+            Err(_elapsed) => return IndexingWait::Pending,
+            Ok(Ok(status)) => status,
+            Ok(Err(FileStorageError::Unavailable { message })) => {
+                // Provider text: redact ids, Debug-escape control characters.
+                let message = crate::infra::llm::sanitize_provider_message(&message);
+                if last_error.is_none() {
+                    tracing::warn!(error = ?message, "indexing status read failed; polling again");
+                } else {
+                    tracing::debug!(error = ?message, "indexing status read failed; polling again");
+                }
+                *last_error = Some(message);
+                VectorStoreFileStatus::InProgress
+            }
+            Ok(Err(e)) => return IndexingWait::Failed(e.to_string()),
+        };
+    }
+}
+
+/// Everything the background indexing wait needs; owned so it can outlive
+/// the upload request.
+struct BackgroundIndexing<AR: AttachmentRepository + 'static> {
+    db: Arc<DbProvider>,
+    metrics: Arc<dyn MiniChatMetricsPort>,
+    attachment_repo: Arc<AR>,
+    vector_store: Arc<dyn VectorStoreProvider>,
+    outbox_enqueuer: Arc<dyn OutboxEnqueuer>,
+    ctx: SecurityContext,
+    scope: AccessScope,
+    attachment_id: Uuid,
+    provider_id: String,
+    vector_store_id: String,
+    provider_file_id: String,
+    /// [`BACKGROUND_INDEXING_TIMEOUT`]; shorter in tests.
+    timeout: std::time::Duration,
+    /// Cancelled on gear stop. The row stays `uploaded`; the upload reaper
+    /// finishes it once `updated_at` goes stale.
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl<AR: AttachmentRepository + 'static> BackgroundIndexing<AR> {
+    /// Keep polling after the upload request returned `uploaded`.
+    /// `completed` → `ready`; `failed` or [`BACKGROUND_INDEXING_TIMEOUT`] →
+    /// `failed` / `indexing_failed` with the provider file handed to the
+    /// attachment cleanup.
+    async fn run(self) {
+        match self.wait().await {
+            None => {}
+            Some(IndexingWait::Completed) => self.mark_ready().await,
+            Some(IndexingWait::Failed(reason)) => {
+                self.metrics
+                    .record_background_indexing(background_indexing_result::FAILED);
+                self.mark_failed(&reason).await;
+            }
+            Some(IndexingWait::Pending) => {
+                // `wait_until_settled` names the last status read error; this
+                // arm is only a fallback.
+                self.metrics
+                    .record_background_indexing(background_indexing_result::TIMEOUT);
+                self.mark_failed("indexing not finished in time").await;
+            }
+        }
+    }
+
+    /// Poll in rounds of [`BACKGROUND_HEARTBEAT_INTERVAL`]; each round first
+    /// refreshes `updated_at` so the upload reaper leaves the row alone.
+    /// `None` when the row is gone or no longer `uploaded`.
+    async fn wait(&self) -> Option<IndexingWait> {
+        tokio::select! {
+            outcome = self.wait_until_settled() => outcome,
+            () = self.shutdown.cancelled() => {
+                tracing::info!(attachment_id = %self.attachment_id, "background indexing: stopped on shutdown");
+                None
+            }
+        }
+    }
+
+    async fn wait_until_settled(&self) -> Option<IndexingWait> {
+        let overall = tokio::time::Instant::now() + self.timeout;
+        let mut last_error = None;
+        loop {
+            if !self.heartbeat().await {
+                return None;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= overall {
+                self.metrics
+                    .record_background_indexing(background_indexing_result::TIMEOUT);
+                let reason = match &last_error {
+                    Some(e) => {
+                        format!("indexing not finished in time; last status read error: {e}")
+                    }
+                    None => "indexing not finished in time".to_owned(),
+                };
+                self.mark_failed(&reason).await;
+                return None;
+            }
+            let outcome = wait_for_indexing(
+                self.vector_store.as_ref(),
+                &self.ctx,
+                (now + BACKGROUND_HEARTBEAT_INTERVAL).min(overall),
+                BACKGROUND_POLL_MAX,
+                (
+                    &self.provider_id,
+                    &self.vector_store_id,
+                    &self.provider_file_id,
+                ),
+                VectorStoreFileStatus::InProgress,
+                &mut last_error,
+            )
+            .await;
+            if outcome != IndexingWait::Pending {
+                return Some(outcome);
+            }
+        }
+    }
+
+    /// `false` only when the row is gone or no longer `uploaded`; a DB error
+    /// keeps waiting.
+    async fn heartbeat(&self) -> bool {
+        let touched = match self.db.conn() {
+            Ok(conn) => {
+                self.attachment_repo
+                    .touch_uploaded(&conn, &self.scope, self.attachment_id)
+                    .await
+            }
+            Err(e) => Err(DomainError::from(e)),
+        };
+        match touched {
+            Ok(0) => {
+                tracing::info!(attachment_id = %self.attachment_id, "background indexing: row no longer uploaded, stopping");
+                false
+            }
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(attachment_id = %self.attachment_id, error = %e, "background indexing: heartbeat failed");
+                true
+            }
+        }
+    }
+
+    /// Set the row `ready`, retrying a failed write a few times: the
+    /// heartbeat has stopped, so a row left `uploaded` is later taken by the
+    /// upload reaper (`upload_abandoned`) and its provider file deleted.
+    /// The retries take a few seconds, well inside the reaper's
+    /// `stale_after_secs`.
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "one retry loop; the tracing macros add most of the score"
+    )]
+    async fn mark_ready(&self) {
+        use crate::domain::repos::SetReadyParams;
+        let mut delay = MARK_READY_RETRY_INITIAL;
+        for attempt in 1..=MARK_READY_ATTEMPTS {
+            let result = match self.db.conn() {
+                Ok(conn) => {
+                    self.attachment_repo
+                        .cas_set_ready(
+                            &conn,
+                            &self.scope,
+                            SetReadyParams {
+                                id: self.attachment_id,
+                                img_thumbnail: None,
+                                img_thumbnail_width: None,
+                                img_thumbnail_height: None,
+                            },
+                        )
+                        .await
+                }
+                Err(e) => Err(DomainError::from(e)),
+            };
+            match result {
+                Ok(0) => {
+                    tracing::info!(attachment_id = %self.attachment_id, "background indexing: row no longer uploaded, not set ready");
+                    return;
+                }
+                Ok(_) => {
+                    tracing::info!(attachment_id = %self.attachment_id, "background indexing: ready");
+                    self.metrics
+                        .record_background_indexing(background_indexing_result::READY);
+                    return;
+                }
+                Err(e) if attempt < MARK_READY_ATTEMPTS => {
+                    tracing::warn!(attachment_id = %self.attachment_id, attempt, error = %e, "background indexing: set ready failed, retrying");
+                }
+                Err(e) => {
+                    tracing::error!(attachment_id = %self.attachment_id, attempt, error = %e, "background indexing: set ready failed; the upload reaper will fail the row");
+                    self.metrics
+                        .record_background_indexing(background_indexing_result::SET_READY_FAILED);
+                    return;
+                }
+            }
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = self.shutdown.cancelled() => return,
+            }
+            delay *= 2;
+        }
+    }
+
+    /// Mark the attachment `failed` / `indexing_failed` and hand its provider
+    /// file to the attachment cleanup, in one transaction: the outbox handler
+    /// deletes the file with retries, so a failed delete does not leave it
+    /// behind. A row that changed meanwhile (deleted, owned by chat cleanup)
+    /// is left to whoever changed it.
+    async fn mark_failed(&self, reason: &str) {
+        // Provider text: redact provider ids, and log with Debug so control
+        // characters are escaped on the text console too.
+        let reason = crate::infra::llm::sanitize_provider_message(reason);
+        tracing::warn!(attachment_id = %self.attachment_id, reason = ?reason, "background indexing: failed");
+        let row = match self.db.conn() {
+            Ok(conn) => {
+                self.attachment_repo
+                    .get(&conn, &self.scope, self.attachment_id)
+                    .await
+            }
+            Err(e) => Err(DomainError::from(e)),
+        };
+        let row = match row {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!(attachment_id = %self.attachment_id, error = %e, "background indexing: load row failed");
+                return;
+            }
+        };
+        let event = crate::domain::repos::AttachmentCleanupEvent {
+            event_type: "attachment_indexing_failed".to_owned(),
+            tenant_id: row.tenant_id,
+            chat_id: row.chat_id,
+            attachment_id: row.id,
+            provider_file_id: Some(self.provider_file_id.clone()),
+            vector_store_id: None,
+            storage_backend: row.storage_backend.clone(),
+            attachment_kind: row.attachment_kind.to_string(),
+            deleted_at: time::OffsetDateTime::now_utc(),
+            secondary_ref: None,
+        };
+        self.fail_with_cleanup(event).await;
+    }
+
+    /// One transaction: CAS the row to `failed` and enqueue its cleanup.
+    async fn fail_with_cleanup(&self, event: crate::domain::repos::AttachmentCleanupEvent) {
+        let repo = Arc::clone(&self.attachment_repo);
+        let outbox = Arc::clone(&self.outbox_enqueuer);
+        let scope = self.scope.clone();
+        let id = self.attachment_id;
+        let result = self
+            .db
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let affected = repo
+                        .cas_fail_uploaded_for_cleanup(tx, &scope, id, "indexing_failed")
+                        .await
+                        .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
+                    if affected == 0 {
+                        return Ok(None);
+                    }
+                    let wake = outbox
+                        .enqueue_attachment_cleanup(tx, event)
+                        .await
+                        .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
+                    Ok(Some(wake))
+                })
+            })
+            .await;
+        match result {
+            Ok(Some(wake)) => wake.fire(),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(attachment_id = %self.attachment_id, error = %e, "background indexing: set failed failed");
+            }
+        }
+    }
+}
+
 /// Service handling file attachment operations.
 #[domain_model]
 pub struct AttachmentService<
@@ -186,6 +543,14 @@ pub struct AttachmentService<
     /// configured — the parallel upload is skipped silently in that case.
     anthropic_files_client:
         Option<Arc<crate::infra::llm::providers::anthropic_files_client::AnthropicFilesClient>>,
+    /// Indexing deadline measured from the upload start
+    /// ([`UPLOAD_INDEXING_DEADLINE`]).
+    indexing_deadline: std::time::Duration,
+    /// Limit of the background indexing wait ([`BACKGROUND_INDEXING_TIMEOUT`]).
+    background_indexing_timeout: std::time::Duration,
+    /// Stops background indexing waits on gear stop
+    /// ([`Self::stop_background_tasks`]).
+    background_shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl<
@@ -228,7 +593,28 @@ impl<
             thumbnail_config,
             metrics,
             anthropic_files_client,
+            indexing_deadline: UPLOAD_INDEXING_DEADLINE,
+            background_indexing_timeout: BACKGROUND_INDEXING_TIMEOUT,
+            background_shutdown: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_indexing_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.indexing_deadline = deadline;
+        self
+    }
+
+    /// Stop the background indexing waits (gear stop). Rows they leave
+    /// `uploaded` are finished by the upload reaper.
+    pub(crate) fn stop_background_tasks(&self) {
+        self.background_shutdown.cancel();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_background_indexing_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.background_indexing_timeout = timeout;
+        self
     }
 
     /// Resolve the effective upload size limits for a chat.
@@ -237,8 +623,10 @@ impl<
     /// `min(ConfigMap, CCM per-model)` for each kind. Returns an
     /// `UploadContext` that `upload_file` can reuse (no double-authz).
     ///
-    /// Falls back to ConfigMap-only limits if model resolution fails
-    /// (e.g., CCM snapshot unavailable).
+    /// Fails when the chat's model cannot be resolved: `InvalidModel` if it
+    /// left the catalog (same as the stream path), the resolver's error
+    /// otherwise. Without the model there is no provider to store the file
+    /// with.
     pub(crate) async fn get_upload_context(
         &self,
         ctx: &SecurityContext,
@@ -260,24 +648,22 @@ impl<
             .chat_repo
             .get(&conn, &chat_scope, chat_id)
             .await?
-            .ok_or_else(|| DomainError::not_found("Chat", chat_id))?;
+            .ok_or_else(|| DomainError::not_found(NotFoundEntity::Chat, chat_id))?;
 
         // ConfigMap ceiling (always available).
         let config_file_bytes = u64::from(self.rag_config.uploaded_file_max_size_kb) * 1024;
         let config_image_bytes = u64::from(self.rag_config.uploaded_image_max_size_kb) * 1024;
 
-        // CCM per-model limit (best-effort — fall back to ConfigMap on failure).
         let (provider_id, storage_backend, ccm_bytes, model_supports_ci, anthropic_upload) =
-            self.resolve_model_limits(ctx, chat_id, chat.model).await;
+            self.resolve_model_limits(ctx, chat_id, chat.model).await?;
 
         let code_interpreter_status = self
             .resolve_ci_status(ctx, chat_id, model_supports_ci)
             .await;
 
         let limits = UploadLimits {
-            max_file_bytes: ccm_bytes.map_or(config_file_bytes, |ccm| config_file_bytes.min(ccm)),
-            max_image_bytes: ccm_bytes
-                .map_or(config_image_bytes, |ccm| config_image_bytes.min(ccm)),
+            max_file_bytes: config_file_bytes.min(ccm_bytes),
+            max_image_bytes: config_image_bytes.min(ccm_bytes),
         };
 
         Ok(UploadContext {
@@ -292,22 +678,16 @@ impl<
     }
 
     /// Resolve provider, storage backend, per-model byte limit, and CI support
-    /// from the model catalog. Falls back to ConfigMap-only on transient failure.
+    /// from the model catalog.
     async fn resolve_model_limits(
         &self,
         ctx: &SecurityContext,
         chat_id: Uuid,
         model: String,
-    ) -> (
-        String,
-        String,
-        Option<u64>,
-        Option<bool>,
-        Option<AnthropicUploadInfo>,
-    ) {
+    ) -> Result<(String, String, u64, bool, Option<AnthropicUploadInfo>), DomainError> {
         match self
             .model_resolver
-            .resolve_model(ctx.subject_id(), Some(model))
+            .resolve_chat_model(ctx.subject_id(), &model)
             .await
         {
             Ok(resolved) => {
@@ -326,7 +706,7 @@ impl<
                     .provider_resolver
                     .resolve_storage_backend(&storage_provider_id);
                 let ccm = u64::from(resolved.max_file_size_mb) * 1_048_576;
-                let ci = Some(resolved.tool_support.code_interpreter);
+                let ci = resolved.tool_support.code_interpreter;
 
                 // §8.0: when the chat's LLM provider is Anthropic, the upload
                 // path performs a second parallel upload to Anthropic's Files
@@ -346,25 +726,16 @@ impl<
                     None
                 };
 
-                (
-                    storage_provider_id,
-                    backend,
-                    Some(ccm),
-                    ci,
-                    anthropic_upload,
-                )
+                Ok((storage_provider_id, backend, ccm, ci, anthropic_upload))
             }
             Err(e) => {
                 tracing::warn!(
                     chat_id = %chat_id,
+                    model = %model,
                     error = %e,
-                    "model resolution failed for upload limits; using ConfigMap only"
+                    "model resolution failed for upload; rejecting"
                 );
-                let fallback_provider = "openai".to_owned();
-                let backend = self
-                    .provider_resolver
-                    .resolve_storage_backend(&fallback_provider);
-                (fallback_provider, backend, None, None, None)
+                Err(e)
             }
         }
     }
@@ -375,7 +746,7 @@ impl<
         &self,
         ctx: &SecurityContext,
         chat_id: Uuid,
-        model_supports_ci: Option<bool>,
+        model_supports_ci: bool,
     ) -> CodeInterpreterStatus {
         let disable = match self
             .model_resolver
@@ -393,10 +764,10 @@ impl<
             }
         };
 
-        match model_supports_ci {
-            None => CodeInterpreterStatus::Unknown,
-            Some(true) if !disable => CodeInterpreterStatus::Allowed,
-            _ => CodeInterpreterStatus::Denied,
+        if model_supports_ci && !disable {
+            CodeInterpreterStatus::Allowed
+        } else {
+            CodeInterpreterStatus::Denied
         }
     }
 
@@ -426,7 +797,7 @@ impl<
         self.chat_repo
             .get(&conn, &chat_scope, chat_id)
             .await?
-            .ok_or_else(|| DomainError::not_found("Chat", chat_id))?;
+            .ok_or_else(|| DomainError::not_found(NotFoundEntity::Chat, chat_id))?;
 
         // Attachment entity is no_owner — use tenant-only scope.
         let att_scope = scope.tenant_only();
@@ -434,16 +805,21 @@ impl<
             .attachment_repo
             .get(&conn, &att_scope, attachment_id)
             .await?
-            .ok_or_else(|| DomainError::not_found("Attachment", attachment_id))?;
+            .ok_or_else(|| DomainError::attachment_not_found(attachment_id))?;
 
         // Chat-scoped access: attachment must belong to the requested chat
         if row.chat_id != chat_id {
-            return Err(DomainError::not_found("Attachment", attachment_id));
+            return Err(DomainError::attachment_not_found(attachment_id));
         }
 
         // Handler-level 404 for soft-deleted
         if row.deleted_at.is_some() {
-            return Err(DomainError::not_found("Attachment", attachment_id));
+            return Err(DomainError::attachment_not_found(attachment_id));
+        }
+
+        // Another user's upload is invisible, as on DELETE.
+        if row.uploaded_by_user_id != ctx.subject_id() {
+            return Err(DomainError::attachment_not_found(attachment_id));
         }
 
         Ok(row)
@@ -481,11 +857,11 @@ impl<
             .chat_repo
             .get(conn, chat_scope, chat_id)
             .await?
-            .ok_or_else(|| DomainError::not_found("Chat", chat_id))?;
+            .ok_or_else(|| DomainError::not_found(NotFoundEntity::Chat, chat_id))?;
 
         let resolved = match self
             .model_resolver
-            .resolve_model(ctx.subject_id(), Some(chat_row.model.clone()))
+            .resolve_chat_model(ctx.subject_id(), &chat_row.model)
             .await
         {
             Ok(r) => r,
@@ -545,7 +921,7 @@ impl<
         self.chat_repo
             .get(&conn, &chat_scope, chat_id)
             .await?
-            .ok_or_else(|| DomainError::not_found("Chat", chat_id))?;
+            .ok_or_else(|| DomainError::not_found(NotFoundEntity::Chat, chat_id))?;
 
         // Load row (including soft-deleted); attachment is no_owner → tenant scope.
         let att_scope = scope.tenant_only();
@@ -553,16 +929,18 @@ impl<
             .attachment_repo
             .get(&conn, &att_scope, attachment_id)
             .await?
-            .ok_or_else(|| DomainError::not_found("Attachment", attachment_id))?;
+            .ok_or_else(|| DomainError::attachment_not_found(attachment_id))?;
 
         // Chat-scoped access: attachment must belong to the requested chat
         if row.chat_id != chat_id {
-            return Err(DomainError::not_found("Attachment", attachment_id));
+            return Err(DomainError::attachment_not_found(attachment_id));
         }
 
-        // Ownership check (explicit since entity uses no_owner)
+        // Ownership check (explicit since entity uses no_owner). Masked as
+        // 404, like every other "not yours" path, so the caller cannot probe
+        // for attachment ids.
         if row.uploaded_by_user_id != ctx.subject_id() {
-            return Err(DomainError::Forbidden);
+            return Err(DomainError::attachment_not_found(attachment_id));
         }
 
         // Idempotent: already deleted → 204
@@ -664,6 +1042,10 @@ impl<
     /// Loser path (unique violation on INSERT): poll `find_by_chat` with
     /// exponential backoff until `vector_store_id` is populated.
     /// Timeout after 5 polls → 503.
+    #[allow(
+        clippy::cognitive_complexity,
+        reason = "the winner/loser/reclaim protocol reads best as one function"
+    )]
     pub(crate) async fn get_or_create_vector_store(
         &self,
         ctx: SecurityContext,
@@ -680,24 +1062,11 @@ impl<
             .vector_store_repo
             .find_by_chat(&conn, scope, chat_id)
             .await?
+            && let Some(vs_id) = self
+                .use_existing_vector_store(&conn, scope, chat_id, row, &expected_backend)
+                .await?
         {
-            // Provider consistency: reject if existing VS was created for a
-            // different provider than the current upload's resolved provider.
-            if row.provider != expected_backend {
-                return Err(DomainError::conflict(
-                    "provider_mismatch",
-                    format!(
-                        "vector store provider mismatch: existing='{}', current='{expected_backend}'",
-                        row.provider
-                    ),
-                ));
-            }
-            if let Some(vs_id) = row.vector_store_id {
-                return Ok(vs_id);
-            }
-            // Row exists but vector_store_id is NULL → creation in progress.
-            // Fall through to loser polling path.
-            return self.poll_vector_store(scope, chat_id).await;
+            return Ok(vs_id);
         }
 
         // Try to become the winner: insert a placeholder row.
@@ -722,7 +1091,7 @@ impl<
                 // Create vector store via provider trait.
                 let vs_id = match self
                     .vector_store
-                    .create_vector_store(ctx, provider_id)
+                    .create_vector_store(ctx.clone(), provider_id)
                     .await
                 {
                     Ok(id) => id,
@@ -744,12 +1113,22 @@ impl<
                     .await?;
 
                 if affected == 0 {
-                    // Should not happen — we inserted the row and no one else
-                    // can CAS it. Log and return the ID anyway.
+                    // Our placeholder was reclaimed as stale while the store
+                    // was being created, so no row references the new store.
+                    // Delete it and use whatever store the chat has now.
                     tracing::warn!(
                         row_id = %row_id,
-                        "CAS set vector_store_id returned 0 (unexpected)"
+                        chat_id = %chat_id,
+                        "vector store placeholder reclaimed during creation; deleting the new store"
                     );
+                    if let Err(e) = self
+                        .vector_store
+                        .delete_vector_store(ctx, provider_id, &vs_id)
+                        .await
+                    {
+                        tracing::warn!(chat_id = %chat_id, error = %e, "delete of the unreferenced vector store failed");
+                    }
+                    return self.poll_vector_store(scope, chat_id).await;
                 }
 
                 Ok(vs_id)
@@ -763,6 +1142,55 @@ impl<
                     .await
             }
         }
+    }
+
+    /// Resolves an existing `chat_vector_stores` row. Returns `None` when the
+    /// row was a stale placeholder that has been reclaimed, so the caller
+    /// creates a new vector store.
+    async fn use_existing_vector_store(
+        &self,
+        conn: &toolkit_db::DbConn<'_>,
+        scope: &AccessScope,
+        chat_id: Uuid,
+        row: crate::infra::db::entity::chat_vector_store::Model,
+        expected_backend: &str,
+    ) -> Result<Option<String>, DomainError> {
+        // Provider consistency: reject if existing VS was created for a
+        // different provider than the current upload's resolved provider.
+        if row.provider != expected_backend {
+            return Err(DomainError::conflict(
+                "provider_mismatch",
+                format!(
+                    "vector store provider mismatch: existing='{}', current='{expected_backend}'",
+                    row.provider
+                ),
+            ));
+        }
+        if let Some(vs_id) = row.vector_store_id {
+            return Ok(Some(vs_id));
+        }
+        let cutoff = time::OffsetDateTime::now_utc() - STALE_VECTOR_STORE_PLACEHOLDER;
+        if row.created_at > cutoff {
+            // Row exists but vector_store_id is NULL → creation in progress.
+            return self.poll_vector_store(scope, chat_id).await.map(Some);
+        }
+        // A NULL placeholder this old means its creator died between the
+        // insert and the CAS. Reclaim it, otherwise every later upload to
+        // this chat would poll and fail with 503. The delete is conditional:
+        // a slow creator may still set the ID, and then its row must stay.
+        let deleted = self
+            .vector_store_repo
+            .delete_stale_placeholder(conn, scope, row.id, cutoff)
+            .await?;
+        if deleted == 0 {
+            return self.poll_vector_store(scope, chat_id).await.map(Some);
+        }
+        tracing::warn!(
+            chat_id = %chat_id,
+            row_id = %row.id,
+            "reclaimed stale vector store placeholder"
+        );
+        Ok(None)
     }
 
     /// Defensive fallback for vector-store insert failures that may be
@@ -854,7 +1282,7 @@ impl<
             }
         };
 
-        // Keep polling only while the row exists but is still wake.
+        // Keep polling only while the row exists but is still pending.
         let still_pending = |e: &DomainError| matches!(e, DomainError::ProviderError { code, .. } if code.as_str() == "vector_store_timeout");
 
         RetryIf::start(strategy, poll, still_pending).await
@@ -863,7 +1291,7 @@ impl<
     /// Upload a file attachment to a chat.
     ///
     /// Flow: use pre-resolved `UploadContext` (from `get_upload_context`) ->
-    ///   TX(lock chat, check limits, insert wake) -> COMMIT ->
+    ///   TX(lock chat, check limits, insert pending) -> COMMIT ->
     ///   upload stream to provider via OAGW -> CAS `set_uploaded` (with exact size) ->
     ///   branch on kind:
     ///   - Document: vector store get-or-create + add file with attributes + CAS `set_ready`
@@ -894,9 +1322,22 @@ impl<
         use crate::domain::mime_validation::structured_filename;
         use crate::domain::repos::InsertAttachmentParams;
 
+        let indexing_deadline = tokio::time::Instant::now() + self.indexing_deadline;
         let tenant_id = ctx.subject_tenant_id();
         let user_id = ctx.subject_id();
         let is_document = attachment_kind == AttachmentKind::Document;
+
+        // The images kill switch rejects image uploads up front, before any
+        // provider or thumbnail work (the stream path rejects image inputs too).
+        if attachment_kind == AttachmentKind::Image
+            && self
+                .model_resolver
+                .get_kill_switches(user_id)
+                .await?
+                .disable_images
+        {
+            return Err(DomainError::ImagesDisabled);
+        }
 
         let scope = upload_ctx.scope;
         let provider_id = upload_ctx.provider_id;
@@ -914,16 +1355,9 @@ impl<
         // When CI is blocked, remove it from purposes rather than rejecting
         // outright — the attachment may still serve other purposes (e.g.
         // FileSearch). Only reject if no purposes remain after filtering.
-        // When CI status is Unknown (transient resolution failure), return 503
-        // so the client can retry rather than hard-rejecting the upload.
         let purposes = if purposes.contains(&AttachmentPurpose::CodeInterpreter)
             && upload_ctx.code_interpreter_status != CodeInterpreterStatus::Allowed
         {
-            if upload_ctx.code_interpreter_status == CodeInterpreterStatus::Unknown {
-                return Err(DomainError::service_unavailable(
-                    "Unable to determine code interpreter support; please retry",
-                ));
-            }
             let filtered: Vec<_> = purposes
                 .into_iter()
                 .filter(|p| *p != AttachmentPurpose::CodeInterpreter)
@@ -1012,7 +1446,7 @@ impl<
                         }
                     }
 
-                    // Insert wake row (size_bytes = hint or 0; exact set in set_uploaded)
+                    // Insert pending row (size_bytes = hint or 0; exact set in set_uploaded)
                     let row = attachment_repo
                         .insert(tx, &scope_tx, insert_params)
                         .await
@@ -1024,7 +1458,7 @@ impl<
             .await
             .map_err(unwrap_mutation_err)?;
 
-        // Metrics: attachment is now wake (in-flight to provider).
+        // Metrics: attachment is now pending (in-flight to provider).
         // PendingGuard ensures decrement on every exit path (Drop-based).
         let kind_metric = if is_document {
             kind_label::DOCUMENT
@@ -1090,14 +1524,15 @@ impl<
         {
             Ok(result) => result,
             Err(e) => {
-                // Size-limit error from the streaming adapter → FileTooLarge (413).
+                // Size-limit error from the streaming adapter → FileTooLarge
+                // (400 `FILE_TOO_LARGE`).
                 if let crate::domain::ports::FileStorageError::Rejected {
                     ref code,
                     ref message,
                 } = e
                     && code == "file_too_large"
                 {
-                    self.try_set_failed(&scope, attachment_id, "wake", "file_too_large")
+                    self.try_set_failed(&scope, attachment_id, "pending", "file_too_large")
                         .await;
                     self.metrics
                         .record_attachment_upload(kind_metric, upload_result::FILE_TOO_LARGE);
@@ -1105,8 +1540,8 @@ impl<
                         message: message.clone(),
                     });
                 }
-                // P1-13: upload failure → CAS set_failed from wake
-                self.try_set_failed(&scope, attachment_id, "wake", "upload_failed")
+                // P1-13: upload failure → CAS set_failed from pending
+                self.try_set_failed(&scope, attachment_id, "pending", "upload_failed")
                     .await;
                 self.metrics
                     .record_attachment_upload(kind_metric, upload_result::PROVIDER_ERROR);
@@ -1114,7 +1549,7 @@ impl<
             }
         };
 
-        // 4. CAS: wake → uploaded (with exact size from provider)
+        // 4. CAS: pending → uploaded (with exact size from provider)
         {
             use crate::domain::repos::SetUploadedParams;
             #[allow(clippy::cast_possible_wrap)]
@@ -1136,7 +1571,7 @@ impl<
                 // P1-14: Concurrent soft-delete — best-effort cleanup provider file
                 tracing::warn!(attachment_id = %attachment_id, "CAS set_uploaded returned 0 (concurrent delete?)");
                 self.spawn_delete_file(ctx.clone(), &provider_id, &provider_file_id);
-                return Err(DomainError::not_found("Attachment", attachment_id));
+                return Err(DomainError::attachment_not_found(attachment_id));
             }
 
             // 4b. Post-upload aggregate storage check.
@@ -1243,7 +1678,7 @@ impl<
                         tracing::warn!(
                             attachment_id = %attachment_id,
                             error = %e,
-                            "failed to persist secondary wake status; \
+                            "failed to persist secondary pending status; \
                              watchdog will have no in-flight signal"
                         );
                     }
@@ -1252,7 +1687,7 @@ impl<
                     tracing::warn!(
                         attachment_id = %attachment_id,
                         error = %e,
-                        "could not acquire DB connection for wake-status write; continuing"
+                        "could not acquire DB connection for pending-status write; continuing"
                     );
                 }
             }
@@ -1324,7 +1759,7 @@ impl<
                             attachment_id = %attachment_id,
                             error = %e,
                             "failed to persist Anthropic upload outcome; \
-                             row stays in wake (best-effort)"
+                             row stays in pending (best-effort)"
                         );
                     }
                 }
@@ -1333,7 +1768,7 @@ impl<
                         attachment_id = %attachment_id,
                         error = %e,
                         "could not acquire DB connection to record Anthropic upload outcome; \
-                         row stays in wake/not_attempted (best-effort)"
+                         row stays in pending/not_attempted (best-effort)"
                     );
                 }
             }
@@ -1363,13 +1798,13 @@ impl<
             };
 
             // Add file to vector store with attachment_id attribute
-            if let Err(e) = self
+            let added = self
                 .vector_store
                 .add_file_to_vector_store(
                     ctx.clone(),
                     &provider_id,
                     AddFileToVectorStoreParams {
-                        vector_store_id: vs_id,
+                        vector_store_id: vs_id.clone(),
                         provider_file_id: provider_file_id.clone(),
                         attributes: HashMap::from([(
                             "attachment_id".to_owned(),
@@ -1377,16 +1812,81 @@ impl<
                         )]),
                     },
                 )
-                .await
-            {
+                .await;
+            // P1-13: indexing failure → CAS set_failed from uploaded,
+            // best-effort delete provider file. `ready` only after the vector
+            // store reports the file `completed`, so file_search can find it.
+            let outcome = match added {
+                Err(e) => Err(DomainError::from(e)),
+                Ok(status) => Ok(wait_for_indexing(
+                    self.vector_store.as_ref(),
+                    ctx,
+                    indexing_deadline,
+                    INDEXING_POLL_MAX,
+                    (&provider_id, &vs_id, &provider_file_id),
+                    status,
+                    &mut None,
+                )
+                .await),
+            };
+            let failure = match outcome {
+                Ok(IndexingWait::Completed) => None,
+                Ok(IndexingWait::Pending) => {
+                    // Not indexed yet: answer `uploaded` and finish in the
+                    // background. The row becomes `ready` or `failed`.
+                    tokio::spawn(
+                        BackgroundIndexing {
+                            db: Arc::clone(&self.db),
+                            metrics: Arc::clone(&self.metrics),
+                            attachment_repo: Arc::clone(&self.attachment_repo),
+                            vector_store: Arc::clone(&self.vector_store),
+                            outbox_enqueuer: Arc::clone(&self.outbox_enqueuer),
+                            ctx: ctx.clone(),
+                            scope: scope.clone(),
+                            attachment_id,
+                            provider_id: provider_id.clone(),
+                            vector_store_id: vs_id.clone(),
+                            provider_file_id: provider_file_id.clone(),
+                            timeout: self.background_indexing_timeout,
+                            shutdown: self.background_shutdown.child_token(),
+                        }
+                        .run(),
+                    );
+                    self.metrics
+                        .record_attachment_upload(kind_metric, upload_result::OK);
+                    #[allow(clippy::cast_precision_loss)]
+                    self.metrics
+                        .record_attachment_upload_bytes(kind_metric, bytes_uploaded as f64);
+                    pending_guard.defuse();
+                    let conn = self.db.conn().map_err(DomainError::from)?;
+                    return self
+                        .attachment_repo
+                        .get(&conn, &scope, attachment_id)
+                        .await?
+                        .ok_or_else(|| DomainError::attachment_not_found(attachment_id));
+                }
+                Ok(IndexingWait::Failed(reason)) => {
+                    tracing::warn!(
+                        attachment_id = %attachment_id,
+                        reason = ?crate::infra::llm::sanitize_provider_message(&reason),
+                        "vector store indexing failed"
+                    );
+                    Some(DomainError::from(FileStorageError::Rejected {
+                        code: "indexing_failed".to_owned(),
+                        message: "vector store indexing failed".to_owned(),
+                    }))
+                }
+                Err(e) => Some(e),
+            };
+            if let Some(e) = failure {
                 // P1-13: indexing failure → CAS set_failed from uploaded,
-                // best-effort delete provider file
+                // best-effort delete provider file.
                 self.try_set_failed(&scope, attachment_id, "uploaded", "indexing_failed")
                     .await;
                 self.spawn_delete_file(ctx.clone(), &provider_id, &provider_file_id);
                 self.metrics
                     .record_attachment_upload(kind_metric, upload_result::PROVIDER_ERROR);
-                return Err(DomainError::from(e));
+                return Err(e);
             }
         }
 
@@ -1450,7 +1950,7 @@ impl<
                 if let Some((alias, file_id)) = secondary_cleanup.take() {
                     self.spawn_delete_secondary_file(ctx.clone(), alias, file_id);
                 }
-                return Err(DomainError::not_found("Attachment", attachment_id));
+                return Err(DomainError::attachment_not_found(attachment_id));
             }
         }
 
@@ -1467,7 +1967,7 @@ impl<
         self.attachment_repo
             .get(&conn, &scope, attachment_id)
             .await?
-            .ok_or_else(|| DomainError::not_found("Attachment", attachment_id))
+            .ok_or_else(|| DomainError::attachment_not_found(attachment_id))
     }
 
     /// Best-effort CAS `set_failed` — log on failure, never propagate.
@@ -1538,5 +2038,6 @@ impl<
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "attachment_service_test.rs"]
 mod tests;

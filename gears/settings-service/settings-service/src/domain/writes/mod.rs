@@ -9,7 +9,9 @@ use serde_json::Value;
 use crate::domain::precondition::ETag;
 use crate::domain::value::StoredValue;
 
-pub use service::{Change, Committed, Gated, StagePrecondition, Staged, ValueWriter, WriteActor};
+pub use service::{
+    Change, Committed, Gated, ImpactPage, StagePrecondition, Staged, ValueWriter, WriteActor,
+};
 
 /// The tag of a scope that holds no row yet.
 pub const ABSENT_VALUE_TAG: &str = "absent";

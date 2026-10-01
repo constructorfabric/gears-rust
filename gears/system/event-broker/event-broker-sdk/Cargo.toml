@@ -29,7 +29,6 @@ integration = []
 # `cf-evctl` binary. Off by default so a plain SDK build pulls in no HTTP or
 # wire dependencies (base-trait purity, docs/arch/toolkit-contract-binding).
 rest-client = [
-    "dep:reqwest",
     "dep:toolkit-http",
     "dep:bytes",
     "dep:serde_html_form",
@@ -37,7 +36,6 @@ rest-client = [
     "dep:clap",
     "dep:secrecy",
     "dep:http-body-util",
-    "dep:http-body",
     "dep:tracing-subscriber",
     "dep:rusqlite",
 ]
@@ -60,7 +58,6 @@ toolkit-canonical-errors = { workspace = true }
 toolkit-stable-hash = { workspace = true }
 jsonschema = { workspace = true }
 
-gts-id = { workspace = true }
 gts = { workspace = true }
 toolkit-gts = { workspace = true }
 # `Iso8601Duration` for the retention trait and its DTO: a validated duration
@@ -75,7 +72,6 @@ toolkit-db = { workspace = true, optional = true }
 sea-orm = { workspace = true, optional = true }
 
 # --- REST transport (feature = "rest-client") -------------------------------
-reqwest = { workspace = true, optional = true }
 toolkit-http = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 serde_html_form = { workspace = true, optional = true }
@@ -83,7 +79,6 @@ clap = { workspace = true, optional = true }
 secrecy = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
-http-body = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
 [[bin]]

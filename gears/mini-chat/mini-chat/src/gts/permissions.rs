@@ -222,6 +222,7 @@ gts_instance! {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
         CHAT_RESOURCE_TYPE_WILDCARD, MODEL_RESOURCE_TYPE_WILDCARD,

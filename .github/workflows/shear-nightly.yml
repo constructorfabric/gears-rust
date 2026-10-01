@@ -42,7 +42,7 @@ env:
   # passed through to `make shear` below so the toolchain this job installs and
   # caches is provably the one that compiles. The Makefile's RUST_NIGHTLY
   # default only covers local runs.
-  RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-04-16
+  RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-08-21
   # Notified in the issue body when the nightly fails. A username or team;
   # empty still files the issue, but nothing would actively alert anyone.
   SHEAR_ISSUE_MENTION: '@MikeFalcon77'
@@ -72,12 +72,12 @@ jobs:
           swap-storage: true
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 
@@ -112,7 +112,7 @@ jobs:
       # Keep this version in sync with SHEAR_VERSION in the Makefile, so a local
       # `make shear` and this job reach the same verdict.
       - name: Install cargo-shear
-        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-shear@1.13.1
 

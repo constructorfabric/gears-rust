@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -47,6 +48,9 @@ pub trait ProcessorFactory: Send {
 fn build_processor_worker<S: super::strategy::ProcessingStrategy + 'static>(
     ctx: &SpawnContext,
     strategy: S,
+    // What the strategy still does after it stops its handler at shutdown
+    // (an ack or a rollback); the worker's own backstop waits this much longer.
+    wind_down: Duration,
 ) -> (String, Pin<Box<dyn Future<Output = ()> + Send>>) {
     let processor = PartitionProcessor::new(
         strategy,
@@ -59,6 +63,7 @@ fn build_processor_worker<S: super::strategy::ProcessingStrategy + 'static>(
     let (poker_notify, _poker_handle) =
         super::taskward::poker(ctx.tuning.idle_interval, ctx.cancel.clone());
     let mut builder = WorkerBuilder::<ProcessorReport>::new(&name, ctx.cancel.clone())
+        .stop_grace(ctx.tuning.stop_grace.saturating_add(wind_down))
         .pacing(&ctx.tuning)
         .notifier(poker_notify)
         .notifier(Arc::clone(&ctx.partition_notify))
@@ -146,8 +151,10 @@ impl QueueBuilder {
     /// Register a leased handler.
     ///
     /// Accepts any `LeasedHandler` (batch) or `LeasedMessageHandler` (per-message,
-    /// via blanket impl). The framework enforces lease-aware cancellation by
-    /// dropping the handler future - no `CancellationToken` is passed.
+    /// via blanket impl). No `CancellationToken` is passed: the handler checks
+    /// `Batch::should_stop()` between messages, and the framework drops the
+    /// handler future at the lease cancel point or `WorkerTuning::stop_grace`
+    /// after shutdown, whichever comes first.
     ///
     /// Chain `.lease(LeaseConfig { .. })` after this to customize lease duration
     /// and ack headroom. Defaults: 30s duration, 2s headroom.
@@ -224,7 +231,7 @@ impl<H: TransactionalHandler + 'static> ProcessorFactory for TransactionalProces
         let strategy = TransactionalStrategy::new(Box::new(ArcTransactionalHandler(Arc::clone(
             &self.handler,
         ))));
-        build_processor_worker(&ctx, strategy)
+        build_processor_worker(&ctx, strategy, super::strategy::ROLLBACK_ALLOWANCE)
     }
 }
 
@@ -258,7 +265,7 @@ impl ProcessorFactory for LeasedProcessorFactory {
         ctx.tuning.lease_duration = self.lease_config.duration;
         let worker_id = generate_worker_id(&self.queue_name);
         let strategy = LeasedStrategy::new(Arc::clone(&self.handler), worker_id, self.lease_config);
-        build_processor_worker(&ctx, strategy)
+        build_processor_worker(&ctx, strategy, self.lease_config.headroom)
     }
 }
 

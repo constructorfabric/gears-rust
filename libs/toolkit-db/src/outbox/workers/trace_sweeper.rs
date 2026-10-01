@@ -67,7 +67,7 @@ impl TraceSweeper {
     /// one table. A trace still working has `pending > 0` and is held by the
     /// last rule until it has made no progress for `leftover_after`; the
     /// messages themselves are never touched by this sweep.
-    pub(super) async fn sweep(&self) -> Result<usize, OutboxError> {
+    pub(super) async fn sweep(&self, cancel: &CancellationToken) -> Result<usize, OutboxError> {
         let store = OutboxStore::new(&self.statements);
         let conn = self.db.sea_internal();
 
@@ -94,7 +94,8 @@ impl TraceSweeper {
             ))
             .await?;
 
-        if rows.is_empty() {
+        // Collecting is idempotent: rows left at shutdown are found again.
+        if rows.is_empty() || cancel.is_cancelled() {
             return Ok(0);
         }
 
@@ -120,11 +121,8 @@ impl WorkerAction for TraceSweeper {
     type Payload = u64;
     type Error = OutboxError;
 
-    async fn execute(
-        &mut self,
-        _cancel: &CancellationToken,
-    ) -> Result<Directive<u64>, Self::Error> {
-        match self.sweep().await {
+    async fn execute(&mut self, cancel: &CancellationToken) -> Result<Directive<u64>, Self::Error> {
+        match self.sweep(cancel).await {
             Ok(count) => {
                 let collected = u64::try_from(count).unwrap_or(u64::MAX);
                 // A full page suggests more is waiting, so keep going rather

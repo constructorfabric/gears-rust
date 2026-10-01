@@ -1,13 +1,10 @@
-// Called from QuotaService which is not yet wired into the turn handler.
-// Remove `dead_code` allows once QuotaService is live.
-
 use toolkit_macros::domain_model;
 
 use crate::config::EstimationBudgets;
 
 /// Input to the token estimation function.
 #[domain_model]
-#[allow(dead_code, clippy::struct_excessive_bools)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct EstimationInput {
     pub utf8_bytes: u64,
     pub num_images: u32,
@@ -18,7 +15,6 @@ pub struct EstimationInput {
 
 /// Result of token estimation.
 #[domain_model]
-#[allow(dead_code)]
 pub struct EstimationResult {
     pub estimated_input_tokens: u64,
 }
@@ -26,10 +22,11 @@ pub struct EstimationResult {
 /// Estimate input tokens and reserve from request metadata.
 ///
 /// Pure function — no I/O. Uses the estimation budgets from `ConfigMap`.
-#[allow(dead_code)]
 pub fn estimate_tokens(input: &EstimationInput, budgets: &EstimationBudgets) -> EstimationResult {
     // Step 1: text tokens from byte count
-    let bpt = u64::from(budgets.bytes_per_token_conservative);
+    // The bundled static plugin rejects a zero ratio; other policy plugins may
+    // not, so guard against it here.
+    let bpt = u64::from(budgets.bytes_per_token_conservative.max(1));
     let base_text_tokens = if input.utf8_bytes == 0 {
         u64::from(budgets.fixed_overhead_tokens)
     } else {
@@ -76,6 +73,7 @@ pub fn estimate_tokens(input: &EstimationInput, budgets: &EstimationBudgets) -> 
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -90,6 +88,31 @@ mod tests {
             code_interpreter_surcharge_tokens: 1000,
             minimal_generation_floor: 50,
         }
+    }
+
+    /// A zero `bytes_per_token_conservative` (accepted as a deprecated config
+    /// value) is treated as 1 instead of dividing by zero.
+    #[test]
+    fn zero_bytes_per_token_is_treated_as_one() {
+        let input = EstimationInput {
+            utf8_bytes: 40,
+            num_images: 0,
+            tools_enabled: false,
+            web_search_enabled: false,
+            code_interpreter_enabled: false,
+        };
+        let zero = EstimationBudgets {
+            bytes_per_token_conservative: 0,
+            ..default_budgets()
+        };
+        let one = EstimationBudgets {
+            bytes_per_token_conservative: 1,
+            ..default_budgets()
+        };
+        assert_eq!(
+            estimate_tokens(&input, &zero).estimated_input_tokens,
+            estimate_tokens(&input, &one).estimated_input_tokens
+        );
     }
 
     #[test]
