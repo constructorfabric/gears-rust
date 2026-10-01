@@ -311,7 +311,7 @@ Realises `cpt-cf-quota-enforcement-seq-lease-auto-release`.
 2. [ ] - `p1` - The elected replica runs the tick loop on the child `CancellationToken` it received; the resolved
    cluster backend renews the claim; on leadership loss the token is cancelled, the loop stops before its next batch,
    and the replica is a follower again until re-election, which is automatic - `inst-swp-lost`
-3. [ ] - `p1` - DB: `reclaim_expired_leases(batch_size, before = now())`; **FOR EACH** batch, one transaction:
+3. [ ] - `p1` - DB: `reclaim_expired_leases(batch_size, before = now())`; **FOR EACH** batch, repeated until a batch comes back short, one transaction:
    transition every lease with `expiry_at <= now() AND state = 'active'` to `AutoReleased`, decrement the
    active-lease counter per row, return each hold's `held_amount` to its acquisition period's counter (I5), and
    enqueue exactly one `lease-auto-released` event per lease, carrying the lease ID, owning subject context, held
@@ -319,7 +319,7 @@ Realises `cpt-cf-quota-enforcement-seq-lease-auto-release`.
 4. [ ] - `p1` - The sweeper is the canonical emission point for `lease-auto-released`: emission is deterministic with
    respect to the expiry timestamp, and under sweeper outage the events are deferred until reclamation while the
    semantic tier keeps accounting correct - `inst-swp-emit`
-5. [ ] - `p1` - Physical reclamation completes within an operator-configurable interval after expiry (default 1 hour);
+5. [ ] - `p1` - Physical reclamation completes within 1 hour of expiry: every tick drains the whole backlog, so reclamation normally lags expiry by one tick plus the drain time, and the knobs are the tick interval and the batch size;
    the sweeper **MAY** delete lease rows after a grace period per operator configuration - `inst-swp-interval`
 6. [ ] - `p1` - Emit the `lease_unreclaimed_expired` gauge for the count of expired-but-unreclaimed leases by canonical
    registered `metric`, so operators can detect and localize sweeper outages - `inst-swp-gauge`
@@ -471,11 +471,9 @@ lifecycle event of the reclamation tier; the gateway never checks sweeper state 
 
 The system **MUST** deliver `LeaseSweeper` (`cpt-cf-quota-enforcement-component-lease-sweeper`) as a single-leader
 background task (default tick 60 s) under the `lease-sweeper` cluster election (`SingletonScope::LeaseSweeper`)
-through the foundation coordination adapter, consuming its run-while-leader semantics without re-specifying them. Each cycle invokes `reclaim_expired_leases` in operator-configurable batches
-(P1 reference default 1000): per batch one transaction transitions expired `Active` leases to `AutoReleased`, returns
+through the foundation coordination adapter, consuming its run-while-leader semantics without re-specifying them. Each cycle invokes `reclaim_expired_leases` in operator-configurable batches (P1 reference default 1000) until a batch comes back short: per batch one transaction transitions expired `Active` leases to `AutoReleased`, returns
 held capacity to acquisition-period counters, decrements `lease_capacity_counters`, and enqueues exactly one
-`lease-auto-released` event per lease same-tx (I11). Reclamation **MUST** complete within the operator-configured
-interval after expiry (default 1 hour); rows **MAY** be deleted after a grace period. The sweeper **MUST** surface
+`lease-auto-released` event per lease same-tx (I11). Reclamation **MUST** complete within 1 hour of expiry, and a rising `lease_unreclaimed_expired` gauge signals a sweeper that cannot keep up; rows **MAY** be deleted after a grace period. The sweeper **MUST** surface
 the `lease_unreclaimed_expired` gauge by canonical registered `metric`. Sweeper liveness **MUST NOT** gate correctness. The
 sweeper **MUST** run as a lifecycle-managed background task per the ToolKit lifecycle model: it receives a child
 `CancellationToken`, its tick and batch loop are cancellation-aware, and on graceful shutdown it stops
@@ -548,8 +546,7 @@ election TTL plus observation lag. No promise beyond the PRD threshold is added.
   the expired lease fails with `LEASE_NOT_ACTIVE`; the `lease_unreclaimed_expired` gauge reports the backlog by
   canonical registered `metric`; after the sweeper resumes, rows transition to `AutoReleased` and the deferred
   `lease-auto-released` events are enqueued
-- [ ] The sweeper reclaims expired lease rows within the operator-configured interval after expiry (default at most
-  1 hour) and enqueues exactly one `lease-auto-released` event per lease, carrying the lease ID, owning subject
+- [ ] The sweeper reclaims expired lease rows within 1 hour of expiry and enqueues exactly one `lease-auto-released` event per lease, carrying the lease ID, owning subject
   context, held amount, affected Quotas, and expiry timestamp, in the same transaction as the state transition
 - [ ] One `LeaseSweeper` leader runs at a time across replicas in steady state; killing the leader makes a survivor
   the leader of `SingletonScope::LeaseSweeper` within one election TTL plus observation lag, and the survivor resumes

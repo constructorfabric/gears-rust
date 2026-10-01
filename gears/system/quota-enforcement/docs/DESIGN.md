@@ -811,9 +811,7 @@ outbox. Optionally deletes lease rows after a grace period.
 
 Single-leader execution under the `lease-sweeper` election (`SingletonScope::LeaseSweeper`) through the
 `CoordinationAdapter`: the sweep loop starts when this replica is elected and receives a child cancellation token, the
-resolved cluster backend renews the claim, and the loop stops when leadership is lost; re-election is automatic. Batch
-size
-operator-configurable (P1 reference default: 1000 expired leases per cycle). Surface `lease_unreclaimed_expired` gauge
+resolved cluster backend renews the claim, and the loop stops when leadership is lost; re-election is automatic. Each tick reclaims expired leases in batches of an operator-configurable size (P1 reference default 1000 per transaction) and repeats until a batch comes back short, so the whole backlog drains every tick. Surface `lease_unreclaimed_expired` gauge
 by canonical registered `metric`.
 
 ##### Responsibility boundaries

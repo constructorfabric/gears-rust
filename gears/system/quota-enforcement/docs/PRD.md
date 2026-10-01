@@ -1474,7 +1474,7 @@ tiers**, deliberately separated so that correctness never depends on a backgroun
 
 1. **Physical reclamation (eventual, storage hygiene).** A background sweeper **MUST** be deployed to perform physical
    cleanup of expired lease rows — deletion, or operator-defined archival to a long-term store. Reclamation **MUST**
-   complete within an operator-configurable interval after expiry (default: 1 hour). The sweeper is also the canonical
+   complete within 1 hour of expiry. The sweeper is also the canonical
    emission point for the `lease-auto-released` notification event: exactly one event per lease, carrying the lease ID,
    owning subject context, held amount, affected Quotas, and expiry timestamp.
 
@@ -2575,7 +2575,7 @@ such fields before forwarding (e.g., pass `session_id_hash` rather than `session
 | Quotas (deactivated)                          | Retained indefinitely for read access in P1; no automatic purge. P2 may introduce a configurable grace-period auto-purge tied to audit infrastructure (see §13)                                                                                      | P2 candidate for auto-purge                                                     |
 | Counters for consumption-type Quotas          | Active period plus operator-configurable historical window (default: 13 months) sufficient for year-over-year reporting                                                                                                                              | Background sweeper, period-rollover-aware                                       |
 | Leases (active and committed/released)        | Active leases live until commit, release, or TTL expiry (lazy expiry per `cpt-cf-quota-enforcement-fr-lease-timeout`). Resolved leases (committed, released, or auto-released) are retained as ledger entries for the operation-log retention window | Background sweeper                                                              |
-| Leases (expired but unreclaimed rows)         | Physically reclaimed within an operator-configurable interval after expiry (default: 1 hour) — see `cpt-cf-quota-enforcement-fr-lease-timeout`                                                                                                       | Background sweeper; correctness independent of sweeper liveness (lazy semantic) |
+| Leases (expired but unreclaimed rows)         | Physically reclaimed within 1 hour of expiry — see `cpt-cf-quota-enforcement-fr-lease-timeout`                                                                                                       | Background sweeper; correctness independent of sweeper liveness (lazy semantic) |
 | Idempotency records                           | Operator-configurable per-`(tenant, metric)` retention (default: 24 hours) sufficient to bound legitimate retry windows                                                                                                                              | Background sweeper                                                              |
 | Operation log                                 | Operator-configurable (default: 30 days)                                                                                                                                                                                                             | Background sweeper                                                              |
 | Notification dispatch records (best-effort)   | Operator-configurable retention for delivery-failure diagnostics (default: 7 days); records older than the window are reclaimed                                                                                                                      | Background sweeper (shared with idempotency cleanup)                            |
@@ -3147,8 +3147,7 @@ on behalf of a tenant administrator)
   regardless of operation kind (debit, credit, rollback, reserve, commit, release, batch_debit)
 - [ ] Idempotency replay returns the original Decision (including `debit_plan`); client-submitted Decision-shaped fields
   in a replay payload are silently ignored per the trust-boundary discipline (§3.4)
-- [ ] Lease rows are physically reclaimed by the sweeper within the operator-configured interval after expiry ( default:
-  ≤ 1 hour); telemetry surfaces unreclaimed-expired-lease count by canonical registered `metric`; sweeper outage does
+- [ ] Lease rows are physically reclaimed by the sweeper within 1 hour of expiry; telemetry surfaces unreclaimed-expired-lease count by canonical registered `metric`; sweeper outage does
   not affect correctness (lazy expiry semantic)
 - [ ] Per-`(tenant, metric)` active-lease cap (default: 1000) is enforced at acquisition time; requests exceeding the
   cap are rejected with `LEASE_INFLIGHT_LIMIT_EXCEEDED`; expired leases do not count toward the cap
