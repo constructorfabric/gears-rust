@@ -21,6 +21,7 @@ from .conftest import (
     TOPIC_STREAM,
     TOPIC_LONGPOLL,
     TOPIC_STRICT,
+    TRACE_ID,
 )
 
 
@@ -78,7 +79,7 @@ async def test_batch_mixing_topics_rejected_400(api):
         "status": 400,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -102,7 +103,7 @@ async def test_batch_too_large_rejected_413(api):
         "status": 413,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -135,7 +136,7 @@ async def test_batch_late_validation_failure_rejected_422(api):
         "status": 422,
         "detail": body["detail"],
         "instance": f"{API_BASE}/events:batch",
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "field_violations": [
                 {

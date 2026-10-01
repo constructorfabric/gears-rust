@@ -18,7 +18,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from .conftest import API_BASE, EVENT_TYPE_STREAM, SUBJECT_TYPE, TOPIC_STREAM
+from .conftest import API_BASE, EVENT_TYPE_STREAM, SUBJECT_TYPE, TOPIC_STREAM, TRACE_ID
 
 
 def _now() -> str:
@@ -203,7 +203,7 @@ async def test_chained_sequence_violation_returns_412(api):
         "status": 412,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "violations": [
                 {
@@ -338,7 +338,7 @@ async def test_unknown_producer_returns_404(api):
         "status": 404,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.producer.v1~",
             "resource_name": fake_producer_id,
@@ -403,7 +403,7 @@ async def test_chained_producer_desync_recovery(api):
             "status": 412,
             "detail": stale_body["detail"],
             "instance": stale_body["instance"],
-            "trace_id": stale_body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "violations": [
                     {
@@ -583,7 +583,7 @@ async def test_monotonic_publish_with_previous_rejected_400(api):
             "status": 400,
             "detail": "Request validation failed",
             "instance": f"{API_BASE}/events",
-            "trace_id": body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "field_violations": [
                     {

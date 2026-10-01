@@ -67,6 +67,7 @@ members = [
     "libs/toolkit-gts",
     "libs/toolkit-gts-macros",
     "libs/toolkit-http",
+    "libs/toolkit-trace-context",
     "libs/toolkit-http-middleware",
     "libs/toolkit-gateway",
     "libs/toolkit-k8s-auth",
@@ -146,6 +147,7 @@ members = [
     "gears/system/usage-collector/usage-collector",
     "gears/system/usage-collector/plugins/noop-usage-collector-plugin",
     "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin",
+    "gears/system/usage-collector/plugins/clickhouse-usage-collector-plugin",
     "gears/system/quota-enforcement/quota-enforcement-sdk",
     "gears/system/quota-enforcement/quota-enforcement",
     "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin",
@@ -314,6 +316,7 @@ quota-enforcement-engine-cel = { package = "cf-gears-quota-enforcement-engine-ce
 # libs
 toolkit = { package = "cf-gears-toolkit", version = "0.10.0", path = "libs/toolkit" }
 toolkit-http = { package = "cf-gears-toolkit-http", version = "0.6.18", path = "libs/toolkit-http" }
+toolkit-trace-context = { package = "cf-gears-toolkit-trace-context", version = "0.1.0", path = "libs/toolkit-trace-context" }
 toolkit-http-middleware = { package = "cf-gears-toolkit-http-middleware", version = "0.3.2", path = "libs/toolkit-http-middleware" }
 toolkit-gateway = { package = "cf-gears-toolkit-gateway", version = "0.2.8", path = "libs/toolkit-gateway" }
 toolkit-k8s-auth = { package = "cf-gears-toolkit-k8s-auth", version = "0.3.0", path = "libs/toolkit-k8s-auth" }
@@ -671,6 +674,16 @@ fred = { version = "10.1", default-features = false, features = [
     "enable-rustls",
     "partial-tracing",
 ] }
+
+# ClickHouse async client (official crate, HTTP-based, rustls TLS).
+# Used by the clickhouse-usage-collector-plugin (DESIGN.md §3.5).
+clickhouse = { version = "0.15", features = ["rustls-tls"] }
+# `#[repr(i8)]` (de)serialization for ClickHouse Enum8 columns -- the
+# `clickhouse` crate's RowBinaryWithNamesAndTypes schema validation requires
+# Enum8/Enum16 columns to (de)serialize as their underlying integer
+# discriminant, not as a string (see clickhouse crate README "Enum(8|16)").
+# Used by the clickhouse-usage-collector-plugin (DESIGN.md §3.5).
+serde_repr = "0.1"
 
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 

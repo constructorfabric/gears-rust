@@ -10,9 +10,9 @@ from .helpers import (
     assert_operation,
     read_created,
     read_entity,
-    replace_text,
     submit_and_poll,
 )
+from .conftest import TRACE_ID
 
 
 # Marks a `$id` the scenario removes rather than replaces.
@@ -292,7 +292,7 @@ async def test_register_batch_with_partial_failure(
                 "status": 404,
                 "detail": "<detail>",
                 "instance": "<request_path>",
-                "trace_id": "<trace_id>",
+                "trace_id": TRACE_ID,
                 "context": {
                     "resource_type": "gts.cf.types_registry.registry.type.v1~",
                     "resource_name": candidate["gts_id"],
@@ -331,7 +331,7 @@ def _expected_id_refusal(gts_id, description):
         "status": 400,
         "detail": "Request validation failed",
         "instance": "<request_path>",
-        "trace_id": "<trace_id>",
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.types_registry.registry.type.v1~",
             "resource_name": gts_id,
@@ -390,7 +390,6 @@ async def test_register_batch_refuses_mismatched_schema_id(
     actual = response.json()
     assert actual["instance"] == response.request.url.path, actual
     actual["instance"] = "<request_path>"
-    replace_text(actual, "trace_id")
     assert_json(actual, _expected_id_refusal(schema["gts_id"], description))
 
     for candidate in (instance, schema):
@@ -405,7 +404,7 @@ async def test_register_batch_refuses_mismatched_schema_id(
                 "status": 404,
                 "detail": "<detail>",
                 "instance": "<request_path>",
-                "trace_id": "<trace_id>",
+                "trace_id": TRACE_ID,
                 "context": {
                     "resource_type": "gts.cf.types_registry.registry.type.v1~",
                     "resource_name": candidate["gts_id"],

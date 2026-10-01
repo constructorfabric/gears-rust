@@ -29,6 +29,7 @@ from .conftest import (
     TOPIC_4P,
     TOPIC_STREAM,
     SseFrameReader,
+    TRACE_ID,
 )
 
 
@@ -153,7 +154,7 @@ async def test_positions_not_set_recovery(api):
             "status": 409,
             "detail": bad_body["detail"],
             "instance": bad_body["instance"],
-            "trace_id": bad_body["trace_id"],
+            "trace_id": TRACE_ID,
             "context": {
                 "resource_type": "gts.cf.core.events.subscription.v1~",
                 "violations": bad_body["context"]["violations"],
