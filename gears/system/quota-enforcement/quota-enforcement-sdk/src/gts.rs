@@ -82,7 +82,7 @@ pub const SCOPE_TENANT: &str = gts_id!("cf.core.qe.scope.v1~cf.core.qe.tenant.v1
 /// id in their `x-gts-ref` narrowing, so the two must change together. Metrics
 /// are registry-owned; the gear never registers this base, it only checks
 /// admitted metrics against it at bootstrap.
-pub const METRIC_BASE_TYPE: &str = gts_id!("cf.qe.metric.type.v1~");
+pub const METRIC_BASE_TYPE: &str = gts_id!("cf.core.qe.metric_type.v1~");
 
 const SUBJECT_BASE_JSON: &str = include_str!("../schemas/gts.cf.core.qe.subj.v1~.schema.json");
 const RESOURCE_BASE_JSON: &str = include_str!("../schemas/gts.cf.core.qe.res.v1~.schema.json");

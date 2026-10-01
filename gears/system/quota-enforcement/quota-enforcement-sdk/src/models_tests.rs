@@ -363,7 +363,7 @@ fn subject_scope_parse_and_deserialization_accept_only_scope_instances() {
     let rejected = [
         SCOPE_TYPE,                                             // a type, not an instance
         "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~", // another type
-        "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1", // an instance of another type
+        "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1", // an instance of another type
         "not-a-gts-id",
         "",
     ];
@@ -383,7 +383,7 @@ fn subject_scope_parse_and_deserialization_accept_only_scope_instances() {
         );
     }
     assert!(matches!(
-        SubjectScope::parse("gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1"),
+        SubjectScope::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1"),
         Err(ScopeError::NotAScope { .. })
     ));
 }
@@ -401,7 +401,7 @@ fn subject_scope_serializes_as_its_instance_id_and_round_trips() {
 #[test]
 fn evaluation_attribution_distinguishes_omitted_metadata_from_null() {
     let tenant = Uuid::from_u128(7);
-    let metric = "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1";
+    let metric = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1";
 
     let omitted: EvaluationAttribution =
         serde_json::from_value(json!({ "tenant_id": tenant, "metric": metric }))
@@ -491,7 +491,7 @@ fn contract_ref_for_type_takes_the_major_version_of_the_last_segment() {
 #[test]
 fn projection_bindings_are_distinct_by_pair() {
     let metric =
-        MetricId::parse("gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1").expect("metric");
+        MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1").expect("metric");
     let user =
         GtsTypeId::try_new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~").expect("type");
     let tenant =

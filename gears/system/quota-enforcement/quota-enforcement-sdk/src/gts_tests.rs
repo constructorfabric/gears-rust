@@ -249,7 +249,7 @@ fn the_owner_examples_validate_as_concrete_derived_contracts_with_their_traits()
         .expect("token request contract");
     assert_eq!(
         token.effective_traits["metric"],
-        format!("{METRIC_BASE_TYPE}cf.qe.metric.ai_tokens_input.v1")
+        format!("{METRIC_BASE_TYPE}cf.genai.llm_gateway.ai_tokens_input.v1")
     );
     assert_eq!(
         token.effective_traits["constraint_contract"],
