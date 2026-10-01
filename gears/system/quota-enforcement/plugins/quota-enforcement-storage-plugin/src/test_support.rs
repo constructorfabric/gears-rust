@@ -33,9 +33,11 @@ use crate::infra::storage::Migrator;
 /// The `llm_gateway` user projection the gear's fixtures use.
 pub const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
 /// A metric instance id.
-pub const METRIC_TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
+pub const METRIC_TOKENS: &str =
+    "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
 /// Another metric instance id.
-pub const METRIC_REQUESTS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1";
+pub const METRIC_REQUESTS: &str =
+    "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1";
 
 /// One in-memory `SQLite` database with every plugin migration applied. One
 /// connection: a second connection would be a second database.

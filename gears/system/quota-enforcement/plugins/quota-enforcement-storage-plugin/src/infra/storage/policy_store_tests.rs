@@ -51,6 +51,52 @@ fn policy_changed(policy_id: Option<PolicyId>) -> NotificationEvent {
 }
 
 #[tokio::test]
+async fn a_deleted_policy_cannot_be_rolled_back_to_any_version() {
+    let db = test_db().await;
+    let (handle, outbox) = bound_outbox(&db).await;
+    let store = SqlPolicyStore::new(db, outbox);
+    let id = store
+        .create_policy(&context(), draft(), &[])
+        .await
+        .expect("create")
+        .policy_id;
+    store
+        .update_policy(&context(), id.clone(), patch(1), &[])
+        .await
+        .expect("v2 supersedes v1");
+    store
+        .delete_policy(&context(), id.clone(), None, &[])
+        .await
+        .expect("delete");
+
+    // Delete retires the active version; the older one stays superseded.
+    // Neither comes back, and the refusal changes no state.
+    for (target, state) in [
+        (1, PolicyVersionState::Superseded),
+        (2, PolicyVersionState::Deleted),
+    ] {
+        let refused = store
+            .rollback_policy(&context(), id.clone(), target, None, &[])
+            .await;
+        assert!(
+            matches!(refused, Err(StorageError::PolicyDeleted { .. })),
+            "rollback to v{target} after delete: {refused:?}"
+        );
+        assert_eq!(
+            store
+                .read_policy_version(&id, target)
+                .await
+                .expect("read")
+                .expect("retained")
+                .state,
+            state,
+            "the refused rollback changed nothing"
+        );
+    }
+    handle.stop().await;
+}
+
+#[tokio::test]
 async fn versions_rollback_recreate_and_noops_preserve_history() {
     let db = test_db().await;
     let (handle, outbox) = bound_outbox(&db).await;
