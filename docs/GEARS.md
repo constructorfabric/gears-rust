@@ -43,6 +43,16 @@ All gears can be divided into several categories:
 - **OSS (Operations Support System)** - operational gears for infrastructure management, DNS, certificates, monitoring, service catalog, and multi-region operations
 - **Studio** - developer experience and governance gears for the Constructor Studio product
 
+These categories reach Gearbox through the `category` field of a gear's `gear.gdl`, which takes
+the kebab-case slug: `api-ingress`, `bss`, `core-functionality`, `core-platform-integration`,
+`gen-ai`, `oss`, `serverless`, plus `example` for the sample gears. **Business Logic Gears, Core
+Platform Services and Studio have no slug yet**, so a descriptor using one raises `GBX0108`.
+That is a warning rather than an error: the gear still loads and composes, and the taxonomy is
+the team's to extend.
+
+A gear without a `gear.gdl` is invisible to composition. See [GEARBOX.md](GEARBOX.md) for what
+the file holds and [gdl.md](gdl.md) for the language.
+
 The **Core Platform Integration Gears** layer abstracts integration with core platform services, such as IdP, policy management, licensing, and credentials management that that can be out of scope of Gears. This keeps Gears reusable: it can run as a standalone platform, or it can integrate into an existing enterprise platform by wiring adapters to the platform’s services.
 
 ## Dependency rules

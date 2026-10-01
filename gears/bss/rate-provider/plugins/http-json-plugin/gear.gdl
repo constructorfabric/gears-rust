@@ -1,0 +1,27 @@
+# Gearbox product metadata for the HTTP-JSON Rate Source Plugin.
+#
+# Projected from #[toolkit::gear]: id, colocated_deps (types-registry).
+#
+# A source plugin for bss-rate-provider, declared by `fills`: the spec its
+# instances register under, which bss-rate-provider declares as its point. No
+# `sdk` -- the rate-provider SDK and its GTS types are bss-rate-provider's.
+
+gear(
+    name = "HTTP-JSON Rate Source Plugin",
+    description = "Generic HTTP-JSON feed source plugin for the FX Rate Provider gear.",
+    category = "bss",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-bss-rate-provider-http-json-plugin",
+        lib = "bss_rate_provider_http_json_plugin",
+        path = ".",
+    ),
+
+    fills = "cf.bss.rate_provider_source.plugin.v1~",
+
+    # `id` is the instance's registration identity and is left to the file.
+    # `auth` carries credentials and `mapping` is a nested record; neither is
+    # offered as a control.
+    config_schema = config(exposes = ["vendor", "priority", "base_url", "timeout_ms"]),
+)

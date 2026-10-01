@@ -1,0 +1,35 @@
+# Gearbox product metadata for the File Parser.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (rest).
+
+gear(
+    name = "File Parser",
+    description = "Pluggable document parsing and content extraction for indexing and business workflows.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-file-parser",
+        lib = "file_parser",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-file-parser-sdk",
+        lib = "file_parser_sdk",
+        path = "../file-parser-sdk",
+    ),
+
+    # `magika_intra_op_threads` is an `Option<NonZeroUsize>` and only means
+    # anything in a build with `magika`, so it is left to the file.
+    config_schema = config(exposes = [
+        "max_file_size_mb",
+        "allowed_local_base_dir",
+        "detection_confidence_threshold",
+    ]),
+
+    # Content-based type detection. A real deployment choice with a real cost:
+    # ONNX Runtime, ~3 MB of model weights, and `libonnxruntime` at run time.
+    # Offered to every profile kind, because nothing in the crate ties it to one.
+    cargo_features = [feature("magika")],
+)

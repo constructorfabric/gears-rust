@@ -7,6 +7,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "cf-gears-example-server"
+
 [lints]
 workspace = true
 

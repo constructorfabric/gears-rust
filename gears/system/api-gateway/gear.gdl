@@ -1,0 +1,45 @@
+# Gearbox product metadata for the api-gateway gear.
+#
+# Under ADR cpt-gearbox-adr-macro-projected-catalogue the Rust attributes keep
+# every fact they already express. Projected from #[toolkit::gear] in
+# src/gear.rs, and therefore NOT written here:
+#
+#   id             <- name = "api-gateway"
+#   runtime_caps   <- capabilities = [rest_host, rest, stateful]
+#   colocated_deps <- deps = [grpc_hub, authn_resolver]   (link-time; uncuttable)
+#   lifecycle      <- lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
+#
+# Declaring any of them here is GBX0210, which names the owning attribute.
+
+gear(
+    name = "API Gateway",
+    description = "Application-wide REST host: composes every gear's router, serves OpenAPI, terminates auth.",
+    category = "api-ingress",
+    visibility = "internal",
+
+    # `lib` is mandatory, never derived. `attr` is omitted: this crate declares
+    # exactly one gear, so scanning src/ is unambiguous.
+    package = cargo(
+        crate_name = "cf-gears-api-gateway",
+        lib = "api_gateway",
+        path = ".",
+    ),
+
+    # `bind_addr` is this gear's real config key (src/config.rs), and a runtime
+    # configuration fact rather than a Rust one -- so it is declared here.
+    serves = [endpoint(name = "rest", config_key = "bind_addr", default_port = 8087)],
+
+    # The five an operator actually sets -- see config/quickstart.yaml. The other
+    # nine fields of ApiGatewayConfig are nested structures (openapi, defaults,
+    # cors, health, ...) and are edited in the configuration file directly.
+    config_schema = config(exposes = ["bind_addr", "enable_docs", "cors_enabled", "prefix_path", "auth_disabled"]),
+
+    # Every one of these is a product decision. `k8s-auth` is the exception that
+    # needs a kind: it authenticates against a Kubernetes service account.
+    cargo_features = [
+        feature("grpc"),
+        feature("otel"),
+        feature("embed_elements"),
+        feature("k8s-auth", kinds = ["kubernetes"]),
+    ],
+)

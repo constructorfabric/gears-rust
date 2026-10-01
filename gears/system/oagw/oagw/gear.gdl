@@ -1,0 +1,42 @@
+# Gearbox product metadata for OAGW, the Outbound API Interface.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (system, rest),
+# colocated_deps (types-registry, authz-resolver, credstore, tenant-resolver).
+
+gear(
+    name = "Outbound API Interface",
+    description = "Abstraction layer for outbound API calls with credential injection and observability.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-oagw",
+        lib = "oagw",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-oagw-sdk",
+        lib = "oagw_sdk",
+        path = "../oagw-sdk",
+    ),
+
+    # Timeouts, limits and the two policy switches. `ssrf_policy` and `metrics`
+    # are nested sections and stay in the configuration file.
+    config_schema = config(exposes = [
+        "proxy_timeout_secs",
+        "max_body_size_bytes",
+        "allow_http_upstream",
+        "token_cache_ttl_secs",
+        "token_cache_capacity",
+        "websocket_idle_timeout_secs",
+        "websocket_close_timeout_secs",
+        "streaming_idle_timeout_secs",
+        "protocol_cache_ttl_secs",
+        "management_api_enabled",
+    ]),
+
+    # `fips` restricts TLS to FIPS-approved suites, a real deployment choice.
+    # `test-utils` is test scaffolding and is not offered.
+    cargo_features = [feature("fips")],
+)

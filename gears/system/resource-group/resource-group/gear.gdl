@@ -1,0 +1,34 @@
+# Gearbox product metadata for the resource-group gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest), colocated_deps
+# (authz-resolver, types-registry). This gear reads no configuration -- there is
+# no `ctx.config*()` call in its `impl Gear` -- so it declares no
+# `config_schema`, which is the right answer rather than a gap.
+
+gear(
+    name = "Resource Groups Manager",
+    description = "Group related resources into lifecycle-linked collections for bulk access and operations.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-resource-group",
+        lib = "resource_group",
+        path = ".",
+    ),
+
+    # `cf-gears-resource-group-sdk` has no [lib] section, so its library
+    # identifier is `cf_gears_resource_group_sdk`, NOT `resource_group_sdk`.
+    # Declared rather than derived for exactly this reason: deriving it would
+    # emit a link line that does not compile.
+    sdk = cargo(
+        crate_name = "cf-gears-resource-group-sdk",
+        lib = "cf_gears_resource_group_sdk",
+        path = "../resource-group-sdk",
+    ),
+
+    # `odata` is a real product decision and is on by Cargo's default; `default`
+    # itself is not a choice an integrator makes, and `integration` gates a
+    # Postgres suite that needs Docker.
+    cargo_features = [feature("odata")],
+)

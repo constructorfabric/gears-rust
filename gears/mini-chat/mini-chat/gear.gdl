@@ -1,0 +1,54 @@
+# Gearbox product metadata for MiniChat.
+#
+# Projected from #[toolkit::gear] in src/gear.rs: id, runtime_caps (db, rest,
+# stateful), colocated_deps (types-registry, authn-resolver, authz-resolver,
+# oagw). Its two extension points -- model policy and audit -- are declared
+# below and checked against the sdk.
+#
+# **One crate, three gears.** The same crate declares the two static plugins
+# that fill those points, each with its own attribute in its own directory
+# under src/infra/plugins/, and each described beside that attribute. `attr`
+# pins which attribute this description is about; the rest of the crate's
+# files are read as this gear's only where no plugin's directory encloses them.
+
+gear(
+    name = "MiniChat",
+    description = "Lightweight chat module for simple Azure and OpenAI conversational scenarios.",
+    category = "gen-ai",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-mini-chat",
+        lib = "mini_chat",
+        path = ".",
+        attr = "src/gear.rs",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-mini-chat-sdk",
+        lib = "mini_chat_sdk",
+        path = "../mini-chat-sdk",
+    ),
+
+    # One `vendor` selects for both points.
+    extension_points = [
+        extension_point(
+            "cf.core.mini_chat_model_policy.plugin.v1~",
+            trait = "MiniChatModelPolicyPluginClientV1",
+        ),
+        extension_point(
+            "cf.core.mini_chat_audit.plugin.v1~",
+            trait = "MiniChatAuditPluginClientV1",
+        ),
+    ],
+
+    # The two top-level scalars. Everything else in `MiniChatConfig` is a
+    # nested section -- providers, quotas, workers, streaming -- and stays in
+    # the configuration file.
+    config_schema = config(exposes = ["url_prefix", "vendor"]),
+
+    # Kubernetes Lease leader election for the background workers. A build
+    # with it *requires* a Kubernetes runtime: startup fails without
+    # `POD_NAMESPACE`, `POD_NAME` and kube client access.
+    cargo_features = [feature("k8s", kinds = ["kubernetes"])],
+)

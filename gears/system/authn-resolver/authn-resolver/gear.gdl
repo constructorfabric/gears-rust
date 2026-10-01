@@ -1,0 +1,36 @@
+# Gearbox product metadata for the authn-resolver gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (system), colocated_deps
+# (types-registry).
+
+gear(
+    name = "Authentication Resolver",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-authn-resolver",
+        lib = "authn_resolver",
+        path = ".",
+    ),
+
+    # A locator, not a restatement: nothing in the gear's own crate says where
+    # its SDK is, and the SDK is where the extension point below is checked --
+    # its spec among the GTS types, its trait among the `pub trait`s.
+    sdk = cargo(
+        crate_name = "cf-gears-authn-resolver-sdk",
+        lib = "authn_resolver_sdk",
+        path = "../authn-resolver-sdk",
+    ),
+
+    # The point plugins fill, keyed by the GTS spec their instances register
+    # under and this gear selects by. Declared, and checked against the sdk: the
+    # spec must be a `PluginV1` type it declares, the trait a `pub trait` in it.
+    extension_points = [
+        extension_point("cf.core.authn_resolver.plugin.v1~", trait = "AuthNResolverPluginClient"),
+    ],
+
+    # The join key against a plugin's own vendor. Overriding one side and not the
+    # other is what fails silently at runtime, which is why it is worth surfacing.
+    config_schema = config(exposes = ["vendor"]),
+)

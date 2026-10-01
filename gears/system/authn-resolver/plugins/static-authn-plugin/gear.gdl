@@ -1,0 +1,32 @@
+# Gearbox product metadata for the static AuthN plugin.
+#
+# Projected from #[toolkit::gear]: id, colocated_deps (types-registry).
+# Declared below: which extension point this gear fills, by the spec its host
+# declares. The `impl AuthNResolverPluginClient` in this crate is checked
+# against the declaration, not read as it.
+# Projected from this crate's own config: the vendor and priority it registers
+# itself under (`constructorfabric` / 100), which is the join key the host's
+# `vendor` selector matches against.
+
+gear(
+    name = "Static AuthN Plugin",
+    description = "Accepts configured tokens and returns a fixed identity. For dev and test.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-static-authn-plugin",
+        lib = "static_authn_plugin",
+        path = ".",
+    ),
+
+    # The point this plugin fills, by the GTS spec its host declares. The
+    # declaration is the role; the `impl` in this crate is only checked against
+    # it. No `sdk`: the host's SDK is the host's.
+    fills = "cf.core.authn_resolver.plugin.v1~",
+
+    # `mode` is an enum, and its variants are read from AuthNMode rather than
+    # listed here -- adding one needs no change to this file or to Gearbox.
+    # `tokens` and `default_identity` are nested and stay in the config file.
+    config_schema = config(exposes = ["vendor", "priority", "mode"]),
+)

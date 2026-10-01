@@ -1,0 +1,50 @@
+# Gearbox product metadata for the Chat Engine.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful),
+# colocated_deps (authz-resolver), the lifecycle (entry `serve`, stop timeout
+# 30s, awaits readiness), and the client it publishes
+# (`chat_engine_sdk::ChatEngineBackendPlugin`). The attribute's `ctor` is the
+# macro's business and has no counterpart here.
+#
+# **No extension point, though its SDK has a trait called a plugin.**
+# `ChatEngineBackendPlugin` backends are the crate's own -- `WebhookCompatPlugin`
+# and `LlmGatewayPlugin` -- looked up by an instance id stored per session type,
+# with no GTS spec and no vendor selection. There is no point another gear
+# could fill, so none is declared.
+
+gear(
+    name = "Chat Engine",
+    description = "Multi-tenant conversational infrastructure with plugin-driven backend message processing.",
+    category = "gen-ai",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-chat-engine",
+        lib = "chat_engine",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-chat-engine-sdk",
+        lib = "chat_engine_sdk",
+        path = "../chat-engine-sdk",
+    ),
+
+    # Deadlines, buffers, retention and the search switch. The optional URLs
+    # and TTL, and the `webhook_endpoints` list, stay in the configuration file.
+    config_schema = config(exposes = [
+        "plugin_deadline_secs",
+        "ndjson_buffer_size",
+        "summary_buffer_size",
+        "retention_cleanup_interval_hours",
+        "retention_max_sessions_per_tick",
+        "retention_max_deletes_per_session",
+        "enable_search",
+    ]),
+
+    # Lease-based leader election for the retention sweep, so only one replica
+    # runs it. Without it the elector is the crate's single-process no-op; the
+    # feature means something only where there are replicas and a Kubernetes
+    # API to lease from.
+    cargo_features = [feature("k8s", kinds = ["kubernetes"])],
+)

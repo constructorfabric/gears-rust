@@ -29,10 +29,25 @@ use crate::server;
 /// - Exposes `DirectoryService` gRPC service via `grpc-hub`
 /// - Tracks gear instances and provides service resolution
 /// - Exposes REST API to list all registered gears
+// `one_per_installation`: the directory is this process's own instance map --
+// a `DashMap` in `GearManager`, with no store, no replication and no quorum --
+// and every worker is handed one endpoint with no way to find another.
+//
+// Two of these in one installation are two disjoint maps that never meet, and
+// every consequence is silent: the edge prunes the other half's public routes
+// to 404 because its safety valve only covers an *empty* snapshot, readiness
+// stays at 503 forever because re-registration never gives up, and instance
+// targeting answers with a complete-looking ownership map over half the shards.
+//
+// The registry cannot refuse this the way it refuses a second `rest_host`: that
+// check works because a process can see its own gears, and no process can see
+// another. Composition tooling refuses it instead, which is why the fact is
+// stated here rather than merely known.
 #[toolkit::gear(
     name = "gear-orchestrator",
     capabilities = [grpc, system, rest],
-    client = cf_system_sdks::directory::DirectoryClient
+    client = cf_system_sdks::directory::DirectoryClient,
+    one_per_installation = true
 )]
 pub struct GearOrchestrator {
     directory_api: OnceLock<Arc<dyn DirectoryClient>>,

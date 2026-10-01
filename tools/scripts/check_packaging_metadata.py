@@ -18,12 +18,33 @@ runs in the release job):
    because the `path` is stripped on publish and crates.io needs a version
    to resolve the dependency.
 
-This script checks both rules with no cargo invocation at all, so it's cheap
-enough to run on every CI build.
+And one rule that is ours rather than cargo's:
+
+3. Every crate spells out its target section: a crate with `src/lib.rs`
+   declares `[lib] name`, a crate with `src/main.rs` declares a `[[bin]]`
+   covering it. Cargo is perfectly happy without either — it derives the
+   name from the *package* name, `-` becoming `_` for a library and verbatim
+   for a binary — and that is exactly the problem. The derived name moves
+   whenever the package is renamed, silently, and a gear description restates
+   the library name:
+
+       package = cargo(crate_name = "cf-gears-api-gateway",
+                       lib = "api_gateway", path = ".")
+
+   (`api_gateway` is not derivable from that package name; it is what `[lib]`
+   says.) So a silent rename is a wrong `gear.gdl` and a wrong
+   `use <lib> as _;` in the code Gearbox generates from it. Declared, the name
+   is a fact somebody has to change on purpose.
+
+   Unlike the two above this has nothing to do with `cargo publish`, so it
+   applies to every crate in the workspace, published or not.
+
+This script checks all three rules with no cargo invocation at all, so it's
+cheap enough to run on every CI build.
 
 Exit codes:
-  0 - All publishable crates pass both checks
-  1 - One or more publishable crates violate a rule
+  0 - All crates pass every applicable check
+  1 - One or more crates violate a rule
 """
 
 import sys
@@ -39,6 +60,18 @@ SKIP_DIR_NAMES = {"target", ".git"}
 # so their packaging metadata is irrelevant here.
 EXCLUDED_DIRS = {"tools/fuzz"}
 
+# Relative to the workspace root, directories exempt from rule 3 only (they
+# are still checked for packaging metadata). `examples/oop-gears/` is being
+# rewritten in an open PR (#4663) and its four crates predate the rule; they
+# are left to that PR rather than edited underneath it. Delete this once the
+# PR merges — the rule is then unconditional.
+TARGET_RULE_EXEMPT_DIRS = {"examples/oop-gears"}
+
+
+def is_under(rel_dir: str, directories) -> bool:
+    """True if `rel_dir` is one of `directories` or sits inside one."""
+    return any(rel_dir == d or rel_dir.startswith(d + "/") for d in directories)
+
 
 def find_manifests(workspace_root: Path) -> List[Path]:
     """Find all Cargo.toml files in the workspace, skipping excluded dirs."""
@@ -47,8 +80,7 @@ def find_manifests(workspace_root: Path) -> List[Path]:
         rel_parts = path.relative_to(workspace_root).parts
         if any(part in SKIP_DIR_NAMES for part in rel_parts):
             continue
-        rel_dir = "/".join(rel_parts[:-1])
-        if any(rel_dir == excluded or rel_dir.startswith(excluded + "/") for excluded in EXCLUDED_DIRS):
+        if is_under("/".join(rel_parts[:-1]), EXCLUDED_DIRS):
             continue
         manifests.append(path)
     return sorted(manifests)
@@ -170,6 +202,53 @@ def check_file_metadata(
     return violations
 
 
+def check_declared_targets(
+    data: dict, package: dict, crate_dir: Path
+) -> List[Tuple[str, str]]:
+    """Return `(section, name_cargo_would_derive)` for each target left implicit.
+
+    Presence of the source file is the trigger, because that is what makes
+    cargo auto-discover a target at all. A crate with neither `src/lib.rs` nor
+    `src/main.rs` has no target to name and is therefore silently in the clear
+    — which is the right answer for the macro-test crates, whose whole
+    contents are `tests/`.
+
+    `src/bin/*.rs` is deliberately *not* required to be declared: those target
+    names come from the file name, not from the package name, so renaming the
+    package cannot move them. They are already explicit, which is all rule 3
+    asks for.
+    """
+    violations: List[Tuple[str, str]] = []
+    package_name = package.get("name")
+    if not isinstance(package_name, str):
+        return violations  # nothing to derive a name from; cargo will complain first
+
+    if (crate_dir / "src" / "lib.rs").is_file():
+        lib = data.get("lib")
+        if not (isinstance(lib, dict) and isinstance(lib.get("name"), str)):
+            violations.append(("[lib]", package_name.replace("-", "_")))
+
+    if (crate_dir / "src" / "main.rs").is_file():
+        declared = data.get("bin")
+        declared = declared if isinstance(declared, list) else []
+        # A `[[bin]]` for some `src/bin/*.rs` does not cover `src/main.rs`:
+        # auto-discovery still applies to it, under the package's name. So the
+        # entry has to be the one that claims `src/main.rs` — by path, or by
+        # carrying the name cargo infers that path from.
+        covers_main = any(
+            isinstance(entry, dict)
+            and (
+                entry.get("path") in ("src/main.rs", "./src/main.rs")
+                or entry.get("name") == package_name
+            )
+            for entry in declared
+        )
+        if not covers_main:
+            violations.append(("[[bin]]", package_name))
+
+    return violations
+
+
 def main() -> int:
     script_dir = Path(__file__).parent
     workspace_root = script_dir.parent.parent
@@ -180,9 +259,11 @@ def main() -> int:
         return 1
 
     checked = 0
-    file_violations = []  # (manifest_path, [(field, declared, expected_rel), ...])
-    dep_violations = []   # (manifest_path, [(table_path, dep_name), ...])
-    parse_errors = []     # (manifest_path, message)
+    targets_checked = 0
+    file_violations = []   # (manifest_path, [(field, declared, expected_rel), ...])
+    dep_violations = []    # (manifest_path, [(table_path, dep_name), ...])
+    target_violations = []  # (manifest_path, [(section, derived_name), ...])
+    parse_errors = []      # (manifest_path, message)
 
     # First pass: parse every manifest once and record workspace roots so that
     # `workspace = true` dependencies can be resolved to their shared spec.
@@ -207,17 +288,34 @@ def main() -> int:
                 return ancestor
         return None
 
-    # Second pass: validate each publishable crate.
+    # Second pass: validate each crate.
+    #
+    # Rule 3 covers every crate this workspace builds, while rules 1 and 2 only
+    # concern the ones `cargo publish` runs on — so the publish-only filters sit
+    # *below* the target check rather than above it. A `publish = false` crate
+    # still has to name its target; that is where most of the offenders were.
     for manifest_path, data in parsed.items():
         package = data.get("package")
-        if package is None or not is_publishable(package):
+        if package is None:
             continue
 
         # Crates in a separate nested workspace (e.g. `tools/dylint_lints`,
         # test fixtures) are never published alongside the root workspace, so
-        # `cargo publish` never runs on them — skip to avoid false positives.
+        # `cargo publish` never runs on them — and nothing here links them
+        # either, so neither rule has anything to say. Skip to avoid false
+        # positives.
         root = governing_root(manifest_path.parent)
         if root is not None and root != workspace_root:
+            continue
+
+        rel_dir = "/".join(manifest_path.relative_to(workspace_root).parts[:-1])
+        if not is_under(rel_dir, TARGET_RULE_EXEMPT_DIRS):
+            targets_checked += 1
+            targets_missing = check_declared_targets(data, package, manifest_path.parent)
+            if targets_missing:
+                target_violations.append((manifest_path, targets_missing))
+
+        if not is_publishable(package):
             continue
 
         # Per repo convention (see release-plz.toml) every crate that is
@@ -238,7 +336,7 @@ def main() -> int:
         if deps_missing:
             dep_violations.append((manifest_path, deps_missing))
 
-    has_problems = bool(file_violations or dep_violations or parse_errors)
+    has_problems = bool(file_violations or dep_violations or target_violations or parse_errors)
     if has_problems:
         print("=" * 80, file=sys.stderr)
         print("PACKAGING METADATA VIOLATIONS DETECTED", file=sys.stderr)
@@ -275,19 +373,35 @@ def main() -> int:
         dep_violations,
         lambda v: f'[{v[0]}] {v[1]} -> add a `version = "..."`',
     )
+    report_group(
+        "The following crates leave a target name for cargo to derive from the "
+        "package name, so renaming the package renames the target silently. "
+        "Declare it (the name below is the one in effect today, so adding it "
+        "changes nothing):",
+        target_violations,
+        lambda v: f'{v[0]} -> add `name = "{v[1]}"`',
+    )
 
     if has_problems:
-        invalid = len({p for p, _ in file_violations} | {p for p, _ in dep_violations})
+        invalid = len(
+            {p for p, _ in file_violations}
+            | {p for p, _ in dep_violations}
+            | {p for p, _ in target_violations}
+        )
         print("=" * 80, file=sys.stderr)
         print(
-            f"Summary: {checked} publishable crates checked, "
+            f"Summary: {checked} publishable crates checked for packaging metadata, "
+            f"{targets_checked} crates checked for declared targets, "
             f"{invalid} with violations, {len(parse_errors)} unparseable",
             file=sys.stderr,
         )
         print("=" * 80, file=sys.stderr)
         return 1
 
-    print(f"OK: {checked} publishable crates checked")
+    print(
+        f"OK: {checked} publishable crates checked for packaging metadata, "
+        f"{targets_checked} crates declare their targets"
+    )
     return 0
 
 

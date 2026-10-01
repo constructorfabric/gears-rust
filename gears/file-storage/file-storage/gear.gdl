@@ -1,0 +1,48 @@
+# Gearbox product metadata for File Storage.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful),
+# colocated_deps (authz-resolver).
+
+gear(
+    name = "File Storage",
+    description = "Abstract file storage API with pluggable backends for media and generated content.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-file-storage",
+        lib = "file_storage",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-file-storage-sdk",
+        lib = "file_storage_sdk",
+        path = "../file-storage-sdk",
+    ),
+
+    # The operator's knobs. Not offered: `signing_key_seed` and
+    # `finalize_internal_secret`, which are secrets -- a form that saved one
+    # would write it into the description; `s3_backends`, a list of nested
+    # backend records; and `default_backend_id`, which only means something
+    # against that list. The two `require_*` switches that guard the secrets
+    # are offered, since they are policy rather than credentials.
+    config_schema = config(exposes = [
+        "storage_root",
+        "sidecar_base_url",
+        "default_url_ttl_secs",
+        "max_url_ttl_secs",
+        "default_page_size",
+        "max_page_size",
+        "idempotency_ttl_secs",
+        "orphan_grace_secs",
+        "sweep_interval_secs",
+        "enable_background_sweep",
+        "enable_in_memory_backend",
+        "require_signing_key_seed",
+        "require_finalize_internal_secret",
+    ]),
+
+    # `default = []` is the only feature and enables nothing.
+    cargo_features = [],
+)

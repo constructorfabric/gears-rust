@@ -1,0 +1,18 @@
+# Gearbox product metadata for the gear-orchestrator gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (grpc, system, rest), and
+# `client = cf_system_sdks::directory::DirectoryClient` -- the only gear in the
+# slice declaring a client trait.
+
+gear(
+    name = "Gear Orchestrator",
+    description = "DirectoryService server: instance registration, heartbeat, endpoint resolution.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-gear-orchestrator",
+        lib = "gear_orchestrator",
+        path = ".",
+    ),
+)

@@ -1,0 +1,25 @@
+# Gearbox product metadata for Simple User Settings.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (rest, db), colocated_deps
+# (authz-resolver).
+
+gear(
+    name = "Simple User Settings",
+    description = "Lightweight per-user settings storage with CRUD API and schema validation.",
+    category = "serverless",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-simple-user-settings",
+        lib = "simple_user_settings",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-simple-user-settings-sdk",
+        lib = "simple_user_settings_sdk",
+        path = "../simple-user-settings-sdk",
+    ),
+
+    config_schema = config(exposes = ["max_field_length"]),
+)

@@ -1,0 +1,66 @@
+# Gearbox product metadata for the api-contracts-consumer example gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (rest). The contract edges
+# themselves come from #[toolkit::consumes] -- their existence and identity are
+# Rust facts. What is declared here is product-level: which gear is expected to
+# supply each one, and whether it gates readiness.
+
+PAYMENT_SDK = cargo(
+    crate_name = "cf-api-contracts-sdk",
+    lib = "cf_api_contracts_sdk",
+    path = "../api-contracts-sdk",
+    features = ["rest-client"],
+)
+
+gear(
+    name = "Payments Consumer (example)",
+    description = "Resolves PaymentApi from another gear through the client hub.",
+    category = "example",
+    visibility = "public",
+
+    package = cargo(
+        crate_name = "cf-api-contracts-consumer",
+        lib = "cf_api_contracts_consumer",
+        path = ".",
+    ),
+
+    consumes = [
+        consume(
+            contract = "PaymentApi",
+            rust = "api_contracts_sdk::PaymentApi",
+            sdk = PAYMENT_SDK,
+        ),
+        consume(
+            contract = "PaymentApiV2",
+            rust = "api_contracts_sdk::PaymentApiV2",
+            sdk = PAYMENT_SDK,
+        ),
+    ],
+
+    # The coordination this gear takes part in. `profile` is a join key, not a
+    # label: it must name one of the crate's own `impl ClusterProfile` markers
+    # (`src/cluster.rs`), and Gearbox refuses a name no marker supplies
+    # (GBX0508). Capabilities are only those the registered backends actually
+    # declare -- `linearizable` yes, `prefix_watch` no: the postgres cache
+    # declares `CacheFeatures::new(false)` because NOTIFY carries one key per
+    # payload, so asking for it is GBX0502 rather than a wish.
+    #
+    # No provider registers leader election at all, so it resolves to the SDK's
+    # compare-and-swap default over the cache. That is the intended design, not
+    # a fallback, and it is reported as GBX0504.
+    #
+    # A lock is deliberately not required. `postgres` is the only lock provider,
+    # and the resolver prefers a dedicated backend over the CAS default -- so a
+    # lock requirement drags postgres into the single-process dev profile, where
+    # the operator declared no provider for it and therefore no credentials.
+    # This gear coordinates through the cache and the leader; it needs no lock.
+    requires = [
+        cluster.cache(profile = "event-broker", capabilities = [cluster_cap.linearizable]),
+        cluster.leader_election(profile = "event-broker"),
+    ],
+
+    serves = [endpoint(name = "rest", via = "rest_host")],
+
+    # `default` is Cargo's own and not a choice.
+    cargo_features = [feature("otel")],
+)

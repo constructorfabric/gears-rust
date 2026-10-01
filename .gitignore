@@ -592,3 +592,4 @@ testing/e2e/logs/
 
 # Local reports from the toolkit-pr-review skill (never committed)
 /REVIEW_*.md
+.env

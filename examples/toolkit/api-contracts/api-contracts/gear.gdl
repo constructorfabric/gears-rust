@@ -1,0 +1,65 @@
+# Gearbox product metadata for the api-contracts example gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (rest).
+# Projected from #[toolkit::contract] in the SDK crate, per contract: its gear,
+# version and kind -- and which transports it can be bound over, which follows
+# from whether a `<Base>Rest` / `<Base>Grpc` projection trait exists beside the
+# base. So `provide` names the trait as a join key and declares only the
+# generator inputs: base paths, the local factory, the gRPC stub module.
+#
+# Note what that means here: v1 has PaymentApiRest AND PaymentApiGrpc, so it is
+# reachable over both. v2 has only PaymentApiV2Rest, so gRPC is not available
+# for it -- and no description can say otherwise.
+
+PAYMENT_SDK = cargo(
+    crate_name = "cf-api-contracts-sdk",
+    lib = "cf_api_contracts_sdk",
+    path = "../api-contracts-sdk",
+    features = ["rest-client"],
+)
+
+gear(
+    name = "Payments (example provider)",
+    description = "Provides PaymentApi v1 and v2 side by side; v1 also has a gRPC projection.",
+    category = "example",
+    visibility = "public",
+
+    # cf-api-contracts has no [lib] section, so its library identifier is
+    # `cf_api_contracts`, NOT `api_contracts`. This is why `lib` is declared
+    # rather than derived: deriving it would emit a link line that does not
+    # compile.
+    package = cargo(
+        crate_name = "cf-api-contracts",
+        lib = "cf_api_contracts",
+        path = ".",
+    ),
+
+    provides = [
+        provide(
+            contract = "PaymentApi",
+            rust = "api_contracts_sdk::PaymentApi",
+            sdk = PAYMENT_SDK,
+            local = "Self::build_local",
+            rest = rest(base_path = "/api-contracts/v1"),
+            grpc = grpc(
+                package = "api_contracts.payment.v1",
+                service = "PaymentApi",
+                stubs_module = "crate::grpc::stubs",
+            ),
+        ),
+        # The second major of the same family. Its version comes from its own
+        # #[toolkit::contract(version = "v2")], not from here.
+        provide(
+            contract = "PaymentApiV2",
+            rust = "api_contracts_sdk::PaymentApiV2",
+            sdk = PAYMENT_SDK,
+            local = "Self::build_local_v2",
+            rest = rest(base_path = "/api-contracts/v2", require_full_coverage = True),
+        ),
+    ],
+
+    serves = [endpoint(name = "rest", via = "rest_host")],
+
+    # `default` is Cargo's own and not a choice; the other two are.
+    cargo_features = [feature("otel"), feature("grpc-client")],
+)

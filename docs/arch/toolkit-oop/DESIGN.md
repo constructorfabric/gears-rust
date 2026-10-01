@@ -1895,11 +1895,43 @@ Flight Control itself.** OoP gears register with Flight Control's directory and 
 
 | Component | Role | State | Notes |
 |-----------|------|-------|-------|
-| gear-orchestrator (DirectoryService) | Service registration + discovery | No DB; in-memory registry. Gears re-register on heartbeat, so restart recovery is handled. | Serves gRPC via grpc-hub; its REST surface (co-hosted on api-gateway) enables k8s-native discovery. |
+| gear-orchestrator (DirectoryService) | Service registration + discovery | No DB; in-memory registry. Gears re-register on heartbeat, so restart recovery is handled. | Serves gRPC via grpc-hub; its REST surface (co-hosted on api-gateway) enables k8s-native discovery. **One per installation** — see below. |
 | grpc-hub | gRPC transport for the directory + platform-plane RPCs | Stateless. | Hosts the DirectoryService gRPC endpoint. |
 | api-gateway | Edge + REST host: reverse-proxies exposed OoP routes and co-hosts the other control-plane gears' REST routes (directory, types-registry) on one HTTP server | No DB; in-memory route table populated from directory registrations. | Built-in edge in Profile 2 and Profile 3 Mode A; in Mode B an external gateway (Kong/Tyk) replaces the edge. |
 | types-registry | GTS catalogue | In-memory (link-time inventory + config seed + runtime registrations). Shared/DB persistence is a future optimization for multi-instance. | `post_init` graph validation must see a consistent view across distributed registrations. |
 | authn-resolver | Edge JWT validation (bearer token → tenant `SecurityContext`) | No DB; JWKS cache only. | Stateless. Runs at the edge here and also embeds in each OoP pod for per-hop re-validation. |
+
+##### One directory per installation
+
+The row above answers *restart* and not *duplication*, and the two are different
+questions. The registry is this process's own instance map — a `DashMap` in
+`GearManager`, with no store, no replication, no gossip and no quorum — and
+every worker is handed exactly one endpoint: `TOOLKIT_DIRECTORY_ENDPOINT` is a
+string, not a list, and there is no failover path.
+
+So two `gear-orchestrator` instances in one installation are two disjoint maps
+that never meet, and every consequence is silent rather than loud:
+
+* **The edge withdraws the other half's public routes.** api-gateway's
+  `compute_removals` treats an *empty* snapshot as a transient directory hiccup
+  and skips the prune. A second directory produces a **partial** snapshot, which
+  takes the ordinary filter path — so the routes belonging to gears registered
+  with the other directory are deregistered and the public API returns 404, with
+  no warning, because from the edge's point of view those gears legitimately
+  went away.
+* **Readiness never arrives.** A gear whose dependency registered with the other
+  directory stays at `503 {"state":"starting"}`. The re-registration loop is
+  idempotent and unbounded, so it neither succeeds nor fails.
+* **Instance targeting answers wrongly rather than emptily.** A half-view yields
+  a complete-looking ownership map over half the shards, and a non-match is
+  specified as `Ok(empty)` — so a caller cannot tell "no such shard" from "that
+  shard is registered with the other directory".
+
+This cannot be enforced the way `MultipleRestHosts` and `MultipleGrpcHubs` are.
+Those work because a process can enumerate its own gears; no process can
+enumerate another, so an installation-wide claim has no runtime vantage point.
+The gear therefore states it — `#[toolkit::gear(one_per_installation = true)]` —
+and composition tooling refuses a topology that would deploy it twice.
 
 #### Runs outside Flight Control (OoP)
 
