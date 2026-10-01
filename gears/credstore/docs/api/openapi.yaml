@@ -258,7 +258,9 @@ paths:
         `$select` is absent or names any of `sharing`/ `status`/`fallback`/`inheritance`/`version`/`updated_at`/`owner_id`,
         `read_secret` when `secret` is named, both when both. Supersedes the withdrawn `GET .../secret`:
         `GET .../{ref}?$select=reference,type,expires_at,secret` is its equivalent, and a secret-only
-        projection resolving to a value-less winner is the same canonical 404 that address gave.'
+        projection resolving to a value-less winner is the same canonical 404 that address gave. Selecting
+        `secret` of a record whose expiry has passed fails 409 `SECRET_EXPIRED` (only for a caller who
+        may read the secret); without `secret` the record is returned with `status` `expired`.'
       operationId: credstore.get_credential
       parameters:
       - description: Credential reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
@@ -304,6 +306,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
           description: Not Found
+        '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Conflict
         '500':
           content:
             application/problem+json:
@@ -618,6 +626,7 @@ components:
       - none
       - declared
       - active
+      - expired
       type: string
     FallbackDto:
       description: Suppression policy for the REST transport layer (ADR-0004, "Suppression").

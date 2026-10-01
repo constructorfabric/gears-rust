@@ -1,33 +1,48 @@
 Created:  2026-09-15 by Constructor Tech
-Updated:  2026-09-15 by Constructor Tech
+Updated:  2026-10-02 by Constructor Tech
 
-# Moving existing values to the ADR-0006 address
+# Moving existing values into the immutable-versions store
 
 > **Temporary document.** Delete it, together with the `docs/migration/`
 > directory, once every deployment that held credentials written before ADR-0006
-> has completed the procedure below and removed its superseded backend entries.
+> has completed the procedure below and removed its superseded store entries.
 >
 > None of it applies to an installation created after ADR-0006 shipped: it never
 > wrote a value at the old address, so `m0002` runs over an empty table and there
-> is nothing to move.
+> is nothing to move. An installation whose old backend was the in-memory plugin
+> has nothing to copy either (its values did not survive a restart): after `m0002`
+> its rows are simply `declared`.
 
-ADR-0006 changes the address a value is stored under in the backend plugin:
+ADR-0006 changes how a value is addressed in the value store:
 
-| | Old address | New address |
+| | Old | New |
 |---|---|---|
-| Composed of | `tenant_id` + `reference` + key class (owner or tenant) | `tenant_id` + `value_id`, a fresh UUID4 |
+| Store key | `tenant_id` + `reference` + key class (owner or tenant) | `(tenant_id, record_id)`, where `record_id` is the row's `id` |
+| Which value is current | the one value under the key | the immutable version the row points at: column `value_version` of `credstore_secrets` |
+| Integrity check | fingerprint columns `value_fp` / `fp_key_id` with a fence key kept in the store | none; PostgreSQL alone decides which version is current |
 
-The two key spaces cannot overlap, which is another way of saying that **no value
-written before ADR-0006 is reachable by the new contract** — the plugin has no
-method left that can name the old address.
+A store key holds many immutable versions. A write is a `put` that returns an
+opaque `value_version`; the row is then switched to that version in PostgreSQL.
+A row with `value_version IS NULL` is `declared` (`status = 4`); a row with a
+`value_version` is `active` (`status = 2`). The table enforces this pairing with a
+`CHECK`, so the two columns are always set together.
 
-`m0002` brings the schema to its new shape and, in doing so, empties the rows:
-`status` becomes `4` (`declared`), and `value_id`, `value_fp` and `fp_key_id`
-become `NULL`. Rows in `status IN (1, 3)` are deleted outright. Moving the values
-across is therefore a separate, one-off job that runs outside the gear, against
-the database and the backend's own API.
+No value written before ADR-0006 is reachable by the new contract: nothing was
+ever written under the new key. `m0002` therefore cannot carry values; it
+reshapes the schema and leaves every surviving row `declared`:
 
-**Part 1** is what an operator runs. **Part 2** is a prompt that generates the
+- adds `value_version` (`NULL`) and `fallback` (default `1`, `inherit`);
+- narrows the `status` check to `(2, 4)`; codes `1` and `3` are retired;
+- rows in `status IN (1, 3)` (unfinished writes and deletes) are deleted;
+- every `active` row becomes `declared`;
+- drops `value_fp`, `fp_key_id` and the index that swept unfinished rows.
+
+`m0002` moves no store bytes and mints no `value_version`. There is **no gc
+table, no maintenance job and no fingerprint fence** after it. Moving the values
+is a separate, one-off job: **scripts run by the operator**, outside the gear,
+against the database and the store's own API. The gear ships no such job.
+
+**Part 1** is what the operator runs. **Part 2** is a prompt that generates the
 three scripts Part 1 refers to.
 
 ---
@@ -37,96 +52,141 @@ three scripts Part 1 refers to.
 ## The order, and why it is this order
 
 ```
-1. export.py      snapshot everything to CSV, old version still serving   ← the backup
-2. m0002          the ordinary schema migration
-3. migrate.py     copy values in the backend, promote the rows
-4. test
-5. cleanup.py     optional, later: delete the superseded backend entries
+1. copy.py       before m0002: copy every active value into the new store, verify by value_fp
+2. m0002         the schema migration; drops value_fp, so it cannot come earlier than 1
+3. activate.py   set value_version for every migrated row from the results of 1
+4. test          verify reads
+5. cleanup.py    only now, optionally: retire the old store entries
 ```
 
-**The CSV from step 1 is the only source of truth for steps 3 and 5.** It holds
-the fingerprints `m0002` is about to null and the addresses of the rows it is
-about to delete. Without it the migration is not recoverable, and step 5 has
-nothing to work from.
+The migration is stop-the-world. The old and new key shapes and plugin contracts
+cannot both serve the same reference, so a rolling or mixed-version rollout is not
+supported.
 
-## Before stopping the old version
+**The result file of step 1 is the only link between a row and its new version.**
+It maps each row id to the `value_version` the store returned. `m0002` demotes
+every row to `declared`, so nothing in the database remembers which version
+belongs to which row. Keep the file safe until step 3 has finished, and until the
+test has passed.
 
-1. Register the new credential types in the types registry — the base type, every
+`value_fp` is available only until `m0002` runs. That is why copy and
+verification happen first, and why `m0002` is applied only after step 1 has
+succeeded.
+
+## Prerequisites
+
+1. The new store is in place and is a versioned backend with ordered versions.
+   For Vault / OpenBao that is a KV v2 mount with **`max_versions = 0`**,
+   **`delete_version_after = 0`** and **`cas_required = false`**. These are the
+   operator's obligation: the plugin does not check them at startup or later. A
+   mount that evicts versions on its own would lose values the database still
+   points at.
+2. Register the new credential types in the types registry — the base type, every
    derived type, and any custom types of your own, under
    `gts.cf.core.credstore.credential.v1~`. This is additive; the old version does
    not see them.
-2. Issue PDP policies for the new resource type and its six actions (`list`,
+3. Issue PDP policies for the new resource type and its six actions (`list`,
    `read`, `write`, `delete`, `read_secret`, `write_secret`). They are inert
-   while the old version runs, which asks about the old type — **and that is
-   what keeps authorization from failing the moment the new version starts.**
-   Skipping this breaks every call regardless of how well the values migrate.
-3. Remove any `static-credstore-plugin.config.secrets` block from deployment
-   configuration. ADR-0006 withdrew config seeding and the field is now rejected,
-   so the new version will refuse to start with it present.
-4. **Take a database dump and a backend snapshot.** Not optional: step 2 is
-   irreversible with respect to data.
-5. Run `export.py` (read-only) and read its reconciliation report. Investigate
-   anything it flags *before* going further — this is the last moment at which
-   looking costs nothing.
+   while the old version runs, **and that is what keeps authorization from
+   failing the moment the new version starts.** See the type-scoped authorization
+   ADR (0010) for who reissues what. Skipping this breaks every call regardless
+   of how well the values migrate.
+4. Remove any `static-credstore-plugin.config.secrets` block from deployment
+   configuration. Config seeding was withdrawn and the field is now rejected, so
+   the new version will refuse to start with it present.
+5. **Take a database dump and a snapshot of the old store** (and of the new one,
+   if it is not empty). Not optional: `m0002` is irreversible with respect to
+   data.
+
+## Before stopping the old version
+
+6. Run `copy.py` in its show-only mode (read-only) and read its reconciliation
+   report. Investigate anything it flags *before* going further — this is the
+   last moment at which looking costs nothing.
 
 ## The migration itself (downtime)
 
-6. Stop the old version.
-7. Apply `m0002`, either as a `--migrate-only` run or by letting the new binary
-   boot. **Point of no return for the database:** once it succeeds the rows hold
-   no values, and only `migrate.py` or the dump brings them back.
-8. Run `migrate.py`. Read its report: the fence key must be found, and both
-   `fp_mismatch` and `missing` should be zero.
-9. Start the new version.
+7. Stop the old version.
+8. Run `copy.py` for real. Read its report: `fp_mismatch` and `missing` should be
+   zero, or each entry understood. The step must succeed before `m0002`.
+9. Apply `m0002`, either as a `--migrate-only` run or by letting the new binary
+   boot. **Point of no return for the database:** once it succeeds the fingerprints
+   are gone, saga rows are deleted, and every row is `declared`; only
+   `activate.py` or the dump brings the values back.
+10. Run `activate.py`. Read its report: promoted, left `declared`.
+11. Start the new version.
 
 ## Testing
 
-10. Read a value, read an inherited value, list, rotate. If any of it goes badly,
-    restore the dump and bring the old version back — the old backend entries are
-    still there, because only step 5 touches them.
+12. Read a value, read an inherited value, list, rotate. A row left `declared`
+    (see below) returns no value; that is expected and reported by `activate.py`.
+    If anything else goes badly, roll back (below). The old store entries are still
+    there, because only step 13 touches them.
 
 ## Afterwards
 
-11. Optionally run `cleanup.py`. Nothing forces it: the superseded entries harm
+13. Optionally run `cleanup.py`. Nothing forces it: the superseded entries harm
     nothing beyond occupying space and holding a second copy of every secret.
-    **Point of no return for the backend**, and the old fence key goes last.
+    **Point of no return for the old store.** The old fence-key entry goes last.
+
+## Rows that did not get a value
+
+A row whose value was missing from the old store, or failed the fingerprint check,
+is **not** copied and stays `declared`. `activate.py` marks it `fallback = 2`
+(`none`). Reason: `fallback = 1` (`inherit`) would make resolution walk past the
+row and up the tenant chain, so the moment an ancestor is given a value the
+descendant would quietly serve *that* secret instead of returning an honest
+"no value". `none` fails closed. These records need their secret provisioned
+again by their owner.
+
+## Verification
+
+- After step 8: every `active` row is either in the result file with a
+  `value_version`, or listed as `missing` / `fp_mismatch`.
+- After step 10: no row has `status = 2` with `value_version IS NULL` (the table
+  rejects that anyway), and the number of `status = 2` rows equals the number of
+  promoted entries in the report.
+- After step 11: reads through the gear return the expected values for a sample
+  of records of each sharing mode, including an inherited one.
 
 ## Rollback
 
 Restore the database dump and start the old version. This works at any point
-before `cleanup.py` deletes anything, because the values it would delete are
-exactly what the old version reads. Policies and type registrations are additive
-and do not interfere.
+before `cleanup.py` deletes anything, because the old entries are exactly what
+the old version reads. The values written to the new store by `copy.py` are
+inert: no restored row points at them; remove them with the store's own tooling
+if they are unwanted. Policies and type registrations are additive and do not
+interfere. Do **not** use a schema `down` migration against live data: it cannot
+bring back fingerprints or dropped rows.
 
 After `cleanup.py` has run, only backups remain — and a list of key names is not
-a backup, so take a snapshot if the backend offers one.
+a backup, so take a store snapshot if the backend offers one.
 
 ---
 
 # Part 2 — The prompt
 
 Everything below is meant to be handed to an assistant together with the material
-listed under **Inputs**. It produces three scripts: `export.py`, `migrate.py`,
+listed under **Inputs**. It produces three scripts: `copy.py`, `activate.py`,
 `cleanup.py`.
 
 ## Context
 
-A credential store keeps metadata rows in PostgreSQL (`credstore_secrets`) and
-the secret values themselves in a separate backend, behind a small key-value API.
-The address of a value in that backend is changing from
-`(tenant_id, reference, key_class)` to `(tenant_id, value_id)`, where `value_id`
-is a fresh UUID4 minted per value. A SQL migration (`m0002`) has already been
-written; it updates the schema and empties the rows. Your scripts move the values
-across and put the rows back together.
+A credential store keeps metadata rows in PostgreSQL (`credstore_secrets`) and the
+secret values themselves in a separate store, behind a small key-value API. The
+address of a value is changing from `(tenant_id, reference, key_class)` to
+`(tenant_id, record_id)`, where `record_id` is the row's `id`. Writing to the new
+store is `put(key, value)`, which returns an opaque `value_version`; the row then
+records that version in the column `value_version`. A SQL migration (`m0002`)
+runs between your first and second script; it adds `value_version`, drops the
+fingerprint columns and leaves every row `declared`. Your scripts move the values
+across before it and wire the rows up after it.
 
 ### Constants
 
 ```
-nil tenant             00000000-0000-0000-0000-000000000000
-old fence key ref      cfs-internal-fence-key
-new fence key value_id f7252add-b079-558f-81e1-7a03b14a9cc9
-old generic type uuid  2a8aac98-cf09-58ed-acd6-f599f35cb5bf
-new generic type uuid  c57822de-3aae-58b7-b712-71d907c999e2
+nil tenant          00000000-0000-0000-0000-000000000000
+old fence key ref   cfs-internal-fence-key     (nil tenant, tenant key class)
 ```
 
 ### Column encodings in `credstore_secrets`
@@ -134,141 +194,126 @@ new generic type uuid  c57822de-3aae-58b7-b712-71d907c999e2
 ```
 status    1 provisioning   2 active   3 deprovisioning   4 declared
 sharing   1 private        2, 3 non-private
-fallback  1 inherit        2 none
+fallback  1 inherit        2 none          (column exists only after m0002)
 ```
 
-### Deriving the old backend address from a row
+### Deriving the old store address from a row
 
 | `sharing` | Key class | Owner component of the address |
 |---|---|---|
 | `1` | owner | the row's `owner_id` |
 | `2`, `3` | tenant | absent |
 
-This is exactly how the old gear built the argument it passed to the plugin. Use
-the key-formatting code from the old implementation supplied in **Inputs**; do
-not reconstruct the format from this description.
+This is exactly how the old version built the key it passed to the plugin. Use
+the key-formatting code from the old implementation supplied in **Inputs**; do not
+reconstruct the format from this description.
 
-## Script 1 — `export.py`
+## Script 1 — `copy.py`
 
-Runs before the migration, while the old version is still serving. Read-only.
+Runs **before** `m0002`, on the shipped schema, with the old version stopped for
+the real run (the show-only run may happen while it still serves).
 
 Read from the database:
 
 ```sql
-SELECT id, tenant_id, reference, sharing, owner_id,
-       status, value_fp, fp_key_id, secret_type_uuid, version, expires_at
+SELECT id, tenant_id, reference, sharing, owner_id, status, value_fp, fp_key_id
   FROM credstore_secrets
  ORDER BY tenant_id, reference;
 ```
 
-Enumerate the old key space in the backend. Add one more entry that exists in the
-backend but can never have a row: the old fence key, at the nil tenant under the
-reference `cfs-internal-fence-key`, tenant key class.
+Read the old fence key from the old store at the reserved entry above. If it is
+absent, stop: no fingerprint can be verified.
 
-Write a CSV with one line per entry:
-
-```
-secret_id, tenant_id, reference, sharing, owner_id, status,
-value_fp_hex, fp_key_id, secret_type_uuid, old_key, present_in_backend, kind
-```
-
-`value_fp_hex` is the `bytea` fingerprint rendered as hex; `old_key` is the
-assembled backend address; `kind` is `row` or `fence_key`.
-
-Print a reconciliation report over three groups:
+Reconciliation report (show-only mode, and the start of the real run):
 
 | Group | Expectation | If it does not hold |
 |---|---|---|
-| rows with `status = 2` | the key **is** present in the backend | Absent means the value is already gone; those rows will end up without a value. Record them |
-| rows with `status IN (1, 3)` | may or may not be present | Not a discrepancy: these are unfinished sagas |
-| present in the backend, absent from the CSV | **the fence key and nothing else** | Anything else is an orphan from a past failure. Stop and investigate before migrating |
+| rows with `status = 2` | the old key **is** present in the store | Absent means the value is already gone; the row will end up without a value. Record it as `missing` |
+| rows with `status IN (1, 3)` | may or may not be present | Not a discrepancy: unfinished writes or deletes. `m0002` deletes these rows; nothing is copied for them |
 
-## Script 2 — `migrate.py`
+For every row with `status = 2`:
 
-Runs after `m0002`, before the new version starts.
+1. Read the value at the old key.
+2. Verify the fingerprint: `HMAC-SHA256(fence_key, value)` must equal `value_fp`.
+   On a mismatch **do not copy the value**; record it as `fp_mismatch`. This check
+   is the point: a mismatch means the store entry is not the one this row is
+   supposed to name, and copying it anyway would turn a stale or foreign value
+   into a legitimate-looking current one.
+3. `put` the value at the new key `(tenant_id, record_id = row id)`; keep the
+   returned `value_version`.
+4. Read it back by that `value_version` and compare it with the value read in
+   step 1. A mismatch here is a store failure rather than a property of the data
+   — stop.
+5. Append `row id, tenant_id, value_version` to the result file. Leave the old key
+   in place.
 
-**Step 0 — the fence key, strictly first.** Read it at the old address and write
-it at `(nil tenant, f7252add-b079-558f-81e1-7a03b14a9cc9)`. If the new address
-already holds something, leave it alone. If the old address is empty, carry on
-but say so in the report.
+The result file also lists `missing` and `fp_mismatch` rows, each with its
+reason, so `activate.py` knows exactly which rows to leave alone. It never
+contains values.
 
-This must come first because the fence key is what every fingerprint was computed
-under. If the new version boots without finding it there, it generates a fresh
-one, every fingerprint in the CSV stops matching, and the migrated values come
-back as 404.
+**Idempotence.** The result file is the progress file. On a restart, skip rows
+already in it. A `put` whose result was not recorded leaves an unreferenced
+version of that key; it is harmless, and the next successful run supersedes it.
 
-**Step 1 — the values.** For every CSV line with `kind = row` and `status = 2`:
+Exit non-zero if any step failed. The operator decides whether `missing` and
+`fp_mismatch` entries are acceptable before running `m0002`.
 
-1. Mint `value_id = uuid4()`.
-2. Read the value at `old_key`.
-3. Verify the fingerprint: `HMAC-SHA256(fence_key, value)` must equal
-   `bytes.fromhex(value_fp_hex)`. On a mismatch **do not carry the value**;
-   record it as `fp_mismatch` and leave the row without one. This check is the
-   point: a mismatch means the backend entry is not the one this row is supposed
-   to name, and copying it anyway would turn a stale or foreign value into a
-   legitimate-looking new version.
-4. Write the value at the new address `(tenant_id, value_id)`.
-5. Read it back from the new address and verify the fingerprint again. A mismatch
-   here is a backend failure rather than a property of the data — stop.
-6. Promote the row:
-   ```sql
-   UPDATE credstore_secrets
-      SET status = 2, value_id = %s, value_fp = %s, fp_key_id = %s,
-          version = version + 1
-    WHERE id = %s AND status = 4;
-   ```
-   The fingerprint comes **from the CSV**; never recompute it.
-7. Leave the old key in place.
+## Script 2 — `activate.py`
 
-**Step 2 — rows that did not get a value.** For every row left in `status = 4`
-because its value was missing or its fingerprint did not match:
+Runs **after** `m0002`, before the new version starts.
+
+For every entry in the result file with a `value_version`:
+
+```sql
+UPDATE credstore_secrets
+   SET status = 2, value_version = %s, version = version + 1
+ WHERE id = %s AND status = 4 AND value_version IS NULL;
+```
+
+`status` and `value_version` are set together because the table accepts only
+`(declared, NULL)` or `(active, not NULL)`. Take `value_version` **from the result
+file**; never mint or recompute it.
+
+For every row left in `status = 4` because its value was missing or failed
+verification (that is, listed as `missing` or `fp_mismatch`):
 
 ```sql
 UPDATE credstore_secrets SET fallback = 2 WHERE id = %s AND status = 4;
 ```
 
-`fallback = 1` (`inherit`) would make resolution walk past the row and up the
-tenant chain, so the moment an ancestor is given a value the descendant would
-quietly serve **that** secret instead of returning an honest 404. `2` (`none`)
-fails closed.
+Rows that were `declared` before the migration and are not in the result file are
+left untouched.
 
-**Step 3 — type ids.** The type UUID changed:
+**Idempotence.** The `AND status = 4 AND value_version IS NULL` predicate makes a
+re-run safe: rows already activated are not touched. Before changing anything, check
+that every id in the result file still exists; report ids that do not (the
+record was deleted in the meantime).
 
-```sql
-UPDATE credstore_secrets SET secret_type_uuid = %s WHERE secret_type_uuid = %s;
-```
-
-Apply it for the generic type using the constants above, and for every custom
-type pair supplied in **Inputs**. Any `secret_type_uuid` left unmapped will fail
-resolution with `unknown_type`, so report what remains unmapped.
-
-**Idempotence.** The `AND status = 4` predicate makes a re-run safe: rows already
-promoted are not touched. Track processed lines in a progress file so a restart
-does not re-read the backend from the beginning.
-
-Report: promoted, missing from the backend, `fp_mismatch`, unmapped types. No
-values.
+Report: promoted, left `declared` with `fallback = 2`, unknown ids. No values.
 
 ## Script 3 — `cleanup.py`
 
-Runs only after testing has passed. Deletes from the backend, driven by the CSV:
+Runs only after testing has passed. Deletes from the **old** store, driven by the
+old keys recomputed from the result file and the pre-migration snapshot of the
+rows:
 
-| CSV line | Action |
+| Entry | Action |
 |---|---|
-| `kind = row`, promoted successfully | delete |
-| `kind = row`, `status` was `1` or `3` | delete — the row is gone, nothing names the key |
-| `kind = row`, `fp_mismatch` | **keep** — evidence, to be investigated separately |
-| `kind = fence_key` | delete **last**, behind its own confirmation |
+| copied and activated | delete the old key |
+| row was in `status` `1` or `3` | delete the old key — the row is gone, nothing names it |
+| `fp_mismatch` | **keep** — evidence, to be investigated separately |
+| the old fence key | delete **last**, behind its own confirmation |
 
-**The principal risk is touching a new address.** Delete strictly by the
-`old_key` column of the CSV, never by enumerating the backend. The second
-component of a new address is always a UUID; if a UUID turns up in the deletion
-list, stop.
+**The principal risk is touching a new key.** Delete strictly by the old keys the
+result file produces, never by enumerating the store. If a candidate key has the
+shape of a new key (`(tenant_id, record_id)`, with a UUID as its second
+component), stop. If the old and new stores share a mount, this check is
+mandatory.
 
 ## Requirements for all three scripts
 
-- **Never log, print or persist a secret value.** Addresses and fingerprints
-  only. The CSV must not contain values.
+- **Never log, print or persist a secret value.** Addresses, ids, fingerprints and
+  `value_version`s only. The result file must not contain values.
 - Two modes wherever anything is written or deleted: show first, act second.
 - Restartable: an interruption must not prevent a clean re-run.
 - One log line per processed entry, naming the address.
@@ -279,13 +324,13 @@ list, stop.
 
 Supply alongside this prompt:
 
-1. The backend API: how to list keys under a prefix, read, write and delete, and
-   what deleting an absent key returns.
+1. The old store API: how to read, write and delete, and what deleting an absent
+   key returns.
 2. The old implementation's key-formatting code — how
-   `(tenant_id, reference, owner_id)` became a backend key.
-3. The new implementation's key-formatting code, so the scripts can prove they
-   never touch a new address.
+   `(tenant_id, reference, owner_id)` became a store key.
+3. The new store API: `put` returning a `value_version`, read by `value_version`,
+   and the new key formatting, so the scripts can prove they never touch a new key
+   when deleting.
 4. Database connection parameters.
-5. Custom credential types, if any, as old/new UUID pairs.
 
-Expected output: `export.py`, `migrate.py`, `cleanup.py`.
+Expected output: `copy.py`, `activate.py`, `cleanup.py`.
