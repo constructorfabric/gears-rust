@@ -48,8 +48,6 @@ tracing = { workspace = true }
 # `StreamExt`/`TryStreamExt` to drive the `kube::runtime::watcher` streams that
 # back the leader, lock, and cache watches (DESIGN §4.3, §5.3, §6.3).
 futures-util = { workspace = true }
-# `v4`: one fresh UUID per lock acquisition, the holder-token fence (DESIGN §5.1).
-uuid = { workspace = true, features = ["v4"] }
 serde = { workspace = true }
 # Reads the provider's flattened operator-config options passed through by the
 # wiring crate as a serde map (DESIGN §3.5, §8).
@@ -111,21 +109,11 @@ temp-env = { workspace = true }
 # the emitted signals back for assertion.
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
-# WARN capture from spawned tasks (reaper cardinality, heartbeat) via a
-# process-global subscriber rather than tracing-test's thread-local capture.
-tracing-subscriber = { workspace = true }
 # Layer 2 conformance suite (TESTING.md §3): the shared parametrized suites run
 # against this plugin's real k3s-backed cache/leader/lock in tests/conformance.rs.
 # Path-only, no version on purpose: cargo drops a path-only dev-dependency from
 # the published manifest, and this keeps the crate out of release-plz's cycle.
 cf-gears-cluster-conformance = { path = "../../cluster-conformance" }
-# `cluster::defaults::CasBased*` and `ClusterWiring::from_config` for the
-# omit-default and per-primitive-routing tests (TESTING.md §3, §4). Dev-dep only
-# and path-only — the resulting cf-gears-cluster <-> plugin cycle is dev-only,
-# which Cargo permits.
-cluster = { package = "cf-gears-cluster", path = "../../cluster" }
-# The "foreign provider on the other side of a mix" in `K8S-SPEC-006`.
-cf-gears-standalone-cluster-plugin = { path = "../standalone-cluster-plugin" }
 
 # The Layer 2 (conformance) + Layer 3 (integration) scenarios are ONE test
 # binary (`tests/integration/main.rs`, with the former per-suite files as its

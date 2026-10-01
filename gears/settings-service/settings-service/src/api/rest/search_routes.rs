@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use axum::Router;
+use settings_service_sdk::odata::SettingFilterField;
 use toolkit::api::canonical_prelude::*;
+use toolkit::api::operation_builder::OperationBuilderODataExt;
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 use toolkit_db::{DBProvider, DbError};
 
@@ -44,7 +46,11 @@ pub fn register_routes(
              an empty result says nothing about it; a `pii` value is matched only for a \
              caller entitled to read it unmasked. A page holds up to `limit` settings; a \
              setting with several matching overrides contributes one hit per override. \
-             `$filter`, `$orderby` and `$select` are refused.",
+             `$filter` takes the grammar `GET /settings` takes - `category_id eq`, `key eq`, \
+             `key in (...)` and `needs_review eq true`, joined by `and` - and narrows the \
+             corpus in the query, so the cursor pages the filtered set; `needs_review eq \
+             true` keeps the settings with an override flagged for review in the target's \
+             subtree. `$orderby` and `$select` are refused.",
         )
         .tag(TAG)
         .authenticated()
@@ -67,6 +73,7 @@ pub fn register_routes(
             StatusCode::OK,
             "A page of hits, ordered by key, with its pagination cursors",
         )
+        .with_odata_filter::<SettingFilterField>()
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)

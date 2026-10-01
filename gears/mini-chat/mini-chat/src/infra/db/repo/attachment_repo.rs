@@ -29,6 +29,89 @@ fn db_err(e: impl std::fmt::Display) -> DomainError {
 /// Repository for attachment persistence operations.
 pub struct AttachmentRepository;
 
+// ── Upload reaper (system scope, background worker) ─────────────────────
+
+impl AttachmentRepository {
+    /// `pending` / `uploaded` rows not updated since `cutoff`, oldest first.
+    /// Rows with a `cleanup_status` are skipped: chat deletion already owns
+    /// their provider cleanup.
+    pub async fn find_stale_uploads<C: DBRunner>(
+        &self,
+        runner: &C,
+        cutoff: OffsetDateTime,
+        limit: u64,
+    ) -> Result<Vec<AttachmentModel>, DomainError> {
+        Entity::find()
+            .filter(
+                Condition::all()
+                    .add(
+                        Column::Status
+                            .is_in([AttachmentStatus::Pending, AttachmentStatus::Uploaded]),
+                    )
+                    .add(Column::DeletedAt.is_null())
+                    .add(Column::CleanupStatus.is_null())
+                    .add(Column::UpdatedAt.lt(cutoff)),
+            )
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .order_by(Column::UpdatedAt, sea_orm::Order::Asc)
+            .limit(limit)
+            .all(runner)
+            .await
+            .map_err(db_err)
+    }
+
+    /// CAS `from` → `failed` with `error_code = upload_abandoned`, only while
+    /// the row is still stale. With `schedule_cleanup` the row also gets
+    /// `cleanup_status = pending`, so the attachment cleanup handler can mark
+    /// it done after deleting the provider file. Scoped to the row's tenant.
+    /// Returns rows affected.
+    pub async fn cas_abandon_upload<C: DBRunner>(
+        &self,
+        runner: &C,
+        tenant_id: Uuid,
+        id: Uuid,
+        from: AttachmentStatus,
+        cutoff: OffsetDateTime,
+        schedule_cleanup: bool,
+    ) -> Result<u64, DomainError> {
+        let now = OffsetDateTime::now_utc();
+        let mut update = Entity::update_many()
+            .col_expr(Column::Status, Expr::value(AttachmentStatus::Failed))
+            .col_expr(
+                Column::ErrorCode,
+                Expr::value(Some(UPLOAD_ABANDONED.to_owned())),
+            )
+            .col_expr(Column::UpdatedAt, Expr::value(now));
+        if schedule_cleanup {
+            update = update
+                .col_expr(
+                    Column::CleanupStatus,
+                    Expr::value(Some(CleanupStatus::Pending)),
+                )
+                .col_expr(Column::CleanupUpdatedAt, Expr::value(Some(now)));
+        }
+        let result = update
+            .filter(
+                Condition::all()
+                    .add(Column::Id.eq(id))
+                    .add(Column::Status.eq(from))
+                    .add(Column::DeletedAt.is_null())
+                    .add(Column::CleanupStatus.is_null())
+                    .add(Column::UpdatedAt.lt(cutoff)),
+            )
+            .secure()
+            .scope_with(&AccessScope::for_tenant(tenant_id))
+            .exec(runner)
+            .await
+            .map_err(db_err)?;
+        Ok(result.rows_affected)
+    }
+}
+
+/// `error_code` of an attachment reaped by the upload reaper.
+pub const UPLOAD_ABANDONED: &str = "upload_abandoned";
+
 #[async_trait]
 impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
     async fn insert<C: DBRunner>(
@@ -111,6 +194,63 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
         Ok(result.rows_affected)
     }
 
+    async fn touch_uploaded<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<u64, DomainError> {
+        let result = Entity::update_many()
+            .col_expr(Column::UpdatedAt, Expr::value(OffsetDateTime::now_utc()))
+            .filter(
+                Condition::all()
+                    .add(Column::Id.eq(id))
+                    .add(Column::Status.eq(AttachmentStatus::Uploaded))
+                    .add(Column::DeletedAt.is_null())
+                    // Chat deletion marks its attachments for cleanup
+                    // without setting `deleted_at`; stop on those too.
+                    .add(Column::CleanupStatus.is_null()),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(runner)
+            .await
+            .map_err(db_err)?;
+        Ok(result.rows_affected)
+    }
+
+    async fn cas_fail_uploaded_for_cleanup<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        error_code: &str,
+    ) -> Result<u64, DomainError> {
+        let now = OffsetDateTime::now_utc();
+        let result = Entity::update_many()
+            .col_expr(Column::Status, Expr::value(AttachmentStatus::Failed))
+            .col_expr(Column::ErrorCode, Expr::value(Some(error_code.to_owned())))
+            .col_expr(Column::UpdatedAt, Expr::value(now))
+            .col_expr(
+                Column::CleanupStatus,
+                Expr::value(Some(CleanupStatus::Pending)),
+            )
+            .col_expr(Column::CleanupUpdatedAt, Expr::value(Some(now)))
+            .filter(
+                Condition::all()
+                    .add(Column::Id.eq(id))
+                    .add(Column::Status.eq(AttachmentStatus::Uploaded))
+                    .add(Column::DeletedAt.is_null())
+                    .add(Column::CleanupStatus.is_null()),
+            )
+            .secure()
+            .scope_with(scope)
+            .exec(runner)
+            .await
+            .map_err(db_err)?;
+        Ok(result.rows_affected)
+    }
+
     async fn cas_set_ready<C: DBRunner>(
         &self,
         runner: &C,
@@ -134,7 +274,10 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
             Condition::all()
                 .add(Column::Id.eq(params.id))
                 .add(Column::Status.eq(AttachmentStatus::Uploaded))
-                .add(Column::DeletedAt.is_null()),
+                .add(Column::DeletedAt.is_null())
+                // A row of a deleted chat (cleanup pending) never becomes
+                // `ready`; the caller treats 0 rows as a concurrent delete.
+                .add(Column::CleanupStatus.is_null()),
         );
         let result = query
             .secure()
@@ -278,9 +421,17 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
         .not();
 
         let now = OffsetDateTime::now_utc();
+        // The attachment enters the provider-cleanup state machine here, as
+        // in `mark_attachments_pending_for_chat`: the cleanup handler only
+        // advances rows that are `pending`.
         let result = Entity::update_many()
             .col_expr(Column::DeletedAt, Expr::value(Some(now)))
             .col_expr(Column::UpdatedAt, Expr::value(now))
+            .col_expr(
+                Column::CleanupStatus,
+                Expr::value(Some(CleanupStatus::Pending)),
+            )
+            .col_expr(Column::CleanupUpdatedAt, Expr::value(Some(now)))
             .filter(
                 Condition::all()
                     .add(Column::Id.eq(id))
@@ -330,7 +481,10 @@ impl crate::domain::repos::AttachmentRepository for AttachmentRepository {
                 Condition::all()
                     .add(Column::ChatId.eq(chat_id))
                     .add(Column::AttachmentKind.eq(AttachmentKind::Document))
-                    .add(Column::DeletedAt.is_null()),
+                    .add(Column::DeletedAt.is_null())
+                    // A failed upload holds no provider document; like
+                    // `sum_size_bytes`, it does not count against the limit.
+                    .add(Column::Status.ne(AttachmentStatus::Failed)),
             )
             .secure()
             .scope_with(scope)

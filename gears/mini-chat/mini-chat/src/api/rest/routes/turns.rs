@@ -2,8 +2,8 @@ use axum::Router;
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::operation_builder::OperationBuilder;
 
-use super::AiChatLicense;
-use crate::api::rest::handlers;
+use super::{AiChatLicense, retry_after_header};
+use crate::api::rest::{dto, handlers};
 
 const API_TAG: &str = "Mini Chat Turns";
 
@@ -22,8 +22,18 @@ pub(super) fn register_turn_routes(
         .path_param("id", "Chat UUID")
         .path_param("request_id", "Turn request UUID")
         .handler(handlers::turns::get_turn)
-        .json_response(http::StatusCode::OK, "Turn found")
-        .standard_errors(openapi)
+        .json_response_with_schema::<dto::TurnStatusResponse>(
+            openapi,
+            http::StatusCode::OK,
+            "Turn found",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
         .register(router, openapi);
 
     // POST {prefix}/v1/chats/{id}/turns/{request_id}/retry
@@ -37,29 +47,53 @@ pub(super) fn register_turn_routes(
         "{prefix}/v1/chats/{{id}}/turns/{{request_id}}/retry"
     ))
     .operation_id("mini_chat.retry_turn")
-    .summary("Retry a failed turn")
+    .summary("Retry the latest terminal turn and stream the new response via SSE")
     .tag(API_TAG)
     .authenticated()
     .require_license_features([&AiChatLicense])
     .path_param("id", "Chat UUID")
     .path_param("request_id", "Turn request UUID")
     .handler(handlers::turns::retry_turn)
-    .json_response(http::StatusCode::OK, "Turn retry initiated")
-    .standard_errors(openapi)
+    .sse_json::<crate::api::rest::sse::MiniChatSseEvent>(
+        openapi,
+        "SSE stream of the regenerated response",
+    )
+    .error_400(openapi)
+    .error_401(openapi)
+    .error_403(openapi)
+    .error_404(openapi)
+    .error_409(openapi)
+    .error_429(openapi)
+    .error_500(openapi)
+    .error_503(openapi)
+    .response_header(retry_after_header())
     .register(router, openapi);
 
     // PATCH {prefix}/v1/chats/{id}/turns/{request_id}
     router = OperationBuilder::patch(format!("{prefix}/v1/chats/{{id}}/turns/{{request_id}}"))
         .operation_id("mini_chat.edit_turn")
-        .summary("Edit a turn (user message)")
+        .summary("Edit the latest turn's user message and stream the new response via SSE")
         .tag(API_TAG)
         .authenticated()
         .require_license_features([&AiChatLicense])
         .path_param("id", "Chat UUID")
         .path_param("request_id", "Turn request UUID")
+        .json_request::<dto::EditTurnRequest>(openapi, "Replacement user message")
         .handler(handlers::turns::edit_turn)
-        .json_response(http::StatusCode::OK, "Turn edited")
-        .standard_errors(openapi)
+        .sse_json::<crate::api::rest::sse::MiniChatSseEvent>(
+            openapi,
+            "SSE stream of the regenerated response",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_409(openapi)
+        .error_429(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
+        .error_422(openapi)
         .register(router, openapi);
 
     // DELETE {prefix}/v1/chats/{id}/turns/{request_id}
@@ -72,8 +106,15 @@ pub(super) fn register_turn_routes(
         .path_param("id", "Chat UUID")
         .path_param("request_id", "Turn request UUID")
         .handler(handlers::turns::delete_turn)
-        .json_response(http::StatusCode::NO_CONTENT, "Turn deleted")
-        .standard_errors(openapi)
+        .no_content_response(http::StatusCode::NO_CONTENT, "Turn deleted")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_409(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
         .register(router, openapi);
 
     router

@@ -44,9 +44,9 @@ calls are in-process via ClientHub.
 
 ### Profile 2: Host + Workers
 
-The Platform Host spawns OoP Worker processes on the same host (or across hosts for the multi-node P2 variant). Workers
-communicate with the host via UDS (single-node) or TCP+mTLS (multi-node). The Platform Host runs Flight Control
-(DirectoryService) and system gears; Workers run application gears.
+Flight Control spawns OoP Worker processes on the same host (or across hosts for the multi-node P2 variant). Workers
+communicate with it via UDS (single-node) or TCP+mTLS (multi-node). Flight Control runs the DirectoryService
+(gear-orchestrator) and the control-plane system gears; Workers run the AuthZ plane and application gears.
 
 ### Profile 3: K8s Native
 

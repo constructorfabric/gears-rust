@@ -182,16 +182,26 @@ pub fn text_projection(value: &Value) -> String {
     // @cpt-end:cpt-cf-settings-service-algo-search-discoverability-attribution:p2:inst-sd-attr-2
 }
 
-/// The token a search's pagination cursor is bound to: the same query, target
-/// and corpus mint the same token, and a cursor carrying another is refused.
-/// Not a security boundary — the corpus is re-decided on every request — only
-/// a guard against continuing one search with another's cursor.
+/// The token a search's pagination cursor is bound to: the same query, target,
+/// corpus and filter mint the same token, and a cursor carrying another is
+/// refused — a cursor minted under one filter would otherwise page on under
+/// another, silently. Not a security boundary — the corpus is re-decided on
+/// every request — only a guard against continuing one search with another's
+/// cursor.
 #[must_use]
-pub fn cursor_binding(needle: &Needle, tenant: Uuid, corpus: Corpus) -> String {
+pub fn cursor_binding(
+    needle: &Needle,
+    tenant: Uuid,
+    corpus: Corpus,
+    filter: Option<&toolkit_odata::ast::Expr>,
+) -> String {
     let mut hasher = DefaultHasher::new();
     needle.as_str().hash(&mut hasher);
     tenant.hash(&mut hasher);
     corpus.hash(&mut hasher);
+    // The parsed expression, so spelling and spacing do not tell two equal
+    // filters apart.
+    format!("{filter:?}").hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -216,7 +226,12 @@ pub struct SearchRequest<'a> {
     /// The most matching override rows a page fetches; more than that and the
     /// search is refused rather than cut short of its hits.
     pub override_limit: usize,
-    /// Page size, cursor and the binding the cursor must carry.
+    /// `needs_review eq true`: only settings with an override flagged for
+    /// review at one of the tenants — a narrowing of the corpus, in the page
+    /// query, where browse switches its listing instead.
+    pub flagged_only: bool,
+    /// Page size, cursor, the declaration-selecting `$filter` remainder and
+    /// the binding the cursor must carry.
     pub query: &'a ODataQuery,
 }
 
@@ -249,8 +264,9 @@ pub trait SearchRepository: Send + Sync {
     /// Schema Default (within the corpus and not JSON `null`), or an override
     /// explicitly set at one of the request's tenants (within the corpus,
     /// never a secret row). The scope and visibility narrow the page as they
-    /// narrow browsing; the query carries `limit`, `cursor` and the
-    /// `filter_hash` the cursor is bound to.
+    /// narrow browsing; so do the query's `$filter` on `key` and
+    /// `category_id`, and `flagged_only`; the query carries `limit`, `cursor`
+    /// and the `filter_hash` the cursor is bound to.
     ///
     /// # Errors
     /// [`DomainError::Validation`] for a cursor that does not decode or was

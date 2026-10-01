@@ -109,6 +109,3 @@ types-registry-sdk = { workspace = true, features = ["test-util"] }
 # `toolkit_canonical_errors::CanonicalError` don't rely on it being pulled in
 # transitively via the normal (`[dependencies]`) build graph.
 toolkit-canonical-errors = { workspace = true }
-# Captures `tracing` output for the guard-table backfill migration test's
-# `tracing::warn!` assertion (`#[tracing_test::traced_test]` + `logs_contain`).
-tracing-test = { workspace = true, features = ["no-env-filter"] }

@@ -39,10 +39,10 @@ fn make_entry(model_id: &str, tier: ModelTier) -> ModelCatalogEntry {
             available_from: OffsetDateTime::UNIX_EPOCH,
             max_file_size_mb: 25,
             api_params: ModelApiParams {
-                temperature: 0.7,
-                top_p: 1.0,
-                frequency_penalty: 0.0,
-                presence_penalty: 0.0,
+                temperature: Some(0.7),
+                top_p: Some(1.0),
+                frequency_penalty: Some(0.0),
+                presence_penalty: Some(0.0),
                 stop: vec![],
                 extra_body: None,
                 reasoning_effort: None,
@@ -232,4 +232,90 @@ async fn user_limits_reflect_custom_config() {
 
     assert_eq!(limits.standard.limit_daily_credits_micro, 42);
     assert_eq!(limits.premium.limit_monthly_credits_micro, 99);
+}
+
+#[test]
+fn config_rejects_zero_credit_multiplier() {
+    let mut entry = make_entry("m", ModelTier::Standard);
+    let cfg = StaticMiniChatPolicyPluginConfig {
+        model_catalog: vec![entry.clone()],
+        ..StaticMiniChatPolicyPluginConfig::default()
+    };
+    cfg.validate().unwrap();
+
+    entry.output_tokens_credit_multiplier_micro = 0;
+    let cfg = StaticMiniChatPolicyPluginConfig {
+        model_catalog: vec![entry],
+        ..StaticMiniChatPolicyPluginConfig::default()
+    };
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        err.contains("output_tokens_credit_multiplier_micro"),
+        "{err}"
+    );
+}
+
+fn validate_one(entry: ModelCatalogEntry) -> Result<(), String> {
+    StaticMiniChatPolicyPluginConfig {
+        model_catalog: vec![entry],
+        ..StaticMiniChatPolicyPluginConfig::default()
+    }
+    .validate()
+}
+
+#[test]
+fn config_credit_multiplier_bounds() {
+    use crate::domain::service::credit_arithmetic::MAX_MULT;
+    let base = make_entry("m", ModelTier::Standard);
+
+    let mut entry = base.clone();
+    entry.input_tokens_credit_multiplier_micro = MAX_MULT;
+    entry.output_tokens_credit_multiplier_micro = MAX_MULT;
+    validate_one(entry).unwrap();
+
+    for (input, output) in [(MAX_MULT + 1, 1), (1, MAX_MULT + 1), (0, 1)] {
+        let mut entry = base.clone();
+        entry.input_tokens_credit_multiplier_micro = input;
+        entry.output_tokens_credit_multiplier_micro = output;
+        let err = validate_one(entry).unwrap_err();
+        let field = if output == 1 {
+            "input_tokens_credit_multiplier_micro"
+        } else {
+            "output_tokens_credit_multiplier_micro"
+        };
+        assert!(err.contains(field), "{err}");
+    }
+}
+
+#[test]
+fn config_rejects_zero_bytes_per_token() {
+    let mut entry = make_entry("m", ModelTier::Standard);
+    entry.estimation_budgets.bytes_per_token_conservative = 0;
+    let err = validate_one(entry).unwrap_err();
+    assert!(
+        err.contains("estimation_budgets.bytes_per_token_conservative"),
+        "{err}"
+    );
+}
+
+#[test]
+fn config_accepts_partial_kill_switches() {
+    let cfg: StaticMiniChatPolicyPluginConfig = serde_json::from_value(serde_json::json!({
+        "model_catalog": [],
+        "kill_switches": { "disable_images": true }
+    }))
+    .expect("a partial kill_switches object parses");
+    assert!(cfg.kill_switches.disable_images);
+    assert!(!cfg.kill_switches.disable_web_search);
+    assert!(!cfg.kill_switches.force_standard_tier);
+}
+
+#[test]
+fn config_rejects_unknown_kill_switch() {
+    let err = serde_json::from_value::<StaticMiniChatPolicyPluginConfig>(serde_json::json!({
+        "model_catalog": [],
+        "kill_switches": { "disable_image": true }
+    }))
+    .expect_err("a misspelled kill switch is a config error");
+    assert!(err.to_string().contains("disable_image"), "{err}");
 }

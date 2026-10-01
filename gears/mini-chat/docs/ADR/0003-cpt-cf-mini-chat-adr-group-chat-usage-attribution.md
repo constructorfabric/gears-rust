@@ -76,10 +76,10 @@ Chosen option: "Tenant-owned resource with usage attributed to the requesting se
 
 ### Confirmation
 
-* Design review: verify shared chat resource model is tenant-owned and uses group membership predicates in PDP constraints.
-* Integration tests: simulate two users in the same tenant; confirm per-request quota usage increments only for the sender and that access decisions are enforced correctly.
-* Audit validation: verify emitted audit events include both `requester_user_id` and tenant billing attribution (`billing_tenant_id = chat.tenant_id`) and that system tasks use `requester_type=system`.
-* Metrics validation: verify system-attributed usage is observable via a bounded-label metric series (no tenant/user labels).
+* Design review (P2+, with group chats): verify shared chat resource model is tenant-owned and uses group membership predicates in PDP constraints.
+* Integration tests (P2+, with group chats): two users in the same group chat; confirm per-request quota usage increments only for the sender. P1 has single-user chats only; `testing/e2e/suites/mini_chat/test_isolation.py` covers the P1 part: `TestQuotaIsolation::test_other_user_usage_is_not_charged` (a send by user A does not change user B's usage) and `TestIsolation` (another user in the same tenant gets 404 on A's resources).
+* Audit validation (P2+, with group chats): verify emitted audit events include both `requester_user_id` and tenant billing attribution (`billing_tenant_id = chat.tenant_id`) and that system tasks use `requester_type=system`.
+* Metrics validation (P2+): verify system-attributed usage is observable via a bounded-label metric series (no tenant/user labels).
 
 ## Pros and Cons of the Options
 
@@ -114,7 +114,7 @@ The chat creator is treated as an “owner” and all usage is billed/limited ag
 ## More Information
 
 * This ADR defines accounting semantics only. Authorization semantics for group chats (membership, read/write/manage roles, share links) are a separate decision and should be captured in a dedicated ADR when Projects/Sharing (P2) is designed.
-* This attribution model is also used in P0 for system-initiated background tasks (thread summary refresh, doc summary generation): they use `requester_type=system` and are charged to a tenant operational bucket (not a user), while still being included in tenant-level billing and audit logs.
+* System-initiated background tasks use `requester_type=system` and are never charged to a user. In P1 the only such task is the thread summary refresh. It emits a usage event with `billing_outcome=system_task` and `actual_credits_micro=0`, and is not audited. Doc summary generation is not implemented. Charging a tenant operational bucket, auditing system tasks and applying kill switches to them are P2+; see `cpt-cf-mini-chat-adr-quota-policy-scope`.
 
 ## Traceability
 

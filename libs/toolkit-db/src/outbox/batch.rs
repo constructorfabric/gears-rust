@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use super::handler::OutboxMessage;
 
@@ -16,23 +17,30 @@ pub struct Rejection {
 ///
 /// Provides single-message and chunked iteration, progress tracking, and
 /// remaining lease time. The handler owns timeout decisions - `Batch` only
-/// exposes facts (`remaining()`, `len()`), never timeout suggestions.
+/// exposes facts (`remaining()`, `should_stop()`, `len()`), never timeout
+/// suggestions.
 pub struct Batch<'a> {
     msgs: &'a [OutboxMessage],
     cursor: usize,
     processed: u32,
     rejections: Vec<Rejection>,
     lease_deadline: Instant,
+    cancel: CancellationToken,
 }
 
 impl<'a> Batch<'a> {
-    pub(crate) fn new(msgs: &'a [OutboxMessage], lease_deadline: Instant) -> Self {
+    pub(crate) fn new(
+        msgs: &'a [OutboxMessage],
+        lease_deadline: Instant,
+        cancel: CancellationToken,
+    ) -> Self {
         Self {
             msgs,
             cursor: 0,
             processed: 0,
             rejections: Vec::new(),
             lease_deadline,
+            cancel,
         }
     }
 
@@ -82,6 +90,15 @@ impl<'a> Batch<'a> {
             .unwrap_or(Duration::ZERO)
     }
 
+    /// Whether the handler should stop starting new messages: the lease
+    /// budget is spent or the outbox is shutting down. Checked between
+    /// messages; the message already in flight keeps its budget, which
+    /// [`Self::remaining`] goes on reporting from the lease alone.
+    #[must_use]
+    pub fn should_stop(&self) -> bool {
+        self.remaining().is_zero() || self.cancel.is_cancelled()
+    }
+
     /// Number of unconsumed messages remaining.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -127,7 +144,7 @@ mod tests {
     fn next_iterates_all_messages() {
         let msgs: Vec<OutboxMessage> = (1..=3).map(make_msg).collect();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut batch = Batch::new(&msgs, deadline);
+        let mut batch = Batch::new(&msgs, deadline, CancellationToken::new());
 
         assert_eq!(batch.len(), 3);
         assert!(!batch.is_empty());
@@ -143,7 +160,7 @@ mod tests {
     fn next_chunk_returns_correct_slices() {
         let msgs: Vec<OutboxMessage> = (1..=7).map(make_msg).collect();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut batch = Batch::new(&msgs, deadline);
+        let mut batch = Batch::new(&msgs, deadline, CancellationToken::new());
 
         let chunk1 = batch.next_chunk(3);
         assert_eq!(chunk1.len(), 3);
@@ -164,7 +181,7 @@ mod tests {
     fn ack_and_ack_chunk_track_progress() {
         let msgs: Vec<OutboxMessage> = (1..=5).map(make_msg).collect();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut batch = Batch::new(&msgs, deadline);
+        let mut batch = Batch::new(&msgs, deadline, CancellationToken::new());
 
         assert_eq!(batch.processed(), 0);
 
@@ -181,7 +198,7 @@ mod tests {
     fn reject_tracks_rejection_and_progress() {
         let msgs: Vec<OutboxMessage> = (1..=3).map(make_msg).collect();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let mut batch = Batch::new(&msgs, deadline);
+        let mut batch = Batch::new(&msgs, deadline, CancellationToken::new());
 
         batch.next_msg(); // msg 1
         batch.ack();
@@ -200,7 +217,7 @@ mod tests {
     fn remaining_returns_time_until_deadline() {
         let msgs: Vec<OutboxMessage> = vec![];
         let deadline = Instant::now() + Duration::from_secs(10);
-        let batch = Batch::new(&msgs, deadline);
+        let batch = Batch::new(&msgs, deadline, CancellationToken::new());
         let remaining = batch.remaining();
         // Should be close to 10s (allow some slack for test execution)
         assert!(remaining > Duration::from_secs(9));
@@ -211,7 +228,27 @@ mod tests {
     fn remaining_returns_zero_when_past_deadline() {
         let msgs: Vec<OutboxMessage> = vec![];
         let deadline = Instant::now(); // already expired
-        let batch = Batch::new(&msgs, deadline);
+        let batch = Batch::new(&msgs, deadline, CancellationToken::new());
         assert_eq!(batch.remaining(), Duration::ZERO);
+    }
+
+    #[test]
+    fn should_stop_once_the_lease_is_spent() {
+        let msgs: Vec<OutboxMessage> = vec![];
+        let batch = Batch::new(&msgs, Instant::now(), CancellationToken::new());
+        assert!(batch.should_stop());
+    }
+
+    #[test]
+    fn should_stop_on_cancel_while_remaining_keeps_the_lease() {
+        let msgs: Vec<OutboxMessage> = vec![];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let cancel = CancellationToken::new();
+        let batch = Batch::new(&msgs, deadline, cancel.clone());
+        assert!(!batch.should_stop());
+
+        cancel.cancel();
+        assert!(batch.should_stop());
+        assert!(batch.remaining() > Duration::from_secs(9));
     }
 }

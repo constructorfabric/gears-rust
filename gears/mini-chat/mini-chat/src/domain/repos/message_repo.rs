@@ -169,16 +169,19 @@ pub trait MessageRepository: Send + Sync {
         chat_id: Uuid,
     ) -> Result<Option<(i64, i64)>, DomainError>;
 
-    /// Fetch the latest non-deleted message frontier for a chat.
+    /// Fetch the latest non-deleted message of the chat that does not belong
+    /// to the turn `exclude_request_id`.
     ///
-    /// Returns `(created_at, message_id)` of the most recent message,
-    /// used as `frozen_target_frontier` for thread summary trigger.
-    /// Returns `None` if the chat has no messages.
-    async fn find_latest_message<C: DBRunner>(
+    /// Returns `(created_at, message_id)`, used as `frozen_target_frontier`
+    /// for the thread summary trigger. The finalized turn is excluded so the
+    /// summary never covers the latest turn, which retry, edit and delete may
+    /// still replace. Returns `None` if no such message exists.
+    async fn find_latest_message_before_turn<C: DBRunner>(
         &self,
         runner: &C,
         scope: &AccessScope,
         chat_id: Uuid,
+        exclude_request_id: Uuid,
     ) -> Result<Option<crate::domain::repos::SummaryFrontier>, DomainError>;
 
     /// Fetch messages in a range defined by frontiers for thread summary.

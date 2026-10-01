@@ -37,10 +37,11 @@ pub struct ProducerOutboxEnvelope {
     data: Option<serde_json::Value>,
     broker_partition: u32,
     // `ProducerMode` is a transport-free SDK type (no serde derives), so the
-    // envelope - a private wire DTO - maps it through a local serde DTO
-    // (`producer_mode_dto`) rather than serializing the SDK enum directly. The
-    // field stays the domain type; only the wire mapping lives in the adapter.
-    #[serde(with = "producer_mode_dto")]
+    // envelope - the outbox row's private wire form - maps it through a local
+    // serde mirror (`producer_mode_wire`) rather than serializing the SDK enum
+    // directly. The field stays the domain type; only the wire mapping lives in
+    // the adapter.
+    #[serde(with = "producer_mode_wire")]
     producer_mode: ProducerMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     producer_id: Option<ProducerId>,
@@ -49,25 +50,26 @@ pub struct ProducerOutboxEnvelope {
     diagnostic_metadata: ProducerOutboxDiagnostics,
 }
 
-/// Private wire DTO for [`ProducerMode`] inside [`ProducerOutboxEnvelope`].
+/// Private wire mirror of [`ProducerMode`] inside [`ProducerOutboxEnvelope`].
 /// `ProducerMode` carries no serde derives (SDK types stay transport-free), so
 /// this local serde-derived mirror is the one place the mode's wire form is
-/// defined; `#[serde(with = "producer_mode_dto")]` maps the envelope field
-/// through it.
-mod producer_mode_dto {
+/// defined; `#[serde(with = "producer_mode_wire")]` maps the envelope field
+/// through it. It is an outbox row format, not a REST DTO: it has no OpenAPI
+/// schema and does not belong under `api/rest`.
+mod producer_mode_wire {
     use serde::{Deserialize, Serialize};
 
     use crate::api::ProducerMode;
 
     #[derive(Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
-    enum ProducerModeDto {
+    enum ProducerModeWire {
         Stateless,
         Monotonic,
         Chained,
     }
 
-    impl From<ProducerMode> for ProducerModeDto {
+    impl From<ProducerMode> for ProducerModeWire {
         fn from(mode: ProducerMode) -> Self {
             match mode {
                 ProducerMode::Stateless => Self::Stateless,
@@ -77,12 +79,12 @@ mod producer_mode_dto {
         }
     }
 
-    impl From<ProducerModeDto> for ProducerMode {
-        fn from(dto: ProducerModeDto) -> Self {
-            match dto {
-                ProducerModeDto::Stateless => Self::Stateless,
-                ProducerModeDto::Monotonic => Self::Monotonic,
-                ProducerModeDto::Chained => Self::Chained,
+    impl From<ProducerModeWire> for ProducerMode {
+        fn from(wire: ProducerModeWire) -> Self {
+            match wire {
+                ProducerModeWire::Stateless => Self::Stateless,
+                ProducerModeWire::Monotonic => Self::Monotonic,
+                ProducerModeWire::Chained => Self::Chained,
             }
         }
     }
@@ -91,13 +93,13 @@ mod producer_mode_dto {
         mode: &ProducerMode,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        ProducerModeDto::from(*mode).serialize(serializer)
+        ProducerModeWire::from(*mode).serialize(serializer)
     }
 
     pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> Result<ProducerMode, D::Error> {
-        Ok(ProducerModeDto::deserialize(deserializer)?.into())
+        Ok(ProducerModeWire::deserialize(deserializer)?.into())
     }
 }
 

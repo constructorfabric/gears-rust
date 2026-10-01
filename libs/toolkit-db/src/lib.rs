@@ -222,7 +222,10 @@ pub enum DbError {
     #[error("SQLite pragma error: {0}")]
     SqlitePragma(String),
 
-    #[error("Environment variable '{name}': {source}")]
+    /// `{name:?}` rather than `'{name}'`: the name comes from configuration
+    /// and is printed in a log line, and `Debug` escapes a newline or a
+    /// control character in it, so the line cannot be split.
+    #[error("Environment variable {name:?}: {source}")]
     EnvVar {
         name: String,
         source: std::env::VarError,

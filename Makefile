@@ -38,7 +38,7 @@ OPENAPI_SERVER_FEATURE_ARGS ?= $(E2E_SERVER_FEATURE_ARGS)
 # `shear`, which drives -Zunpretty=expanded). This default serves local runs;
 # CI overrides it via `make shear RUST_NIGHTLY=...` so the toolchain it installs
 # and caches cannot drift from the one that actually compiles.
-RUST_NIGHTLY ?= nightly-2026-04-16
+RUST_NIGHTLY ?= nightly-2026-08-21
 
 # cargo-shear version installed by `make setup`. Pinned because an unused-dep
 # verdict that disagrees with CI is worse than no local check at all.
@@ -664,7 +664,7 @@ GEAR_COVERAGE_ARGS := $(if $(GEAR),--package $(firstword $(subst -p ,,$(GEAR_PKG
 
 # --- Server feature selection for run / openapi ---
 # Base features always enabled when running a focused server.
-GEAR_SERVER_BASE_FEATURES ?= static-tenants,static-authn,static-authz,account-management
+GEAR_SERVER_BASE_FEATURES ?= static-tenants,static-authn,static-authz
 # System gears that are non-optional deps of the example server (always linked).
 GEAR_SERVER_ALWAYS_LINKED ?= api-gateway gear-orchestrator types-registry tenant-resolver authn-resolver authz-resolver
 # Check whether GEAR is a valid example-server feature or an always-linked gear.
@@ -673,7 +673,11 @@ GEAR_SERVER_ALWAYS_LINKED ?= api-gateway gear-orchestrator types-registry tenant
 GEAR_HAS_SERVER_FEATURE := $(or $(filter $(GEAR),$(GEAR_SERVER_ALWAYS_LINKED)),$(filter $(GEAR),$(EXAMPLE_SERVER_ALL_FEATURES)))
 # The gear itself as an optional feature (empty if it's an always-linked gear).
 GEAR_SERVER_OPTIONAL_FEATURES := $(if $(GEAR_HAS_SERVER_FEATURE),$(filter-out $(GEAR_SERVER_ALWAYS_LINKED),$(GEAR)),)
-GEAR_SERVER_FEATURES ?= $(GEAR_SERVER_OPTIONAL_FEATURES)$(if $(GEAR_SERVER_OPTIONAL_FEATURES),$(COMMA),)$(GEAR_SERVER_BASE_FEATURES)
+# Extra local-dev plugins a gear needs to start (GEAR_SERVER_EXTRA_FEATURES_<gear>).
+# mini-chat registers OAGW upstreams whose secret_ref OAGW checks in credstore.
+GEAR_SERVER_EXTRA_FEATURES_mini-chat ?= static-credstore
+GEAR_SERVER_EXTRA_FEATURES := $(GEAR_SERVER_EXTRA_FEATURES_$(GEAR))
+GEAR_SERVER_FEATURES ?= $(GEAR_SERVER_OPTIONAL_FEATURES)$(if $(GEAR_SERVER_OPTIONAL_FEATURES),$(COMMA),)$(GEAR_SERVER_BASE_FEATURES)$(if $(GEAR_SERVER_EXTRA_FEATURES),$(COMMA)$(GEAR_SERVER_EXTRA_FEATURES),)
 GEAR_SERVER_FEATURE_ARGS := $(if $(GEAR),$(if $(GEAR_HAS_SERVER_FEATURE),--no-default-features --features $(GEAR_SERVER_FEATURES),),$(EXAMPLE_SERVER_FEATURE_ARGS))
 
 # --- OpenAPI ---

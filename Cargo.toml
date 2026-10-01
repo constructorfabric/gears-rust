@@ -51,6 +51,7 @@ debug = true
 [workspace]
 members = [
     "apps/cf-gears-example-server",
+    "apps/cf-gears-flight-control",
     "tools/gts-analyze",
     "tools/xtask",
     "libs/toolkit",
@@ -269,6 +270,9 @@ unnecessary_wraps = "deny"
 unnested_or_patterns = "deny"
 unreadable_literal = "deny"
 unused_async = "deny"
+# Trait impls stay `async fn` to mirror the trait; the lint's `future::ready`
+# rewrite runs the body at call time instead of first poll.
+unused_async_trait_impl = "allow"
 unused_self = "deny"
 unwrap_used = "deny"
 use_debug = "deny"
@@ -379,7 +383,6 @@ cf-gears-cluster-conformance = { version = "0.3.8", path = "gears/system/cluster
 
 # System gears SDKs
 account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.7.5", path = "gears/system/account-management/account-management-sdk" }
-keycloak-idp-plugin = { package = "cf-gears-keycloak-idp-plugin", version = "0.1.7", path = "gears/system/account-management/plugins/keycloak-idp-plugin" }
 cluster-sdk = { package = "cf-gears-cluster-sdk", version = "0.2.8", path = "gears/system/cluster/cluster-sdk" }
 types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.9", path = "gears/system/types-registry/types-registry-sdk" }
 tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.4.5", path = "gears/system/tenant-resolver/tenant-resolver-sdk" }
@@ -424,7 +427,7 @@ aws-lc-rs = "1.17"
 
 # settings-service
 settings-service-sdk = { package = "cf-gears-settings-service-sdk", version = "0.1.0", path = "gears/settings-service/settings-service-sdk" }
-settings-service = { package = "cf-gears-settings-service", version = "0.1.0", path = "gears/settings-service/settings-service" }
+settings-service = { package = "cf-gears-settings-service", version = "0.1.2", path = "gears/settings-service/settings-service" }
 
 # credstore
 credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.17", path = "gears/credstore/credstore-sdk" }
@@ -569,6 +572,9 @@ proptest = "1"
 
 # CLI support
 clap = { version = "4.5", features = ["derive"] }
+
+# Allocator
+mimalloc = { version = "0.1" }
 
 # Database utilities
 #
@@ -781,7 +787,7 @@ proc-macro-crate = "3"
 # `testcontainers` pair it wraps.
 test-containers = { package = "cf-gears-test-containers", path = "libs/test-containers" }
 trybuild = "1"
-serial_test = { version = "3", features = ["file_locks"] }
+serial_test = { version = "4", features = ["file_locks"] }
 criterion = { version = "0.8", default-features = false }
 testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
 testcontainers-modules = { version = "0.15", default-features = false, features = ["aws-lc-rs", "postgres", "mysql", "redis"] }
@@ -824,7 +830,6 @@ magika = "1.1"
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"] }
 
 # Additional testing utilities
-tokio-test = "0.4"
 mockall = "0.15"
 temp-env = { version = "0.3", features = ["async_closure"] }
 wiremock = "0.6"

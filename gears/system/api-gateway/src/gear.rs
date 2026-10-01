@@ -1849,7 +1849,7 @@ mod tests {
         use toolkit::contracts::ApiGatewayCapability;
 
         let cfg = ApiGatewayConfig {
-            advertise_uri: Some("http://platform-host:8087".to_owned()),
+            advertise_uri: Some("http://flight-control:8087".to_owned()),
             ..Default::default()
         };
         let api = ApiGateway::new(cfg.clone());
@@ -1859,7 +1859,7 @@ mod tests {
 
         assert_eq!(
             api.bound_endpoint(),
-            Some("http://platform-host:8087".to_owned())
+            Some("http://flight-control:8087".to_owned())
         );
     }
 
@@ -1908,7 +1908,7 @@ mod tests {
         // published verbatim: the prefix is NOT appended, so the operator must
         // include it themselves (here it does). The prefix is not doubled.
         let cfg = ApiGatewayConfig {
-            advertise_uri: Some("http://platform-host:8087/cf".to_owned()),
+            advertise_uri: Some("http://flight-control:8087/cf".to_owned()),
             prefix_path: "/cf".to_owned(),
             ..Default::default()
         };
@@ -1919,7 +1919,7 @@ mod tests {
 
         assert_eq!(
             api.bound_endpoint(),
-            Some("http://platform-host:8087/cf".to_owned())
+            Some("http://flight-control:8087/cf".to_owned())
         );
     }
 

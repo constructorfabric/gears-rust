@@ -41,6 +41,7 @@ pub mod search_dto;
 pub mod search_handlers;
 pub mod search_routes;
 pub mod setting_dto;
+pub mod setting_filter;
 pub mod setting_handlers;
 pub mod setting_routes;
 pub mod value_dto;

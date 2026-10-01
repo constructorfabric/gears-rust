@@ -18,7 +18,7 @@ name = "grpc_hub"
 [features]
 default = []
 # Enable the Kubernetes TokenReview validator for `internal_auth: { provider:
-# kube }` on the inbound gRPC platform-plane middleware (Profile 3 platform host).
+# kube }` on the inbound gRPC platform-plane middleware (Profile 3 flight control).
 k8s-auth = ["dep:toolkit-k8s-auth"]
 
 [lints]

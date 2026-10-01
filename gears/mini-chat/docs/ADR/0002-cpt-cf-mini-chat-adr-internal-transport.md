@@ -40,11 +40,11 @@ Chosen option: "HTTP with SSE passthrough", because OAGW already speaks HTTP, Op
 
 ### Confirmation
 
-* Code review: `llm_provider` uses `reqwest` HTTP client, not a gRPC client
-* Integration test: verify OAGW preserves SSE streaming semantics (no buffering) and that `llm_provider` can parse provider SSE and translate it to the stable client SSE contract
-* Cancellation test: verify HTTP connection abort propagates through OAGW within 200 ms
-* Ops check: verify active streams and connection pressure are observable (for example `mini_chat_active_streams{instance}` and instance-level FD monitoring)
-* Infrastructure validation: confirm proxy buffering is disabled for SSE passthrough on both OAGW and `api_gateway`
+* Code review: `llm_provider` sends HTTP requests through the in-process OAGW client (`oagw_sdk::ServiceGatewayClientV1::proxy_request`, resolved from ClientHub) and consumes the SSE response; no gRPC client is used
+* E2E: `test_principles.py::TestPrinciples::test_no_buffering` (`testing/e2e/suites/mini_chat`) checks that deltas reach the client before the provider finishes; the adapter unit tests (`mini-chat/src/infra/llm/providers/*_tests.rs`) cover parsing of provider SSE into the client SSE contract
+* Cancellation through OAGW within 200 ms: no automated test. `mini_chat_time_to_abort_ms` measures only the Mini Chat side (disconnect observed to provider stream cancelled)
+* Ops check (manual): active streams are observable via `mini_chat_active_streams`; FD monitoring is instance-level infrastructure
+* Infrastructure validation (manual): confirm proxy buffering is disabled for SSE passthrough on both OAGW and `api_gateway`
 
 ## Pros and Cons of the Options
 

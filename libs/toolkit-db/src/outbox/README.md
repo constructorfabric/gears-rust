@@ -338,9 +338,11 @@ The most common case. Implement `LeasedMessageHandler` - one message, one
 result. Use `HttpClient` from `cf-gears-toolkit-http` for the outgoing call.
 
 **Cancellation is framework-managed.** The processor drops the handler
-future when the lease cancel point is reached (`lease_duration - ack_headroom`).
-In-flight `HttpClient` calls are cancelled via drop - hyper closes the
-connection.
+future when the lease cancel point is reached (`lease_duration - ack_headroom`),
+or `WorkerTuning::stop_grace` (default 5s) after `stop()`, whichever comes
+first. Shutdown never waits out the lease. In-flight `HttpClient` calls are
+cancelled via drop - hyper closes the connection. The ack still runs after a
+drop, so the unfinished message is retried and the partition is released.
 
 ```rust
 use toolkit_db::outbox::{LeasedMessageHandler, MessageResult, OutboxMessage};
@@ -435,7 +437,9 @@ use toolkit_db::outbox::{Batch, HandlerResult, LeasedHandler};
 #[async_trait::async_trait]
 impl LeasedHandler for BulkExportHandler {
     async fn handle(&self, batch: &mut Batch<'_>) -> HandlerResult {
-        while !batch.is_empty() {
+        // should_stop() turns true once the lease budget is spent or the
+        // outbox is shutting down; acked chunks are kept, the rest retried.
+        while !batch.is_empty() && !batch.should_stop() {
             let chunk = batch.next_chunk(10);
             if chunk.is_empty() {
                 break;

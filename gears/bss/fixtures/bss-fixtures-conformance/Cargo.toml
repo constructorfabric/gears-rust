@@ -29,4 +29,3 @@ chrono = { workspace = true }
 # crate onto the other's major is a code change nobody has reviewed, so this one
 # states its own. The lockfile already resolves both.
 toml = "1"
-serde = { workspace = true }
