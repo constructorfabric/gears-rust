@@ -403,7 +403,9 @@ erDiagram
 **Type-stability invariants** (`cpt-cf-quota-enforcement-constraint-toolkit`):
 
 - All enums (`QuotaType`, `EnforcementMode`, `QuotaSource`, `LeaseState`, `DecisionResult`, `NotificationEventKind`,
-`PolicyVersionState`) are closed at SDK boundary.
+`PolicyVersionState`) are closed at SDK boundary. They serialize as their snake_case names on the wire and in storage
+  (a CHECK-constrained column), a reader rejects an unrecognized value as `Internal`, the names are stable, and adding,
+  renaming, or removing a variant is an SDK major-version change.
 - Input deserialization uses `serde(deny_unknown_fields)`, with one exception: the top-level request bodies of the
   consumption, lease, and batch-debit operations (and each batch item) tolerate unknown fields, so a Decision-shaped
   field a caller echoes back (`result`, `debit_plan`, `diagnostics`) is silently ignored per PRD §3.4; the attribution
@@ -1279,9 +1281,8 @@ of them. QE source is the same in both.
 - At most one participant observes itself as leader in steady state; the claim lapses within the election TTL when the
   holder dies, so a survivor is elected within the TTL plus observation lag. This bounds
   `cpt-cf-quota-enforcement-nfr-recovery` (RTO ≤ 15 min).
-- The signal is advisory: two replicas can both run the sweep body for a bounded window after a partition. Both sweep
-  bodies are idempotent (lazy semantic release I4; retention deletes find nothing twice), so the window costs duplicate
-  work, never incorrect state.
+- The signal is advisory: two replicas can both run the sweep body for a bounded window after a partition. All three bodies tolerate it (lazy semantic release I4; retention deletes find nothing twice; the gauge refresh only
+  publishes an absolute snapshot), so the window costs duplicate work, never incorrect state.
 - The `Linearizable` requirement excludes eventually consistent backends, which can elect two leaders on every
   failover (cluster ADR-009).
 
@@ -1318,7 +1319,7 @@ the §3.3 mapping table (`Timeout` → `CanonicalError::DeadlineExceeded`; `Cost
 **Compiled-artifact cache contract.** Engines whose `evaluate` requires a non-trivial compiled artifact (CEL AST,
 future Wasm module instantiation, etc.) rely on a `ValidatedConfig` cache keyed by `(policy_id, policy_version)` that
 **MUST** be compiled as part of every Policy create / update and published to the cache after the transaction commits;
-a rolled-back transaction publishes nothing, and a cache miss rebuilds from the persisted Engine-validated config.
+a rolled-back transaction publishes nothing, the cache is bounded at `artifact_cache_entries` (default 512, oldest evicted first), and a cache miss rebuilds from the persisted Engine-validated config.
 
 P1 ships two implementations:
 
@@ -1473,7 +1474,7 @@ renegotiating the corresponding invariant or NFR, and that renegotiation is out 
 - The persistent backend is reached only via the Storage plugin; no other QE component opens connections.
 - Only integration / adapter components talk to external systems (`StoragePlugin` → persistent backend;
   `CoordinationAdapter` → platform `cluster` gear; `Gateway` → PDP via `authz-resolver-sdk::PolicyEnforcer`).
-  Telemetry has no QE-side adapter — components emit `tracing` events directly.
+  Metrics leave QE only through the `QeMetrics` port, whose `OpenTelemetry` adapter is the one telemetry adapter; logs and spans use `tracing` directly.
 
 ### 3.6 Interactions & Sequences
 
@@ -1553,7 +1554,7 @@ rule of `cpt-cf-quota-enforcement-fr-idempotency` by never re-invoking the Engin
 
 **FR**: `cpt-cf-quota-enforcement-fr-credit`
 
-**Actors**: `cpt-cf-quota-enforcement-actor-quota-consumer`, `cpt-cf-quota-enforcement-actor-quota-manager`
+**Actors**: `cpt-cf-quota-enforcement-actor-quota-manager`, `cpt-cf-quota-enforcement-actor-platform-operator`
 
 ```mermaid
 sequenceDiagram
@@ -1878,7 +1879,7 @@ sequenceDiagram
         EO -->> Caller: stored BatchDecision
     else fresh
         EO ->> SP: BEGIN tx + apply_batch_debit(envelope, items, events)
-        Note over SP: 0. Lock the envelope's idempotency stripe and re-read its record<br/>(a concurrent winner's outcome is replayed)<br/>1. Sort all applicable Quotas across items<br/>2. Single locked read on union (lex by quota_id, ADR-0002)<br/>3. Per-item evaluate sequentially (sees intermediate state per PRD §5.7)<br/>4. Validate invariants per item<br/>5. Apply mutations or roll back the entire envelope
+        Note over SP: 1. Sort all applicable Quotas across items<br/>2. Single locked read on union (lex by quota_id, ADR-0002)<br/>3. Lock the envelope's idempotency stripe and re-read its record<br/>(a concurrent winner's outcome is replayed)<br/>4. Per-item evaluate sequentially (sees intermediate state per PRD §5.7)<br/>5. Validate invariants per item<br/>6. Apply mutations or roll back the entire envelope
         alt any item fails OR batch-timeout (250 ms)
             SP -->> EO: BatchDecision with all-or-nothing rollback
             EO -->> Caller: BatchDecision with all-or-nothing rollback
@@ -2369,8 +2370,9 @@ classification lookup per distinct metric, and publishes one sample that the obs
 I/O. A sample is published only after a refresh that succeeded in the current leadership term; a failed refresh, a
 timed-out one, or a `Stale` classification keeps the last sample and warns, and after the configured staleness bound
 the sample is withdrawn, so a failed read is never reported as zero. Leadership loss, a `Lagged` or `Reset` watch
-event, or shutdown withdraw the sample and discard any late refresh result; followers publish nothing, not zero, so
-identical global counts are never summed across replicas. Telemetry backends must treat a former leader's series as
+event, or shutdown withdraw the sample and discard any late refresh result; followers publish nothing, not zero, so in steady state identical global counts are never summed across replicas;
+during an advisory overlap two leaders may briefly publish the same absolute value, so dashboards aggregate these
+gauges with max or last, never sum. Telemetry backends must treat a former leader's series as
 stale once it stops updating, so a failover cannot double-count.
 
 Label cardinality is bounded at compile time (`cpt-cf-quota-enforcement-constraint-bounded-cardinality`).

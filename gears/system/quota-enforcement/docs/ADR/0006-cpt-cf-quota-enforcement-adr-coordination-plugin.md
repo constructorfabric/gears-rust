@@ -132,11 +132,13 @@ observation model, and the graceful step-down that the 2026-05-07 record specifi
 ### Advisory semantics and what QE requires
 
 Cluster leader election is advisory (cluster PRD §5.2, "Advisory Semantics, Not Mutual Exclusion"): two replicas can
-both observe themselves as leader for a window bounded by the election TTL plus observation lag. Both QE sweepers tolerate that window:
+both observe themselves as leader for a window bounded by the election TTL plus observation lag. All three QE election consumers tolerate that window:
 
 - `LeaseSweeper` reclaims leases that are already expired by timestamp. Lazy semantic release (I4) keeps accounting
   correct regardless of who reclaims, and a duplicate reclamation is a no-op on rows already transitioned.
 - `RetentionSweeper` deletes rows past their retention window. A duplicate delete finds nothing.
+- The lifecycle-gauge refresh only reads counts and publishes an absolute snapshot in process. An overlap costs at
+  most a duplicate, identical series for the window and never changes state.
 
 So the singleton property QE needs is "at most one active sweeper in steady state, and a bounded takeover time", not
 strict mutual exclusion. QE still requires the `Linearizable` capability at resolve time: an eventually consistent
@@ -180,9 +182,10 @@ plugin uses. QE code does not change.
   `cluster-sdk` major version like any other platform SDK.
 - QE is the first gear in the workspace to wire cluster leader election in production code. Integration defects
   surface in the foundation feature; the tests below run against both shipped cluster backends.
-- Multi-process deployments on a SQLite storage backend have no cluster backend today (the standalone provider is
-  in-process). QE does not target that shape; the record states it so an operator does not discover it in
-  production.
+- Multi-process deployments on a SQLite storage backend need a cross-process election: the deployed profile against
+  one cluster pod, or the Postgres cluster backend. The embedded standalone binding is in-process, cannot see peer
+  processes, and so cannot detect this misconfiguration; if it happens, the overlap stays bounded by the idempotent
+  sweep bodies.
 
 ### Confirmation
 
@@ -190,11 +193,10 @@ Confirmed by: a resolve-time test that binds the `quota-enforcement` profile to 
 and asserts `CapabilityNotMet` at startup; a handover test with two sweeper participants over one standalone backend
 that asserts one leader at a time and a successor after `resign`; the same handover test over the Postgres cluster
 backend; the chaos drill that kills the elected replica and verifies a survivor runs the sweep within one election
-TTL plus observation lag (RTO ≤ 15 min per `cpt-cf-quota-enforcement-nfr-recovery`); and two forced-overlap tests
-that run two sweep bodies at once against the same rows. Concurrent lease sweeps must produce one state transition,
-one capacity reversal, and one outbox event per lease. Concurrent retention sweeps must complete without error, with
-each expired row deleted once. The overlap tests are the evidence for the advisory-semantics argument above; the
-uniqueness and handover tests alone do not cover it.
+TTL plus observation lag (RTO ≤ 15 min per `cpt-cf-quota-enforcement-nfr-recovery`); and a forced-overlap test that runs two lease sweep bodies at once against the same rows and must produce one state
+transition, one capacity reversal, and one outbox event per lease. The retention body deletes by a predicate that a
+second run finds empty, and the gauge refresh writes nothing, so neither needs its own overlap test. The overlap test
+is the evidence for the advisory-semantics argument above; the uniqueness and handover tests alone do not cover it.
 
 ## Pros and Cons of the Options
 
@@ -210,7 +212,8 @@ uniqueness and handover tests alone do not cover it.
   the immediate handover on graceful shutdown.
 - Bad, because QE is the first production consumer of cluster leader election in the workspace and carries the
   integration risk.
-- Bad, because a multi-process deployment on SQLite storage has no cluster backend.
+- Bad, because a multi-process deployment on SQLite storage needs a cross-process election backend; the embedded
+  standalone binding can neither provide nor detect one.
 
 ### Consume the platform `cluster` gear's distributed lock
 

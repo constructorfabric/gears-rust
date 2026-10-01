@@ -1788,6 +1788,7 @@ default to the latest version unless they explicitly request a specific version.
 - `update_policy(policy_id, if_match_version, engine_id?, engine_config?, [comment])` — creates `policy_version = N+1`
   with `version_state = active`; previous active version transitions to `superseded`; latest-pointer moved to `N+1`.
   **Rejected with `VERSION_CONFLICT` if `if_match_version` does not equal the current latest** (lost-update protection).
+  `if_match_version` is a required positive integer; a request without a valid one is rejected before any write.
   Atomic.
 - `rollback_policy(policy_id, target_version, [comment])` — makes `target_version` active again (its `version_state`
   returns to `active`); the previously-active version transitions to `rolled_back` (terminal). Latest-pointer moved to

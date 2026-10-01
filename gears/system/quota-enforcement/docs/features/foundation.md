@@ -106,13 +106,13 @@ consumption-operations feature)
 2. [ ] - `p1` - DB: `bootstrap()` verifies the installed schema matches the plugin contract major version - `inst-boot-schema`
 3. [ ] - `p1` - **IF** schema version is incompatible - `inst-boot-schema-if`
    1. [ ] - `p1` - Abort readiness with `SchemaVersionMismatch`; serve nothing - `inst-boot-schema-abort`
-4. [ ] - `p1` - DB: seed default config rows (`contention_timeout_config`, `lease_capacity_config`, `idempotency_retention_config`) when missing - `inst-boot-seed-config`
+4. [ ] - `p1` - DB: seed default config rows (`contention_timeout_config`, `lease_capacity_config`, `idempotency_retention_config`) when missing, with fixed default values rather than operator input - `inst-boot-seed-config`
 5. [ ] - `p1` - API: resolve the cluster leader-election facade for the `quota-enforcement` profile with the
    linearizable requirement; the cluster resolver validates the operator's backend binding - `inst-boot-cluster-resolve`
 6. [ ] - `p1` - API: verify `authz-resolver` reachability with one bounded PDP evaluation round trip; any decision
    proves the PDP answered, a transport error or the deadline fails the probe - `inst-boot-pdp-probe`
 7. [ ] - `p1` - **IF** any probe or the cluster resolve fails - `inst-boot-probe-if`
-   1. [ ] - `p1` - Fail readiness and surface the failing dependency in the health endpoint - `inst-boot-probe-abort`
+   1. [ ] - `p1` - Fail readiness and surface the failing dependency in the health endpoint; every bootstrap dependency call is bounded (storage-plugin selection and each types-registry call 10 s, cluster resolve by the cluster SDK's descriptor timeout, the PDP probe by the PEP's default evaluation deadline, schema check and seeding by the backend's statement and lock timeouts), so a hung dependency fails readiness instead of stalling it - `inst-boot-probe-abort`
 8. [ ] - `p1` - Register REST routes into the platform `api-gateway` via ToolKit typed-operation registration - `inst-boot-rest`
 9. [ ] - `p1` - **RETURN** ready; later features extend this bootstrap hook with their own steps (the
    resolution-policy-engine feature seeds the `global` Policy here once its Engine is registered) - `inst-boot-ready`
@@ -139,7 +139,7 @@ consumption-operations feature)
 3. [ ] - `p1` - Deserialize the request and run the operation's documented public target-shape checks; reject malformed
    shape with canonical `InvalidArgument` before any PDP call - `inst-adm-shape`
 4. [ ] - `p1` - API: call `PolicyEnforcer::access_scope(...)` with the requested operation and explicit target — the in-process PEP evaluates against `authz-resolver`
-   and compiles the response itself within the configured `pdp_deadline_ms` (default 250 ms; an overrun is a PDP-unreachable
+   and compiles the response itself within the configured `pdp_deadline_ms` (default 250 ms, at least 1 ms, and 0 fails startup; an overrun is a PDP-unreachable
    `EnforcerError`), returning `AccessScope` or `EnforcerError`; QE never sees the raw decision and
    keeps no PDP decision cache of its own - `inst-adm-pdp`
 5. [ ] - `p1` - **IF** the call returns `EnforcerError` (denied, compile-failed, or PDP unreachable) - `inst-adm-deny-if`
