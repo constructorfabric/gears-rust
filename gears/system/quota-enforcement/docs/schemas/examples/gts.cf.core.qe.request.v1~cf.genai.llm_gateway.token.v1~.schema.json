@@ -3,7 +3,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "description": "Worked owner example (ADR-0007): one operation request contract for the llm-gateway token metric, shared by all callers and subject scopes.",
   "x-gts-traits": {
-    "metric": "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1",
+    "metric": "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1",
     "constraint_contract": "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v1~"
   },
   "type": "object",

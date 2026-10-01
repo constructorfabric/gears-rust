@@ -23,16 +23,16 @@ use serde_json::{Value, json};
 use toolkit_gts::{InventoryInstance, InventoryTypeSchema, PluginV1, gts_id, gts_type_schema};
 
 /// GTS resource type for Quota records (declarative caps).
-pub const QUOTA_RESOURCE: &str = gts_id!("cf.qe.resource.quota.v1~");
+pub const QUOTA_RESOURCE: &str = gts_id!("cf.core.qe.quota.v1~");
 
 /// GTS resource type for Quota Resolution Policy records and their versions.
-pub const POLICY_RESOURCE: &str = gts_id!("cf.qe.resource.policy.v1~");
+pub const POLICY_RESOURCE: &str = gts_id!("cf.core.qe.policy.v1~");
 
 /// GTS resource type for two-phase capacity leases.
-pub const LEASE_RESOURCE: &str = gts_id!("cf.qe.resource.lease.v1~");
+pub const LEASE_RESOURCE: &str = gts_id!("cf.core.qe.lease.v1~");
 
 /// GTS resource type for operation-log records.
-pub const OPERATION_RESOURCE: &str = gts_id!("cf.qe.resource.operation.v1~");
+pub const OPERATION_RESOURCE: &str = gts_id!("cf.core.qe.operation.v1~");
 
 // ---------------------------------------------------------------------------
 // Projection contract bases (ADR-0007)
@@ -82,7 +82,7 @@ pub const SCOPE_TENANT: &str = gts_id!("cf.core.qe.scope.v1~cf.core.qe.tenant.v1
 /// id in their `x-gts-ref` narrowing, so the two must change together. Metrics
 /// are registry-owned; the gear never registers this base, it only checks
 /// admitted metrics against it at bootstrap.
-pub const METRIC_BASE_TYPE: &str = gts_id!("cf.qe.metric.type.v1~");
+pub const METRIC_BASE_TYPE: &str = gts_id!("cf.core.qe.metric_type.v1~");
 
 const SUBJECT_BASE_JSON: &str = include_str!("../schemas/gts.cf.core.qe.subj.v1~.schema.json");
 const RESOURCE_BASE_JSON: &str = include_str!("../schemas/gts.cf.core.qe.res.v1~.schema.json");

@@ -344,8 +344,9 @@ applicable-Quota set and does not implement registry traversal.
 
 Metric names in Quota Enforcement are not internally minted. Every metric referenced by a Quota is the registered name
 of a usage type in the platform `types-registry` gear. Metric instances follow the GTS URI form under base
-`gts.cf.qe.metric.type.v1~` — e.g., `gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1`,
-`gts.cf.qe.metric.type.v1~cf.qe.metric.vcpu_hours.v1`, `gts.cf.qe.metric.type.v1~cf.qe.metric.storage_bytes.v1`.
+`gts.cf.core.qe.metric_type.v1~`, with the instance segment named under the metric's owning Gear — e.g.,
+`gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1`,
+`gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1`.
 
 > **Notation.** Throughout this document, metric instances are referenced by their short instance names
 > (`ai-tokens-input`, `vCPU-hours`, `storage-bytes`, etc.) in examples, and use-case payloads for readability.
@@ -356,12 +357,12 @@ time, Quota Enforcement validates that the referenced metric name exists in `typ
 reported as an actionable creation-time error, and an unreachable registry fails the request rather than skipping the
 check (`cpt-cf-quota-enforcement-fr-metric-identity-validation`). The format of the metric name (length, allowed characters, namespace
 conventions) is governed entirely by `types-registry` — Quota Enforcement inherits whatever format the registry permits
-and adds no additional naming rules of its own. The `cf.qe.metric.*` namespace used in this document is provisional
-pending platform-wide alignment (§13 Open Questions).
+and adds no additional naming rules of its own beyond the base: the metric base `gts.cf.core.qe.metric_type.v1~` is
+owned by Quota Enforcement, and each metric instance is named under its single owning Gear.
 
 Every metric has one owning Gear. Its subject projections declare the metrics they admit, allowing `types-registry` to
-enumerate the owner, supported scopes, and request schemas. This does not settle metric identity: owner-namespacing is
-only a candidate for the open cross-gear namespace decision, and the registry remains authoritative.
+enumerate the owner, supported scopes, and request schemas. The metric instance is named under that owning Gear, and
+the registry remains authoritative for the instance itself.
 
 The metric kind reported by `types-registry` (`counter` vs `gauge`) is informative for operators choosing the
 appropriate quota type:
@@ -784,9 +785,9 @@ The system **MUST** reject creation of a Quota whose projection is not registere
 base, is absent from the configured evaluation catalogue, or does not admit the metric, and **MUST** reject a
 `subject_id` that violates the declared scope.
 
-**Source value semantics.** `source` instances live under base `gts.cf.qe.source.type.v1~`. P1 seeds two:
-`gts.cf.qe.source.type.v1~cf.qe.source.licensing.v1` (default; caps materialized from the licensing layer) and
-`gts.cf.qe.source.type.v1~cf.qe.source.operator.v1` (caps an operator created manually outside the licensing
+**Source value semantics.** `source` instances live under base `gts.cf.core.qe.source_type.v1~`. P1 seeds two:
+`gts.cf.core.qe.source_type.v1~cf.core.qe.licensing.v1` (default; caps materialized from the licensing layer) and
+`gts.cf.core.qe.source_type.v1~cf.core.qe.operator.v1` (caps an operator created manually outside the licensing
 flow — incident response, compliance carve-outs, soft-launch placeholders). A stored Quota's `source` value never
 changes silently. Mutation rules in P1 are uniform across both source values (operator-level or Quota-Manager PDP
 scope; see the mutation paragraph below); P2 source-kind extensions (`tenant_admin`, `user_self`, …) and per-source
@@ -1000,12 +1001,12 @@ single-item counterparts (per `cpt-cf-quota-enforcement-fr-authorization`,
 ### 5.3 Quota Type Semantics
 
 Each Quota carries a `quota_type` identifying its accounting model. P1 reserves three GTS instances under base
-`gts.cf.qe.quota.type.v1~`:
+`gts.cf.core.qe.quota_type.v1~`:
 
-- `gts.cf.qe.quota.type.v1~cf.qe.quota.allocation.v1` — in-flight reservable capacity (no period reset).
-- `gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1` — per-period cumulative consumption (resets at the period
+- `gts.cf.core.qe.quota_type.v1~cf.core.qe.allocation.v1` — in-flight reservable capacity (no period reset).
+- `gts.cf.core.qe.quota_type.v1~cf.core.qe.consumption.v1` — per-period cumulative consumption (resets at the period
   boundary).
-- `gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1` — P3 type; Quota creation is rejected in P1 with
+- `gts.cf.core.qe.quota_type.v1~cf.core.qe.rate.v1` — P3 type; Quota creation is rejected in P1 with
   `NOT_YET_IMPLEMENTED` per `cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`.
 
 > **Notation.** Throughout this document, quota types are referenced by their short instance names (`allocation`,
@@ -1088,12 +1089,12 @@ then, `type=rate` creation requests continue to be rejected per the P1 FR.
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-fr-period-semantics`
 
 The system **MUST** support consumption-quota periods drawn from a fixed set of GTS instances under base
-`gts.cf.qe.period.type.v1~`. P1 reserves five instances:
-`gts.cf.qe.period.type.v1~cf.qe.period.day.v1`,
-`gts.cf.qe.period.type.v1~cf.qe.period.week.v1`,
-`gts.cf.qe.period.type.v1~cf.qe.period.month.v1`,
-`gts.cf.qe.period.type.v1~cf.qe.period.year.v1`, and
-`gts.cf.qe.period.type.v1~cf.qe.period.one_time.v1`. All periods **MUST** be UTC and calendar-aligned by
+`gts.cf.core.qe.period_type.v1~`. P1 reserves five instances:
+`gts.cf.core.qe.period_type.v1~cf.core.qe.day.v1`,
+`gts.cf.core.qe.period_type.v1~cf.core.qe.week.v1`,
+`gts.cf.core.qe.period_type.v1~cf.core.qe.month.v1`,
+`gts.cf.core.qe.period_type.v1~cf.core.qe.year.v1`, and
+`gts.cf.core.qe.period_type.v1~cf.core.qe.one_time.v1`. All periods **MUST** be UTC and calendar-aligned by
 default: a `day` period begins at 00:00 UTC and ends at 24:00 UTC; a `month` period begins at 00:00 UTC on the first
 day of the calendar month; a `week` period begins at 00:00 UTC on Monday. The `one-time` period denotes a non-recurring
 quota (typically used for promotional or single-event budgets) — it has no automatic reset and **MUST** be deactivated
@@ -2180,8 +2181,8 @@ does not specify that product's end-user authentication or rate-limit story.
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-fr-enforcement-mode`
 
 Every Quota **MUST** carry an `enforcement_mode` field drawn from GTS instances under base
-`gts.cf.qe.enforcement.type.v1~`. **P1 reserves one instance**:
-`gts.cf.qe.enforcement.type.v1~cf.qe.enforcement.hard.v1` (`hard`) — operations whose execution would cause a
+`gts.cf.core.qe.enforcement_type.v1~`. **P1 reserves one instance**:
+`gts.cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1` (`hard`) — operations whose execution would cause a
 `hard` Quota's remaining capacity to drop below zero are denied per `cpt-cf-quota-enforcement-fr-hard-quota-reject`;
 counter integrity is preserved (the counter never crosses cap).
 
@@ -2194,7 +2195,7 @@ Future phases MAY extend additively:
 
 - `hard-with-clamp` (P3 candidate, see §13) — for batch-style workloads where admitting a clamped magnitude is
   preferable to rejecting outright. Requires registering a new instance
-  `gts.cf.qe.enforcement.type.v1~cf.qe.enforcement.hard_with_clamp.v1` and the Decision contract to gain an
+  `gts.cf.core.qe.enforcement_type.v1~cf.core.qe.hard_with_clamp.v1` and the Decision contract to gain an
   `AllowedWithClamp(quota_id, admitted_magnitude)` arm; the existing per-entry `amount ≤ request.amount` Debit-Plan
   invariant already accommodates clamped magnitudes without further relaxation.
 
@@ -3218,10 +3219,10 @@ on behalf of a tenant administrator)
   documented semantics (always satisfiable, counter still increments, `remaining` reported as `null`);
   `notification_thresholds` on unbounded Quotas are rejected at create/update with `THRESHOLDS_REQUIRE_BOUNDED_CAP`;
   the `quota_cap_zero_total` and `quota_cap_unbounded_total` gauges count the active Quotas of each kind
-- [ ] Quota record carries `enforcement_mode` from GTS instances under `gts.cf.qe.enforcement.type.v1~` (P1: only
+- [ ] Quota record carries `enforcement_mode` from GTS instances under `gts.cf.core.qe.enforcement_type.v1~` (P1: only
   `hard` is accepted); attempts to create a Quota with an unsupported `enforcement_mode` value are rejected with an
   actionable error; future values are added as new GTS instances per `cpt-cf-quota-enforcement-fr-enforcement-mode`
-- [ ] Quota record carries `source` from GTS instances under `gts.cf.qe.source.type.v1~` (P1: `licensing` (default),
+- [ ] Quota record carries `source` from GTS instances under `gts.cf.core.qe.source_type.v1~` (P1: `licensing` (default),
   `operator`); attempts to create a Quota with an unsupported `source` value are rejected with an actionable error;
   mutation rules in P1 are uniform across both source values (operator-level or Quota-Manager PDP scope); P2
   source-kind extensions (`tenant_admin`, `user_self`) and per-source mutation rules are additive per
@@ -3336,14 +3337,10 @@ on behalf of a tenant administrator)
 
 ## 13. Open Questions
 
-- **Shared metric-identifier namespace across QE, Usage Collector, and `types-registry`.** P1 QE uses
-  `gts.cf.qe.metric.*` for the illustrative GTS instance examples in §3.2 because no platform-wide convention has been
-  ratified for the metric identifier namespace shared between QE (which references metrics in Quotas) and the Usage
-  Collector (which emits usage records). Once the cross-gear convention for shared type identifiers is resolved at the
-  platform level, QE revisits the namespace choice and renames references in lockstep. QE PRD/DESIGN remains
-  format-agnostic in the meantime per §3.2 ("QE inherits whatever format the registry permits"). Owner: Platform
-  Engineering — target resolution: pending cross-gear type-convention decision. Naming each metric beneath its single
-  owning Gear is the leading candidate; this ADR records the candidate but does not decide it.
+- **Metric-identifier namespace (resolved).** The metric base is `gts.cf.core.qe.metric_type.v1~`, owned by Quota
+  Enforcement, and each metric instance is named under its single owning Gear. Usage Collector keeps its own
+  usage-record family (`gts.cf.core.uc.usage_record.v1~`), so aligning the two is a mapping between families, not a
+  shared base.
 - **Built-in `cascade-priority` Engine**: cascade is expressible via `cel` in P1; should P2 ship a hardcoded
   `cascade-priority` Engine for operators who do not want to author CEL? Trade-off: convenience and lower
   CEL-attack-surface vs. coupling QE to one specific cascade variant before operator preferences are observed in

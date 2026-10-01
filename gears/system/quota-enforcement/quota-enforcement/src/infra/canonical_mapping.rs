@@ -10,16 +10,16 @@ use toolkit_canonical_errors::{CanonicalError, resource_error};
 
 use crate::domain::error::{DomainError, ResourceKind};
 
-#[resource_error(gts_id!("cf.qe.resource.quota.v1~"))]
+#[resource_error(gts_id!("cf.core.qe.quota.v1~"))]
 pub(crate) struct QuotaResource;
 
-#[resource_error(gts_id!("cf.qe.resource.policy.v1~"))]
+#[resource_error(gts_id!("cf.core.qe.policy.v1~"))]
 pub(crate) struct PolicyResource;
 
-#[resource_error(gts_id!("cf.qe.resource.lease.v1~"))]
+#[resource_error(gts_id!("cf.core.qe.lease.v1~"))]
 pub(crate) struct LeaseResource;
 
-#[resource_error(gts_id!("cf.qe.resource.operation.v1~"))]
+#[resource_error(gts_id!("cf.core.qe.operation.v1~"))]
 pub(crate) struct OperationResource;
 
 /// Closed reason tokens of the canonical envelope.

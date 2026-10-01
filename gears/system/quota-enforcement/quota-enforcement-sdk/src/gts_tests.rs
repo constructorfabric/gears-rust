@@ -83,7 +83,7 @@ fn resource_ids_are_distinct_five_segment_type_ids() {
         OPERATION_RESOURCE,
     ];
     for id in all {
-        assert!(id.starts_with("gts.cf.qe.resource."), "{id}");
+        assert!(id.starts_with("gts.cf.core.qe."), "{id}");
         assert!(id.ends_with(".v1~"), "{id}");
     }
     let mut sorted = all.to_vec();
@@ -249,7 +249,7 @@ fn the_owner_examples_validate_as_concrete_derived_contracts_with_their_traits()
         .expect("token request contract");
     assert_eq!(
         token.effective_traits["metric"],
-        format!("{METRIC_BASE_TYPE}cf.qe.metric.ai_tokens_input.v1")
+        format!("{METRIC_BASE_TYPE}cf.genai.llm_gateway.ai_tokens_input.v1")
     );
     assert_eq!(
         token.effective_traits["constraint_contract"],

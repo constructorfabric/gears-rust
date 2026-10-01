@@ -411,7 +411,7 @@ Realises `cpt-cf-quota-enforcement-seq-period-rollover`.
 period
 
 **Steps**:
-1. [ ] - `p1` - Periods are drawn from the five GTS instances under `gts.cf.qe.period.type.v1~` (`day`, `week`,
+1. [ ] - `p1` - Periods are drawn from the five GTS instances under `gts.cf.core.qe.period_type.v1~` (`day`, `week`,
    `month`, `year`, `one_time`), all UTC and calendar-aligned by default; the current period boundary timestamp is
    persisted with each consumption counter for deterministic detection
    (`cpt-cf-quota-enforcement-fr-period-semantics`) - `inst-per-spec`
@@ -601,7 +601,7 @@ The system **MUST** implement the two P1 counter shapes: allocation Quotas keep 
 period (incremented by debit, decremented by credit with a floor of zero, and reversed exactly by rollback), and
 consumption Quotas keep a per-period consumed counter (increased by debit, decreased by credit with a floor of zero,
 and reversed exactly by rollback against the debit's attribution period) that resets to zero at every period
-boundary. Periods **MUST** be the five GTS instances under `gts.cf.qe.period.type.v1~`, UTC and
+boundary. Periods **MUST** be the five GTS instances under `gts.cf.core.qe.period_type.v1~`, UTC and
 calendar-aligned, with the current boundary timestamp persisted per counter; consumption rows are materialized lazily
 on first evaluate; rollover **MUST** be atomic with respect to in-flight operations, attribute mutations by the
 half-open `[start, end)` commit-time rule, set `highest_crossed_threshold_pct = NULL` on every new row (I13), emit the
