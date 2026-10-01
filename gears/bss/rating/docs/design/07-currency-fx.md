@@ -1,8 +1,8 @@
 Created:  2026-08-24 by Virtuozzo International GmbH
-Updated:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-10-01 by Virtuozzo International GmbH
 
 <!-- CONFLUENCE_TITLE: [BSS]: Rating — Multi-Currency & FX (Design) -->
-<!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: Finance (FX), Pricing (Product Catalog), Subscriptions, Promotions | Downstream: Rating, Billing | Owners: BSS Rating team -->
+<!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: Pricing (per-market rows), Subscriptions ((currency, region) binding), FX source (none yet) | Downstream: step 9, Billing | Owners: BSS Rating team -->
 
 # DESIGN — Multi-Currency & FX (Slice 7)
 
@@ -39,21 +39,18 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 
 ### 1.1 Architectural Vision
 
-This slice is the **step-8 evaluator** of the §17.1 order ([`../PRD.md`](../PRD.md) §6.9, §17.1):
-the only point in the platform where an authoritative currency conversion happens. It keeps three
-currency roles strictly apart — **price currency** (the selected row's currency; per-market rows
-are first-class catalog rows, never FX-derived), **billing currency** (the payer's invoice
-currency, frozen by Subscriptions at activation), and **presentment currency** (portal display FX,
-non-authoritative and outside rating-core) — and converts exactly once, only when billing ≠ price.
+This slice is the **step-8 evaluator** in `rating-core`. It keeps three currency roles apart —
+**price currency** (the selected row's currency), **billing currency** (the subscription's
+`(currency, region)` binding), **presentment currency** (display only, outside Rating) — and is the
+only place a conversion could occur.
 
-Conversion runs as a pure function over **frozen Finance inputs**: the FX table and lock policy
-arrive with a `fxTableVersion` that is part of the determinism tuple
-([`./01-foundation.md`](./01-foundation.md) §4.2). Two deterministic policies exist and no third:
-**per-window rate-lock** (final at event time) and **invoice-period FX** (provisional on the hot
-path, authoritative re-rate **by delta at period close** under the slice-08 correction keys —
-never by mutating the provisional line). The FX-lock id is a Rating-written segment of
-`pricingSnapshotRef` (SEAMS S1); conversion never rounds — Billing rounds in billing currency
-after conversion; a missing FX record where one is required fails closed, never a provider default.
+No gear provides versioned, pinnable FX rates to Rating (SEAMS F-1…F-3): `rate-provider` is a
+latest-only plugin of the ledger, and the ledger mints its rate snapshots only when it posts.
+**Launch behaviour is native currency only** (DESIGN §2.2, R-07): pricing publishes per-market rows
+per `(currency, region)`, the subscription binding selects the row, and billing currency must equal
+price currency. A mismatch fails the child closed with `fx_not_supported`. The FX policies in §4.2
+are the specified target behaviour and activate when a pinnable rate-snapshot contract exists
+(SEAMS J-8).
 
 ### 1.2 Architecture Drivers
 
@@ -61,51 +58,34 @@ after conversion; a missing FX record where one is required fails closed, never 
 
 | Requirement | Design Response |
 |-------------|-----------------|
-| `cpt-cf-bss-rating-fr-multi-currency` | Three declared roles (§4.1): price (selected row; distinct per-market rows, never FX-derived), billing (payer invoice currency via the frozen Subscriptions binding), presentment (display-only, outside rating-core, labelled estimates). The `CurrencyRoleResolver` converts only when billing ≠ price; equal currencies skip step 8 (§17.1 step 2, native multi-currency). |
-| `cpt-cf-bss-rating-fr-fx-policy` | The `FxPolicyApplier` executes exactly two policies over the frozen Finance table (§4.2): per-window rate-lock (final at event time) and invoice-period FX (provisional, flagged; close-time `fxTableVersion` authoritative; delta at close via slice 08). Every conversion records `fxTableVersion` / locked-rate id; no implicit or provider-default rate can be emitted. |
-| `cpt-cf-bss-rating-fr-evaluation-order` | The evaluator registers into the fixed step-8 slot: after price-currency coupons (step 7), before emission (step 9); there is no configuration surface to move it. |
-| `cpt-cf-bss-rating-fr-coupon-application-order` | The `settlementCurrency` split (§4.4): `price` coupons complete in step 7 before conversion; `billing` coupons apply after conversion on the billing-currency amount under the **same** `fxTableVersion`. The placement is this slice's; the coupon semantics (stacking, applyScope) stay slice 06's. |
-| `cpt-cf-bss-rating-fr-snapshot-carry` | The FX-lock id is the Rating-written FX segment of `pricingSnapshotRef` (§4.3, SEAMS S1); the recorded `fxTableVersion` rides the outcome metadata; both immutable once the ref is sealed. |
+| `cpt-cf-bss-rating-fr-multi-currency` | Roles separated (§4.1); native currency at launch; per-market rows are never FX-derived. |
+| `cpt-cf-bss-rating-fr-fx-policy` | Two policies specified (§4.2); inactive until R-07; no implicit or provider-default rate ever. |
+| `cpt-cf-bss-rating-fr-evaluation-order` | Fixed step-8 slot between the two coupon passes. |
+| `cpt-cf-bss-rating-fr-coupon-application-order` | Billing-currency coupons after step 8 (§4.4). |
+| `cpt-cf-bss-rating-fr-snapshot-carry` | FX segment of the snapshot (empty at launch) (§4.3). |
 
 #### NFR Allocation
 
 | NFR theme | Allocated To | Design Response | Verification / Status |
 |-----------|--------------|-----------------|-----------------------|
-| `cpt-cf-bss-rating-nfr-throughput-latency` | Invoice-period policy split | The hot path never waits for close-time rates: provisional amount at the locked/spot rate from the frozen table, no I/O inside the step; the authoritative re-rate is an off-hot-path delta | Load test; **targets provisional — NFR workshop** ([`../PRD.md`](../PRD.md) §7.1) |
-| `cpt-cf-bss-rating-nfr-resilience` | Fail-closed FX guard | Missing FX table / policy / lock record with billing ≠ price ⇒ fail closed, never a provider-default rate; retries replay the same `fxTableVersion` to the same amount | Chaos/retry test |
-| `cpt-cf-bss-rating-nfr-horizontal-scale` | Frozen-table pinning | The table version is pinned per evaluation unit — no shared mutable rate state, no cross-partition coordination | Design + load test |
-| Decimal precision of converted amounts | Full-precision conversion | Conversion never rounds (§4.4); Billing rounds in billing currency; the concrete DECIMAL precision is the Foundation open ([`./01-foundation.md`](./01-foundation.md) §4.4) | **Open — set with Billing** |
+| `cpt-cf-bss-rating-nfr-throughput-latency` | Native check | One equality check at launch | — |
+| `cpt-cf-bss-rating-nfr-resilience` | Fail-closed guard | Mismatch or missing rate record ⇒ typed error | Fixture |
+| `cpt-cf-bss-rating-nfr-horizontal-scale` | Pinned inputs | Rates (when added) are values of the input | Design |
 
 #### Key ADRs
 
 | ADR ID | Decision Summary |
 |--------|------------------|
-| `cpt-cf-bss-rating-adr-scope-key-adoption` | `currency` is an axis of the adopted 8-axis key: each market is its own catalog row selected at step 2 — step 8 never fabricates a missing market row via FX derivation. |
-| `cpt-cf-bss-pricing-adr-canonical-scope-key` (adopted) | The key definition carrying the `currency`/`region` axes; per-`(currency, region)` rows are authored independently in the pricing gear ([`../../../pricing/docs/design/04-currency-tax.md`](../../../pricing/docs/design/04-currency-tax.md)). |
+| `cpt-cf-bss-rating-adr-scope-key-adoption` | `currency` is a scope-key axis: each market is its own row, never derived by FX. |
 
 ### 1.3 Architecture Layers
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-rating-tech-stack-fx`
 
-```text
-Step-8 evaluator (this slice)     CurrencyRoleResolver · FxPolicyApplier · FxLockRecorder ·
-        │  (registers into the fixed §17.1     BillingCurrencyCouponPass · FxCloseDeltaCalculator
-        ▼   step-8 slot)
-Evaluation pipeline (Foundation)  EvaluationPipeline · SnapshotComposer · DeterminismGuard ·
-                                  EmissionGuard · MetadataRecorder
-        │
-        ▼
-Frozen inputs (external SoRs)     FX tables + lock policy, fxTableVersion (Finance) ·
-                                  per-(currency, region) price rows (pricing) · (currency, region)
-                                  binding (Subscriptions) · coupon snapshots (Promotions) ·
-                                  periodState at close (Billing)
-```
-
 | Layer | Responsibility | Technology |
 |-------|----------------|------------|
-| Application | The step-8 evaluator and the close-time re-rate math used by slice 08 | Rust module in the `rating` gear (rating-core crate) |
-| Domain | Currency roles, FX policy semantics, `FxApplication` / lock-segment shapes | Rust; GTS + Rust domain structs |
-| Infrastructure | **None authoritative** — a non-authoritative cache of frozen FX table pages keyed by `fxTableVersion`; loss degrades latency, never correctness | In-process cache; Rating persistence |
+| Domain | `CurrencyRoleResolver`, `FxPolicyApplier` (inactive), billing-currency coupon pass hook | `rating-core` module |
+| Infrastructure | None | — |
 
 ## 2. Principles and Constraints
 
@@ -115,24 +95,21 @@ Frozen inputs (external SoRs)     FX tables + lock policy, fxTableVersion (Finan
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-currency-roles-fx`
 
-Price, billing, and presentment currency are distinct declared roles, never inferred from one
-another. The only authoritative conversion in the platform is step 8, and it runs only when
-billing ≠ price; presentment FX is never computed here ([`../PRD.md`](../PRD.md) §6.9).
+Price, billing and presentment currency are distinct; the only authoritative conversion is step 8,
+and it runs only when billing ≠ price.
 
 #### No unrecorded FX
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-no-implicit-fx`
 
-Every converted amount carries its policy identity: policy kind + `fxTableVersion` / locked-rate
-id. An implicit or provider-default rate is a defect; absence of the required FX record fails
-closed ([`./01-foundation.md`](./01-foundation.md) §3.3).
+A converted amount always carries its rate record identity; without a record, evaluation fails
+closed.
 
 #### Convert at full precision, never round
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-full-precision-conversion-fx`
 
-Conversion output keeps full intermediate precision. Rounding is Billing's, in billing currency,
-after conversion (§17.1 rating-core/Billing boundary; [`./01-foundation.md`](./01-foundation.md) §4.4).
+Conversion is exact (rational rate × exact amount); Billing rounds to minor units (T-D-46).
 
 ### 2.2 Constraints
 
@@ -140,25 +117,21 @@ after conversion (§17.1 rating-core/Billing boundary; [`./01-foundation.md`](./
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-finance-sor-fx`
 
-FX rate tables and lock policies arrive **frozen** with a `fxTableVersion`
-([`../PRD.md`](../PRD.md) §9.2 Finance FX input contract). Rating never sources, derives, or
-interpolates a rate; the boundary contract is owned by
-[`11-consumer-contracts.md`](./11-consumer-contracts.md).
+Rating never sources, derives, inverts or triangulates a rate. `[DEPENDENCY GAP R-07]` No FX owner
+exposes pinnable rates today; J-8 names the required change (ledger or a Finance gear exposing
+`lock_rate` / `read_snapshot`).
 
 #### The (currency, region) binding is consumed, never re-derived
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-binding-consumed-fx`
 
-Subscriptions freezes the `(currency, region)` binding into `pricingSnapshotRef` at activation
-(SEAMS S1). Step 8 reads the bound billing currency from the frozen context; re-deriving it at
-evaluation time is a defect.
+Billing currency is read from the stored subscription version (SEAMS S-1); Rating never infers it.
 
 #### Presentment is outside rating-core
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-presentment-outside-fx`
 
-Portal display FX is non-authoritative, computed outside rating-core, and MUST be labelled estimates
-([`../PRD.md`](../PRD.md) §6.9). Nothing in the resolved outcome depends on a presentment amount.
+Display conversion is non-authoritative and not computed here.
 
 ## 3. Technical Architecture
 
@@ -166,95 +139,71 @@ Portal display FX is non-authoritative, computed outside rating-core, and MUST b
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-domain-model-fx`
 
-- **`CurrencyRoles`** — value object bound per line from the frozen context: `priceCurrency` (currency of the step-2 selected row), `billingCurrency` (payer account/contract invoice currency via the frozen Subscriptions binding); presentment is deliberately absent from the model.
-- **`FxPolicyRecord`** — frozen Finance input: policy kind (`per_window_rate_lock` \| `invoice_period`), `fxTableVersion`, locked-rate id (rate-lock), and the rate material for the pair at `t`.
-- **`FxApplication`** — the outcome fragment: pre-conversion amount (price currency), post-conversion amount (billing currency), policy kind, `fxTableVersion` / locked-rate id, and the **provisional** flag (invoice-period only).
-- **`FxLockSegment`** — the S1 snapshot segment: FX-lock id (if any), written by Rating at evaluation (§4.3).
-- **`FxCloseDelta`** — the close-time re-rate difference for provisional lines: same frozen tuple except the close-time `fxTableVersion`; leaves under the slice-08 correction key (§4.2).
+- **`CurrencyRoles`** — `price_currency` (selected row), `billing_currency` (subscription binding).
+- **`FxRateRecord`** (target) — `rate_ref` (pinnable id from the FX owner), pair `(price →
+  billing)`, rate, policy kind (`per_window_rate_lock | invoice_period`). No source at launch.
+- **`FxApplication`** (target) — pre/post amounts, `rate_ref`, provisional flag.
 
 ### 3.2 Component Model
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-component-conversion-fx`
 
-- **`CurrencyRoleResolver`** — binds `CurrencyRoles` from the frozen context; short-circuits step 8 when billing = price (native multi-currency, §17.1 step 2). Authoritative: the slice-02 FX-skip flag is advisory metadata, re-derived here.
-- **`FxPolicyApplier`** — applies the frozen table under the selected policy; produces `FxApplication`; fails closed on any missing table / policy / lock record.
-- **`FxLockRecorder`** — hands the FX-lock segment to the `SnapshotComposer` before sealing; stamps `fxTableVersion` / locked-rate id into the outcome metadata (`MetadataRecorder`).
-- **`BillingCurrencyCouponPass`** — re-invokes the slice-06 coupon evaluator for `settlementCurrency = billing` coupons on the converted amount, same `fxTableVersion` (§4.4).
-- **`FxCloseDeltaCalculator`** — pure re-rate math (`FxCloseDelta`) invoked by the slice-08 wrapper at period close; owns no path of its own.
+- **`CurrencyRoleResolver`** — binds roles; equal ⇒ skip conversion; different ⇒ `fx_not_supported`
+  at launch, `FxPolicyApplier` once R-07 is resolved.
+- **`FxPolicyApplier`** (target) — §4.2.
+- **Billing-currency coupon pass** — invokes slice 06 with `Pass::Billing`.
 
 ### 3.3 API Contracts
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-interface-convert-fx`
 
-The **step-8 evaluator contract** (conceptual; invoked by the Foundation pipeline):
-`applyFx(lineAmount@priceCurrency, CurrencyRoles, FxPolicyRecord) → FxApplication`. Pure; same
-inputs ⇒ byte-identical output (the `fxTableVersion` at each stage is part of the replay inputs,
-[`../PRD.md`](../PRD.md) §6.9). Fail-closed problem values: missing FX record / policy / lock with
-billing ≠ price; unbound billing currency (torn Subscriptions segment — rejected by the
-`SnapshotComposer`, [`./01-foundation.md`](./01-foundation.md) §4.3).
-
-The Finance FX input contract and the Billing handoff (provisional flag, rounding, close-time
-authority) are owned by [`11-consumer-contracts.md`](./11-consumer-contracts.md); the close delta
-leaves through the Foundation `cpt-cf-bss-rating-interface-reresolve-fnd` under slice 08.
+Internal: `apply_fx(&CouponLine, &CurrencyRoles, Option<&FxRateRecord>) -> Result<FxLine,
+EvaluationError>`. Errors: `fx_not_supported` (launch), `fx_rate_missing`, `fx_pair_missing`
+(exact pair direction required; no inversion).
 
 ### 3.4 Internal Dependencies
 
-Foundation ([`01-foundation.md`](./01-foundation.md)): step-slot registration, determinism tuple,
-`SnapshotComposer`, `EmissionGuard`. [`06-coupons.md`](./06-coupons.md): price-currency coupons
-complete before this step; the billing-currency pass re-invokes the slice-06 evaluator — semantics
-stay there, placement is here. [`08-retroactivity-corrections.md`](./08-retroactivity-corrections.md):
-the invoice-period close delta is a correction under its keys.
-[`09-period-plan-change.md`](./09-period-plan-change.md): floor/cap set in price currency converts
-for comparison under the same policy + `fxTableVersion` (§17.2) — slice 09's obligation, this
-slice's recorded policy identity. [`11-consumer-contracts.md`](./11-consumer-contracts.md): boundary contracts.
+Upstream: slice 02 (row currency), slice 06 (price-currency pass). Downstream: slice 06
+(billing-currency pass), slice 01 step-9 guards, slice 09 (floor/cap comparison currency).
 
 ### 3.5 External Dependencies
 
-| Dependency | What arrives frozen | Contract |
-|------------|--------------------|----------|
-| Finance | FX tables + lock policy, `fxTableVersion` / locked-rate ids | PRD §9.2 Finance FX; [`11-consumer-contracts.md`](./11-consumer-contracts.md) |
-| Pricing (Product Catalog) | per-`(currency, region)` price rows (first-class, never FX-derived), ISO 4217 minor-unit amounts | PRD §9.2 read-model contract; pricing [`design/04`](../../../pricing/docs/design/04-currency-tax.md) |
-| Subscriptions | `(currency, region)` binding frozen at activation | SEAMS S1; PRD §9.2 Subscriptions input |
-| Promotions | frozen coupon snapshots incl. `settlementCurrency` | PRD §9.2 Promotions; [`06-coupons.md`](./06-coupons.md) |
-| Billing | rounds in billing currency after conversion; period close fixes the authoritative close-time `fxTableVersion` | PRD §9.2 Billing; §17.1 rating-core/Billing boundary |
+| Dependency | What arrives | Status |
+|------------|--------------|--------|
+| Pricing | Per-`(currency, region)` rows, minor/nano-minor amounts | Fields exist (SEAMS P-2, P-8); read API MISSING (R-02) |
+| Subscriptions | `(currency, region)` binding | ASSUMED (SEAMS S-1) |
+| FX owner (ledger / Finance) | Pinnable rate snapshots | MISSING (SEAMS F-1…F-3, R-07) |
 
 ### 3.6 Interactions and Sequences
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-step8-convert-fx`
 
-**Step 8 within one line** (the step-8 leg of `cpt-cf-bss-rating-seq-evaluate-tariff`):
-
-1. Resolve `CurrencyRoles`; if billing = price, skip conversion entirely (native multi-currency; no FX record required, no FX-lock segment written) and proceed to step 4 below.
-2. Load the frozen `FxPolicyRecord`; missing with billing ≠ price ⇒ fail closed.
-3. Convert at full precision: rate-lock ⇒ the locked rate, final at event time; invoice-period ⇒ the locked/spot rate from the frozen table, amount **flagged provisional**.
-4. Apply `settlementCurrency = billing` coupons on the billing-currency amount via the slice-06 evaluator, same `fxTableVersion` (§4.4).
-5. Record `fxTableVersion` / locked-rate id in metadata; `FxLockRecorder` writes the S1 segment; hand to step 9 (`EmissionGuard`).
+1. Resolve `CurrencyRoles` from the selected row and the subscription version.
+2. Equal ⇒ no conversion; FX segment empty.
+3. Different ⇒ `fx_not_supported` (launch). Target: load the pinned `FxRateRecord`, convert at full
+   precision, record `rate_ref`.
+4. Apply billing-currency coupons (slice 06); hand to step 9.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-rating-flow-close-delta-fx`
 
-**Invoice-period FX delta at period close** (boundary with slice 08):
-
-1. Billing closes the period; the close-time `fxTableVersion` becomes authoritative ([`../PRD.md`](../PRD.md) §6.9).
-2. The slice-08 wrapper re-rates each provisional line via `FxCloseDeltaCalculator`: identical frozen tuple and pinned snapshot, only the close-time `fxTableVersion` substituted — a **full re-execution of step 8 plus the billing-currency coupon pass and the step-9 guards**, diffed at the line level. (A `percent` coupon re-scales with the converted amount; a billing-currency `fixed_amount` coupon does not — recomputing the conversion alone would mis-state the delta.)
-3. The difference leaves as a delta keyed `(unitKey[, slice], prior-rated-version, snapshot)` via the Adjustment path ([`08-retroactivity-corrections.md`](./08-retroactivity-corrections.md)); the provisional line is never mutated.
-4. Replay of either stage is byte-identical given which `fxTableVersion` applied at which stage — both are recorded inputs.
+Target (R-07) — invoice-period FX: the child is evaluated with a provisional rate; once the
+close-time rate record exists the child is re-evaluated with it, producing a new window revision and
+a new parent revision like any other correction (DESIGN §3.6 Flow B). Finalization waits for the
+close-time rate (pending reason `fx_rate_pending`), so Billing receives one complete revision rather
+than a provisional one. Not active at launch.
 
 ### 3.7 Database Schemas and Tables
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-storage-none-fx`
 
-**None owned.** FX tables and lock policies live in Finance; the recorded `fxTableVersion` /
-locked-rate id and the FX-lock segment ride the emitted outcome (Rating persistence). The only local
-state is a non-authoritative cache of frozen table pages keyed by `fxTableVersion`, whose loss
-degrades latency, never correctness.
+None. When FX is enabled, the rate record used is stored with the window result so replay does not
+read the FX owner.
 
 ### 3.8 Deployment Topology
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-rating-deployment-fx`
 
-Runs in the `rating` gear (rating-core crate) ([`./01-foundation.md`](./01-foundation.md)
-§3.8) — no additional topology. FX table pages are pinned per version and safely cold-startable;
-there is no shared mutable rate state and no cross-partition coordination.
+Part of `rating-core`.
 
 ## 4. Additional Context
 
@@ -262,45 +211,51 @@ there is no shared mutable rate state and no cross-partition coordination.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-currency-roles-fx`
 
-- **Price currency** — the currency of the `Price.amount` row selected at step 2. Per-market rows are first-class catalog rows authored per `(currency, region)` in the pricing gear; **no FX derivation ever** — a missing market row is absent, not derivable (pricing [`design/04`](../../../pricing/docs/design/04-currency-tax.md); `currencyFallbackPolicy` is a pricing Future).
-- **Billing currency** — the invoice currency per payer account/contract, delivered via the Subscriptions-frozen `(currency, region)` binding (S1).
-- **Presentment currency** — portal display FX; non-authoritative, outside rating-core, labelled estimates.
-- Conversion applies **iff** billing ≠ price; equal currencies skip step 8 (native multi-currency, §17.1 step 2).
-- Single-currency-per-invoice is a pricing publish-time guarantee (pricing Slice 4 `CurrencyBindingChecker`); Rating relies on it and never mixes currencies within one line.
+- **Price currency**: currency of the selected row; per-market rows are first-class; a missing market
+  row is `no_eligible_window`, never FX-derived.
+- **Billing currency**: the subscription's `(currency, region)` binding.
+- **Presentment currency**: outside Rating.
+- Conversion iff billing ≠ price; at launch that case fails closed (`fx_not_supported`).
+- One currency per line; lines of one invoice share the billing currency.
 
 ### 4.2 FX Policy Semantics (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-fx-policy-fx`
 
-- Exactly two deterministic policies, selected by the frozen Finance policy ([`../PRD.md`](../PRD.md) §6.9): **(a) per-window rate-lock** — the locked rate is final at event time; the conversion is definitive and the lock id is recorded; **(b) invoice-period FX** — provisional amount at the locked/spot rate on the hot path (flagged provisional), authoritative re-rate at the close-time `fxTableVersion`, emitted **as a delta** under the slice-08 correction keys (§3.6).
-- `fxTableVersion` is part of the determinism tuple ([`./01-foundation.md`](./01-foundation.md) §4.2): replay over identical inputs — including which version applied at which stage — is byte-identical.
-- Missing FX record (table, policy, or lock) with billing ≠ price ⇒ **fail closed**; no implicit or provider-default rate exists in the design.
-- The frozen table MUST carry the exact **pair-direction** record (price → billing) for the conversion; rate inversion or cross-rate derivation from other pairs is a derivation Rating never performs — absence of the exact pair fails closed.
-- The policy-binding scope (which payer/account/contract binds which policy) arrives frozen from Finance; its concrete field shape is closed in [`11-consumer-contracts.md`](./11-consumer-contracts.md), not here.
+*Activates with R-07.*
+
+- **Per-window rate lock**: the locked rate is final when rated; `rate_ref` recorded.
+- **Invoice-period FX**: provisional rate on provisional evaluations; the child finalizes only with
+  the close-time rate record; a later rate correction is a new revision (Billing derives any
+  difference).
+- The rate record must carry the exact pair direction (price → billing); no inversion or
+  triangulation.
+- Missing record with billing ≠ price ⇒ fail closed.
 
 ### 4.3 FX-Lock Snapshot Segment (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-fx-lock-segment-fx`
 
-- The FX-lock id (if any) is a **Rating-written segment** of `pricingSnapshotRef`, appended at evaluation and sealed by the `SnapshotComposer` (SEAMS S1; [`./01-foundation.md`](./01-foundation.md) §4.3).
-- Segment population: rate-lock ⇒ the lock id; invoice-period ⇒ no lock id — the applied `fxTableVersion` + provisional flag ride the outcome metadata; native (step 8 skipped) ⇒ segment empty.
-- The sealed ref is immutable: the close-time re-rate never rewrites it — the close delta carries its own correction key and records the close-time `fxTableVersion` in its own metadata.
+- The FX segment of the `rating_snapshot` body holds the `rate_ref`(s) used; empty for native
+  currency (all launch lines).
+- A later re-evaluation with a different rate produces a new snapshot and revision; recorded snapshots
+  never change.
 
 ### 4.4 Ordering and Precision at the FX Boundary (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-fx-ordering-fx`
 
-- **Order**: coupons with `settlementCurrency = price` complete in step 7 **before** conversion; conversion runs once; coupons with `settlementCurrency = billing` apply **after** conversion on the billing-currency amount under the **same** `fxTableVersion`; then the step-9 guards. No other step converts ([`../PRD.md`](../PRD.md) §17.1 steps 7–8, §17.2; [`./01-foundation.md`](./01-foundation.md) §3.6).
-- **Native-currency lines**: only the conversion is skipped — the billing-currency coupon pass still executes in its step-8 position on the (identical-currency) amount, keeping coupon placement invariant. The PRD states only the FX skip (§17.1 step 2); this placement reading is fixed here in Design and exercised by the slice-06 joint coupon fixture.
-- **Precision**: conversion computes at full intermediate precision and never rounds; Billing rounds in billing currency after conversion, and the emission records the rounding-policy id ([`./01-foundation.md`](./01-foundation.md) §4.4). The non-negative guard runs at step 9, after the billing-currency coupon pass.
-- **Period floor/cap**: amounts set in price currency convert for billing-currency comparison with the same FX policy + `fxTableVersion` as step 8 (§17.2) — executed under slice 09's obligation, with this slice's recorded policy identity.
+- Order: price-currency coupons (step 7) → conversion (step 8, skipped when native) →
+  billing-currency coupons → step-9 guards. The billing-currency pass runs even when conversion is
+  skipped, keeping coupon placement invariant.
+- Conversion computes at full precision and never rounds; Billing rounds to minor units.
+- Period floor/cap comparison in billing currency uses the same rate record as step 8 (slice 09).
 
 ## 5. Traceability
 
 **Traces to**: `cpt-cf-bss-rating-fr-multi-currency`, `cpt-cf-bss-rating-fr-fx-policy`
 
-- **PRD**: §6.9 (`fr-multi-currency`, `fr-fx-policy`), §17.1 step 8 + step-2 native skip + "Multi-currency (preserved)", §17.2 (billing-currency coupons; floor/cap currency), §12 AC 8, §4.1, §9.2 (Finance FX input contract), §7.1 NFRs.
-- **Seams**: S1 (fx-lock segment — the Rating-written segment owned by this slice), W2 (the close delta replays the pinned snapshot) — [`../SEAMS.md`](../SEAMS.md).
-- **Decisions**: T-D-03 (snapshot composition), T-D-04 (snapshot-only replay for the close delta) — [`../DECISIONS.md`](../DECISIONS.md).
-- **Slices**: [`01-foundation.md`](./01-foundation.md) (pipeline slot, determinism tuple, emission guards), [`06-coupons.md`](./06-coupons.md) (coupon ordering across the FX boundary), [`08-retroactivity-corrections.md`](./08-retroactivity-corrections.md) (close-time delta path), [`09-period-plan-change.md`](./09-period-plan-change.md) (floor/cap conversion), [`11-consumer-contracts.md`](./11-consumer-contracts.md) (Finance/Billing contracts).
-- **Pricing design set**: [`04-currency-tax.md`](../../../pricing/docs/design/04-currency-tax.md) (per-market rows, no FX derivation, currency binding), [`06-consumer-contracts.md`](../../../pricing/docs/design/06-consumer-contracts.md) (frozen read-model consumer contract).
+- **PRD**: §6.9, §17.1 steps 2 and 8, §12 AC 8.
+- **Seams / contracts**: [`../SEAMS.md`](../SEAMS.md) F-1…F-3, P-8, S-1, J-8.
+- **Decisions**: R-07, T-D-46 — [`../DECISIONS.md`](../DECISIONS.md).
+- **Related slices**: [`06-coupons.md`](./06-coupons.md), [`08-retroactivity-corrections.md`](./08-retroactivity-corrections.md), [`09-period-plan-change.md`](./09-period-plan-change.md).

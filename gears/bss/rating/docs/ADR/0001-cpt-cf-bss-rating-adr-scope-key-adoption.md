@@ -5,7 +5,7 @@ decision-makers: "BSS Rating team"
 ---
 
 Created:  2026-08-24 by Virtuozzo International GmbH
-Updated:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-10-01 by Virtuozzo International GmbH
 
 # ADR-0001: Adopt the Pricing Canonical Scope Key (Do Not Define a Tariffs Key)
 
@@ -56,12 +56,26 @@ Tariffs use so that selection is unique without banning hybrid / grandfathered /
 
 ## Decision Outcome
 
-Chosen option: **Adopt the pricing 8-axis canonical scope key verbatim** —
-`(planId, currency, region, priceOverlay, phase, priceEligibility, chargeKind, cohort)` — for both
-selection and the non-overlap invariant. `phase` is a `phase_id` (uuid). Within
+Chosen option: **Adopt the pricing canonical scope key verbatim** — for both selection and the
+non-overlap invariant. As implemented by pricing (`pricing/src/domain/scope_key.rs`, pricing D-196)
+the key has **ten** axes: `(plan_id, currency, region, price_overlay, phase, price_eligibility,
+charge_kind, cohort, meter, dimension_key)`; the original decision text named the first eight. `phase` is a `phase_id` (uuid). Within
 `existing_grandfathered`, the generation is selected by the `cohort` of the subscription's **pinned
-price id** in `pricingSnapshotRef`, never by `activatedAt` alone. Eligibility classes order
+price id** (originally read from `pricingSnapshotRef`; since 2026-09-25 from the subscription version's pinned price ids — see the note below), never by `activatedAt` alone. Eligibility classes order
 `existing_grandfathered > new_subscriptions_only > all_subscriptions`.
+
+**Amendment (2026-09-25)**: the decision is unchanged in substance — adopt the owner's key, whatever
+its axis count — and the axis list is updated to the ten axes pricing implements. `meter` and
+`dimension_key` make usage rows of one plan distinct per meter/dimension, which Rating already
+selects on in step 3. Pricing enforces window non-overlap per `price_id` in the database; Rating's
+selection guard fails closed on more than one match on the full key.
+
+**Challenge recorded (2026-10-01, decision unchanged)**: the Seam Atlas v2 baseline (D02/D06) moves
+price selection to order acceptance in a PriceBook Pricing model and has Rating load bindings by
+price id without re-resolving. That Pricing model does not exist in this repository (DECISIONS
+R-17). Until the owners decide R-18, this ADR stands and Rating additionally asserts that its
+selection equals the `priceId` the commercial fact carries (`binding_mismatch`). The cohort pin
+moved from the snapshot pre-stamp to the subscription version's pinned price ids (slice 02).
 
 ### Consequences
 
@@ -72,7 +86,7 @@ price id** in `pricingSnapshotRef`, never by `activatedAt` alone. Eligibility cl
 ### Confirmation
 
 * A joint fixture: a hybrid plan (`recurring` + `usage`) and a grandfathered plan with ≥ 2 `cohort` generations both resolve to exactly one row per line without a non-overlap failure.
-* The Tariffs step-2 selection key and the pricing gear's `pricing_price` uniqueness/non-overlap key are byte-identical in the shared fixture set.
+* The Rating step-2 selection key and the pricing gear's `pricing_price` uniqueness key (`uq_pricing_price_scope_key_*`, ten columns) are identical in the shared fixture set.
 
 ## Pros and Cons of the Options
 

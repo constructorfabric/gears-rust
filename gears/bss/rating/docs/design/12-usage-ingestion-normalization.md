@@ -1,12 +1,12 @@
 Created:  2026-08-24 by Virtuozzo International GmbH
-Updated:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-10-02 by Virtuozzo International GmbH
 
 <!-- CONFLUENCE_TITLE: [BSS]: Rating — Usage Ingestion & Normalization (Design) -->
-<!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: OSS Metering, Subscriptions | Downstream: 13-q-store-attribution, rating-core | Owners: BSS Rating team -->
+<!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: usage-collector, subscriptions, types-registry | Downstream: 13-q-store-attribution | Owners: BSS Rating team -->
 
 # DESIGN — Usage Ingestion & Normalization (Slice 12, pipeline)
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-design-usage-ingestion`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-design-usage-ingestion`
 
 <!-- toc -->
 
@@ -27,11 +27,13 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
   - [3.7 Database Schemas and Tables](#37-database-schemas-and-tables)
   - [3.8 Deployment Topology](#38-deployment-topology)
 - [4. Additional Context](#4-additional-context)
-  - [4.1 Normalization to UsageRecord (normative)](#41-normalization-to-usagerecord-normative)
-  - [4.2 Continuous-Duration Session Merge (normative)](#42-continuous-duration-session-merge-normative)
-  - [4.3 Authoritative Usage Dedup (normative)](#43-authoritative-usage-dedup-normative)
-  - [4.4 Correction Ingestion (normative)](#44-correction-ingestion-normative)
-  - [4.5 Fail-Closed Intake and Quarantine (normative)](#45-fail-closed-intake-and-quarantine-normative)
+  - [4.1 Collector Entry → Rating Usage Mapping (normative)](#41-collector-entry--rating-usage-mapping-normative)
+  - [4.2 Attribution (normative)](#42-attribution-normative)
+  - [4.3 Usage Dedup (normative)](#43-usage-dedup-normative)
+  - [4.4 Invalidations, Replacements and Negative Quantities (normative)](#44-invalidations-replacements-and-negative-quantities-normative)
+  - [4.5 Exceptions (normative)](#45-exceptions-normative)
+  - [4.6 Feed Checkpoint, Retention and Backpressure (normative)](#46-feed-checkpoint-retention-and-backpressure-normative)
+  - [4.7 Usage Type Declarations (normative)](#47-usage-type-declarations-normative)
 - [5. Traceability](#5-traceability)
 
 <!-- /toc -->
@@ -40,294 +42,343 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 
 ### 1.1 Architectural Vision
 
-The **intake edge** of the rating pipeline: it receives raw usage events, normalizes them into
-canonical `UsageRecord`s (units, UTC timestamps, tenant axes, subscription/meter linkage,
-`dimensionKey` value pass-through from OSS metering), merges contiguous usage of
-continuous-duration meters into session/window measures **before** the core's granularity
-round-up, and owns the **authoritative usage idempotency/dedup** — the same source event never
-contributes to `Q` twice. Correcting/negative usage enters the pipeline here (ingestion + dedup are
-pipeline-side; the reversal *math* is the core's — slice [`08`](./08-retroactivity-corrections.md)).
+The intake edge of the pipeline. `UsageFeedReader` pulls the usage-collector **usage feed** for the
+GTS types Rating prices, stores every entry (records and invalidations) in `rating_usage_record`,
+attributes records through the Subscriptions attribution projection (slice 13), and hands quantities
+to the counter materializer — all in the page transaction that advances the feed cursor
+(DESIGN §3.6 Flow A). It computes no money and reads no price.
 
-This slice is deliberately **content-free about price**: it computes no money, resolves no catalog,
-and reads no snapshot — it produces the clean, deduplicated, canonical measure the windowed `Q`
-store (slice [`13`](./13-q-store-attribution.md)) counts and the core prices. Everything the core's
-determinism contract depends on being *frozen* starts life here as a normalized, immutable
-`UsageRecord`; a raw event that cannot be normalized is **quarantined, never guessed or dropped**
-([`../PRD.md`](../PRD.md) §6.1, §6.7, §9.2; ADR-0002 — this slice absorbs the ingestion half of the
-VHP-810 rating-engine scope).
+The contract is the **usage-collector's own target V1 design** on upstream `main` (commit
+`5de85f067`, "rework the metering model"): `read_usage_feed`, interval entries, invalidation as an
+entry, a dedup identity over the covered period (usage-collector DESIGN §3.3, ADR-0007, ADR-0010,
+ADR-0011). Rating follows it; the Seam Atlas's `UsageFeedV1` / `UsageCollectorClientV2` sketch is
+withdrawn by the Atlas Plus overlay (2026-10-02) in favour of the same design.
+
+**CURRENT**: the usage-collector code (SDK, gear and plugins, on this branch and on upstream
+`main`) still implements the superseded point-record model — no feed, `created_at` instants,
+`deactivate_usage_record`, `corrects_id` compensation. The collector's DESIGN names this as known
+debt and states that the document, not the code, is normative (usage-collector DESIGN:2296).
+`[DEPENDENCY GAP R-01]`. This branch's base (`8aca4d6df`) predates the redesign; the redesign is on
+upstream `main`.
 
 ### 1.2 Architecture Drivers
 
 #### Functional Drivers
 
-| Requirement | Design Response |
-|-------------|-----------------|
-| `cpt-cf-bss-rating-fr-idempotency` (usage family) | The `UsageDedupStore` is the **authoritative** dedup: a source event keyed `(sourceSystem, meterId, sourceEventId)` yields at most one `UsageRecord` contribution; a duplicate returns the recorded record id and never re-counts into `Q` (§4.3). |
-| Merge-before-round-up (PRD §17.1 step 3) | The `SessionMerger` folds contiguous/overlapping intervals of a continuous-duration meter into one session measure **before** the core's granularity round-up — the core prices the merged aggregate, never raw records (§4.2; core slice [`03`](./03-metering-models.md) §4.4). |
-| `dimensionKey` value pass-through (PRD §6.7, §17.3) | The `Normalizer` copies `dimensionKey` **values** from OSS metering verbatim into the `UsageRecord`; it never fabricates, defaults, or collapses a dimension value — an undeclared/partial tuple is the core's routing concern (slice [`03`](./03-metering-models.md) §4.2), not an intake guess (§4.1). |
-| Correction ingestion (PRD §6.10) | A correcting/negative event is a first-class `UsageRecord` carrying a `corrects` lineage reference; it is **not** a dedup collision — the replay/diff math is core slice [`08`](./08-retroactivity-corrections.md) (§4.4). |
+| Requirement | Design response |
+|---|---|
+| `cpt-cf-bss-rating-fr-idempotency` (usage) | Dedup on the collector entry id, which the collector derives from its dedup identity (§4.3). |
+| `cpt-cf-bss-rating-fr-usage-corrections` | Invalidation entries withdraw the target's quantity; replacements are ordinary records; negative quantities are ordinary measurements (§4.4). |
+| `cpt-cf-bss-rating-fr-dimension-population-contract` | `dimension_key` from declared metadata (§4.1; R-16). |
+| `cpt-cf-bss-rating-fr-meter-mapping-granularity` | Entries are stored raw; granularity applies to the aggregate (slice 03). |
 
 #### NFR Allocation
 
-| NFR theme | Allocated To | Design Response | Verification / Status |
-|-----------|--------------|-----------------|-----------------------|
-| `cpt-cf-bss-rating-nfr-throughput-latency` (≥ 10M ev/day/region) | Ingestion consumer + dedup write path | The write-heavy edge of the gear: a durable at-least-once consumer, partition-local dedup upserts on `(orderingTenantId)` shards, sub-sharded by hash of `subscriptionId`; no catalog read, no core call on the intake path | Load test (slice [`16`](./16-billing-handoff-operations.md) NFR home) |
-| `cpt-cf-bss-rating-nfr-resilience` | Dedup + quarantine | At-least-once redelivery is absorbed by the idempotent dedup upsert; an un-normalizable event is quarantined (dead-letter), never silently dropped; replay of the source stream re-derives byte-identical `UsageRecord`s | Chaos/retry test |
-| `cpt-cf-bss-rating-nfr-horizontal-scale` | Partition contract | Dedup and merge stay inside the `(orderingTenantId)` partition and the `(subscription, meter, …)` aggregate; no cross-partition coordination | Design + load test |
-
-#### Key Decisions
-
-| Decision | Summary |
-|----------|---------|
-| Two dedup layers, distinct owners | **Ingestion dedup** (this slice, source-event identity → one `Q` contribution) is separate from **rated-output dedup** (slice [`15`](./15-rated-output-balance-effects.md), usage key → one `RatedCharge`, correction key → one `Adjustment`, T-D-11); the ingestion usage key propagates into the rated-output key so "same key + same snapshot never double-charges" (core slice [`01`](./01-foundation.md) §4.2). |
-| T-D-16 scope absorption | This slice is the ingestion half of the consolidated pipeline (ADR-0002); it owns the **first authoritative store** in a gear whose evaluation core owns none. |
+| NFR | Design response |
+|---|---|
+| `cpt-cf-bss-rating-nfr-throughput-latency` | One transaction per page of ≤ 1 000 entries; inserts and counter upserts only. The collector's replay target (a 24 h backlog cleared in 6 h, ≥ 5 × the subscribed arrival rate) bounds catch-up. |
+| `cpt-cf-bss-rating-nfr-resilience` | Cursor advances with effects; replay is idempotent; poison entries become exceptions and never block the feed. |
 
 ### 1.3 Architecture Layers
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-rating-tech-stack-ing`
 
-```text
-Raw usage transport (external)   OSS metering usage events (at-least-once, durable) ·
-        │                        Subscriptions meter↔subscription linkage (frozen ctx)
-        ▼
-Ingestion edge (this slice)      IntakeConsumer · Normalizer · SessionMerger · UsageDedupStore ·
-        │                        CorrectionIntake · QuarantineSink
-        ▼
-Windowed Q store (slice 13)      normalized UsageRecords counted into Q (single-writer)
-```
-
-| Layer | Responsibility | Technology |
-|-------|----------------|------------|
-| Application | The intake consumer, normalization, session merge, dedup, correction intake, quarantine | Rust modules in the `rating` gear (pipeline crate; **not** `rating-core`) |
-| Domain | Raw-event and `UsageRecord` shapes, session-merge geometry, dedup/correction keys | Rust; GTS + Rust domain structs |
-| Infrastructure | The **usage dedup store** and the append-only `usage_record` store; the quarantine (dead-letter) store | PostgreSQL, SecureORM (`toolkit-db`); durable event transport |
+`rating` crate: `infra/upstream/usage_feed.rs` (SDK adapter), `infra/upstream/usage_types.rs`
+(types-registry declarations), `domain/ingest.rs` (normalization, pure),
+`infra/storage/usage_repo.rs`.
 
 ## 2. Principles and Constraints
 
 ### 2.1 Design Principles
 
-#### Normalize once, freeze forever
-
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-principle-normalize-once-ing`
-
-A raw event becomes exactly one immutable `UsageRecord`; downstream stages (Q, core, output) read
-it frozen and never re-normalize. Re-ingesting the same source event replays to the same record —
-normalization is a pure function of the raw event plus the frozen unit-identity catalog (§4.1).
-
-#### Merge before the core rounds
-
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-principle-merge-before-round-ing`
-
-Continuous-duration usage is merged into a session/window measure here, **before** the core's
-granularity round-up — the core prices the merged aggregate, never raw samples (PRD §17.1 step 3;
-core slice [`03`](./03-metering-models.md) §4.4). Merge is deterministic and idempotent (§4.2).
-
-#### Pass dimensions through, never author them
-
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-principle-dimension-passthrough-ing`
-
-`dimensionKey` values are OSS metering's (the external critical path); this slice copies them
-verbatim and never fabricates, defaults, or collapses a value. Declaration is the catalog's, freeze
-is the core's (slice [`03`](./03-metering-models.md) §4.2) — intake only carries (§4.1).
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-normalize-once-ing`
+  An entry is stored once, exactly as received plus Rating's attribution columns; later stages read
+  the stored row and never re-read the collector.
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-merge-before-round-ing`
+  Round the aggregate, never the record: `billingGranularity` applies to the window quantity
+  (slice 03).
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-dimension-passthrough-ing`
+  Dimension values come only from the entry's declared metadata; ingestion never defaults or
+  collapses a value.
 
 ### 2.2 Constraints
 
-#### Authoritative usage dedup
-
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-constraint-authoritative-dedup-ing`
-
-Usage dedup is authoritative **here** (PRD §6.1 `fr-idempotency`; core slice [`01`](./01-foundation.md)
-§4.2): a source event contributes to `Q` at most once. This is distinct from — and upstream of —
-the rated-output dedup owned by slice [`15`](./15-rated-output-balance-effects.md).
-
-#### No price, no snapshot, no catalog
-
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-constraint-no-price-ing`
-
-Intake computes no money, pins no `pricingSnapshotRef`, and reads no catalog — it produces the
-canonical measure; the core does all evaluation over the frozen inputs assembled later (slice
-[`14`](./14-unit-synthesis-period-tick.md)).
-
-#### UTC, canonical units
-
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-constraint-utc-units-ing`
-
-All timestamps are UTC; measures carry the meter's canonical unit (unit identity is immutable —
-GB ≠ GiB is a different unit, not a conversion; a unit correction is a new unit — aligned with the
-registry's deprecate-then-remove doctrine, [`../SEAMS.md`](../SEAMS.md) §I). Intake never converts
-units.
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-authoritative-dedup-ing`
+  `rating_usage_record` is the authoritative record of what Rating counted: an entry contributes to
+  counters at most once. The collector's dedup ends at its retention floor (125 days from
+  `window_end`); Rating's key is kept for the correction horizon (≥ 7 years). The collector requires
+  this of a charging consumer (usage-collector PRD:547, PRD:1503-1504).
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-no-price-ing`
+  Ingestion reads no pricing document and pins no catalog version; window placement uses the stored
+  meter spec (slice 13).
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-utc-units-ing`
+  Times are UTC as received; quantities are in the usage type's canonical unit and never converted.
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-entries-not-aggregates-ing`
+  Money is computed from feed entries only, never from the collector's aggregate or query paths
+  (usage-collector ADR-0011: "a consumer that computes money reads entries, not aggregates"). The
+  superseded `deactivate_usage_record` status flip and `corrects_id` compensation are never consumed.
 
 ## 3. Technical Architecture
 
 ### 3.1 Domain Model
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-domain-model-ing`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-domain-model-ing`
 
-- **`RawUsageEvent`** — the wire input from OSS metering: source system, `sourceEventId`, meter id, subscription/resource linkage, quantity or start/stop interval, unit, `dimensionKey` values, event time (UTC), optional `corrects` reference.
-- **`UsageRecord`** — the normalized, immutable output: `usageKey` (§4.3), tenant axes (`orderingTenantId`, `resourceTenantId`, `payerTenantId`, `sellerTenantId`), subscription + meter + `dimensionKey`, canonical measure, event-time window coordinates, session-merge lineage, `corrects` reference (if any), source lineage.
-- **`SessionMeasure`** — for continuous-duration meters: the merged half-open `[start, stop)` interval set and its total measure; the merge lineage (which raw records folded in).
-- **`UsageDedupEntry`** — `usageKey` → recorded `UsageRecord` id + digest; the authoritative dedup fact (§4.3).
-- **`QuarantineEntry`** — an un-normalizable raw event + typed reason (§4.5); never silently dropped, operator-visible, replayable after remediation.
+- **`FeedEntry`** (collector `UsageRecord`, target V1, usage-collector REST YAML:787-889):
+  required `id, tenant_id, resource_ref {resource_id, resource_type}, gts_type_id, entry_type
+  (record | invalidation), quantity, window_start, window_end, idempotency_key, accepted_at, origin
+  (live | backfill)`; optional `subject_ref, metadata`; invalidations only `invalidates, reason_code`.
+  `quantity` is a decimal string, at most 28 significant and 28 fractional digits (ADR-0013).
+  `window_start = window_end` is a point event.
+- **`FeedPage`** — `{entries[≤ 1000], page_info {next_cursor, prev_cursor = null, limit}}`;
+  `next_cursor` is never null on a live read and is null only on the page that reaches `until`.
+  No position, sequence or watermark is on the page.
+- **`NormalizedUsage`** — the `rating_usage_record` row (DESIGN §3.7) minus attribution.
+- **`Attribution`** — `{segment_id, segment_version, subscription_id, sub_line_key, payer_tenant_id,
+  seller_tenant_id, meter = gts_type_id, dimension_key}`.
 
 ### 3.2 Component Model
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-component-usage-ingestion`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-component-usage-ingestion`
 
-- **`IntakeConsumer`** — the durable at-least-once transport consumer; hands each `RawUsageEvent` to normalization; commits its transport offset only after the dedup upsert commits (no lost, no double-counted event).
-- **`Normalizer`** — `RawUsageEvent` → `UsageRecord`: canonical units, UTC coordinates, tenant-axis + subscription/meter resolution against the frozen context, `dimensionKey` verbatim pass-through; a resolution failure routes to quarantine (§4.5).
-- **`SessionMerger`** — folds contiguous/overlapping continuous-duration intervals into a `SessionMeasure` before round-up (§4.2).
-- **`UsageDedupStore`** — the authoritative dedup upsert on `usageKey`; returns the recorded id on a duplicate (§4.3).
-- **`CorrectionIntake`** — admits correcting/negative events as first-class `UsageRecord`s with a `corrects` reference; routes the replay/diff to core slice [`08`](./08-retroactivity-corrections.md) via the Q store re-materialization (slice [`13`](./13-q-store-attribution.md)) (§4.4).
-- **`QuarantineSink`** — the dead-letter store for un-normalizable events (§4.5).
+| Component | Responsibility |
+|---|---|
+| `UsageFeedReader` | Holds the lease of one feed subscription, fetches pages, runs the page transaction. |
+| `UsageNormalizer` | Shape, interval and metadata validation, `content_sha256`, `dimension_key` (pure). |
+| `UsageTypeCache` | Usage type declarations (fold, canonical unit) from types-registry (§4.7). |
+| `Attributor` | Projection lookup `(resource_tenant, resource_id, interval)` → `Attribution` (slice 13 §4.6). |
+| `UsageRepo` | Insert-if-absent, invalidation application, exception writes. |
 
 ### 3.3 API Contracts
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-interface-ingest-ing`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-interface-ingest-ing`
 
-**Inbound (consumed)**: the OSS metering usage transport — at-least-once, durable, ordered per
-source partition; the raw-event schema is an OSS-metering contract this slice adopts. **Outbound
-(provided in-process to slice [`13`](./13-q-store-attribution.md))**: `UsageRecord`s (new and
-correcting) with their `usageKey`, ready to count into `Q`. No external synchronous API — intake is
-transport-driven; the Subscriptions meter↔subscription linkage arrives as frozen context.
+Consumed — **DOCUMENTED on upstream `main`, NOT YET IMPLEMENTED in code** (usage-collector
+DESIGN:1127-1142, REST `GET /usage-collector/v1/feed`):
+
+```rust
+async fn read_usage_feed(&self, ctx: &SecurityContext, subscription: &FeedSubscription,
+    start: FeedStart<&CursorV1>, until: Option<&CursorV1>, limit: Option<u64>)
+    -> Result<FeedPage, UsageCollectorError>;
+```
+
+| Element | Semantics Rating relies on (usage-collector reference) |
+|---|---|
+| `FeedSubscription` | the set of GTS types one consumer reads; 1..100 types per subscription (YAML:342-359) |
+| `FeedStart::Oldest` | the oldest retained entry; never refused (DESIGN:923-926, 1324) |
+| `FeedStart::After(cursor)` | continue after a delivered page; the cursor binds the subscription (`INVALID_CURSOR`, `FILTER_MISMATCH` otherwise) |
+| `until` | a later cursor bounding a replay; a bounded replay is identical entry for entry (DESIGN:919-920) |
+| `limit` | 1..1 000, default 100 |
+| ordering | one deterministic plugin-chosen order; the only promise is that an invalidation follows its target (DESIGN:600) |
+| consistency | pages carry only settled entries; nothing appears behind a returned cursor; the feed is prefix-stable, and there is no snapshot token (ADR-0011) |
+| retention | `InvalidArgument(CursorBeyondRetention)` when retention removed an entry after the cursor; a cursor within the 35-day replay horizon is served (PRD:683-699) |
+| freshness | acceptance → feed visibility p95 ≤ 5 min is a plugin readiness gate for charging consumers (PRD:884-892) |
+
+The feed subscription set is gear config `rating.usage_feed.subscriptions` (lists of ≤ 100 GTS
+types). Provided: nothing externally — there is no usage ingestion API on Rating.
 
 ### 3.4 Internal Dependencies
 
-Downstream: slice [`13`](./13-q-store-attribution.md) (counts `UsageRecord`s into `Q`), core slice
-[`03`](./03-metering-models.md) (prices the merged aggregate), core slice
-[`08`](./08-retroactivity-corrections.md) (correction replay math). Boundary/context contracts:
-slice [`11`](./11-consumer-contracts.md) (Subscriptions input; the frozen linkage). No dependency on
-`rating-core` internals — intake precedes evaluation.
+`Attributor` reads the projection of slice 13; `CounterMaterializer::apply` (slice 13) runs inside
+the page transaction; child work is enqueued through the outbox in the same transaction (slice 14).
 
 ### 3.5 External Dependencies
 
-| Dependency | What crosses the boundary | Contract |
-|------------|---------------------------|----------|
-| OSS Metering (Usage Collector) | raw usage events (quantity/interval, unit, `dimensionKey` values, event time), at-least-once durable | PRD §6.7, §17.3; the external critical path. **The built v1 collector has no emission surface (pull/query only)** — the transport, attribution join, dedup-key derivation, and correction visibility are tracked as [`../SEAMS.md`](../SEAMS.md) §J (UC1–UC6; UC6 = temporal shape — v1 carries point-stamped `(value, created_at)` only, duration rides chunked counter deltas until a native interval kind lands); **UC1 gates this slice's implementation** |
-| Subscriptions | meter ↔ subscription linkage, tenant axes, the pinned `orderingTenantId` | slice [`11`](./11-consumer-contracts.md) §4.3; SEAMS S1 / SUB-R1 |
+usage-collector (SEAMS §B), subscriptions attribution (SEAMS S-3, R-25), types-registry usage type
+declarations (SEAMS U-9).
 
 ### 3.6 Interactions and Sequences
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-flow-ingest-ing`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-ingest-ing`
+  The page transaction is DESIGN §3.6 Flow A. Example (hourly cloudlets):
 
-**Ingest one usage event**:
+  ```text
+  entry   id=0192…a1  entry_type=record  tenant=T10  gts_type_id=gts.cf.oss.cloudlet_hours.v1~ (illustrative)
+          resource_ref={ct-7f3a, container}  window=[2026-10-08T10:00Z, 2026-10-08T11:00Z)
+          quantity="8"  accepted_at=2026-10-08T11:00:07Z  origin=live
+  attribution ct-7f3a @ window → segment SEG-4 v2 → subscription S42, sub_line_key plan#1,
+          payer C1, seller S1
+  stored  rating_usage_record(T10, 0192…a1) meter=gts.cf.oss.cloudlet_hours.v1~,
+          dimension_key="", window_start=2026-10-08T10:00Z (per_hour spec of S42)
+  counter agg_key{S1,C1,T10,S42,plan#1,meter,"",subscription_line} window 10:00 slice 10:00
+          q 0 → 8, q_version 0 → 1
+  work    enqueue child wk1|F-USAGE-OCT|2026-10-08T10:00Z|agg  (provisional)
+  ```
 
-1. `IntakeConsumer` receives a `RawUsageEvent` from the durable transport.
-2. `Normalizer` resolves tenant axes + subscription/meter linkage and produces a canonical `UsageRecord` (UTC, canonical unit, `dimensionKey` verbatim); an unresolvable event routes to `QuarantineSink` (§4.5) and the offset still commits (poison message never blocks the partition).
-3. `UsageDedupStore` upserts on `usageKey`: a first sighting persists the `UsageRecord`; a duplicate returns the recorded id and stops (no re-count).
-4. For continuous-duration meters, `SessionMerger` folds the record into its open session measure (§4.2) — idempotently, keyed by the same `usageKey` set.
-5. The transport offset commits **after** the dedup upsert; the `UsageRecord` is now visible to the Q store (slice [`13`](./13-q-store-attribution.md)).
+  An entry `[10:30, 11:30)` would be `boundary_split_required` under a `per_hour` spec (T-D-48).
 
-- [ ] `p3` - **ID**: `cpt-cf-bss-rating-flow-correction-intake-ing`
-
-**Correction intake**: a correcting/negative event carries a `corrects` reference; it is admitted
-as a new `UsageRecord` (its own `usageKey`), links to the corrected record, and signals slice
-[`13`](./13-q-store-attribution.md) to re-materialize the affected window `Q` — the reversal math
-runs in core slice [`08`](./08-retroactivity-corrections.md). A correction is never a dedup
-collision with the record it corrects.
+- [ ] `p2` - **ID**: `cpt-cf-bss-rating-flow-correction-intake-ing`
+  An invalidation entry is stored in the same page transaction as any other entry; its target's
+  counter receives `−target.quantity` and the child is enqueued (§4.4; DESIGN Flow B).
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-storage-ingestion-ing`
-
-**Owned (the gear's first authoritative stores; partitioned by the pinned `orderingTenantId`, UTC):**
-
-- `usage_record` — append-only normalized records; indexed by `(subscription, meter, dimensionKey, event-time window)` to feed the Q store; immutable.
-- `usage_dedup` — unique index on `usageKey`; the authoritative ingestion dedup fact.
-- `usage_quarantine` — dead-letter store: raw event + typed reason + remediation/replay status.
-
-Concrete DDL is Design; the append-only + immutability posture mirrors the core's frozen-input
-doctrine. No monetary column (the gear computes no money — core slice [`01`](./01-foundation.md) §3.7).
-
-#### Hot/cold tiering of `usage_record` (storage posture)
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-storage-ingestion-ing`
+  `rating_usage_record`, `rating_source_checkpoint`, `rating_exception` — DESIGN §3.7.
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-rating-storage-tiering-ing`
-
-`usage_record` is tiered; the guarantees are tier-invariant. **Hot** (PostgreSQL): open windows
-plus a trailing K months past `closed_posted` (K is deployment-tuned; correction traffic decays
-fast). **Cold**: an **S3-compatible object store** holding immutable, digest-verified columnar
-objects (Parquet) to the full ≥ 7-year correction horizon (core slice
-[`08`](./08-retroactivity-corrections.md) §4.1), partitioned by `(orderingTenantId, window)` and
-sorted `(subscription, meter, eventTime)` for partition/row-group pruning. A per-shard **archiver**
-job (coordination lease, same sharding line as the other pipeline jobs) rewrites hot rows into
-objects, **verifies row count + content digest against the manifest, and only then prunes hot** —
-never an unverified delete. The `usage_archive_manifest` table (partition → object keys, row
-count, digest) is authoritative state and is backed up with the hot store; loss is repaired by
-bucket listing + digest re-verification.
-
-Cold is read **only off the hot path** — three consumers: correction-lane re-materialization
-(slice [`13`](./13-q-store-attribution.md) §4.4 reads the contributing record set), dispute/audit
-evidence, and DR rebuild. A fetch hydrates the partition (optionally into a bounded-TTL
-rehydration cache so a cascade over the same window fetches once); immutable objects + the
-recorded digest preserve the determinism contract across tiers (same record set ⇒ same `Q`).
-Object-store unavailability backpressures the correction lane fail-closed; **first rating never
-reads cold**. Tiering applies to `usage_record` only: `usage_dedup` stays hot forever (tiny rows,
-unbounded window — archiving it would silently shrink the dedup guarantee), and
-`usage_quarantine` follows its remediation lifecycle. **Pinned here**: the contract (S3-compatible
-API, object immutability/lock, digest verification, the partition layout, cold-reads-only-off-hot-path).
-**Deployment profile**: the concrete endpoint (e.g. VHI S3 / MinIO / cloud S3) and K.
+  `rating_usage_record` may be tiered: rows whose windows are final and older than K months move to
+  immutable, digest-verified objects in an S3-compatible store partitioned by `(tenant_id,
+  window_start month)`; the archiver verifies count and digest against a
+  `rating_usage_archive_manifest (tenant_id, partition, row_count, digest, object_ref)` row before
+  deleting hot rows. Cold data is read only by re-materialization, replay and audit. The dedup keys
+  stay hot.
 
 ### 3.8 Deployment Topology
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-rating-deployment-ing`
-
-Pipeline crate inside the one `rating` gear deployable (ADR-0002; distinct from the `rating-core`
-crate). The `IntakeConsumer` runs as a **partitioned consumer group**: one consumer per
-`orderingTenantId` shard, sub-sharded by hash of `subscriptionId` for a large tenant (the same
-sharding rule the subscriptions gear applies to its jobs), so the ≥ 10M ev/day/region write edge is
-never funnelled through one worker; dedup upserts are partition-local. Backpressure is the durable
-transport's (unacked offsets), never a silent drop.
+  One active reader per feed subscription (lease `rating:usage-feed:{subscription_id}`); throughput
+  is scaled by splitting the priced GTS types over more subscriptions.
 
 ## 4. Additional Context
 
-### 4.1 Normalization to UsageRecord (normative)
+### 4.1 Collector Entry → Rating Usage Mapping (normative)
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-normative-normalization-ing`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-normalization-ing`
 
-- Normalization is a **pure function** of `(RawUsageEvent, frozen unit-identity + subscription/meter linkage)`: replay of the source stream re-derives byte-identical `UsageRecord`s.
-- `dimensionKey` **values** are copied verbatim from OSS metering; intake never fabricates, defaults, or collapses a value (declaration = catalog, freeze = core slice [`03`](./03-metering-models.md); PRD §6.7).
-- Units are canonical and immutable (GB ≠ GiB); intake performs **no** unit conversion — a wrong unit is a quarantine, not a silent coercion (§4.5).
-- **Gauge samples (D-44 / T-D-17)**: for a meter whose frozen `aggregationFunction ≠ sum`, records are point-stamped **level samples** (collector `gauge` kind) in the meter's **level unit** (GB, cloudlet — validated at publish against the billable level·granule unit). Intake normalizes and dedups them exactly like counter deltas — it never folds, never integrates, never fills gaps (the granule fold is the Q store's, slice [`13`](./13-q-store-attribution.md); the `hold_last`/`maxHold` gap policy is applied at fold time, not at intake).
-- Every `UsageRecord` carries the full tenant-axis set and the pinned `orderingTenantId` for partition alignment with the core's determinism key and the subscriptions ordering key (SEAMS S1 / SUB-R1).
+| Rating field | Collector target V1 (upstream `main` docs) | Collector code today | Treatment |
+|---|---|---|---|
+| `usage_record_id` | `id` = UUIDv5 over `(tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type)` (ADR-0007) | `id` = UUIDv5 over `(tenant, gts_id, created_at, key)` | copied |
+| `tenant_id` | `tenant_id` | `tenant_id` | copied; the record's resource tenant |
+| `gts_type` | `gts_type_id` | `gts_id` | copied |
+| `meter` | — | — | **derived**: `= gts_type_id` (R-09); the price row is resolved at rating time from the pinned plan |
+| `resource_type`, `resource_id` | `resource_ref` | `resource_ref` | copied |
+| `subject_ref` | `subject_ref` | `subject_ref` | copied (lineage only) |
+| `interval_start`, `interval_end` | `window_start`, `window_end` (half-open; equal = point event) | **unavailable** (`created_at` only) | copied; code-today records are not rateable (`interval_missing`) |
+| `quantity` | `quantity` (decimal string, ≤ 28 fractional digits) | `value` | copied as `NUMERIC` |
+| unit, fold | not on the entry; on the types-registry declaration | `UsageKind` counter/gauge | **resolved** from types-registry (§4.7) |
+| `dimension_key` | `metadata` (closed map of declared keys) | `metadata` | **derived**: R-16 encoding of the keys the pinned row declares; launch: `""` |
+| `idempotency_key` | `idempotency_key` | `idempotency_key` | copied (natural key) |
+| `entry_type` | `record` \| `invalidation` | — | copied |
+| `invalidates_id`, `reason_code` | `invalidates` (server-stamped), `reason_code` | — | copied |
+| `origin` | `live` \| `backfill` (the route, not the age) | — | copied |
+| `accepted_at` | `accepted_at` (server) | — | copied; late-arrival detection (`accepted_at` vs `window_end`) |
+| `subscription_id`, `sub_line_key`, payer, seller | — (commercial identity is the consumer's, PRD:513) | — | **resolved** through the attribution projection (§4.2); **CURRENT: no source** |
+| — | removed from the target trait | `status`, `corrects_id`, `deactivate_usage_record` | **obsolete**: never consumed |
 
-### 4.2 Continuous-Duration Session Merge (normative)
+- `content_sha256` = SHA-256 over the canonical serialization of every copied field (metadata
+  sorted by key).
+- An entry with `window_end < window_start`, an unknown GTS type, or metadata keys outside the type's
+  declared set is `usage_malformed`.
+- Backfilled entries (`origin = backfill`, admitted up to 90 days back through the collector's
+  backfill route) are processed identically.
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-normative-session-merge-ing`
+### 4.2 Attribution (normative)
 
-- For a continuous-duration meter, contiguous or overlapping `[start, stop)` intervals for the same `(subscription, meter, dimensionKey)` are merged into one **session measure** before the core's granularity round-up (PRD §17.1 step 3): twelve 5-minute samples become one measured span, not twelve rounded units (core slice [`03`](./03-metering-models.md) §4.4).
-- Merge is **deterministic and idempotent**: overlapping intervals union (no double-count of an overlap); a re-delivered interval folds to the same session by `usageKey`; half-open UTC geometry means a boundary instant belongs to exactly one interval.
-- The merge lineage (which raw records folded in) is retained so a correction to one contributing record re-materializes the session deterministically (slice [`13`](./13-q-store-attribution.md), core slice [`08`](./08-retroactivity-corrections.md)).
-- Discrete / `per_event` meters are **not** merged — each event is its own measure (core slice [`01`](./01-foundation.md) §4.2 `per_event` unit).
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-session-merge-ing`
+  **Attribution rule** (this ID once named the session-merge rule):
 
-### 4.3 Authoritative Usage Dedup (normative)
+- A record is attributed by `(resource_tenant_id = tenant_id, resource_id, interval)` to the segment
+  whose `[valid_from, valid_to)` contains the whole interval (slice 13 §4.6).
+- No covering segment ⇒ `awaiting_attribution`, stored uncounted; applied when a segment arrives.
+- An interval crossing a segment boundary (payer transfer, line change) ⇒
+  `boundary_split_required` (T-D-48, T-D-50).
+- Two segments covering the interval ⇒ `quarantined` (`usage_ambiguous_attribution`); never an
+  arbitrary choice (Atlas P2).
+- Attribution is set once per entry and records the `(segment_id, segment_version)` used. A later
+  segment version that changes the owner of an already-counted interval is a correction: the entry is
+  un-counted from the old aggregation key and counted under the new one in one transaction, and both
+  children are re-evaluated (slice 08).
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-normative-usage-dedup-ing`
+### 4.3 Usage Dedup (normative)
 
-- The **usage key** is `(sourceSystem, meterId, sourceEventId)`; where a source cannot supply a stable event id, a content digest over the canonical fields is the fallback key (recorded so the choice is auditable). **The digest is pinned (2026-07-31 review, #42 — a dedup key must be stable across releases and reproducible on replay)**: SHA-256 over the canonical serialization of exactly `(tenant_id, usageTypeRef, resource_ref, subject_ref, event time, value, unit, metadata as sorted k=v pairs)`, recorded beside the key with **`digest_key_version = 1`** — a field-set or algorithm change bumps the version, and records deduplicate only within one version. Latent at launch: the only launch source (the Usage Collector) always supplies the stable `(tenant_id, gts_id, idempotency_key)` identity (SEAMS UC4), so the branch is not exercised. Dedup is a unique-index upsert: a first sighting persists, a duplicate returns the recorded `UsageRecord` id and **does not** re-count into `Q`.
-- Dedup is **authoritative here** — the single source of truth that a usage event contributes to `Q` at most once (PRD §6.1; core slice [`01`](./01-foundation.md) §4.2). This is a **distinct layer** from the rated-output dedup (slice [`15`](./15-rated-output-balance-effects.md): `RatedCharge` per usage key, `Adjustment` per correction key, T-D-11); the ingestion `usageKey` **propagates** into the rated-output key so the two layers compose ("same key + same snapshot never double-charges").
-- At-least-once transport redelivery, consumer restart, and source-stream replay are all absorbed by the idempotent upsert — none double-counts.
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-usage-dedup-ing`
 
-### 4.4 Correction Ingestion (normative)
+- Primary key `(tenant_id, usage_record_id)`; insert is `ON CONFLICT DO NOTHING`; a conflicting row
+  with a different `content_sha256` raises `usage_content_conflict` and the stored row stands.
+- Defence key: unique `(tenant_id, gts_type, idempotency_key, interval_start, interval_end,
+  entry_type)` — the collector's own dedup identity. An entry with a new id but an existing natural
+  key is a conflict, not a new measurement. The key is never weaker than the upstream scope, because
+  the upstream id is a function of exactly that identity.
+- Replay of any feed range — including a full replay from `Oldest` — is harmless.
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-normative-correction-intake-ing`
+### 4.4 Invalidations, Replacements and Negative Quantities (normative)
 
-- A correcting or negative usage event is admitted as a **first-class `UsageRecord`** with its own `usageKey` and a `corrects` lineage reference; it is **never** a dedup collision with the record it adjusts.
-- Correction ingestion stays pipeline-side (PRD §6.10); the record signals slice [`13`](./13-q-store-attribution.md) to **re-materialize** the affected window `Q`, and the replay/diff/reversal math runs in core slice [`08`](./08-retroactivity-corrections.md) over the pinned snapshot — intake carries the corrected measure, never computes the delta.
-- Late arrival vs `periodState` (`open` / `closed_posted`) is **not** decided here: intake tags event time; routing to open-period re-resolution or posted-period protection is the core's (slice [`08`](./08-retroactivity-corrections.md) §4.3), driven by the Billing `periodState` assembled in slice [`14`](./14-unit-synthesis-period-tick.md).
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-correction-intake-ing`
 
-### 4.5 Fail-Closed Intake and Quarantine (normative)
+- An invalidation is a faithful copy of its target with `entry_type = invalidation`, a server-stamped
+  `invalidates` and a `reason_code`; its quantity is an echo, not a negation (usage-collector
+  DESIGN:589-590). Rating stores it (unique `(tenant_id, invalidates_id)`) and, if the target is
+  counted, applies `−target.quantity` to the target's counter slice and enqueues the child. The feed
+  places an invalidation after its target.
+- At most one invalidation per record (a duplicate with the same reason is absorbed upstream; Rating's
+  unique key absorbs any replay). There is no invalidation of an invalidation.
+- **Replacement is not atomic upstream**: an invalidation, then a fresh record under a new key with
+  the same attribution and period (usage-collector PRD:436-438). Rating counts each when it arrives;
+  the window may briefly show the target withdrawn and the replacement not yet present. That state is
+  never treated as settled: under `evidence_mode = full` the coverage digest does not match until both
+  are stored (slice 14 §4.5); under `delay_only` (R-21) a later replacement produces a new revision.
+- Target not stored ⇒ `invalidation_target_unknown`, retried every 15 minutes.
+- A negative-quantity record is an ordinary measurement. A window driven below zero fails closed
+  `negative_window_quantity`.
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-normative-quarantine-ing`
+### 4.5 Exceptions (normative)
 
-- An event that cannot be normalized — unknown meter, unresolvable subscription linkage, non-canonical/unknown unit, malformed interval — is routed to `usage_quarantine` with a **typed reason**; it is **never silently dropped and never guessed** (the fail-closed doctrine of core slice [`01`](./01-foundation.md) §2.1).
-- Quarantine is operator-visible and **replayable**: after the upstream defect is fixed (e.g. the meter is declared, the subscription linkage lands), the event replays through normalization deterministically. **Replay is an authorized operator action** — `usage × replay` under the gear authz catalog (slice [`10`](./10-governance-asc606.md) §4.6): replaying quarantined usage creates billable charges, so it is never an unauthenticated maintenance call; the actor and replayed set are audited (2026-07-31 review, #51).
-- A poison event never blocks its partition: the transport offset commits after quarantine so the consumer group makes progress; correctness is preserved because a quarantined event contributes nothing to `Q` until replayed.
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-quarantine-ing`
+
+| `reason_code` | Cursor advances | Retry | Resolution |
+|---|---|---|---|
+| `usage_malformed` | yes | operator | collector fix, `POST /exceptions/{id}:retry` |
+| `interval_missing` | yes | operator | the collector's target V1 record (intervals) |
+| `usage_type_not_chargeable` | yes | on declaration change | the type's fold is not `SUM` (§4.7) |
+| `awaiting_attribution` (state, exception after 1 h) | yes | on segment arrival, every 15 min | automatic |
+| `usage_ambiguous_attribution` | yes | no | Subscriptions fix |
+| `boundary_split_required` | yes | on replacement | emitter re-split |
+| `invalidation_target_unknown` | yes | every 15 min | automatic or operator |
+| `usage_content_conflict` | yes | no | investigation (alarm) |
+
+Operator retry (`usage × retry`) is authorized and audited because it can create charges. An
+exception never blocks the feed.
+
+### 4.6 Feed Checkpoint, Retention and Backpressure (normative)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-feed-checkpoint-ing`
+
+- **Checkpoint**: `rating_source_checkpoint['usage:{subscription_id}'] = {cursor}`, written only by
+  the page transaction with a CAS on `cursor`. The collector's cursor is the only position; there is
+  no snapshot token, sequence or watermark to store.
+- **Advance**: after the page's effects; a crash before commit re-reads the page from the old cursor.
+- **Bootstrap**: a new subscription starts at `FeedStart::Oldest`. Adding a GTS type is a new
+  subscription (the cursor binds the subscription) that bootstraps from `Oldest`; dedup absorbs the
+  overlap.
+- **Widened authorization scope**: the cursor does not bind the PDP scope; entries that become
+  visible behind the cursor are not delivered. When Rating's service grant widens (for example a new
+  tenant), Rating replays that subscription from `Oldest` (usage-collector PRD:669).
+- **Retention**: `CursorBeyondRetention` restarts the subscription from `Oldest` and raises
+  `rating_feed_restart_total` (page). Entries removed upstream that Rating never stored are lost: the
+  retention floor (125 days from `window_end`) must exceed the largest finalization delay plus the
+  supported outage window (Atlas C09).
+- **Bounded replay** (reconciliation): `read_usage_feed(subscription, After(c1), until = c2)` re-reads
+  a delivered range identically; inserts are no-ops.
+- **Backpressure**: a reader stops fetching while `rating.child_work` depth exceeds
+  `max_queue_depth` (default 1 000 000) and resumes below 80 %; nothing is dropped.
+- **Reconciliation**: daily per `(tenant, gts_type)` against the collector's reconciliation metadata
+  (`GET /usage-collector/v1/reconciliation`: accepted count, quantity summary, watermarks). The route
+  is REST-only and operator-scoped; whether Rating's service identity may call it is UNKNOWN /
+  EXTERNAL CONTRACT REQUIRED. Watermarks prove nothing about completeness (ADR-0011).
+
+### 4.7 Usage Type Declarations (normative)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-usage-types-ing`
+
+- Declarations live in types-registry, not in the collector (usage-collector ADR-0008): required
+  `aggregation_fold ∈ {SUM, COUNT, MAX, MIN, LATEST}`, `canonical_unit`, `retention`; optional
+  `nominal_sampling_interval` (`schemas/usage_record.v1.schema.json:44-65`). The collector serves no
+  type reads.
+- Rating reads a declaration through the types-registry SDK (`TypesRegistryClient` schema reads)
+  and caches it by GTS type id (declarations are immutable). A typed accessor returning fold, unit and
+  accrual method is not specified by anybody (Atlas Plus X7): UNKNOWN / EXTERNAL CONTRACT REQUIRED.
+- Only `SUM` is chargeable (usage-collector ADR-0009, ADR-0011); entries of a type with another fold
+  are stored and raise `usage_type_not_chargeable` (R-06).
+- `nominal_sampling_interval`, when declared, is the input to Rating's stall signal per resource
+  (`rating_usage_stall_seconds`); stall detection is the consumer's (usage-collector PRD:749).
 
 ## 5. Traceability
 
 **Traces to**: `cpt-cf-bss-rating-fr-dimension-population-contract`
 
-- **PRD**: §9.2 (Rating handoff duties — usage dedup, merge), §6.1 (`fr-idempotency` usage family), §6.7 (`dimensionKey` values), §6.10 (correction ingestion), §17.1 step 3 (merge-before-round-up), §7.1 (throughput NFR).
-- **Seams**: M7 (feeds the single-writer Q store), S1 / SUB-R1 (pinned `orderingTenantId`), **UC1–UC6 §J** (Usage Collector ingestion bridge — transport, watermark, attribution join, dedup-key derivation, correction visibility, temporal shape; UC1 gates implementation) — [`../SEAMS.md`](../SEAMS.md).
-- **Decisions**: T-D-04 (counter key the records feed), T-D-11 (rated-output dedup is a distinct downstream layer), T-D-16 (consolidation; this slice absorbs VHP-810 ingestion scope) — [`../DECISIONS.md`](../DECISIONS.md).
-- **ADR**: [`../ADR/0002-cpt-cf-bss-rating-adr-rating-gear-consolidation.md`](../ADR/0002-cpt-cf-bss-rating-adr-rating-gear-consolidation.md).
-- **Related slices**: [`13-q-store-attribution.md`](./13-q-store-attribution.md) (counts the records), [`01-foundation.md`](./01-foundation.md) / [`03-metering-models.md`](./03-metering-models.md) / [`08-retroactivity-corrections.md`](./08-retroactivity-corrections.md) (core consumers), [`11-consumer-contracts.md`](./11-consumer-contracts.md) (Subscriptions input).
+- **DESIGN**: §3.6 Flow A, Flow B; §3.7; §4.2; §4.3.
+- **SEAMS**: U-1…U-14, S-3, §L C05, §M-5, §M-13.
+- **Decisions**: R-01, R-06, R-09, R-16, R-21, R-25, T-D-36, T-D-48, T-D-51, T-D-52.
+- **Usage collector (upstream `main`)**: DESIGN §3.3, ADR-0007, ADR-0008, ADR-0009, ADR-0010,
+  ADR-0011, ADR-0013.

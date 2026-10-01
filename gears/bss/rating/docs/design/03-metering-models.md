@@ -1,8 +1,8 @@
 Created:  2026-08-24 by Virtuozzo International GmbH
-Updated:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-10-01 by Virtuozzo International GmbH
 
 <!-- CONFLUENCE_TITLE: [BSS]: Rating — Metering & Pricing Models (Design) -->
-<!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: Pricing (Product Catalog), Rating, Subscriptions, OSS Metering | Downstream: Rating | Owners: BSS Rating team -->
+<!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md, ../DECISIONS.md | Upstream: slice 02 outcome, window counters, pinned plan documents, subscription version | Downstream: slice 04 | Owners: BSS Rating team -->
 
 # DESIGN — Metering & Pricing Models (Slice 3)
 
@@ -29,7 +29,7 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 - [4. Additional Context](#4-additional-context)
   - [4.1 Model Formulas (normative)](#41-model-formulas-normative)
   - [4.2 Meter Mapping and Dimensional Lines (normative)](#42-meter-mapping-and-dimensional-lines-normative)
-  - [4.3 Tier Aggregation Window and `Q` (normative)](#43-tier-aggregation-window-and-q-normative)
+  - [4.3 Tier Aggregation Window, Slices and Band Continuity (normative)](#43-tier-aggregation-window-slices-and-band-continuity-normative)
   - [4.4 Granularity Round-Up (normative)](#44-granularity-round-up-normative)
 - [5. Traceability](#5-traceability)
 
@@ -39,26 +39,16 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 
 ### 1.1 Architectural Vision
 
-Metering & Pricing Models is the **step 3 evaluator** plus the **model-formula library**: it
-maps the evaluation unit to a charge line keyed `(meter, dimensionKey)` (injective per plan
-revision, fail-closed otherwise), normalizes the measure (`billingGranularity` round-up on the
-**merged** aggregate, never per raw record), resolves the tier-counter window, and computes the
-model math for the catalog `modelKind` set `{flat, per_unit, graduated, volume, package}` —
-the pricing §17.2 **kind→formula mapping adopted verbatim as shared SoR** (SEAMS M1). `hybrid`
-and `committed` are **not** model kinds: a hybrid plan is a composition emitting two lines
-under one `planId`; committed usage is a commitment pool over a base model, evaluated at step 6
-([`05-commitments-reservations.md`](./05-commitments-reservations.md)).
+Step 3 of the evaluation: map the child to a charge line `(meter, dimension_key)`, apply
+`billingGranularity` round-up to the aggregate, and compute the model formula of the selected row
+for `modelKind ∈ {flat, per_unit, graduated, volume, package}` — the pricing kind→formula mapping,
+adopted verbatim. The slice also owns **slice band continuity**: when split points divide a usage
+aggregation window, all slices are priced in one call, each slice's quantity placed on the bands
+after the quantity of the slices before it. `hybrid` and `committed` are compositions, not kinds:
+a hybrid plan emits separate `recurring` and `usage` lines; committed usage is step 6 (slice 05).
 
-The slice also owns the two cloud-defining launch capabilities riding step 3: **dimensional
-lines** — each distinct `(meter, dimensionKey)` prices as its own line, with the declared
-dimension set frozen in `pricingSnapshotRef` and no silent collapsing of partial values — and
-**composite (derived) meter evaluation** — a catalog-declared frozen formula-as-data over ≥ 2
-input units producing one output quantity that is then priced by its own `modelKind`
-(SEAMS M5). What it does **not** own: `Q` aggregation (Rating, single-writer per
-`(subscription, meter, dimensionKey, window)` — SEAMS M7), dimension **declaration** authoring
-(pricing catalog) and dimension **value emission** (OSS metering, the external critical path),
-pool drawdown (slice 05), and period floor/cap (slice 09; bands are open-top by catalog
-guarantee — capping is a period-level obligation).
+Quantities arrive computed: the pipeline materializes per-slice window quantities (slice 13) as
+`rust_decimal::Decimal` from usage-collector records. This slice never aggregates records.
 
 ### 1.2 Architecture Drivers
 
@@ -66,54 +56,43 @@ guarantee — capping is a period-level obligation).
 
 | Requirement | Design Response |
 |-------------|-----------------|
-| `cpt-cf-bss-rating-fr-meter-mapping-granularity` | `MeterMapper` maps the unit to `(meter, dimensionKey)` injectively per plan revision (configuration error ⇒ fail closed); `GranularityNormalizer` rounds up the merged measure exactly once (§4.4). |
-| `cpt-cf-bss-rating-fr-flat-pricing` | `ModelFormulaEvaluator`: `unitPrice × Q` (or fixed amount per period for recurring); no thresholds evaluated (§4.1). |
-| `cpt-cf-bss-rating-fr-per-unit-pricing` | `per_unit` = `unitPrice × quantity` where quantity comes from the frozen `quantitySource` (`subscription_seat_count` from Subscriptions, or `manual`) — **never** metered `Q`; pricing **p1 launch**, joint fixture (SEAMS M2). |
-| `cpt-cf-bss-rating-fr-tiered-graduated` | Marginal band math per band; a single-band graduated is numerically Variant A — distinguished by configured kind, not by math; counter per the resolved window (§4.3). |
-| `cpt-cf-bss-rating-fr-volume-variant-a` | One band rate applied to **all** units by total `Q` in the window; explicit per-SKU configuration, distinguishable from graduated (§4.1). |
-| `cpt-cf-bss-rating-fr-package-pricing` | `ceil(usedQ / packageSize) × packagePrice` over the window; partial block rounds up to one block; parity with pricing p2 launch, joint fixture (SEAMS M3). |
-| `cpt-cf-bss-rating-fr-hybrid-pricing` | Composition, not a kind: two lines under one `planId`, independently evaluated; min-commit expressed as committed-usage, never conflated with a period floor; attachment configuration frozen in `pricingSnapshotRef` (§4.1). |
-| `cpt-cf-bss-rating-fr-committed-usage` | Composition over a base model: in-commitment vs overage rates and `TrueUpObligation` are step 6 ([`05`](./05-commitments-reservations.md)); reversal/refill under slice [`08`](./08-retroactivity-corrections.md) keys. This slice contributes only the base-model math the pool wraps. |
-| `cpt-cf-bss-rating-fr-dimensional-pricing` | `MeterMapper` prices each distinct `(meter, dimensionKey)` as its own line; empty/partial values on a dimension-declaring plan route to a **published** default/catch-all line or fail closed — never guessed (§4.2). |
-| `cpt-cf-bss-rating-fr-dimension-population-contract` | Declaration = catalog; **freeze = this slice** (declared set into `pricingSnapshotRef`); value emission = OSS metering (external critical path); until then `dimensionKey` is the empty tuple (§4.2). |
-| `cpt-cf-bss-rating-fr-composite-meter-eval` | `CompositeMeterEvaluator` evaluates the frozen formula-as-data to the output quantity, then prices the output unit by its `modelKind` — **composite inputs are window-`sum` only at launch** (D-44's no-co-occurrence rule: non-`sum` aggregation and composite meters never meet on one row); the pipeline never authors or mutates the derivation (§4.1). |
+| `cpt-cf-bss-rating-fr-meter-mapping-granularity` | `MeterMapper` (injective per plan revision) and `GranularityNormalizer` (round-up once, on the aggregate) (§4.2, §4.4). |
+| `cpt-cf-bss-rating-fr-flat-pricing` | `flat` formula (§4.1). |
+| `cpt-cf-bss-rating-fr-per-unit-pricing` | `per_unit` = unit rate × seat quantity from the subscription version (or `manualQuantity`), never metered Q (§4.1). |
+| `cpt-cf-bss-rating-fr-tiered-graduated` | Marginal band placement with slice offset (§4.1, §4.3). |
+| `cpt-cf-bss-rating-fr-volume-variant-a` | Band of the window total applied to all units (§4.1, §4.3). |
+| `cpt-cf-bss-rating-fr-package-pricing` | `ceil` blocks, cumulative across slices (§4.1, §4.3). |
+| `cpt-cf-bss-rating-fr-level-aggregation` | Not active: rows with `aggregationFunction ≠ sum` fail closed `unsupported_aggregation` pending R-06 (§4.3). |
+| `cpt-cf-bss-rating-fr-hybrid-pricing` | Two lines under one `plan_id`, one per `charge_kind`, each selected and priced independently (§4.1). |
+| `cpt-cf-bss-rating-fr-committed-usage` | Base-model math only; pool drawdown is slice 05. |
+| `cpt-cf-bss-rating-fr-tier-aggregation-window` | Five window kinds with UTC boundaries (§4.3). |
+| `cpt-cf-bss-rating-fr-billing-granularity` | §4.4. |
+| `cpt-cf-bss-rating-fr-dimensional-pricing` | One line per `(meter, dimension_key)`; launch posture empty key only (§4.2, R-16). |
+| `cpt-cf-bss-rating-fr-dimension-population-contract` | Declaration by pricing, values from usage metadata, mapping per R-16 (§4.2). |
+| `cpt-cf-bss-rating-fr-composite-meter-eval` | Composite formula over ≥ 2 input quantities, then priced by the output row's `modelKind` (§3.6). |
 
 #### NFR Allocation
 
 | NFR theme | Allocated To | Design Response | Verification / Status |
 |-----------|--------------|-----------------|-----------------------|
-| `cpt-cf-bss-rating-nfr-throughput-latency` | `ModelFormulaEvaluator` | Formula math is O(bands) in-memory over the frozen aggregate; no I/O inside step 3 | Load test; targets provisional (NFR workshop) |
-| `cpt-cf-bss-rating-nfr-horizontal-scale` | `Q` consumption | The counter key `(subscription, meter, dimensionKey, window)` **is** the partition key (SEAMS M7) — window math stays partition-local for every single-meter model; the composite meter is the one exception and reads its input `Q`s as frozen values, never live counters (§3.6) | Design + load test |
-| `cpt-cf-bss-rating-nfr-resilience` | `MeterMapper` fail-closed | Non-injective mapping, unresolvable dimension routing, or a missing frozen model parameter is a typed configuration failure — never a guessed line | Chaos/retry test + joint fixtures |
+| `cpt-cf-bss-rating-nfr-throughput-latency` | `ModelFormulaEvaluator` | O(slices × bands) arithmetic, no I/O | Benchmark |
+| `cpt-cf-bss-rating-nfr-horizontal-scale` | Purity | Stateless | Design |
+| `cpt-cf-bss-rating-nfr-resilience` | Fail-closed mapping and params | Typed errors (slice 01 §4.4) | Fixture corpus (tier-boundary, package, per-unit, flat, supersession-continuity families) |
 
 #### Key ADRs
 
 | ADR ID | Decision Summary |
 |--------|------------------|
-| `cpt-cf-bss-rating-adr-scope-key-adoption` | The window key is the pricing 8-axis key; `(meter, dimensionKey)` keys the **line within** the selected row — it is not a window-selection axis (SEAMS K1 boundary). |
-| `cpt-cf-bss-pricing-adr-canonical-scope-key` (adopted) | Key definition SoR; the usage-only restriction for tier models rides the key's `chargeKind` axis (pricing D-18). |
+| `cpt-cf-bss-rating-adr-scope-key-adoption` | `meter` and `dimension_key` are scope-key axes of the row; the line key reuses them. |
 
 ### 1.3 Architecture Layers
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-rating-tech-stack-mm`
 
-```text
-Step 3 evaluator (this slice)     MeterMapper · GranularityNormalizer · TierWindowResolver ·
-        │  (registers into §17.1 slot 3)      ModelFormulaEvaluator · CompositeMeterEvaluator
-        ▼
-Foundation mechanisms (01)        EvaluationPipeline · EvaluationUnit shapes · frozen-input digest
-        │
-        ▼
-Frozen inputs                     selected row + model params (slice 02 / snapshot) · windowed Q
-                                  (Rating) · seat count (Subscriptions) · declared dimension set +
-                                  composite formula (pricing snapshot) · dimensionKey values (OSS)
-```
-
 | Layer | Responsibility | Technology |
 |-------|----------------|------------|
-| Application | The step 3 evaluator: mapping, normalization, model math, composite evaluation | Rust module in the `rating` gear (rating-core crate) |
-| Domain | Line key, normalized measure, band/package/per-unit parameter shapes, window spec | Rust; GTS + Rust domain structs |
-| Infrastructure | **None owned** — `Q` and dedup live in Rating; model params arrive in the pinned snapshot | In-process (01 §3.7) |
+| Domain | Mapping, granularity, formulas, slice continuity, composite | module `rating_core::models` |
+| Infrastructure | None | — |
 
 ## 2. Principles and Constraints
 
@@ -123,27 +102,23 @@ Frozen inputs                     selected row + model params (slice 02 / snapsh
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-shared-formula-sor-mm`
 
-The catalog `modelKind` enum and its formula semantics are the pricing §17.2 mapping adopted
-verbatim (SEAMS M1); Rating implements, never redefines. Commercial constructs that are *not*
-kinds (hybrid, committed) are compositions over kinds — reclassifying them as kinds is the
-defect this principle guards against.
+The formulas are pricing's §17.2 mapping, also encoded in the shared `bss-fixtures` corpus and its
+reference oracle; Rating implements them and must agree with the oracle on every corpus row
+(`CorpusEvaluator`, SEAMS H-1).
 
 #### Price the aggregate, not the record
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-aggregate-not-record-mm`
 
-All windowed math — granularity round-up, tier placement, package blocks, composite sums —
-operates on the **window-aggregated, merged measure** (`Q` for
-`(subscription, meter, dimensionKey, window)`), never on raw `UsageRecord`s. Rating aggregates
-(single-writer); Rating prices the normalized aggregate (SEAMS M7).
+Round-up, band placement and package blocks operate on the slice/window quantity, never on single
+records (except `per_event`, whose unit is one record).
 
 #### Never guess a line
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-never-guess-line-mm`
 
-An ambiguous meter mapping, a partial dimension tuple, or a missing frozen parameter routes to
-an explicitly **published** default line or fails closed — silent collapsing of dimensional
-usage into one line is mispricing by construction ([`../PRD.md`](../PRD.md) §6.7).
+An ambiguous mapping, an unmapped dimension tuple, or a missing parameter is an error or an
+explicitly published catch-all line — never a merged line.
 
 ### 2.2 Constraints
 
@@ -151,33 +126,27 @@ usage into one line is mispricing by construction ([`../PRD.md`](../PRD.md) §6.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-catalog-guarantees-mm`
 
-Tier bands are **always open-top** (pricing D-17: no closed top, no above-max fail-closed
-branch — capping is a period-level obligation, slice [`09`](./09-period-plan-change.md));
-`graduated` / `volume` / `package` are **usage-only** (`chargeKind=usage`, pricing D-18);
-`aggregationFunction ∈ {sum (default), peak, time_weighted}` per D-44/T-D-17 (the granule
-fold of §4.3 — the 2026-07-28 review deleted the stale "sum-only" wording here, which
-contradicted §4.3 and the p1 `fr-level-aggregation` and would have made the two level-billed
-launch products unrateable); the one surviving `sum`-only boundary is **composite-meter
-inputs** (no co-occurrence with non-`sum`, D-44). The evaluator presupposes these guarantees
-and carries no code paths for their violation.
+Relied on as published by pricing: `graduated`/`volume`/`package` rows are `charge_kind = usage`;
+the last band is open-top (`toQty = null`); bands are contiguous half-open `[fromQty, toQty)`
+starting at 0; `tierQualificationWindow = trailing_period` and `includedAllowance` carry are refused
+at publish (SEAMS P-10). A violation found at evaluation is `missing_model_param` or
+`unsupported_primitive`, never a fallback.
 
 #### Quantity sources are typed
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-typed-quantity-mm`
 
-Metered `Q` (Rating), `subscription_seat_count` (Subscriptions), and `manual` are distinct
-frozen quantity sources; `per_unit` never reads `Q`, usage models never read seat count. The
-`quantitySource` is frozen in `pricingSnapshotRef` (SEAMS M2).
+Metered quantity (window counters), seat quantity (`quantitySource = subscription_seat_count`,
+from the subscription version's seat timeline) and manual quantity (`quantitySource = manual`,
+`manualQuantity` on the row) are distinct; `per_unit` never reads metered quantity and usage models
+never read seats.
 
 #### Dimension declaration is not dimension emission
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-declare-vs-emit-mm`
 
-The catalog persists the declared dimension set; this slice **freezes** it in the snapshot;
-Rating passes `dimensionKey` through; OSS metering emits values (external upstream, critical
-path — [`../PRD.md`](../PRD.md) §16, §17.3). Until OSS emits, `dimensionKey` stays the empty
-tuple. Cross-doc wording of the launch posture is the **open seam M6**
-([`../SEAMS.md`](../SEAMS.md)).
+Pricing declares the priced `dimension_key` on the row; the usage-collector carries metadata values
+declared by the GTS type; the mapping between them is R-16. Rating never fabricates a value.
 
 ## 3. Technical Architecture
 
@@ -185,113 +154,85 @@ tuple. Cross-doc wording of the launch posture is the **open seam M6**
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-domain-model-mm`
 
-All value objects; model parameters are frozen snapshot content, never authored here.
-
-- **`ChargeLineKey`** — `(meter, dimensionKey)`; injective per plan revision; the empty tuple for plans declaring no dimensions.
-- **`NormalizedMeasure`** — the merged, granularity-rounded quantity of the evaluation unit (01 §4.2); carries the pre-round raw aggregate for lineage.
-- **`ModelParams`** — the frozen per-kind parameter set: `unitPrice` (flat/per_unit), open-top marginal bands (graduated/volume A), `packageSize`/`packagePrice` (package), `quantitySource` (per_unit), and the **level-aggregation triple** `aggregationFunction`/`aggregationGranularity`/`maxHold` (non-`sum` usage rows — D-44/T-D-17, §4.3; 2026-07-28 review fix: §4.3 consumed them but this list omitted them).
-- **`TierWindowSpec`** — the resolved `tierAggregationWindow` value + concrete UTC boundaries (anchor policy applied); recorded in metadata and frozen in the snapshot.
-- **`QCounterRef`** — the window-aggregated `Q` for `(subscription, meter, dimensionKey, window)` — Rating-owned, consumed frozen; never written here.
-- **`CompositeFormula`** — the frozen formula-as-data: input unit set (≥ 2), window-`sum` derivation, output unit; catalog-declared (pricing Slice 10).
-- **`ModelLineOutcome`** — per-line model result: effective rate(s), band/block placement, quantities in/out, feeding steps 4+ and the outcome lineage.
+- **`ChargeLineKey`** — `(meter, dimension_key)`; empty `dimension_key` for undimensioned rows.
+- **`ModelParams`** — from the selected row: `modelKind`, `amountMinor` (flat), `unitRateNanoMinor`
+  (flat per-unit rate / per_unit), `bands[{fromQty, toQty, unitPriceNanoMinor}]`
+  (graduated/volume), `packageSize` + `packagePriceMinor` (package), `quantitySource` +
+  `manualQuantity` (per_unit), `billingGranularity`, `tierAggregationWindow`,
+  `aggregationFunction`, `aggregationGranularity`, `maxHoldGranules`, `reservedRateNanoMinor`,
+  `reservationFlavor`.
+- **`SliceQuantity`** — `(slice_start, slice_end, q: Decimal)` from the input, ordered.
+- **`BandPlacement`** — per slice: offset (quantity before the slice on the band axis), band
+  segments `(band, quantity, rate)`.
+- **`ModelLineOutcome`** — billable quantity, placement, exact amount (`ExactAmount`, minor units,
+  never rounded — T-D-46), lineage.
 
 ### 3.2 Component Model
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-component-metering-models-mm`
 
-The step 3 evaluator, registered into the fixed slot (01 §3.2):
-
-- **`MeterMapper`** — evaluation unit → `ChargeLineKey`; asserts injectivity per plan revision (violation ⇒ fail-closed configuration error); routes empty/partial dimension tuples on a dimension-declaring plan to the published default/catch-all line or fails closed (§4.2).
-- **`GranularityNormalizer`** — applies `billingGranularity` round-up once, on the merged measure (§4.4); records the granularity in metadata.
-- **`TierWindowResolver`** — resolves `tierAggregationWindow` to concrete UTC boundaries: `calendar_month` in UTC; `invoice_period` per the frozen `billingAnchorPolicy` + D-20 clamp; `subscription_lifetime`; `per_event` (§4.3).
-- **`ModelFormulaEvaluator`** — the five kind formulas (§4.1) over `NormalizedMeasure` / `QCounterRef` and `ModelParams`; full intermediate precision, no rounding (01 §4.4).
-- **`CompositeMeterEvaluator`** — evaluates `CompositeFormula` to the output quantity, then delegates the output unit to `ModelFormulaEvaluator` under its own `modelKind` (§4.1).
+- **`MeterMapper`** — unit → `ChargeLineKey`; asserts injectivity within the plan revision.
+- **`GranularityNormalizer`** — round-up per §4.4.
+- **`WindowResolver`** — aggregation-window boundaries per §4.3 (also used by `split_points`).
+- **`ModelFormulaEvaluator`** — §4.1 formulas with slice continuity (§4.3).
+- **`CompositeMeterEvaluator`** — composite formula (§3.6).
 
 ### 3.3 API Contracts
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-interface-price-line-mm`
 
-The **step 3 contract** (internal; pipeline-invoked): `price_line(SelectionOutcome,
-EvaluationUnit, frozen params) → ModelLineOutcome | ModelProblem`. Deterministic over the
-frozen tuple (01 §4.2). Problems (this slice's rows in the Design-set error taxonomy):
-`non_injective_mapping`, `unroutable_dimension_tuple`, `missing_model_param`,
-`unknown_model_kind` (enum drift — guarded upstream by the CI gate, SEAMS P1 pattern),
-`max_hold_exceeded` (the D-44 sampling-gap signal: the granule folds to level 0 **and** this
-operator signal raises — the outcome still emits, unlike every other row here; 2026-07-28
-review fix) — all others fail-closed.
+`price_unit(&SelectionOutcome per slice, &ModelParams per slice, &[SliceQuantity]) ->
+Result<Vec<ModelLineOutcome>, EvaluationError>` — internal. Errors: `non_injective_mapping`,
+`unroutable_dimension_tuple`, `missing_model_param`, `unknown_enum_value`,
+`unsupported_aggregation`, `unsupported_primitive`, `negative_window_quantity`.
 
 ### 3.4 Internal Dependencies
 
-Upstream: [`01-foundation.md`](./01-foundation.md) (pipeline, evaluation unit, precision
-guards); [`02-selection-eligibility.md`](./02-selection-eligibility.md) (the selected row and
-its `modelKind`/params provenance). Downstream: [`04-overlays-precedence.md`](./04-overlays-precedence.md)
-stacks overlays on the model output; [`05-commitments-reservations.md`](./05-commitments-reservations.md)
-wraps it in pool/reservation math; [`08-retroactivity-corrections.md`](./08-retroactivity-corrections.md)
-drives the correction-time counter decrement (Rating executes the decrement; the key is M7's).
+Upstream: slice 02 (selected rows per slice). Downstream: slice 04 (overlays on the model amount),
+slice 05 (reservation split re-runs this slice over the remainder), slice 09 (split points and
+recurring proration).
 
 ### 3.5 External Dependencies
 
-| Dependency | What arrives frozen | Contract |
-|------------|--------------------|----------|
-| Rating pipeline (intra-gear — slices 12/13) | window-aggregated `Q` per `(subscription, meter, dimensionKey, window)` (single-writer); merged session measures for continuous-duration meters | PRD §9.2 handoff; slices 12/13; SEAMS M7 |
-| Pricing (Product Catalog) | `modelKind` + per-kind params, declared dimension set, composite formula, `tierAggregationWindow` / `billingAnchorPolicy` — all in the pinned snapshot | [`11-consumer-contracts.md`](./11-consumer-contracts.md); SEAMS M1/M3/M5 |
-| Subscriptions | `subscription_seat_count` for the `per_unit` `quantitySource` | PRD §9.2 Subscriptions input; SEAMS M2 |
-| OSS Metering | `dimensionKey` **values** on usage (external critical path; empty tuple until delivered) | PRD §6.7, §17.3; SEAMS M6 (open wording) |
+| Dependency | What arrives (by value) | Contract |
+|------------|------------------------|----------|
+| pricing | row parameters listed in §3.1, composite declarations (`composites`) | SEAMS P-2, P-9 — [DEPENDENCY GAP R-02] |
+| Rating pipeline | per-slice quantities + `q_version` | slice 13 |
+| subscriptions | seat timeline | SEAMS S-1 — [DEPENDENCY GAP R-03] |
 
 ### 3.6 Interactions and Sequences
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-price-line-mm`
 
-**Price one line** (step 3 of `cpt-cf-bss-rating-seq-evaluate-tariff`):
-
-1. `MeterMapper`: evaluation unit → `ChargeLineKey`; injectivity assert; dimension routing (§4.2).
-2. `GranularityNormalizer`: round the merged measure up to `billingGranularity` — exactly once (§4.4).
-3. `TierWindowResolver`: resolve the window and its UTC boundaries; for windowed models bind `QCounterRef` (§4.3).
-4. `ModelFormulaEvaluator`: apply the kind formula (§4.1) at full intermediate precision.
-5. Emit `ModelLineOutcome` (+ granularity, window value, band/block placement into metadata); hand to step 4.
+**Price one unit** (step 3 of `cpt-cf-bss-rating-seq-evaluate-tariff`): map the line key → check
+`aggregationFunction = sum` → for each slice in order: round up, place on the slice row's bands at
+the running offset, compute the amount → emit one `ModelLineOutcome` per slice.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-rating-flow-composite-eval-mm`
 
-**Composite (derived) meter**: evaluate the frozen formula (window-`sum` over ≥ 2 input units)
-→ one output quantity → the output unit's line is priced by its own `modelKind` through the
-same steps; formula, input set, and output unit are frozen in `pricingSnapshotRef`; Rating
-never authors or mutates the derivation (SEAMS M5).
-
-**Composite partition rule**: the input `Q`s come from ≥ 2 *different* meters — different
-partition keys — making the composite the one launch case where an evaluation unit reads across
-counter partitions. The input `Q`s enter the frozen tuple as ordinary frozen inputs (digested by
-the `DeterminismGuard`, 01 §4.2); the composite line itself partitions on
-`(subscription, outputUnit, dimensionKey, window)`; a late-arrival change to **any** input `Q`
-triggers re-resolution of the composite line under the slice-08 correction keys. Reads are of
-frozen values, never live counters — no cross-partition lock exists.
-
-**Composite × dimensions**: at launch the two do not co-occur (`dimensionKey` is the empty tuple
-until OSS emission — SEAMS M6). The input-join rule for dimension-carrying inputs (join on the
-matching tuple vs a formula-declared join) MUST be pinned jointly with the pricing gear before
-both are live — tracked open.
+**Composite (derived) meter**: the plan declares an output meter computed by a formula over ≥ 2
+input meters (`composites` in the plan document). The pipeline materializes a composite unit whose
+input is the tuple of the input meters' slice quantities for the same subscription and window,
+each at its own `q_version` (slice 13). The core evaluates the formula per slice to the output
+quantity and prices it by the output row's `modelKind`. Composite inputs are `sum` meters; a
+composite whose inputs carry non-empty `dimension_key` is `unsupported_primitive` until the
+input-join rule is decided [OPEN QUESTION — composite × dimensions, DECISIONS carried opens].
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-rating-flow-dimension-routing-mm`
 
-**Dimension routing**: a record with empty/partial dimension values on a dimension-declaring
-plan → the explicitly **published** default/catch-all line if defined, else fail-closed
-(reject/quarantine) — never silently priced as a single line ([`../PRD.md`](../PRD.md) §6.7).
+**Dimension routing**: see §4.2 launch posture.
 
 ### 3.7 Database Schemas and Tables
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-storage-none-mm`
 
-**None owned.** `Q` and usage dedup live in Rating; model parameters, dimension declarations,
-and composite formulas live in the pinned catalog snapshot; nothing model-side persists in
-Rating (01 §3.7).
+None.
 
 ### 3.8 Deployment Topology
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-rating-deployment-mm`
 
-Nothing beyond the Foundation posture (01 §3.8). The counter key doubling as the partition key
-(SEAMS M7) is what keeps step 3 horizontally scalable — single-meter window math is
-partition-local by construction; the composite meter reads its frozen input `Q`s across
-partitions without locks (§3.6).
+Part of `rating-core` (slice 01 §3.8).
 
 ## 4. Additional Context
 
@@ -299,56 +240,119 @@ partitions without locks (§3.6).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-model-formulas-mm`
 
-The catalog `modelKind` enum and formulas — the pricing §17.2 mapping, shared SoR (SEAMS M1):
+Prices are exact: `amountMinor` and `packagePriceMinor` are integer minor units, rates
+(`unitRateNanoMinor`, band `unitPriceNanoMinor`) are integer 10⁻⁹ minor units, i.e. `rate / 10⁹`
+minor. `Q` is the billable (rounded-up) quantity, a finite decimal. Every amount is an exact reduced
+rational in minor units (T-D-46); nothing is rounded.
 
-| `modelKind` | Formula | Notes |
-|-------------|---------|-------|
-| `flat` | `unitPrice × Q`, or a fixed amount per period (recurring) | no thresholds evaluated |
-| `per_unit` | `unitPrice × quantity` from frozen `quantitySource ∈ {subscription_seat_count, manual}` | **never** metered `Q`; p1 launch (SEAMS M2) |
-| `graduated` | marginal band rate per unit within each open-top band | single-band case numerically = volume A; distinguished by configured kind |
-| `volume` | one band rate × **all** units by total `Q` in the window | **Variant A only**; Variant B (per-tier block fee) is **not authorable** (pricing D Q3, SEAMS M4) |
-| `package` | `ceil(usedQ / packageSize) × packagePrice` over the window | partial block rounds **up**; p2 launch (SEAMS M3) |
+| `modelKind` | Amount | Notes |
+|-------------|--------|-------|
+| `flat` | recurring: `amountMinor` per period line; usage: `unitRateNanoMinor × Q` | no bands |
+| `per_unit` | `unitRateNanoMinor × N`, `N` = seat quantity at the period line's start from the subscription version, or `manualQuantity` | never metered Q; seat changes mid-period are split points (slice 09) |
+| `graduated` | `Σ` over bands of `(quantity in band) × unitPriceNanoMinor` | marginal |
+| `volume` | `Q × unitPriceNanoMinor` of the band containing the window total | Variant A only; Variant B is not authorable |
+| `package` | `ceil(Q / packageSize) × packagePriceMinor` | partial block rounds up |
 
-- `hybrid` and `committed` are **compositions**, not kinds: hybrid = two lines (recurring + usage) under one `planId`, independently evaluated per their period boundaries; a hybrid "minimum commitment" is committed-usage (pool + overage, step 6) — **never** conflated with a period floor (slice [`09`](./09-period-plan-change.md)). Attachment points (commitment/floor to the usage line unless plan-level; coupon per `applyScope`, `line_total` split back pro-rata deterministically — executed by slice [`06`](./06-coupons.md)) are **frozen in `pricingSnapshotRef`**.
-- `graduated`/`volume`/`package` are usage-only (D-18); bands are open-top (D-17); launch aggregation is `aggregationFunction ∈ {sum, peak, time_weighted}` per the SEAMS M10 re-scope (T-D-17; §4.3) — *the pre-re-scope "sum only" limit is void, and this line had kept it after §2.2 and §4.3 were fixed (2026-07-31 billing-domain review, #1)*.
-- **Band boundary rule** (money-affecting, adopted): thresholds are half-open `[lower, upper)` — a quantity exactly at a boundary falls in the **upper** band, identically for graduated marginal placement and volume-A band selection ([`../PRD.md`](../PRD.md) §1.4 Tier aggregation window).
-- A free-tier allowance in current scope is expressed as a per-`(meter, dimensionKey)` **$0 band** ([`../PRD.md`](../PRD.md) §15); a cross-account allowance is a Follow-on aggregate.
+- Band boundaries are half-open `[fromQty, toQty)`: a quantity exactly at `toQty` is in the next
+  band, for graduated placement and for volume band selection alike.
+- A single-band graduated and a single-band volume row give the same amount; `model_kind` is still
+  recorded.
+- A free allowance is a band with rate 0.
+- Hybrid: a plan with a `recurring` and a `usage` row yields two independent lines; a "minimum
+  commitment" is committed usage (slice 05), never a period floor (slice 09).
 
 ### 4.2 Meter Mapping and Dimensional Lines (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-dimensional-mapping-mm`
 
-- The mapping unit → `(meter, dimensionKey)` MUST be **injective per plan revision**; violation is a fail-closed configuration error, never a merged line.
-- Each distinct `(meter, dimensionKey)` resolves to **its own** charge line and price; a plan declaring no dimensions prices as the single empty-tuple line.
-- Empty/partial dimension values on a dimension-declaring plan route to an explicitly **published** default/catch-all line, else fail closed (reject/quarantine) — never guess.
-- Ownership split (SEAMS M6, PRD §6.7): catalog **declares** (persists `dimension_key` structurally now); this slice **freezes** the declared set in `pricingSnapshotRef`; Rating passes values through; OSS metering **emits** values — the external critical path (§17.3). Until emission lands, `dimensionKey` is the empty tuple and per-combination meters are the only workaround (cardinality risk, §16). **Closed 2026-07-28:** the cross-doc launch-posture wording (seam M6) is now stated identically on both sides — *declaration + freeze are in scope now (the catalog persists `dimension_key` structurally, this gear freezes the declared set in the snapshot); pricing dimension **values** are OSS-emission-gated* (pricing design/03 §6 carries the same sentence).
+- A child's charge line key is `(meter, dimension_key)`; `meter` is the usage record's GTS type id
+  (R-09). Within one plan revision the mapping `(meter, dimension_key) → price row` must be
+  injective per `charge_kind`, else `non_injective_mapping`.
+- Each distinct `(meter, dimension_key)` is its own line and its own window counter (slice 13).
+- **Launch posture (R-16)**: pricing's `dimensionKey` is an opaque string and the encoding of a
+  usage record's metadata into it is not yet decided. Until R-16 is decided, only rows with an
+  empty `dimensionKey` are rateable; a selected row with a non-empty `dimensionKey` fails closed
+  `unsupported_primitive`, and every usage record is counted under the empty `dimension_key`.
+- Once R-16 is decided (proposed: `name=value` pairs of the GTS type's declared metadata, sorted by
+  name, joined by `,`), a record whose values do not form a declared tuple routes to a published
+  catch-all line if the plan has one, else `unroutable_dimension_tuple`.
 
-### 4.3 Tier Aggregation Window and `Q` (normative)
+### 4.3 Tier Aggregation Window, Slices and Band Continuity (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-tier-window-mm`
 
-- `tierAggregationWindow ∈ {calendar_month, invoice_period, subscription_lifetime, per_event}` governs when the tier counter resets; the active value is recorded in evaluation metadata **and** frozen in `pricingSnapshotRef` ([`../PRD.md`](../PRD.md) §6.5).
-- Boundaries: `calendar_month` in UTC; `invoice_period` anchored per the frozen catalog `billingAnchorPolicy ∈ {calendar_month, subscription_start, fixed_day(d)}` with the D-20 no-drift clamp (31→28→31, anchor day preserved) — the anchor authority is slice [`09`](./09-period-plan-change.md)'s adopted enum (SEAMS P2); this slice consumes the resolved boundaries.
-- The counter is the window-aggregated `Q` for **`(subscription, meter, dimensionKey, window)`** (SEAMS M7 — the superset key: per-subscription reset scope + per-dimension counters); the **rating pipeline** (slice 13 `QMaterializer`) is the single writer per this key; **rating-core** never aggregates and never mutates the counter (core/pipeline per §2.1 — the post-rename "Rating…Rating" collapse fixed 2026-07-28). For `tierAggregationWindow ≠ per_event`, tier/volume/package math evaluates over `Q`; for `per_event`, the unit is the event (01 §4.2).
-- **Aggregation derivation (D-44 / T-D-17)**: `Q`'s derivation is the row's frozen `aggregationFunction ∈ {sum (default), peak, time_weighted}`. For `sum`, `Q` is the plain sum of normalized measures. For non-`sum` the meter is **level-shaped** (gauge samples in the level unit): the window is cut into `aggregationGranularity ∈ {hour (default), day}` granules; each granule folds deterministically — `peak` = max sample in the granule, `time_weighted` = step-integral of the level over the granule (`hold_last` bounded by the declared `maxHold` — **an integer count of granules ≥ 1** (pricing design/03 §6, the field's SoR): the last level legitimately carries **across granule boundaries** for up to `maxHold` granules, so granule N+1's integral may depend on N's last sample, and a late/backfilled sample in granule N re-folds **N through N+maxHold** — each re-fold its own standard delta; the "re-folds only its granule" shorthand elsewhere reads *per affected granule*, and the whole-window recompute (slice 13 §4.4) stays governing (2026-07-31 review, #16 — the rating set had never stated `maxHold`'s unit); beyond the hold the level reads 0 + the `max_hold_exceeded` operator signal, never a guess — **the momentary under-billing this implies is the accepted product call** (D-44, 2026-07-28 review #19): zero is deliberately the customer-favourable floor and it is **provisional**, because a late/backfilled sample re-folds only its granule and emits the standard delta (§4.4 lane) — the alternative, quarantining the granule, would block the whole window's rating on a metering blip) — and **`Q` = Σ granule folds**, so `Q` stays **additive** and every rule in this section (band math, supersession continuity, `bandOffsetQ` slice math, package cumulative-ceil) applies unchanged. The billable unit is **level unit × granule duration** — GB·h / cloudlet·h at `hour`, **GB·day at `day`** (pricing design/03 §6 publishes it so, and pricing D-77 pins the pairing `hour ⇒ per_hour` / `day ⇒ per_day` precisely to keep band edges aligned; the flat "level·granule-hours" gloss was exact only at `hour` — 2026-07-31 review, #46) — the SKU-declared unit, distinct from the sample's level unit. A late/corrected sample re-folds **only its granule** → a `Q` delta under the standard re-materialization (slice [`13`](./13-q-store-attribution.md) §4.4). Non-`sum` does not co-occur with composite meters at launch ([`../PRD.md`](../PRD.md) `fr-level-aggregation`).
-- **Intra-window boundary continuity (adopted, money-affecting — T-D-12)**: when a slice-[`09`](./09-period-plan-change.md) split point (mid-cycle window activation/supersession, plan change, phase conversion) falls **inside** an open aggregation window, the window remains the counter scope but **each sub-window slice is its own evaluation unit** ([`01-foundation.md`](./01-foundation.md) §4.2): a slice prices only its attributed `Q_slice` under its own single pinned snapshot, and the accumulated prior-slice quantity arrives as the explicit frozen input **`bandOffsetQ`**. Adopted verbatim from pricing: supersession does **NOT** reset an in-window counter — the new row's bands apply to the continued `Q` ([`../../../pricing/docs/design/03-price-structure.md`](../../../pricing/docs/design/03-price-structure.md), joint fixture `inst-tb-window-continuity`). Per-kind slice math:
-  - `graduated` — `Q_slice` places marginally into the slice row's bands over `[bandOffsetQ, bandOffsetQ + Q_slice)`;
-  - `volume` — every slice's band is selected by the **window-total `Q`** (the full window's cumulative as of the evaluation; for the newest slice that equals `bandOffsetQ + Q_slice`, and an earlier slice NEVER keeps its own partial cumulative as the selection input — volume-A is one rate for **all** units by the total, §4.1); the slice bills `Q_slice ×` the selected band rate of **its own** frozen row; whenever window growth moves the total into a new band, **every already-priced slice re-resolves as a delta** from its own pin to the new total's band (slice [`08`](./08-retroactivity-corrections.md) cascade), so at any settled point all slices of the window price at the single band of the same window total;
-  - `package` — blocks are counted **once over the window** by cumulative ceil-diff: the slice bills `ceil((bandOffsetQ + Q_slice)/packageSize) − ceil(bandOffsetQ/packageSize)` blocks at its own frozen `packagePrice` — a straddling block belongs to the slice that opened it, and the window total is exactly `ceil(windowQ/packageSize)`.
-  - **Granule × slice boundary (T-D-26, 2026-08-01)** — a granule straddling a slice cut **belongs to the slice that opened it** (the same precedent as the straddling package block above): folds stay whole-granule (slice 13 §4.4 partials), so `Q = Σ granule folds` stays additive — per-slice `peak` maxima over a cut granule are **never** both counted (splitting a granule would make the per-slice maxima sum exceed the whole-granule max, and split points are arbitrary UTC instants).
+- **Windows** (`tierAggregationWindow`, UTC, half-open): `calendar_month` (first instant of the UTC
+  month to the next); `invoice_period` (the billing period from `billingAnchorPolicy` with the D-20
+  clamp — slice 09); `subscription_lifetime` (activation to termination); `per_hour` (UTC clock
+  hour); `per_event` (no window — one `usage_event` child per record, no bands carried).
+- **Split points** inside a child (computed by `split_points`, slice 01 §3.3): activation or expiry
+  of a window of the selected scope key, phase conversion, money-only term-slice boundary, seat change
+  (`period_line` only). Each slice is one line priced under its own selected row.
+- **Band continuity**: the slices of a child share one band axis; a slice's offset is the sum of the
+  billable quantities of the earlier slices. When a tier window spans several facts (billing-period
+  boundary, `carry` plan change — DESIGN §4.3 window groups), the members' ordered slices form one
+  band axis; a plan change with `reset` (or absent flag) starts a new axis at 0 (T-D-29).
+  - `graduated` — a slice places `[offset, offset + Q_slice)` on its own row's bands.
+  - `volume` — every slice uses the band that contains the **window total** (sum over all slices)
+    on its own row, times its own `Q_slice`; when later usage moves the total into another band,
+    the next evaluation re-prices every slice and the pipeline records a new revision.
+  - `package` — a slice bills `ceil((offset + Q_slice) / size) − ceil(offset / size)` blocks at its
+    own row's `packagePriceMinor`; the straddling block belongs to the slice that opened it.
+- **Reservations** exclude matched quantity from the band axis window-cumulatively (T-D-23, slice 05).
+- **Aggregation function**: only `sum` is active. A row with `aggregationFunction ∈ {peak,
+  time_weighted}` fails closed `unsupported_aggregation` until R-06 is decided. Under option (a) of
+  R-06 (not active) the window would be cut into `aggregationGranularity` granules, each folded
+  (`peak` = max sample, `time_weighted` = step integral with `hold_last` bounded by
+  `maxHoldGranules`), and `Q` = Σ granule folds.
 
-  Boundary kinds: window-activation/supersession and phase-conversion boundaries **always carry** (`bandOffsetQ` = accumulated prior-slice `Q`; continuity is not configurable); only a **plan-change** boundary consults the snapshot-frozen carry-vs-reset flag routed by slice [`09`](./09-period-plan-change.md) (`reset` ⇒ `bandOffsetQ = 0`). A **collapsed cut** — a plan-change boundary coinciding with a window-activation/phase-conversion instant (slice 09 §4.1 "coincident boundaries collapse into one cut") — consults the **plan-change flag**: it is the only configurable rule at the cut, and the activation/conversion halves carry unconditionally either way (2026-07-31 review, #37). Rating (single-writer) materializes the per-slice attribution and `bandOffsetQ` from event-time attribution; a change to an earlier slice's `Q` shifts later slices' `bandOffsetQ` and re-resolves them under the slice-08 cascade.
-- **Reservation remainder re-band (T-D-13; band axis pinned by T-D-23, 2026-08-01 — flagged for veto)**: the consumption-flavor matched quantity is excluded from `Q` (slice [`05`](./05-commitments-reservations.md) §4.2); this slice's band math re-runs over the on-demand remainder as part of the steps-3–5 remainder re-run — band placement first, then the steps-4–5 overlays re-apply to the re-banded amount ([`04-overlays-precedence.md`](./04-overlays-precedence.md) §4.2). **"From zero" means the remainder's band axis starts at the window origin with reserved quantity excluded — never a per-slice reset**: on a reservation-carrying line the banded axis is the **cumulative post-reservation remainder** (T-D-19's basis), maintained window-cumulatively, so a sub-window slice's remainder places over `[remainderOffsetQ, remainderOffsetQ + slice_remainder)` where `remainderOffsetQ` is the window's accumulated prior-slice remainder — slice [`13`](./13-q-store-attribution.md) §4.3 materializes it beside `bandOffsetQ`, whose raw-`Q` definition **excludes reservation-matched quantity on the band axis of such lines**. Before T-D-23, T-D-12's `[bandOffsetQ, …)` placement and this bullet's "from zero" gave two different band placements for a slice carrying both a `reservationMatch` and a non-zero offset, with no precedence stated — five-figure divergence per line on the worked-example bands. A per-slice reset is rejected for the T-D-12 reason: every split would re-enter band 1. The joint fixture set gains the **reservation + sub-window slice** scenario (slice 05 §4.6 list).
-- Correction-time counter decrement is executed by Rating under slice [`08`](./08-retroactivity-corrections.md) keys.
+Worked example — graduated, bands `[0, 100)` at 1.00 EUR, `[100, ∞)` at 0.80 EUR; window September;
+a new price row (bands `[0, 100)` at 0.90 EUR, `[100, ∞)` at 0.70 EUR) activates 2026-09-15:
+
+```text
+slice A [09-01, 09-15)  Q=80   offset 0    → 80 × 1.00                 = 80.00
+slice B [09-15, 10-01)  Q=50   offset 80   → 20 × 0.90 + 30 × 0.70     = 39.00
+unit total 119.00 EUR; as volume: total Q=130 → A: 80 × 0.80 = 64.00, B: 50 × 0.70 = 35.00
+```
+
+**Hourly windows** (`tierAggregationWindow = per_hour`; Atlas C10/D14, T-D-48):
+
+- The canonical window is the UTC clock hour `[HH:00, HH+1:00)`; Q resets to zero at every hour and
+  nothing carries into the next hour. Hourly results roll up into the monthly parent result without
+  re-selecting a tier (slice 15).
+- A partial first/last hour keeps its canonical bounds with a clipped served range; the quantity is
+  the actual source-integrated quantity and **thresholds are not prorated**.
+- Volume selects the band containing the whole-hour Q and applies its rate to all Q of that hour;
+  graduated allocates Q across bands from zero within the hour.
+- Aggregation scope is `subscription_line` (all attributed resources of one subscription line, item,
+  dimension value and tenant axes share Q); `resource` scope is not expressible in the catalog today
+  (R-23).
+- Hourly rows with a period floor (`periodFloorCaps`) or an included allowance are not rateable per
+  hour: a floor is a period obligation (slice 09) and never applied per hour; an allowance on a
+  `per_hour` row fails closed `unsupported_primitive` (Atlas C10: "do not apply a monthly floor once
+  per hour").
+
+Worked examples — bands `[0, 10)` €0.02, `[10, ∞)` €0.015 (Atlas fixtures):
+
+| Fixture | Input | Volume | Graduated |
+|---|---|---|---|
+| F23 | hours Q = 8, then Q = 12 | 0.16 + 0.18 = **0.34** (one tier over Q = 20 would give 0.30 — forbidden) | 0.16 + 0.23 = 0.39 |
+| F24 | one hour Q = 10 | 10 × 0.015 = 0.15 | 10 × 0.02 = 0.20 |
+| F24 | one hour Q = 12 | 0.18 | 10 × 0.02 + 2 × 0.015 = 0.23 |
+| F25 | two resources × 6 in one hour, one line | Q = 12 → 0.18 (resource scope would give 0.12 + 0.12 = 0.24) | 0.23 |
+| F29 | activation 10:30, 8 cloudlets until 11:00 | Q = 4 → 0.08 | 0.08 |
 
 ### 4.4 Granularity Round-Up (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-granularity-mm`
 
-- `billingGranularity ∈ {per_second, per_minute, per_hour, per_day, whole-unit}`; round-up applies to the **aggregated/merged measure** of the evaluation unit, **never per raw `UsageRecord`** — twelve 5-minute samples at `per_hour` bill **1 hour**, not 12.
-- Continuous-duration meters: contiguous usage is merged into a session/window measure first (Rating owns the merge), then rounded up **once**; discrete/`per_event` meters: the unit is the event; windowed models: round-up applies to the window measure **before** tier placement.
-- The applied `billingGranularity` is recorded in evaluation metadata; amounts continue at full intermediate precision (01 §4.4).
-- A per-resource `minimumCharge` MAY be configured to bound ephemeral-churn over-charge — the churn policy itself is a PRD §15 open (Product + Finance); this slice only honors a configured value.
+- `billingGranularity ∈ {per_second, per_minute, per_hour, per_day, whole_unit}` rounds the slice
+  (or `per_event` record) quantity **up** to a whole multiple of the unit, once, before band
+  placement. Example: a `per_hour` meter measured in seconds with twelve 5-minute records in one
+  hour has slice quantity 3 600 s → 1 hour, not 12 hours.
+- Band offsets use billable (rounded) quantities, so slice continuity is on the same scale as the
+  bands.
+- The applied granularity is recorded in lineage. A per-resource `minimumCharge` is not modelled
+  until pricing publishes it [OPEN QUESTION — PRD §15 minimum charge].
 
 ## 5. Traceability
 
@@ -357,8 +361,8 @@ The catalog `modelKind` enum and formulas — the pricing §17.2 mapping, shared
 `cpt-cf-bss-rating-fr-hybrid-pricing`, `cpt-cf-bss-rating-fr-meter-mapping-granularity`, `cpt-cf-bss-rating-fr-tier-aggregation-window`,
 `cpt-cf-bss-rating-fr-billing-granularity`, `cpt-cf-bss-rating-fr-dimensional-pricing`, `cpt-cf-bss-rating-fr-composite-meter-eval`
 
-- **PRD**: §6.2 (all seven model FRs incl. hybrid/committed composition status), §6.3 `fr-meter-mapping-granularity`, §6.5 `fr-tier-aggregation-window` + `fr-billing-granularity`, §6.7 (dimensional, dimension-population, composite), §17.1 step 3, §17.2 (kind→formula SoR), §17.3 (cloud phasing).
-- **Seams**: M1 (enum/mapping), M2 (per_unit launch-blocking), M3 (package), M4 (Variant B deleted), M5 (composite in launch), M6 (**open** — dimensional wording), M7 (counter key), M10 (re-scoped 2026-07-16: `aggregationFunction {sum, peak, time_weighted}` in launch — pricing D-44 / T-D-17), M11 (D-17/D-18 guarantees) — [`../SEAMS.md`](../SEAMS.md).
-- **Decisions**: T-D-04 (M7 key), T-D-05 (model set + launch scope), T-D-12 (intra-window boundary continuity / `bandOffsetQ`), T-D-13 (steps-3–5 remainder re-run) — [`../DECISIONS.md`](../DECISIONS.md).
-- **ADR**: [`../ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md`](../ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md) (line key vs window key boundary).
-- **Related slices**: [`01-foundation.md`](./01-foundation.md) (unit, precision, digest), [`02-selection-eligibility.md`](./02-selection-eligibility.md) (selected row in), [`04-overlays-precedence.md`](./04-overlays-precedence.md) (stack on the model output), [`05-commitments-reservations.md`](./05-commitments-reservations.md) (committed composition), [`06-coupons.md`](./06-coupons.md) (hybrid `applyScope` split execution), [`08-retroactivity-corrections.md`](./08-retroactivity-corrections.md) (counter decrement), [`09-period-plan-change.md`](./09-period-plan-change.md) (anchor authority, floor/cap).
+- **PRD**: §6.2, §6.3 `fr-meter-mapping-granularity`, §6.5, §6.7, §17.1 step 3.
+- **Design**: [`../DESIGN.md`](../DESIGN.md) §4.3.
+- **Contracts**: SEAMS P-2, P-9, P-10, U-4, H-1, §I (M1–M7, M10–M11) — [`../SEAMS.md`](../SEAMS.md).
+- **Decisions**: T-D-05, T-D-12, T-D-13, T-D-23, T-D-26, T-D-29, T-D-38, T-D-46, T-D-48, R-06, R-09, R-16, R-23 — [`../DECISIONS.md`](../DECISIONS.md).
+- **Related slices**: [`01-foundation.md`](./01-foundation.md), [`02-selection-eligibility.md`](./02-selection-eligibility.md), [`05-commitments-reservations.md`](./05-commitments-reservations.md), [`09-period-plan-change.md`](./09-period-plan-change.md), [`13-q-store-attribution.md`](./13-q-store-attribution.md).
