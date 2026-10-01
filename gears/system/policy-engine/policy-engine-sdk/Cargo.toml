@@ -1,0 +1,47 @@
+[package]
+name = "cf-gears-policy-engine-sdk"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SDK for the policy-engine gear: management API, models, GTS identifiers"
+keywords = ["constructorfabric", "cf-gears", "policy"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+name = "policy_engine_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Serialization / core
+async-trait = { workspace = true }
+# Required by the `gts_instance!` expansions of the permission catalog.
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+
+# GTS types. `gts` is a normal dependency: the `gts_instance!` expansions of
+# the permission catalog resolve paths through `::gts`.
+gts = { workspace = true }
+toolkit-gts = { workspace = true }
+
+# ToolKit dependencies
+toolkit-canonical-errors = { workspace = true }
+toolkit-security = { workspace = true }
+
+# The management surface lists through `ODataQuery` / `Page` and declares its
+# filter schemas with `#[derive(ODataFilterable)]`. Hard dependencies: every
+# consumer of `PolicyManagementClientV1` needs the query and schema types.
+toolkit-odata = { workspace = true }
+toolkit-odata-macros = { workspace = true }
+
+[dev-dependencies]
+# Checks the plugin instance id derives from the engine plugin spec.
+admission-control-sdk = { workspace = true }

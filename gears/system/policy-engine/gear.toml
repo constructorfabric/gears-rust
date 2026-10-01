@@ -1,0 +1,7 @@
+[gear]
+name = "Policy Engine"
+description = "Tenant-scoped policy document management and evaluation on the shared evaluation facility."
+category = "core-functionality"
+is_plugin = false
+has_plugins = false
+has_extension_point = true

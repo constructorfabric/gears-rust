@@ -1,0 +1,84 @@
+[package]
+name = "cf-gears-policy-engine"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Policy-engine gear: stores, validates and evaluates tenant policy documents"
+keywords = ["constructorfabric", "cf-gears", "policy"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+name = "policy_engine"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+policy-engine-sdk = { workspace = true }
+admission-control-sdk = { workspace = true }
+toolkit-policy-evaluation = { workspace = true }
+
+# Platform SDKs
+tenant-resolver-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+authz-resolver-sdk = { workspace = true }
+
+# Gear crates referenced by `#[toolkit::gear(deps = [types_registry, tenant_resolver, authz_resolver])]`
+types-registry = { workspace = true }
+tenant-resolver = { workspace = true }
+authz-resolver = { workspace = true }
+
+# ToolKit dependencies
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-canonical-errors = { workspace = true, features = ["axum", "utoipa"] }
+toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
+toolkit-db-macros = { workspace = true }
+# Persistence (DESIGN §3.7): entities and migrations; drivers come from toolkit-db
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-security = { workspace = true }
+gts = { workspace = true }
+
+# REST API (DESIGN §3.3 "Policy Administration REST API")
+axum = { workspace = true }
+utoipa = { workspace = true }
+http = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+# Error handling and serialization
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+
+# Required by toolkit::gear macro
+inventory = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+opentelemetry = { workspace = true }
+
+# Compile cache (sync lock, never held across .await)
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio-util = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+serde-saphyr = { workspace = true }
+# REST router tests: `ServiceExt::oneshot`
+tower = { workspace = true }

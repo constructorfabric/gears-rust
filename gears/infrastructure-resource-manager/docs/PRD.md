@@ -169,7 +169,7 @@ Each goal is tracked by a metric that the sources named beside it can actually c
 | RBAC | Role-Based Access Control — the access model that the platform RBAC engine resolves. |
 | IdP | Identity Provider — the platform component that authenticates callers and supplies subject identity. |
 | AM | Account Management — the platform component that owns tenants and accounts. |
-| Policy Decision Service | Abstract decision-service role that answers admission, policy, quota, and license-entitlement questions fail-closed. A capability, not a component; which engine implements it is a design decision. |
+| Policy Decision Service | Abstract decision-service role that answers admission, policy, quota, and license-entitlement questions fail-closed. A capability, not a component; which engine implements it is a design decision. The platform realizes it as the admission-control gate with a pluggable policy engine. |
 | IRM | The short name for the Infrastructure Resource Manager gear, used throughout this document. |
 
 ## 2. Architecture Alignment
@@ -246,7 +246,7 @@ All human actors are technical professionals who work through the API, CLI, and 
 
 **ID**: `cpt-cf-infrastructure-resource-manager-actor-policy-engine`
 
-**Role**: Evaluates admission, policy, quota, and license-entitlement decisions for IRM operations. Decisions are fail-closed. This is an abstract decision-service role: IRM depends on the capability, not on a concrete component. Which engine implements it — including the runtime that evaluates adapter-registered policy bundles — is a design decision (§16).
+**Role**: Evaluates admission, policy, quota, and license-entitlement decisions for IRM operations. Decisions are fail-closed. This is an abstract decision-service role: IRM depends on the capability, not on a concrete component. Which engine implements it — including the runtime that evaluates adapter-registered policy bundles — is a design decision (§16); the platform realizes the role as the admission-control gate with a pluggable policy engine.
 **Direction**: Outbound — IRM requests decisions.
 
 #### AM and IdP
@@ -475,7 +475,7 @@ An adapter upgrade **MUST** make local type/catalog changes and external policy 
 
 - [ ] `p2` - **ID**: `cpt-cf-infrastructure-resource-manager-fr-manifest-policy`
 
-An adapter package **MAY** declare authorization policy for its own resource types. The system **MUST** publish those policies to the platform policy service as part of onboarding. The system **MUST** activate the policies only after they are complete. Registration of an adapter therefore changes platform authorization. The change **MUST** be attributable to that adapter.
+An adapter package **MAY** declare authorization policy for its own resource types. The system **MUST** publish those policies to the platform policy service as part of onboarding. The system **MUST** activate the policies only after they are complete. Registration of an adapter therefore changes platform authorization. The change **MUST** be attributable to that adapter. A bundle published for all tenants does not reach self-managed (barrier) tenants, because the policy engine respects tenant barriers; rules that must apply everywhere belong in admission-control built-in policies. IRM publishes under its own service identity, which holds author and publish permissions.
 
 **Rationale**: Providers know which operations on their types must be permitted or denied. Delivery of that policy with the adapter avoids a separate manual policy rollout per provider.
 
@@ -1171,7 +1171,7 @@ Resource creation **MUST** pass through an ordered, extensible admission pipelin
 
 - [ ] `p1` - **ID**: `cpt-cf-infrastructure-resource-manager-fr-policy-gating`
 
-Policy evaluation **MUST** gate provisioning, modification, and lifecycle actions before any change executes. Denials **MUST** carry an actionable reason. When the decision service is unavailable, the system **MUST** fail closed. A decision **MAY** be advisory: an allow verdict **MAY** carry obligations or warnings from the decision service, and the system **MUST** deliver them to the caller unaltered alongside the operation result.
+Policy evaluation **MUST** gate provisioning, modification, and lifecycle actions before any change executes. Denials **MUST** carry an actionable reason. When the decision service is unavailable, the system **MUST** fail closed. Advisory obligations or warnings are not delivered in the first release, because the platform admission gate relays none; a later version may add them.
 
 **Rationale**: Governance that runs after the change is not governance.
 

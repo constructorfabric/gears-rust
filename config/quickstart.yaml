@@ -206,6 +206,72 @@ gears:
       # one. See the plugin README for a worked rule set.
       grants: []
 
+  # Requires --features admission-control.
+  # Admission gate for platform operations (gears/system/admission-control).
+  # `engine` is omitted on purpose: with no engine configured the gate refuses,
+  # with could-not-run, every operation a built-in policy does not already
+  # refuse. Add `engine: { vendor: "<vendor>" }` (optionally
+  # `instance_id: "<GTS instance id>"`) once an engine plugin is linked; a
+  # configured engine that cannot be resolved fails startup. Refusals are
+  # published best-effort to the event broker when one is linked (dropped
+  # otherwise). Timeouts are in milliseconds; unknown keys fail startup.
+  admission-control:
+    config:
+      # Selects policy-engine as the admission engine plugin (commented out
+      # by default, so the gate stays built-ins-only above).
+      # Requires --features admission-control,policy-engine and the
+      # policy-engine gear section below to be linked; the vendor must match
+      # policy-engine's own `engine_plugin.vendor` (default
+      # "constructorfabric", as below) or the two cannot find each other.
+      # engine:
+      #   vendor: "constructorfabric"
+      engine_timeout_ms: 100
+      builtin_timeout_ms: 3
+      max_properties: 256
+      max_context_bytes: 65536
+      event_queue_capacity: 1024
+      builtin_policies:
+        # Refuses creating or renaming a resource whose `name` property
+        # starts with a reserved prefix, with or without an engine. The
+        # namespace wildcard needs no registered type; a concrete type id
+        # (ending in `~`) must resolve in types-registry or startup fails.
+        - id: "reserved-name-prefix"
+          description: "Resource names starting with a reserved platform prefix cannot be created or renamed"
+          resource_types: ["gts.cf.core.*"]
+          actions: ["create", "rename"]
+          content: |
+            package builtin.reserved_name_prefix
+
+            reserved_prefixes := ["cf-", "system-"]
+
+            deny if {
+                input.action in {"create", "rename"}
+                some prefix in reserved_prefixes
+                startswith(input.properties.name, prefix)
+            }
+
+  # Requires --features policy-engine.
+  # Stores, validates and evaluates tenant policy documents on the shared
+  # evaluation facility (gears/system/policy-engine), and (optionally, see
+  # the commented `engine:` selection in the admission-control section
+  # above) serves as one of the gate's engine plugins. Depends on
+  # types-registry, tenant-resolver and authz-resolver only, so it starts
+  # even with --features policy-engine alone; wiring it into the gate needs
+  # --features admission-control too. Every other setting keeps its
+  # documented default (timeouts, compile cache size, content limits) - see
+  # gears/system/policy-engine/policy-engine/src/config.rs. Unknown keys
+  # fail startup.
+  policy-engine:
+    database:
+      server: "sqlite_users"
+      file: "policy_engine.db"
+    config:
+      engine_plugin:
+        # Must match the `engine.vendor` selected in the admission-control
+        # section above for the gate to resolve this instance.
+        vendor: "constructorfabric"
+        priority: 100
+
   account-management:
     database:
       server: "sqlite_users"
