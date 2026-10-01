@@ -51,7 +51,7 @@ use quota_enforcement_storage_plugin::{
 };
 
 const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
-const METRIC_TOKENS: &str = "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1";
+const METRIC_TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
 
 fn tenant() -> TenantId {
     TenantId::new(Uuid::from_u128(0x00ac_ce55))

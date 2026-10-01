@@ -52,13 +52,13 @@ fn quota(subject: &str) -> Value {
         "tenant_id": tenant().as_uuid(),
         "subject": { "projection_type": LLM_USER_PROJECTION, "subject_id": subject },
         "metric": METRIC_TOKENS,
-        "quota_type": "gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1",
-        "period": "gts.cf.qe.period.type.v1~cf.qe.period.month.v1",
-        "enforcement_mode": "gts.cf.qe.enforcement.type.v1~cf.qe.enforcement.hard.v1",
+        "quota_type": "gts.cf.core.qe.quota_type.v1~cf.core.qe.consumption.v1",
+        "period": "gts.cf.core.qe.period_type.v1~cf.core.qe.month.v1",
+        "enforcement_mode": "gts.cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1",
         "cap": 100,
         "notification_thresholds": [50],
         "metadata": { "regions": ["eu"], "weight": 5 },
-        "source": "gts.cf.qe.source.type.v1~cf.qe.source.operator.v1"
+        "source": "gts.cf.core.qe.source_type.v1~cf.core.qe.operator.v1"
     })
 }
 

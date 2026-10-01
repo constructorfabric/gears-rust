@@ -18,9 +18,9 @@ use crate::test_support::{
 
 const TTL: Duration = Duration::from_mins(1);
 const GRACE: Duration = Duration::from_mins(5);
-const GAUGE_DIRECT: &str = "gts.cf.qe.metric.type.v1~cf.qe.metric.gpu_seconds.v1";
-const BAD_KIND: &str = "gts.cf.qe.metric.type.v1~cf.qe.metric.bad_kind.v1";
-const BAD_MODE: &str = "gts.cf.qe.metric.type.v1~cf.qe.metric.bad_mode.v1";
+const GAUGE_DIRECT: &str = "gts.cf.core.qe.metric_type.v1~cf.test.qe.gpu_seconds.v1";
+const BAD_KIND: &str = "gts.cf.core.qe.metric_type.v1~cf.test.qe.bad_kind.v1";
+const BAD_MODE: &str = "gts.cf.core.qe.metric_type.v1~cf.test.qe.bad_mode.v1";
 
 fn metric(id: &str) -> MetricId {
     MetricId::parse(id).expect("metric id")

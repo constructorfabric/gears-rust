@@ -12,7 +12,7 @@ fn a_published_backlog_is_read_back_and_a_withdrawal_clears_it() {
     let cell = LeaseBacklogCell::default();
     assert!(cell.load().is_none(), "nothing before the first cycle");
 
-    let tokens = label("gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1");
+    let tokens = label("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1");
     cell.publish(Some(vec![(tokens.clone(), 3)]));
     assert_eq!(cell.load().as_deref(), Some(&vec![(tokens, 3)]));
 

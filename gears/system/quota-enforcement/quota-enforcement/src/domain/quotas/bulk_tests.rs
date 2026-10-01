@@ -317,7 +317,7 @@ async fn the_size_check_comes_before_any_item_check() {
 async fn the_first_failing_item_is_reported_and_nothing_is_created() {
     let h = Harness::new(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]))).await;
     let mut unknown = draft("u2");
-    unknown.metric = "gts.cf.qe.metric.type.v1~cf.qe.metric.unknown.v1".to_owned();
+    unknown.metric = "gts.cf.core.qe.metric_type.v1~cf.test.qe.unknown.v1".to_owned();
     let mut foreign = draft("u3");
     foreign.tenant_id = quota_enforcement_sdk::TenantId::new(Uuid::from_u128(0xf0));
     let err = h

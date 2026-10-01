@@ -589,7 +589,7 @@ async fn ac9_immutable_fields_are_rejected_and_identity_survives_updates() {
         (
             "period",
             UpdateQuotaRequest {
-                period: Presence::Value(json!("gts.cf.qe.period.type.v1~cf.qe.period.day.v1")),
+                period: Presence::Value(json!("gts.cf.core.qe.period_type.v1~cf.core.qe.day.v1")),
                 ..UpdateQuotaRequest::default()
             },
         ),

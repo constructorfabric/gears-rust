@@ -52,7 +52,7 @@ fn gts_enums_reject_short_names_and_unknown_ids() {
         }
     );
     assert!(
-        "gts.cf.qe.quota.type.v1~cf.qe.quota.burst.v1"
+        "gts.cf.core.qe.quota_type.v1~cf.core.qe.burst.v1"
             .parse::<QuotaType>()
             .is_err()
     );
@@ -92,7 +92,7 @@ fn every_gts_enum_value_derives_from_its_declared_base() {
     assert_eq!(PeriodType::ALL.len(), 5, "PRD 5.4 reserves five periods");
     assert_eq!(
         PeriodType::OneTime.as_gts_id(),
-        "gts.cf.qe.period.type.v1~cf.qe.period.one_time.v1"
+        "gts.cf.core.qe.period_type.v1~cf.core.qe.one_time.v1"
     );
 }
 
@@ -187,10 +187,10 @@ fn policy_id_recognizes_the_seeded_global_policy() {
 
 #[test]
 fn metric_id_accepts_instance_ids_and_rejects_type_ids() {
-    let ok = MetricId::parse("gts.cf.qe.metric.type.v1~cf.genai.llm_gateway.token.v1");
+    let ok = MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1");
     assert!(ok.is_ok(), "{ok:?}");
     assert!(
-        MetricId::parse("gts.cf.qe.metric.type.v1~").is_err(),
+        MetricId::parse("gts.cf.core.qe.metric_type.v1~").is_err(),
         "type id rejected"
     );
     assert!(MetricId::parse("not-a-gts-id").is_err());
@@ -308,7 +308,7 @@ fn decision_result_is_tagged_and_denied_carries_its_reason() {
 
 #[test]
 fn policy_scope_is_tagged_by_kind() {
-    let metric = MetricId::parse("gts.cf.qe.metric.type.v1~cf.genai.llm_gateway.token.v1")
+    let metric = MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1")
         .expect("metric id");
     let scope = PolicyScope::Metric {
         metric: metric.clone(),
@@ -367,7 +367,7 @@ fn subject_scope_parse_and_deserialization_accept_only_scope_instances() {
     let rejected = [
         SCOPE_TYPE,                                             // a type, not an instance
         "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~", // another type
-        "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1", // an instance of another type
+        "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1", // an instance of another type
         "not-a-gts-id",
         "",
     ];
@@ -387,7 +387,7 @@ fn subject_scope_parse_and_deserialization_accept_only_scope_instances() {
         );
     }
     assert!(matches!(
-        SubjectScope::parse("gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1"),
+        SubjectScope::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1"),
         Err(ScopeError::NotAScope { .. })
     ));
 }
@@ -405,7 +405,7 @@ fn subject_scope_serializes_as_its_instance_id_and_round_trips() {
 #[test]
 fn evaluation_attribution_distinguishes_omitted_metadata_from_null() {
     let tenant = Uuid::from_u128(7);
-    let metric = "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1";
+    let metric = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1";
 
     let omitted: EvaluationAttribution =
         serde_json::from_value(json!({ "tenant_id": tenant, "metric": metric }))
@@ -495,7 +495,7 @@ fn contract_ref_for_type_takes_the_major_version_of_the_last_segment() {
 #[test]
 fn projection_bindings_are_distinct_by_pair() {
     let metric =
-        MetricId::parse("gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1").expect("metric");
+        MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1").expect("metric");
     let user =
         GtsTypeId::try_new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~").expect("type");
     let tenant =
@@ -528,7 +528,7 @@ fn spec() -> QuotaSpec {
             projection_type: GtsTypeId::new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~"),
             subject_id: "u1".to_owned(),
         },
-        metric: MetricId::parse("gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1")
+        metric: MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1")
             .expect("metric"),
         quota_type: QuotaType::Consumption,
         period: Some(PeriodType::Month),
@@ -648,7 +648,7 @@ fn active_quota_counts_default_to_zero_and_round_trip() {
     assert_eq!((counts.cap_zero, counts.cap_unbounded), (0, 0));
     counts.cap_zero = 2;
     counts.by_metric.insert(
-        MetricId::parse("gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1")
+        MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1")
             .expect("metric"),
         3,
     );
@@ -833,8 +833,8 @@ fn a_debit_request_ignores_decision_shaped_fields_a_caller_echoed_back() {
     let request: DebitRequest = serde_json::from_value(json!({
         "attribution": {
             "tenant_id": "00000000-0000-0000-0000-000000000001",
-            "metric": "gts.cf.qe.metric.type.v1~acme.tokens.v1",
-            "subjects": [{"kind": "gts.cf.core.qe.scope.v1~cf.qe.scope.tenant.v1", "id": "t-1"}],
+            "metric": "gts.cf.core.qe.metric_type.v1~acme.tokens.v1",
+            "subjects": [{"kind": "gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1", "id": "t-1"}],
             "metadata": {}
         },
         "amount": 5,
@@ -854,7 +854,7 @@ fn an_attribution_inside_a_request_keeps_rejecting_its_own_unknown_fields() {
     let error = serde_json::from_value::<DebitRequest>(json!({
         "attribution": {
             "tenant_id": "00000000-0000-0000-0000-000000000001",
-            "metric": "gts.cf.qe.metric.type.v1~acme.tokens.v1",
+            "metric": "gts.cf.core.qe.metric_type.v1~acme.tokens.v1",
             "subjects": [],
             "metadata": {},
             "tenant": "typo"
@@ -872,7 +872,7 @@ fn a_signed_amount_reaches_the_domain_instead_of_failing_deserialization() {
     let request: DebitRequest = serde_json::from_value(json!({
         "attribution": {
             "tenant_id": "00000000-0000-0000-0000-000000000001",
-            "metric": "gts.cf.qe.metric.type.v1~acme.tokens.v1",
+            "metric": "gts.cf.core.qe.metric_type.v1~acme.tokens.v1",
             "subjects": [],
             "metadata": {}
         },
@@ -1093,7 +1093,7 @@ fn a_rollback_names_the_namespace_of_the_operation_it_reverses() {
     let legacy: crate::models::RollbackRequest = serde_json::from_value(json!({
         "attribution": {
             "tenant_id": "00000000-0000-0000-0000-000000000001",
-            "metric": "gts.cf.qe.metric.type.v1~acme.tokens.v1",
+            "metric": "gts.cf.core.qe.metric_type.v1~acme.tokens.v1",
             "subjects": [],
             "metadata": {}
         },

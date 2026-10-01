@@ -178,7 +178,7 @@ fn token_of(outcome: &TransitionOutcome<EvaluatedLease>) -> LeaseToken {
 /// so a rollback in these tests presents the same one the debit recorded.
 fn authorized() -> AttributionDigest {
     AttributionDigest::of_canonical(&serde_json::json!({
-        "metric": "gts.cf.qe.metric.type.v1~cf.qe.metric.tokens.v1",
+        "metric": "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.tokens.v1",
         "subjects": [{"kind": "user", "id": "u1"}],
     }))
     .expect("a constant document serializes")

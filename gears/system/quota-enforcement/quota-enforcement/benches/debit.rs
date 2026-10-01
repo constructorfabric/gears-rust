@@ -41,7 +41,7 @@ use tokio::runtime::Runtime;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-const METRIC: &str = "gts.cf.qe.metric.type.v1~cf.qe.metric.tokens.v1";
+const METRIC: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.tokens.v1";
 
 fn tenant() -> TenantId {
     TenantId::new(Uuid::from_u128(1))

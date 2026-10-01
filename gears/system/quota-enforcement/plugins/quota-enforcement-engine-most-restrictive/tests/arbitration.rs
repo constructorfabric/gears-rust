@@ -13,7 +13,7 @@ fn quota(cap: Option<u64>, consumed: u64) -> Result<QuotaSnapshot, Box<dyn std::
         subject: serde_json::from_value(
             json!({"projection_type":"gts.cf.core.qe.subj.v1~cf.test.qe.user.v1~", "subject_id":"alice"}),
         )?,
-        metric: MetricId::parse("gts.cf.qe.metric.type.v1~cf.genai.llm_gateway.token.v1")?,
+        metric: MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1")?,
         quota_type: QuotaType::Consumption,
         enforcement_mode: EnforcementMode::Hard,
         cap,
@@ -44,7 +44,7 @@ fn evaluate(
         created_by: "operator".into(),
         comment: None,
     };
-    let metric = MetricId::parse("gts.cf.qe.metric.type.v1~cf.genai.llm_gateway.token.v1")?;
+    let metric = MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1")?;
     let input: Vec<_> = quotas
         .iter()
         .map(|(snapshot, tier)| EvaluationQuota {

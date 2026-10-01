@@ -14,7 +14,7 @@
 //!
 //! # Provisional classification contract
 //!
-//! The metric base `gts.cf.qe.metric.type.v1~` is a platform namespace (PRD
+//! The metric base `gts.cf.core.qe.metric_type.v1~` is a platform namespace (PRD
 //! sections 3.2 and 13). Until the platform publishes its schema, QE reads two
 //! fields of the instance document, named in [`contract`]:
 //! `kind ∈ {counter, gauge}` and `enforcement ∈ {quota_gated, direct}`.

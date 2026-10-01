@@ -12,8 +12,8 @@ use time::OffsetDateTime;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-const METRIC: &str = "gts.cf.qe.metric.type.v1~cf.genai.llm_gateway.token.v1";
-const OTHER_METRIC: &str = "gts.cf.qe.metric.type.v1~cf.genai.llm_gateway.request.v1";
+const METRIC: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1";
+const OTHER_METRIC: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.request.v1";
 
 /// One admitted metric: a `region` on the request, `regions` on the Quota.
 fn snapshot_for(metric: &str) -> Result<PolicySchemaSnapshot, Box<dyn std::error::Error>> {

@@ -345,10 +345,10 @@ fn quota_lifecycle_rejections_carry_their_tokens_and_subjects() {
         ),
         (
             DomainError::MetricClassificationInvalid {
-                metric: "gts.cf.qe.metric.type.v1~cf.qe.metric.m.v1".to_owned(),
+                metric: "gts.cf.core.qe.metric_type.v1~cf.test.qe.m.v1".to_owned(),
             },
             "METRIC_CLASSIFICATION_INVALID",
-            "gts.cf.qe.metric.type.v1~cf.qe.metric.m.v1",
+            "gts.cf.core.qe.metric_type.v1~cf.test.qe.m.v1",
         ),
     ];
     for (err, token, subject) in cases {

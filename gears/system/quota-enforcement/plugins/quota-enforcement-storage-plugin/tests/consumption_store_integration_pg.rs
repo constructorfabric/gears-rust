@@ -49,8 +49,8 @@ use quota_enforcement_storage_plugin::{
 };
 
 const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
-const METRIC_TOKENS: &str = "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1";
-const METRIC_OTHER: &str = "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1";
+const METRIC_TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
+const METRIC_OTHER: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1";
 
 /// A Tuesday, and the day after it: one calendar period boundary apart.
 const DAY_ONE: OffsetDateTime = time::macros::datetime!(2026-03-17 10:00:00 UTC);

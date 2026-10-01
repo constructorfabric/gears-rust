@@ -71,7 +71,7 @@ pub fn test_tenant() -> TenantId {
 /// A registered-looking metric instance id.
 #[must_use]
 pub fn test_metric() -> MetricId {
-    MetricId::parse("gts.cf.qe.metric.type.v1~cf.genai.llm_gateway.token.v1")
+    MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1")
         .expect("well-formed metric id")
 }
 

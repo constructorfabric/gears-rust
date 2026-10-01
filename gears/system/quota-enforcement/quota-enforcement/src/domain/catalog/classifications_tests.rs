@@ -9,7 +9,7 @@ use crate::domain::ports::metric_registry::{
     Classified, Freshness, MetricDescriptor, MetricMode, MetricRegistry,
 };
 
-const TOKENS: &str = "gts.cf.qe.metric.type.v1~cf.qe.metric.tokens.v1";
+const TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.tokens.v1";
 
 fn metric() -> MetricId {
     MetricId::parse(TOKENS).expect("metric")

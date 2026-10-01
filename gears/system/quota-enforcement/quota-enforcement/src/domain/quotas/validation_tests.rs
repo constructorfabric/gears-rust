@@ -210,7 +210,7 @@ fn windows_must_not_be_inverted_and_ids_and_metrics_must_parse() {
         invalid("subject.subject_id", tokens::SUBJECT_ID_REQUIRED)
     );
     let err = validate_create_shape(CreateQuotaRequest {
-        metric: "gts.cf.qe.metric.type.v1~".to_owned(),
+        metric: "gts.cf.core.qe.metric_type.v1~".to_owned(),
         ..consumption()
     })
     .expect_err("a type id is not a metric");

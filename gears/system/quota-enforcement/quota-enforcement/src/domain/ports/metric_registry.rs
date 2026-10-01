@@ -5,7 +5,7 @@
 //! answers two questions the write path and the gauge refresh ask: is the id a
 //! registered instance of the metric base, and how does the registry classify
 //! it. The classification contract is provisional: the metric base
-//! `gts.cf.qe.metric.type.v1~` is a platform namespace (PRD section 13), and QE
+//! `gts.cf.core.qe.metric_type.v1~` is a platform namespace (PRD section 13), and QE
 //! documents the fields it reads (`kind`, `enforcement`) as a proposal. A
 //! registered metric without a usable classification is an error, never a
 //! default.
