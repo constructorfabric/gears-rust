@@ -55,7 +55,7 @@ A tenant that removes its own secret, or never had one, must be able to say what
 | `declared` | `none` | 404 — the walk stops here |
 | `active` | either | own secret — `fallback` not consulted |
 
-Candidates: `status = active OR (status = declared AND fallback = none)`. A `declared`/`none` row competes and, when nearest, wins; a winner without a secret yields 404. `shared` blocks the whole subtree, `tenant` only that tenant. A descendant reading `suppressed` learns nothing about which tenant blocked or what sits behind it — the same withholding as a plain 404.
+Candidates: `status = active OR (status = declared AND fallback = none)`. A `declared`/`none` row competes and, when nearest, wins; a winner without a secret yields 404. `fallback` governs `declared` rows only: it never applies to an expired `active` record, which stays decisive and answers `SECRET_EXPIRED` to a secret read instead of letting resolution continue. `shared` blocks the whole subtree, `tenant` only that tenant. A descendant reading `suppressed` learns nothing about which tenant blocked or what sits behind it — the same withholding as a plain 404.
 
 ### Suppression is one request, always
 

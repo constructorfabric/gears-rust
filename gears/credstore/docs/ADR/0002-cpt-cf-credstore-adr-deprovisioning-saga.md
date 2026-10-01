@@ -3,8 +3,8 @@ status: superseded
 date: 2026-07-04
 ---
 
-Created:  2026-07-07 by Virtuozzo International GmbH
-Updated:  2026-07-07 by Virtuozzo International GmbH
+Created:  2026-07-07 by Constructor Tech
+Updated:  2026-07-07 by Constructor Tech
 
 # ADR-0002: Status-Driven Deprovisioning Saga with Name Retention
 
