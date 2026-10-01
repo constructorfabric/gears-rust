@@ -48,7 +48,7 @@ fn gts_enums_reject_short_names_and_unknown_ids() {
         }
     );
     assert!(
-        "gts.cf.qe.quota.type.v1~cf.qe.quota.burst.v1"
+        "gts.cf.core.qe.quota_type.v1~cf.core.qe.burst.v1"
             .parse::<QuotaType>()
             .is_err()
     );
@@ -88,7 +88,7 @@ fn every_gts_enum_value_derives_from_its_declared_base() {
     assert_eq!(PeriodType::ALL.len(), 5, "PRD 5.4 reserves five periods");
     assert_eq!(
         PeriodType::OneTime.as_gts_id(),
-        "gts.cf.qe.period.type.v1~cf.qe.period.one_time.v1"
+        "gts.cf.core.qe.period_type.v1~cf.core.qe.one_time.v1"
     );
 }
 
@@ -183,10 +183,10 @@ fn policy_id_recognizes_the_seeded_global_policy() {
 
 #[test]
 fn metric_id_accepts_instance_ids_and_rejects_type_ids() {
-    let ok = MetricId::parse("gts.cf.qe.metric.type.v1~cf.genai.llm_gateway.token.v1");
+    let ok = MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1");
     assert!(ok.is_ok(), "{ok:?}");
     assert!(
-        MetricId::parse("gts.cf.qe.metric.type.v1~").is_err(),
+        MetricId::parse("gts.cf.core.qe.metric_type.v1~").is_err(),
         "type id rejected"
     );
     assert!(MetricId::parse("not-a-gts-id").is_err());
@@ -304,7 +304,7 @@ fn decision_result_is_tagged_and_denied_carries_its_reason() {
 
 #[test]
 fn policy_scope_is_tagged_by_kind() {
-    let metric = MetricId::parse("gts.cf.qe.metric.type.v1~cf.genai.llm_gateway.token.v1")
+    let metric = MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1")
         .expect("metric id");
     let scope = PolicyScope::Metric {
         metric: metric.clone(),

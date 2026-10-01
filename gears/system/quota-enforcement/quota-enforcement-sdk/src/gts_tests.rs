@@ -83,7 +83,7 @@ fn resource_ids_are_distinct_five_segment_type_ids() {
         OPERATION_RESOURCE,
     ];
     for id in all {
-        assert!(id.starts_with("gts.cf.qe.resource."), "{id}");
+        assert!(id.starts_with("gts.cf.core.qe."), "{id}");
         assert!(id.ends_with(".v1~"), "{id}");
     }
     let mut sorted = all.to_vec();

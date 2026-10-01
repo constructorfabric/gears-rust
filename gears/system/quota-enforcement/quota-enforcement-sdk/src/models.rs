@@ -356,47 +356,47 @@ macro_rules! gts_closed_enum {
 
 gts_closed_enum!(
     /// Accounting model of a Quota (PRD section 5.3).
-    QuotaType, kind = "quota_type", base = "gts.cf.qe.quota.type.v1~", {
+    QuotaType, kind = "quota_type", base = "gts.cf.core.qe.quota_type.v1~", {
         /// In-flight reservable capacity, no period reset.
-        Allocation => "gts.cf.qe.quota.type.v1~cf.qe.quota.allocation.v1",
+        Allocation => "gts.cf.core.qe.quota_type.v1~cf.core.qe.allocation.v1",
         /// Per-period cumulative consumption, reset at the period boundary.
-        Consumption => "gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1",
+        Consumption => "gts.cf.core.qe.quota_type.v1~cf.core.qe.consumption.v1",
         /// Reserved for P3. Creation is rejected in P1.
-        Rate => "gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1",
+        Rate => "gts.cf.core.qe.quota_type.v1~cf.core.qe.rate.v1",
     }
 );
 
 gts_closed_enum!(
     /// Behaviour of a Quota at its cap boundary (PRD section 5.11).
-    EnforcementMode, kind = "enforcement_mode", base = "gts.cf.qe.enforcement.type.v1~", {
+    EnforcementMode, kind = "enforcement_mode", base = "gts.cf.core.qe.enforcement_type.v1~", {
         /// Operations that would cross the cap are denied. The only P1 mode.
-        Hard => "gts.cf.qe.enforcement.type.v1~cf.qe.enforcement.hard.v1",
+        Hard => "gts.cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1",
     }
 );
 
 gts_closed_enum!(
     /// Who imposed the Quota (PRD section 5.2, "Source value semantics").
-    QuotaSource, kind = "quota_source", base = "gts.cf.qe.source.type.v1~", {
+    QuotaSource, kind = "quota_source", base = "gts.cf.core.qe.source_type.v1~", {
         /// Materialized from the licensing layer. The default.
-        Licensing => "gts.cf.qe.source.type.v1~cf.qe.source.licensing.v1",
+        Licensing => "gts.cf.core.qe.source_type.v1~cf.core.qe.licensing.v1",
         /// Created manually by an operator outside the licensing flow.
-        Operator => "gts.cf.qe.source.type.v1~cf.qe.source.operator.v1",
+        Operator => "gts.cf.core.qe.source_type.v1~cf.core.qe.operator.v1",
     }
 );
 
 gts_closed_enum!(
     /// Calendar-aligned UTC period of a consumption Quota (PRD section 5.4).
-    PeriodType, kind = "period_type", base = "gts.cf.qe.period.type.v1~", {
+    PeriodType, kind = "period_type", base = "gts.cf.core.qe.period_type.v1~", {
         /// 00:00 UTC to 24:00 UTC.
-        Day => "gts.cf.qe.period.type.v1~cf.qe.period.day.v1",
+        Day => "gts.cf.core.qe.period_type.v1~cf.core.qe.day.v1",
         /// Monday 00:00 UTC to the next Monday.
-        Week => "gts.cf.qe.period.type.v1~cf.qe.period.week.v1",
+        Week => "gts.cf.core.qe.period_type.v1~cf.core.qe.week.v1",
         /// First day of the month, 00:00 UTC.
-        Month => "gts.cf.qe.period.type.v1~cf.qe.period.month.v1",
+        Month => "gts.cf.core.qe.period_type.v1~cf.core.qe.month.v1",
         /// First of January, 00:00 UTC.
-        Year => "gts.cf.qe.period.type.v1~cf.qe.period.year.v1",
+        Year => "gts.cf.core.qe.period_type.v1~cf.core.qe.year.v1",
         /// Non-recurring. No automatic reset.
-        OneTime => "gts.cf.qe.period.type.v1~cf.qe.period.one_time.v1",
+        OneTime => "gts.cf.core.qe.period_type.v1~cf.core.qe.one_time.v1",
     }
 );
 
