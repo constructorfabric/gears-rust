@@ -3,4 +3,4 @@
 mod client;
 pub mod service;
 
-pub use service::Service;
+pub use service::{GrantValue, PropertyGrant, Service};
