@@ -33,7 +33,7 @@ Shipped: `GET /credstore/v1/secrets/{ref}` always returns the secret, and there 
 ## Decision Drivers
 
 - **D1** — correctness over continuity with the shipped shape.
-- **D2** — enumerating, reading metadata and reading a secret are distinct privileges; one PDP evaluation per distinct type.
+- **D2** — enumerating, reading metadata and reading a secret are distinct privileges; one PDP evaluation per action, whatever the number of types.
 - **D3** — refusal is the canonical 404, per item in bulk too; a bulk secret read never exceeds the caller's scope and is never paginated.
 - **D4** — a secret-blind writer gets a CAS validator from a response it may read.
 - **D5** — `$select`, not the path, decides disclosure: one address serves every projection.
@@ -54,10 +54,10 @@ Axis B, requesting the secret: **B1** own sub-resource address; **B2** opt-in qu
 | `$select` names | Point read | Collection |
 |---|---|---|
 | record fields only, or nothing | `read` | `list` |
-| `secret`, at most with `reference`, `type`, `expires_at` | `read_secret` | `read_secret` per distinct type |
+| `secret`, at most with `reference`, `type`, `expires_at` | `read_secret` | `read_secret`, one evaluation |
 | `secret` plus any other field | `read` + `read_secret` | `list` + `read_secret` |
 
-`reference`, `type`, `expires_at` are readable under either action because a secret is unusable without them. The action is evaluated once, on the concrete type, before the response is assembled. Denial is 404 on the point read and an omitted item on the collection. Endpoint table, preconditions, codes, examples: DESIGN §4.3.2.
+`reference`, `type`, `expires_at` are readable under either action because a secret is unusable without them. The action is evaluated once, on the base credential type, whose answer carries the credential-type constraint ([ADR-0010](0010-cpt-cf-credstore-adr-type-scoped-authorization.md)), before the response is assembled. Denial is 404 on the point read and an omitted item on the collection. Endpoint table, preconditions, codes, examples: DESIGN §4.3.2.
 
 ### Naming
 
