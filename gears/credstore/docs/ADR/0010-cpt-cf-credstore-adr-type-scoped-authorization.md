@@ -4,9 +4,9 @@ date: 2026-09-18
 ---
 
 Created:  2026-09-18 by Constructor Tech
-Updated:  2026-09-18 by Constructor Tech
+Updated:  2026-10-02 by Constructor Tech
 
-# ADR-0010: Six Actions on the Credential Type; the Type Is the Only Scope Axis
+# ADR-0010: Six Actions on the Credential Type; Type and Reference Are the Scope Axes
 
 <!-- toc -->
 
@@ -14,7 +14,8 @@ Updated:  2026-09-18 by Constructor Tech
 - [Decision Drivers](#decision-drivers)
 - [Considered Options](#considered-options)
 - [Decision Outcome](#decision-outcome)
-  - [Permissions as GTS instances, evaluated on the concrete type](#permissions-as-gts-instances-evaluated-on-the-concrete-type)
+  - [Permissions as GTS instances; the type returned as a PDP constraint](#permissions-as-gts-instances-the-type-returned-as-a-pdp-constraint)
+  - [Per-instance grants by reference](#per-instance-grants-by-reference)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
@@ -33,7 +34,7 @@ The shipped resource type `gts.cf.core.credstore.secret.v1~` has three actions (
 
 - **D1** — enumerating, reading metadata, reading a secret, and their write counterparts are six separately grantable privileges.
 - **D2** — no metadata write may move a credential from one reader's grant into another's (`fr-override-type-consistency` depends on this).
-- **D3** — the PDP resource is resolvable before authorization runs, from data the row already carries.
+- **D3** — the PDP resource is known before authorization runs, without reading the row: a constant base type for an existing credential, the requested type for a create.
 
 ## Considered Options
 
@@ -42,13 +43,23 @@ The shipped resource type `gts.cf.core.credstore.secret.v1~` has three actions (
 
 ## Decision Outcome
 
-**Chosen: type alone.** The GTS base type is renamed `gts.cf.core.credstore.secret.v1~` → `…credential.v1~` ([ADR-0004](0004-cpt-cf-credstore-adr-secret-value-exposure.md)) and carries six actions: `list`, `read`, `write`, `delete` on the record; `read_secret`, `write_secret` on the secret. There is no synonym for the old `read`: after the rename no shipped grant matches any new operation, so the break is structural. Plain verbs follow the platform convention; the `_secret` suffix follows the compound-action pattern (`set_reaction`) and names the secret, whether reached through the item's field or through `$select` on the collection. `read` is the floor the other actions imply and `delete` rides with `write` in practice, but both stay separate atoms for audit and downward grants.
+**Chosen: the type, plus the reference for per-instance grants; no editable field.** The GTS base type is renamed `gts.cf.core.credstore.secret.v1~` → `…credential.v1~` ([ADR-0004](0004-cpt-cf-credstore-adr-secret-value-exposure.md)) and carries six actions: `list`, `read`, `write`, `delete` on the record; `read_secret`, `write_secret` on the secret. There is no synonym for the old `read`: after the rename no shipped grant matches any new operation, so the break is structural. Plain verbs follow the platform convention; the `_secret` suffix follows the compound-action pattern (`set_reaction`) and names the secret, whether reached through the item's field or through `$select` on the collection. `read` is the floor the other actions imply and `delete` rides with `write` in practice, but both stay separate atoms for audit and downward grants.
 
-With `category` gone, the type is the whole purpose axis: an application granted `read_secret` on a subtype receives exactly that subtype's credentials, and a consumer that needs "its own" credentials declares a derived type instead of filing records under a mutable label. `type` is immutable after create (D2), so no write can move a credential between grants.
+With `category` gone, the type is the purpose axis (a single instance is addressed by its reference, below): an application granted `read_secret` on a subtype receives exactly that subtype's credentials, and a consumer that needs "its own" credentials declares a derived type instead of filing records under a mutable label. `type` is immutable after create (D2), so no write can move a credential between grants.
 
-### Permissions as GTS instances, evaluated on the concrete type
+### Permissions as GTS instances; the type returned as a PDP constraint
 
-A permission is a GTS instance `gts.cf.toolkit.authz.permission.v1~cf.core.credstore.<name>.v1` whose `resource_type` is the base type or a concrete descendant. The PDP evaluates against the credential's **full concrete type**, resolved before the call (D3), so a policy can target any registered type without a base-type gate. On the collection this is one evaluation per distinct type among the candidate rows, folded into a `secret_type_uuid IN (…)` clamp ([ADR-0005](0005-cpt-cf-credstore-adr-upward-collection-read.md)). **Override-type-consistency makes the clamp sound**: an override carries the type of the credential it overrides (`fr-override-type-consistency`), so `secret_type_uuid` is invariant along one reference's chain and the clamp can only keep or drop a reference's whole group, never change which row wins.
+A permission is a GTS instance `gts.cf.toolkit.authz.permission.v1~cf.core.credstore.<name>.v1` whose `resource_type` is the base type or a concrete descendant. An operation on an **existing** credential evaluates its action on the **base type**, once per needed action, and declares the credential type as a supported PDP property next to the tenant. The PDP matches the caller's grants — base type, concrete descendant or wildcard — and answers with the tenant constraint plus a constraint on that property: the set of credential types the grants cover for the action (as the deterministic UUIDs the row stores), omitted when they cover every type. The constraint is compiled to a predicate on the stored type column and applied to the row lookup itself, so a row of an uncovered type is simply not found, and the number of PDP calls never depends on how many types exist (hundreds are expected) or which ones a tenant holds; the data-independent refusal stays a plain PDP denial. A **create** takes its type from the request and has no row to constrain, so it evaluates the requested **concrete** type. On the collection the type constraint becomes the SQL clamp `secret_type_uuid IN (…)` ([ADR-0005](0005-cpt-cf-credstore-adr-upward-collection-read.md)). A PDP that cannot express the type set is type-blind and grants every type in the tenant or denies; type-scoped grants need a PDP that answers a base-type request with the constraint. **Override-type-consistency makes the clamp sound**: an override carries the type of the credential it overrides (`fr-override-type-consistency`), so `secret_type_uuid` is invariant along one reference's chain and the clamp can only keep or drop a reference's whole group, never change which row wins.
+
+### Per-instance grants by reference
+
+The gear declares a second supported PDP property next to the type: the credential's **reference**. For one evaluation per action on the base type the PDP may answer with constraints on the type, the reference or both, as alternatives (OR) of conjunctions (AND): "type A, or reference x" and "type A and reference x" are both expressible, so the gear keeps the constraint structure and does not flatten it into sets. Example: application `email-sender` holds `read_secret` on `reference in ["smtp-password"]` and receives that one credential and no other.
+
+A per-instance grant is expressed by reference, **not by record id**: a re-created record gets a new id, so an id-based grant would silently stop matching after a delete and create, while the reference names the same credential across generations. Reference values are compared as strings, exactly and case-sensitively; a UUID-shaped grant value matches the reference in its lowercase hyphenated form. The constraints are applied to the row lookup in the store, and the tenant dimension stays a gate: only a constraint that affirms the caller's own tenant counts, and any other restriction the gear cannot evaluate fails closed.
+
+- **Create** has no row to constrain, so the PDP's constraints on the concrete type are evaluated against the request: the requested reference must be admitted, otherwise the create is refused exactly like a PDP refusal (403), before any lookup, so a refusal never discloses whether the name is taken.
+- **Replace, patch and delete** look the row up under the PDP's constraints; a row the constraints do not admit is answered as a missing row.
+- **Inheritance.** The decisive row of a reference is chosen from all visible rows, unclamped. If the constraints do not admit that decisive row, the point read answers a miss (404) and the collection omits the item; the read never falls through to an ancestor's value, which would serve a different credential than the one the resolution picked.
 
 ### Consequences
 
@@ -56,10 +67,14 @@ A permission is a GTS instance `gts.cf.toolkit.authz.permission.v1~cf.core.creds
 - A bare shape type (`api_key`, `generic`) cannot be scoped per purpose; a purpose needs its own subtype. Registering one needs no credstore release.
 - **Grant reissuance is a pre-deployment step, not a rolling one.** Because no shipped grant matches any new action, every existing policy against `gts.cf.core.credstore.secret.v1~` (`read`/`write`/`delete`) must be re-issued against `credential.v1~`'s six actions (`read` → `read` + `list`; `write` → `write`; `delete` → `delete`; a grant that also needs the secret adds `read_secret`/`write_secret` explicitly, never inferred) before this ADR's code deploys — the same PDP policy owner (platform or tenant admin, per the grant's own scope) who issued the old grant reissues it. There is no dual-grant window: since the actions genuinely differ (three vs. six, with the secret split out), a policy engine cannot honor both simultaneously without over- or under-granting, so this ships in the same stop-the-world window as the `m0002` data migration (DESIGN §8), not as an independent rollout.
 
+- **Deployment prerequisite.** The shipped tenant-resolver PDP plugin returns tenant constraints only; it is blind to type and reference and grants every credential in the tenant. The shipped static PDP does the same unless it is configured with property grants, which exist for development and tests. Type- and reference-scoped grants take effect in production only with a PDP that answers a base-type request with constraints on the credential-type and reference properties; a PDP that denies a base-type request for a caller holding grants on derived types only would lock that caller out.
+
 ### Confirmation
 
 - E2E: an application granted `read_secret` on one type receives exactly that type's credentials for a `$filter` scoped to it, and an empty result for a type it is not granted.
+- Unit: every operation on an existing credential issues one PDP evaluation per needed action on the base type, regardless of how many credential types the tenant holds; a type-restricted scope hides rows of other types (404/409) in the SQL lookup, and a flat PDP denial is 403 whether or not the record exists.
 - E2E: a metadata write that would change a record's type is refused unconditionally, not only when it would create a chain mismatch.
+- Unit: a reference constraint admits and hides rows by name in the point read, the collection (metadata and secret modes), replace, patch, delete and the removal of a value; a create of a reference the constraint does not admit is 403; a decisive child override the constraints do not admit is a miss and the ancestor's value is never served.
 - Contract: no permission targets `category`; the field exists neither on the wire nor in storage.
 
 ## Pros and Cons of the Options
