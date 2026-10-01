@@ -3,7 +3,7 @@ status: superseded by ADR-0006
 date: 2026-07-08
 ---
 
-Created:  2026-07-07 by Virtuozzo International GmbH
+Created:  2026-07-07 by Constructor Tech
 Updated:  2026-10-01 by Constructor Tech
 
 # ADR-0003: Value-Fingerprint Fence for the Metadata/Value Dual Write

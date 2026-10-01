@@ -3,7 +3,7 @@ status: accepted
 date: 2026-07-04
 ---
 
-Created:  2026-07-07 by Virtuozzo International GmbH
+Created:  2026-07-07 by Constructor Tech
 Updated:  2026-10-01 by Constructor Tech
 
 # ADR-0001: Stateful Gear with Gear-Owned Secret Metadata
