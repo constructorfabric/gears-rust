@@ -3,6 +3,7 @@
 pub(super) mod provider_task;
 mod types;
 
+pub use types::requester_type_column;
 pub use types::{StreamError, StreamOutcome};
 
 use std::sync::Arc;
@@ -32,8 +33,65 @@ use crate::infra::llm::provider_resolver::ProviderResolver;
 use super::{DbProvider, actions, resources};
 use types::{
     FinalizationCtx, InvalidAttachmentError, PreflightResult, attachment_err,
-    check_input_token_limit, flatten_preflight, requester_type_from_str,
+    check_input_token_limit, flatten_preflight, requester_type_from_str, reserve_limit_exceeded,
 };
+
+/// Map a failure of the reserve + message + turn transaction.
+fn turn_tx_error(e: toolkit_db::DbError) -> StreamError {
+    match e {
+        toolkit_db::DbError::Other(anyhow_err)
+            if anyhow_err.is::<super::quota_service::ReserveLimitExceeded>() =>
+        {
+            reserve_limit_exceeded()
+        }
+        toolkit_db::DbError::Other(anyhow_err) => {
+            match anyhow_err.downcast::<InvalidAttachmentError>() {
+                Ok(err) => StreamError::InvalidAttachment {
+                    code: "invalid_attachment".to_owned(),
+                    message: err.message,
+                },
+                Err(anyhow_err) => match anyhow_err.downcast::<DomainError>() {
+                    // Lost the race on the one-running-turn-per-chat
+                    // index (or on UNIQUE(chat_id, request_id)).
+                    Ok(DomainError::Conflict { code, message }) if code == "unique_violation" => {
+                        StreamError::Conflict {
+                            code: "turn_already_running".to_owned(),
+                            message,
+                        }
+                    }
+                    // Deleted after the pre-checks (`require_live_chat`).
+                    Ok(DomainError::ChatNotFound { id }) => {
+                        StreamError::ChatNotFound { chat_id: id }
+                    }
+                    Ok(domain_err) => StreamError::TurnCreationFailed { source: domain_err },
+                    Err(err) => StreamError::TurnCreationFailed {
+                        source: DomainError::from(toolkit_db::DbError::Other(err)),
+                    },
+                },
+            }
+        }
+        other => StreamError::TurnCreationFailed {
+            source: DomainError::from(other),
+        },
+    }
+}
+
+/// Quota preflight computed for a retry/edit before its mutation commits.
+pub struct MutationPreflight {
+    computed: super::quota_service::PreflightComputed,
+    pf: PreflightResult,
+    ready_doc_count: i64,
+    ci_file_ids: Vec<String>,
+    image_file_ids: Vec<String>,
+}
+
+/// Everything needed to start the provider task for a mutation turn.
+struct PreparedMutationStream<TR: TurnRepository + 'static, MR: MessageRepository + 'static> {
+    message_id: Uuid,
+    summary_info: Option<ThreadSummaryInfo>,
+    finalization_ctx: FinalizationCtx<TR, MR>,
+    task_config: provider_task::ProviderTaskConfig,
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // StreamService
@@ -50,7 +108,7 @@ pub struct StreamService<
     TR: TurnRepository + 'static,
     MR: MessageRepository + 'static,
     QR: QuotaUsageRepository + 'static,
-    CR: ChatRepository,
+    CR: ChatRepository + 'static,
     TSR: ThreadSummaryRepository + 'static,
     AR: AttachmentRepository + 'static,
     VSR: VectorStoreRepository + 'static,
@@ -80,7 +138,7 @@ impl<
     TR: TurnRepository + 'static,
     MR: MessageRepository + 'static,
     QR: QuotaUsageRepository + 'static,
-    CR: ChatRepository,
+    CR: ChatRepository + 'static,
     TSR: ThreadSummaryRepository + 'static,
     AR: AttachmentRepository + 'static,
     VSR: VectorStoreRepository + 'static,
@@ -275,14 +333,8 @@ impl<
         cancel: CancellationToken,
         tx: mpsc::Sender<StreamEvent>,
     ) -> Result<tokio::task::JoinHandle<StreamOutcome>, StreamError> {
-        let has_vision_input = resolved_model
-            .multimodal_capabilities
-            .iter()
-            .any(|c| c == "VISION_INPUT");
         let ResolvedModel {
-            model_id: model,
-            provider_id,
-            ..
+            model_id: model, ..
         } = resolved_model;
         let tenant_id = ctx.subject_tenant_id();
         let user_id = ctx.subject_id();
@@ -309,6 +361,24 @@ impl<
             .map_err(|e| StreamError::TurnCreationFailed { source: e })?
             .ok_or(StreamError::ChatNotFound { chat_id })?;
 
+        // ── attachment_ids length (before any query that takes the list) ──
+        // A valid message references at most every document of the chat plus
+        // `max_images_per_message` images; duplicates are rejected later.
+        let max_attachment_ids = usize::try_from(self.rag_config.max_documents_per_chat)
+            .unwrap_or(usize::MAX)
+            .saturating_add(
+                usize::try_from(self.rag_config.max_images_per_message).unwrap_or(usize::MAX),
+            );
+        if attachment_ids.len() > max_attachment_ids {
+            return Err(StreamError::InvalidAttachment {
+                code: "invalid_attachment".to_owned(),
+                message: format!(
+                    "Too many attachment IDs: {} (at most {max_attachment_ids})",
+                    attachment_ids.len()
+                ),
+            });
+        }
+
         let scope = chat_scope.tenant_only();
 
         // ── Idempotency check (DESIGN §3.7 Check Priority Order) ──
@@ -318,8 +388,10 @@ impl<
             .await
             .map_err(|e| StreamError::TurnCreationFailed { source: e })?
         {
+            // A soft-deleted turn (replaced by retry/edit or deleted) is never
+            // replayed; its request_id stays taken by UNIQUE(chat_id, request_id).
             return Err(match existing_turn.state {
-                TurnState::Completed => StreamError::Replay {
+                TurnState::Completed if existing_turn.deleted_at.is_none() => StreamError::Replay {
                     turn: Box::new(existing_turn),
                 },
                 _ => StreamError::Conflict {
@@ -381,37 +453,10 @@ impl<
             .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
 
         // ── Pre-fetch image attachment count for guards + token estimation ──
-        // Validates chat_id to prevent cross-chat attachment references.
-        let image_file_ids: Vec<String> = if attachment_ids.is_empty() {
-            Vec::new()
-        } else {
-            let rows = self
-                .attachment_repo
-                .get_batch(&conn, &scope, &attachment_ids)
-                .await
-                .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
-            rows.iter()
-                .filter(|r| {
-                    r.chat_id == chat_id
-                        && r.attachment_kind
-                            == crate::infra::db::entity::attachment::AttachmentKind::Image
-                        && r.status == crate::infra::db::entity::attachment::AttachmentStatus::Ready
-                })
-                .filter_map(|r| r.provider_file_id.clone())
-                .collect()
-        };
-        let num_images = u32::try_from(image_file_ids.len()).unwrap_or(u32::MAX);
-
-        // ── Image count guard (before preflight, before TX) ──
-        if num_images > 0 {
-            let max = self.rag_config.max_images_per_message;
-            if num_images > max {
-                return Err(StreamError::TooManyImages {
-                    count: num_images,
-                    max,
-                });
-            }
-        }
+        let image_file_ids = self
+            .image_file_ids(&conn, &scope, chat_id, &attachment_ids)
+            .await?;
+        let num_images = self.check_image_count(&image_file_ids)?;
 
         // ── Preflight quota evaluate (external I/O, no DB writes) ──
         let selected_model = model.clone();
@@ -439,25 +484,18 @@ impl<
         self.record_preflight_metrics(&computed, &selected_model);
 
         let pf = flatten_preflight(computed.decision.clone())?;
+        // Adapter, OAGW alias and file-id maps follow the effective model: a
+        // downgrade may land on a model of another provider.
+        let provider_id = pf.effective_provider_id.clone();
 
         // ── Input token limit check ──
         check_input_token_limit(&content, &pf)?;
 
         // ── Post-preflight image guards (kill switches + vision capability) ──
-        if num_images > 0 {
-            if computed.kill_switches.disable_images {
-                return Err(StreamError::ImagesDisabled);
-            }
-            // DESIGN.md line 181: check VISION_INPUT on the effective_model.
-            // DESIGN.md line 3206: P1 catalog invariant — ALL enabled models
-            // MUST include VISION_INPUT (enforced at startup). Under a valid
-            // P1 config, quota downgrade cannot demote to a non-vision model,
-            // so checking the selected_model is sufficient. This guard is
-            // defensive for future non-vision models or catalog misconfiguration.
-            if !has_vision_input {
-                return Err(StreamError::UnsupportedMedia);
-            }
-        }
+        check_image_support(num_images, &computed.kill_switches, pf.vision_input)?;
+        // The web_search tool is sent only when the effective model supports it;
+        // the requested flag is still stored on the turn for retry/edit.
+        let web_search_tool = web_search_enabled && pf.tool_support.web_search;
 
         // Metrics: estimated tokens (only on allow/downgrade)
         #[allow(clippy::cast_precision_loss)]
@@ -466,7 +504,10 @@ impl<
 
         // Period boundaries from the computed preflight (used by finalization for settlement)
         let period_starts = computed.periods.clone();
-        let file_search_disabled = computed.kill_switches.disable_file_search;
+        // The kill switch, or an effective model without file_search support,
+        // leaves the tool out.
+        let file_search_disabled =
+            computed.kill_switches.disable_file_search || !pf.tool_support.file_search;
         let has_reserve_buckets = !computed.buckets.is_empty();
 
         // ── Retrieval mode determination ──
@@ -483,7 +524,7 @@ impl<
             tracing::info!(
                 chat_id = %chat_id,
                 ready_doc_count,
-                "file_search disabled by kill switch -- {ready_doc_count} ready documents skipped"
+                "file_search disabled (kill switch or model without file_search support) -- {ready_doc_count} ready documents skipped"
             );
         }
 
@@ -544,8 +585,71 @@ impl<
             (Vec::new(), false)
         };
 
+        // ── Context assembly ──
+        let token_budget = Some(super::context_assembly::TokenBudget {
+            context_window: pf.context_window,
+            max_output_tokens_applied: pf.max_output_tokens_applied,
+            max_input_tokens: pf.max_input_tokens,
+            budgets: pf.estimation_budgets,
+            tools_enabled: file_search_enabled,
+            web_search_enabled: web_search_tool,
+            code_interpreter_enabled,
+        });
+        // file_search and knowledge_search are mutually exclusive — when both
+        // are configured, file_search wins (native vector-store tool, already
+        // billed via the adapter). knowledge_search would otherwise double-bill
+        // OpenAI/Responses traffic and silently drop on Anthropic.
+        // The flag follows the parameters: when they cannot be built (no
+        // retriever, provider or api_version), the tool is not offered.
+        let knowledge_search = if file_search_enabled {
+            None
+        } else {
+            self.build_knowledge_search_params(&tenant_id.to_string())
+        };
+        let knowledge_search_enabled = knowledge_search.is_some();
+        let (assembled, summary_info) = self
+            .gather_context(
+                tenant_id,
+                chat_id,
+                snapshot_boundary,
+                &pf.system_prompt,
+                &content,
+                web_search_tool,
+                file_search_enabled,
+                knowledge_search_enabled,
+                &vector_store_ids,
+                None, // file_search_filters: wired by P4-6
+                pf.web_search_context_size,
+                pf.file_search_max_num_results,
+                ci_file_ids,
+                token_budget,
+                &image_file_ids,
+            )
+            .await?;
+
+        // Record image metrics
+        if num_images > 0 {
+            self.metrics.record_image_inputs_per_turn(num_images);
+        }
+        let tenant_id_str = tenant_id.to_string();
+        let resolved_provider = self
+            .provider_resolver
+            .resolve(&provider_id, Some(&tenant_id_str))
+            .map_err(|e| StreamError::TurnCreationFailed {
+                source: DomainError::internal(format!("provider resolution: {e}")),
+            })?;
+        // Build the full OAGW proxy path: {alias}{api_path} with {model} substituted.
+        // Use effective provider_model_id (may differ from requested on downgrade).
+        let effective_provider_model_id = pf.effective_provider_model_id.clone();
+        let api_path = resolved_provider
+            .api_path
+            .replace("{model}", &effective_provider_model_id);
+        let proxy_path = format!("{}{api_path}", resolved_provider.upstream_alias);
+
         // ── Single transaction: reserve + user message + turn ──
-        let requester_type = ctx.subject_type().unwrap_or("user").to_owned();
+        // Runs after every fallible pre-provider step so an error before this
+        // point leaves no running turn and no quota reserve behind.
+        let requester_type = types::requester_type_column(ctx.subject_type()).to_owned();
         let turn_id = self
             .reserve_and_create_turn(
                 &scope,
@@ -576,7 +680,7 @@ impl<
         // Pre-generate assistant message ID (sent in StreamStartedData and used in CAS)
         let message_id = Uuid::new_v4();
 
-        let mut finalization_ctx = FinalizationCtx {
+        let finalization_ctx = FinalizationCtx {
             finalization_svc: Arc::clone(&self.finalization),
             db: Arc::clone(&self.db),
             turn_repo: Arc::clone(&self.turn_repo),
@@ -600,71 +704,14 @@ impl<
             downgrade_reason: pf.downgrade_reason,
             period_starts,
             context_window: pf.context_window,
-            assembled_context_tokens: 0, // updated after context assembly
-            messages_truncated: false,   // updated after context assembly
+            max_input_tokens: pf.max_input_tokens,
+            assembled_context_tokens: assembled.estimated_context_tokens,
+            messages_truncated: assembled.messages_truncated,
             provider_id: provider_id.clone(),
             metrics: Arc::clone(&self.metrics),
             quota_warnings_provider: Arc::clone(&self.quota)
                 as Arc<dyn crate::domain::service::quota_settler::QuotaWarningsProvider>,
         };
-
-        // ── Context assembly ──
-        let token_budget = Some(super::context_assembly::TokenBudget {
-            context_window: pf.context_window,
-            max_output_tokens_applied: pf.max_output_tokens_applied,
-            budgets: pf.estimation_budgets,
-            tools_enabled: file_search_enabled,
-            web_search_enabled,
-            code_interpreter_enabled,
-        });
-        // file_search and knowledge_search are mutually exclusive — when both
-        // are configured, file_search wins (native vector-store tool, already
-        // billed via the adapter). knowledge_search would otherwise double-bill
-        // OpenAI/Responses traffic and silently drop on Anthropic.
-        let knowledge_search_enabled = self.knowledge_search_config.enabled
-            && self.knowledge_retriever.is_some()
-            && !file_search_enabled;
-        let (assembled, summary_info) = self
-            .gather_context(
-                tenant_id,
-                chat_id,
-                snapshot_boundary,
-                &pf.system_prompt,
-                &content,
-                web_search_enabled,
-                file_search_enabled,
-                knowledge_search_enabled,
-                &vector_store_ids,
-                None, // file_search_filters: wired by P4-6
-                pf.web_search_context_size,
-                pf.file_search_max_num_results,
-                ci_file_ids,
-                token_budget,
-                &image_file_ids,
-            )
-            .await?;
-
-        finalization_ctx.assembled_context_tokens = assembled.estimated_context_tokens;
-        finalization_ctx.messages_truncated = assembled.messages_truncated;
-
-        // Record image metrics
-        if num_images > 0 {
-            self.metrics.record_image_inputs_per_turn(num_images);
-        }
-        let tenant_id_str = tenant_id.to_string();
-        let resolved_provider = self
-            .provider_resolver
-            .resolve(&provider_id, Some(&tenant_id_str))
-            .map_err(|e| StreamError::TurnCreationFailed {
-                source: DomainError::internal(format!("provider resolution: {e}")),
-            })?;
-        // Build the full OAGW proxy path: {alias}{api_path} with {model} substituted.
-        // Use effective provider_model_id (may differ from requested on downgrade).
-        let effective_provider_model_id = pf.effective_provider_model_id.clone();
-        let api_path = resolved_provider
-            .api_path
-            .replace("{model}", &effective_provider_model_id);
-        let proxy_path = format!("{}{api_path}", resolved_provider.upstream_alias);
 
         emit_stream_started(&tx, request_id, message_id, summary_info).await;
 
@@ -685,7 +732,7 @@ impl<
                 api_params: pf.api_params,
                 provider_file_id_map,
                 anthropic_file_ids,
-                knowledge_search: self.build_knowledge_search_params(&tenant_id_str),
+                knowledge_search,
             },
             cancel,
             tx,
@@ -718,6 +765,7 @@ impl<
         let quota_repo = Arc::clone(&self.quota.repo);
         let attachment_repo = Arc::clone(&self.attachment_repo);
         let message_attachment_repo = Arc::clone(&self.message_attachment_repo);
+        let chat_repo = Arc::clone(&self.chat_repo);
         let scope_tx = scope.clone();
         let effective_model_tx = pf.effective_model.clone();
         let reserve_tokens = pf.reserve_tokens;
@@ -726,7 +774,8 @@ impl<
         let policy_version_applied = pf.policy_version_applied;
         let minimal_generation_floor_applied = pf.minimal_generation_floor_applied;
 
-        self.db
+        let result = self
+            .db
             .transaction(|tx| {
                 use crate::domain::repos::IncrementReserveParams;
                 Box::pin(async move {
@@ -754,9 +803,21 @@ impl<
                                     })?;
                             }
                         }
+                        super::quota_service::verify_reserve_within_limits(
+                            &*quota_repo,
+                            tx,
+                            &computed,
+                        )
+                        .await?;
                     }
 
-                    // 2. Insert user message
+                    // 2. Insert user message; the chat moves to the top of
+                    //    the activity-ordered chat list.
+                    //    `false`: the chat was deleted after the checks above.
+                    require_live_chat(
+                        chat_repo.touch_activity(tx, &scope_tx, chat_id).await,
+                        chat_id,
+                    )?;
                     message_repo
                         .insert_user_message(
                             tx,
@@ -887,27 +948,56 @@ impl<
                 })
             })
             .await
-            .map_err(|e: toolkit_db::DbError| match e {
-                toolkit_db::DbError::Other(anyhow_err) => {
-                    match anyhow_err.downcast::<InvalidAttachmentError>() {
-                        Ok(err) => StreamError::InvalidAttachment {
-                            code: "invalid_attachment".to_owned(),
-                            message: err.message,
-                        },
-                        Err(anyhow_err) => StreamError::TurnCreationFailed {
-                            source: match anyhow_err.downcast::<DomainError>() {
-                                Ok(domain_err) => domain_err,
-                                Err(err) => DomainError::from(toolkit_db::DbError::Other(err)),
-                            },
-                        },
-                    }
-                }
-                other => StreamError::TurnCreationFailed {
-                    source: DomainError::from(other),
-                },
-            })?;
+            .map_err(turn_tx_error);
 
-        Ok(turn_id)
+        match result {
+            Ok(()) => Ok(turn_id),
+            Err(e) => Err(self
+                .classify_turn_conflict(scope, chat_id, request_id, e)
+                .await),
+        }
+    }
+
+    /// The unique violation behind `turn_already_running` is either the
+    /// running-turn index or `UNIQUE(chat_id, request_id)`. Report the latter
+    /// as `request_id_conflict`, like the idempotency pre-check does.
+    async fn classify_turn_conflict(
+        &self,
+        scope: &AccessScope,
+        chat_id: Uuid,
+        request_id: Uuid,
+        err: StreamError,
+    ) -> StreamError {
+        let StreamError::Conflict { code, message } = err else {
+            return err;
+        };
+        if code != "turn_already_running" {
+            return StreamError::Conflict { code, message };
+        }
+        // A lookup failure keeps the original code; it is logged, not returned.
+        let lookup = match self.db.conn() {
+            Ok(conn) => {
+                self.turn_repo
+                    .find_by_chat_and_request_id(&conn, scope, chat_id, request_id)
+                    .await
+            }
+            Err(e) => Err(DomainError::from(e)),
+        };
+        let request_id_taken = match lookup {
+            Ok(turn) => turn.is_some(),
+            Err(e) => {
+                warn!(%chat_id, %request_id, error = %e, "request_id lookup after turn conflict failed");
+                false
+            }
+        };
+        StreamError::Conflict {
+            code: if request_id_taken {
+                "request_id_conflict".to_owned()
+            } else {
+                code
+            },
+            message,
+        }
     }
 
     /// Shared context assembly: thread summary lookup, recent-message fetch
@@ -955,8 +1045,14 @@ impl<
             token_estimate: u32::try_from(ts.token_estimate).unwrap_or(0),
         });
 
-        let recent_messages = match &thread_summary {
-            Some(ts) => {
+        // `None`: the chat had no live message when the snapshot was taken,
+        // so there is no history. Retry/edit take the snapshot before they
+        // insert the new user message but read history after it; an
+        // unbounded query would return that message and the provider would
+        // get the question twice.
+        let recent_messages = match (&thread_summary, snapshot_boundary) {
+            (_, None) => Ok(Vec::new()),
+            (Some(ts), snapshot_boundary @ Some(_)) => {
                 self.message_repo
                     .recent_after_boundary(
                         &conn,
@@ -969,7 +1065,7 @@ impl<
                     )
                     .await
             }
-            None => {
+            (None, snapshot_boundary @ Some(_)) => {
                 self.message_repo
                     .recent_for_context(
                         &conn,
@@ -1040,55 +1136,86 @@ impl<
         Ok((assembled, summary_info))
     }
 
-    /// Run streaming for an already-created turn (used by retry/edit mutations).
-    ///
-    /// The mutation transaction has already created the turn (state=running) and
-    /// user message. This method does quota preflight, writes reserves, resolves
-    /// the provider, and spawns the streaming task.
-    ///
-    /// Per design D3: mutation transaction commits first, streaming runs post-commit.
-    #[allow(
-        clippy::too_many_arguments,
-        clippy::too_many_lines,
-        clippy::cognitive_complexity
-    )]
-    pub(crate) async fn run_stream_for_mutation(
+    /// Provider file IDs of the ready image attachments among `attachment_ids`.
+    /// Rows from another chat are ignored (no cross-chat references).
+    async fn image_file_ids<C: toolkit_db::secure::DBRunner>(
         &self,
-        ctx: SecurityContext,
+        conn: &C,
+        scope: &AccessScope,
         chat_id: Uuid,
-        request_id: Uuid,
-        turn_id: Uuid,
-        content: String,
-        resolved_model: ResolvedModel,
+        attachment_ids: &[Uuid],
+    ) -> Result<Vec<String>, StreamError> {
+        if attachment_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .attachment_repo
+            .get_batch(conn, scope, attachment_ids)
+            .await
+            .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
+        Ok(rows
+            .iter()
+            .filter(|r| {
+                r.chat_id == chat_id
+                    && r.attachment_kind
+                        == crate::infra::db::entity::attachment::AttachmentKind::Image
+                    && r.status == crate::infra::db::entity::attachment::AttachmentStatus::Ready
+            })
+            .filter_map(|r| r.provider_file_id.clone())
+            .collect())
+    }
+
+    /// Image count guard (before preflight, before any write).
+    fn check_image_count(&self, image_file_ids: &[String]) -> Result<u32, StreamError> {
+        let num_images = u32::try_from(image_file_ids.len()).unwrap_or(u32::MAX);
+        let max = self.rag_config.max_images_per_message;
+        if num_images > max {
+            return Err(StreamError::TooManyImages {
+                count: num_images,
+                max,
+            });
+        }
+        Ok(num_images)
+    }
+
+    /// Quota preflight for a retry/edit, run **before** the mutation commits.
+    ///
+    /// Read-only: a rejection (quota, kill switch, input too long) returns
+    /// before the previous turn is soft-deleted, so the user keeps their last
+    /// answer and the chat is not blocked by a running turn.
+    ///
+    /// Image attachments of `source_message_id` (the turn's original user
+    /// message, copied to the new turn) are re-sent to the model and go
+    /// through the same image guards as a new message.
+    pub(crate) async fn preflight_mutation(
+        &self,
+        ctx: &SecurityContext,
+        chat_id: Uuid,
+        source_message_id: Uuid,
+        content: &str,
+        resolved_model: &ResolvedModel,
         web_search_enabled: bool,
-        snapshot_boundary: Option<SnapshotBoundary>,
-        cancel: CancellationToken,
-        tx: mpsc::Sender<StreamEvent>,
-    ) -> Result<tokio::task::JoinHandle<StreamOutcome>, StreamError> {
-        let model = resolved_model.model_id;
-        let provider_id = resolved_model.provider_id;
+    ) -> Result<MutationPreflight, StreamError> {
         let tenant_id = ctx.subject_tenant_id();
         let user_id = ctx.subject_id();
         let scope = AccessScope::for_tenant(tenant_id);
 
-        // ── Pre-preflight attachment queries (for surcharge estimation) ──
         let conn = self
             .db
             .conn()
             .map_err(|e| StreamError::TurnCreationFailed {
                 source: DomainError::from(e),
             })?;
-        let pre_ready_doc_count = self
+        let ready_doc_count = self
             .attachment_repo
             .count_ready_documents(&conn, &scope, chat_id)
             .await
             .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
-        let pre_ci_file_ids = self
+        let ci_file_ids = self
             .attachment_repo
             .get_code_interpreter_file_ids(&conn, &scope, chat_id)
             .await
             .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
-
         let prior_context_tokens = self
             .message_repo
             .last_assistant_token_counts(&conn, &scope, chat_id)
@@ -1099,9 +1226,17 @@ impl<
                     .unwrap_or(0)
                     .saturating_add(u64::try_from(out.max(0)).unwrap_or(0))
             });
+        let attachment_ids = self
+            .message_attachment_repo
+            .attachment_ids_for_message(&conn, &scope, chat_id, source_message_id)
+            .await
+            .map_err(|e| StreamError::TurnCreationFailed { source: e })?;
+        let image_file_ids = self
+            .image_file_ids(&conn, &scope, chat_id, &attachment_ids)
+            .await?;
+        let num_images = self.check_image_count(&image_file_ids)?;
 
-        // ── Preflight quota evaluate ────────────────────────────────────
-        let selected_model = model;
+        let selected_model = resolved_model.model_id.clone();
         let computed = self
             .quota
             .preflight_evaluate(crate::domain::model::quota::PreflightInput {
@@ -1109,10 +1244,10 @@ impl<
                 user_id,
                 selected_model: selected_model.clone(),
                 utf8_bytes: content.len() as u64,
-                num_images: 0,
-                tools_enabled: pre_ready_doc_count > 0,
+                num_images,
+                tools_enabled: ready_doc_count > 0,
                 web_search_enabled,
-                code_interpreter_enabled: !pre_ci_file_ids.is_empty(),
+                code_interpreter_enabled: !ci_file_ids.is_empty(),
                 max_output_tokens_cap: self.streaming_config.max_output_tokens,
                 prior_context_tokens,
             })
@@ -1126,45 +1261,115 @@ impl<
         self.record_preflight_metrics(&computed, &selected_model);
 
         let pf = flatten_preflight(computed.decision.clone())?;
+        check_input_token_limit(content, &pf)?;
+        check_image_support(num_images, &computed.kill_switches, pf.vision_input)?;
 
-        // ── Input token limit check ──
-        // The turn is already committed (created by mutate_for_stream). If the
-        // message exceeds max_input_tokens we mark it Failed before returning so
-        // the turn does not stay stuck in Running state.
-        if let Err(too_long) = check_input_token_limit(&content, &pf) {
-            let detail = match &too_long {
-                StreamError::InputTooLong {
-                    estimated_tokens,
-                    max_input_tokens,
-                } => Some(format!(
-                    "estimated {estimated_tokens} tokens, limit {max_input_tokens}"
-                )),
-                _ => None,
-            };
-            if let Err(e) = self
-                .turn_repo
-                .cas_update_state(
-                    &conn,
-                    &scope,
-                    CasTerminalParams {
-                        turn_id,
-                        state: TurnState::Failed,
-                        error_code: Some("input_too_long".to_owned()),
-                        error_detail: detail,
-                        assistant_message_id: None,
-                        provider_response_id: None,
-                    },
-                )
-                .await
-            {
-                warn!(
-                    %turn_id,
-                    error = %e,
-                    "failed to mark turn as Failed after InputTooLong check"
-                );
+        Ok(MutationPreflight {
+            computed,
+            pf,
+            ready_doc_count,
+            ci_file_ids,
+            image_file_ids,
+        })
+    }
+
+    /// Run streaming for an already-created turn (used by retry/edit mutations).
+    ///
+    /// The mutation transaction has already created the turn (state=running)
+    /// and user message; `preflight` was computed before it committed. Context
+    /// assembly and provider resolution run first and the quota reserve is
+    /// written last, so any failure here only has to mark the new turn
+    /// `failed` — there is no reserve to release.
+    ///
+    /// Per design D3: mutation transaction commits first, streaming runs post-commit.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_stream_for_mutation(
+        &self,
+        ctx: SecurityContext,
+        chat_id: Uuid,
+        request_id: Uuid,
+        turn_id: Uuid,
+        content: String,
+        resolved_model: ResolvedModel,
+        web_search_enabled: bool,
+        snapshot_boundary: Option<SnapshotBoundary>,
+        preflight: MutationPreflight,
+        cancel: CancellationToken,
+        tx: mpsc::Sender<StreamEvent>,
+    ) -> Result<tokio::task::JoinHandle<StreamOutcome>, StreamError> {
+        let scope = AccessScope::for_tenant(ctx.subject_tenant_id());
+        match self
+            .prepare_mutation_stream(
+                &ctx,
+                chat_id,
+                request_id,
+                turn_id,
+                content,
+                resolved_model,
+                web_search_enabled,
+                snapshot_boundary,
+                preflight,
+            )
+            .await
+        {
+            Ok(prepared) => {
+                emit_stream_started(&tx, request_id, prepared.message_id, prepared.summary_info)
+                    .await;
+                Ok(provider_task::spawn_provider_task(
+                    ctx,
+                    prepared.task_config,
+                    cancel,
+                    tx,
+                    Some(prepared.finalization_ctx),
+                ))
             }
-            return Err(too_long);
+            Err(e) => {
+                self.fail_unstarted_turn(&scope, turn_id, &e).await;
+                Err(e)
+            }
         }
+    }
+
+    /// Fallible post-commit part of [`Self::run_stream_for_mutation`]. The
+    /// quota reserve is the last step: nothing after it can fail.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cognitive_complexity
+    )]
+    async fn prepare_mutation_stream(
+        &self,
+        ctx: &SecurityContext,
+        chat_id: Uuid,
+        request_id: Uuid,
+        turn_id: Uuid,
+        content: String,
+        resolved_model: ResolvedModel,
+        web_search_enabled: bool,
+        snapshot_boundary: Option<SnapshotBoundary>,
+        preflight: MutationPreflight,
+    ) -> Result<PreparedMutationStream<TR, MR>, StreamError> {
+        let selected_model = resolved_model.model_id;
+        let tenant_id = ctx.subject_tenant_id();
+        let user_id = ctx.subject_id();
+        let scope = AccessScope::for_tenant(tenant_id);
+        let MutationPreflight {
+            computed,
+            pf,
+            ready_doc_count,
+            ci_file_ids: pre_ci_file_ids,
+            image_file_ids,
+        } = preflight;
+        // Same as `run_stream`: route to the effective model's provider.
+        let provider_id = pf.effective_provider_id.clone();
+        let web_search_tool = web_search_enabled && pf.tool_support.web_search;
+
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| StreamError::TurnCreationFailed {
+                source: DomainError::from(e),
+            })?;
 
         // Metrics: estimated tokens (only on allow/downgrade)
         #[allow(clippy::cast_precision_loss)]
@@ -1172,86 +1377,13 @@ impl<
             .record_quota_estimated_tokens(pf.reserve_tokens as f64);
 
         let period_starts = computed.periods.clone();
-        let file_search_disabled = computed.kill_switches.disable_file_search;
+        // The kill switch, or an effective model without file_search support,
+        // leaves the tool out.
+        let file_search_disabled =
+            computed.kill_switches.disable_file_search || !pf.tool_support.file_search;
         let disable_code_interpreter = computed.kill_switches.disable_code_interpreter;
 
-        // ── Persist preflight fields + write quota reserves atomically ──
-        // Both must be visible together so the orphan watchdog can settle
-        // quota correctly if the pod crashes after this point.
-        let quota_repo = Arc::clone(&self.quota.repo);
-        let turn_repo_tx = Arc::clone(&self.turn_repo);
-        let computed_for_tx = computed;
-        let has_reserves = !computed_for_tx.buckets.is_empty();
-        let preflight_params = crate::domain::repos::UpdatePreflightParams {
-            turn_id,
-            reserve_tokens: pf.reserve_tokens,
-            max_output_tokens_applied: pf.max_output_tokens_applied,
-            reserved_credits_micro: pf.reserved_credits_micro,
-            policy_version_applied: pf.policy_version_applied,
-            effective_model: pf.effective_model.clone(),
-            minimal_generation_floor_applied: pf.minimal_generation_floor_applied,
-        };
-        let scope_for_tx = scope.clone();
-
-        {
-            self.db
-                .transaction(|txn| {
-                    use crate::domain::repos::IncrementReserveParams;
-                    Box::pin(async move {
-                        // 1. Backfill preflight fields on the turn row.
-                        turn_repo_tx
-                            .update_preflight_fields(txn, &scope_for_tx, preflight_params)
-                            .await
-                            .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
-
-                        // 2. Write quota reserves.
-                        let reserve_scope = AccessScope::for_tenant(computed_for_tx.tenant_id);
-                        for bucket in &computed_for_tx.buckets {
-                            for (period_type, period_start) in &computed_for_tx.periods {
-                                quota_repo
-                                    .increment_reserve(
-                                        txn,
-                                        &reserve_scope,
-                                        IncrementReserveParams {
-                                            tenant_id: computed_for_tx.tenant_id,
-                                            user_id: computed_for_tx.user_id,
-                                            period_type: period_type.clone(),
-                                            period_start: *period_start,
-                                            bucket: bucket.clone(),
-                                            amount_micro: computed_for_tx.reserved_credits_micro,
-                                        },
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        toolkit_db::DbError::Other(anyhow::Error::new(e))
-                                    })?;
-                            }
-                        }
-                        Ok(())
-                    })
-                })
-                .await
-                .map_err(|e| StreamError::TurnCreationFailed {
-                    source: DomainError::database(e.to_string()),
-                })?;
-
-            // Metrics: quota reserve committed (one per period, only when reserves exist)
-            if has_reserves {
-                for (period_type, _) in &period_starts {
-                    let label = match period_type {
-                        crate::infra::db::entity::quota_usage::PeriodType::Daily => period::DAILY,
-                        crate::infra::db::entity::quota_usage::PeriodType::Monthly => {
-                            period::MONTHLY
-                        }
-                    };
-                    self.metrics.record_quota_reserve(label);
-                }
-            }
-        }
-
         // ── Retrieval mode determination ──
-        let ready_doc_count = pre_ready_doc_count;
-
         let retrieval_mode = crate::domain::retrieval::determine_retrieval_mode(
             file_search_disabled,
             ready_doc_count,
@@ -1262,7 +1394,7 @@ impl<
             tracing::info!(
                 chat_id = %chat_id,
                 ready_doc_count,
-                "file_search disabled by kill switch during mutation -- {ready_doc_count} ready documents skipped"
+                "file_search disabled during mutation (kill switch or model without file_search support) -- {ready_doc_count} ready documents skipped"
             );
         }
 
@@ -1316,54 +1448,25 @@ impl<
                 (Vec::new(), false)
             };
 
-        // ── Build finalization context + resolve provider + spawn ────────
-        let message_id = Uuid::new_v4();
-
-        let mut finalization_ctx = FinalizationCtx {
-            finalization_svc: Arc::clone(&self.finalization),
-            db: Arc::clone(&self.db),
-            turn_repo: Arc::clone(&self.turn_repo),
-            scope: scope.clone(),
-            turn_id,
-            tenant_id,
-            chat_id,
-            request_id,
-            user_id,
-            requester_type: requester_type_from_str(ctx.subject_type()),
-            message_id,
-            effective_model: pf.effective_model.clone(),
-            selected_model: selected_model.clone(),
-            reserve_tokens: pf.reserve_tokens,
-            max_output_tokens_applied: pf.max_output_tokens_applied,
-            reserved_credits_micro: pf.reserved_credits_micro,
-            policy_version_applied: pf.policy_version_applied,
-            minimal_generation_floor_applied: pf.minimal_generation_floor_applied,
-            quota_decision: pf.quota_decision,
-            downgrade_from: pf.downgrade_from,
-            downgrade_reason: pf.downgrade_reason,
-            period_starts,
-            context_window: pf.context_window,
-            assembled_context_tokens: 0, // updated after context assembly
-            messages_truncated: false,   // updated after context assembly
-            provider_id: provider_id.clone(),
-            metrics: Arc::clone(&self.metrics),
-            quota_warnings_provider: Arc::clone(&self.quota)
-                as Arc<dyn crate::domain::service::quota_settler::QuotaWarningsProvider>,
-        };
-
         // ── Context assembly ──
         let token_budget = Some(super::context_assembly::TokenBudget {
             context_window: pf.context_window,
             max_output_tokens_applied: pf.max_output_tokens_applied,
+            max_input_tokens: pf.max_input_tokens,
             budgets: pf.estimation_budgets,
             tools_enabled: file_search_enabled,
-            web_search_enabled,
+            web_search_enabled: web_search_tool,
             code_interpreter_enabled,
         });
         // See `run_stream` for the mutual-exclusion rationale.
-        let knowledge_search_enabled = self.knowledge_search_config.enabled
-            && self.knowledge_retriever.is_some()
-            && !file_search_enabled;
+        // The flag follows the parameters: when they cannot be built (no
+        // retriever, provider or api_version), the tool is not offered.
+        let knowledge_search = if file_search_enabled {
+            None
+        } else {
+            self.build_knowledge_search_params(&tenant_id.to_string())
+        };
+        let knowledge_search_enabled = knowledge_search.is_some();
         let (assembled, summary_info) = self
             .gather_context(
                 tenant_id,
@@ -1371,7 +1474,7 @@ impl<
                 snapshot_boundary,
                 &pf.system_prompt,
                 &content,
-                web_search_enabled,
+                web_search_tool,
                 file_search_enabled,
                 knowledge_search_enabled,
                 &vector_store_ids,
@@ -1380,12 +1483,9 @@ impl<
                 pf.file_search_max_num_results,
                 ci_file_ids,
                 token_budget,
-                &[], // retry/edit: no new image attachments
+                &image_file_ids,
             )
             .await?;
-
-        finalization_ctx.assembled_context_tokens = assembled.estimated_context_tokens;
-        finalization_ctx.messages_truncated = assembled.messages_truncated;
 
         let tenant_id_str = tenant_id.to_string();
         let resolved_provider = self
@@ -1400,11 +1500,131 @@ impl<
             .replace("{model}", &effective_provider_model_id);
         let proxy_path = format!("{}{api_path}", resolved_provider.upstream_alias);
 
-        emit_stream_started(&tx, request_id, message_id, summary_info).await;
+        // ── Persist preflight fields + write quota reserves atomically ──
+        // Both must be visible together so the orphan watchdog can settle
+        // quota correctly if the pod crashes after this point.
+        let quota_repo = Arc::clone(&self.quota.repo);
+        let turn_repo_tx = Arc::clone(&self.turn_repo);
+        let has_reserves = !computed.buckets.is_empty();
+        let preflight_params = crate::domain::repos::UpdatePreflightParams {
+            turn_id,
+            reserve_tokens: pf.reserve_tokens,
+            max_output_tokens_applied: pf.max_output_tokens_applied,
+            reserved_credits_micro: pf.reserved_credits_micro,
+            policy_version_applied: pf.policy_version_applied,
+            effective_model: pf.effective_model.clone(),
+            minimal_generation_floor_applied: pf.minimal_generation_floor_applied,
+        };
+        let scope_for_tx = scope.clone();
 
-        Ok(provider_task::spawn_provider_task(
-            ctx,
-            provider_task::ProviderTaskConfig {
+        self.db
+            .transaction(|txn| {
+                use crate::domain::repos::IncrementReserveParams;
+                Box::pin(async move {
+                    // 1. Backfill preflight fields on the turn row.
+                    turn_repo_tx
+                        .update_preflight_fields(txn, &scope_for_tx, preflight_params)
+                        .await
+                        .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
+
+                    // 2. Write quota reserves.
+                    let reserve_scope = AccessScope::for_tenant(computed.tenant_id);
+                    for bucket in &computed.buckets {
+                        for (period_type, period_start) in &computed.periods {
+                            quota_repo
+                                .increment_reserve(
+                                    txn,
+                                    &reserve_scope,
+                                    IncrementReserveParams {
+                                        tenant_id: computed.tenant_id,
+                                        user_id: computed.user_id,
+                                        period_type: period_type.clone(),
+                                        period_start: *period_start,
+                                        bucket: bucket.clone(),
+                                        amount_micro: computed.reserved_credits_micro,
+                                    },
+                                )
+                                .await
+                                .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
+                        }
+                    }
+                    super::quota_service::verify_reserve_within_limits(
+                        &*quota_repo,
+                        txn,
+                        &computed,
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| match e {
+                toolkit_db::DbError::Other(err)
+                    if err.is::<super::quota_service::ReserveLimitExceeded>() =>
+                {
+                    reserve_limit_exceeded()
+                }
+                toolkit_db::DbError::Other(err) => StreamError::TurnCreationFailed {
+                    source: err
+                        .downcast::<DomainError>()
+                        .unwrap_or_else(|err| DomainError::from(toolkit_db::DbError::Other(err))),
+                },
+                other => StreamError::TurnCreationFailed {
+                    source: DomainError::from(other),
+                },
+            })?;
+
+        // Metrics: quota reserve committed (one per period, only when reserves exist)
+        if has_reserves {
+            for (period_type, _) in &period_starts {
+                let label = match period_type {
+                    crate::infra::db::entity::quota_usage::PeriodType::Daily => period::DAILY,
+                    crate::infra::db::entity::quota_usage::PeriodType::Monthly => period::MONTHLY,
+                };
+                self.metrics.record_quota_reserve(label);
+            }
+        }
+
+        // ── Build finalization context ──
+        let message_id = Uuid::new_v4();
+        let finalization_ctx = FinalizationCtx {
+            finalization_svc: Arc::clone(&self.finalization),
+            db: Arc::clone(&self.db),
+            turn_repo: Arc::clone(&self.turn_repo),
+            scope,
+            turn_id,
+            tenant_id,
+            chat_id,
+            request_id,
+            user_id,
+            requester_type: requester_type_from_str(ctx.subject_type()),
+            message_id,
+            effective_model: pf.effective_model.clone(),
+            selected_model,
+            reserve_tokens: pf.reserve_tokens,
+            max_output_tokens_applied: pf.max_output_tokens_applied,
+            reserved_credits_micro: pf.reserved_credits_micro,
+            policy_version_applied: pf.policy_version_applied,
+            minimal_generation_floor_applied: pf.minimal_generation_floor_applied,
+            quota_decision: pf.quota_decision,
+            downgrade_from: pf.downgrade_from,
+            downgrade_reason: pf.downgrade_reason,
+            period_starts,
+            context_window: pf.context_window,
+            max_input_tokens: pf.max_input_tokens,
+            assembled_context_tokens: assembled.estimated_context_tokens,
+            messages_truncated: assembled.messages_truncated,
+            provider_id,
+            metrics: Arc::clone(&self.metrics),
+            quota_warnings_provider: Arc::clone(&self.quota)
+                as Arc<dyn crate::domain::service::quota_settler::QuotaWarningsProvider>,
+        };
+
+        Ok(PreparedMutationStream {
+            message_id,
+            summary_info,
+            finalization_ctx,
+            task_config: provider_task::ProviderTaskConfig {
                 llm: resolved_provider.adapter,
                 upstream_alias: proxy_path,
                 messages: assembled.messages,
@@ -1419,13 +1639,63 @@ impl<
                 api_params: pf.api_params,
                 provider_file_id_map,
                 anthropic_file_ids,
-                knowledge_search: self.build_knowledge_search_params(&tenant_id_str),
+                knowledge_search,
             },
-            cancel,
-            tx,
-            Some(finalization_ctx),
-        ))
+        })
     }
+
+    /// Marks a turn that never reached the provider as `failed`. Used after a
+    /// post-commit setup error; no quota reserve exists yet at that point.
+    async fn fail_unstarted_turn(&self, scope: &AccessScope, turn_id: Uuid, err: &StreamError) {
+        let error_code = match err {
+            StreamError::ContextBudgetExceeded { .. } => "context_length_exceeded",
+            StreamError::QuotaExhausted { error_code, .. } => error_code.as_str(),
+            _ => "turn_setup_failed",
+        };
+        warn!(%turn_id, error_code, error = ?err, "turn setup failed after the mutation committed");
+        let result = match self.db.conn() {
+            Ok(conn) => self
+                .turn_repo
+                .cas_update_state(
+                    &conn,
+                    scope,
+                    CasTerminalParams {
+                        turn_id,
+                        state: TurnState::Failed,
+                        error_code: Some(error_code.to_owned()),
+                        error_detail: None,
+                        assistant_message_id: None,
+                        provider_response_id: None,
+                    },
+                )
+                .await
+                .map(|_| ()),
+            Err(e) => Err(DomainError::from(e)),
+        };
+        if let Err(e) = result {
+            warn!(%turn_id, error = %e, "failed to mark unstarted turn as Failed");
+        }
+    }
+}
+
+/// Post-preflight image guards: the images kill switch and the vision
+/// capability of the effective model (after any quota downgrade), which is
+/// the model the images are sent to.
+fn check_image_support(
+    num_images: u32,
+    kill_switches: &mini_chat_sdk::KillSwitches,
+    has_vision_input: bool,
+) -> Result<(), StreamError> {
+    if num_images == 0 {
+        return Ok(());
+    }
+    if kill_switches.disable_images {
+        return Err(StreamError::ImagesDisabled);
+    }
+    if !has_vision_input {
+        return Err(StreamError::UnsupportedMedia);
+    }
+    Ok(())
 }
 
 /// Emit `stream_started` before handing `tx` to the provider task (D3).
@@ -1449,11 +1719,38 @@ async fn emit_stream_started(
     }
 }
 
+/// Maps the `touch_activity` result inside a transaction: `false` means the
+/// chat row is gone, and the transaction must abort with 404.
+fn require_live_chat(
+    touched: Result<bool, DomainError>,
+    chat_id: Uuid,
+) -> Result<(), toolkit_db::DbError> {
+    match touched {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(toolkit_db::DbError::Other(anyhow::Error::new(
+            DomainError::chat_not_found(chat_id),
+        ))),
+        Err(e) => Err(toolkit_db::DbError::Other(anyhow::Error::new(e))),
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::types::{StreamTerminal, normalize_error};
     use super::*;
+
+    /// A chat deleted between the pre-checks and the turn transaction is
+    /// `ChatNotFound`, not a turn creation failure.
+    #[test]
+    fn turn_tx_error_maps_deleted_chat_to_chat_not_found() {
+        let chat_id = Uuid::new_v4();
+        let err = require_live_chat(Ok(false), chat_id).unwrap_err();
+        match turn_tx_error(err) {
+            StreamError::ChatNotFound { chat_id: id } => assert_eq!(id, chat_id),
+            other => panic!("expected ChatNotFound, got {other:?}"),
+        }
+    }
     use crate::domain::llm::{ToolPhase, Usage};
     use crate::domain::repos::CasTerminalParams;
     use crate::infra::db::repo::attachment_repo::AttachmentRepository as OrmAttachmentRepo;
@@ -1835,10 +2132,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -1900,10 +2197,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -1958,10 +2255,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -2065,10 +2362,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -2201,7 +2498,7 @@ mod tests {
                         is_default: true,
                         input_tokens_credit_multiplier_micro: 1_000_000,
                         output_tokens_credit_multiplier_micro: 1_000_000,
-                        multimodal_capabilities: vec![],
+                        multimodal_capabilities: vec!["VISION_INPUT".to_owned()],
                         context_window: 128_000,
                         max_output_tokens: 4096,
                         description: String::new(),
@@ -2303,6 +2600,8 @@ mod tests {
             },
             thread_summary_prompt: String::new(),
             max_output_tokens: 16_384,
+            max_input_tokens: 0,
+            bytes_per_token_conservative: 4,
         }
     }
 
@@ -2386,6 +2685,111 @@ mod tests {
             matches!(err, StreamError::Replay { .. }),
             "expected Replay, got: {err:?}"
         );
+    }
+
+    /// Authenticated users carry a GTS `subject_type`; it maps to the
+    /// `requester_type = 'user'` column value instead of being stored verbatim
+    /// (which violated `CHECK (requester_type IN ('user', 'system'))`).
+    #[tokio::test]
+    async fn run_stream_accepts_gts_subject_type() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["hi"]));
+        let svc = build_stream_service(db, provider);
+        let ctx = SecurityContext::builder()
+            .subject_id(user_id)
+            .subject_tenant_id(tenant_id)
+            .subject_type("gts.cf.core.security.subject_user.v1~")
+            .build()
+            .expect("security context");
+        let (tx, mut rx) = mpsc::channel(32);
+
+        let result = svc
+            .run_stream(
+                ctx,
+                chat_id,
+                Uuid::new_v4(),
+                "hello".into(),
+                test_resolved_model(),
+                false,
+                Vec::new(),
+                CancellationToken::new(),
+                tx,
+            )
+            .await;
+        assert!(result.is_ok(), "stream should start: {:?}", result.err());
+        let mut got_done = false;
+        while let Some(ev) = rx.recv().await {
+            if ev.is_terminal() {
+                got_done = matches!(ev, StreamEvent::Done(_));
+                break;
+            }
+        }
+        assert!(got_done);
+    }
+
+    /// A completed but soft-deleted turn (replaced by retry/edit) is not
+    /// replayed: its `request_id` returns `request_id_conflict`.
+    #[tokio::test]
+    async fn idempotency_deleted_completed_turn_returns_conflict() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+        insert_running_turn(&db, tenant_id, user_id, chat_id, request_id, turn_id).await;
+
+        let scope = AccessScope::allow_all();
+        let conn = db.conn().unwrap();
+        TurnRepo
+            .cas_update_state(
+                &conn,
+                &scope,
+                CasTerminalParams {
+                    turn_id,
+                    state: TurnState::Completed,
+                    error_code: None,
+                    error_detail: None,
+                    assistant_message_id: None,
+                    provider_response_id: None,
+                },
+            )
+            .await
+            .expect("complete turn");
+        TurnRepo
+            .soft_delete(&conn, &scope, turn_id, Some(Uuid::new_v4()))
+            .await
+            .expect("soft-delete turn");
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["hi"]));
+        let svc = build_stream_service(db, provider);
+        let (tx, _rx) = mpsc::channel(32);
+
+        let err = svc
+            .run_stream(
+                test_security_ctx_with_id(tenant_id, user_id),
+                chat_id,
+                request_id,
+                "hello".into(),
+                test_resolved_model(),
+                false,
+                Vec::new(),
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .expect_err("should be Conflict");
+
+        match err {
+            StreamError::Conflict { code, .. } => assert_eq!(code, "request_id_conflict"),
+            other => panic!("expected Conflict, got: {other:?}"),
+        }
     }
 
     /// 6.2: Running turn with same `request_id` → Conflict (not Replay).
@@ -2741,6 +3145,7 @@ mod tests {
         let decision = PreflightDecision::Allow {
             effective_model: "m".to_owned(),
             effective_provider_model_id: "m-provider".to_owned(),
+            effective_provider_id: "openai".to_owned(),
             reserve_tokens: 100,
             max_output_tokens_applied: 1024,
             reserved_credits_micro: 0,
@@ -2760,19 +3165,31 @@ mod tests {
                 mcp: false,
             },
             api_params: mini_chat_sdk::ModelApiParams {
-                temperature: 0.7,
-                top_p: 1.0,
-                frequency_penalty: 0.0,
-                presence_penalty: 0.0,
+                temperature: Some(0.7),
+                top_p: Some(1.0),
+                frequency_penalty: Some(0.0),
+                presence_penalty: Some(0.0),
                 stop: vec![],
                 extra_body: None,
                 reasoning_effort: None,
             },
             web_search_context_size: mini_chat_sdk::models::WebSearchContextSize::Low,
+            vision_input: true,
         };
 
-        let result = flatten_preflight(decision).expect("Allow should produce Ok");
+        let mut result = flatten_preflight(decision).expect("Allow should produce Ok");
         assert_eq!(result.max_input_tokens, 65_536);
+        // A message far above a small limit is rejected; with 0 (no separate
+        // limit, as in the context budget) it is accepted.
+        let long = "x".repeat(40_000);
+        result.max_input_tokens = 1_000;
+        assert!(matches!(
+            check_input_token_limit(&long, &result),
+            Err(StreamError::InputTooLong { .. })
+        ));
+        result.max_input_tokens = 0;
+        check_input_token_limit(&long, &result).unwrap();
+        result.max_input_tokens = 65_536;
         assert_eq!(result.context_window, 128_000);
         assert_eq!(result.quota_decision, "allow");
         assert!(result.downgrade_from.is_none());
@@ -2789,7 +3206,7 @@ mod tests {
         );
         assert_eq!(result.file_search_max_num_results, 4);
         assert_eq!(result.max_tool_calls, 2);
-        assert!((result.api_params.temperature - 0.7).abs() < f64::EPSILON);
+        assert!((result.api_params.temperature.expect("temperature") - 0.7).abs() < f64::EPSILON);
         assert_eq!(
             result.web_search_context_size,
             mini_chat_sdk::models::WebSearchContextSize::Low,
@@ -2805,6 +3222,7 @@ mod tests {
         let decision = PreflightDecision::Downgrade {
             effective_model: "m-mini".to_owned(),
             effective_provider_model_id: "m-mini-provider".to_owned(),
+            effective_provider_id: "openai".to_owned(),
             reserve_tokens: 50,
             max_output_tokens_applied: 512,
             reserved_credits_micro: 0,
@@ -2826,15 +3244,16 @@ mod tests {
                 mcp: false,
             },
             api_params: mini_chat_sdk::ModelApiParams {
-                temperature: 0.7,
-                top_p: 1.0,
-                frequency_penalty: 0.0,
-                presence_penalty: 0.0,
+                temperature: Some(0.7),
+                top_p: Some(1.0),
+                frequency_penalty: Some(0.0),
+                presence_penalty: Some(0.0),
                 stop: vec![],
                 extra_body: None,
                 reasoning_effort: None,
             },
             web_search_context_size: mini_chat_sdk::models::WebSearchContextSize::Low,
+            vision_input: true,
         };
 
         let result = flatten_preflight(decision).expect("Downgrade should produce Ok");
@@ -2855,7 +3274,7 @@ mod tests {
         );
         assert_eq!(result.file_search_max_num_results, 4);
         assert_eq!(result.max_tool_calls, 2);
-        assert!((result.api_params.temperature - 0.7).abs() < f64::EPSILON);
+        assert!((result.api_params.temperature.expect("temperature") - 0.7).abs() < f64::EPSILON);
         assert_eq!(
             result.web_search_context_size,
             mini_chat_sdk::models::WebSearchContextSize::Low,
@@ -3392,6 +3811,7 @@ mod tests {
             downgrade_reason: Some("premium_exhausted".to_owned()),
             period_starts: Vec::new(),
             context_window: 128_000,
+            max_input_tokens: 0,
             assembled_context_tokens: 0,
             messages_truncated: false,
             provider_id: "openai".to_owned(),
@@ -3418,10 +3838,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -3464,18 +3884,18 @@ mod tests {
             done.selected_model, "gpt-4o",
             "selected_model should be the user's original choice"
         );
-        assert_eq!(done.quota_decision, "downgrade");
+        assert_eq!(
+            done.quota_decision,
+            crate::domain::stream_events::QuotaDecisionKind::Downgrade
+        );
         assert_eq!(done.downgrade_from.as_deref(), Some("gpt-4o"));
         assert_eq!(done.downgrade_reason.as_deref(), Some("premium_exhausted"));
     }
 
-    /// 8.7: Done fallback on finalization failure preserves quota fields from `fctx`.
-    ///
-    /// When `finalize_turn_cas` returns `Err`, the Done event must use
-    /// `fctx.quota_decision`, `fctx.downgrade_from`, and `fctx.downgrade_reason`
-    /// instead of hardcoding `"allow"` / `None` / `None` (issue #1364).
+    /// 8.7: When `finalize_turn_cas` returns `Err` the turn is not committed,
+    /// so the client gets `error{finalization_failed}` instead of `done`.
     #[tokio::test]
-    async fn done_fallback_preserves_quota_fields_on_finalization_failure() {
+    async fn finalization_failure_emits_error_not_done() {
         use crate::domain::service::finalization_service::FinalizationService;
         use crate::domain::service::quota_settler::QuotaSettler;
 
@@ -3572,6 +3992,7 @@ mod tests {
             downgrade_reason: Some("premium_exhausted".to_owned()),
             period_starts: Vec::new(),
             context_window: 128_000,
+            max_input_tokens: 0,
             assembled_context_tokens: 0,
             messages_truncated: false,
             provider_id: "openai".to_owned(),
@@ -3598,10 +4019,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -3624,37 +4045,20 @@ mod tests {
             }
         }
 
-        let done = events
-            .iter()
-            .find_map(|ev| match ev {
-                StreamEvent::Done(d) => Some(d),
-                _ => None,
-            })
-            .expect("should have a Done event even when finalization fails");
-
-        assert_eq!(
-            done.quota_decision, "downgrade",
-            "fallback Done must use fctx.quota_decision, not hardcoded 'allow'"
+        assert!(
+            !events.iter().any(|ev| matches!(ev, StreamEvent::Done(_))),
+            "no Done may be sent for a turn that was not committed"
         );
-        assert_eq!(
-            done.downgrade_from.as_deref(),
-            Some("gpt-4o"),
-            "fallback Done must use fctx.downgrade_from"
-        );
-        assert_eq!(
-            done.downgrade_reason.as_deref(),
-            Some("premium_exhausted"),
-            "fallback Done must use fctx.downgrade_reason"
-        );
+        match events.last() {
+            Some(StreamEvent::Error(e)) => assert_eq!(e.code, "finalization_failed"),
+            other => panic!("expected terminal error, got: {other:?}"),
+        }
     }
 
-    /// 8.8: Done fallback on finalization failure preserves quota fields for the
-    /// **incomplete** terminal path.
-    ///
-    /// Same invariant as 8.7 but triggered via `MockProvider::incomplete` so the
-    /// `TerminalOutcome::Incomplete` branch is exercised.
+    /// 8.8: Same invariant as 8.7 for the **incomplete** terminal path
+    /// (`MockProvider::incomplete` exercises `TerminalOutcome::Incomplete`).
     #[tokio::test]
-    async fn done_fallback_preserves_quota_fields_on_finalization_failure_incomplete() {
+    async fn finalization_failure_emits_error_not_done_incomplete() {
         use crate::domain::service::finalization_service::FinalizationService;
         use crate::domain::service::quota_settler::QuotaSettler;
 
@@ -3750,6 +4154,7 @@ mod tests {
             downgrade_reason: Some("premium_exhausted".to_owned()),
             period_starts: Vec::new(),
             context_window: 128_000,
+            max_input_tokens: 0,
             assembled_context_tokens: 0,
             messages_truncated: false,
             provider_id: "openai".to_owned(),
@@ -3777,10 +4182,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -3803,28 +4208,14 @@ mod tests {
             }
         }
 
-        let done = events
-            .iter()
-            .find_map(|ev| match ev {
-                StreamEvent::Done(d) => Some(d),
-                _ => None,
-            })
-            .expect("should have a Done event even when finalization fails on incomplete path");
-
-        assert_eq!(
-            done.quota_decision, "downgrade",
-            "incomplete fallback Done must use fctx.quota_decision, not hardcoded 'allow'"
+        assert!(
+            !events.iter().any(|ev| matches!(ev, StreamEvent::Done(_))),
+            "no Done may be sent for a turn that was not committed"
         );
-        assert_eq!(
-            done.downgrade_from.as_deref(),
-            Some("gpt-4o"),
-            "incomplete fallback Done must use fctx.downgrade_from"
-        );
-        assert_eq!(
-            done.downgrade_reason.as_deref(),
-            Some("premium_exhausted"),
-            "incomplete fallback Done must use fctx.downgrade_reason"
-        );
+        match events.last() {
+            Some(StreamEvent::Error(e)) => assert_eq!(e.code, "finalization_failed"),
+            other => panic!("expected terminal error, got: {other:?}"),
+        }
     }
 
     // ── Preflight wiring tests (11.x) ──
@@ -3867,6 +4258,29 @@ mod tests {
         OrmVectorStoreRepo,
         OrmMessageAttachmentRepo,
     > {
+        build_stream_service_with_resolver(
+            db,
+            ProviderResolver::single_provider(provider),
+            catalog,
+            limits,
+        )
+    }
+
+    fn build_stream_service_with_resolver(
+        db: Arc<DbProvider>,
+        provider_resolver: ProviderResolver,
+        catalog: Vec<mini_chat_sdk::ModelCatalogEntry>,
+        limits: mini_chat_sdk::UserLimits,
+    ) -> StreamService<
+        TurnRepo,
+        MsgRepo,
+        OrmQuotaUsageRepo,
+        OrmChatRepo,
+        MockThreadSummaryRepo,
+        OrmAttachmentRepo,
+        OrmVectorStoreRepo,
+        OrmMessageAttachmentRepo,
+    > {
         use crate::domain::service::finalization_service::FinalizationService;
         use crate::domain::service::quota_settler::QuotaSettler;
 
@@ -3892,7 +4306,7 @@ mod tests {
             }
         }
 
-        let provider_resolver = Arc::new(ProviderResolver::single_provider(provider));
+        let provider_resolver = Arc::new(provider_resolver);
         let turn_repo = Arc::new(TurnRepo);
         let message_repo = Arc::new(MsgRepo::new(toolkit_db::odata::LimitCfg {
             default: 20,
@@ -4024,7 +4438,10 @@ mod tests {
             })
             .expect("should have a Done event");
 
-        assert_eq!(done.quota_decision, "allow");
+        assert_eq!(
+            done.quota_decision,
+            crate::domain::stream_events::QuotaDecisionKind::Allow
+        );
         assert_eq!(done.effective_model, "gpt-5.2");
         assert_eq!(done.selected_model, "gpt-5.2");
         assert!(done.downgrade_from.is_none());
@@ -4171,6 +4588,8 @@ mod tests {
                     },
                     thread_summary_prompt: String::new(),
                     max_output_tokens: 16_384,
+                    max_input_tokens: 0,
+                    bytes_per_token_conservative: 4,
                 },
                 false,
                 Vec::new(),
@@ -4201,7 +4620,10 @@ mod tests {
             })
             .expect("should have a Done event");
 
-        assert_eq!(done.quota_decision, "downgrade");
+        assert_eq!(
+            done.quota_decision,
+            crate::domain::stream_events::QuotaDecisionKind::Downgrade
+        );
         assert_eq!(
             done.effective_model, "gpt-5-mini",
             "should be downgraded model"
@@ -4335,6 +4757,8 @@ mod tests {
                     },
                     thread_summary_prompt: String::new(),
                     max_output_tokens: 16_384,
+                    max_input_tokens: 0,
+                    bytes_per_token_conservative: 4,
                 },
                 false,
                 Vec::new(),
@@ -4359,6 +4783,135 @@ mod tests {
             "provider-gpt-5-mini",
             "provider should receive the downgraded model's provider_model_id, \
              not the originally-requested premium model's"
+        );
+    }
+
+    /// A downgrade to a model of another `providers.<id>` entry must use that
+    /// provider's OAGW alias, not the selected model's.
+    #[tokio::test]
+    async fn downgrade_routes_to_effective_models_provider() {
+        #[domain_model]
+        struct AliasCapturingProvider {
+            captured: std::sync::Mutex<Option<(String, String)>>,
+            inner: MockProvider,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for AliasCapturingProvider {
+            async fn stream(
+                &self,
+                ctx: SecurityContext,
+                request: LlmRequest<Streaming>,
+                upstream_alias: &str,
+                cancel: CancellationToken,
+            ) -> Result<ProviderStream, LlmProviderError> {
+                *self.captured.lock().unwrap() =
+                    Some((request.model().to_owned(), upstream_alias.to_owned()));
+                self.inner
+                    .stream(ctx, request, upstream_alias, cancel)
+                    .await
+            }
+
+            async fn complete(
+                &self,
+                _ctx: SecurityContext,
+                _request: LlmRequest<NonStreaming>,
+                _upstream_alias: &str,
+            ) -> Result<ResponseResult, LlmProviderError> {
+                unimplemented!("not needed for streaming tests")
+            }
+        }
+
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+
+        let capturing = Arc::new(AliasCapturingProvider {
+            captured: std::sync::Mutex::new(None),
+            inner: MockProvider::completed(&["Hi"]),
+        });
+        let resolver = ProviderResolver::single_provider(Arc::clone(&capturing) as _)
+            .with_alias_provider("premium-provider", "premium-host")
+            .with_alias_provider("standard-provider", "standard-host");
+
+        let mut premium = make_catalog_entry("gpt-5", mini_chat_sdk::ModelTier::Premium);
+        premium.provider_id = "premium-provider".to_owned();
+        let mut standard = make_catalog_entry("gpt-5-mini", mini_chat_sdk::ModelTier::Standard);
+        standard.provider_id = "standard-provider".to_owned();
+
+        // Premium limits = 0 → forces downgrade to standard
+        let limits = mini_chat_sdk::UserLimits {
+            user_id: Uuid::nil(),
+            policy_version: 1,
+            standard: mini_chat_sdk::TierLimits {
+                limit_daily_credits_micro: 100_000_000,
+                limit_monthly_credits_micro: 1_000_000_000,
+            },
+            premium: mini_chat_sdk::TierLimits {
+                limit_daily_credits_micro: 0,
+                limit_monthly_credits_micro: 0,
+            },
+        };
+        let svc = build_stream_service_with_resolver(db, resolver, vec![premium, standard], limits);
+
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = svc
+            .run_stream(
+                ctx,
+                chat_id,
+                Uuid::new_v4(),
+                "hello".into(),
+                ResolvedModel {
+                    model_id: "gpt-5".into(),
+                    provider_model_id: "provider-gpt-5".into(),
+                    provider_id: "premium-provider".into(),
+                    display_name: "GPT 5".into(),
+                    tier: "premium".into(),
+                    multiplier_display: "1x".into(),
+                    description: None,
+                    multimodal_capabilities: vec![],
+                    context_window: 128_000,
+                    max_file_size_mb: 25,
+                    system_prompt: String::new(),
+                    tool_support: mini_chat_sdk::ModelToolSupport {
+                        web_search: false,
+                        file_search: false,
+                        image_generation: false,
+                        code_interpreter: false,
+                        mcp: false,
+                    },
+                    thread_summary_prompt: String::new(),
+                    max_output_tokens: 16_384,
+                    max_input_tokens: 0,
+                    bytes_per_token_conservative: 4,
+                },
+                false,
+                Vec::new(),
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .expect("should succeed (downgrade, not reject)");
+        while let Some(ev) = rx.recv().await {
+            if ev.is_terminal() {
+                break;
+            }
+        }
+        let _outcome = handle.await.expect("task should complete");
+
+        let (model, alias) = capturing
+            .captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider was never called");
+        assert_eq!(model, "provider-gpt-5-mini");
+        assert!(
+            alias.starts_with("standard-host"),
+            "request must go through the effective provider's alias, got {alias}"
         );
     }
 
@@ -4548,10 +5101,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -4607,10 +5160,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -4676,10 +5229,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -4732,10 +5285,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -4790,10 +5343,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -4859,10 +5412,10 @@ mod tests {
                 web_search_max_calls: 2,
                 code_interpreter_max_calls: 2,
                 api_params: mini_chat_sdk::ModelApiParams {
-                    temperature: 0.7,
-                    top_p: 1.0,
-                    frequency_penalty: 0.0,
-                    presence_penalty: 0.0,
+                    temperature: Some(0.7),
+                    top_p: Some(1.0),
+                    frequency_penalty: Some(0.0),
+                    presence_penalty: Some(0.0),
                     stop: vec![],
                     extra_body: None,
                     reasoning_effort: None,
@@ -5160,6 +5713,46 @@ mod tests {
         assert!(
             matches!(err, StreamError::InvalidAttachment { ref message, .. } if message.contains("Duplicate")),
             "expected 'Duplicate', got: {err:?}"
+        );
+    }
+
+    /// More attachment IDs than documents per chat plus images per message
+    /// are rejected before any attachment query; the bound itself passes
+    /// the length check.
+    #[tokio::test]
+    async fn send_message_too_many_attachment_ids() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["hi"]));
+        let svc = build_stream_service(db.clone(), provider);
+        let max = usize::try_from(
+            svc.rag_config.max_documents_per_chat + svc.rag_config.max_images_per_message,
+        )
+        .unwrap();
+
+        // Unknown ids: had the list reached the lookup, it would be "not found".
+        let ids: Vec<Uuid> = (0..=max).map(|_| Uuid::new_v4()).collect();
+        let err =
+            run_stream_expect_invalid_attachment(&svc, tenant_id, user_id, chat_id, ids).await;
+        assert!(
+            matches!(
+                err,
+                StreamError::InvalidAttachment { ref message, .. }
+                    if message.starts_with("Too many attachment IDs")
+            ),
+            "expected 'Too many attachment IDs', got: {err:?}"
+        );
+
+        let ids: Vec<Uuid> = (0..max).map(|_| Uuid::new_v4()).collect();
+        let err =
+            run_stream_expect_invalid_attachment(&svc, tenant_id, user_id, chat_id, ids).await;
+        assert!(
+            matches!(err, StreamError::InvalidAttachment { ref message, .. } if message.contains("not found")),
+            "expected 'not found' at the bound, got: {err:?}"
         );
     }
 
@@ -5647,16 +6240,29 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let cancel = CancellationToken::new();
 
+        let content: String = "retry question".into();
+        let preflight = svc
+            .preflight_mutation(
+                &ctx,
+                chat_id,
+                Uuid::new_v4(),
+                &content,
+                &test_resolved_model(),
+                false,
+            )
+            .await
+            .expect("preflight should allow the mutation");
         let result = svc
             .run_stream_for_mutation(
                 ctx,
                 chat_id,
                 request_id,
                 turn_id,
-                "retry question".into(),
+                content,
                 test_resolved_model(),
                 false,
                 None,
+                preflight,
                 cancel,
                 tx,
             )
@@ -5694,16 +6300,29 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let cancel = CancellationToken::new();
 
+        let content: String = "retry without docs".into();
+        let preflight = svc
+            .preflight_mutation(
+                &ctx,
+                chat_id,
+                Uuid::new_v4(),
+                &content,
+                &test_resolved_model(),
+                false,
+            )
+            .await
+            .expect("preflight should allow the mutation");
         let result = svc
             .run_stream_for_mutation(
                 ctx,
                 chat_id,
                 request_id,
                 turn_id,
-                "retry without docs".into(),
+                content,
                 test_resolved_model(),
                 false,
                 None,
+                preflight,
                 cancel,
                 tx,
             )
@@ -5762,16 +6381,29 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
         let cancel = CancellationToken::new();
 
+        let content: String = "retry with kill switch".into();
+        let preflight = svc
+            .preflight_mutation(
+                &ctx,
+                chat_id,
+                Uuid::new_v4(),
+                &content,
+                &test_resolved_model(),
+                false,
+            )
+            .await
+            .expect("preflight should allow the mutation");
         let result = svc
             .run_stream_for_mutation(
                 ctx,
                 chat_id,
                 request_id,
                 turn_id,
-                "retry with kill switch".into(),
+                content,
                 test_resolved_model(),
                 false,
                 None,
+                preflight,
                 cancel,
                 tx,
             )
@@ -5823,6 +6455,10 @@ mod tests {
         cancel_requested: AtomicU64,
         cancel_effective: AtomicU64,
         time_to_abort_ms: AtomicU64,
+        /// `f64::to_bits` of the last recorded value.
+        last_time_to_abort_ms: AtomicU64,
+        /// `f64::to_bits` of the last recorded value.
+        last_stream_total_latency_ms: AtomicU64,
     }
 
     impl TestMetrics {
@@ -5847,7 +6483,17 @@ mod tests {
                 cancel_requested: AtomicU64::new(0),
                 cancel_effective: AtomicU64::new(0),
                 time_to_abort_ms: AtomicU64::new(0),
+                last_time_to_abort_ms: AtomicU64::new(0),
+                last_stream_total_latency_ms: AtomicU64::new(0),
             }
+        }
+
+        fn last_time_to_abort_ms(&self) -> f64 {
+            f64::from_bits(self.last_time_to_abort_ms.load(Ordering::Relaxed))
+        }
+
+        fn last_stream_total_latency_ms(&self) -> f64 {
+            f64::from_bits(self.last_stream_total_latency_ms.load(Ordering::Relaxed))
         }
     }
 
@@ -5876,8 +6522,10 @@ mod tests {
         fn record_ttft_overhead_ms(&self, _: &str, _: &str, _: f64) {
             self.ttft_overhead_ms.fetch_add(1, Ordering::Relaxed);
         }
-        fn record_stream_total_latency_ms(&self, _: &str, _: &str, _: f64) {
+        fn record_stream_total_latency_ms(&self, _: &str, _: &str, ms: f64) {
             self.stream_total_latency_ms.fetch_add(1, Ordering::Relaxed);
+            self.last_stream_total_latency_ms
+                .store(ms.to_bits(), Ordering::Relaxed);
         }
         fn record_turn_mutation(&self, _: &str, _: &str) {}
         fn record_turn_mutation_latency_ms(&self, _: &str, _: f64) {}
@@ -5910,8 +6558,10 @@ mod tests {
         fn record_cancel_effective(&self, _: &str) {
             self.cancel_effective.fetch_add(1, Ordering::Relaxed);
         }
-        fn record_time_to_abort_ms(&self, _: &str, _: f64) {
+        fn record_time_to_abort_ms(&self, _: &str, ms: f64) {
             self.time_to_abort_ms.fetch_add(1, Ordering::Relaxed);
+            self.last_time_to_abort_ms
+                .store(ms.to_bits(), Ordering::Relaxed);
         }
         fn record_streams_aborted(&self, _: &str) {}
         fn record_attachment_upload(&self, _: &str, _: &str) {}
@@ -5922,6 +6572,9 @@ mod tests {
         fn record_orphan_detected(&self, _: &str) {}
         fn record_orphan_finalized(&self, _: &str) {}
         fn record_orphan_scan_duration_seconds(&self, _: f64) {}
+        fn record_upload_abandoned(&self, _: &str) {}
+        fn record_background_indexing(&self, _: &str) {}
+        fn record_upload_reaper_scan_duration_seconds(&self, _: f64) {}
         fn record_code_interpreter_calls(&self, _: &str, _: u32) {}
         fn record_cleanup_completed(&self, _: &str) {}
         fn record_cleanup_failed(&self, _: &str) {}
@@ -6031,8 +6684,8 @@ mod tests {
         // Reserve: 2 calls (daily + monthly)
         assert_eq!(metrics.quota_reserve.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.quota_estimated_tokens.load(Ordering::Relaxed), 1);
-        // Finalization: audit emit + latency
-        assert_eq!(metrics.audit_emit.load(Ordering::Relaxed), 1);
+        // Finalization: latency. audit_emit is recorded on delivery, not here.
+        assert_eq!(metrics.audit_emit.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.finalization_latency_ms.load(Ordering::Relaxed), 1);
     }
 
@@ -6204,45 +6857,36 @@ mod tests {
         assert_eq!(metrics.stream_total_latency_ms.load(Ordering::Relaxed), 1);
     }
 
-    /// `run_stream_for_mutation` returns `InputTooLong` for oversized content
-    /// and marks the already-committed turn as `Failed` so it does not stay
-    /// stuck in `Running` state.
+    /// Oversized content is rejected by `preflight_mutation`, i.e. before the
+    /// mutation transaction runs, so no turn is touched.
     ///
     /// Setup: model catalog has `context_window = max_input_tokens = 500`.
     /// Content: 1500 ASCII bytes → ~523 estimated tokens > 500 → `InputTooLong`.
     #[tokio::test]
-    async fn run_stream_for_mutation_input_too_long_marks_turn_failed() {
+    async fn preflight_mutation_rejects_input_too_long() {
         let db = mock_db_provider(inmem_db().await);
         let tenant_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
         let chat_id = Uuid::new_v4();
-        let request_id = Uuid::new_v4();
-        let turn_id = Uuid::new_v4();
         insert_test_chat(&db, tenant_id, user_id, chat_id).await;
-        insert_running_turn(&db, tenant_id, user_id, chat_id, request_id, turn_id).await;
 
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&[]));
-        let svc = build_stream_service_with_context_window(db.clone(), provider, 500);
-
+        let svc = build_stream_service_with_context_window(db, provider, 500);
         let ctx = test_security_ctx_with_id(tenant_id, user_id);
-        let (tx, _rx) = mpsc::channel(32);
-        let cancel = CancellationToken::new();
 
-        let err = svc
-            .run_stream_for_mutation(
-                ctx,
+        let Err(err) = svc
+            .preflight_mutation(
+                &ctx,
                 chat_id,
-                request_id,
-                turn_id,
-                "a".repeat(1500),
-                test_resolved_model(),
+                Uuid::new_v4(),
+                &"a".repeat(1500),
+                &test_resolved_model(),
                 false,
-                None,
-                cancel,
-                tx,
             )
             .await
-            .expect_err("should be InputTooLong");
+        else {
+            panic!("oversized content should be rejected by preflight");
+        };
 
         match err {
             StreamError::InputTooLong {
@@ -6257,24 +6901,1238 @@ mod tests {
             }
             other => panic!("expected InputTooLong, got: {other:?}"),
         }
+    }
 
-        // The pre-committed turn must be marked Failed, not left in Running.
+    /// Retry/edit re-sends the original message's image attachments.
+    #[tokio::test]
+    async fn preflight_mutation_carries_source_message_images() {
+        use crate::domain::service::test_helpers::{
+            insert_test_message, insert_test_message_attachment,
+        };
+        use crate::infra::db::entity::attachment::AttachmentKind;
+
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+        insert_test_message(&db, tenant_id, chat_id, message_id).await;
+        let image_id = insert_test_attachment(
+            &db,
+            InsertTestAttachmentParams {
+                uploaded_by_user_id: user_id,
+                kind: AttachmentKind::Image,
+                filename: "cat.png".to_owned(),
+                content_type: "image/png".to_owned(),
+                provider_file_id: Some("file-img-retry".to_owned()),
+                for_file_search: false,
+                ..InsertTestAttachmentParams::ready_document(tenant_id, chat_id)
+            },
+        )
+        .await;
+        insert_test_message_attachment(&db, tenant_id, chat_id, message_id, image_id).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["unused"]));
+        let svc = build_stream_service(db, provider);
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let model = ResolvedModel {
+            multimodal_capabilities: vec!["VISION_INPUT".to_owned()],
+            ..test_resolved_model()
+        };
+
+        let preflight = svc
+            .preflight_mutation(&ctx, chat_id, message_id, "what is this?", &model, false)
+            .await
+            .expect("preflight should allow the mutation");
+        assert_eq!(preflight.image_file_ids, vec!["file-img-retry".to_owned()]);
+    }
+
+    /// A setup failure after the mutation committed marks the new turn
+    /// `Failed` and leaves no quota reserve, so the chat is not blocked.
+    #[tokio::test]
+    async fn run_stream_for_mutation_setup_failure_marks_turn_failed() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+        insert_running_turn(&db, tenant_id, user_id, chat_id, request_id, turn_id).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["unused"]));
+        let mut svc = build_stream_service(db.clone(), provider);
+        // A resolver without providers makes provider resolution fail.
+        svc.provider_resolver = Arc::new(ProviderResolver::empty());
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx, _rx) = mpsc::channel(32);
+
+        let model = test_resolved_model();
+        let content = "retry question".to_owned();
+        let preflight = svc
+            .preflight_mutation(&ctx, chat_id, Uuid::new_v4(), &content, &model, false)
+            .await
+            .expect("preflight should allow the mutation");
+        let err = svc
+            .run_stream_for_mutation(
+                ctx,
+                chat_id,
+                request_id,
+                turn_id,
+                content,
+                model,
+                false,
+                None,
+                preflight,
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .expect_err("provider resolution should fail");
+        assert!(
+            matches!(err, StreamError::TurnCreationFailed { .. }),
+            "expected TurnCreationFailed, got: {err:?}"
+        );
+
+        let conn = db.conn().unwrap();
+        let turn = TurnRepo
+            .find_by_chat_and_request_id(&conn, &AccessScope::allow_all(), chat_id, request_id)
+            .await
+            .expect("DB query should succeed")
+            .expect("turn must exist");
+        assert_eq!(turn.state, TurnState::Failed);
+        assert_eq!(turn.error_code.as_deref(), Some("turn_setup_failed"));
+        assert!(
+            turn.reserve_tokens.is_none(),
+            "no quota reserve may be written for a turn that never started"
+        );
+    }
+
+    /// Retry/edit: a concurrent reserve booked after the mutation preflight
+    /// makes the reserve write fail with `quota_exceeded`; the turn is marked
+    /// failed and no reserve stays behind.
+    #[tokio::test]
+    async fn run_stream_for_mutation_rechecks_limits_after_concurrent_reserve() {
+        use crate::domain::repos::{IncrementReserveParams, QuotaUsageRepository};
+
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+        insert_running_turn(&db, tenant_id, user_id, chat_id, request_id, turn_id).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["unused"]));
+        let svc = build_stream_service(db.clone(), provider);
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx, _rx) = mpsc::channel(32);
+
+        let model = test_resolved_model();
+        let content = "retry question".to_owned();
+        let preflight = svc
+            .preflight_mutation(&ctx, chat_id, Uuid::new_v4(), &content, &model, false)
+            .await
+            .expect("preflight should allow the mutation");
+
+        let (period_type, period_start) = preflight.computed.periods[0].clone();
+        let competing = preflight
+            .computed
+            .user_limits
+            .standard
+            .limit_daily_credits_micro;
+        let conn = db.conn().unwrap();
+        OrmQuotaUsageRepo
+            .increment_reserve(
+                &conn,
+                &AccessScope::for_tenant(tenant_id),
+                IncrementReserveParams {
+                    tenant_id,
+                    user_id,
+                    period_type: period_type.clone(),
+                    period_start,
+                    bucket: "total".to_owned(),
+                    amount_micro: competing,
+                },
+            )
+            .await
+            .unwrap();
+
+        let err = svc
+            .run_stream_for_mutation(
+                ctx,
+                chat_id,
+                request_id,
+                turn_id,
+                content,
+                model,
+                false,
+                None,
+                preflight,
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .expect_err("the reserve no longer fits the daily limit");
+        assert!(
+            matches!(&err, StreamError::QuotaExhausted { error_code, .. } if error_code == "quota_exceeded"),
+            "expected quota_exceeded, got: {err:?}"
+        );
+
+        let turn = TurnRepo
+            .find_by_chat_and_request_id(&conn, &AccessScope::allow_all(), chat_id, request_id)
+            .await
+            .unwrap()
+            .expect("turn must exist");
+        assert_eq!(turn.state, TurnState::Failed);
+        assert_eq!(turn.error_code.as_deref(), Some("quota_exceeded"));
+        let rows = OrmQuotaUsageRepo
+            .find_bucket_rows_for_update(
+                &conn,
+                &AccessScope::for_tenant(tenant_id),
+                tenant_id,
+                user_id,
+                &[period_type],
+                &[period_start],
+            )
+            .await
+            .unwrap();
+        let reserved: i64 = rows.iter().map(|r| r.reserved_credits_micro).sum();
+        assert_eq!(reserved, competing, "the mutation's reserve rolled back");
+    }
+
+    // ── Atomic reserve + user message + turn (E2E 09-03) ──
+
+    /// Runs the real preflight and then `reserve_and_create_turn` directly,
+    /// skipping the pre-stream guards so the failure comes from the turn
+    /// INSERT inside the transaction (the race the guards cannot close).
+    async fn reserve_and_create_turn_after_preflight(
+        svc: &StreamService<
+            TurnRepo,
+            MsgRepo,
+            OrmQuotaUsageRepo,
+            OrmChatRepo,
+            MockThreadSummaryRepo,
+            OrmAttachmentRepo,
+            OrmVectorStoreRepo,
+            OrmMessageAttachmentRepo,
+        >,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        chat_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<Uuid, StreamError> {
+        let content = "hello".to_owned();
+        let computed = svc
+            .quota
+            .preflight_evaluate(crate::domain::model::quota::PreflightInput {
+                tenant_id,
+                user_id,
+                selected_model: "gpt-5.2".to_owned(),
+                utf8_bytes: content.len() as u64,
+                num_images: 0,
+                tools_enabled: false,
+                web_search_enabled: false,
+                code_interpreter_enabled: false,
+                max_output_tokens_cap: svc.streaming_config.max_output_tokens,
+                prior_context_tokens: 0,
+            })
+            .await
+            .expect("preflight evaluate");
+        assert!(
+            !computed.buckets.is_empty() && computed.reserved_credits_micro > 0,
+            "preflight must produce a reserve for the test to be meaningful"
+        );
+        let pf = super::types::flatten_preflight(computed.decision.clone()).expect("allow");
+        svc.reserve_and_create_turn(
+            &AccessScope::for_tenant(tenant_id),
+            &pf,
+            computed,
+            tenant_id,
+            user_id,
+            chat_id,
+            request_id,
+            "user".to_owned(),
+            content,
+            Vec::new(),
+            false,
+        )
+        .await
+    }
+
+    /// Asserts the failed transaction left no user message and no quota reserve.
+    async fn assert_nothing_persisted(
+        db: &Arc<DbProvider>,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        chat_id: Uuid,
+        request_id: Uuid,
+    ) {
+        use crate::domain::repos::{
+            ChatRepository as _, MessageRepository as _, QuotaUsageRepository as _,
+        };
+
+        let conn = db.conn().unwrap();
+        let scope = AccessScope::allow_all();
+        let chat_repo = OrmChatRepo::new(toolkit_db::odata::LimitCfg {
+            default: 20,
+            max: 100,
+        });
+        assert_eq!(
+            chat_repo
+                .count_messages(&conn, &scope, chat_id)
+                .await
+                .unwrap(),
+            0,
+            "user message must be rolled back"
+        );
+        let msg_repo = MsgRepo::new(toolkit_db::odata::LimitCfg {
+            default: 20,
+            max: 100,
+        });
+        assert!(
+            msg_repo
+                .find_user_message_by_request_id(&conn, &scope, chat_id, request_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "no user message for the failed request_id"
+        );
+        let rows = OrmQuotaUsageRepo
+            .find_bucket_rows(&conn, &scope, tenant_id, user_id)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter().all(|r| r.reserved_credits_micro == 0),
+            "quota reserve must be rolled back, got: {:?}",
+            rows.iter()
+                .map(|r| (&r.bucket, r.reserved_credits_micro))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_and_create_turn_rolls_back_on_running_turn_conflict() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+        // A concurrent request already holds the one running turn for the chat.
+        let other_turn = Uuid::new_v4();
+        insert_running_turn(&db, tenant_id, user_id, chat_id, Uuid::new_v4(), other_turn).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["unused"]));
+        let svc = build_stream_service(db.clone(), provider);
+
+        let err =
+            reserve_and_create_turn_after_preflight(&svc, tenant_id, user_id, chat_id, request_id)
+                .await
+                .expect_err("turn insert must hit the running-turn unique index");
+        match err {
+            StreamError::Conflict { code, .. } => assert_eq!(code, "turn_already_running"),
+            other => panic!("expected Conflict, got: {other:?}"),
+        }
+
+        assert_nothing_persisted(&db, tenant_id, user_id, chat_id, request_id).await;
+        let conn = db.conn().unwrap();
+        let running = TurnRepo
+            .find_running_by_chat_id(&conn, &AccessScope::allow_all(), chat_id)
+            .await
+            .unwrap()
+            .expect("pre-existing running turn stays");
+        assert_eq!(running.id, other_turn);
+        assert!(
+            TurnRepo
+                .find_by_chat_and_request_id(&conn, &AccessScope::allow_all(), chat_id, request_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "no turn for the failed request_id"
+        );
+    }
+
+    /// A reserve booked by a concurrent request between the preflight check
+    /// and the reserve write is seen by the write transaction: the request
+    /// gets `quota_exceeded` and leaves nothing behind.
+    #[tokio::test]
+    async fn reserve_and_create_turn_rechecks_limits_after_concurrent_reserve() {
+        use crate::domain::repos::{IncrementReserveParams, QuotaUsageRepository};
+
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["unused"]));
+        let svc = build_stream_service(db.clone(), provider);
+
+        let content = "hello".to_owned();
+        let computed = svc
+            .quota
+            .preflight_evaluate(crate::domain::model::quota::PreflightInput {
+                tenant_id,
+                user_id,
+                selected_model: "gpt-5.2".to_owned(),
+                utf8_bytes: content.len() as u64,
+                num_images: 0,
+                tools_enabled: false,
+                web_search_enabled: false,
+                code_interpreter_enabled: false,
+                max_output_tokens_cap: svc.streaming_config.max_output_tokens,
+                prior_context_tokens: 0,
+            })
+            .await
+            .expect("preflight evaluate");
+        let pf = super::types::flatten_preflight(computed.decision.clone()).expect("allow");
+
+        // The concurrent request books the whole daily limit.
+        let (period_type, period_start) = computed.periods[0].clone();
+        let competing = computed.user_limits.standard.limit_daily_credits_micro;
+        let conn = db.conn().unwrap();
+        OrmQuotaUsageRepo
+            .increment_reserve(
+                &conn,
+                &AccessScope::for_tenant(tenant_id),
+                IncrementReserveParams {
+                    tenant_id,
+                    user_id,
+                    period_type: period_type.clone(),
+                    period_start,
+                    bucket: "total".to_owned(),
+                    amount_micro: competing,
+                },
+            )
+            .await
+            .unwrap();
+
+        let err = svc
+            .reserve_and_create_turn(
+                &AccessScope::for_tenant(tenant_id),
+                &pf,
+                computed,
+                tenant_id,
+                user_id,
+                chat_id,
+                request_id,
+                "user".to_owned(),
+                content,
+                Vec::new(),
+                false,
+            )
+            .await
+            .expect_err("the reserve no longer fits the daily limit");
+        assert!(
+            matches!(&err, StreamError::QuotaExhausted { error_code, quota_scope, .. }
+                if error_code == "quota_exceeded" && quota_scope == "tokens"),
+            "expected quota_exceeded, got: {err:?}"
+        );
+
+        let rows = OrmQuotaUsageRepo
+            .find_bucket_rows_for_update(
+                &conn,
+                &AccessScope::for_tenant(tenant_id),
+                tenant_id,
+                user_id,
+                &[period_type],
+                &[period_start],
+            )
+            .await
+            .unwrap();
+        let reserved: i64 = rows.iter().map(|r| r.reserved_credits_micro).sum();
+        assert_eq!(
+            reserved, competing,
+            "the failed request's reserve rolled back"
+        );
+        assert!(
+            TurnRepo
+                .find_by_chat_and_request_id(&conn, &AccessScope::allow_all(), chat_id, request_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "no turn for the rejected request"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_and_create_turn_rolls_back_on_duplicate_request_id() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+        // A finished turn with the same request_id and no user message, so the
+        // message INSERT succeeds and only UNIQUE(chat_id, request_id) on the
+        // turn INSERT fails.
+        let existing_turn = Uuid::new_v4();
+        insert_running_turn(&db, tenant_id, user_id, chat_id, request_id, existing_turn).await;
+        let conn = db.conn().unwrap();
+        let affected = TurnRepo
+            .cas_update_state(
+                &conn,
+                &AccessScope::allow_all(),
+                CasTerminalParams {
+                    turn_id: existing_turn,
+                    state: TurnState::Failed,
+                    error_code: Some("test".to_owned()),
+                    error_detail: None,
+                    assistant_message_id: None,
+                    provider_response_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["unused"]));
+        let svc = build_stream_service(db.clone(), provider);
+
+        let err =
+            reserve_and_create_turn_after_preflight(&svc, tenant_id, user_id, chat_id, request_id)
+                .await
+                .expect_err("turn insert must hit UNIQUE(chat_id, request_id)");
+        assert!(
+            matches!(&err, StreamError::Conflict { code, .. } if code == "request_id_conflict"),
+            "expected request_id_conflict, got: {err:?}"
+        );
+
+        assert_nothing_persisted(&db, tenant_id, user_id, chat_id, request_id).await;
+        let turn = TurnRepo
+            .find_by_chat_and_request_id(&conn, &AccessScope::allow_all(), chat_id, request_id)
+            .await
+            .unwrap()
+            .expect("original turn stays");
+        assert_eq!(turn.id, existing_turn);
+        assert_eq!(turn.state, TurnState::Failed);
+    }
+
+    /// Control for the rollback tests: without a conflict the same call
+    /// persists the message, the turn and the reserve.
+    #[tokio::test]
+    async fn reserve_and_create_turn_commits_all_rows_on_success() {
+        use crate::domain::repos::QuotaUsageRepository as _;
+
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["unused"]));
+        let svc = build_stream_service(db.clone(), provider);
+
+        let turn_id =
+            reserve_and_create_turn_after_preflight(&svc, tenant_id, user_id, chat_id, request_id)
+                .await
+                .expect("turn created");
+
         let conn = db.conn().unwrap();
         let scope = AccessScope::allow_all();
         let turn = TurnRepo
             .find_by_chat_and_request_id(&conn, &scope, chat_id, request_id)
             .await
-            .expect("DB query should succeed")
-            .expect("turn must exist");
-        assert_eq!(
-            turn.state,
-            TurnState::Failed,
-            "turn should be marked Failed after InputTooLong"
+            .unwrap()
+            .expect("turn persisted");
+        assert_eq!(turn.id, turn_id);
+        assert_eq!(turn.state, TurnState::Running);
+        let msgs = MsgRepo::new(toolkit_db::odata::LimitCfg {
+            default: 20,
+            max: 100,
+        })
+        .find_user_message_by_request_id(&conn, &scope, chat_id, request_id)
+        .await
+        .unwrap();
+        assert!(msgs.is_some(), "user message persisted");
+        let rows = OrmQuotaUsageRepo
+            .find_bucket_rows(&conn, &scope, tenant_id, user_id)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter().any(|r| r.reserved_credits_micro > 0),
+            "quota reserve persisted"
         );
+    }
+
+    // ── Branch review follow-ups ──
+
+    /// Loads a turn by `request_id`, panicking if it does not exist.
+    async fn load_turn(
+        db: &Arc<DbProvider>,
+        chat_id: Uuid,
+        request_id: Uuid,
+    ) -> crate::infra::db::entity::chat_turn::Model {
+        let conn = db.conn().unwrap();
+        TurnRepo
+            .find_by_chat_and_request_id(&conn, &AccessScope::allow_all(), chat_id, request_id)
+            .await
+            .expect("DB query should succeed")
+            .expect("turn must exist")
+    }
+
+    /// Receives events until the provider task drops the sender.
+    async fn collect_events(rx: &mut mpsc::Receiver<StreamEvent>) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        events
+    }
+
+    /// Provider resolution runs before `reserve_and_create_turn`, so its
+    /// failure leaves no turn, no user message and no quota reserve.
+    #[tokio::test]
+    async fn run_stream_provider_resolution_failure_persists_nothing() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["unused"]));
+        let mut svc = build_stream_service(db.clone(), provider);
+        // A resolver without providers makes provider resolution fail.
+        svc.provider_resolver = Arc::new(ProviderResolver::empty());
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx, _rx) = mpsc::channel(32);
+
+        let model = test_resolved_model();
+        let err = svc
+            .run_stream(
+                ctx,
+                chat_id,
+                request_id,
+                "hello".into(),
+                model,
+                false,
+                Vec::new(),
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .expect_err("provider resolution should fail");
+        assert!(
+            matches!(err, StreamError::TurnCreationFailed { .. }),
+            "expected TurnCreationFailed, got: {err:?}"
+        );
+
+        assert_nothing_persisted(&db, tenant_id, user_id, chat_id, request_id).await;
+        let conn = db.conn().unwrap();
+        assert!(
+            TurnRepo
+                .find_by_chat_and_request_id(&conn, &AccessScope::allow_all(), chat_id, request_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "no chat_turns row for the failed request"
+        );
+    }
+
+    /// Context assembly over budget after the mutation committed fails the
+    /// new turn with `context_length_exceeded`, not `turn_setup_failed`.
+    ///
+    /// `context_window = 500`: 1000 bytes estimate to 385 tokens, within
+    /// `max_input_tokens = 500`, but above the assembly budget of
+    /// 500 - 125 (output) - 100 (overhead) = 275.
+    #[tokio::test]
+    async fn run_stream_for_mutation_context_budget_exceeded_marks_turn_failed() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+        insert_running_turn(&db, tenant_id, user_id, chat_id, request_id, turn_id).await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["unused"]));
+        let svc = build_stream_service_with_context_window(db.clone(), provider, 500);
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx, _rx) = mpsc::channel(32);
+
+        let content = "a".repeat(1000);
+        let model = test_resolved_model();
+        let preflight = svc
+            .preflight_mutation(&ctx, chat_id, Uuid::new_v4(), &content, &model, false)
+            .await
+            .expect("content fits max_input_tokens");
+        let err = svc
+            .run_stream_for_mutation(
+                ctx,
+                chat_id,
+                request_id,
+                turn_id,
+                content,
+                model,
+                false,
+                None,
+                preflight,
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .expect_err("context assembly should exceed the budget");
+        assert!(
+            matches!(err, StreamError::ContextBudgetExceeded { .. }),
+            "expected ContextBudgetExceeded, got: {err:?}"
+        );
+
+        let turn = load_turn(&db, chat_id, request_id).await;
+        assert_eq!(turn.state, TurnState::Failed);
+        assert_eq!(turn.error_code.as_deref(), Some("context_length_exceeded"));
+        assert!(turn.reserve_tokens.is_none(), "no quota reserve written");
+    }
+
+    /// Inserts a ready image attachment linked to `message_id`.
+    async fn insert_linked_image(
+        db: &Arc<DbProvider>,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        chat_id: Uuid,
+        message_id: Uuid,
+        provider_file_id: &str,
+    ) {
+        use crate::domain::service::test_helpers::{
+            insert_test_message, insert_test_message_attachment,
+        };
+        use crate::infra::db::entity::attachment::AttachmentKind;
+
+        insert_test_message(db, tenant_id, chat_id, message_id).await;
+        let image_id = insert_test_attachment(
+            db,
+            InsertTestAttachmentParams {
+                uploaded_by_user_id: user_id,
+                kind: AttachmentKind::Image,
+                filename: "cat.png".to_owned(),
+                content_type: "image/png".to_owned(),
+                provider_file_id: Some(provider_file_id.to_owned()),
+                for_file_search: false,
+                ..InsertTestAttachmentParams::ready_document(tenant_id, chat_id)
+            },
+        )
+        .await;
+        insert_test_message_attachment(db, tenant_id, chat_id, message_id, image_id).await;
+    }
+
+    /// Records the messages of the outgoing provider request.
+    #[domain_model]
+    struct MessageCapturingProvider {
+        captured: std::sync::Mutex<Option<Vec<LlmMessage>>>,
+        inner: MockProvider,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MessageCapturingProvider {
+        async fn stream(
+            &self,
+            ctx: SecurityContext,
+            request: LlmRequest<Streaming>,
+            upstream_alias: &str,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, LlmProviderError> {
+            *self.captured.lock().unwrap() = Some(request.messages().to_vec());
+            self.inner
+                .stream(ctx, request, upstream_alias, cancel)
+                .await
+        }
+
+        async fn complete(
+            &self,
+            _ctx: SecurityContext,
+            _request: LlmRequest<NonStreaming>,
+            _upstream_alias: &str,
+        ) -> Result<ResponseResult, LlmProviderError> {
+            unimplemented!("not needed for streaming tests")
+        }
+    }
+
+    struct ToolCapturingProvider {
+        captured: std::sync::Mutex<Option<Vec<crate::domain::llm::LlmTool>>>,
+        inner: MockProvider,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ToolCapturingProvider {
+        async fn stream(
+            &self,
+            ctx: SecurityContext,
+            request: LlmRequest<Streaming>,
+            upstream_alias: &str,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, LlmProviderError> {
+            *self.captured.lock().unwrap() = Some(request.tools().to_vec());
+            self.inner
+                .stream(ctx, request, upstream_alias, cancel)
+                .await
+        }
+
+        async fn complete(
+            &self,
+            _ctx: SecurityContext,
+            _request: LlmRequest<NonStreaming>,
+            _upstream_alias: &str,
+        ) -> Result<ResponseResult, LlmProviderError> {
+            unimplemented!("not needed for streaming tests")
+        }
+    }
+
+    struct NoopRetriever;
+
+    #[async_trait::async_trait]
+    impl crate::domain::ports::KnowledgeRetriever for NoopRetriever {
+        async fn retrieve(
+            &self,
+            _ctx: SecurityContext,
+            _req: crate::domain::ports::knowledge_retriever::RetrievalRequest,
+        ) -> Result<
+            Vec<crate::domain::ports::knowledge_retriever::RetrievedChunk>,
+            crate::domain::ports::knowledge_retriever::RetrievalError,
+        > {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Knowledge search is enabled with a retriever, but its parameters cannot
+    /// be built (no `provider_id`): the tool must not be offered to the model.
+    #[tokio::test]
+    async fn knowledge_search_tool_not_sent_when_params_cannot_be_built() {
+        let db = mock_db_provider(inmem_db().await);
+        let (tenant_id, user_id, chat_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+
+        let capturing = Arc::new(ToolCapturingProvider {
+            captured: std::sync::Mutex::new(None),
+            inner: MockProvider::completed(&["ok"]),
+        });
+        let mut svc = build_stream_service(db.clone(), Arc::clone(&capturing) as _);
+        svc.knowledge_search_config.enabled = true;
+        svc.knowledge_search_config.provider_id = None;
+        svc.knowledge_retriever = Some(Arc::new(NoopRetriever));
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = svc
+            .run_stream(
+                test_security_ctx_with_id(tenant_id, user_id),
+                chat_id,
+                Uuid::new_v4(),
+                "hello".into(),
+                test_resolved_model(),
+                false,
+                Vec::new(),
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .expect("stream starts");
+        while rx.recv().await.is_some() {}
+        handle.await.unwrap();
+
+        let tools = capturing
+            .captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider called");
+        assert!(
+            !tools
+                .iter()
+                .any(|t| matches!(t, crate::domain::llm::LlmTool::Function { name, .. } if name == "search_knowledge")),
+            "search_knowledge must not be sent: {tools:?}"
+        );
+    }
+
+    /// `web_search` requested on a model whose catalog entry does not support it:
+    /// the tool is not sent to the provider.
+    #[tokio::test]
+    async fn web_search_tool_not_sent_when_model_lacks_support() {
+        let db = mock_db_provider(inmem_db().await);
+        let (tenant_id, user_id, chat_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+        let capturing = Arc::new(ToolCapturingProvider {
+            captured: std::sync::Mutex::new(None),
+            inner: MockProvider::completed(&["ok"]),
+        });
+        // The test catalog entry has tool_support.web_search = false.
+        let svc = build_stream_service(db.clone(), Arc::clone(&capturing) as _);
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = svc
+            .run_stream(
+                test_security_ctx_with_id(tenant_id, user_id),
+                chat_id,
+                Uuid::new_v4(),
+                "hello".into(),
+                test_resolved_model(),
+                true,
+                Vec::new(),
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .expect("stream starts");
+        while rx.recv().await.is_some() {}
+        handle.await.unwrap();
+
+        let tools = capturing
+            .captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider called");
+        assert!(
+            !tools
+                .iter()
+                .any(|t| matches!(t, crate::domain::llm::LlmTool::WebSearch { .. })),
+            "web_search must not be sent: {tools:?}"
+        );
+    }
+
+    /// Retry/edit sends the source message's images to the provider.
+    #[tokio::test]
+    async fn run_stream_for_mutation_sends_source_images_to_provider() {
+        use crate::domain::llm::ContentPart;
+
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let source_message_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+        insert_linked_image(
+            &db,
+            tenant_id,
+            user_id,
+            chat_id,
+            source_message_id,
+            "file-img-retry",
+        )
+        .await;
+        insert_running_turn(&db, tenant_id, user_id, chat_id, request_id, turn_id).await;
+
+        let capturing = Arc::new(MessageCapturingProvider {
+            captured: std::sync::Mutex::new(None),
+            inner: MockProvider::completed(&["a cat"]),
+        });
+        let svc = build_stream_service(db.clone(), Arc::clone(&capturing) as _);
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let model = ResolvedModel {
+            multimodal_capabilities: vec!["VISION_INPUT".to_owned()],
+            ..test_resolved_model()
+        };
+        let content = "what is this?".to_owned();
+        let preflight = svc
+            .preflight_mutation(&ctx, chat_id, source_message_id, &content, &model, false)
+            .await
+            .expect("preflight should allow the mutation");
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let handle = svc
+            .run_stream_for_mutation(
+                ctx,
+                chat_id,
+                request_id,
+                turn_id,
+                content,
+                model,
+                false,
+                None,
+                preflight,
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .expect("mutation stream should start");
+        collect_events(&mut rx).await;
+        let outcome = handle.await.expect("task should complete");
+        assert_eq!(outcome.terminal, StreamTerminal::Completed);
+
+        let messages = capturing
+            .captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider was never called");
+        let user_message = messages.last().expect("request has messages");
+        assert!(
+            user_message.content.iter().any(
+                |part| matches!(part, ContentPart::Image { file_id } if file_id == "file-img-retry")
+            ),
+            "image must reach the provider request, got: {:?}",
+            user_message.content
+        );
+    }
+
+    /// The images kill switch rejects a retry whose source message has images.
+    #[tokio::test]
+    async fn preflight_mutation_rejects_images_when_kill_switch_set() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let source_message_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+        insert_linked_image(
+            &db,
+            tenant_id,
+            user_id,
+            chat_id,
+            source_message_id,
+            "file-img-retry",
+        )
+        .await;
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["unused"]));
+        let svc = build_stream_service_with_policy(
+            db,
+            provider,
+            mini_chat_sdk::KillSwitches {
+                disable_images: true,
+                ..mini_chat_sdk::KillSwitches::default()
+            },
+        );
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let model = ResolvedModel {
+            multimodal_capabilities: vec!["VISION_INPUT".to_owned()],
+            ..test_resolved_model()
+        };
+
+        let Err(err) = svc
+            .preflight_mutation(&ctx, chat_id, source_message_id, "again", &model, false)
+            .await
+        else {
+            panic!("images kill switch should reject the retry");
+        };
+        assert!(
+            matches!(err, StreamError::ImagesDisabled),
+            "expected ImagesDisabled, got: {err:?}"
+        );
+    }
+
+    /// A completed answer whose assistant message cannot be stored ends with
+    /// `error{message_persistence_failed}` and no `done`; the turn is Failed.
+    ///
+    /// The insert fails on `idx_messages_chat_request_role`: an assistant
+    /// message with the same `(chat_id, request_id)` already exists.
+    #[tokio::test]
+    async fn completed_stream_with_unsaved_message_sends_persistence_error() {
+        use crate::domain::repos::{InsertAssistantMessageParams, MessageRepository as _};
+
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+        {
+            let conn = db.conn().unwrap();
+            MsgRepo::new(toolkit_db::odata::LimitCfg {
+                default: 20,
+                max: 100,
+            })
+            .insert_assistant_message(
+                &conn,
+                &AccessScope::allow_all(),
+                InsertAssistantMessageParams {
+                    id: Uuid::new_v4(),
+                    tenant_id,
+                    chat_id,
+                    request_id,
+                    content: "occupies the slot".to_owned(),
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_write_input_tokens: None,
+                    reasoning_tokens: None,
+                    model: None,
+                    provider_response_id: None,
+                },
+            )
+            .await
+            .expect("insert blocking assistant message");
+        }
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::completed(&["Hello"]));
+        let svc = build_stream_service(db.clone(), provider);
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx, mut rx) = mpsc::channel(32);
+
+        let handle = svc
+            .run_stream(
+                ctx,
+                chat_id,
+                request_id,
+                "hello".into(),
+                test_resolved_model(),
+                false,
+                Vec::new(),
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .expect("stream should start");
+        let events = collect_events(&mut rx).await;
+        handle.await.expect("task should complete");
+
+        assert!(
+            !events.iter().any(|ev| matches!(ev, StreamEvent::Done(_))),
+            "no done event for an unsaved answer"
+        );
+        let codes: Vec<&str> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                StreamEvent::Error(e) => Some(e.code.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(codes, ["message_persistence_failed"]);
+
+        let turn = load_turn(&db, chat_id, request_id).await;
+        assert_eq!(turn.state, TurnState::Failed);
         assert_eq!(
             turn.error_code.as_deref(),
-            Some("input_too_long"),
-            "error_code should be set to input_too_long"
+            Some("message_persistence_failed")
         );
+    }
+
+    /// The client disconnects while the provider task is blocked sending on
+    /// a full channel: the turn is finalized as Cancelled.
+    #[tokio::test]
+    async fn receiver_dropped_during_blocked_send_finalizes_cancelled() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+
+        let provider: Arc<dyn LlmProvider> =
+            Arc::new(MockProvider::completed(&["one", "two", "three"]));
+        let svc = build_stream_service(db.clone(), provider);
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        // `stream_started` takes the only slot, so the first delta send blocks.
+        let (tx, rx) = mpsc::channel(1);
+
+        let handle = svc
+            .run_stream(
+                ctx,
+                chat_id,
+                request_id,
+                "hello".into(),
+                test_resolved_model(),
+                false,
+                Vec::new(),
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+            .expect("stream should start");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!handle.is_finished(), "task must be blocked on the send");
+        drop(rx);
+
+        let outcome = handle.await.expect("task should complete");
+        assert_eq!(outcome.terminal, StreamTerminal::Cancelled);
+        let turn = load_turn(&db, chat_id, request_id).await;
+        assert_eq!(turn.state, TurnState::Cancelled);
+    }
+
+    /// `time_to_abort_ms` measures from cancel observation, not from the
+    /// stream start.
+    #[tokio::test]
+    async fn time_to_abort_excludes_time_before_cancel() {
+        let db = mock_db_provider(inmem_db().await);
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        insert_test_chat(&db, tenant_id, user_id, chat_id).await;
+
+        let metrics = Arc::new(TestMetrics::new());
+        let provider: Arc<dyn LlmProvider> = Arc::new(HangingProvider);
+        let svc = build_stream_service_with_metrics(db, provider, Arc::clone(&metrics) as _);
+        let ctx = test_security_ctx_with_id(tenant_id, user_id);
+        let (tx, mut rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        let handle = svc
+            .run_stream(
+                ctx,
+                chat_id,
+                Uuid::new_v4(),
+                "hello".into(),
+                test_resolved_model(),
+                false,
+                Vec::new(),
+                cancel.clone(),
+                tx,
+            )
+            .await
+            .expect("stream should start");
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamEvent::StreamStarted(_))
+        ));
+        assert!(matches!(rx.recv().await, Some(StreamEvent::Delta(_))));
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        cancel.cancel();
+        collect_events(&mut rx).await;
+        let outcome = handle.await.expect("task should complete");
+        assert_eq!(outcome.terminal, StreamTerminal::Cancelled);
+
+        assert_eq!(metrics.time_to_abort_ms.load(Ordering::Relaxed), 1);
+        let total = metrics.last_stream_total_latency_ms();
+        let abort = metrics.last_time_to_abort_ms();
+        assert!(total >= 300.0, "total latency {total} covers the wait");
+        assert!(
+            abort < 100.0,
+            "time_to_abort {abort} must not include the {total} ms before cancel"
+        );
+    }
+
+    /// Every enforcer failure, including a PDP outage, is an authorization
+    /// failure (fail closed).
+    #[test]
+    fn enforcer_errors_map_to_authorization_failed() {
+        use authz_resolver_sdk::EnforcerError;
+        use authz_resolver_sdk::pep::ConstraintCompileError;
+
+        // (error, source is AuthzUnavailable rather than Forbidden)
+        let errors = [
+            (EnforcerError::Denied { deny_reason: None }, false),
+            (
+                EnforcerError::EvaluationFailed(
+                    toolkit_canonical_errors::CanonicalError::service_unavailable()
+                        .with_detail("authz-resolver unreachable")
+                        .create(),
+                ),
+                true,
+            ),
+            (
+                EnforcerError::CompileFailed(ConstraintCompileError::ConstraintsRequiredButAbsent),
+                false,
+            ),
+        ];
+        for (e, unavailable) in errors {
+            let label = format!("{e:?}");
+            match StreamError::from(e) {
+                StreamError::AuthorizationFailed { source } if unavailable => assert!(
+                    matches!(source, DomainError::AuthzUnavailable),
+                    "{label}: source must be AuthzUnavailable, got {source:?}"
+                ),
+                StreamError::AuthorizationFailed { source } => assert!(
+                    matches!(source, DomainError::Forbidden),
+                    "{label}: source must be Forbidden, got {source:?}"
+                ),
+                other => panic!("{label} must map to AuthorizationFailed, got {other:?}"),
+            }
+        }
     }
 }

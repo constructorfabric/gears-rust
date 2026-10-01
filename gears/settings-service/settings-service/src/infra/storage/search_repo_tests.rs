@@ -117,7 +117,7 @@ async fn page_of(
     let n = needle(raw);
     let mut q = query.clone();
     if q.filter_hash.is_none() {
-        q.filter_hash = Some(cursor_binding(&n, h.tree.root, corpus));
+        q.filter_hash = Some(cursor_binding(&n, h.tree.root, corpus, None));
     }
     repo()
         .declarations(
@@ -130,6 +130,7 @@ async fn page_of(
                 tenant_ids: tenants,
                 hidden_for: &[],
                 override_limit: 1_000,
+                flagged_only: false,
                 query: &q,
             },
         )

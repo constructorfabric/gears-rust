@@ -1,0 +1,69 @@
+[package]
+name = "cf-gears-flight-control"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CF/Gears Flight Control - the minimal platform control-plane deployment unit (orchestration + edge + AuthN) for distributed Profile 2/3 deployments"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "flight-control"
+path = "src/main.rs"
+
+[features]
+# Plugin availability is a build-time choice (which plugin crates are linked);
+# the active vendor is selected at runtime via GTS `vendor` config. Only the
+# authn-resolver backend is relevant:
+#   * `static-authn` - static/config-driven authn plugin (accept-all); zero
+#                      external dependencies, boots out of the box. The default,
+#                      for CI / demos / on-prem.
+#   * `oidc-authn`   - OIDC authn. The real Profile 3 stack.
+# Build the production flight-control image with
+# `--no-default-features --features oidc-authn`.
+default = ["static-authn"]
+
+# authn-resolver backends
+static-authn = ["dep:static-authn-plugin"]
+oidc-authn = ["dep:oidc-authn-plugin"]
+
+# FIPS-140-3: use the AWS-LC FIPS-validated crypto module for all crypto ops.
+fips = ["toolkit/fips"]
+# Kubernetes platform-plane auth (SA-token TokenReview validation). Enables the
+# toolkit k8s-auth path, the grpc-hub inbound TokenReview validator (the hub
+# serves the DirectoryService whose RPCs are enforced on the platform plane),
+# and the api-gateway inbound TokenReview validator (it is the REST host for
+# co-hosted platform-plane routes and the edge).
+k8s = ["toolkit/k8s-auth", "grpc_hub/k8s-auth", "api_gateway/k8s-auth"]
+# OpenTelemetry tracing/metrics export.
+otel = ["toolkit/otel"]
+
+[dependencies]
+mimalloc = { workspace = true }
+
+# ToolKit bootstrap (host mode)
+toolkit = { workspace = true, features = ["bootstrap"] }
+
+# Control-plane system gears: directory (gear-orchestrator), transport (grpc-hub),
+# edge / REST host (api-gateway), GTS catalogue (types-registry), and edge JWT
+# validation (authn-resolver).
+gear_orchestrator = { package = "cf-gears-gear-orchestrator", path = "../../gears/system/gear-orchestrator" }
+types_registry = { package = "cf-gears-types-registry", path = "../../gears/system/types-registry/types-registry" }
+api_gateway = { package = "cf-gears-api-gateway", path = "../../gears/system/api-gateway" }
+grpc_hub = { package = "cf-gears-grpc-hub", path = "../../gears/system/grpc-hub" }
+authn-resolver = { package = "cf-gears-authn-resolver", path = "../../gears/system/authn-resolver/authn-resolver" }
+
+# Optional authn-resolver plugins
+static-authn-plugin = { package = "cf-gears-static-authn-plugin", path = "../../gears/system/authn-resolver/plugins/static-authn-plugin", optional = true }
+oidc-authn-plugin = { package = "cf-gears-oidc-authn-plugin", path = "../../gears/system/authn-resolver/plugins/oidc-authn-plugin", optional = true }
+
+anyhow = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

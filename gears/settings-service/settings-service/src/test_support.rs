@@ -14,7 +14,8 @@ use sea_orm_migration::MigratorTrait;
 use serde_json::Value;
 use settings_service_sdk::SettingKey;
 use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
+use toolkit_db::test_support::QueryRecorder;
+use toolkit_db::{ConnectOpts, DBProvider, Db, DbError, connect_db};
 use types_registry_sdk::{GtsTypeId, GtsTypeSchema};
 use uuid::Uuid;
 
@@ -22,7 +23,7 @@ use crate::audit::{AuditRecord, AuditSink};
 use crate::domain::contribution::SettingTypeRegistrar;
 use crate::domain::error::DomainError;
 use crate::domain::platform_scope::PlatformScope;
-use crate::domain::resolution::TenantHierarchy;
+use crate::domain::resolution::{Subtree, TenantHierarchy};
 use crate::infra::type_validator::SchemaSource;
 
 use std::num::NonZeroU32;
@@ -225,14 +226,33 @@ impl SettingTypeRegistrar for RecordingRegistrar {
 /// One connection, because `SQLite` `:memory:` is per-connection: every
 /// repository and every transaction must see the same schema and data.
 pub async fn sqlite_provider() -> Arc<DBProvider<DbError>> {
-    let opts = ConnectOpts {
+    let db = connect_db("sqlite::memory:", sqlite_opts())
+        .await
+        .expect("in-memory sqlite connects");
+    migrated(db).await
+}
+
+/// As [`sqlite_provider`], with every statement recorded: for a test that
+/// pins how many round trips an operation takes, which no timing assertion
+/// could do without flaking. The recorder attaches before the connection is
+/// wrapped, the only point `SeaORM` lets it.
+pub async fn sqlite_provider_recorded() -> (Arc<DBProvider<DbError>>, QueryRecorder) {
+    let (db, recorder) =
+        toolkit_db::test_support::connect_with_recorder("sqlite::memory:", sqlite_opts())
+            .await
+            .expect("in-memory sqlite connects with a recorder");
+    (migrated(db).await, recorder)
+}
+
+fn sqlite_opts() -> ConnectOpts {
+    ConnectOpts {
         max_conns: Some(1),
         min_conns: Some(1),
         ..Default::default()
-    };
-    let db = connect_db("sqlite::memory:", opts)
-        .await
-        .expect("in-memory sqlite connects");
+    }
+}
+
+async fn migrated(db: Db) -> Arc<DBProvider<DbError>> {
     run_migrations_for_testing(
         &db,
         crate::infra::storage::migrations::Migrator::migrations(),
@@ -263,6 +283,12 @@ pub struct FakeHierarchy {
     /// Report every bounded walk as cut short: a subtree larger than any
     /// budget, without building one.
     pub truncate_subtrees: std::sync::atomic::AtomicBool,
+    /// How many bounded walks were asked for: what a caller resolving a whole
+    /// subtree asks once, however many descendants it holds.
+    pub subtree_calls: std::sync::atomic::AtomicUsize,
+    /// Never answer a bounded walk: a tenant resolver that has stopped
+    /// answering, for the time budget a walk runs under.
+    pub stall_subtrees: std::sync::atomic::AtomicBool,
 }
 
 /// What [`FakeHierarchy::on_chain`] runs.
@@ -292,6 +318,15 @@ impl FakeHierarchy {
 
     pub fn chain_calls(&self) -> usize {
         self.chain_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn subtree_calls(&self) -> usize {
+        self.subtree_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Add a tenant below `parent` to a tree already handed out.
+    pub fn add_tenant(&self, id: Uuid, parent: Uuid) {
+        self.parents.lock().expect("lock").insert(id, Some(parent));
     }
 
     /// Every tenant below `tenant` that administration from it can reach:
@@ -376,14 +411,19 @@ impl TenantHierarchy for FakeHierarchy {
         Ok(self.standalone.lock().expect("lock").contains(&tenant))
     }
 
-    async fn descendants_bfs(
-        &self,
-        tenant: Uuid,
-        budget: usize,
-    ) -> Result<(Vec<Uuid>, bool), DomainError> {
+    async fn subtree(&self, tenant: Uuid, budget: usize) -> Result<Subtree, DomainError> {
+        self.subtree_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .stall_subtrees
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            std::future::pending::<()>().await;
+        }
         let reachable = self.reachable(tenant).await?;
         let parents = self.parents.lock().expect("lock").clone();
         let mut order = Vec::new();
+        let mut parent = HashMap::new();
         let mut queue = std::collections::VecDeque::from([tenant]);
         let mut truncated = false;
         while let Some(next) = queue.pop_front() {
@@ -399,6 +439,7 @@ impl TenantHierarchy for FakeHierarchy {
                     break;
                 }
                 order.push(kid);
+                parent.insert(kid, next);
                 queue.push_back(kid);
             }
             if truncated {
@@ -411,7 +452,11 @@ impl TenantHierarchy for FakeHierarchy {
         {
             truncated = true;
         }
-        Ok((order, truncated))
+        Ok(Subtree {
+            order,
+            parent,
+            truncated,
+        })
     }
 }
 
@@ -490,7 +535,16 @@ impl ResolutionHarness {
     }
 
     pub async fn with_ttl(ttl: Duration) -> Self {
-        let db = sqlite_provider().await;
+        Self::over(sqlite_provider().await, ttl).await
+    }
+
+    /// A harness whose database records every statement.
+    pub async fn recorded() -> (Self, QueryRecorder) {
+        let (db, recorder) = sqlite_provider_recorded().await;
+        (Self::over(db, Duration::from_secs(30)).await, recorder)
+    }
+
+    async fn over(db: Arc<DBProvider<DbError>>, ttl: Duration) -> Self {
         let tree = Tree::new();
         let hierarchy = Arc::new(tree.hierarchy());
         let cache = Arc::new(EffectiveCache::new(ttl));
@@ -555,6 +609,50 @@ impl ResolutionHarness {
         value_type_id: &str,
         classification: &str,
     ) -> Uuid {
+        self.declare_in(
+            self.category_id,
+            name,
+            scope_class,
+            default,
+            value_type_id,
+            classification,
+        )
+        .await
+    }
+
+    /// A second category beside the harness's own, by slug.
+    pub async fn add_category(&self, slug: &str) -> Uuid {
+        let conn = self.db.conn().expect("connection");
+        CategoryRepo
+            .insert(
+                &conn,
+                &AccessScope::allow_all(),
+                CategoryDraft {
+                    key: CategoryKey::parse(slug).expect("slug"),
+                    name: slug.to_owned(),
+                    description: None,
+                    domain_affinity: None,
+                    sort_order: 0,
+                    icon: None,
+                },
+            )
+            .await
+            .expect("category")
+            .id
+    }
+
+    /// Declare a setting in a named category; its key still carries the
+    /// harness's `network` segment, so the key names one category and the
+    /// row another — what a filter on `category_id` must follow.
+    pub async fn declare_in(
+        &self,
+        category_id: Uuid,
+        name: &str,
+        scope_class: &str,
+        default: Value,
+        value_type_id: &str,
+        classification: &str,
+    ) -> Uuid {
         let conn = self.db.conn().expect("connection");
         let key = self.key(name);
         DeclarationRepo
@@ -565,7 +663,7 @@ impl ResolutionHarness {
                     key: key.to_string(),
                     leaf_slug: name.to_owned(),
                     value_type_id: value_type_id.to_owned(),
-                    category_id: self.category_id,
+                    category_id,
                     default_value: default,
                     scope_class: scope_class.to_owned(),
                     mode: "standard".to_owned(),

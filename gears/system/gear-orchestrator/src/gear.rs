@@ -233,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn init_reads_trusted_registrars_config() {
         let gear = init_with_config(serde_json::json!({
-            "trusted_registrars": ["flight-control", "platform-host"]
+            "trusted_registrars": ["oagw", "cluster"]
         }))
         .await
         .expect("init with a trusted_registrars config section must succeed");
@@ -241,7 +241,7 @@ mod tests {
         let policy = gear.policy.get().expect("init must build the policy");
         assert_eq!(
             policy.trusted_registrars,
-            string_set(&["flight-control", "platform-host"]),
+            string_set(&["oagw", "cluster"]),
             "both configured registrars must reach the policy"
         );
     }

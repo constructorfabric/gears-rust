@@ -604,13 +604,17 @@ async fn pg_spec_009_expired_backlog_swept_in_bounded_batches() {
     .await;
     let connection_string = config.connection_string.clone();
     let schema = config.schema.clone();
+    // No background reaper: it sweeps at startup and again whenever `try_lock`
+    // below signals its deadline hint, and its `SKIP LOCKED` batches would take
+    // part of the backlog this test counts. `__test_sweep_once` must be the only
+    // sweeper for the exact counts below to mean anything.
     let handle = PostgresLockPlugin::builder(config)
+        .__without_reaper()
         .build_and_start()
         .await
         .unwrap();
     // The seams live on the concrete backend, as in PG-SPEC-005.
     let lock: Arc<PostgresLock> = handle.__test_lock();
-    let lock_backend = handle.lock();
     let control_pool = common::raw_pool(&connection_string).await;
 
     // An empty table has no next deadline at all.
@@ -638,11 +642,19 @@ async fn pg_spec_009_expired_backlog_swept_in_bounded_batches() {
     .expect("seed the expired backlog");
 
     // A row that is *not* expired must survive the sweep and then be what the
-    // next-deadline probe reports.
-    let _guard = lock_backend
-        .try_lock("spec9-live", Duration::from_mins(5))
-        .await
-        .expect("acquire a live lock");
+    // next-deadline probe reports. Seeded directly rather than via `try_lock`:
+    // an acquisition signals the reaper's `deadline_hint` (PG-SPEC-010), and the
+    // background reaper woken by it would drain the same backlog concurrently.
+    // Its `FOR UPDATE SKIP LOCKED` batches then leave this sweep a short batch,
+    // so it stops early and the count below races.
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO {schema}.cluster_lock \
+         (name, owner, fence, acquired_at, expires_at) \
+         VALUES ('spec9-live', 'spec9-foreign-owner', 1, now(), now() + interval '5 minutes')"
+    )))
+    .execute(&control_pool)
+    .await
+    .expect("seed a live lock");
 
     let swept = lock.__test_sweep_once().await.expect("sweep");
     assert_eq!(

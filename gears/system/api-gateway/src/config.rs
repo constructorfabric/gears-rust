@@ -96,8 +96,8 @@ pub struct ApiGatewayConfig {
     #[serde(default)]
     pub gateway_proxy: GatewayProxyConfig,
 
-    /// Platform-plane credential for the embedded platform-host, serving **both
-    /// directions** from one block:
+    /// Platform-plane credential for the embedded flight-control host, serving
+    /// **both directions** from one block:
     ///
     /// - **Inbound** — `internal_auth_middleware`, installed ahead of the tenant
     ///   plane, validates the `X-ToolKit-Internal-Token` on co-hosted internal

@@ -332,9 +332,10 @@ pub fn register_routes(
         .description(
             "Report whether the candidate would be accepted, with field-level detail, the \
              current effective value and its source at the target, and - for a cascading \
-             setting - the descendants the change would affect, in pages. Read-only: needs no \
-             step-up, stores nothing, emits no audit record, and is never required before a \
-             write.",
+             setting - the descendants the change would affect, in pages, unless the body \
+             says `impact: false`, for a client that fetches that report on its own time \
+             through `impact`. Read-only: needs no step-up, stores nothing, emits no audit \
+             record, and is never required before a write.",
         )
         .tag(TAG)
         .authenticated()
@@ -364,7 +365,10 @@ pub fn register_routes(
             "Which descendants of the target would see a different effective value under the \
              candidate: the first `limit` in breadth-first order (default 100, at most 500), \
              the total, how many were scanned under the node budget of 5000, and whether the \
-             report was truncated. Standalone descendants are omitted from the list and the \
+             report was truncated - by that budget, by `limit`, or by the time budget of one \
+             second the walk runs under, in which case nothing was scanned. The subtree is \
+             resolved in one pass, a fixed number of round trips whatever its size. Standalone \
+             descendants are omitted from the list and the \
              count; each listed descendant's current value is masked by the setting's \
              classification. A POST because the candidate travels in the body, as it does \
              for `validate` - a value may run to 64 KiB. Read-only, informational, and never \

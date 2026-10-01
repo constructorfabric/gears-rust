@@ -69,16 +69,17 @@ impl crate::domain::repos::ChatRepository for ChatRepository {
             .secure()
             .scope_with(scope);
 
+        let query = super::with_id_tiebreaker(query, ("updated_at", SortDir::Desc), SortDir::Desc);
         let page = paginate_odata::<ChatCursorField, ChatODataMapper, _, _, _, _>(
             base_query,
             conn,
-            query,
-            ("updated_at", SortDir::Desc),
+            &query,
+            ("id", SortDir::Desc),
             self.limit_cfg,
             Into::into,
         )
         .await
-        .map_err(db_err)?;
+        .map_err(super::odata_err)?;
 
         Ok(page)
     }
@@ -129,6 +130,28 @@ impl crate::domain::repos::ChatRepository for ChatRepository {
             .await
             .map_err(db_err)?;
         Ok(chat)
+    }
+
+    async fn touch_activity<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<bool, DomainError> {
+        let result = Entity::update_many()
+            .filter(
+                sea_orm::Condition::all()
+                    .add(Expr::col(Column::Id).eq(id))
+                    .add(Expr::col(Column::DeletedAt).is_null()),
+            )
+            .col_expr(Column::UpdatedAt, Expr::value(OffsetDateTime::now_utc()))
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_err)?;
+
+        Ok(result.rows_affected > 0)
     }
 
     async fn soft_delete<C: DBRunner>(

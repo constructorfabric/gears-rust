@@ -141,6 +141,8 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
         // ── Agentic-level mutable state (persists across search_knowledge iterations) ──
         let mut accumulated_text = String::new();
         let mut cancelled = false;
+        // When the disconnect was observed; `time_to_abort_ms` is measured from here.
+        let mut cancel_observed_at: Option<std::time::Instant> = None;
         let mut web_search_call_count: u32 = 0;
         let mut web_search_completed_count: u32 = 0;
         let mut code_interpreter_call_count: u32 = 0;
@@ -268,6 +270,11 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
             features,
         };
         builder = builder.metadata(metadata);
+        // Provider-side abuse attribution (`user` field on adapters that send it).
+        builder = builder.user_identity(
+            ctx.subject_tenant_id().to_string(),
+            ctx.subject_id().to_string(),
+        );
 
         // Forward typed model-policy API params; each adapter selects the
         // fields its protocol supports.
@@ -391,6 +398,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         };
                         fctx.metrics.record_stream_disconnected(disconnect_stage);
                     }
+                    cancel_observed_at = Some(std::time::Instant::now());
                     provider_stream.cancel();
                     cancelled = true;
                     break;
@@ -422,31 +430,34 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                                     accumulated_text.push_str(content);
                                 }
 
-                                // Throttled progress timestamp update for orphan detection.
-                                // Timer resets only on success — retry sooner on transient
-                                // failures to avoid stale last_progress_at triggering false
-                                // orphan detection.
-                                if let Some(ref fctx) = fin_ctx
-                                    && last_progress_update.elapsed() >= PROGRESS_UPDATE_INTERVAL
-                                {
-                                    let ok = match fctx.db.conn() {
-                                        Ok(conn) => {
-                                            match fctx.turn_repo.update_progress_at(&conn, &fctx.scope, fctx.turn_id).await {
-                                                Ok(_) => true,
-                                                Err(e) => {
-                                                    warn!(turn_id = %fctx.turn_id, error = %e, "failed to update progress timestamp");
-                                                    false
-                                                }
+                            }
+
+                            // Throttled progress timestamp update for orphan detection on
+                            // any provider progress (text or tool events), so a long tool
+                            // phase is not mistaken for an orphan.
+                            // Timer resets only on success — retry sooner on transient
+                            // failures to avoid stale last_progress_at triggering false
+                            // orphan detection.
+                            if progress_update_due(&client_event, last_progress_update.elapsed())
+                                && let Some(ref fctx) = fin_ctx
+                            {
+                                let ok = match fctx.db.conn() {
+                                    Ok(conn) => {
+                                        match fctx.turn_repo.update_progress_at(&conn, &fctx.scope, fctx.turn_id).await {
+                                            Ok(_) => true,
+                                            Err(e) => {
+                                                warn!(turn_id = %fctx.turn_id, error = %e, "failed to update progress timestamp");
+                                                false
                                             }
                                         }
-                                        Err(e) => {
-                                            warn!(turn_id = %fctx.turn_id, error = %e, "failed to get DB connection for progress update");
-                                            false
-                                        }
-                                    };
-                                    if ok {
-                                        last_progress_update = std::time::Instant::now();
                                     }
+                                    Err(e) => {
+                                        warn!(turn_id = %fctx.turn_id, error = %e, "failed to get DB connection for progress update");
+                                        false
+                                    }
+                                };
+                                if ok {
+                                    last_progress_update = std::time::Instant::now();
                                 }
                             }
 
@@ -548,6 +559,32 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                                                     warn!(turn_id = %fctx.turn_id, error = %e, "failed to acquire DB connection for web_search_completed_count");
                                                 }
                                             }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Count provider-native file_search calls. They share the
+                            // file_search counter with search_knowledge: the two tools
+                            // are never enabled in the same request, so the agentic
+                            // iteration cap below is not affected.
+                            if let ClientSseEvent::Tool {
+                                phase: ToolPhase::Done,
+                                name,
+                                ..
+                            } = client_event
+                                && name == "file_search"
+                            {
+                                knowledge_call_count += 1;
+                                if let Some(ref fctx) = fin_ctx {
+                                    match fctx.db.conn() {
+                                        Ok(conn) => {
+                                            if let Err(e) = fctx.turn_repo.increment_tool_calls(&conn, &fctx.scope, fctx.turn_id, ToolCallType::FileSearch).await {
+                                                warn!(turn_id = %fctx.turn_id, error = %e, "failed to persist file_search_completed_count");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(turn_id = %fctx.turn_id, error = %e, "failed to acquire DB connection for file_search_completed_count");
                                         }
                                     }
                                 }
@@ -656,8 +693,13 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
 
                             let stream_event = StreamEvent::from(client_event);
                             if tx.send(stream_event).await.is_err() {
-                                // Receiver dropped (client disconnect handled by relay)
+                                // Receiver dropped: the client disconnected while
+                                // this send was blocked on a full channel. Finalize
+                                // as cancelled, same as the cancel-token path.
                                 info!("channel closed (client disconnect), exiting provider task");
+                                cancel_observed_at = Some(std::time::Instant::now());
+                                provider_stream.cancel();
+                                cancelled = true;
                                 break;
                             }
 
@@ -755,6 +797,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
 
         if cancelled {
             let elapsed = stream_start.elapsed();
+            let abort_ms = cancel_observed_at.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
             info!(
                 terminal = "cancelled",
                 duration_ms = elapsed.as_millis() as u64,
@@ -783,7 +826,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                 // Metrics: cancelled stream
                 let ms = elapsed.as_secs_f64() * 1000.0;
                 fctx.metrics.record_cancel_effective(trigger::DISCONNECT);
-                fctx.metrics.record_time_to_abort_ms(trigger::DISCONNECT, ms);
+                fctx.metrics.record_time_to_abort_ms(trigger::DISCONNECT, abort_ms);
                 fctx.metrics.record_stream_total_latency_ms(&fctx.provider_id, &fctx.effective_model, ms);
             }
 
@@ -834,7 +877,10 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         Some(elapsed.as_millis() as u64),
                     );
                     match fctx.finalization_svc.finalize_turn_cas(input).await {
-                        Ok(outcome) if outcome.won_cas => {
+                        Ok(outcome)
+                            if outcome.won_cas
+                                && outcome.persisted_state == TurnState::Completed =>
+                        {
                             // P4-2: Map provider file_ids to internal UUIDs
                             let mapped = crate::domain::citation_mapping::map_citation_ids(
                                 citations,
@@ -863,31 +909,25 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                             };
                             let _ = tx
                                 .send(StreamEvent::Done(Box::new(DoneData {
-                                    usage: Some(usage),
+                                    usage,
                                     effective_model: fctx.effective_model.clone(),
                                     selected_model: fctx.selected_model.clone(),
-                                    quota_decision: fctx.quota_decision.clone(),
+                                    quota_decision: crate::domain::stream_events::QuotaDecisionKind::from_decision(
+                                        &fctx.quota_decision,
+                                    ),
                                     downgrade_from: fctx.downgrade_from.clone(),
                                     downgrade_reason: fctx.downgrade_reason.clone(),
                                     quota_warnings,
                                 })))
                                 .await;
                         }
+                        Ok(outcome) if outcome.won_cas => {
+                            send_unsaved_answer_error(&tx).await;
+                        }
                         Ok(_) => { /* CAS loser — no SSE emission */ }
                         Err(fe) => {
                             warn!(error = %fe, "finalization failed on completed stream");
-                            // Emit Done anyway so client isn't left hanging
-                            let _ = tx
-                                .send(StreamEvent::Done(Box::new(DoneData {
-                                    usage: Some(usage),
-                                    effective_model: fctx.effective_model.clone(),
-                                    selected_model: fctx.selected_model.clone(),
-                                    quota_decision: fctx.quota_decision.clone(),
-                                    downgrade_from: fctx.downgrade_from.clone(),
-                                    downgrade_reason: fctx.downgrade_reason.clone(),
-                                    quota_warnings: None,
-                                })))
-                                .await;
+                            send_finalization_failed_error(&tx).await;
                         }
                     }
                 } else {
@@ -905,10 +945,10 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                     }
                     let _ = tx
                         .send(StreamEvent::Done(Box::new(DoneData {
-                            usage: Some(usage),
+                            usage,
                             effective_model: model.clone(),
                             selected_model: model.clone(),
-                            quota_decision: "allow".into(),
+                            quota_decision: crate::domain::stream_events::QuotaDecisionKind::Allow,
                             downgrade_from: None,
                             downgrade_reason: None,
                             quota_warnings: None,
@@ -960,7 +1000,10 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                         Some(elapsed.as_millis() as u64),
                     );
                     match fctx.finalization_svc.finalize_turn_cas(input).await {
-                        Ok(outcome) if outcome.won_cas => {
+                        Ok(outcome)
+                            if outcome.won_cas
+                                && outcome.persisted_state == TurnState::Completed =>
+                        {
                             let quota_warnings = match fctx
                                 .quota_warnings_provider
                                 .get_quota_warnings(&fctx.scope, fctx.tenant_id, fctx.user_id)
@@ -974,39 +1017,34 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                             };
                             let _ = tx
                                 .send(StreamEvent::Done(Box::new(DoneData {
-                                    usage: Some(usage),
+                                    usage,
                                     effective_model: fctx.effective_model.clone(),
                                     selected_model: fctx.selected_model.clone(),
-                                    quota_decision: fctx.quota_decision.clone(),
+                                    quota_decision: crate::domain::stream_events::QuotaDecisionKind::from_decision(
+                                        &fctx.quota_decision,
+                                    ),
                                     downgrade_from: fctx.downgrade_from.clone(),
                                     downgrade_reason: fctx.downgrade_reason.clone(),
                                     quota_warnings,
                                 })))
                                 .await;
                         }
+                        Ok(outcome) if outcome.won_cas => {
+                            send_unsaved_answer_error(&tx).await;
+                        }
                         Ok(_) => {}
                         Err(fe) => {
                             warn!(error = %fe, "finalization failed on incomplete stream");
-                            let _ = tx
-                                .send(StreamEvent::Done(Box::new(DoneData {
-                                    usage: Some(usage),
-                                    effective_model: fctx.effective_model.clone(),
-                                    selected_model: fctx.selected_model.clone(),
-                                    quota_decision: fctx.quota_decision.clone(),
-                                    downgrade_from: fctx.downgrade_from.clone(),
-                                    downgrade_reason: fctx.downgrade_reason.clone(),
-                                    quota_warnings: None,
-                                })))
-                                .await;
+                            send_finalization_failed_error(&tx).await;
                         }
                     }
                 } else {
                     let _ = tx
                         .send(StreamEvent::Done(Box::new(DoneData {
-                            usage: Some(usage),
+                            usage,
                             effective_model: model.clone(),
                             selected_model: model.clone(),
-                            quota_decision: "allow".into(),
+                            quota_decision: crate::domain::stream_events::QuotaDecisionKind::Allow,
                             downgrade_from: None,
                             downgrade_reason: None,
                             quota_warnings: None,
@@ -1424,9 +1462,65 @@ fn format_chunks_as_text(chunks: &[RetrievedChunk]) -> String {
         })
 }
 
+/// Whether `event` should bump `last_progress_at`: text and tool events count
+/// as provider progress, throttled to one update per `PROGRESS_UPDATE_INTERVAL`.
+fn progress_update_due(event: &ClientSseEvent, since_last_update: std::time::Duration) -> bool {
+    matches!(
+        event,
+        ClientSseEvent::Delta { .. } | ClientSseEvent::Tool { .. }
+    ) && since_last_update >= PROGRESS_UPDATE_INTERVAL
+}
+
+/// Terminal error for a completed answer whose message could not be
+/// persisted; the turn was stored as `failed` (`message_persistence_failed`).
+async fn send_unsaved_answer_error(tx: &mpsc::Sender<StreamEvent>) {
+    let event = StreamEvent::Error(ErrorData {
+        code: "message_persistence_failed".to_owned(),
+        message: "The response could not be saved".to_owned(),
+    });
+    if tx.send(event).await.is_err() {
+        debug!("client disconnected before the terminal error was sent");
+    }
+}
+
+/// Terminal error when the finalization transaction did not commit; the turn
+/// stays `running` until the orphan watchdog fails it.
+async fn send_finalization_failed_error(tx: &mpsc::Sender<StreamEvent>) {
+    let event = StreamEvent::Error(ErrorData {
+        code: "finalization_failed".to_owned(),
+        message: "The response could not be saved".to_owned(),
+    });
+    if tx.send(event).await.is_err() {
+        debug!("client disconnected before the terminal error was sent");
+    }
+}
+
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_event_counts_as_progress() {
+        let tool = ClientSseEvent::Tool {
+            phase: ToolPhase::Start,
+            name: "web_search",
+            details: serde_json::json!({}),
+        };
+        let delta = ClientSseEvent::Delta {
+            r#type: "text",
+            content: "x".to_owned(),
+        };
+        let citations = ClientSseEvent::Citations { items: Vec::new() };
+        let just_under = PROGRESS_UPDATE_INTERVAL
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap();
+
+        assert!(progress_update_due(&tool, PROGRESS_UPDATE_INTERVAL));
+        assert!(progress_update_due(&delta, PROGRESS_UPDATE_INTERVAL));
+        assert!(!progress_update_due(&tool, just_under), "throttled");
+        assert!(!progress_update_due(&citations, PROGRESS_UPDATE_INTERVAL));
+    }
 
     fn chunk(source_uri: &str, title: &str, text: &str) -> RetrievedChunk {
         RetrievedChunk {

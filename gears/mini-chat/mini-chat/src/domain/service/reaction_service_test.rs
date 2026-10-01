@@ -302,6 +302,33 @@ async fn delete_reaction_idempotent() {
 }
 
 #[tokio::test]
+async fn delete_reaction_on_user_message_rejected() {
+    let db = inmem_db().await;
+    let db_provider = mock_db_provider(db);
+    let chat_repo = Arc::new(OrmChatRepository::new(limit_cfg()));
+
+    let tenant_id = Uuid::new_v4();
+    let ctx = test_security_ctx(tenant_id);
+
+    let (chat_id, user_msg_id, _assistant_msg_id) =
+        setup_chat_with_messages(&db_provider, &chat_repo, &ctx, tenant_id).await;
+
+    let reaction_svc = build_reaction_service(Arc::clone(&db_provider), Arc::clone(&chat_repo));
+
+    let result = reaction_svc
+        .delete_reaction(&ctx, chat_id, user_msg_id)
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(DomainError::InvalidReactionTarget { id }) if id == user_msg_id
+        ),
+        "Expected InvalidReactionTarget, got {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn set_reaction_chat_not_found() {
     let db = inmem_db().await;
     let db_provider = mock_db_provider(db);

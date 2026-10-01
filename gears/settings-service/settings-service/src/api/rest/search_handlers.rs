@@ -14,6 +14,7 @@ use toolkit_security::{AccessScope, SecurityContext};
 
 use crate::api::authz::{self, resource};
 use crate::api::rest::search_dto::{SearchHitDto, render_hit};
+use crate::api::rest::setting_filter::interpret;
 use crate::api::rest::setting_handlers::{
     conn_error, gate_target, may_read_pii, parse_tenant, unsupported,
 };
@@ -29,9 +30,9 @@ pub type ConcreteSearchService = SearchService<SearchRepo>;
 
 const READ: &str = "read";
 
-/// The plain query parameters; `limit` and `cursor` arrive through the `OData`
-/// extractor, which is also what refuses the options this resource does not
-/// take.
+/// The plain query parameters; `$filter`, `limit` and `cursor` arrive through
+/// the `OData` extractor, which is also what carries the options this
+/// resource refuses.
 #[derive(Debug, Default, Deserialize)]
 pub struct SearchParams {
     /// Free text, at least two characters.
@@ -43,12 +44,13 @@ pub struct SearchParams {
 }
 
 /// `GET /settings-service/v1/search?q={query}&tenant={tenant_id}` with
-/// `limit` and `cursor`.
+/// `$filter` in browse's grammar, `limit` and `cursor`.
 ///
 /// # Errors
 /// 400 when `q` is absent, shorter than two characters or longer than two
-/// hundred, on a malformed `tenant`, on `$filter`, `$orderby` or `$select`,
-/// or on a cursor minted for another search; 403 when the caller may not read
+/// hundred, on a malformed `tenant`, on a `$filter` outside the grammar, on
+/// `$orderby` or `$select`, or on a cursor minted for another search; 403
+/// when the caller may not read
 /// values or the target is outside its subtree or standalone; 503 when a
 /// dependency cannot answer.
 // @cpt-dod:cpt-cf-settings-service-dod-search-discoverability-surface:p2
@@ -64,12 +66,17 @@ pub async fn search_settings(
     // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-1
     let needle = Needle::parse(params.q.as_deref().unwrap_or_default())?;
     let requested = parse_tenant(params.tenant.as_deref())?;
-    if query.filter.is_some() || !query.order.0.is_empty() || query.select.is_some() {
+    if !query.order.0.is_empty() || query.select.is_some() {
         return Err(unsupported(
-            "search takes `q`, `tenant`, `limit` and `cursor`; results are ordered by key",
+            "search takes `q`, `tenant`, `$filter`, `limit` and `cursor`; results are \
+             ordered by key, and no field is selected out of a hit",
         )
         .into());
     }
+    // The same grammar and the same reading as browse: `category_id` and
+    // `key` select declarations and go into the page query; `needs_review`
+    // narrows the corpus to settings with a flagged override.
+    let filter = interpret(query.filter.as_deref())?;
     // @cpt-end:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-1
 
     // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-2
@@ -111,7 +118,13 @@ pub async fn search_settings(
 
     // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-6
     let mut query: ODataQuery = query;
-    query.filter_hash = Some(cursor_binding(&needle, target_tenant, corpus));
+    query.filter_hash = Some(cursor_binding(
+        &needle,
+        target_tenant,
+        corpus,
+        query.filter.as_deref(),
+    ));
+    query.filter = filter.declarations.map(Box::new);
     // @cpt-end:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-6
 
     let conn = db.conn().map_err(|e| conn_error(&e))?;
@@ -133,6 +146,7 @@ pub async fn search_settings(
                 tenant_ids: &tenant_ids,
                 hidden_for: &caller_chain,
                 override_limit: SEARCH_OVERRIDE_LIMIT,
+                flagged_only: filter.needs_review,
                 query: &query,
             },
         )

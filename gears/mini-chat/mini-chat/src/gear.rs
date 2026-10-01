@@ -12,7 +12,7 @@ use oagw_sdk::ServiceGatewayClientV1;
 use sea_orm_migration::MigrationTrait;
 use tokio_util::sync::CancellationToken;
 use toolkit_db::outbox::{LeaseConfig, Outbox, OutboxHandle, Partitions};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::api::rest::routes;
 use crate::background_workers::{self, WORKER_STOP_TIMEOUT, WorkerConfigs};
@@ -127,7 +127,7 @@ impl Gear for MiniChatGear {
             .validate()
             .map_err(|e| anyhow::anyhow!("streaming config: {e}"))?;
         cfg.estimation_budgets
-            .validate()
+            .validate(cfg.streaming.max_output_tokens)
             .map_err(|e| anyhow::anyhow!("estimation_budgets config: {e}"))?;
         cfg.quota
             .validate()
@@ -151,12 +151,27 @@ impl Gear for MiniChatGear {
         cfg.orphan_watchdog
             .validate()
             .map_err(|e| anyhow::anyhow!("orphan_watchdog config: {e}"))?;
+        cfg.upload_reaper
+            .validate()
+            .map_err(|e| anyhow::anyhow!("upload_reaper config: {e}"))?;
         cfg.thread_summary_worker
             .validate()
             .map_err(|e| anyhow::anyhow!("thread_summary_worker config: {e}"))?;
         cfg.cleanup_worker
             .validate()
             .map_err(|e| anyhow::anyhow!("cleanup_worker config: {e}"))?;
+        for field in cfg
+            .cleanup_worker
+            .deprecated_fields_set()
+            .into_iter()
+            .chain(cfg.thread_summary_worker.deprecated_fields_set())
+            .chain(cfg.estimation_budgets.deprecated_fields_set())
+        {
+            warn!(
+                field,
+                "deprecated config field is set and has no effect (ADR-0010)"
+            );
+        }
         cfg.thumbnail
             .validate()
             .map_err(|e| anyhow::anyhow!("thumbnail config: {e}"))?;
@@ -276,12 +291,13 @@ impl Gear for MiniChatGear {
                 Arc<dyn crate::domain::ports::VectorStoreProvider>,
             ) = match entry.storage_kind {
                 crate::config::StorageKind::Azure => {
-                    let api_version = entry.api_version.clone().unwrap_or_else(|| {
-                        panic!(
-                            "provider '{provider_id}': storage_kind is 'azure' \
-                             but api_version is not set"
+                    // `ProviderEntry::validate` already rejects this at the top of `init`.
+                    let api_version = entry.api_version.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "providers config: provider '{provider_id}': storage_kind is \
+                             'azure' but api_version is not set"
                         )
-                    });
+                    })?;
                     (
                         Arc::new(
                             crate::infra::llm::providers::azure_file_storage::AzureFileStorage::new(
@@ -317,15 +333,20 @@ impl Gear for MiniChatGear {
             file_impls.insert(provider_id.clone(), file);
             vs_impls.insert(provider_id.clone(), vs);
         }
+        let backend_aliases = build_backend_aliases(&file_impls, |provider_id| {
+            provider_resolver.resolve_storage_backend(provider_id)
+        });
         let file_storage: Arc<dyn crate::domain::ports::FileStorageProvider> = Arc::new(
             crate::infra::llm::providers::dispatching_storage::DispatchingFileStorage::new(
                 file_impls,
-            ),
+            )
+            .with_aliases(backend_aliases.clone()),
         );
         let vector_store_prov: Arc<dyn crate::domain::ports::VectorStoreProvider> = Arc::new(
             crate::infra::llm::providers::dispatching_storage::DispatchingVectorStore::new(
                 vs_impls,
-            ),
+            )
+            .with_aliases(backend_aliases),
         );
 
         // ── Metrics ─────────────────────────────────────────────────────────
@@ -444,6 +465,7 @@ impl Gear for MiniChatGear {
         self.worker_configs
             .set(WorkerConfigs {
                 orphan_watchdog: cfg.orphan_watchdog,
+                upload_reaper: cfg.upload_reaper,
             })
             .map_err(|_| anyhow::anyhow!("{} worker_configs already set", Self::MODULE_NAME))?;
 
@@ -551,6 +573,11 @@ impl RunnableCapability for MiniChatGear {
         // Start the outbox pipeline now that OAGW upstreams are registered.
         // Cleanup handlers can immediately call provider DELETE via OAGW.
         if let Some(od) = self.outbox_deferred.get() {
+            crate::infra::workers::thread_summary_worker::check_summary_model(
+                od.model_policy_gw.as_ref(),
+                &od.thread_summary_config,
+            )
+            .await;
             let outbox_db = od.db.db();
             let num_partitions = od.outbox_config.num_partitions;
             let max_cleanup_attempts = od.cleanup_config.max_attempts;
@@ -617,6 +644,13 @@ impl RunnableCapability for MiniChatGear {
                         ),
                     ),
                 )
+                // The summary handler makes a non-streaming LLM call (with
+                // prompt-too-long retries); the default 30s lease would cancel
+                // and redeliver it mid-call.
+                .lease(LeaseConfig {
+                    duration: Duration::from_secs(od.thread_summary_config.claim_timeout_secs),
+                    ..LeaseConfig::default()
+                })
                 .queue(&od.outbox_config.audit_queue_name, partitions)
                 .leased(AuditEventHandler {
                     audit_gateway: Arc::clone(&od.audit_gateway),
@@ -659,14 +693,45 @@ impl RunnableCapability for MiniChatGear {
             None
         };
 
-        let (handles, worker_cancel) =
-            background_workers::spawn_workers(wc, &cancel, leader_elector.as_ref(), orphan_deps)?;
+        // The reaper enqueues attachment cleanup events, so it needs the
+        // outbox pipeline set up above.
+        let reaper_deps = if wc.upload_reaper.enabled {
+            let services = self.service.get().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} not initialized - init() must run before start()",
+                    Self::MODULE_NAME
+                )
+            })?;
+            let od = self
+                .outbox_deferred
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("{} outbox not initialized", Self::MODULE_NAME))?;
+            Some(crate::infra::workers::upload_reaper::UploadReaperDeps {
+                db: Arc::clone(&services.db),
+                outbox_enqueuer: Arc::clone(&od.enqueuer)
+                    as Arc<dyn crate::domain::repos::OutboxEnqueuer>,
+                metrics: Arc::clone(&services.metrics),
+            })
+        } else {
+            None
+        };
+
+        let (handles, worker_cancel) = background_workers::spawn_workers(
+            wc,
+            &cancel,
+            leader_elector.as_ref(),
+            orphan_deps,
+            reaper_deps,
+        )?;
         self.store_worker_runtime(handles, worker_cancel).await?;
 
         Ok(())
     }
 
     async fn stop(&self, cancel: CancellationToken) -> anyhow::Result<()> {
+        if let Some(services) = self.service.get() {
+            services.attachments.stop_background_tasks();
+        }
         if let Some(worker_cancel) = self
             .worker_cancel
             .lock()
@@ -886,6 +951,29 @@ async fn reconcile_deferred_once(
     }
 }
 
+/// Storage backend label → provider id, for cleanup rows that carry the label
+/// instead of the provider id. A label equal to its own provider id, or equal
+/// to another provider id, gets no alias. When several providers share a
+/// label, the smallest id wins deterministically; they share the storage
+/// account by definition.
+fn build_backend_aliases<V>(
+    impls: &std::collections::HashMap<String, V>,
+    backend_of: impl Fn(&str) -> String,
+) -> std::collections::HashMap<String, String> {
+    let mut backend_aliases = std::collections::HashMap::new();
+    let mut provider_ids: Vec<&String> = impls.keys().collect();
+    provider_ids.sort();
+    for provider_id in provider_ids {
+        let backend = backend_of(provider_id);
+        if &backend != provider_id && !impls.contains_key(&backend) {
+            backend_aliases
+                .entry(backend)
+                .or_insert_with(|| provider_id.clone());
+        }
+    }
+    backend_aliases
+}
+
 /// Exchange `OAuth2` client credentials via the `AuthN` resolver to obtain
 /// a `SecurityContext` for OAGW upstream provisioning.
 async fn exchange_client_credentials(
@@ -904,4 +992,63 @@ async fn exchange_client_credentials(
         .map_err(|e| anyhow::anyhow!("client credentials exchange failed: {e}"))?;
     info!("Security context obtained for OAGW provisioning");
     Ok(result.security_context)
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::build_backend_aliases;
+
+    fn impls(ids: &[&str]) -> HashMap<String, u8> {
+        ids.iter().map(|id| ((*id).to_owned(), 0)).collect()
+    }
+
+    fn backends(map: &[(&str, &str)]) -> impl Fn(&str) -> String {
+        let map: HashMap<String, String> = map
+            .iter()
+            .map(|(id, label)| ((*id).to_owned(), (*label).to_owned()))
+            .collect();
+        move |id| map.get(id).cloned().unwrap_or_else(|| id.to_owned())
+    }
+
+    #[test]
+    fn backend_alias_skips_label_equal_to_own_id() {
+        let aliases = build_backend_aliases(
+            &impls(&["openai", "azure_openai"]),
+            backends(&[("azure_openai", "azure")]),
+        );
+        assert_eq!(
+            aliases,
+            HashMap::from([("azure".to_owned(), "azure_openai".to_owned())])
+        );
+    }
+
+    #[test]
+    fn backend_alias_skips_label_that_is_a_provider_id() {
+        // `azure_eu` stores under the `openai` label, which is itself a
+        // provider id: rows labelled `openai` must keep going to `openai`.
+        let aliases = build_backend_aliases(
+            &impls(&["openai", "azure_eu"]),
+            backends(&[("azure_eu", "openai")]),
+        );
+        assert!(aliases.is_empty(), "got: {aliases:?}");
+    }
+
+    #[test]
+    fn backend_alias_shared_label_picks_smallest_id() {
+        let aliases = build_backend_aliases(
+            &impls(&["azure_west", "azure_east", "azure_north"]),
+            backends(&[
+                ("azure_west", "azure"),
+                ("azure_east", "azure"),
+                ("azure_north", "azure"),
+            ]),
+        );
+        assert_eq!(
+            aliases,
+            HashMap::from([("azure".to_owned(), "azure_east".to_owned())])
+        );
+    }
 }

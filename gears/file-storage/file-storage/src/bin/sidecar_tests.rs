@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use axum::response::IntoResponse;
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -25,7 +26,8 @@ use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, Uploa
 
 use super::{
     DEFAULT_MAX_BODY_BYTES, SidecarState, build_router, finalize_with_control_plane,
-    write_multipart_part_native, write_multipart_part_offset_object,
+    report_part_with_control_plane, write_multipart_part_native,
+    write_multipart_part_offset_object,
 };
 
 fn test_state() -> SidecarState {
@@ -679,9 +681,10 @@ async fn finalize_failure_does_not_leak_control_plane_url() {
     )
     .await;
 
-    let Err(response) = outcome else {
+    let Err(rejection) = outcome else {
         panic!("finalize must fail when the control plane returns an error status");
     };
+    let response = rejection.into_response();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
     let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1082,7 +1085,7 @@ async fn write_multipart_part_native_undersized_returns_400() {
         .await
         .expect_err("undersized part must be rejected");
     assert_eq!(
-        err.status(),
+        err.status,
         StatusCode::BAD_REQUEST,
         "undersized part is a client size mismatch, not an over-limit body"
     );
@@ -1119,7 +1122,7 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
             .await
             .expect_err("undersized part must be rejected");
     assert_eq!(
-        err.status(),
+        err.status,
         StatusCode::BAD_REQUEST,
         "undersized part is a client size mismatch, not an over-limit body"
     );
@@ -1221,4 +1224,264 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
         .await
         .expect("get from other backend");
     assert_eq!(&got_b[..], b"bytes-for-other");
+}
+
+/// Spawn a mock control plane that answers every request with `500` and
+/// return its base URL.
+async fn failing_control_plane() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock control plane");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            if stream.read(&mut buf).await.is_ok() {
+                stream
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n")
+                    .await
+                    .ok();
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// `op = multipart_part` claims for part 1, `size` bytes, at `backend_path`.
+fn part_claims(backend_id: &str, backend_path: &str, size: u64, backend_handle: String) -> Claims {
+    Claims {
+        op: Op::MultipartPart,
+        file_id: Uuid::now_v7(),
+        version_id: Uuid::now_v7(),
+        backend_id: backend_id.to_owned(),
+        backend_path: backend_path.to_owned(),
+        exp: OffsetDateTime::now_utc().unix_timestamp() + 60,
+        upload: UploadConstraints::default(),
+        multipart: MultipartClaims {
+            upload_id: Uuid::now_v7(),
+            part_number: 1,
+            offset: 0,
+            size,
+            backend_handle,
+        },
+        request_id: "test-request-id".to_owned(),
+        content_type: String::new(),
+        etag: String::new(),
+    }
+}
+
+/// A part that streams past its `size` claim is refused mid-stream with
+/// `413`, before anything reaches the native backend.
+#[tokio::test]
+async fn write_multipart_part_native_oversized_returns_413() {
+    let backend = InMemoryBackend::new("mem");
+    let backend_handle = backend
+        .initiate_multipart("/oversized-native")
+        .await
+        .expect("initiate native multipart session");
+    let claims = part_claims("mem", "/oversized-native", 4, backend_handle);
+
+    let err = write_multipart_part_native(&backend, &claims, 1, Body::from(b"longer".to_vec()))
+        .await
+        .expect_err("oversized part must be rejected");
+    assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// A body stream that errors part-way is the client's failure: `400`.
+#[tokio::test]
+async fn write_multipart_part_native_body_read_error_returns_400() {
+    let backend = InMemoryBackend::new("mem");
+    let claims = part_claims("mem", "/broken-body", 8, String::new());
+    let body = Body::from_stream(futures::stream::iter([
+        Ok(bytes::Bytes::from_static(b"part")),
+        Err(std::io::Error::other("client reset the stream")),
+    ]));
+
+    let err = write_multipart_part_native(&backend, &claims, 1, body)
+        .await
+        .expect_err("a body read error must be rejected");
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert_eq!(err.body, "body read error");
+}
+
+/// A native `upload_part` failure is a backend error, `500`, and names no
+/// backend detail. Here the session handle was never initiated.
+#[tokio::test]
+async fn write_multipart_part_native_backend_failure_returns_500() {
+    let backend = InMemoryBackend::new("mem");
+    let claims = part_claims("mem", "/no-session", 4, "no-such-session".to_owned());
+
+    let err = write_multipart_part_native(&backend, &claims, 1, Body::from(b"four".to_vec()))
+        .await
+        .expect_err("upload_part into an unknown session must fail");
+    assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(err.body, "backend error");
+}
+
+/// The offset-object path maps the backend's `max_size` refusal to `413`.
+#[tokio::test]
+async fn write_multipart_part_offset_object_oversized_returns_413() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let backend = LocalFsBackend::new("local-fs", dir.path());
+    let claims = part_claims("local-fs", "/oversized-offset", 4, String::new());
+
+    let err =
+        write_multipart_part_offset_object(&backend, &claims, 1, Body::from(b"longer".to_vec()))
+            .await
+            .expect_err("oversized part must be rejected");
+    assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// Any other offset-object write failure is a backend error, `500`. The
+/// backend root is a regular file, so no part can be written under it.
+#[tokio::test]
+async fn write_multipart_part_offset_object_backend_failure_returns_500() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root = dir.path().join("not-a-directory");
+    std::fs::write(&root, b"").expect("create a file where the root should be");
+    let backend = LocalFsBackend::new("local-fs", root);
+    let claims = part_claims("local-fs", "/unwritable/part", 4, String::new());
+
+    let err =
+        write_multipart_part_offset_object(&backend, &claims, 1, Body::from(b"four".to_vec()))
+            .await
+            .expect_err("a part under a file root must fail");
+    assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(err.body, "backend error");
+}
+
+/// An unreachable control plane fails the report-part callback with `502`
+/// once the retries are spent.
+#[tokio::test]
+async fn report_part_callback_unreachable_returns_502() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a port to release");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+
+    let mut state = test_state();
+    state.control_base_url = format!("http://{addr}");
+
+    let err = report_part_with_control_plane(
+        &state,
+        "dummy-token",
+        "test-request-id",
+        Uuid::nil(),
+        Uuid::nil(),
+        Uuid::nil(),
+        1,
+        "etag",
+        "deadbeef",
+        4,
+    )
+    .await
+    .expect_err("an unreachable control plane must fail the report");
+    assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(err.body, "report failed");
+}
+
+/// A failed finalize callback reaches the client as the upload's `502`.
+#[tokio::test]
+async fn upload_returns_502_when_finalize_fails() {
+    let (mut state, issuer, _backend) = test_download_state();
+    state.control_base_url = failing_control_plane().await;
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let token = upload_token(&issuer, file_id, version_id, "test", "/finalize-fails");
+
+    let response = build_router(state, DEFAULT_MAX_BODY_BYTES)
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"content".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+/// A part the sidecar refuses to write reaches the client with the write's
+/// status, and no report-part callback is made.
+#[tokio::test]
+async fn multipart_part_returns_413_when_part_write_fails() {
+    let (mut state, issuer, backend) = test_download_state();
+    state.control_base_url = failing_control_plane().await;
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let backend_path = format!("/{file_id}/{version_id}");
+    let backend_handle = backend
+        .initiate_multipart(&backend_path)
+        .await
+        .expect("initiate native multipart session");
+    let token = multipart_part_token(
+        &issuer,
+        file_id,
+        version_id,
+        "test",
+        &backend_path,
+        Uuid::now_v7(),
+        1,
+        0,
+        4,
+        &backend_handle,
+    );
+
+    let response = build_router(state, DEFAULT_MAX_BODY_BYTES)
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/1?fs-token={token}"
+            ))
+            .body(Body::from(b"longer than four".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// A written part whose report-part callback fails reaches the client as
+/// `502`, so it retries; the write and the report are idempotent per part.
+#[tokio::test]
+async fn multipart_part_returns_502_when_report_fails() {
+    let (mut state, issuer, backend) = test_download_state();
+    state.control_base_url = failing_control_plane().await;
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    let backend_path = format!("/{file_id}/{version_id}");
+    let backend_handle = backend
+        .initiate_multipart(&backend_path)
+        .await
+        .expect("initiate native multipart session");
+    let part = b"part".to_vec();
+    let token = multipart_part_token(
+        &issuer,
+        file_id,
+        version_id,
+        "test",
+        &backend_path,
+        Uuid::now_v7(),
+        1,
+        0,
+        part.len() as u64,
+        &backend_handle,
+    );
+
+    let response = build_router(state, DEFAULT_MAX_BODY_BYTES)
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/multipart/{file_id}/{version_id}/parts/1?fs-token={token}"
+            ))
+            .body(Body::from(part))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read response body");
+    assert_eq!(&body[..], b"report failed");
 }

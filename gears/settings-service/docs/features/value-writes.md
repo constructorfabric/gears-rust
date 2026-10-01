@@ -104,14 +104,14 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 - The target is outside the caller's subtree
 
 **Steps**:
-1. [x] - `p1` - Actor sends POST /settings-service/v1/settings/{key}/validate?tenant={tenant_id} with the candidate `value` and an optional `limit` for the impact page - `inst-vw-val-1`
+1. [x] - `p1` - Actor sends POST /settings-service/v1/settings/{key}/validate?tenant={tenant_id} with the candidate `value`, an optional `limit` for the impact page, and optionally `impact: false` to skip that page — for a client that fetches the report on its own time through `impact`, asynchronously, and waits only on the type check - `inst-vw-val-1`
 2. [x] - `p1` - Authorize `read` on the setting's key; **IF** deny or cannot be obtained → **RETURN** `403`; no step-up is consulted, since nothing is written - `inst-vw-val-2`
 3. [x] - `p1` - Confirm the target is within the caller's subtree and not standalone; **IF** not → **RETURN** `403` - `inst-vw-val-3`
 4. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** the caller's effective access is `hidden` → **RETURN** `404` - `inst-vw-val-4`
 5. [x] - `p1` - Validate the value through the Type Validator against the declaration's `value_type_id`, including the size cap and numeric canonicality, collecting field-level detail rather than stopping at the first fault - `inst-vw-val-5`
 6. [x] - `p1` - Resolve the current effective value and its source at the target through the Value Resolver - `inst-vw-val-6`
-7. [x] - `p1` - **IF** the scope class is `cascading` → invoke the bounded impact walk for the target and the candidate value - `inst-vw-val-7`
-8. [x] - `p1` - **RETURN** `200` with `valid` and any violations, the current effective value and source, and the impact page; the call stores nothing, emits no audit record, and is never a prerequisite for a write - `inst-vw-val-8`
+7. [x] - `p1` - **IF** the scope class is `cascading` **AND** the request did not skip the impact → invoke the bounded impact walk for the target and the candidate value - `inst-vw-val-7`
+8. [x] - `p1` - **RETURN** `200` with `valid` and any violations, the current effective value and source, and the impact page when it was asked for; the call stores nothing, emits no audit record, and is never a prerequisite for a write - `inst-vw-val-8`
 
 ### Set a Value
 
@@ -325,10 +325,11 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 
 **Steps**:
 1. [x] - `p1` - Clamp `limit` to its default of one hundred when absent and to five hundred at most - `inst-vw-imp-walk-1`
-2. [x] - `p1` - Walk the requesting scope's descendants breadth-first through the tenant resolver, each descendant once whatever duplicate or cyclic parent links the answer carries, stopping at a node budget of five thousand distinct scanned - `inst-vw-imp-walk-2`
+2. [x] - `p1` - Walk the requesting scope's descendants breadth-first through the tenant resolver — one bounded request for the whole subtree, whose parent links are kept — each descendant once whatever duplicate or cyclic parent links the answer carries, stopping at a node budget of five thousand distinct scanned - `inst-vw-imp-walk-2`
 3. [x] - `p1` - **FOR EACH** descendant → **IF** it is standalone or below a standalone tenant → skip it, counting it neither in the list nor in the total, since a bare count still discloses that it exists and differs - `inst-vw-imp-walk-3`
-4. [x] - `p1` - Resolve the descendant's current effective value and the value it would have under the candidate; **IF** they differ → count it, and record it while the list holds fewer than `limit` entries - `inst-vw-imp-walk-4`
-5. [x] - `p1` - **RETURN** the list in traversal order without ranking, `total_changed`, `scanned`, and `truncated` when either the budget or `limit` was hit; a truncated report reads as "at least this many" and never blocks the write - `inst-vw-imp-walk-5`
+4. [x] - `p1` - Resolve every descendant's current effective value in one pass — the target's ancestor chain fetched once, the rows of the chain and of the whole subtree read with one set query, each descendant's chain built in memory from the parent links, under the same nearest-match and review fallthrough as a read of it — so the tenant resolver and the database are asked a fixed number of times whatever the subtree holds; **FOR EACH** descendant, compare that value with the one it would have under the candidate — a row of a tenant in the walked subtree keeps supplying it; **IF** they differ → count it, and record it while the list holds fewer than `limit` entries - `inst-vw-imp-walk-4`
+5. [x] - `p1` - Run steps 2–4 under a time budget of one second: the node budget bounds what is examined, not how long a dependency may take to answer, and the report is advisory while the `validate` that carries it is what a field editor waits on; **IF** the budget runs out → **RETURN** the report truncated with nothing scanned, rather than an answer that never comes - `inst-vw-imp-walk-6`
+6. [x] - `p1` - **RETURN** the list in traversal order without ranking, `total_changed`, `scanned`, and `truncated` when the node budget, the time budget or `limit` was hit; a truncated report reads as "at least this many" and never blocks the write - `inst-vw-imp-walk-5`
 
 ## 4. States (CDSL)
 
@@ -451,7 +452,7 @@ A batch **MUST** carry at most five hundred changes, each a `set` (the default, 
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-writes-impact`
 
-The impact report **MUST** walk the target's descendants breadth-first under a node budget of five thousand, **MUST** return the first `limit` changed descendants — default one hundred, at most five hundred — in traversal order together with the total count and a truncation flag, **MUST** omit standalone descendants from both the list and the count, and **MUST NOT** block a write however large the report.
+The impact report **MUST** walk the target's descendants breadth-first under a node budget of five thousand, **MUST** resolve the subtree in a fixed number of round trips to the tenant resolver and the database whatever its size — never once per descendant — **MUST** run under a time budget and report a walk cut by it as truncated, **MUST** return the first `limit` changed descendants — default one hundred, at most five hundred — in traversal order together with the total count and a truncation flag, **MUST** omit standalone descendants from both the list and the count, and **MUST NOT** block a write however large the report.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-value-writes-impact`
@@ -521,5 +522,6 @@ Every committed change **MUST** publish `event_value_changed` and every rejected
 - [x] A write to a secret-trait declaration with no Secret Manager bound is refused as unavailable, and no plaintext appears in `setting_values`
 - [x] A valid set clears `needs_review` on the row
 - [x] The impact report omits standalone descendants from its list and its total, honours `limit` between one and five hundred, stops at the node budget with `truncated` set, and never blocks the write
+- [x] The impact walk over a subtree of a thousand tenants asks the tenant resolver and the database the same fixed number of times as over five hundred, and `validate` of a cascading setting carries that report; a walk whose subtree the tenant resolver never answers returns a truncated report with nothing scanned instead of waiting
 - [x] A committed change publishes `event_value_changed` and a rejected one `event_value_change_failed`; `settings_value_writes_total` and `settings_step_up_total` count both outcomes
 - [x] With no `StepUpVerifier` bound, reads keep serving and every write to a declaration that requires step-up refuses

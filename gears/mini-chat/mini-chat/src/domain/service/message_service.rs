@@ -131,5 +131,6 @@ impl<MR: MessageRepository, CR: ChatRepository, RR: ReactionRepository> MessageS
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "message_service_test.rs"]
 mod tests;

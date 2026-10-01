@@ -46,4 +46,6 @@ toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
 
 [dev-dependencies]
+toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 toolkit-gts = { workspace = true }
+tower = { workspace = true, features = ["util"] }

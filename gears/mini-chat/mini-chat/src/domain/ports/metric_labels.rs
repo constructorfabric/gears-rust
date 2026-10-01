@@ -45,6 +45,9 @@ pub mod result {
     pub const RETRY: &str = "retry";
     /// Audit emit permanent failure — dead-lettered by the outbox.
     pub const REJECT: &str = "reject";
+    /// Audit event acknowledged without delivery: no audit plugin is
+    /// registered.
+    pub const DROPPED: &str = "dropped";
 }
 
 /// Quota preflight decision labels (`decision` label).
@@ -75,7 +78,6 @@ pub mod kind {
 /// Attachment upload result labels (`result` label).
 pub mod upload_result {
     pub const OK: &str = "ok";
-    #[allow(dead_code)] // declared ahead of call site (deferred metrics)
     pub const FILE_TOO_LARGE: &str = "file_too_large";
     #[allow(dead_code)] // declared ahead of call site (deferred metrics)
     pub const UNSUPPORTED_TYPE: &str = "unsupported_type";
@@ -84,10 +86,33 @@ pub mod upload_result {
     pub const CONCURRENCY_LIMIT: &str = "concurrency_limit";
 }
 
+/// Background indexing result labels (`result` label of
+/// `attachment_background_indexing`).
+pub mod background_indexing_result {
+    /// Indexing completed and the row is `ready`.
+    pub const READY: &str = "ready";
+    /// The provider reported `failed`/`cancelled`, or a status read failed
+    /// with a non-transient error.
+    pub const FAILED: &str = "failed";
+    /// Indexing did not finish within the background timeout.
+    pub const TIMEOUT: &str = "timeout";
+    /// Indexing completed but the row could not be set `ready`.
+    pub const SET_READY_FAILED: &str = "set_ready_failed";
+}
+
 /// Cleanup resource type labels (`resource_type` label).
 pub mod resource_type {
     pub const FILE: &str = "file";
     pub const VECTOR_STORE: &str = "vector_store";
+}
+
+/// Cleanup retry reason labels (`reason` label of `cleanup_retry`).
+/// Bounded values only; the error text goes to the log.
+pub mod cleanup_retry_reason {
+    /// The provider file delete failed.
+    pub const PROVIDER_ERROR: &str = "provider_error";
+    /// The provider vector store delete failed.
+    pub const VECTOR_STORE_DELETE_FAILED: &str = "vector_store_delete_failed";
 }
 
 /// Cleanup backlog state labels (`state` label).
@@ -100,7 +125,6 @@ pub mod cleanup_state {
 
 /// Orphan watchdog reason labels (`reason` label).
 pub mod reason {
-    #[allow(dead_code)] // declared ahead of call site (watchdog uses string literals)
     pub const STALE_PROGRESS: &str = "stale_progress";
 }
 
@@ -114,4 +138,22 @@ pub mod trigger {
     pub const CLIENT_DISCONNECT: &str = "client_disconnect";
     pub const ORPHAN_TIMEOUT: &str = "orphan_timeout";
     pub const INTERNAL_ABORT: &str = "internal_abort";
+}
+
+/// Thread summary execution result labels (`result` label of
+/// `thread_summary_execution`).
+pub mod summary_result {
+    pub const SUCCESS: &str = "success";
+    pub const RETRY: &str = "retry";
+    pub const PROVIDER_ERROR: &str = "provider_error";
+    pub const EMPTY_SUMMARY: &str = "empty_summary";
+    /// The summary model is missing or disabled in the catalog; the task is
+    /// rejected.
+    pub const MODEL_UNAVAILABLE: &str = "model_unavailable";
+    /// The target frontier message was deleted while the summary was
+    /// generated; nothing is committed.
+    pub const FRONTIER_DELETED: &str = "frontier_deleted";
+    /// The task expected a stored summary that no longer exists (dropped by
+    /// a retry, edit or delete); nothing is committed.
+    pub const BASE_MISSING: &str = "base_missing";
 }

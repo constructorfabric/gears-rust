@@ -5,6 +5,24 @@ use toolkit_db::secure::ScopeError;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+/// Resource kind carried by [`DomainError::NotFound`]. The REST layer picks the
+/// problem `resource_type` from it, so it is an enum rather than a free string.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotFoundEntity {
+    Chat,
+    Attachment,
+}
+
+impl std::fmt::Display for NotFoundEntity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Chat => "Chat",
+            Self::Attachment => "Attachment",
+        })
+    }
+}
+
 /// Domain-specific errors for the mini-chat gear.
 #[domain_model]
 #[derive(Error, Debug)]
@@ -18,6 +36,13 @@ pub enum DomainError {
     #[error("Validation failed: {message}")]
     Validation { message: String },
 
+    /// A client-side `OData` query error (bad `$filter`, `$orderby`, `limit`
+    /// or cursor). `Db` / `ParsingUnavailable` are mapped to `Database`
+    /// instead. The REST layer renders it through the canonical `OData`
+    /// mapping so clients get the `field_violations[].reason` codes.
+    #[error(transparent)]
+    OData(toolkit_odata::Error),
+
     #[error("Database error: {message}")]
     Database { message: String },
 
@@ -25,10 +50,16 @@ pub enum DomainError {
     Conflict { code: String, message: String },
 
     #[error("{entity} not found: {id}")]
-    NotFound { entity: String, id: Uuid },
+    NotFound { entity: NotFoundEntity, id: Uuid },
 
     #[error("Access denied")]
     Forbidden,
+
+    /// The authorization decision point could not be evaluated (PDP down or
+    /// failing). Still fail closed (no access), but reported as 503 so
+    /// clients and monitoring can tell an outage from a denial.
+    #[error("Authorization service unavailable")]
+    AuthzUnavailable,
 
     #[error("Message not found: {id}")]
     MessageNotFound { id: Uuid },
@@ -42,7 +73,7 @@ pub enum DomainError {
     #[error("Internal error: {message}")]
     InternalError { message: String },
 
-    /// An outbox enqueue failed. The typed [`OutboxError`](crate::domain::repos::OutboxError)
+    /// An outbox enqueue failed. The typed `OutboxError`
     /// is kept as the error source so the chain survives; the REST layer derives
     /// the HTTP status from the inner variant (oversize is a client error, the
     /// rest are server faults).
@@ -52,8 +83,8 @@ pub enum DomainError {
     #[error("Web search is currently disabled")]
     WebSearchDisabled,
 
-    #[error("Web search calls exceeded for this message")]
-    WebSearchCallsExceeded,
+    #[error("Image input is currently disabled")]
+    ImagesDisabled,
 
     #[error("Unsupported file type: {mime}")]
     UnsupportedFileType { mime: String },
@@ -66,9 +97,6 @@ pub enum DomainError {
 
     #[error("Storage limit exceeded: {message}")]
     StorageLimitExceeded { message: String },
-
-    #[error("Service temporarily unavailable: {message}")]
-    ServiceUnavailable { message: String },
 
     /// Provider returned an error. `sanitized_message` is pre-sanitized by
     /// `sanitize_provider_message()` at construction — safe for client exposure.
@@ -111,21 +139,18 @@ impl DomainError {
         }
     }
 
-    pub fn not_found(entity: impl Into<String>, id: Uuid) -> Self {
-        Self::NotFound {
-            entity: entity.into(),
-            id,
-        }
+    #[must_use]
+    pub fn not_found(entity: NotFoundEntity, id: Uuid) -> Self {
+        Self::NotFound { entity, id }
+    }
+
+    #[must_use]
+    pub fn attachment_not_found(id: Uuid) -> Self {
+        Self::not_found(NotFoundEntity::Attachment, id)
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::InternalError {
-            message: message.into(),
-        }
-    }
-
-    pub fn service_unavailable(message: impl Into<String>) -> Self {
-        Self::ServiceUnavailable {
             message: message.into(),
         }
     }
@@ -220,9 +245,11 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
                 tracing::warn!(error = %err, "AuthZ constraint compile failed - access denied");
                 Self::Forbidden
             }
+            // Fail closed, but as 503: the PDP could not decide, which is
+            // not a denial.
             authz_resolver_sdk::EnforcerError::EvaluationFailed(ref err) => {
-                tracing::error!(error = %err, "AuthZ evaluation failed (internal error)");
-                Self::internal(err.to_string())
+                tracing::error!(error = %err, "AuthZ evaluation failed - request refused");
+                Self::AuthzUnavailable
             }
         }
     }
@@ -245,4 +272,23 @@ fn map_db_err(db_err: &sea_orm::DbErr) -> DomainError {
         };
     }
     DomainError::database(db_err.to_string())
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::DomainError;
+
+    #[test]
+    fn pdp_evaluation_failure_is_authz_unavailable() {
+        let e = authz_resolver_sdk::EnforcerError::EvaluationFailed(
+            toolkit_canonical_errors::CanonicalError::service_unavailable()
+                .with_detail("authz-resolver unreachable")
+                .create(),
+        );
+        assert!(matches!(
+            DomainError::from(e),
+            DomainError::AuthzUnavailable
+        ));
+    }
 }

@@ -9,7 +9,8 @@
 //! has to disappear from every one of these paths rather than from the one
 //! that happened to have a unit test.
 
-use serde_json::json;
+use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::domain::access::TenantAccess;
 use crate::domain::resolution::MASK_TOKEN;
@@ -232,25 +233,236 @@ async fn a_hidden_setting_keeps_its_history_from_the_caller() {
 // ── The options each resource does and does not take ─────────────────────────
 
 #[tokio::test]
-async fn search_refuses_the_odata_options_it_does_not_take() {
+async fn search_takes_a_filter_and_refuses_orderby_and_select() {
     let h = RestHarness::new().await;
     h.inner.declare("proxy", "cascading", json!(true)).await;
 
-    for option in [
-        "&$filter=key%20eq%20%27x%27",
-        "&$orderby=key",
-        "&$select=key",
-    ] {
+    for option in ["&$orderby=key", "&$select=key"] {
         let uri = format!("/settings-service/v1/search?q=proxy{option}");
         let (status, body) = h.get(&uri, h.inner.tree.root).await;
         assert_eq!(status, 400, "{option}: {body}");
     }
+    // A filter in browse's grammar is served; outside it, refused with the
+    // same refusals browse gives.
+    let (status, body) = h
+        .get(
+            "/settings-service/v1/search?q=proxy&$filter=key%20eq%20%27x%27",
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    for (filter, said) in [
+        ("tenant%20eq%20%27x%27", "tenant"),
+        (
+            "needs_review%20eq%20false",
+            "`needs_review eq false` is not a listing; omit the filter to browse",
+        ),
+    ] {
+        let uri = format!("/settings-service/v1/search?q=proxy&$filter={filter}");
+        let (status, body) = h.get(&uri, h.inner.tree.root).await;
+        assert_eq!(status, 400, "{filter}: {body}");
+        assert!(body.to_string().contains(said), "{filter}: {body}");
+        // The same expression, the same answer on browse.
+        let (status, browse) = h
+            .get(
+                &format!("/settings-service/v1/settings?$filter={filter}"),
+                h.inner.tree.root,
+            )
+            .await;
+        assert_eq!(status, 400, "{filter}: {browse}");
+        assert!(browse.to_string().contains(said), "{filter}: {browse}");
+    }
+}
 
-    // Without them the same query is served.
+/// Twelve settings whose keys all match `se` through the `settings` base
+/// type: six in the harness's category, six in `other`; two of them, one in
+/// each category, flagged for review at the root.
+async fn corpus_for_filtering(h: &RestHarness) -> (Uuid, Vec<String>, Vec<String>) {
+    let other = h.inner.add_category("other").await;
+    let mut network = Vec::new();
+    let mut in_other = Vec::new();
+    for i in 0..6 {
+        let name = format!("net_{i}");
+        let id = h.inner.declare(&name, "cascading", json!(true)).await;
+        if i == 1 {
+            h.inner
+                .set_flagged(id, h.inner.tree.root, json!("bad"))
+                .await;
+        }
+        network.push(h.inner.key(&name).to_string());
+        let name = format!("oth_{i}");
+        let id = h
+            .inner
+            .declare_in(other, &name, "cascading", json!(true), TEXT, "public")
+            .await;
+        if i == 4 {
+            h.inner
+                .set_flagged(id, h.inner.tree.root, json!("bad"))
+                .await;
+        }
+        in_other.push(h.inner.key(&name).to_string());
+    }
+    (other, network, in_other)
+}
+
+/// Follow a search to its end, one page at a time.
+async fn every_page(h: &RestHarness, first: &str) -> (Vec<Value>, usize) {
+    let mut items = Vec::new();
+    let mut pages = 0;
+    let mut uri = first.to_owned();
+    loop {
+        let (status, body) = h.get(&uri, h.inner.tree.root).await;
+        assert_eq!(status, 200, "{uri}: {body}");
+        pages += 1;
+        items.extend(body["items"].as_array().expect("items").iter().cloned());
+        match body["page_info"]["next_cursor"].as_str() {
+            Some(cursor) => uri = format!("{first}&cursor={cursor}"),
+            None => return (items, pages),
+        }
+    }
+}
+
+fn keys_of(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .map(|i| i["key"].as_str().expect("a key").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_filtered_search_reaches_matches_beyond_the_first_page_and_pages_the_filtered_set() {
+    // The defect: a client sieving the page it holds never sees a match past
+    // it, and the cursor pages the unfiltered set. The filter is in the query:
+    // every page holds only the filtered set, and the set is followed to its
+    // end without a repeat or a gap.
+    let h = RestHarness::new().await;
+    let (other, _, in_other) = corpus_for_filtering(&h).await;
+
+    let uri =
+        format!("/settings-service/v1/search?q=se&limit=4&$filter=category_id%20eq%20{other}");
+    let (items, pages) = every_page(&h, &uri).await;
+    assert_eq!(pages, 2, "six matches over pages of four");
+    let mut keys = keys_of(&items);
+    let mut expected = in_other.clone();
+    keys.sort();
+    expected.sort();
+    assert_eq!(
+        keys, expected,
+        "exactly the filtered set, no repeat, no gap"
+    );
+    assert!(
+        items.iter().all(|i| i["category"]["id"] == json!(other)),
+        "{items:?}"
+    );
+
+    // Without the filter the same search is twice the size.
+    let (all, _) = every_page(&h, "/settings-service/v1/search?q=se&limit=4").await;
+    assert_eq!(all.len(), 12);
+}
+
+#[tokio::test]
+async fn each_filter_field_narrows_the_search_and_a_conjunction_narrows_further() {
+    let h = RestHarness::new().await;
+    let (other, network, in_other) = corpus_for_filtering(&h).await;
+    let search =
+        |filter: String| format!("/settings-service/v1/search?q=se&limit=1&$filter={filter}");
+
+    // `needs_review eq true`: the flagged settings, in either category, found
+    // past the first page of one.
+    let (items, pages) = every_page(&h, &search("needs_review%20eq%20true".to_owned())).await;
+    let mut keys = keys_of(&items);
+    keys.sort();
+    let mut flagged = vec![network[1].clone(), in_other[4].clone()];
+    flagged.sort();
+    assert_eq!((keys, pages), (flagged, 2));
+
+    // `key eq` and `key in (...)`.
+    let one = network[2].replace('~', "%7E");
+    let (items, _) = every_page(&h, &search(format!("key%20eq%20%27{one}%27"))).await;
+    assert_eq!(keys_of(&items), vec![network[2].clone()]);
+    let two = in_other[0].replace('~', "%7E");
+    let (items, _) = every_page(&h, &search(format!("key%20in%20(%27{one}%27,%27{two}%27)"))).await;
+    let mut keys = keys_of(&items);
+    keys.sort();
+    let mut expected = vec![network[2].clone(), in_other[0].clone()];
+    expected.sort();
+    assert_eq!(keys, expected);
+
+    // A conjunction: the flagged setting of one category alone.
+    let (items, _) = every_page(
+        &h,
+        &search(format!(
+            "category_id%20eq%20{other}%20and%20needs_review%20eq%20true"
+        )),
+    )
+    .await;
+    assert_eq!(keys_of(&items), vec![in_other[4].clone()]);
+}
+
+#[tokio::test]
+async fn a_search_cursor_minted_under_one_filter_is_refused_under_another() {
+    let h = RestHarness::new().await;
+    let (other, _, _) = corpus_for_filtering(&h).await;
+    let (_, first) = h
+        .get(
+            &format!("/settings-service/v1/search?q=se&limit=4&$filter=category_id%20eq%20{other}"),
+            h.inner.tree.root,
+        )
+        .await;
+    let cursor = first["page_info"]["next_cursor"]
+        .as_str()
+        .expect("a second page")
+        .to_owned();
+
+    for filter in ["", "&$filter=needs_review%20eq%20true"] {
+        let (status, body) = h
+            .get(
+                &format!("/settings-service/v1/search?q=se&limit=4{filter}&cursor={cursor}"),
+                h.inner.tree.root,
+            )
+            .await;
+        assert_eq!(status, 400, "another filter, another search: {body}");
+    }
+    // The same filter, spelt with different spacing, continues.
     let (status, _) = h
-        .get("/settings-service/v1/search?q=proxy", h.inner.tree.root)
+        .get(
+            &format!(
+                "/settings-service/v1/search?q=se&limit=4&$filter=category_id%20%20eq%20{other}&cursor={cursor}"
+            ),
+            h.inner.tree.root,
+        )
         .await;
     assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn a_filtered_search_hides_what_an_unfiltered_one_hides() {
+    let h = RestHarness::new().await;
+    let (other, _, in_other) = corpus_for_filtering(&h).await;
+    let hidden_key = in_other[0].clone();
+    let hidden = h
+        .inner
+        .resolver
+        .find_declaration(
+            &h.inner.db.conn().expect("connection"),
+            &settings_service_sdk::SettingKey::parse(&hidden_key).expect("key"),
+        )
+        .await
+        .expect("lookup")
+        .expect("declared")
+        .id;
+    h.restrict(hidden, h.inner.tree.a, TenantAccess::Hidden)
+        .await;
+
+    let items = h
+        .items(
+            &format!("/settings-service/v1/search?q=se&$filter=category_id%20eq%20{other}"),
+            h.inner.tree.a,
+        )
+        .await;
+    let keys = keys_of(&items);
+    assert_eq!(keys.len(), 5);
+    assert!(!keys.contains(&hidden_key), "{keys:?}");
 }
 
 #[tokio::test]

@@ -106,6 +106,10 @@ types-registry-sdk = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 proptest = "1.5"
+# The users route driven against the real static IdP plugin
+# (`tests/api_users_test.rs`): what the route admits is what the plugin
+# must be able to evaluate.
+static-idp-plugin = { package = "cf-gears-static-idp-plugin", path = "../plugins/static-idp-plugin" }
 # `no-env-filter` accepts events with `target: "am.*"` (otherwise the
 # default `{crate}=trace` filter rejects custom targets, hiding the
 # very `am.retention` events the redaction tests need to inspect).

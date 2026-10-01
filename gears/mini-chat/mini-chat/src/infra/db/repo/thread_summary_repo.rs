@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, Set};
 use time::OffsetDateTime;
-use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureUpdateExt, secure_insert};
+use toolkit_db::secure::{
+    DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt, secure_insert,
+};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -113,5 +115,32 @@ impl crate::domain::repos::ThreadSummaryRepository for ThreadSummaryRepository {
                 Ok(result.rows_affected)
             }
         }
+    }
+
+    async fn delete_for_chat<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        chat_id: Uuid,
+    ) -> Result<u64, DomainError> {
+        use crate::infra::db::entity::message::{Column as MessageColumn, Entity as MessageEntity};
+
+        let result = Entity::delete_many()
+            .filter(Column::ChatId.eq(chat_id))
+            .secure()
+            .scope_with(scope)
+            .exec(runner)
+            .await?;
+        // Without the summary the compressed messages would drop out of the
+        // context and out of the next summary for good.
+        MessageEntity::update_many()
+            .col_expr(MessageColumn::IsCompressed, Expr::value(false))
+            .filter(MessageColumn::ChatId.eq(chat_id))
+            .filter(MessageColumn::IsCompressed.eq(true))
+            .secure()
+            .scope_with(scope)
+            .exec(runner)
+            .await?;
+        Ok(result.rows_affected)
     }
 }

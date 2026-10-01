@@ -1,5 +1,23 @@
 # Feature: Anthropic Model Support
 
+## 0. Implementation Status
+
+This document started as the design for Anthropic support. Parts of it are implemented and parts are not. The table below is the current state; sections that describe unimplemented behaviour carry a **Not implemented** note. The P1 retrieval scope is recorded in [ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md); the provider adapter model in [ADR-0005](../ADR/0005-cpt-cf-mini-chat-adr-multi-provider-adapters.md).
+
+| Capability | Status | Where |
+|---|---|---|
+| `ProviderKind::AnthropicMessages` adapter (`/v1/messages`, SSE, `complete()`) | Implemented | `infra/llm/providers/anthropic_messages.rs`, `infra/llm/providers/mod.rs` |
+| Native `web_search_20260209` and `code_execution_20250825` tools | Implemented. Web search citations are **not implemented**: the adapter returns `citations: vec![]` and does not parse `web_search_tool_result` or citation blocks | `anthropic_messages.rs` (tool mapping) |
+| Function tools (e.g. `search_knowledge`) | Implemented. The function-tool loop runs in `StreamService` (`domain/service/stream_service/provider_task.rs`), not inside the adapter | `provider_task.rs` |
+| `rag_provider` on `ProviderEntry`, `ProviderResolver::resolve_rag_provider()` | Implemented | `config.rs`, `infra/llm/provider_resolver.rs` |
+| Parallel upload to the Anthropic Files API | Implemented for **images only**, 30 s timeout, failure is non-fatal. Documents are not uploaded to Anthropic | `domain/service/attachment_service.rs`, `infra/llm/providers/anthropic_files_client.rs` |
+| `attachments.secondary_file_id` / `secondary_status` / `secondary_provider_kind` | Implemented | `infra/db/entity/attachment.rs`, migration `m20260417_000004_add_secondary_upload_fields.rs` |
+| Image blocks | Implemented. Images are sent automatically as `image` blocks with `source.type = "file"`, using the `provider_file_id → secondary_file_id` map; an image without an Anthropic copy is dropped from the request | `anthropic_messages.rs`, `AttachmentRepository::build_secondary_file_id_map` |
+| Deleting the Anthropic copy on attachment/chat cleanup | Implemented in the attachment-cleanup outbox handler | `infra/workers/cleanup_worker.rs` |
+| `search_files` tool loop and `vector_store_search.rs` | **Not implemented.** The adapter drops `LlmTool::FileSearch`, so documents indexed in the RAG provider's vector store are not searched in Anthropic chats | see [ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md) |
+| `load_files` tool, `document` and `container_upload` blocks | **Not implemented.** Only the SSE tool-name mapping for `load_files` exists | see [ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md) |
+| Prompt caching (`cache_control`) | Not implemented | — |
+
 ## 1. Feature Context
 
 ### 1.1 Overview
@@ -10,15 +28,15 @@ Add Anthropic Claude model support to mini-chat, enabling both Microsoft Foundry
 
 1. **One adapter, two platforms** — Microsoft Foundry and Anthropic Platform both use native Anthropic Messages API (`/v1/messages`). One `AnthropicMessagesProvider` serves both — the difference is only base URL and auth.
 
-2. **Tool loop inside adapter** — Custom tool calls (`search_files`, `load_files`) are handled inside the adapter, invisible to `StreamService` and turn architecture. 1 turn = 1 `ProviderStream` regardless of internal LLM calls.
+2. **Tool loop inside adapter** — Custom tool calls (`search_files`, `load_files`) are handled inside the adapter, invisible to `StreamService` and turn architecture. 1 turn = 1 `ProviderStream` regardless of internal LLM calls. *Not implemented:* neither tool exists ([ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md)). The only function-tool loop (`search_knowledge`) runs in `StreamService` (`provider_task.rs`).
 
-3. **Files API on both platforms (beta)** — Both Microsoft Foundry and Anthropic Platform support Files API in beta. Confirmed in [Anthropic overview: Files and Assets](https://platform.claude.com/docs/en/build-with-claude/overview#files-and-assets) (as of March 2026). This enables `load_files` tool, `document`, `image`, and `container_upload` blocks on both platforms.
+3. **Files API on both platforms (beta)** — Both Microsoft Foundry and Anthropic Platform support Files API in beta. Confirmed in [Anthropic overview: Files and Assets](https://platform.claude.com/docs/en/build-with-claude/overview#files-and-assets) (as of March 2026). This enables `load_files` tool, `document`, `image`, and `container_upload` blocks on both platforms. *Implemented:* `image` blocks only.
 
 4. **Model is immutable per chat** — `chat.model` is set at creation and cannot change (`cpt-cf-mini-chat-constraint-model-locked-per-chat`). This means: if a chat uses an Anthropic model, all files in that chat are for Anthropic. No model-switching scenarios to handle.
 
-5. **Eager upload to both backends (Anthropic model chats only)** — Files always go to Azure/OpenAI (file store + vector store). When the chat model is Anthropic, also upload to Anthropic Files API **in parallel** — `anthropic_file_id` is set immediately. For OpenAI model chats, only the Azure/OpenAI upload happens (existing behavior, unchanged). Azure/OpenAI is the primary store: if it fails, the entire upload fails regardless of Anthropic result. If only the Anthropic upload fails, the file upload succeeds (`anthropic_status=failed`), but `load_files` will return an error for that file. This is possible because the chat model is immutable (decision #4).
+5. **Eager upload to both backends (Anthropic model chats only)** — Files always go to Azure/OpenAI (file store + vector store). When the chat model is Anthropic, also upload to Anthropic Files API **in parallel** — `secondary_file_id` is set immediately (images only; see §8.0). For OpenAI model chats, only the Azure/OpenAI upload happens (existing behavior, unchanged). Azure/OpenAI is the primary store: if it fails, the entire upload fails regardless of Anthropic result. If only the Anthropic upload fails, the file upload succeeds (`secondary_status=failed`) and the image is left out of Anthropic requests. This is possible because the chat model is immutable (decision #4).
 
-6. **All files accessed via `load_files` tool** — Files (documents and images) are never included in requests automatically. Claude calls `load_files` when it needs file content. The adapter determines the correct content block type (`document`, `image`, or `container_upload`) based on attachment metadata.
+6. **All files accessed via `load_files` tool** — Files (documents and images) are never included in requests automatically. Claude calls `load_files` when it needs file content. The adapter determines the correct content block type (`document`, `image`, or `container_upload`) based on attachment metadata. *Not implemented* ([ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md)). Images attached to a message are included automatically as `image` blocks; documents are not sent to Claude.
 
 7. **Usage: sum all tokens** — Tool loop sums all token fields across internal LLM calls. Matches what Anthropic bills us and maintains parity with OpenAI (where retrieved chunks are baked into `input_tokens`).
 
@@ -33,7 +51,7 @@ Anthropic **does not provide** this RAG infrastructure:
 - **No embedding API** — [explicitly recommends](https://platform.claude.com/docs/en/build-with-claude/embeddings) third-party services (as of March 2026).
 - **Files API is limited to content access** — [Files API](https://platform.claude.com/docs/en/build-with-claude/files) (beta, March 2026) allows file upload and referencing in messages, but provides no vector search or embedding.
 
-Given these constraints, file access is split into two custom tools:
+Given these constraints, file access is split into two custom tools (**not implemented**, see [ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md)):
 
 - **`search_files`** — semantic search via Azure/OpenAI vector store (`POST /v1/vector_stores/{vs_id}/search`)
 - **`load_files`** — full file access via Anthropic Files API (`document` / `image` / `container_upload` blocks)
@@ -55,13 +73,13 @@ Given these constraints, file access is split into two custom tools:
 | Capability | OpenAI (current) | Anthropic (this feature) |
 |-----------|------------------|--------------------------|
 | Text streaming | Native SSE | Native Anthropic SSE |
-| Web search | Native tool | Native `web_search_20260209` (server-side) |
+| Web search | Native tool | Native `web_search_20260209` (server-side). Web citations **not implemented** (no `source: "web"` citations) |
 | Code execution | Native `code_interpreter` | Native `code_execution_20250825` (server-side) |
 | Function calling | Native | Native `tool_use` (Anthropic format) |
-| File search / RAG | Native `file_search` (server-side) | Custom `search_files` tool loop via Azure vector store |
-| Full file access | Native (file_id in request) | Custom `load_files` tool → Files API → `document`/`image`/`container_upload` |
-| Images | file_id in request (auto-included) | `load_files` tool → Files API → `image` block |
-| Code execution + files | file_id in request | `load_files` → `container_upload` in sandbox |
+| File search / RAG | Native `file_search` (server-side) | Planned: custom `search_files` tool loop via Azure vector store. **Not implemented** — `FileSearch` is dropped |
+| Full file access | Native (file_id in request) | Planned: custom `load_files` tool → Files API → `document`/`image`/`container_upload`. **Not implemented** |
+| Images | file_id in request (auto-included) | Implemented: auto-included `image` block with the Anthropic `secondary_file_id` |
+| Code execution + files | file_id in request | Planned: `load_files` → `container_upload` in sandbox. **Not implemented** |
 
 ---
 
@@ -71,7 +89,7 @@ Given these constraints, file access is split into two custom tools:
 
 New `AnthropicMessagesProvider` implementing the existing `LlmProvider` trait, following the same pattern as `OpenAiResponsesProvider`.
 
-**Key decision: All tool loops live inside the adapter**, not in `StreamService`.
+**Key decision: All tool loops live inside the adapter**, not in `StreamService`. *Current code differs:* the adapter has no tool loop; the `search_knowledge` function-tool loop runs in `StreamService` (`provider_task.rs`).
 
 Rationale:
 - `LlmProvider::stream()` returns `ProviderStream` yielding `ClientSseEvent` items. Tool loops are an implementation detail of the Anthropic adapter.
@@ -93,7 +111,7 @@ The tool loop is **completely transparent** to the turn layer.
 - Retry: same flow, reuses original user content
 - Snapshot boundary ensures deterministic context (same attachments, same vector store)
 
-**Vector store search call tracking:**
+**Vector store search call tracking** (not implemented for Anthropic, no `search_files` tool):
 - Adapter emits `ClientSseEvent::Tool { phase: Start/Done, name: "file_search" }` for each search
 - `StreamService` counts `Done` events → `file_search_completed_count` (same pattern as `web_search_completed_count`)
 - Passed to `FinalizationInput` → `UsageEvent.file_search_calls`
@@ -146,11 +164,11 @@ event: message_stop        → Terminal(Completed/Incomplete) or enter tool loop
 | `content_block_start` | `type: "text"` | `Skip` (start text block tracking) |
 | `content_block_start` | `type: "tool_use"` | `Skip` (start accumulating tool input JSON) |
 | `content_block_start` | `type: "server_tool_use"`, name starts with `web_search` | `Sse(Tool { Start, "web_search" })` |
-| `content_block_start` | `type: "server_tool_use"`, name starts with `code_execution` | `Sse(Tool { Start, "code_execution" })` |
+| `content_block_start` | `type: "server_tool_use"`, name starts with `code_execution` | `Sse(Tool { Start, "code_interpreter" })` (shared name, so the code interpreter limit and counters apply) |
 | `content_block_delta` | `type: "text_delta"` | `Sse(Delta { "text", content })` |
 | `content_block_delta` | `type: "input_json_delta"` | `Skip` (append to accumulated tool input) |
 | `content_block_stop` | after web_search block | `Sse(Tool { Done, "web_search" })` |
-| `content_block_stop` | after code_execution block | `Sse(Tool { Done, "code_execution" })` |
+| `content_block_stop` | after code_execution block | `Sse(Tool { Done, "code_interpreter" })` |
 | `content_block_stop` | after text/tool_use block | `Skip` |
 | `message_delta` | `stop_reason: "end_turn"` | `Skip` (prepare Completed) |
 | `message_delta` | `stop_reason: "max_tokens"` | `Skip` (prepare Incomplete) |
@@ -164,6 +182,8 @@ event: message_stop        → Terminal(Completed/Incomplete) or enter tool loop
 ---
 
 ## 3. Custom Tool: `search_files`
+
+> **Not implemented.** The Anthropic adapter drops `LlmTool::FileSearch` (`infra/llm/providers/anthropic_messages.rs`); `search_files`, `load_files` and `vector_store_search.rs` do not exist. See [ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md). The section below is the original design.
 
 ### 3.1 Purpose
 
@@ -230,6 +250,8 @@ Annual revenue projections show...
 
 ## 4. Custom Tool: `load_files`
 
+> **Not implemented.** The Anthropic adapter drops `LlmTool::FileSearch` (`infra/llm/providers/anthropic_messages.rs`); `search_files`, `load_files` and `vector_store_search.rs` do not exist. See [ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md). The section below is the original design.
+
 ### 4.1 Purpose
 
 Load files (documents and images) into the conversation so Claude can see their content or process them with code execution. All file types — documents, images, spreadsheets — go through this single tool.
@@ -268,7 +290,7 @@ Load files (documents and images) into the conversation so Claude can see their 
 
 **Dynamic enum:** The `filenames` enum is built at request time from the chat's attachments (all kinds — documents and images). If duplicate filenames exist, a display suffix is added: `report.pdf`, `report (2).pdf`. This deduplication is only in the tool definition — filenames in the DB and storage are unchanged.
 
-**In-memory filename mapping:** The adapter loads all chat attachments at the start of the request and builds a `HashMap<String, Attachment>` mapping display names to attachment records. When Claude returns `filenames: ["report (2).pdf"]`, the adapter resolves the display name to the attachment via this map and reads `anthropic_file_id` directly — no additional DB query needed. The map is transient and lives only for the duration of the request.
+**In-memory filename mapping:** The adapter loads all chat attachments at the start of the request and builds a `HashMap<String, Attachment>` mapping display names to attachment records. When Claude returns `filenames: ["report (2).pdf"]`, the adapter resolves the display name to the attachment via this map and reads `secondary_file_id` directly — no additional DB query needed. The map is transient and lives only for the duration of the request.
 
 **No `mode` parameter.** The adapter determines the content block type automatically from attachment metadata:
 
@@ -286,7 +308,7 @@ Claude → load_files({ filenames: ["report.pdf", "data.csv", "photo.png"] })
 Adapter:
   ├─ Emit Tool { Start, "file_load" }
   ├─ Resolve filenames → attachments via filename map
-  ├─ For each attachment: look up anthropic_file_id (already set at upload time)
+  ├─ For each attachment: look up secondary_file_id (already set at upload time)
   ├─ Emit Tool { Done, "file_load" }
   ├─ Build continuation request with:
   │   ├─ tool_result { content: "Files loaded: report.pdf, data.csv, photo.png" }
@@ -331,6 +353,8 @@ All requests using Files API require: `anthropic-beta: files-api-2025-04-14`
 
 ## 6. Multi-Turn Tool Loop Mechanics
 
+> **Not implemented in the adapter.** The adapter has no internal tool loop ([ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md)). Prompt caching (§6.4) is not implemented. The rest of this section is the original design.
+
 ### 6.1 Usage Accumulation
 
 Each Anthropic API response includes its own `usage`. The adapter **sums ALL fields** across tool loop iterations:
@@ -370,7 +394,7 @@ ExecutingTool → (tool executed) → Continuing
 Continuing → Streaming [new SSE stream from continuation request]
 ```
 
-Cap at `max_tool_calls` iterations (already on `LlmRequest`).
+The adapter does not send or apply `max_tool_calls`. The only implemented loop cap is the `search_knowledge` loop in `provider_task.rs` (`knowledge_search.max_calls_per_message + 2` iterations, then `agentic_iterations_exceeded`); see section 12.
 
 ### 6.3 Error Handling
 
@@ -416,6 +440,7 @@ providers:
     kind: anthropic_messages
     host: "api.anthropic.com"
     api_path: "/v1/messages"
+    storage_kind: openai        # required on every entry; registers the /v1/files routes
     rag_provider: "azure_openai"
     auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
     auth_config:
@@ -423,6 +448,8 @@ providers:
       prefix: ""
       secret_ref: "cred://anthropic-key"
 ```
+
+`storage_kind` has no default: an entry without it fails to deserialize. On an `anthropic_messages` entry it does not route RAG storage (that is `rag_provider`), but it decides which RAG routes OAGW provisioning registers on the entry's upstream: `storage_kind: openai` registers `POST /v1/files` and `DELETE /v1/files/{file_id}` (plus the `POST`, `DELETE` and `GET` `/v1/vector_stores` routes). `AnthropicFilesClient` sends the image copy to `/{upstream_alias}/v1/files` on the Anthropic entry's upstream, so without these routes OAGW returns 404 and the attachment gets `secondary_status = failed`. `storage_kind: azure` would register `/openai/...` routes instead and would also require `api_version`.
 
 ### 7.2 Microsoft Foundry
 
@@ -432,6 +459,7 @@ providers:
     kind: anthropic_messages
     host: "${AZURE_FOUNDRY_HOST}"
     api_path: "/anthropic/v1/messages"
+    storage_kind: openai        # required; see 7.1
     rag_provider: "azure_openai"
     auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
     auth_config:
@@ -457,6 +485,8 @@ providers:
 ```
 
 ### 7.4 Custom Tool Configuration
+
+> **Not implemented.** `search_files_tool` and `load_files_tool` are not configuration keys; `ProviderEntry` (the `providers.<id>` entry) uses `deny_unknown_fields`, so these keys are rejected. See [ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md).
 
 ```yaml
 providers:
@@ -508,7 +538,7 @@ resolve_model() → provider_id: "anthropic"
   → Vector store: DispatchingVectorStore routes by "anthropic" ✗ (no vector store)
 ```
 
-**Solution:** New field `rag_provider: Option<String>` on `ProviderEntry`. When set, storage operations (file upload, vector store, cleanup) use this provider instead of the LLM provider.
+**Solution (implemented):** New field `rag_provider: Option<String>` on `ProviderEntry`. When set, storage operations (file upload, vector store, cleanup) use this provider instead of the LLM provider.
 
 ```rust
 // config.rs — new field on ProviderEntry
@@ -539,6 +569,8 @@ resolve_model() → provider_id: "anthropic"
 5. `resolve_storage_backend()` — resolve from storage provider entry, not LLM provider entry
 6. Validation at startup — if `rag_provider` references a non-existent provider, fail fast
 
+**Limitation — quota downgrade to another provider:** storage is resolved from the chat's model at upload time. After a quota downgrade the turn goes to the effective model's provider, but it still sends the vector store id and file ids of the chat model's storage provider, and the Anthropic file ids exist only if the chat model is on an `anthropic_messages` provider. A downgrade between models whose providers do not share storage does not see the attachments. See DESIGN "Provider after a downgrade".
+
 ---
 
 ## 8. File Upload Flow
@@ -555,28 +587,29 @@ User uploads file (chat model = Anthropic)
 AttachmentService::upload_file()
     ├─ Upload to Azure/OpenAI Files API → provider_file_id          [EXISTING]
     ├─ Add to vector store (if document) → vector_store_id           [EXISTING]
-    └─ Upload to Anthropic Files API → anthropic_file_id             [NEW, parallel]
+    └─ Upload to Anthropic Files API → secondary_file_id             [images only, 30 s timeout]
 ```
+
+**Implemented scope:** only images are uploaded to Anthropic, because their bytes are already buffered for thumbnail generation. Documents are skipped (`secondary_status` stays `not_attempted`); uploading them would need a re-download from Azure/OpenAI. Images larger than the thumbnail decode buffer are also skipped.
 
 For OpenAI model chats, only Azure/OpenAI upload happens (existing behavior, unchanged).
 
 **Why eager parallel upload:**
 - **Model is immutable** (`cpt-cf-mini-chat-constraint-model-locked-per-chat`) — no risk of wasted uploads. If the chat is Anthropic, files will always be for Anthropic.
-- **Zero latency at `load_files` time** — `anthropic_file_id` is ready when Claude needs it.
+- **Zero latency at request time** — `secondary_file_id` is ready when the image block is built.
 - **Azure/OpenAI as primary file store** — Anthropic Files API is still in beta. Azure/OpenAI is the stable backend. Anthropic file_id is a derived cache that can be re-created from Azure/OpenAI if needed.
 
 **Failure policy:**
 
 | Azure/OpenAI | Anthropic | Overall result |
 |---|---|---|
-| OK | OK | `status=ready`, `anthropic_status=uploaded` — happy path |
-| OK | Failed | `status=ready`, `anthropic_status=failed` — RAG works (`search_files`), but `load_files` returns error for this file |
-| Failed | OK | `status=failed` — whole upload failed. Azure/OpenAI is the primary store; without it there's no vector store and no `search_files`. Orphaned Anthropic file cleaned up by cleanup worker |
-| Failed | Failed | `status=failed`, `anthropic_status=failed` — whole upload failed |
+| OK | OK | `status=ready`, `secondary_status=uploaded` — happy path |
+| OK | Failed or timeout | `status=ready`, `secondary_status=failed` — the image is dropped from Anthropic requests |
+| Failed | — | `status=failed` — whole upload failed. The Anthropic upload runs only after the primary upload succeeded; if the attachment then loses the CAS transition to `ready`, the Anthropic copy is deleted best-effort |
 
 **Rule: Azure/OpenAI is the primary store.** If it fails, the entire upload fails regardless of Anthropic result.
 
-When `anthropic_status=failed`: `load_files` returns an error `tool_result` for that file — Claude tells the user the file is unavailable. The user can re-upload. Log the failure at `warn!` level.
+When `secondary_status=failed`, the adapter drops the `image` block for that attachment (logged at `debug!`); the upload failure itself is logged at `warn!`. The user can re-upload. The planned `load_files` error path does not exist.
 
 ### 8.0.1 Streaming & Memory Considerations
 
@@ -586,114 +619,74 @@ The oagw-sdk `Part::stream(name, BodyStream)` is fully implemented for streaming
 
 ### 8.1 Database Schema Changes
 
-#### 8.1.1 `attachments` table — new column
+#### 8.1.1 `attachments` table — secondary-upload columns
+
+The columns are provider-agnostic ("secondary upload"), so another provider can reuse them without a new migration. Today only `anthropic` is allowed.
 
 ```sql
--- PostgreSQL
-ALTER TABLE attachments
-  ADD COLUMN anthropic_file_id VARCHAR(128),
-  ADD COLUMN anthropic_status VARCHAR(16) NOT NULL DEFAULT 'not_attempted'
-    CHECK (anthropic_status IN ('not_attempted', 'pending', 'uploaded', 'failed'));
-
--- SQLite
-ALTER TABLE attachments
-  ADD COLUMN anthropic_file_id TEXT;
-ALTER TABLE attachments
-  ADD COLUMN anthropic_status TEXT NOT NULL DEFAULT 'not_attempted'
-    CHECK (anthropic_status IN ('not_attempted', 'pending', 'uploaded', 'failed'));
+-- Same DDL on PostgreSQL and SQLite
+ALTER TABLE attachments ADD COLUMN secondary_file_id VARCHAR(128);
+ALTER TABLE attachments ADD COLUMN secondary_status VARCHAR(16) NOT NULL DEFAULT 'not_attempted'
+  CHECK (secondary_status IN ('not_attempted', 'pending', 'uploaded', 'failed'));
+ALTER TABLE attachments ADD COLUMN secondary_provider_kind VARCHAR(32)
+  CHECK (secondary_provider_kind IS NULL OR secondary_provider_kind IN ('anthropic'));
 ```
 
-New fields on entity:
+Entity fields (`infra/db/entity/attachment.rs`):
 
 ```rust
-// infra/db/entity/attachment.rs
 #[sea_orm(column_type = "String(StringLen::N(128))", nullable)]
-pub anthropic_file_id: Option<String>,
+pub secondary_file_id: Option<String>,
 
 #[sea_orm(column_type = "String(StringLen::N(16))")]
-pub anthropic_status: AnthropicUploadStatus,
+pub secondary_status: SecondaryUploadStatus,
+
+#[sea_orm(column_type = "String(StringLen::N(32))", nullable)]
+pub secondary_provider_kind: Option<String>,
 ```
 
 ```rust
-/// Anthropic Files API upload status.
 /// Lifecycle: not_attempted → pending → uploaded | failed.
 #[derive(Clone, Debug, PartialEq, Eq, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "String", db_type = "String(StringLen::N(16))")]
-pub enum AnthropicUploadStatus {
-    /// OpenAI model chat, or pre-migration row — never attempted upload.
+pub enum SecondaryUploadStatus {
     #[sea_orm(string_value = "not_attempted")]
     NotAttempted,
-    /// Upload started but not yet completed. If seen after restart, eligible for retry.
     #[sea_orm(string_value = "pending")]
     Pending,
-    /// Successfully uploaded — anthropic_file_id is set.
     #[sea_orm(string_value = "uploaded")]
     Uploaded,
-    /// Upload failed — anthropic_file_id is NULL.
     #[sea_orm(string_value = "failed")]
     Failed,
 }
 ```
 
+`secondary_provider_kind` values are string constants in `attachment::secondary_provider_kind` (`ANTHROPIC = "anthropic"`), not a sea-orm enum, because the column is nullable.
+
 **Field semantics:**
 
-| `anthropic_status` | `anthropic_file_id` | Meaning |
-|---|---|---|
-| `not_attempted` | `NULL` | OpenAI model chat, or pre-migration row |
-| `pending` | `NULL` | Upload in progress (or server crashed mid-upload — eligible for retry) |
-| `uploaded` | `"file_011C..."` | Ready for `load_files` |
-| `failed` | `NULL` | Parallel upload failed — `load_files` returns error |
+| `secondary_status` | `secondary_file_id` | `secondary_provider_kind` | Meaning |
+|---|---|---|---|
+| `not_attempted` | `NULL` | `NULL` | Non-Anthropic chat, a document (documents are not uploaded to Anthropic), or a pre-migration row |
+| `pending` | `NULL` | `anthropic` | Upload in progress (or the server stopped mid-upload) |
+| `uploaded` | `"file_011C..."` | `anthropic` | The Anthropic copy exists; the image is sent as an `image` block |
+| `failed` | `NULL` | `anthropic` | Upload failed or timed out (30 s); the image is dropped from Anthropic requests |
 
-- No index needed — lookup is always by primary key (`id`) or by `(chat_id, tenant_id)`
-- `not_attempted` is the default, safe for existing rows after migration
-
-**No changes to existing columns.** The `provider_file_id` field continues to store Azure/OpenAI file reference. The new columns are independent, provider-specific state.
+- No index — lookups are by primary key or by `(chat_id, tenant_id)`.
+- `not_attempted` is the default, safe for existing rows.
+- `provider_file_id` still holds the primary (Azure/OpenAI) file id.
 
 #### 8.1.2 `chat_vector_stores` table — no changes
 
-The vector store table is not affected. Vector stores remain in Azure/OpenAI and are referenced by the existing `vector_store_id` field. The `search_files` tool loop uses the same vector store infrastructure.
+The vector store table is not affected. Vector stores remain in Azure/OpenAI and are referenced by the existing `vector_store_id` field. Documents are indexed there for Anthropic chats too, but nothing searches them (`search_files` is not implemented, see [ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md)).
 
 #### 8.1.3 Migration
 
-New migration file: `m20260327_000001_add_anthropic_fields.rs`
+`infra/db/migrations/m20260417_000004_add_secondary_upload_fields.rs`. `up()` runs the DDL above on both backends. `down()` drops the three columns; on SQLite a `DROP COLUMN` failure (SQLite < 3.35.0) is logged and ignored, on PostgreSQL it is returned as an error.
 
-```rust
-#[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let stmts = match manager.get_database_backend() {
-            sea_orm::DatabaseBackend::Postgres => vec![
-                "ALTER TABLE attachments ADD COLUMN anthropic_file_id VARCHAR(128)",
-                "ALTER TABLE attachments ADD COLUMN anthropic_status VARCHAR(16) NOT NULL DEFAULT 'not_attempted' CHECK (anthropic_status IN ('not_attempted', 'pending', 'uploaded', 'failed'))",
-            ],
-            sea_orm::DatabaseBackend::Sqlite => vec![
-                "ALTER TABLE attachments ADD COLUMN anthropic_file_id TEXT",
-                "ALTER TABLE attachments ADD COLUMN anthropic_status TEXT NOT NULL DEFAULT 'not_attempted' CHECK (anthropic_status IN ('not_attempted', 'pending', 'uploaded', 'failed'))",
-            ],
-            _ => return Err(DbErr::Custom("unsupported backend".into())),
-        };
-        for sql in stmts {
-            manager.get_connection().execute_unprepared(sql).await?;
-        }
-        Ok(())
-    }
+#### 8.1.4 Cleanup
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        // SQLite does not support DROP COLUMN before 3.35.0
-        for sql in [
-            "ALTER TABLE attachments DROP COLUMN anthropic_status",
-            "ALTER TABLE attachments DROP COLUMN anthropic_file_id",
-        ] {
-            manager.get_connection().execute_unprepared(sql).await?;
-        }
-        Ok(())
-    }
-}
-```
-
-#### 8.1.4 Cleanup considerations
-
-When an attachment is deleted (soft-delete via `deleted_at`), the Anthropic file should also be cleaned up. The existing cleanup worker (`cleanup_worker`) handles provider file deletion — extend it to also call `DELETE /v1/files/{anthropic_file_id}` on the Anthropic Files API when `anthropic_file_id` is present.
+Implemented. When an attachment with `secondary_status = uploaded` is deleted, `AttachmentService` resolves the Anthropic upstream alias at enqueue time and puts a `SecondaryCleanupRef` into the attachment-cleanup outbox payload. `AttachmentCleanupHandler` (`infra/workers/cleanup_worker.rs`) calls `DELETE /v1/files/{id}` through `AnthropicFilesClient` after the primary file is deleted. Chat deletion does the same per attachment using `secondary_upstream_alias` in the chat-cleanup payload. If no Anthropic client is configured, the delete is skipped and `secondary_cleanup_skipped` is incremented.
 
 ---
 
@@ -701,11 +694,11 @@ When an attachment is deleted (soft-delete via `deleted_at`), the Anthropic file
 
 ### 9.1 Token Billing
 
-Sum ALL fields across tool loop iterations (§6.1). Credit calculation unchanged — same formula with per-model multipliers.
+**Not implemented.** The adapter has no tool loop (§6.1), so there are no adapter iterations to sum. In the `search_knowledge` loop in `provider_task.rs`, `TerminalOutcome::ToolUse` carries no usage, so only the usage of the final provider response is settled. Credit calculation unchanged — same formula with per-model multipliers.
 
 ### 9.2 Tool Call Tracking
 
-Add `file_search_calls: u32` with `#[serde(default)]` to `UsageEvent`. Count `Tool { Done, "file_search" }` events (same pattern as `web_search_completed_count`).
+**Implemented.** `UsageEvent` carries `file_search_calls: u32` (`mini-chat-sdk/src/models.rs`), reported from `chat_turns.file_search_completed_count`. The counter is incremented for provider-native `file_search` tool `done` events and for successful `search_knowledge` retrievals (the two tools are never sent in the same request). The Anthropic adapter sends no `file_search`, so on Anthropic chats the count comes from `search_knowledge` only.
 
 ### 9.3 Cost Considerations
 
@@ -728,7 +721,7 @@ Prompt caching mitigates tool loop re-send cost (~10% for cached content).
 ### Phase 1: Core Adapter
 - `ProviderKind::AnthropicMessages` + factory
 - `anthropic_messages.rs`: SSE parsing, event translation, request building
-- Both `stream()` and `complete()` implementations (`complete()` used for thread/doc summaries)
+- Both `stream()` and `complete()` implementations (`complete()` used for thread summaries; document summaries do not exist, [ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md))
 - Native tools: `web_search_20260209`, `code_execution_20250825`
 - `anthropic-version` header, `rag_provider` config field
 - OAGW provisioning verification
@@ -736,16 +729,16 @@ Prompt caching mitigates tool loop re-send cost (~10% for cached content).
 ### Phase 2: Files API + Parallel Upload
 - `AnthropicFilesClient`: upload to Anthropic Files API
 - Parallel upload in `AttachmentService`: Azure/OpenAI + Anthropic for Anthropic model chats
-- `anthropic_file_id` field on attachment entity + migration
+- `secondary_file_id` / `secondary_status` / `secondary_provider_kind` on the attachment entity + migration `m20260417_000004_add_secondary_upload_fields`
 - Beta header handling
 
-### Phase 3: search_files Tool Loop
+### Phase 3: search_files Tool Loop — not implemented ([ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md))
 - `VectorStoreSearchClient` (reuses `RagHttpClient`)
 - Tool loop state machine in adapter
 - Configurable tool description/params
 - `LlmRequest` storage context fields
 
-### Phase 4: load_files Tool
+### Phase 4: load_files Tool — not implemented ([ADR-0007](../ADR/0007-cpt-cf-mini-chat-adr-document-retrieval-scope.md))
 - Tool definition with dynamic `filenames` enum from chat attachments
 - Content block type resolution from attachment metadata (document/image/container_upload)
 - Inject content blocks in continuation request
@@ -755,15 +748,15 @@ Prompt caching mitigates tool loop re-send cost (~10% for cached content).
 - `file_search_calls` in `UsageEvent`
 - Tracking in `stream_service` + finalization pass-through
 
-### Phase 6: Testing
-- Unit: request building, event translation, tool loops, image handling
-- Tool loops: search_files, load_files (mock OAGW + Files API)
-- Integration: provider resolver, config deserialization
+### Phase 6: Testing — partly implemented
+- Unit: request building, event translation, image handling — implemented (tests in `anthropic_messages.rs`). Tool-loop unit tests — not implemented (there is no adapter tool loop).
+- Tool loops: search_files, load_files (mock OAGW + Files API) — not implemented
+- Integration: provider resolver, config deserialization — covered by the `provider_resolver.rs` and `config.rs` tests
 
-### Phase 7: Observability
-- Metrics: `provider_id` labels, `file_search_tool_loop_latency_ms`, `load_files_latency_ms`
-- Logging: tool loop iterations at `debug!` (query, result count, latency)
-- Error sanitization: Anthropic `msg_` response IDs
+### Phase 7: Observability — partly implemented
+- Metrics: per-provider labels exist (`provider` label on stream metrics). `file_search_tool_loop_latency_ms` and `load_files_latency_ms` — not implemented
+- Logging: tool loop iterations at `debug!` (query, result count, latency) — not implemented (no adapter tool loop)
+- Error sanitization: Anthropic `msg_` response IDs — implemented (`infra/llm/mod.rs` redacts `msg_` IDs)
 
 ---
 
@@ -772,15 +765,16 @@ Prompt caching mitigates tool loop re-send cost (~10% for cached content).
 | File | Change | Description |
 |------|--------|-------------|
 | `infra/llm/providers/mod.rs` | Modify | Add `AnthropicMessages` variant, factory |
-| `infra/llm/providers/anthropic_messages.rs` | **New** | Core adapter + tool loops |
-| `infra/llm/providers/vector_store_search.rs` | **New** | Vector store search client |
-| `infra/llm/providers/anthropic_files_client.rs` | **New** | Upload to Anthropic Files API |
-| `domain/service/attachment_service.rs` | Modify | Parallel upload to Anthropic for Anthropic model chats |
+| `infra/llm/providers/anthropic_messages.rs` | **New** | Core adapter (no internal tool loop; `FileSearch` dropped) |
+| `infra/llm/providers/vector_store_search.rs` | — | **Not implemented** (planned vector store search client) |
+| `infra/llm/providers/anthropic_files_client.rs` | **New** | Upload to and delete from Anthropic Files API |
+| `domain/service/attachment_service.rs` | Modify | Parallel upload to Anthropic for Anthropic model chats (images only) |
 | `infra/llm/request.rs` | Modify | Storage context fields + builder methods |
 | `infra/llm/provider_resolver.rs` | Modify | Handle AnthropicMessages, storage provider resolution |
-| `config.rs` | Modify | `rag_provider`, `file_search_tool` fields |
-| `infra/db/entity/attachment.rs` | Modify | `anthropic_file_id` + `anthropic_status` fields, `AnthropicUploadStatus` enum |
-| `infra/db/migrations/` | **New** | Add `anthropic_file_id` and `anthropic_status` columns |
+| `config.rs` | Modify | `rag_provider` field |
+| `infra/db/entity/attachment.rs` | Modify | `secondary_file_id`, `secondary_status`, `secondary_provider_kind` fields, `SecondaryUploadStatus` enum |
+| `infra/db/migrations/m20260417_000004_add_secondary_upload_fields.rs` | **New** | Add the three `secondary_*` columns |
+| `infra/workers/cleanup_worker.rs` | Modify | Delete the Anthropic copy on attachment and chat cleanup |
 | `mini-chat-sdk/src/models.rs` | Modify | `file_search_calls` in `UsageEvent` |
 | `domain/model/finalization.rs` | Modify | `file_search_calls` field |
 | `domain/service/finalization_service.rs` | Modify | Pass `file_search_calls` |
@@ -793,9 +787,9 @@ Prompt caching mitigates tool loop re-send cost (~10% for cached content).
 | Risk | Impact | Mitigation |
 |------|--------|-----------|
 | Tool loop stream complexity | High dev effort | `async_stream::stream!` macro for generator-style impl |
-| OAGW stripping `anthropic-version` header | Requests rejected | Adapter adds per-request via `proxy_request()` |
+| OAGW stripping `anthropic-version` header | Requests rejected | Set as an upstream header rule (`set`) when the gear provisions the OAGW upstream (`anthropic_messages.rs::upstream_headers`, applied in `oagw_provisioning.rs`), not per request |
 | Microsoft Foundry SSE bug (concatenated events) | Parse failures | Resilient SSE parser handling missing `\n\n` |
-| Tool loop infinite iteration | Runaway costs | Cap at `max_tool_calls` from `LlmRequest` |
+| Tool loop infinite iteration | Runaway costs | The `search_knowledge` loop in `provider_task.rs` is hard-capped at `knowledge_search.max_calls_per_message + 2` iterations (then `agentic_iterations_exceeded`); `max_tool_calls` is not sent by the Anthropic adapter |
 | Tool execution failure mid-loop | Lost context | Graceful degradation via error `tool_result` |
 | Storage auth ≠ LLM auth | Search/upload fails | `rag_provider` config separation |
 | Files API beta instability | Breaking changes | Azure/OpenAI is primary store; Anthropic Files API is a re-populatable cache |
@@ -813,8 +807,8 @@ Prompt caching mitigates tool loop re-send cost (~10% for cached content).
 5. **Files API stability** — Beta on both platforms. How to handle breaking changes?
 6. **Model catalog** — How to configure Claude models in policy catalog (provider_id, multipliers, tool support flags)?
 7. **Storage context plumbing for tool loops** — The adapter needs vector_store_ids, attachment metadata, and OAGW gateway reference for `search_files` / `load_files` tool execution. `LlmRequest` currently has no storage-related fields. Options: (a) add storage context fields to `LlmRequest` + builder, (b) pass a separate `ToolLoopContext` alongside `LlmRequest` in `LlmProvider::stream()`, (c) inject storage context at adapter construction time (adapter becomes stateful per-request). Needs design decision before Phase 3.
-8. **Lazy re-upload on `load_files`** — Currently, when `anthropic_status=failed`, the file is unavailable for `load_files` (user must re-upload). A future improvement: at `load_files` time, if `anthropic_status=failed`, download from Azure/OpenAI store and re-upload to Anthropic Files API. On success, update `anthropic_status=uploaded` + set `anthropic_file_id`. Trade-off: adds latency to the tool loop (download + upload mid-stream) and complexity, but improves resilience against transient Anthropic Files API failures. Would also be required if model-switching per chat is added in the future (decision #4 currently prohibits this).
-9. **`anthropic_file_id` / `anthropic_status` column scalability** — Dedicated columns work for one provider. If a third provider (e.g., Google Gemini) needs the same pattern, refactor to an `attachment_provider_files` join table with `(attachment_id, provider, file_id, status)` instead of adding per-provider columns.
+8. **Lazy re-upload on `load_files`** — Currently, when `secondary_status=failed`, the image is not sent to Claude (user must re-upload). A future improvement: at request time, if `secondary_status=failed`, download from Azure/OpenAI store and re-upload to Anthropic Files API. On success, update `secondary_status=uploaded` + set `secondary_file_id`. Trade-off: adds latency to the tool loop (download + upload mid-stream) and complexity, but improves resilience against transient Anthropic Files API failures. Would also be required if model-switching per chat is added in the future (decision #4 currently prohibits this).
+9. **`secondary_*` column scalability** — The columns hold one secondary copy per attachment, discriminated by `secondary_provider_kind`. If an attachment ever needs copies at more than one secondary provider, refactor to an `attachment_provider_files` join table with `(attachment_id, provider, file_id, status)`.
 
 ---
 
@@ -822,6 +816,6 @@ Prompt caching mitigates tool loop re-send cost (~10% for cached content).
 
 1. `cargo test -p cf-gears-mini-chat` — all new tests pass
 2. `make dev-clippy && make dev-fmt`
-3. **E2E Anthropic Platform:** text streaming → web_search → upload file → search_files → load_files → code_execution with file → images
+3. **E2E Anthropic Platform:** text streaming → web_search → code_execution → image upload and image block (`search_files` / `load_files` not implemented)
 4. **E2E Microsoft Foundry:** same flow (Files API beta)
 5. **Billing:** verify `UsageEvent` token counts and `file_search_calls` across tool loop iterations

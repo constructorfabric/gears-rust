@@ -49,6 +49,15 @@ pub trait ChatRepository: Send + Sync {
         chat: Chat,
     ) -> Result<Chat, DomainError>;
 
+    /// Record activity on a chat (a message was sent): bumps `updated_at`,
+    /// which orders the chat list. Returns `true` if a row was affected.
+    async fn touch_activity<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<bool, DomainError>;
+
     /// Soft-delete a chat by ID. Returns `true` if a row was affected.
     async fn soft_delete<C: DBRunner>(
         &self,

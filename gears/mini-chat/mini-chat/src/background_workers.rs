@@ -4,15 +4,17 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::config::OrphanWatchdogConfig;
+use crate::config::{OrphanWatchdogConfig, UploadReaperConfig};
 use crate::domain::repos::{MessageRepository, TurnRepository};
 use crate::infra::leader::LeaderElector;
 use crate::infra::workers::WorkerHandles;
 use crate::infra::workers::orphan_watchdog::OrphanWatchdogDeps;
+use crate::infra::workers::upload_reaper::UploadReaperDeps;
 
 /// Worker configs captured in `init()` and consumed by `start()`.
 pub struct WorkerConfigs {
     pub(crate) orphan_watchdog: OrphanWatchdogConfig,
+    pub(crate) upload_reaper: UploadReaperConfig,
 }
 
 /// Default grace period for top-level worker shutdown before remaining tasks
@@ -40,6 +42,7 @@ pub fn spawn_workers<TR, MR>(
     parent_cancel: &CancellationToken,
     leader_elector: Option<&Arc<dyn LeaderElector>>,
     orphan_deps: Option<OrphanWatchdogDeps<TR, MR>>,
+    reaper_deps: Option<UploadReaperDeps>,
 ) -> anyhow::Result<(WorkerHandles, CancellationToken)>
 where
     TR: TurnRepository + 'static,
@@ -68,11 +71,31 @@ where
         );
     }
 
+    if configs.upload_reaper.enabled {
+        let elector = Arc::clone(
+            leader_elector
+                .ok_or_else(|| anyhow::anyhow!("leader elector required for upload_reaper"))?,
+        );
+        let deps = reaper_deps
+            .ok_or_else(|| anyhow::anyhow!("upload reaper deps required when enabled"))?;
+        let cancel = worker_cancel.child_token();
+        handles.spawn(
+            "upload_reaper",
+            cancel.clone(),
+            crate::infra::workers::upload_reaper::run(
+                elector,
+                configs.upload_reaper.clone(),
+                deps,
+                cancel,
+            ),
+        );
+    }
+
     Ok((handles, worker_cancel))
 }
 
 fn leader_workers_enabled(configs: &WorkerConfigs) -> bool {
-    configs.orphan_watchdog.enabled
+    configs.orphan_watchdog.enabled || configs.upload_reaper.enabled
 }
 
 /// Create the appropriate [`LeaderElector`] based on compile-time features
@@ -106,12 +129,17 @@ async fn create_leader_elector() -> anyhow::Result<Arc<dyn LeaderElector>> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
     fn disabled_configs() -> WorkerConfigs {
         WorkerConfigs {
             orphan_watchdog: OrphanWatchdogConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            upload_reaper: UploadReaperConfig {
                 enabled: false,
                 ..Default::default()
             },
@@ -125,11 +153,12 @@ mod tests {
         assert!(elector.is_none());
 
         let parent_cancel = CancellationToken::new();
-        let (handles, worker_cancel) = spawn_workers::<
-            crate::infra::db::repo::turn_repo::TurnRepository,
-            crate::infra::db::repo::message_repo::MessageRepository,
-        >(&configs, &parent_cancel, elector.as_ref(), None)
-        .unwrap();
+        let (handles, worker_cancel) =
+            spawn_workers::<
+                crate::infra::db::repo::turn_repo::TurnRepository,
+                crate::infra::db::repo::message_repo::MessageRepository,
+            >(&configs, &parent_cancel, elector.as_ref(), None, None)
+            .unwrap();
         assert_eq!(handles.len(), 0);
 
         worker_cancel.cancel();

@@ -250,3 +250,29 @@ fn lower_with_max_top_zero_floors_to_one_no_panic() {
         "floored top must satisfy IdpUserPagination::top >= 1 invariant"
     );
 }
+
+/// A cursor whose sort order names a field outside the whitelist is refused like an unknown `$orderby`.
+#[test]
+fn lower_with_unknown_field_in_cursor_order_returns_validation_error() {
+    // The cursor is caller-held: its `s` order passes the same
+    // whitelist as `$orderby`, so a forged unknown field never reaches
+    // the plugin (the static plugin has no projection for one).
+    use toolkit_odata::CursorV1;
+    let cur = CursorV1 {
+        k: vec!["alpha".to_owned(), "id".to_owned()],
+        o: SortDir::Asc,
+        s: "+foo,+id".to_owned(),
+        f: None,
+        d: "fwd".to_owned(),
+    };
+    let query = ODataQuery {
+        cursor: Some(cur),
+        ..ODataQuery::default()
+    };
+    let err = lower_odata_to_list_users_query(query, 200)
+        .expect_err("an unknown field in the cursor's order must reject");
+    let DomainError::Validation { detail } = err else {
+        panic!("expected Validation, got {err:?}")
+    };
+    assert!(detail.contains("`foo`"), "names the field: {detail}");
+}

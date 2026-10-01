@@ -4,8 +4,7 @@ import httpx
 import pytest
 from uuid import uuid4
 
-from .conftest import API_PREFIX, parse_sse, expect_done, expect_stream_started, stream_message, DB_PATH
-from .mock_provider.responses import Scenario, MockEvent, Usage
+from .conftest import API_PREFIX, RESOURCE_ODATA, assert_problem, expect_done, stream_message
 
 
 def _create_chat_with_messages(count: int = 1) -> str:
@@ -25,82 +24,37 @@ def _create_chat_with_messages(count: int = 1) -> str:
 class TestMessages:
     """GET /chats/{cid}/messages with OData query options."""
 
-    def test_odata_select(self, server):
-        """$select should limit returned fields to the requested set.
-
-        NOTE: If $select is not implemented, this test will fail.
-        That is expected — triage as a feature gap.
-        """
-        chat_id = _create_chat_with_messages(1)
-
-        resp = httpx.get(
-            f"{API_PREFIX}/chats/{chat_id}/messages",
-            params={"$select": "id,content"},
-        )
-        assert resp.status_code == 200, f"GET messages failed: {resp.status_code} {resp.text}"
-        items = resp.json()["items"]
-        assert len(items) >= 1
-
-        for msg in items:
-            # Selected fields must be present
-            assert "id" in msg, f"'id' missing from $select response: {msg}"
-            assert "content" in msg, f"'content' missing from $select response: {msg}"
-            # Non-selected fields should be absent (strict $select)
-            # Some APIs include id/type always — at minimum, heavy fields like
-            # input_tokens should be absent if $select is enforced.
-            non_selected = {"input_tokens", "output_tokens", "model"}
-            present_extras = non_selected & set(msg.keys())
-            # Soft assertion: warn but don't fail if server includes extra fields
-            # (some OData impls include structural fields always)
-            if present_extras:
-                pytest.xfail(
-                    f"$select did not strip extra fields: {present_extras}. "
-                    "Server may include structural fields by default."
-                )
-
     def test_odata_orderby(self, server):
-        """$orderby=created_at desc should return messages in reverse chronological order."""
+        """`$orderby=created_at desc` returns the four messages of two turns
+        in exactly the reverse of the default (chronological) order."""
         chat_id = _create_chat_with_messages(2)
+        url = f"{API_PREFIX}/chats/{chat_id}/messages"
 
-        resp = httpx.get(
-            f"{API_PREFIX}/chats/{chat_id}/messages",
-            params={"$orderby": "created_at desc"},
-        )
+        default = httpx.get(url)
+        assert default.status_code == 200, default.text
+        ascending = [m["id"] for m in default.json()["items"]]
+        assert len(ascending) == 4, ascending
+        assert [m["role"] for m in default.json()["items"]] == ["user", "assistant"] * 2
+
+        resp = httpx.get(url, params={"$orderby": "created_at desc"})
         assert resp.status_code == 200, f"GET messages failed: {resp.status_code} {resp.text}"
-        body = resp.json()
-        assert "page_info" in body
-        items = body["items"]
-        assert len(items) >= 2, f"Expected at least 2 messages, got {len(items)}"
-
-        # Verify descending order by created_at
-        timestamps = [m["created_at"] for m in items]
-        for i in range(len(timestamps) - 1):
-            assert timestamps[i] >= timestamps[i + 1], (
-                f"Messages not in descending order: {timestamps[i]} < {timestamps[i + 1]} "
-                f"at positions {i}, {i + 1}"
-            )
+        assert [m["id"] for m in resp.json()["items"]] == ascending[::-1], resp.json()
 
     def test_odata_filter_role(self, server):
-        """$filter=role eq 'assistant' should return only assistant messages."""
-        chat_id = _create_chat_with_messages(1)
+        """`$filter=role eq 'assistant'` returns exactly the answers: one
+        per turn, in order."""
+        chat_id = _create_chat_with_messages(2)
+        url = f"{API_PREFIX}/chats/{chat_id}/messages"
+        answers = [m["id"] for m in httpx.get(url).json()["items"] if m["role"] == "assistant"]
+        assert len(answers) == 2, answers
 
-        resp = httpx.get(
-            f"{API_PREFIX}/chats/{chat_id}/messages",
-            params={"$filter": "role eq 'assistant'"},
-        )
+        resp = httpx.get(url, params={"$filter": "role eq 'assistant'"})
         assert resp.status_code == 200, f"GET messages failed: {resp.status_code} {resp.text}"
-        body = resp.json()
-        assert "page_info" in body
-        items = body["items"]
-        assert len(items) >= 1, "Expected at least one assistant message"
-
-        for msg in items:
-            assert msg["role"] == "assistant", (
-                f"Expected only assistant messages, got role={msg['role']}"
-            )
+        items = resp.json()["items"]
+        assert [(m["id"], m["role"]) for m in items] == [(a, "assistant") for a in answers], items
 
     def test_my_reaction_field(self, server):
-        """Assistant messages should include a 'my_reaction' field (null when no reaction set)."""
+        """Every message has the required `my_reaction` field: null when no reaction is set."""
         chat_id = _create_chat_with_messages(1)
 
         resp = httpx.get(f"{API_PREFIX}/chats/{chat_id}/messages")
@@ -122,20 +76,199 @@ class TestMessages:
         user_msgs = [m for m in items if m["role"] == "user"]
         assert len(user_msgs) >= 1, "No user messages found"
         for user_msg in user_msgs:
-            assert user_msg.get("my_reaction") is None, (
-                f"Expected my_reaction=null for user message {user_msg['id']}, "
-                f"got: {user_msg.get('my_reaction')}"
-            )
+            # A required field: present (null) on user messages too.
+            assert "my_reaction" in user_msg, user_msg
+            assert user_msg["my_reaction"] is None, user_msg
 
     def test_cursor_pagination(self, server):
-        chat_id = _create_chat_with_messages()
-        # First page with limit=1
-        resp = httpx.get(f"{API_PREFIX}/chats/{chat_id}/messages", params={"limit": 1})
-        assert resp.status_code == 200
+        """Following next_cursor with limit=1 visits every message exactly once, in order."""
+        chat_id = _create_chat_with_messages(3)
+        full = httpx.get(f"{API_PREFIX}/chats/{chat_id}/messages").json()["items"]
+        assert len(full) == 6
+
+        ids: list[str] = []
+        params = {"limit": 1}
+        for _ in range(20):
+            resp = httpx.get(f"{API_PREFIX}/chats/{chat_id}/messages", params=params)
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert len(body["items"]) == 1
+            ids.extend(m["id"] for m in body["items"])
+            cursor = body["page_info"].get("next_cursor")
+            if not cursor:
+                break
+            params = {"limit": 1, "cursor": cursor}
+        assert ids == [m["id"] for m in full]
+
+    def test_prev_cursor_pages_back(self, server):
+        """03-23: `page_info.prev_cursor` is absent on the first page and set
+        on the next one; following it returns the first page again, and
+        `$top` / `$skiptoken` are the same as `limit` / `cursor`."""
+        chat_id = _create_chat_with_messages(3)
+        url = f"{API_PREFIX}/chats/{chat_id}/messages"
+        ids = [m["id"] for m in httpx.get(url).json()["items"]]
+        assert len(ids) == 6, ids
+
+        first = httpx.get(url, params={"limit": 2}).json()
+        assert [m["id"] for m in first["items"]] == ids[:2]
+        assert first["page_info"].get("prev_cursor") is None, first["page_info"]
+        second = httpx.get(url, params={"limit": 2, "cursor": first["page_info"]["next_cursor"]})
+        assert second.status_code == 200, second.text
+        second = second.json()
+        assert [m["id"] for m in second["items"]] == ids[2:4]
+        prev = second["page_info"].get("prev_cursor")
+        assert prev, second["page_info"]
+
+        back = httpx.get(url, params={"$top": 2, "$skiptoken": prev})
+        assert back.status_code == 200, back.text
+        back = back.json()
+        assert [m["id"] for m in back["items"]] == ids[:2], back
+        assert back["page_info"].get("prev_cursor") is None, back["page_info"]
+        assert back["page_info"].get("next_cursor"), back["page_info"]
+
+    def test_unknown_filter_field_400(self, chat):
+        resp = httpx.get(
+            f"{API_PREFIX}/chats/{chat['id']}/messages", params={"$filter": "nosuchfield eq 'x'"},
+        )
+        assert_problem(
+            resp, 400, "invalid_argument",
+            field_reason="INVALID_FILTER", resource_type=RESOURCE_ODATA,
+        )
+
+    def test_unknown_orderby_field_400(self, chat):
+        resp = httpx.get(
+            f"{API_PREFIX}/chats/{chat['id']}/messages", params={"$orderby": "nosuchfield desc"},
+        )
+        assert_problem(
+            resp, 400, "invalid_argument",
+            field_reason="INVALID_ORDERBY_FIELD", resource_type=RESOURCE_ODATA,
+        )
+
+    def test_malformed_cursor_400(self, chat):
+        resp = httpx.get(f"{API_PREFIX}/chats/{chat['id']}/messages", params={"cursor": "not-a-cursor"})
+        assert_problem(resp, 400, "invalid_argument", field_reason="INVALID_CURSOR")
+
+    @pytest.mark.parametrize(
+        "first_filter,next_filter",
+        [("role ne 'system'", "role eq 'user'"), ("role ne 'system'", None)],
+        ids=["other_filter", "filter_dropped"],
+    )
+    def test_cursor_with_other_filter_400(self, server, first_filter, next_filter):
+        """A cursor is bound to the `$filter` it was issued for: another or a
+        missing filter on the continuation is rejected."""
+        chat_id = _create_chat_with_messages(1)
+        url = f"{API_PREFIX}/chats/{chat_id}/messages"
+        params = {"limit": 1}
+        if first_filter is not None:
+            params["$filter"] = first_filter
+        first = httpx.get(url, params=params)
+        assert first.status_code == 200, first.text
+        cursor = first.json()["page_info"].get("next_cursor")
+        assert cursor, first.json()
+
+        params = {"limit": 1, "cursor": cursor}
+        if next_filter is not None:
+            params["$filter"] = next_filter
+        resp = httpx.get(url, params=params)
+        assert_problem(
+            resp, 400, "invalid_argument",
+            field_reason="FILTER_MISMATCH", resource_type=RESOURCE_ODATA,
+        )
+
+    def test_zero_limit_400(self, chat):
+        resp = httpx.get(f"{API_PREFIX}/chats/{chat['id']}/messages", params={"limit": 0})
+        assert_problem(resp, 400, "invalid_argument", field_reason="INVALID_LIMIT")
+
+    def test_limit_above_100_is_clamped(self, server):
+        """`limit=500` is not rejected: the page size is clamped to 100."""
+        chat_id = _create_chat_with_messages(1)
+        resp = httpx.get(f"{API_PREFIX}/chats/{chat_id}/messages", params={"limit": 500})
+        assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert len(body["items"]) <= 1
-        assert "page_info" in body
-        assert body["page_info"] is not None
+        assert body["page_info"]["limit"] == 100, body["page_info"]
+        assert len(body["items"]) == 2, body["items"]
+
+    def test_select_accepted_and_ignored(self, server):
+        """03-02: a valid `$select` is accepted and ignored: the page is the
+        one returned without it, with every message field."""
+        chat_id = _create_chat_with_messages(1)
+        url = f"{API_PREFIX}/chats/{chat_id}/messages"
+        plain = httpx.get(url)
+        assert plain.status_code == 200, plain.text
+        selected = httpx.get(url, params={"$select": "id"})
+        assert selected.status_code == 200, selected.text
+        assert selected.json() == plain.json()
+        assert all("content" in m and "role" in m for m in selected.json()["items"])
+
+    def test_invalid_select_400(self, chat):
+        """03-02: the `$select` syntax is validated: a duplicate field is 400
+        invalid_argument INVALID_SELECT."""
+        resp = httpx.get(
+            f"{API_PREFIX}/chats/{chat['id']}/messages", params={"$select": "id,id"},
+        )
+        assert_problem(
+            resp, 400, "invalid_argument",
+            field_reason="INVALID_SELECT", resource_type=RESOURCE_ODATA,
+        )
+
+    def test_unsupported_query_option_400(self, chat):
+        """A `$` option the OData extractor does not bind (`$skip`) is 400
+        invalid_argument UNSUPPORTED_QUERY_PARAM, not silently ignored."""
+        resp = httpx.get(f"{API_PREFIX}/chats/{chat['id']}/messages", params={"$skip": "1"})
+        assert_problem(
+            resp, 400, "invalid_argument",
+            field_reason="UNSUPPORTED_QUERY_PARAM", resource_type=RESOURCE_ODATA,
+        )
+
+    def test_filter_too_long_400(self, chat):
+        """A `$filter` longer than MAX_FILTER_LEN (8 KiB,
+        libs/toolkit/src/api/odata.rs) is 400 invalid_argument FILTER_TOO_LONG."""
+        long_filter = "role eq '" + "a" * (8 * 1024) + "'"
+        resp = httpx.get(
+            f"{API_PREFIX}/chats/{chat['id']}/messages", params={"$filter": long_filter},
+        )
+        assert_problem(
+            resp, 400, "invalid_argument",
+            field_reason="FILTER_TOO_LONG", resource_type=RESOURCE_ODATA,
+        )
+
+    def test_filter_too_complex_400(self, chat):
+        """A `$filter` of more than 2000 nodes (MAX_NODES,
+        libs/toolkit/src/api/odata.rs) within the length limit: 501
+        comparisons joined with `or` are 4 * 501 - 1 = 2003 nodes in 7511
+        bytes → 400 invalid_argument FILTER_TOO_COMPLEX."""
+        complex_filter = " or ".join(["role eq 'a'"] * 501)
+        resp = httpx.get(
+            f"{API_PREFIX}/chats/{chat['id']}/messages", params={"$filter": complex_filter},
+        )
+        assert_problem(
+            resp, 400, "invalid_argument",
+            field_reason="FILTER_TOO_COMPLEX", resource_type=RESOURCE_ODATA,
+        )
+
+    def test_limit_not_a_number_400(self, chat):
+        """`limit=abc` does not deserialize: 400 invalid_argument
+        INVALID_QUERY_PARAMS on `query`."""
+        resp = httpx.get(f"{API_PREFIX}/chats/{chat['id']}/messages", params={"limit": "abc"})
+        body = assert_problem(
+            resp, 400, "invalid_argument",
+            field_reason="INVALID_QUERY_PARAMS", resource_type=RESOURCE_ODATA,
+        )
+        assert [v["field"] for v in body["context"]["field_violations"]] == ["query"], body
+
+    def test_orderby_with_cursor_400(self, server):
+        chat_id = _create_chat_with_messages(1)
+        url = f"{API_PREFIX}/chats/{chat_id}/messages"
+        first = httpx.get(url, params={"limit": 1})
+        assert first.status_code == 200, first.text
+        cursor = first.json()["page_info"].get("next_cursor")
+        assert cursor, first.json()
+        resp = httpx.get(url, params={"cursor": cursor, "$orderby": "created_at desc"})
+        assert_problem(resp, 400, "invalid_argument", field_reason="ORDER_WITH_CURSOR")
+
+    def test_messages_of_nonexistent_chat_404(self, server):
+        resp = httpx.get(f"{API_PREFIX}/chats/{uuid4()}/messages")
+        assert_problem(resp, 404, "not_found")
 
     def test_request_id_non_null(self, server):
         """03-05: Every message must have a non-null request_id."""
@@ -155,16 +288,12 @@ class TestMessages:
 
     def test_request_id_shared_per_turn(self, server):
         """03-08: User and assistant messages in same turn share request_id."""
-        chat_id = _create_chat_with_messages()
+        chat_id = _create_chat_with_messages(2)
         resp = httpx.get(f"{API_PREFIX}/chats/{chat_id}/messages")
         assert resp.status_code == 200
         items = resp.json()["items"]
-        # Find pairs by position (user, assistant alternating)
-        validated = 0
-        for i in range(0, len(items) - 1, 2):
-            if items[i]["role"] == "user" and items[i+1]["role"] == "assistant":
-                assert items[i]["request_id"] == items[i+1]["request_id"], (
-                    f"Turn pair request_ids don't match: {items[i]['request_id']} vs {items[i+1]['request_id']}"
-                )
-                validated += 1
-        assert validated >= 1, f"No user+assistant pairs found to validate. Items: {[m['role'] for m in items]}"
+        assert [m["role"] for m in items] == ["user", "assistant"] * 2
+        pairs = [(items[i]["request_id"], items[i + 1]["request_id"]) for i in (0, 2)]
+        for user_rid, assistant_rid in pairs:
+            assert user_rid == assistant_rid, pairs
+        assert pairs[0][0] != pairs[1][0], "each turn has its own request_id"

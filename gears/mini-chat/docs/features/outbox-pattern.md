@@ -1,4 +1,4 @@
- # Feature: Transactional Outbox Pattern
+# Feature: Transactional Outbox Pattern
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-featstatus-usage-outbox`
 
 <!-- reference to DECOMPOSITION entry -->
@@ -8,164 +8,137 @@
 
 ### 1.1 Overview
 
-This feature describes the transactional outbox pattern implemented in `toolkit-db` (shared infra table `toolkit_outbox_events`) so that event publishing is reliable and does not add synchronous network calls to the critical execution hot path.
+Mini Chat publishes usage events, audit events and background work (attachment cleanup, chat cleanup, thread summaries) through the shared transactional outbox in `toolkit-db` (`libs/toolkit-db/src/outbox`). Producers write outbox rows in the same database transaction as their side effects; background tasks deliver them to handlers with at-least-once semantics. No synchronous call to billing or audit sits on the request hot path.
 
-The outbox is a **general-purpose infrastructure mechanism**.
-Gears use it by publishing messages under a dedicated `(namespace, topic)` pair.
+The outbox is a general-purpose library. A gear registers named **queues**, each split into a fixed number of **partitions**, and one handler per queue. The library reference is `libs/toolkit-db/src/outbox/README.md`.
 
 ### 1.2 Purpose
 
-This feature ensures the **Outbox Completeness Invariant**: for any domain operation that is defined to emit an outbox event, it MUST be impossible for that operation's side effects to commit without the corresponding `toolkit_outbox_events` row being persisted in the same database transaction.
+This feature ensures the **Outbox Completeness Invariant**: for any domain operation that is defined to emit an outbox event, it MUST be impossible for that operation's side effects to commit without the corresponding outbox row being persisted in the same database transaction.
 
 This invariant applies only to domain operations that are defined to emit outbox events (e.g., quota-bearing turn finalization in Mini Chat). It does not apply to read-only operations, pre-reserve validation failures, or state transitions that intentionally produce no event. The set of operations that require outbox emission is defined by each consuming gear (see DESIGN.md section 5.7 for the Mini Chat normative list).
 
-It also ensures events can be delivered asynchronously with at-least-once delivery semantics.
+Delivery is asynchronous and at-least-once.
 
-**Scope clarification**: The Outbox Completeness Invariant covers *transactional persistence* of the outbox row — not end-to-end delivery. A row that reaches `dead` status (section 4) satisfies the persistence invariant but represents a delivery failure. Dead rows MUST be surfaced via operational monitoring (see DoD `cpt-cf-mini-chat-dod-usage-outbox-dispatcher`); manual replay or escalation is outside the scope of this feature.
+**Scope clarification**: the invariant covers *transactional persistence* of the outbox row, not end-to-end delivery. A message a handler rejects is moved to the dead-letter table (section 4); it satisfies the persistence invariant but is a delivery failure. Dead letters MUST be surfaced via operational monitoring (see DoD `cpt-cf-mini-chat-dod-usage-outbox-dispatcher`). Mini Chat has no replay tooling of its own; the library's dead-letter operations (`replay`, `resolve`, `discard`) are the recovery path.
 
 ### 1.3 Actors
 
 | Actor | Role in Feature |
 |-------|-----------------|
 | `cpt-cf-mini-chat-actor-chat-user` | Initiates an operation whose commit MUST enqueue an outbox event (when side effects are applied). |
-| `cpt-cf-mini-chat-actor-usage-outbox-dispatcher` | Background worker that claims pending outbox rows and publishes events to a downstream consumer with retries. |
-| `cpt-cf-mini-chat-actor-outbox-consumer` | Downstream event consumer that processes deliveries idempotently. |
+| `cpt-cf-mini-chat-actor-usage-outbox-dispatcher` | The outbox processor of the `toolkit-db` library: leases a partition, reads its messages in sequence order and calls the queue's handler. |
+| `cpt-cf-mini-chat-actor-outbox-consumer` | Downstream consumer called by a handler (model-policy plugin `publish_usage`, audit plugin, provider file/vector-store APIs). MUST process redeliveries idempotently. |
 
 ### 1.4 References
 
-- ToolKit lifecycle/stateful tasks documentation (stateful worker)
+- `libs/toolkit-db/src/outbox/README.md` — library usage and handler guidance
+- `libs/toolkit-db/src/outbox/migrations.rs` — schema
+- `libs/toolkit-db/src/outbox/handler.rs` — `LeasedMessageHandler`, `MessageResult`, `HandlerResult`
+- `libs/toolkit-db/src/outbox/builder.rs` — queue registration, `LeaseConfig`
+- `gears/mini-chat/mini-chat/src/gear.rs` — queue registration for Mini Chat
+- `gears/mini-chat/mini-chat/src/infra/outbox.rs` — `InfraOutboxEnqueuer`, `UsageEventHandler`, `AuditEventHandler`
+- DESIGN.md §5.6 — usage event payload and `dedupe_key` format
 
 ### 1.5 Implementation Shape (normative)
 
-- Outbox events are enqueued through `toolkit_db::outbox::enqueue(runner, msg)` where `runner: &impl DBRunner`.
+- Producers enqueue through `Outbox::enqueue(runner, record)` where `record` is built with `Record::to(queue, partition).payload(bytes, payload_type).build()`. Mini Chat wraps this in the domain port `OutboxEnqueuer` (`domain/repos/outbox_enqueuer.rs`), implemented by `InfraOutboxEnqueuer`.
 - The enqueue call MUST run inside the same DB transaction as the side effects the event describes.
-- A background dispatcher (ToolKit `stateful` lifecycle task) claims events from `toolkit_outbox_events` using a lease (`locked_by`, `locked_until`) and delivers them with retries.
-- Producers SHOULD provide a stable `dedupe_key` to support idempotent enqueue and idempotent downstream processing.
+- `enqueue` returns a `Wake`. The caller MUST fire it only after the transaction commits (`Wake::fire`), and drop it on rollback. Several enqueues in one unit of work combine with `+=`. An unfired `Wake` does not lose the message: the library's reconciler finds the partition later, so delivery is only delayed.
+- Delivery runs in library background tasks (sequencer, per-partition processor, vacuum), started by `Outbox::builder(db)...start()` in `MiniChat::start()` and stopped in `MiniChat::stop()`.
+- Handlers implement `LeasedMessageHandler` and return `MessageResult::{Ok, Retry, Reject}`.
+- The library has **no deduplication**. There is no `dedupe_key` column and no unique index on enqueue. Idempotency is the consumer's job (section 1.8).
 
 ### 1.6 Outbox Storage (normative)
 
-Outbox events are stored in a shared infrastructure table owned by `toolkit-db`:
+The schema is created by `toolkit_db::outbox::outbox_migrations()`, which Mini Chat appends to its own migrations. Mini Chat uses the default table prefix `toolkit_outbox`, so the tables are shared with other gears in the same database and separated by queue name. Payloads are opaque bytes; Mini Chat always writes JSON with `payload_type = "application/json"`.
 
-`toolkit_outbox_events`
+| Table | Purpose | Key columns |
+|---|---|---|
+| `toolkit_outbox_body` | Message payload, written once | `id`, `payload` (bytes), `payload_type`, `created_at`, `trace` |
+| `toolkit_outbox_partitions` | One row per `(queue, partition)` | `id`, `queue`, `partition`, `sequence`; unique `(queue, partition)` |
+| `toolkit_outbox_incoming` | Enqueued, not yet sequenced | `id`, `partition_id` → partitions, `body_id` → body |
+| `toolkit_outbox_outgoing` | Sequenced, ready for the processor | `id`, `partition_id`, `body_id`, `seq`, `sequenced_at` |
+| `toolkit_outbox_processor` | Per-partition cursor and lease | `partition_id` (PK), `processed_seq`, `attempts`, `last_error`, `locked_by`, `locked_until` |
+| `toolkit_outbox_dead_letters` | Rejected messages with an inline payload copy | `partition_id`, `seq`, `payload`, `payload_type`, `created_at`, `failed_at`, `last_error`, `attempts`, `status` (`pending` / `reprocessing` / `resolved` / `discarded`), `completed_at`, `deadline`, `trace` |
+| `toolkit_outbox_vacuum_counter` | Vacuum bookkeeping per partition | `partition_id`, `counter` |
+| `toolkit_outbox_trace` | Optional batch-completion tracking (not used by Mini Chat) | `trace`, `owner_instance`, `queue`, `entities`, `pending`, … |
 
-**Columns (minimum)**:
+On MySQL the migration also creates `toolkit_outbox_body_id_sequence` and `toolkit_outbox_incoming_id_sequence`.
 
-- `id uuid pk`
-- `namespace text not null`
-- `topic text not null`
-- `tenant_id uuid null`
-- `dedupe_key text null`
-- `payload jsonb not null`
-- `status text not null` (`pending|processing|delivered|dead`)
-- `attempts int not null default 0`
-- `next_attempt_at timestamptz not null default now()`
-- `locked_by uuid null`
-- `locked_until timestamptz null`
-- `last_error text null`
-- `created_at timestamptz not null default now()`
-- `updated_at timestamptz not null default now()` — MUST be set to `now()` by application code on every state transition (`claim`, `ack`, `nack`). Not managed by a DB trigger.
+There is no per-message status column. A message's state follows from where its row is and from the partition cursor (section 4). Leases are held per partition in `toolkit_outbox_processor`, not per message.
 
-**Indexes (minimum)**:
-
-- `index(status, next_attempt_at)`
-- `index(locked_until)`
-
-**Dedupe / idempotency (Postgres)**:
-
-- Partial unique index on `(namespace, topic, dedupe_key)` where `dedupe_key IS NOT NULL`.
-
-**`tenant_id` column vs `dedupe_key` — distinct purposes (normative)**:
-
-The `tenant_id` column and the `dedupe_key` field serve different roles and MUST NOT be conflated:
-
-- **`tenant_id` column** — used for routing, filtering, and downstream partitioning. The dispatcher MAY use it to scope claim queries to a specific tenant. Downstream consumers MAY use it for partition-aware processing. It is nullable to accommodate system-level events that are not tenant-scoped.
-- **`dedupe_key`** — a producer-defined idempotency key whose structure is domain-specific. The partial unique index on `(namespace, topic, dedupe_key)` enforces at-most-once enqueue at the database level. The generic outbox library treats `dedupe_key` as an opaque string and performs NO validation on its structure.
-
-**Dedupe key requiredness by event type (normative):**
-
-The generic outbox library allows `dedupe_key` to be NULL (the partial unique index only applies when `dedupe_key IS NOT NULL`). However, gears MUST follow these rules when enqueuing events:
-
-1. **Quota-bearing / billing events** — MUST have non-null `dedupe_key`
-   - Events that result in quota debit, credit, or billing charges
-   - Events that participate in financial reconciliation
-   - Examples: Mini-Chat usage snapshots, subscription charges, refunds
-   - Rationale: At-least-once delivery semantics require idempotent deduplication to prevent double-charging
-
-2. **Critical state transitions** — SHOULD have non-null `dedupe_key`
-   - Events that trigger irreversible downstream actions
-   - Events used for audit trails or compliance logging
-   - Examples: user deletion notifications, access revocations
-   - Rationale: Prevents duplicate side effects in distributed systems
-
-3. **Informational telemetry** — MAY have NULL `dedupe_key`
-   - Non-critical metrics, analytics, or monitoring events
-   - Events where duplicate delivery is acceptable
-   - Examples: page view counters, system health heartbeats
-   - Rationale: Reduces storage overhead when idempotency is not required
-
-**Mini-Chat-specific convention (not enforced by generic library):** In the Mini Chat domain, the canonical format is `"{tenant_id}/{turn_id}/{request_id}"` (see DESIGN.md section 5.6). Mini Chat domain code MUST validate this format and enforce non-null `dedupe_key` for all quota-bearing events before calling `enqueue`. The validation is the caller's responsibility, not the outbox library's. Mini Chat downstream consumers MUST use the same canonical tuple `(tenant_id, turn_id, request_id)` — extracted from the `dedupe_key` or from the payload — for idempotent processing. Other gears define their own `dedupe_key` format and idempotency extraction rules in their respective feature specs.
-
-The presence of `tenant_id` as a table column does not replace domain-level idempotency semantics embedded in `dedupe_key`. The two serve different purposes. When both are populated, gears SHOULD ensure consistency (tenant_id column matches the tenant component of dedupe_key), but this is a gear-level convention, not a database constraint.
-
-### 1.7 Proposed `toolkit_db::outbox` v1 API (sketch)
-
-This is the intended interface shape for the generalized outbox mechanism in `toolkit-db`.
-Gears consume this API with their own `namespace/topic`.
+### 1.7 `toolkit_db::outbox` API used by Mini Chat
 
 ```rust
-use toolkit_db::secure::DBRunner;
-use toolkit_db::DBProvider;
-use serde_json::Value;
-use std::time::Duration;
-use uuid::Uuid;
+// Registration (gear.rs, MiniChat::start)
+let handle = Outbox::builder(db)
+    .queue(&cfg.outbox.queue_name, Partitions::of(n))
+    .leased(UsageEventHandler { .. })
+    .queue(&cfg.outbox.thread_summary_queue_name, Partitions::of(n))
+    .leased(ThreadSummaryHandler::new(..))
+    .lease(LeaseConfig {
+        duration: Duration::from_secs(thread_summary_worker.claim_timeout_secs),
+        ..LeaseConfig::default()
+    })
+    // ... other queues
+    .start()
+    .await?;
+
+// Producer (inside a transaction)
+let wake = outbox
+    .enqueue(txn, Record::to(queue, partition).payload(json, "application/json").build()?)
+    .await?;
+// after commit:
+wake.fire();
+
+// Consumer
+#[async_trait]
+pub trait LeasedMessageHandler: Send + Sync {
+    async fn handle(&self, msg: &OutboxMessage) -> MessageResult;
+}
 
 pub struct OutboxMessage {
-    pub namespace: &'static str,
-    pub topic: &'static str,
-    pub tenant_id: Option<Uuid>,
-    pub dedupe_key: Option<String>,
-    pub payload: Value,
+    pub partition_id: i64,
+    pub seq: i64,
+    pub payload: Vec<u8>,
+    pub payload_type: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Retries of this message so far (0 on first delivery).
+    pub attempts: i16,
 }
 
-pub async fn enqueue(
-    runner: &impl DBRunner,
-    msg: OutboxMessage,
-) -> Result<Uuid, toolkit_db::DbError>;
-
-pub struct ClaimCfg {
-    pub batch_size: u32,
-    pub lease_duration: Duration,
-    /// Maximum total delivery attempts (including the first).
-    /// Claim query excludes rows where `attempts >= max_attempts`.
-    /// Same value used by retry logic (section 3) for dead-lettering.
-    pub max_attempts: u32,
+pub enum MessageResult {
+    Ok,             // advance the cursor
+    Retry,          // transient: redeliver this message and the rest of the partition after backoff
+    Reject(String), // permanent: move to dead letters, continue with the next message
 }
 
-pub struct ClaimedMessage {
-    pub id: Uuid,
-    pub namespace: String,
-    pub topic: String,
-    pub tenant_id: Option<Uuid>,
-    pub dedupe_key: Option<String>,
-    pub payload: Value,
-    pub attempts: i32,
-}
-
-pub struct OutboxStore<E> {
-    pub db: DBProvider<E>,
-    pub worker_id: Uuid,
-    pub namespace: String,
-}
-
-impl<E> OutboxStore<E>
-where
-    E: From<toolkit_db::DbError> + Send + 'static,
-{
-    pub async fn claim_batch(&self, cfg: ClaimCfg) -> Result<Vec<ClaimedMessage>, E>;
-    pub async fn ack(&self, id: Uuid) -> Result<(), E>;
-    pub async fn nack(&self, id: Uuid, err: &str) -> Result<(), E>;
+pub struct LeaseConfig {
+    pub duration: Duration, // default 30 s
+    pub headroom: Duration, // default 2 s; the handler is cancelled at duration - headroom
 }
 ```
+
+`.lease(..)` applies to the queue registered just before it. Queues without `.lease(..)` use the default.
+
+### 1.8 Mini Chat queues
+
+All queues use the same partition count, `outbox.num_partitions` (power of two, 1–64, default 4). The partition is `uuid.as_u128() % num_partitions` of the partition key (`InfraOutboxEnqueuer::compute_partition`).
+
+| Queue (default name, config key) | Payload | Partition key | Handler | Lease | Retry bound |
+|---|---|---|---|---|---|
+| `mini-chat.usage_snapshot` (`outbox.queue_name`) | `UsageEvent` (SDK) | `tenant_id` | `UsageEventHandler` → model-policy plugin `publish_usage()` | default (30 s) | none; `Retry` until the plugin succeeds or returns `Permanent` |
+| `mini-chat.attachment_cleanup` (`outbox.cleanup_queue_name`) | `AttachmentCleanupEvent` (enqueued by attachment deletion and by the upload reaper, `event_type = attachment_upload_abandoned`, without `secondary_ref`) | `tenant_id` | `AttachmentCleanupHandler` → provider file delete, then Anthropic secondary delete | default | `cleanup_worker.max_attempts`, counted in `attachments.cleanup_attempts`; then the attachment is `failed` and the message `Reject` (dead letter). A delete answered with 2xx or 404 is success, any other status a failed attempt |
+| `mini-chat.chat_cleanup` (`outbox.chat_cleanup_queue_name`) | `ChatCleanupEvent` | `chat_id` | `ChatCleanupHandler` → per-attachment file deletes, vector store delete | default | `cleanup_worker.max_attempts` per attachment (attachment then `failed`, handler continues). A failing vector-store delete returns `Retry` until the delivery that reaches `cleanup_worker.max_attempts` (`msg.attempts`; deliveries that waited for pending attachments count), then `Reject`; the `chat_vector_stores` row is kept for a dead-letter replay |
+| `mini-chat.thread_summary` (`outbox.thread_summary_queue_name`) | `ThreadSummaryTaskPayload` | `chat_id` | `ThreadSummaryHandler` → non-streaming LLM call, summary persist, system usage event | `thread_summary_worker.claim_timeout_secs` | `thread_summary_worker.max_attempts` (`msg.attempts`); then `Reject`. A summary model missing from the catalog or disabled → `Reject` at once (`result = model_unavailable`) |
+| `mini-chat.audit` (`outbox.audit_queue_name`) | `AuditEnvelope` (`Turn` / `Mutation` / `Delete`) | `tenant_id` | `AuditEventHandler` → audit plugin `emit_*` (via `AuditGateway`) | 60 s | none; `Retry` on transient errors. A payload that does not deserialize → `Reject`, checked before the plugin is resolved. No audit plugin registered → `Ok` (event dropped, counted as `audit_emit_total{result="dropped"}`; looked up again on the next delivery). Instance found but its client missing from ClientHub → `Retry` |
+
+Partitioning by `chat_id` serialises work for one chat (cleanup and summaries for the same chat run in order). Partitioning by `tenant_id` keeps one tenant's usage and audit events in order.
+
+The thread-summary lease comes from `claim_timeout_secs` because the handler makes an LLM call (with prompt-too-long retries) that the default 30 s lease would cancel and redeliver mid-call.
+
+**Usage-event idempotency.** `UsageEvent.dedupe_key` is a payload field, not a library feature. Turn finalization sets `"{tenant_id}/{turn_id}/{request_id}"`; the thread-summary handler sets `"{tenant_id}/thread_summary_update/{system_request_id}"` (all UUIDs in 32-char lowercase hex, see DESIGN.md §5.6). The outbox can deliver the same event more than once; the model-policy plugin MUST drop duplicates by `dedupe_key`.
 
 ## 2. Actor Flows (CDSL)
 
@@ -176,23 +149,19 @@ where
 **Actor**: `cpt-cf-mini-chat-actor-chat-user`
 
 **Success Scenarios**:
- - An operation commits, and exactly one logical outbox event is enqueued atomically (resulting in at most one `toolkit_outbox_events` row per `dedupe_key`).
+- An operation commits, and its outbox messages (e.g. one usage event and one audit event for a finalized turn) are written to `toolkit_outbox_body` / `toolkit_outbox_incoming` in the same transaction. After the commit the combined `Wake` is fired.
 
 **Error Scenarios**:
-- The DB transaction fails: the described side effects and outbox insertion MUST both roll back.
+- The DB transaction fails: the side effects and the outbox rows both roll back, and the `Wake` is dropped.
+- The payload exceeds the library size limit: `Record::build()` fails before any statement runs, and the operation returns an error (`OutboxError::PayloadTooLarge`).
 
 **Behavior (normative)**:
-- The outbox row insertion is part of the operation's commit: it MUST be in the **same DB transaction** as the committed side effects.
-- Within that transaction:
-  - The system MUST enqueue exactly one logical outbox event describing the committed side effects. If a `dedupe_key` conflict occurs, the event is considered already enqueued; no duplicate row is inserted.
-- If an operation implementation uses a uniqueness guard for idempotent enqueue (e.g. a stable `dedupe_key` with a unique index):
-  - A conflict on insert MUST be treated as "already enqueued".
-- If the transaction fails/rolls back for any reason:
-  - No `toolkit_outbox_events` row is persisted.
+- The outbox insert is part of the operation's commit: it MUST be in the **same DB transaction** as the committed side effects.
+- The caller MUST NOT enqueue the same logical event twice in one operation. The library does not detect duplicates; retried domain operations are guarded by the domain CAS (e.g. turn finalization), not by the outbox.
+- If the transaction fails/rolls back for any reason, no outbox row is persisted.
 
 **Payload requirements**:
-- The outbox payload MUST include sufficient identifiers for idempotent downstream processing.
-- The outbox row SHOULD include a stable `dedupe_key` suitable for idempotency.
+- The payload MUST include enough identifiers for idempotent downstream processing (for usage events: `dedupe_key`, `tenant_id`, `turn_id`, `request_id`).
 
 ### Outbox Dispatcher Publishes Events
 
@@ -201,39 +170,23 @@ where
 **Actor**: `cpt-cf-mini-chat-actor-usage-outbox-dispatcher`
 
 **Success Scenarios**:
- - Pending outbox rows are claimed using `FOR UPDATE SKIP LOCKED` and published to the downstream consumer.
-- Claimed rows are marked `delivered` on success.
+- The sequencer moves incoming rows to `toolkit_outbox_outgoing` with a per-partition `seq`.
+- The processor for a partition takes the partition lease, reads the next messages after `processed_seq`, calls the handler for each in order, and advances `processed_seq` for every `Ok`.
 
 **Error Scenarios**:
-- Publish fails (temporary): the row is returned to `pending` and scheduled for retry using backoff.
-- Worker crashes after claiming: rows are reclaimed after lease expiry.
+- Handler returns `Retry`: the cursor stays on that message; the message and everything after it in the partition are redelivered after exponential backoff. `attempts` is incremented.
+- Handler returns `Reject(reason)`: the message is copied to `toolkit_outbox_dead_letters` and the cursor moves past it.
+- The instance crashes, or the handler overruns the lease: the lease expires and any instance can take the partition; the un-acked messages are redelivered.
 
 **Behavior (normative)**:
-- The dispatcher is an internal background worker (implemented as a ToolKit stateful lifecycle task).
-- It MUST periodically poll for publishable outbox rows and process them until a shutdown `CancellationToken` is triggered.
-  - **Polling interval**: configurable per-dispatcher via `poll_interval: Duration` (runtime configuration, supplied by the deploying gear). No hardcoded default in this spec. The polling interval MUST be significantly less than `lease_duration` (recommended: `poll_interval <= lease_duration / 3`) to avoid spurious lease-expiry reclaims.
-- Claiming MUST be safe under concurrency (multiple replicas/workers) and MUST use row-level locking via `FOR UPDATE SKIP LOCKED`.
-- Claimed rows MUST be leased using `(locked_by, locked_until)` so that:
-  - A crashing worker does not permanently strand a row.
-  - Another worker can reclaim a row after lease expiry.
-- For each claimed row, the dispatcher MUST publish the outbox payload to the downstream consumer.
-  - **"Publish" definition**: Publish is an abstract operation supplied by the consuming gear as a callback (e.g., `async fn(ClaimedMessage) -> Result<(), PublishError>`). The transport mechanism (in-process function call, HTTP, message queue) is gear-defined and outside the scope of this spec. The dispatcher treats the callback return value as the publish outcome: `Ok(())` = success, `Err(...)` = failure. The dispatcher MUST NOT interpret payload contents.
-- On publish success, the row MUST transition to `delivered` and be made ineligible for further dispatch.
-- On publish failure, the row MUST be returned to `pending` and rescheduled by setting `next_attempt_at` using a retry policy, while recording `attempts` and `last_error`.
-
-**Implementation note (normative)**:
-
-- The dispatcher uses a `toolkit_db::outbox::OutboxStore<E>` constructed from a `DBProvider<E>`.
-- The store provides:
-  - `claim_batch(...) -> Vec<ClaimedMessage>`
-  - `ack(id)`
-  - `nack(id, err)`
-- `ack` MUST only succeed for rows currently leased by the same worker (guarded by `locked_by`).
-- If `ack` fails the lease guard (row not leased by this worker, or lease expired and reclaimed by another worker), `ack` MUST return an error. The dispatcher MUST log the error and MUST NOT treat this as a publish failure requiring `nack`. The row is now owned by another worker or already delivered; no further action by this worker.
+- Processing is sequential within a partition and parallel across partitions. Any instance can process any partition; ownership is the lease in `toolkit_outbox_processor` (`locked_by`, `locked_until`), taken with a conditional update (`locked_by IS NULL OR locked_until < now()`).
+- The handler is called outside a DB transaction. The library cancels the handler future at `lease.duration - lease.headroom` so the ack can still commit inside the lease.
+- A `Retry` blocks the rest of its partition until it succeeds. Handlers whose failures can persist SHOULD bound retries and return `Reject` after a limit (Mini Chat does this for cleanup and thread-summary queues; section 1.8).
+- The handler MUST NOT interpret delivery as exactly-once.
 
 **Idempotency requirement**:
-- The dispatcher MUST assume at-least-once delivery.
-- Downstream processing MUST be idempotent on a stable key (e.g. the outbox `dedupe_key`).
+- Delivery is at-least-once. A message is redelivered if the lease expires before the ack.
+- Downstream processing MUST be idempotent: usage events by `dedupe_key`; cleanup handlers treat a provider 404 as success and skip attachments whose cleanup is already terminal; audit consumers must tolerate duplicates and dedupe on `(tenant_id, event_type, request_id)` for `turn_completed`, `turn_failed` and `turn_delete`, and on `(tenant_id, event_type, new_request_id)` for `turn_retry` and `turn_edit`; a redelivery is byte-identical (the same stored outbox payload).
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -242,110 +195,75 @@ where
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-algo-usage-outbox-enqueue`
 
 **Input**:
-- Operation outcome (completed/failed/aborted)
-- Committed side effects summary (gear-defined)
-- Identifiers used for idempotency and downstream correlation
+- Queue name (from `OutboxConfig`)
+- Partition key (`tenant_id` or `chat_id`, section 1.8)
+- Serialized JSON payload
 
-**Caller responsibility**: The `enqueue` function persists whatever message it receives; it does not inspect or filter by outcome. The *caller* (domain operation code) is responsible for deciding whether a given outcome requires an outbox event. The set of outbox-requiring outcomes is defined by each consuming gear (see section 1.2). If the caller determines that no event is needed (e.g., a pre-reserve validation failure), it simply does not call `enqueue`.
+**Caller responsibility**: `enqueue` persists whatever it receives. The domain code decides whether an outcome requires an event (see section 1.2) and does not call `enqueue` otherwise.
 
 **Output**:
-- Persisted `toolkit_outbox_events` row inserted atomically with the committed side effects
+- One `toolkit_outbox_body` row and one `toolkit_outbox_incoming` row, inserted in the caller's transaction
+- A `Wake` to fire after commit
 
 **Requirements**:
-- The enqueue operation MUST run inside the same DB transaction as the described side effects.
-- The outbox payload MUST be derived from already-validated internal state (no client-provided usage fields).
-- Enqueue MUST be idempotent on `dedupe_key` when it is provided:
-  - Multiple attempts to enqueue the same logical event MUST NOT produce multiple outbox rows.
-  - This is implemented in storage via the dedupe unique index and an upsert/ignore-on-conflict insert.
-- The outbox payload MUST include all information needed by the downstream consumer.
-- The outbox row MUST be initialized with:
-  - `namespace` and `topic` appropriate for the producer
-  - `status = 'pending'`
-  - `attempts = 0`
-  - `next_attempt_at = now()`
-  - `locked_by = NULL`, `locked_until = NULL`
+- The enqueue MUST run inside the same DB transaction as the described side effects.
+- The payload MUST be derived from already-validated internal state (no client-provided usage fields).
+- The payload MUST include all information the handler needs; handlers MUST NOT depend on rows that may be deleted before delivery (e.g. cleanup payloads carry provider file ids and the secondary-upload reference resolved at enqueue time).
+- `Wake::fire()` MUST be called only after a successful commit.
 
 ### Claim Pending Outbox Rows (Lease + Skip Locked)
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-algo-usage-outbox-claim`
 
 **Input**:
-- batch_size
-- lease_duration
-- worker_id
+- Queue and partition
+- `LeaseConfig` of the queue
+- Processor batch size (library `WorkerTuning`)
 
 **Output**:
-- A list of claimed rows ready to publish
+- An ordered batch of `OutboxMessage` for one partition
 
-**Requirements**:
-- Claim MUST be performed in a DB transaction.
-- Only rows eligible for dispatch MAY be claimed. The claim WHERE clause MUST match rows satisfying:
-  - (`status = 'pending'` AND `next_attempt_at <= now()`)
-  - OR (`status = 'processing'` AND `locked_until < now()`) — this covers lease-expired rows from crashed workers; the claim query atomically reclaims them. No separate recovery actor or sweep is required.
-  - In both cases: `attempts < max_attempts` (from `ClaimCfg`; rows at or above the limit are ineligible and MUST be transitioned to `dead` by the dispatcher on next encounter or by a periodic sweep).
-- The claim query MUST lock selected rows using `FOR UPDATE SKIP LOCKED`.
-- Upon claim, the worker MUST atomically:
-  - transition row to `processing` (or keep `processing` if reclaiming an expired lease)
-  - increment `attempts` — this is the **total delivery attempt count**, starting from 0 on insert. After the first claim, `attempts = 1`. `max_attempts = 3` means at most 3 delivery attempts; the row is dead-lettered when `attempts >= max_attempts`.
-  - set `locked_by = worker_id`
-  - set `locked_until = now() + lease_duration`
-  - set `updated_at = now()`
-- Claim ordering MUST be deterministic (e.g., `ORDER BY created_at ASC, id ASC`) to reduce starvation risk.
-- Claim MUST support multiple workers without double-claiming the same row.
+**Requirements** (implemented by the library):
+- The processor takes the partition lease by setting `locked_by` / `locked_until = now() + lease.duration` on the `toolkit_outbox_processor` row, only if the row is unleased or the lease has expired. On PostgreSQL and MySQL, partition and processor rows are locked with `FOR UPDATE SKIP LOCKED` so instances do not wait on each other.
+- It reads outgoing rows with `seq > processed_seq` in `seq` order.
+- One partition is processed by at most one instance at a time while the lease is valid.
+- After an expired lease, another instance takes the partition and continues from `processed_seq`; messages the previous holder handled but did not ack are delivered again.
 
 ### Retry Scheduling on Publish Failure
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-algo-usage-outbox-retry`
 
 **Input**:
-- publish error
-- current attempts count
-- retry policy configuration (max_attempts, base_delay, max_delay)
+- `MessageResult` of the handler
+- `OutboxMessage.attempts`
+- Processor tuning (`retry_base`, `retry_max`)
 
 **Output**:
-- Updated outbox row with next attempt time
+- Advanced cursor, a dead letter, or a delayed redelivery
 
 **Requirements**:
-- On publish failure, the dispatcher MUST record `last_error`.
-- The dispatcher MUST clear any claim lease when rescheduling: `locked_by = NULL`, `locked_until = NULL`.
-- The dispatcher MUST compute `next_attempt_at` using exponential backoff with jitter, bounded by a configured maximum:
-
-  > `delay = min(base_delay * 2^(attempts - 1), max_delay)`
-  > `jittered_delay = uniform_random(delay / 2, delay)`
-  > `next_attempt_at = now() + jittered_delay`
-  >
-  > Where:
-  > * `base_delay` — minimum retry interval. Runtime configuration supplied by the deploying gear (e.g., 1 s). Immutable per dispatcher instance.
-  > * `max_delay` — upper bound on computed delay before jitter. Runtime configuration supplied by the deploying gear (e.g., 300 s). Immutable per dispatcher instance.
-  > * `attempts` — current value of the row's `attempts` column (persisted, incremented at claim time per section 3 claim algo).
-  > * Jitter: uniform random over `[delay/2, delay]` (equal-jitter strategy). Bounding is applied before jitter: `delay` is clamped to `max_delay` first, then jitter is applied to the clamped value.
-
-- If `attempts >= max_attempts`, the dispatcher MUST transition the row to `dead` and MUST NOT retry it automatically. `max_attempts` is the same value as `ClaimCfg.max_attempts` (section 1.7); it represents total delivery attempts. Runtime configuration supplied by the deploying gear, immutable per dispatcher instance.
+- `Retry` increments `attempts` on the partition's processor row and schedules the next attempt with exponential backoff between `retry_base` and `retry_max` (default processor tuning: 1 s to 60 s).
+- `Reject` moves the message to `toolkit_outbox_dead_letters` with its payload, `attempts` and the reject reason as `last_error`.
+- The library has no `max_attempts`. Bounding retries is the handler's job, using `OutboxMessage.attempts` or its own counter:
+  - `ThreadSummaryHandler` returns `Reject` when the delivery is its `thread_summary_worker.max_attempts`-th, and at once when the summary model is missing from the catalog or disabled (`mini_chat_thread_summary_execution_total{result="model_unavailable"}`);
+  - `AttachmentCleanupHandler` counts failures in `attachments.cleanup_attempts` and returns `Reject` at `cleanup_worker.max_attempts`; `ChatCleanupHandler` marks such an attachment `failed` and continues, and returns `Reject` for a failing vector-store delete on the delivery that reaches `cleanup_worker.max_attempts` (`msg.attempts`);
+  - `UsageEventHandler` and `AuditEventHandler` retry until the plugin succeeds or reports a permanent error; `AuditEventHandler` rejects a corrupt payload at once.
 
 ## 4. States (CDSL)
 
-### `toolkit_outbox_events` Row State Machine
+### Outbox Message State Machine
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-state-usage-outbox-row`
 
-**States**: pending, processing, delivered, dead
+**States**: incoming, sequenced, processed, dead-lettered
 
-**Initial State**: pending
+**Initial State**: incoming
 
 **State semantics (normative)**:
-- `pending`:
-  - Row is eligible for claiming when `next_attempt_at <= now()`.
-  - Row MUST NOT be published unless it is first claimed.
-- `processing`:
-  - Row is claimed by a dispatcher and has an active lease (`locked_until`).
-  - Row may be re-published in crash scenarios (at-least-once delivery).
-  - If `now() > locked_until`, the row becomes reclaimable. The claim query (section 3, `cpt-cf-mini-chat-algo-usage-outbox-claim`) handles this inline: it includes `processing` rows with expired leases in its WHERE clause and atomically reclaims them. No separate recovery actor or sweep is required for the `processing → processing` (re-lease) transition.
-- `delivered`:
-  - Terminal state.
-  - Row MUST NOT transition out of `delivered`.
-- `dead`:
-  - Terminal state for permanent failures (attempts exceeded `max_attempts`).
-  - Row MUST NOT be retried automatically.
+- `incoming`: a row in `toolkit_outbox_incoming`. Committed but not yet ordered. Not visible to handlers.
+- `sequenced`: a row in `toolkit_outbox_outgoing` with `seq > processed_seq` of its partition. Eligible for delivery in `seq` order. May be delivered more than once (retry, lease expiry).
+- `processed`: `seq <= processed_seq`. Terminal. The vacuum later deletes the outgoing and body rows.
+- `dead-lettered`: the handler returned `Reject`. The message is in `toolkit_outbox_dead_letters` with status `pending`. It is not retried automatically. Operator actions: `replay` (→ `reprocessing`), `resolve` (→ `resolved`), `discard` (→ `discarded`).
 
 ## 5. Definitions of Done
 
@@ -353,23 +271,25 @@ where
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-dod-usage-outbox-transactional`
 
-For any domain operation defined to emit an outbox event, the system **MUST** persist a `toolkit_outbox_events` row in the same DB transaction as that operation's committed side effects.
+For any domain operation defined to emit an outbox event, the system **MUST** persist the outbox rows (`toolkit_outbox_body`, `toolkit_outbox_incoming`) in the same DB transaction as that operation's committed side effects, and fire the returned `Wake` only after commit.
 
 **Implements**:
 - `cpt-cf-mini-chat-flow-usage-outbox-enqueue`
 - `cpt-cf-mini-chat-algo-usage-outbox-enqueue`
 
 **Touches**:
-- DB: `toolkit_outbox_events`
+- DB: `toolkit_outbox_body`, `toolkit_outbox_incoming`
+- Code: `domain/repos/outbox_enqueuer.rs`, `infra/outbox.rs`, `domain/service/finalization_service.rs`, `domain/service/turn_service.rs`, `domain/service/attachment_service.rs`, `domain/service/chat_service.rs`, `infra/workers/upload_reaper.rs`
 
 ### Provide Stateful Usage Outbox Dispatcher
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-dod-usage-outbox-dispatcher`
 
-The system **MUST** run a background dispatcher as a stateful lifecycle task that:
-- Claims rows using `FOR UPDATE SKIP LOCKED`.
-- Uses a lease (`locked_until`) to ensure rows are recoverable after crashes.
-- Retries failed publishes using backoff and records `last_error`.
+The system **MUST** register every Mini Chat queue with a `LeasedMessageHandler` at start-up so that:
+- Messages are processed in order within a partition under a partition lease.
+- Leases expire so that partitions held by a crashed instance are taken over.
+- Transient failures are retried with backoff; permanent failures are dead-lettered.
+- Dead letters are visible to operators: the usage and audit handlers log at `error!` on `Reject` (audit emits also record `result = reject` in metrics); the cleanup handlers and the thread-summary handler (bounded reject after `max_attempts`) log their rejects at `warn!`.
 
 **Implements**:
 - `cpt-cf-mini-chat-flow-usage-outbox-dispatch`
@@ -378,25 +298,26 @@ The system **MUST** run a background dispatcher as a stateful lifecycle task tha
 - `cpt-cf-mini-chat-state-usage-outbox-row`
 
 **Touches**:
-- DB: `toolkit_outbox_events`
+- DB: `toolkit_outbox_partitions`, `toolkit_outbox_outgoing`, `toolkit_outbox_processor`, `toolkit_outbox_dead_letters`
+- Code: `gear.rs` (`MiniChat::start`), `infra/outbox.rs`, `infra/workers/cleanup_worker.rs`, `infra/workers/thread_summary_worker.rs`
 
 ### Enforce Idempotent Publish Contract
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-dod-usage-outbox-idempotency`
 
-The system **MUST** ensure that event delivery is safe under retries and replays by using a stable dedupe key and requiring downstream processing to be idempotent on that key.
+The system **MUST** keep delivery safe under redelivery: every usage event carries a stable `dedupe_key`, and downstream consumers MUST be idempotent on it. The outbox library does not deduplicate.
 
 **Implements**:
 - `cpt-cf-mini-chat-flow-usage-outbox-dispatch`
 
 **Touches**:
-- DB: `toolkit_outbox_events` (dedupe key)
+- Payload: `UsageEvent.dedupe_key` (`mini-chat-sdk/src/models.rs`)
 
 ## 6. Acceptance Criteria
 
-- [ ] For any domain operation defined to emit an outbox event, at most one `toolkit_outbox_events` row exists per logical domain event (identified by `dedupe_key`), enforced by the partial unique index; on successful first commit, exactly one row is persisted in the same DB transaction as that operation's side effects.
-- [ ] If a producer loses an idempotency race, it observes "already enqueued" and no duplicate `toolkit_outbox_events` row is inserted.
-- [ ] Dispatcher can run concurrently (multiple replicas) without double-processing rows (verified via `SKIP LOCKED` + lease).
-- [ ] If the dispatcher crashes after claiming rows, those rows become eligible for reclaim after lease expiry.
-- [ ] Publish failures reschedule rows with increasing `next_attempt_at` and record `last_error`.
-- [ ] Publishing is safe under retries (downstream processing is idempotent on dedupe key).
+- [ ] For any domain operation defined to emit an outbox event, the outbox rows are committed in the same transaction as the operation's side effects; on rollback no outbox row exists.
+- [ ] Messages of one partition are delivered in enqueue order; two instances never process the same partition while its lease is valid.
+- [ ] If an instance crashes while holding a partition lease, another instance continues from `processed_seq` after the lease expires.
+- [ ] A handler `Retry` redelivers the message with increasing delay; a `Reject` moves it to `toolkit_outbox_dead_letters` and processing of the partition continues.
+- [ ] Thread-summary and cleanup messages that keep failing are dead-lettered after their configured `max_attempts`.
+- [ ] Every usage event has a non-null `dedupe_key` in the canonical format, so the consumer can drop redeliveries.
