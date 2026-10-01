@@ -51,7 +51,7 @@ Without it, operators have no way to answer routine retention / replay / lag que
 ### 1.4 References
 
 - DESIGN.md §3.3 `GET /v1/topics/segments` endpoint summary
-- DESIGN.md §3.2 storage-backend trait — `backend.segments(ctx, topic) -> Vec<Segment>`
+- Feature 0007 §2.1 storage backend trait - `query(at, range) -> Vec<TopicSegment>`, no `SecurityContext`
 - DESIGN.md §3.7 reference to `received` / `max_offset` derivability
 - DESIGN.md §4.6 Out of Scope (the future subscription-based backfill that supersedes external replay tooling)
 - `openapi.yaml#/paths/~1v1~1topics~1segments`
@@ -115,27 +115,29 @@ def maybe_skip_to_earliest(topic, partition, cursor_offset):
 ### 2.4 Producer Health-Check
 
 ```python
-# Producer cross-checks its chain state against the broker's persisted state
-def check_publish_pipeline(producer_id, topic, partition):
+# Producer cross-checks its chain state against the broker's view, per (producer_id, topic).
+# The producer chain (meta.sequence, per (producer_id, topic)) and the backend sequence
+# (end_sequence, per (topic, partition)) are different numbering spaces: the check
+# compares each only with its own kind.
+def check_publish_pipeline(producer_id, topic, partitions):
     resp     = http.get(f"/v1/producers/{producer_id}/cursors").json
-    segments = http.get(f"/v1/topics/segments?topic={topic}&partition={partition}").json
+    accepted = next(t["last_sequence"] for t in resp["topics"] if t["topic"] == topic)
+    sent     = local_last_sent_sequence(producer_id, topic)
 
-    last_seq = next(
-        p["last_sequence"]
-        for t in resp["topics"] if t["topic"] == topic
-        for p in t["partitions"] if p["partition"] == partition
-    )
-    end_seq  = segments["end_sequence"]
-
-    if last_seq < end_seq - LAG_THRESHOLD:
-        log.warn("publish pipeline lag", lag=end_seq - last_seq)
-        # events accepted by ingest but not yet visible on the consumer side
-    elif last_seq > end_seq:
-        log.error("publish desync — producer ahead of backend")
+    if sent - accepted > LAG_THRESHOLD:
+        log.warn("publish pipeline lag", lag=sent - accepted)
+        # events sent but not yet accepted by ingest
+    elif accepted > sent:
+        log.error("publish desync - broker ahead of producer")
         pause_publishes()
         alert_operators()
-        # producer believes it published events the backend did not persist
-        # (ingest outbox backlog, partial failure, etc.)
+        # the producer's local chain state regressed (DB restore, etc.)
+
+    # Backend side, in backend numbering: the partitions the caller watches keep
+    # advancing while the producer publishes, so the ingest outbox is draining.
+    for partition in partitions:
+        env = http.get(f"/v1/topics/segments?topic={topic}&partition={partition}").json
+        observe_progress(topic, partition, env["end_sequence"], env["end_time"])
 
 # AUTHZ: `topic:read` on T + the existing producer-cursor permission.
 ```
@@ -170,7 +172,7 @@ The endpoint is stateless from the broker's perspective. It reflects the backend
 - [ ] `p2` - **ID**: `cpt-cf-evbk-dod-topic-segment-introspection-endpoint`
 
 - `GET /v1/topics/segments` is implemented per `openapi.yaml`.
-- `backend.segments()` is wired through the storage-backend plugin trait.
+- The backend's `query(at, range)` (feature 0007 §2.1) is wired through the storage-backend plugin trait.
 - Authorization checks `topic:read` permission via the PEP.
 - Pagination over the `segments[]` array works per the documented semantics.
 - Backend-unavailable case returns 503 with `Retry-After`.

@@ -16,6 +16,7 @@ decision-makers: Event Broker Team
   - [Registration: `POST /v1/producers`](#registration-post-v1producers)
   - [Mode-Shape Enforcement at Publish Time](#mode-shape-enforcement-at-publish-time)
   - [Mode Immutability](#mode-immutability)
+  - [Chain Scope](#chain-scope)
   - [Bootstrap Chain Value](#bootstrap-chain-value)
   - [Chain Reset — Two Levers](#chain-reset--two-levers)
   - [Producer Registration TTL](#producer-registration-ttl)
@@ -23,6 +24,7 @@ decision-makers: Event Broker Team
   - [Producer Concurrency](#producer-concurrency)
   - [Producer Identity Principal Binding](#producer-identity-principal-binding)
   - [Atomicity: Outbox Enqueue + State Update](#atomicity-outbox-enqueue--state-update)
+  - [Batch Publish](#batch-publish)
   - [Hard-Error Catalog](#hard-error-catalog)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
@@ -63,9 +65,9 @@ The broker is unshipped — no production data, no live producers — so this AD
 
 * Explicit contract: producer mode must be a declared property, not an emergent property of which fields a producer happened to set
 * Hard errors at the wire boundary: mode-shape violations reject the publish loudly, not silently weaken dedup
-* Symmetry with partition selection: same principle ([ADR-0002 revised](0002-partition-selection.md)) — broker is authoritative, producer freedom is constrained to the choice the producer intended to make
+* Symmetry with partition selection: same principle ([ADR-0002 revised](0002-partition-selection.md)) - the producer never chooses a partition; the backend assigns it ([feature 0007](../features/0007-storage-backend-api.md)), and producer freedom is constrained to the choice the producer intended to make
 * Principal binding: a `producer_id` is owned by the principal that created it; cross-principal use is rejected
-* Per-event chain values in batches: chained-mode contiguous batches carry per-event `previous` and `sequence`
+* Per-event chain values in batches: every event carries its own `meta`, so one batch carries events of several producer ids and topics, and each `(producer_id, topic)` run in it is validated against its own chain
 * Future-mode extensibility: new modes (e.g., post-MVP recent-`event.id` LRU stateless variant) ship as new registration values without changing the event schema
 * Operator-driven reset must exist but must be auditable
 * Idle producers should age out automatically so producer-state storage doesn't grow without bound
@@ -78,7 +80,7 @@ The broker is unshipped — no production data, no live producers — so this AD
 
 ## Decision Outcome
 
-Adopt **Option B — mode declared at producer registration, enforced per request**. A producer registers once with `POST /v1/producers { "mode": "chained" | "monotonic" }`, the broker stores `mode` on the producer row, and every subsequent publish referencing that `producer_id` is validated against the stored mode. Mode-shape mismatches reject with `400`. Stateless mode does **not** register: no row, no `meta.producer_id` on publish, no broker-side dedup.
+Adopt **Option B - mode declared at producer registration, enforced per request**. A producer registers once with `POST /v1/producers { "mode": "chained" | "monotonic" }`, the broker stores `mode` on the producer row, and every subsequent publish referencing that `producer_id` is validated against the stored mode. Mode-shape mismatches reject with `400`. Stateless mode does **not** register: no row, no `meta.producer_id` on publish, no broker-side dedup. A producer id is not bound to a topic: it publishes to any number of topics, and the broker keeps one chain per `(producer_id, topic)` (see [Chain Scope](#chain-scope)).
 
 ### Three Modes, Wire Shapes
 
@@ -144,8 +146,10 @@ On every publish, after authn but before any storage write:
 
 After validation passes, mode-specific business rules apply:
 
-- **Chained**: accept iff `meta.previous == evbk_producer_state.last_sequence` AND `meta.sequence > last_sequence`. Chain mismatch → `412 SequenceViolation` carrying broker's `last_sequence`. Duplicate (`meta.sequence <= last_sequence`) → `200 OK` returning the original event_id.
-- **Monotonic**: accept iff `meta.sequence > evbk_producer_state.last_sequence`. Duplicate (`meta.sequence <= last_sequence`) → `200 OK`. Gaps between sequences are accepted.
+- **Chained**: accept iff `meta.previous == evbk_producer_state.last_sequence` AND `meta.sequence > last_sequence`; gaps between sequences are accepted. Duplicate (`meta.sequence == last_sequence`) -> `200 OK`, status only. Anything else -> `412 SequenceViolation` carrying the broker's `last_sequence`.
+- **Monotonic**: accept iff `meta.sequence > evbk_producer_state.last_sequence`. Duplicate (`meta.sequence <= last_sequence`) -> `200 OK`. Gaps between sequences are accepted.
+
+`last_sequence` is read from the `(producer_id, topic)` row of the event's topic. A batch applies the same rules per run (see [Batch Publish](#batch-publish)).
 
 ### Mode Immutability
 
@@ -157,16 +161,28 @@ After validation passes, mode-specific business rules apply:
 
 Why immutable: reusing `evbk_producer_state` rows across modes is unsafe. The chained invariant (`previous` == `last_sequence`) does not hold against the monotonic gap-accepting rule, and switching mid-stream would cause both modes to misbehave on in-flight events.
 
+### Chain Scope
+
+Chain state is kept per `(producer_id, topic)`: `evbk_producer_state` has `PRIMARY KEY (producer_id, topic)` and holds the pair's `last_sequence`.
+
+- **No topic binding.** A producer id is not bound to a topic; registration names none (`[mode, client_agent]`). One id publishes to any number of topics, each topic its own chain, ordered and checked independently of the others.
+- **No partition.** The partition is not part of the chain. The backend assigns it after ingest admits the event ([feature 0007](../features/0007-storage-backend-api.md)); neither the producer nor the broker computes one for the chain, and `meta` carries no partition.
+- **Gaps across topics.** A counter shared across topics (for example a producer-outbox partition's sequence) is valid: each topic's chain sees that counter with gaps, and both modes accept gaps.
+
+#### Producer Partitions
+
+A producer without partitions uses one producer id. A partitioned producer - one whose own work is split into partitions that number their events independently, such as the outbox partitions of the SDK's `DbProducer` - registers one producer id per producer partition, so each id has exactly one sequence space.
+
+The rule is required, not advisory. A sequence space shared across producer partitions interleaves on a topic's chain: producer partition 3 sends `sequence = 7` after producer partition 9 sent `sequence = 40`. Chained mode answers `412`; monotonic mode treats `7` as a duplicate, answers `200 OK` and drops the event silently. The broker cannot tell such an interleave from a retry, so the producer guarantees one sequence space per producer id.
+
 ### Bootstrap Chain Value
 
-The first chained-mode publish for a `(producer_id, topic, partition)` triple — i.e., the publish that creates the `evbk_producer_state` row — establishes the chain. The contract:
+The first accepted publish for a `(producer_id, topic)` pair creates its `evbk_producer_state` row and takes its numbers. The contract:
 
-- The broker treats a missing `evbk_producer_state` row as `last_sequence = 0` (the row's logical default).
-- The first chained event MUST set `meta.previous = 0` and `meta.sequence >= 1`. The broker accepts the publish and inserts the state row with `last_sequence = meta.sequence`.
-- Any `meta.previous` value other than `0` on the first publish rejects with `412 SequenceViolation` (broker reports its known `last_sequence = 0`).
-- The same bootstrap rule applies after a `:reset` (see below) or after the Reaper purges a stale `evbk_producer_state` row.
-
-Monotonic mode has no `previous` — the first publish simply requires `meta.sequence > 0` (since `last_sequence` defaults to `0`).
+- A missing row admits the first publish without a chain check; the row is inserted with `last_sequence = meta.sequence`.
+- Chained mode accepts any `meta.previous` on that first publish (the shape rule `meta.sequence > meta.previous` still applies); the conventional first step is `meta.previous = 0, meta.sequence = 1`.
+- Monotonic mode accepts any `meta.sequence` on that first publish.
+- The same bootstrap rule applies after a `:reset` (see below).
 
 ### Chain Reset — Two Levers
 
@@ -174,27 +190,27 @@ Two distinct paths exist for chain reset, serving different scenarios:
 
 #### Operator-driven reset: `POST /v1/producers/{producer_id}:reset`
 
-- **Request body** (optional): `{ "topic": "...", "partition": N }` to scope the reset to a single `(topic, partition)`. Body absent → reset all `evbk_producer_state` rows for the `producer_id`.
+- **Request body** (optional): `{ "topic": "..." }` to scope the reset to the `(producer_id, topic)` row. Body absent -> reset all `evbk_producer_state` rows for the `producer_id`.
 - **Authz**: owning principal only. Cross-principal → `403 ProducerPrincipalMismatch`.
 - **Audit**: every reset emits an audit record (operator-driven destructive operation).
 - **Effect**: deletes `evbk_producer_state` rows; next publish bootstraps fresh (see [Bootstrap Chain Value](#bootstrap-chain-value)).
 - **`producer_id` is preserved**. The fleet does not need to redistribute a new id.
 
-Use case: the producer's fleet is alive and well, but the chain state on the broker side is wrong (or needs to be cleared for testing / debugging) and the producer can resume from sequence 1.
+Use case: the producer's fleet is alive and well, but the chain state on the broker side is wrong (or needs to be cleared for testing / debugging) and the producer resumes from any sequence: the next accepted publish takes its numbers.
 
 #### Natural reset: Producer Registration TTL
 
-A producer's registration row carries `last_seen_at`, updated on every accepted chained / monotonic publish. The Reaper purges `evbk_producer` rows whose `last_seen_at` is older than the platform's producer-registration TTL (see [Producer Registration TTL](#producer-registration-ttl)). After purge, the `producer_id` is gone — the next publish referencing it gets `404 ProducerNotFound`, the producer re-registers, distributes the new id, and continues.
+A producer's registration row carries `last_seen_at`, updated on every publish of the producer id, on any topic. The Reaper purges `evbk_producer` rows whose `last_seen_at` is older than the platform's producer-registration TTL, together with their chain rows (see [Producer Registration TTL](#producer-registration-ttl)). After purge, the `producer_id` is gone - the next publish referencing it gets `404 ProducerNotFound`, the producer re-registers, distributes the new id, and continues.
 
 Use case: long-quiet producers (monthly batch job that hasn't run in 6 months) shouldn't keep their identity forever. The TTL forces a natural re-registration cycle.
 
 ### Producer Registration TTL
 
 - Default TTL: platform-wide setting (initial proposed value `P30D` — 30 days). Configurable per-deployment.
-- TTL is **per producer registration row**, not per `evbk_producer_state` row. The state rows have their own retention, governed by the broker's `producer.state_retention` (capped at `P14D` — see DESIGN.md §4.1).
-- A producer's `evbk_producer.last_seen_at` is updated atomically with every accepted chained / monotonic publish.
+- TTL is **per producer registration row**. A `(producer_id, topic)` chain row lives as long as its producer registration and has no retention of its own; a quiet topic's row stays while the producer publishes to other topics.
+- A producer's `evbk_producer.last_seen_at` is updated with every publish of the producer id, on any topic.
 - Reaper sweep cadence: bounded (default `PT5M`); exact cadence is implementation detail, not spec.
-- Purge cascade: when an `evbk_producer` row is deleted, any orphaned `evbk_producer_state` rows for the same `producer_id` are also deleted in the same sweep.
+- Purge cascade: an `evbk_producer` row and every `evbk_producer_state` row of the same `producer_id` are deleted together, in one transaction.
 - Post-purge publish: `404 ProducerNotFound`. Producer must re-register and obtain a new `producer_id`.
 
 ### Stateless Safety Floor
@@ -242,23 +258,53 @@ For accepted chained / monotonic publishes, the broker performs the ingest-outbo
 ```sql
 BEGIN;
   INSERT INTO outbox(...) VALUES (...);                     -- enqueue for the dispatcher
-  UPDATE evbk_producer_state
-     SET last_sequence = $meta_sequence, last_seen_at = now()
-   WHERE producer_id = $pid AND topic = $topic AND partition = $partition;
+  UPDATE evbk_producer_state                                -- INSERT for the pair's first accepted publish
+     SET last_sequence = $meta_sequence
+   WHERE producer_id = $pid AND topic = $topic;
   UPDATE evbk_producer
      SET last_seen_at = now()
    WHERE producer_id = $pid;
 COMMIT;
 ```
 
+A duplicate-only publish writes nothing to the outbox or the chain row, but still refreshes `evbk_producer.last_seen_at`: a producer that keeps retrying is alive and must not age out. Every answer - `200`, `201`, `202` - is status only.
+
 Outcomes by failure point:
 
 1. **Producer business txn commit / outbox enqueue split** — handled by `toolkit-db`'s transactional outbox at the producer side; not a broker concern.
-2. **Outbox → ingest network failure mid-publish** — producer SDK retries; broker dedups via chain check (chained) or `sequence` check (monotonic) and returns `200 OK` with original event_id.
+2. **Outbox → ingest network failure mid-publish** - producer SDK retries; broker dedups via chain check (chained) or `sequence` check (monotonic) and returns `200 OK`, status only.
 3. **Ingest crash between enqueue and state update** — single transaction; commits all-or-nothing; producer sees publish failure and retries.
 4. **Producer restart with in-flight outbox rows** — producer SDK resumes from its outbox; broker dedups via mode-specific check.
 
-This atomicity is the central invariant of the "exactly-once via idempotent producer" claim. A publish that returns `200 OK` / `202 Accepted` guarantees BOTH the outbox row is persisted AND the chain state has advanced (or, in stateless, the event has been accepted for storage without chain state).
+This atomicity is the central invariant of the "exactly-once via idempotent producer" claim. A publish answered `201 Created` or `202 Accepted` guarantees BOTH the outbox row is persisted AND the chain state has advanced (or, in stateless, the event has been accepted for storage without chain state); `200 OK` means every event of the request is a duplicate.
+
+A publish is answered `202 Accepted` once the enqueue commits. A producer that needs the events stored asks with `Prefer: wait=N` (RFC 7240; `N` in seconds, capped by broker config). Ingest mints a trace internally (a UUID, never on the wire), subscribes to it and enqueues under it in the same transaction, then waits up to `N`:
+
+- every event stored by the backend -> `201 Created`
+- `N` elapsed first -> `202 Accepted` (the events stay enqueued and are stored later)
+- the backend reports a terminal failure -> `5xx`
+- every event a duplicate -> `200 OK`, with no wait
+
+### Batch Publish
+
+`POST /v1/events:batch` carries events of any producer ids and topics, and stateless events, in one request. Each event's `meta` passes mode-shape enforcement on its own. The broker then splits the chained and monotonic events into runs, one run per `(producer_id, topic)`, each keeping request order; stateless events belong to no run. A single-event publish is a run of one.
+
+Request-shape rules, checked before any chain state is read:
+
+- **R1** - an empty batch -> `400 empty_batch`.
+- **R3** - in-run shape: in a chained run every event has `sequence > previous`, and every event after the first has `previous` equal to the prior event's `sequence`; a monotonic run's sequences strictly increase. A violation -> `400 malformed_run { index }`, naming the first offending event.
+- **R13** - an `event.id` repeated within the batch -> `400 duplicate_event_id { index }`, naming the repeat.
+
+Chain rules, per run against the pair's `last_sequence`:
+
+- **R4 (chained)** - the run advances if its first event's `previous == last`. The whole run is a duplicate if its last event's `sequence == last`. If an event `e[k]` has `sequence == last`, events through `e[k]` are a duplicate prefix and the rest advances. Anything else -> `412`.
+- **R5 (monotonic)** - the leading events with `sequence <= last` are a duplicate prefix; the rest exceeds `last` and advances.
+
+Outcome:
+
+- **All-or-nothing.** The first violation rejects the whole batch with `412 SequenceViolation`, whose `sequence_mismatch` violation carries `{index, producer_id, topic, last_sequence}` (`index` of the violating run's first event); nothing is enqueued.
+- **Duplicates skipped.** Duplicate events are not enqueued; the rest of the batch is. A batch of only duplicates is answered `200 OK`.
+- **No cross-run order.** Runs are checked independently; a batch promises no order between events of different runs beyond per-key order (ADR-0002).
 
 ### Hard-Error Catalog
 
@@ -273,10 +319,12 @@ This atomicity is the central invariant of the "exactly-once via idempotent prod
 | 400 | `UnknownMetaVersion` | `meta.version` exceeds broker's supported version | SDK rolls back to a supported version |
 | 400 | `InvalidEventFieldEncoding` | Non-ASCII bytes in event field | Sanitize input |
 | 400 | `EventFieldTooLong` | Event string field exceeds length cap | Sanitize input |
-| 400 | `RetentionExceedsMaxSpan` | Broker configured with `producer.state_retention > P14D` | Lower the value |
 | 403 | `ProducerPrincipalMismatch` | Cross-principal publish / cursor read / reset | Use the owning principal |
 | 403 | `TenantIdNotAuthorized` | Platform authz resolver denied the `tenant_id` | Acquire grant (platform-side) |
-| 412 | `SequenceViolation` | Chained mode: `meta.previous != last_sequence` | `GET /v1/producers/{id}/cursors` → reconcile → resume |
+| 400 | `BadRequest` (`empty_batch`) | Batch with no events (R1) | Send at least one event |
+| 400 | `BadRequest` (`malformed_run`) | A run's events do not link or increase (R3); names the event `index` | Fix the run's numbering |
+| 400 | `BadRequest` (`duplicate_event_id`) | An `event.id` repeated within one batch (R13); names the event `index` | Send each event once |
+| 412 | `SequenceViolation` | Chained run neither advances nor duplicates the chain head (R4); body `{index, producer_id, topic, last_sequence}` | `GET /v1/producers/{id}/cursors` -> reconcile -> resume |
 
 ### Consequences
 
@@ -300,6 +348,7 @@ The decision is verified by:
 - **Reset audit test**: every successful `:reset` call produces an audit record with operator principal + timestamp + scope.
 - **TTL reap test**: idle producer's row is reaped after the TTL window; next publish gets `404 ProducerNotFound`.
 - **Principal binding test**: cross-principal calls to publish / cursor read / reset all return `403 ProducerPrincipalMismatch`.
+- **Batch run test**: one batch with events of two producer ids, two topics and stateless events; each of R1, R3, R4, R5 and R13 produces its documented outcome, and a `412` leaves nothing enqueued.
 - **Concurrent writer test**: two writers sharing a `producer_id` produce `412 SequenceViolation` (chained) or monotonic regression (monotonic) without broker error — documented behavior.
 
 ## Pros and Cons of the Options
@@ -354,12 +403,12 @@ External references:
 - **PRD**: [PRD.md](../PRD.md)
   - `cpt-cf-evbk-fr-producer-modes` — three producer modes; chained / monotonic dedup; principal binding
   - `cpt-cf-evbk-fr-publish-single` — single-event publish carries `meta` per this ADR's wire shapes
-  - `cpt-cf-evbk-fr-publish-batch` — batch publish carries per-event `meta`; chained-mode batches are contiguous-chain (see [ADR-0003](0003-event-schema.md))
+  - `cpt-cf-evbk-fr-publish-batch` - batch publish carries per-event `meta`; validated per `(producer_id, topic)` run (see [Batch Publish](#batch-publish) and [ADR-0003](0003-event-schema.md))
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
   - §3.2 Producer Modes — shrunk to summary + link to `docs/features/0001-idempotent-producers.md`
   - §3.6 Two Sequences — producer chain in `meta` (per this ADR); server-assigned `sequence` (per [ADR-0003](0003-event-schema.md))
   - §3.7 Database schemas — `evbk_producer` row shape (this ADR); `evbk_producer_state` row shape (existing); both governed by [ADR-0003](0003-event-schema.md) field-level changes
 - **Related ADRs**:
-  - [`0002-partition-selection`](0002-partition-selection.md) — partition derivation contract; chain dedup invariant ((producer_id, topic, partition) determinism on retry)
+  - [`0002-partition-selection`](0002-partition-selection.md) - partition key contract; the chain does not depend on the partition
   - [`0003-event-schema`](0003-event-schema.md) — canonical event shape; `meta` block placement (`writeOnly`); `tenant_id` flips to producer-supplied; `subject_type` stays; ASCII encoding rule
 - **Feature doc**: [`docs/features/0001-idempotent-producers.md`](../features/0001-idempotent-producers.md) — CDSL flows, mode-choice producer-author guidance, acceptance criteria, test plan

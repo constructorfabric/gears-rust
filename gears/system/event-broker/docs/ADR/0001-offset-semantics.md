@@ -89,11 +89,11 @@ Implementations MAY represent cursors as `u64` (unsigned 64-bit integer). Implem
 
 **Backend conformance contract.**
 
-Every storage backend that implements the `StorageBackend` trait MUST satisfy:
+Every storage backend that implements the backend trait (`backend::Backend`, [feature 0007](../features/0007-storage-backend-api.md)) MUST satisfy:
 
 - The first event visible through the broker on a fresh `(topic, partition)` has `sequence = 1`.
 - Sequence 0 is never exposed as an event sequence in stream frames, query results, SEEK responses, topology frames, control frames, or SDK offset stores.
-- On idempotent retry, previously persisted broker-logical sequences are returned as-is; no public sequence is assigned or re-assigned to 0.
+- A backend never re-assigns the sequence of an event it already stored, and never exposes 0 for one.
 - If the backend's native position space does not already satisfy this contract, the backend adapter owns the native-to-logical mapping at its boundary.
 
 A backend that exposes sequence 0 violates this ADR and breaks the cursor non-negativity guarantee for all consumers of that partition.
