@@ -1792,7 +1792,8 @@ default to the latest version unless they explicitly request a specific version.
 - `rollback_policy(policy_id, target_version, [comment])` — makes `target_version` active again (its `version_state`
   returns to `active`); the previously-active version transitions to `rolled_back` (terminal). Latest-pointer moved to
   `target_version`. Atomic. Rejected with `UNKNOWN_POLICY_VERSION` if `target_version` does not exist; rejected with
-  `VERSION_ROLLED_BACK` if `target_version` is in `rolled_back` state. Naturally idempotent on retry against the same
+  `VERSION_ROLLED_BACK` if `target_version` is in `rolled_back` state; rejected with `POLICY_DELETED` if the Policy has
+  been deleted, since its versions are terminal. Naturally idempotent on retry against the same
   target.
 - `delete_policy(policy_id, [comment])` — soft-deletes a narrow-scope Policy entirely. The currently-active version
   transitions to `deleted` (terminal); the latest-pointer is cleared so subsequent evaluations falling within this
