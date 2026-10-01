@@ -578,8 +578,7 @@ testing/e2e/logs/
 # END Constructor Studio
 *.backup*
 .cf-studio/config/kits/sdlc/*
-.cf-studio/.cache/explore/*
-.cf-studio/.cache/planning/*
+.cf-studio/.cache
 
 # code-ranker reports
 .code-ranker/

@@ -56,6 +56,7 @@ timescaledb-usage-collector = ["dep:timescaledb_usage_collector_plugin"]
 # feature doc comment for what it pulls in).
 magika = ["file_parser/magika"]
 bss-pricing = ["dep:bss_pricing"]
+admission-control = ["dep:admission-control"]
 
 [dependencies]
 mimalloc = { workspace = true }
@@ -126,6 +127,9 @@ usage_collector = { package = "cf-gears-usage-collector", path = "../../gears/sy
 timescaledb_usage_collector_plugin = { package = "cf-gears-timescaledb-usage-collector-plugin", path = "../../gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin", optional = true }
 # Optional BSS Plan & Price Modeling gear
 bss_pricing = { package = "cf-gears-bss-pricing", path = "../../gears/bss/pricing/pricing", optional = true }
+
+# Optional Admission Control gear
+admission-control = { package = "cf-gears-admission-control", path = "../../gears/system/admission-control/admission-control", optional = true }
 
 # Optional example module
 users-info = { path = "../../examples/toolkit/users-info/users-info", optional = true }

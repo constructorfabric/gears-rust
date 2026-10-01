@@ -1,0 +1,7 @@
+[gear]
+name = "Admission Control"
+description = "Admission gate for platform operations: built-in deny policies, then one optional pluggable policy engine."
+category = "core-platform-integration"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

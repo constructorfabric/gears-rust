@@ -105,3 +105,6 @@ use timescaledb_usage_collector_plugin as _;
 
 #[cfg(feature = "bss-pricing")]
 use bss_pricing as _;
+
+#[cfg(feature = "admission-control")]
+use admission_control as _;

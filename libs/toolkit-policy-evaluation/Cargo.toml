@@ -1,0 +1,33 @@
+[package]
+name = "cf-gears-toolkit-policy-evaluation"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Shared policy evaluation facility: sandboxed, bounded policy-language backends"
+keywords = ["constructorfabric", "cf-gears", "cf-gears-toolkit", "policy"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+name = "toolkit_policy_evaluation"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Rego backend (exact version and feature set pinned in the workspace manifest).
+regorus = { workspace = true }
+# Error type regorus returns; inspected to classify cost-bound exceedance.
+anyhow = { workspace = true }
+
+# Evaluation input / error surface
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+# `gts_id!` for the backend id.
+toolkit-gts = { workspace = true }
+thiserror = { workspace = true }
