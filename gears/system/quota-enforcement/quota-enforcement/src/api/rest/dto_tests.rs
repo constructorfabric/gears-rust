@@ -16,11 +16,11 @@ fn create_body() -> Value {
         "tenant_id": Uuid::from_u128(1),
         "subject": { "projection_type": LLM_USER_PROJECTION, "subject_id": "u1" },
         "metric": METRIC_TOKENS,
-        "quota_type": "gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1",
-        "period": "gts.cf.qe.period.type.v1~cf.qe.period.month.v1",
-        "enforcement_mode": "gts.cf.qe.enforcement.type.v1~cf.qe.enforcement.hard.v1",
+        "quota_type": "gts.cf.core.qe.quota_type.v1~cf.core.qe.consumption.v1",
+        "period": "gts.cf.core.qe.period_type.v1~cf.core.qe.month.v1",
+        "enforcement_mode": "gts.cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1",
         "cap": -1,
-        "source": "gts.cf.qe.source.type.v1~cf.qe.source.operator.v1"
+        "source": "gts.cf.core.qe.source_type.v1~cf.core.qe.operator.v1"
     })
 }
 
@@ -58,7 +58,7 @@ fn create_bodies_keep_period_presence_and_signed_caps() {
         "the contract is never caller-supplied"
     );
     let mut body = create_body();
-    body["enforcement_mode"] = json!("gts.cf.qe.enforcement.type.v1~cf.qe.enforcement.soft.v1");
+    body["enforcement_mode"] = json!("gts.cf.core.qe.enforcement_type.v1~cf.core.qe.soft.v1");
     assert!(
         serde_json::from_value::<CreateQuotaDto>(body).is_err(),
         "the enforcement mode enum is closed"
@@ -81,7 +81,7 @@ fn update_bodies_distinguish_absent_null_and_value_for_every_gated_field() {
     assert_eq!(dto, UpdateQuotaDto::default());
     let dto: UpdateQuotaDto = serde_json::from_value(json!({
         "metric": null,
-        "quota_type": "gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1",
+        "quota_type": "gts.cf.core.qe.quota_type.v1~cf.core.qe.rate.v1",
         "cap": null,
         "validity_window": null,
         "notification_thresholds": []

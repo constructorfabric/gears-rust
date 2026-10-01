@@ -64,13 +64,13 @@ fn create_body() -> Value {
         "tenant_id": tenant().as_uuid(),
         "subject": { "projection_type": LLM_USER_PROJECTION, "subject_id": "u1" },
         "metric": METRIC_TOKENS,
-        "quota_type": "gts.cf.qe.quota.type.v1~cf.qe.quota.consumption.v1",
-        "period": "gts.cf.qe.period.type.v1~cf.qe.period.month.v1",
-        "enforcement_mode": "gts.cf.qe.enforcement.type.v1~cf.qe.enforcement.hard.v1",
+        "quota_type": "gts.cf.core.qe.quota_type.v1~cf.core.qe.consumption.v1",
+        "period": "gts.cf.core.qe.period_type.v1~cf.core.qe.month.v1",
+        "enforcement_mode": "gts.cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1",
         "cap": 100,
         "notification_thresholds": [50],
         "metadata": { "regions": ["eu"], "weight": 5 },
-        "source": "gts.cf.qe.source.type.v1~cf.qe.source.operator.v1"
+        "source": "gts.cf.core.qe.source_type.v1~cf.core.qe.operator.v1"
     })
 }
 
@@ -124,7 +124,7 @@ async fn shape_rejections_carry_their_tokens_and_statuses() {
         (
             {
                 let mut b = create_body();
-                b["quota_type"] = json!("gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1");
+                b["quota_type"] = json!("gts.cf.core.qe.quota_type.v1~cf.core.qe.rate.v1");
                 b.as_object_mut().expect("object").remove("period");
                 b
             },
@@ -134,7 +134,7 @@ async fn shape_rejections_carry_their_tokens_and_statuses() {
         (
             {
                 let mut b = create_body();
-                b["quota_type"] = json!("gts.cf.qe.quota.type.v1~cf.qe.quota.allocation.v1");
+                b["quota_type"] = json!("gts.cf.core.qe.quota_type.v1~cf.core.qe.allocation.v1");
                 b["period"] = Value::Null;
                 b
             },
@@ -196,7 +196,7 @@ async fn update_gates_rate_before_the_immutable_fields_and_applies_a_patch() {
         Method::PATCH,
         &format!("/quotas/{id}"),
         Some(
-            json!({ "quota_type": "gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1", "metric": null }),
+            json!({ "quota_type": "gts.cf.core.qe.quota_type.v1~cf.core.qe.rate.v1", "metric": null }),
         ),
     )
     .await;
@@ -294,7 +294,7 @@ async fn reads_list_with_repeated_ids_and_reject_bad_parameters() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert!(body.to_string().contains("cf.qe.resource.quota"), "{body}");
+    assert!(body.to_string().contains("cf.core.qe.quota.v1"), "{body}");
 }
 
 #[tokio::test]

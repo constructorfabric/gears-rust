@@ -115,16 +115,16 @@ pub struct CreateQuotaDto {
     pub subject: SubjectRefDto,
     /// Registered metric instance id.
     pub metric: String,
-    /// Quota type instance id under `gts.cf.qe.quota.type.v1~`; `rate` is
+    /// Quota type instance id under `gts.cf.core.qe.quota_type.v1~`; `rate` is
     /// reserved and answers `501`.
     #[schema(value_type = String)]
     pub quota_type: QuotaType,
-    /// Period instance id under `gts.cf.qe.period.type.v1~`. Required for
+    /// Period instance id under `gts.cf.core.qe.period_type.v1~`. Required for
     /// consumption Quotas, rejected for allocation Quotas (`null` included).
     #[serde(default, deserialize_with = "presence")]
     #[schema(value_type = Option<String>)]
     pub period: Presence<PeriodType>,
-    /// Enforcement mode instance id under `gts.cf.qe.enforcement.type.v1~`.
+    /// Enforcement mode instance id under `gts.cf.core.qe.enforcement_type.v1~`.
     #[schema(value_type = String)]
     pub enforcement_mode: EnforcementMode,
     /// Cap in metric units within `0..=9223372036854775807`; absent or
@@ -144,7 +144,7 @@ pub struct CreateQuotaDto {
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub metadata: Option<Map<String, Value>>,
-    /// Source instance id under `gts.cf.qe.source.type.v1~`.
+    /// Source instance id under `gts.cf.core.qe.source_type.v1~`.
     #[schema(value_type = String)]
     pub source: QuotaSource,
 }

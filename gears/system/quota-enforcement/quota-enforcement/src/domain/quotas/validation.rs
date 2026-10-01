@@ -94,7 +94,7 @@ pub fn validate_create_shape(req: CreateQuotaRequest) -> Result<ShapedDraft, Dom
 
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-draft-validation:p1:inst-qdv-type
     // `quota_type` is a closed SDK enum whose values are the instances under
-    // `gts.cf.qe.quota.type.v1~`; anything else failed deserialization.
+    // `gts.cf.core.qe.quota_type.v1~`; anything else failed deserialization.
     let quota_type = req.quota_type;
     // @cpt-end:cpt-cf-quota-enforcement-algo-quota-draft-validation:p1:inst-qdv-type
 
@@ -128,12 +128,12 @@ pub fn validate_create_shape(req: CreateQuotaRequest) -> Result<ShapedDraft, Dom
 
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-draft-validation:p1:inst-qdv-mode
     // `enforcement_mode` is a closed SDK enum under
-    // `gts.cf.qe.enforcement.type.v1~`; P1 holds `hard` only, and a future mode
+    // `gts.cf.core.qe.enforcement_type.v1~`; P1 holds `hard` only, and a future mode
     // arrives as a new variant without API breakage.
     let enforcement_mode = req.enforcement_mode;
     // @cpt-end:cpt-cf-quota-enforcement-algo-quota-draft-validation:p1:inst-qdv-mode
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-draft-validation:p1:inst-qdv-source
-    // `source` is a closed SDK enum under `gts.cf.qe.source.type.v1~` holding
+    // `source` is a closed SDK enum under `gts.cf.core.qe.source_type.v1~` holding
     // the seeded `licensing` and `operator`; a stored value never changes
     // silently because no patch carries the field.
     let source = req.source;
