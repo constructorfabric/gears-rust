@@ -1,4 +1,4 @@
-Updated:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-10-01 by Constructor Tech
 
 # Technical Design — CredStore
 
@@ -25,7 +25,7 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
   - [4.7 Database schemas & tables](#47-database-schemas--tables)
   - [4.8 Deployment Topology](#48-deployment-topology)
   - [4.9 Technology Stack](#49-technology-stack)
-  - [4.10 Value-Fingerprint Fence](#410-value-fingerprint-fence)
+  - [4.10 Value-Fingerprint Fence (withdrawn)](#410-value-fingerprint-fence-withdrawn)
 - [5. Secret Types (GTS-Based, Registry-Driven)](#5-secret-types-gts-based-registry-driven)
   - [5.1 Concept](#51-concept)
   - [5.2 Type Traits](#52-type-traits)
@@ -35,9 +35,10 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
   - [5.6 Storage & API Changes](#56-storage--api-changes)
 - [6. Secret Lifecycle & Write Protocol](#6-secret-lifecycle--write-protocol)
   - [6.1 Status Model](#61-status-model)
-  - [6.2 Value Write Protocol (planned, ADR-0006; shipped saga below)](#62-value-write-protocol-planned-adr-0006-shipped-saga-below)
-  - [6.3 Delete and Garbage Collection (planned, ADR-0006; shipped saga below)](#63-delete-and-garbage-collection-planned-adr-0006-shipped-saga-below)
-  - [6.4 Maintenance Job (planned, ADR-0006; shipped reaper below)](#64-maintenance-job-planned-adr-0006-shipped-reaper-below)
+  - [6.2 Value Write Protocol](#62-value-write-protocol)
+  - [6.3 Delete Record and Outbox Purge](#63-delete-record-and-outbox-purge)
+  - [6.4 Maintenance Job — withdrawn](#64-maintenance-job--withdrawn)
+  - [6.5 Residuals](#65-residuals)
 - [7. Risks / Trade-offs](#7-risks--trade-offs)
   - [7.1 Architectural Trade-offs](#71-architectural-trade-offs)
   - [7.2 Security and Performance Risks](#72-security-and-performance-risks)
@@ -88,11 +89,11 @@ DESIGN LANGUAGE:
 
 ### 1.1 Architectural Vision
 
-CredStore follows the ToolKit Gear + Plugins pattern: a **stateful gear** (`credstore`) owns all secret *metadata* (identity, sharing, ownership, lifecycle status, version) in its own database table, enforces authorization and hierarchical resolution, and exposes the public API; backend **plugins** are pure per-tenant *value stores* selected at runtime by GTS vendor configuration. The backend stores the secret value only — it carries no metadata schema, no sharing semantics, and no policy.
+CredStore follows the ToolKit Gear + Plugins pattern: a **stateful gear** (`credstore`) owns all secret *metadata* (identity, sharing, ownership, lifecycle status, version) in its own database table, enforces authorization and hierarchical resolution, and exposes the public API; backend **plugins** are *versioned value stores* keyed per record, selected at runtime by GTS vendor configuration. The backend stores immutable secret value versions only — it carries no metadata schema, no sharing semantics, and no policy.
 
-The SDK crate (`credstore-sdk`) defines two trait boundaries: `CredStoreClientV1` for consumers and `CredStorePluginClientV1` for backend implementations. Consumers depend only on the gear trait and never interact with plugins directly, which allows runtime backend selection without changing consumer code.
+The SDK crate (`credstore-sdk`) defines two trait boundaries: `CredStoreClientV1` for consumers and `CredStorePluginClientV2` for backend implementations (the five-operation versioned contract of ADR-0006, §4.3). Consumers depend only on the gear trait and never interact with plugins directly, which allows runtime backend selection without changing consumer code.
 
-Because metadata is local, hierarchical resolution (the walk-up that searches for secrets across tenant ancestors) is a **single indexed SQL query** over the metadata table followed by at most **one** backend read for the winning row. Writes are **compensating sagas** over the metadata row and the backend value, made crash-safe by an explicit lifecycle status and a periodic reaper. **Superseded by ADR-0006 (planned)**: a write becomes a value-and-pointer switch under immutable backend versions — no in-flight lifecycle status, no compensation — crash-safety instead comes from an intent log plus a garbage-collection queue drained by a periodic maintenance job, not a resident reaper (§6.2, §6.4).
+Because metadata is local, hierarchical resolution (the walk-up that searches for secrets across tenant ancestors) is a **single indexed SQL query** over the metadata table followed by at most **one** backend read for the winning row. Writes are **put-then-switch** (ADR-0006): the plugin stores the value as a new immutable version and returns the value version the provider assigned, one PG transaction switches the row's `value_version` pointer, and, where the backend supports `destroy`, a best-effort inline destroy removes older versions — no in-flight lifecycle status, no compensation, no resident loop and no maintenance job. Deleting a record deletes the row and enqueues a key purge in the platform transactional outbox in the same transaction (§6.2, §6.3).
 
 Authorization is delegated to the platform PDP (`authz-resolver`) via `PolicyEnforcer`: each operation evaluates an `AccessScope` that is enforced **in SQL** through SecureORM clamps on the metadata table. Tenant isolation is therefore enforced at the data layer, consistent with the rest of the platform.
 
@@ -102,22 +103,22 @@ Authorization is delegated to the platform PDP (`authz-resolver`) via `PolicyEnf
 
 | Requirement | Design Response |
 |-------------|-----------------|
-| `cpt-cf-credstore-fr-put-secret` | Write saga: insert `provisioning` metadata row → plugin `put` (value only) → mark `active`; overwrite ordering follows the precondition kind — version validator claims the metadata CAS before `plugin.put`, `If-Match: *` is backend-first then version bump (§6.2). **Superseded in part** by ADR-0004: the REST form (a single `POST` carrying record and secret) is replaced by a single `PUT` on the record address, still one request carrying record and secret together (§4.3). **Superseded by ADR-0006 (planned)**: value written under a fresh `value_id`, then row CAS; gc table (§6.2) |
+| `cpt-cf-credstore-fr-put-secret` | Value write protocol (§6.2): `plugin.put` returns a `ValueVersion`, then one PG transaction switches the row's `value_version` (CAS on `(id, version)`), then (when the backend supports `destroy`) a best-effort `destroy(Below(vv))`; one ordering for every precondition kind. **Superseded in part** by ADR-0004: the REST form (a single `POST` carrying record and secret) is replaced by a single `PUT` on the record address, still one request carrying record and secret together (§4.3) |
 | `cpt-cf-credstore-fr-get-secret` | Single SQL resolution over the ancestor chain, then one plugin `get` for the winning row. **Superseded in part** by ADR-0004: the secret is read via `$select=secret` on `GET /credentials/{ref}`, independent of the metadata read (§4.3) |
-| `cpt-cf-credstore-fr-delete-secret` | Deprovisioning saga: mark `deprovisioning` → backend delete → row delete (§6.3). **Superseded in part** by ADR-0004: `DELETE` addresses the credential record (secret included), not a standalone secret (§4.3). **Superseded by ADR-0006 (planned)**: row delete + gc, no name retention (§6.3) |
+| `cpt-cf-credstore-fr-delete-secret` | One PG transaction deletes the row and enqueues an outbox purge of the record key; the reference is free at once (§6.3). **Superseded in part** by ADR-0004: `DELETE` addresses the credential record (secret included), not a standalone secret (§4.3) |
 | `cpt-cf-credstore-fr-tenant-scoping` | Gear derives tenant from `SecurityContext.subject_tenant_id()`; own-tenant gate + SecureORM scope clamp |
 | `cpt-cf-credstore-fr-sharing-modes` | `sharing` column in the gear metadata table; partial unique indexes let private and tenant/shared coexist under one reference |
 | `cpt-cf-credstore-fr-authz-pdp` | PDP `AccessScope` per operation on the secret GTS resource type, enforced in SQL; fail-closed. Shipped action set is `read`/`write`/`delete` on `gts.cf.core.credstore.secret.v1~`; ADR-0004 renames the type to `…credential.v1~`, and ADR-0010 replaces the action set with the six actions of `cpt-cf-credstore-fr-authz-action-split` below, so no shipped permission matches the new surface |
-| `cpt-cf-credstore-fr-optimistic-concurrency` | Monotonic `version` column; `GET` returns a strong generation-bound `ETag` (`"<id>.<version>"`, §4.10); `PUT`/`DELETE` require `If-Match` (a validator or `*`) |
+| `cpt-cf-credstore-fr-optimistic-concurrency` | Monotonic `version` column; `GET` returns a strong generation-bound `ETag` (`"<id>.<version>"`, §4.10); `PUT`/`DELETE` require `If-Match` (a validator or `*`); the validator is enforced as a `version = ?` filter on the pointer-switching transaction (§6.2) |
 | `cpt-cf-credstore-fr-secret-types` | GTS-based secret types with enforceable traits (§5) |
-| `cpt-cf-credstore-fr-deprovisioning` | `deprovisioning` status + compensating delete saga swept by the reaper (§6.3). **Superseded by ADR-0006 (planned)**: row delete + gc, no name retention (§6.3) |
+| `cpt-cf-credstore-fr-deprovisioning` | **Superseded by ADR-0006**: row delete plus outbox key purge, no `deprovisioning` status, no name retention, no reaper (§6.3) |
 | `cpt-cf-credstore-fr-credential-record` | Resource split (ADR-0004): the `credentials` collection item carries metadata only by default; the secret is a selectable `secret` field of that same item, disclosed only under `$select` and `read_secret`, never a separate sub-resource (§4.1, §4.3) |
 | `cpt-cf-credstore-fr-list-credentials` | Upward-rooted collection read (ADR-0005): ancestor chain from tenant-resolver, tenant dimension as a PDP gate rather than a SQL clamp, `type`/`reference` as SQL clamps, `sharing`/`expires_at`/`fallback` filtered after reduction, `$select` sparse projection, reference-boundary cursor over reduced rows (§4.4, §4.6, §4.7) |
 | `cpt-cf-credstore-fr-get-credential` | `GET /credentials/{ref}`: hierarchical resolution of the record without the secret; carries the strong `ETag` so a secret-blind caller can still perform a guarded write (§4.3) |
 | `cpt-cf-credstore-fr-write-credential-record` | `PUT /credentials/{ref}` full replace of record and secret in one request (`If-None-Match`/`If-Match`; requires `write` + `write_secret`); `PATCH /credentials/{ref}` merge-patch partial update (requires `write` for metadata keys, `write_secret` for `secret`, both when both are present; never creates); type stays immutable under both (§4.1, §4.3; ADR-0007) |
 | `cpt-cf-credstore-fr-read-secret` | `secret` selected via `$select` on `GET /credentials` or `GET /credentials/{ref}` — no dedicated address — `Cache-Control: no-store`, one audit record per returned secret (§4.3) |
 | `cpt-cf-credstore-fr-write-secret` | Secret written through the record address, as `secret` in a full `PUT` or the `secret` member of a `PATCH`, under the record's one validator; `PATCH {"secret": null}` removes the secret (→ `declared`); requires `write_secret` when `secret` is a string or a `null` that removes an existing secret (plus `write` when metadata is also carried), but not when a `null` creates or leaves a secret-less record — `write_secret` guards changing a secret, not its absence; grants no read of that secret; a `PATCH` never creates a record (§4.3.2; ADR-0007) |
-| `cpt-cf-credstore-fr-bulk-read-secrets` | `GET /credentials` with `$select` containing `secret`: explicit-references or scoped `type` selector, per-item authorization and fence verification, hard cap enforced by fetching `cap + 1` rows with `TOO_MANY_MATCHES` instead of truncation, no pagination (§4.3, §4.6; ADR-0005 "Secret mode") |
+| `cpt-cf-credstore-fr-bulk-read-secrets` | `GET /credentials` with `$select` containing `secret`: explicit-references or scoped `type` selector, per-item authorization, hard cap enforced by fetching `cap + 1` rows with `TOO_MANY_MATCHES` instead of truncation, no pagination (§4.3, §4.6; ADR-0005 "Secret mode") |
 | `cpt-cf-credstore-fr-authz-action-split` | Six PDP actions on the renamed resource type `gts.cf.core.credstore.credential.v1~`: `list` / `read` / `write` / `delete` on the record, `read_secret` / `write_secret` on the secret; shipped permissions target `secret.v1~` and therefore match nothing on the new surface (§4.3, §4.4; ADR-0010) |
 | `cpt-cf-credstore-fr-inheritance-status` | `inheritance` (own / inherited / overridden / suppressed) computed at resolution/reduction time from the ancestor-chain walk; never a filterable or orderable column (§4.1, §4.4; ADR-0009) |
 | `cpt-cf-credstore-fr-suppression` | `fallback` column (`inherit`/`none`) on the record, set with `write`; a secret-less record with `none` wins resolution when nearest and yields 404 for its tenant and, per `sharing`, its descendants; suppressing an active own credential is one atomic `PATCH {"fallback": "none", "secret": null}`; suppressing without an own row is one atomic `PUT` with `If-None-Match: *` and `{"fallback": "none", "secret": null, …}`, needing only `write` (§4.3.2, §6.1; [ADR-0008](./ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md) Suppression) |
@@ -128,18 +129,19 @@ Authorization is delegated to the platform PDP (`authz-resolver`) via `PolicyEnf
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-credstore-nfr-confidentiality` | Secret values never in logs or caches | SDK + gear + plugins | `SecretValue` wrapper with redacting `Debug`/`Display` and zeroize-on-drop; hand-written redacted `Debug` on REST DTOs; `Cache-Control: no-store` on `GET`; no lossy UTF-8 decode | Unit tests on redaction; code review |
 | `cpt-cf-credstore-nfr-tenant-isolation` | No cross-tenant access outside PDP scope | Gear + repo | Scope clamps in SQL; own-tenant gate with `cross_tenant_denied` metric | Repo/service tests incl. scope cases |
-| `cpt-cf-credstore-nfr-observability` | Operational visibility | Gear | OpenTelemetry metrics: walk-up depth, read outcome, dependency timings, saga rollback/reap counters (**superseded by ADR-0006, planned**: the maintenance job's `gc_deleted`/`gc_pending_reclaimed`/`expired_deleted` counters, §10), inventory gauge (shipped; **withdrawn by ADR-0006, planned** — a `COUNT`-based gauge is disallowed by the platform's no-`COUNT` rule, §10) | Metrics unit tests |
+| `cpt-cf-credstore-nfr-audit` | Audit event per secret read/write, best-effort | Gear | Publish through `event-broker` after the operation outcome is known; failure logs an error and counts `audit_publish_failed`, never alters the reply (§6.5) | Service tests with a failing/unavailable broker: reads and writes succeed, error logged, metric incremented |
+| `cpt-cf-credstore-nfr-observability` | Gear | OpenTelemetry metrics: walk-up depth, read outcome, dependency timings, and counters for destroy failures, outbox purge failures and read retries (§10); no inventory gauge (**withdrawn by ADR-0006** — a `COUNT`-based gauge is disallowed by the platform's no-`COUNT` rule) | Metrics unit tests |
 
 #### Key ADRs
 
 | ADR ID | Decision Summary |
 |--------|------------------|
-| `cpt-cf-credstore-adr-stateful-gear` | Stateful gear, value-only backend: the gear owns the `credstore_secrets` metadata table (identity, sharing, ownership, lifecycle status, version); the backend plugin stores only the value ([ADR-0001](./ADR/0001-cpt-cf-credstore-adr-stateful-gear.md)). **Amended by ADR-0006 (planned)**: the metadata row gains a `value_id` pointer instead of the backend value being overwritten in place under a fixed key |
-| `cpt-cf-credstore-adr-deprovisioning-saga` | Delete is a saga symmetric to provisioning: a `deprovisioning` status holds the unique name until backend cleanup completes; stuck rows are swept by the reaper ([ADR-0002](./ADR/0002-cpt-cf-credstore-adr-deprovisioning-saga.md)). **Superseded by ADR-0006 (planned)**: deletion becomes one row transaction plus garbage collection; no `deprovisioning` status, no name retention; the garbage is drained by an operator-scheduled maintenance job, not a resident reaper (§6.4) |
-| `cpt-cf-credstore-adr-value-fingerprint-fence` | Value-fingerprint fence + generation-bound ETag: the gear stamps `value_fp = HMAC(fence_key, value)` in the same write as `sharing` and verifies it on read (fail-closed 404 on mismatch), and binds the strong ETag to `<row-id>.<version>`; closes the crosswise-PUT cross-tenant disclosure and the recreate ABA lost-update ([ADR-0003](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md)). **Amended by ADR-0006 (planned)**: the fence becomes an integrity check only — a fingerprint exists for every value and a value-less row has none (`value_id IS NULL ⇔ value_fp IS NULL ⇔ fp_key_id IS NULL`), no out-of-band seeding, no healing re-put; recovery is a new write under a fresh `value_id` |
+| `cpt-cf-credstore-adr-stateful-gear` | Stateful gear, value-only backend: the gear owns the `credstore_secrets` metadata table (identity, sharing, ownership, lifecycle status, version); the backend plugin stores only values ([ADR-0001](./ADR/0001-cpt-cf-credstore-adr-stateful-gear.md)). **Amended by ADR-0006**: the metadata row gains a `value_version` pointer, and the plugin becomes a versioned kv store keyed by `(tenant_id, record_id)` with five operations instead of overwriting one value in place |
+| `cpt-cf-credstore-adr-deprovisioning-saga` | Delete is a saga symmetric to provisioning: a `deprovisioning` status holds the unique name until backend cleanup completes; stuck rows are swept by the reaper ([ADR-0002](./ADR/0002-cpt-cf-credstore-adr-deprovisioning-saga.md)). **Superseded by ADR-0006**: deletion is one row transaction plus an outbox key purge; no `deprovisioning` status, no name retention, no reaper and no maintenance job (§6.3) |
+| `cpt-cf-credstore-adr-value-fingerprint-fence` | Value-fingerprint fence + generation-bound ETag: the gear stamped `value_fp = HMAC(fence_key, value)` in the same write as `sharing` and verified it on read, and bound the strong ETag to `<row-id>.<version>` ([ADR-0003](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md)). **Superseded by ADR-0006**: the fence is withdrawn entirely — immutable versions with an exact-bytes `get` make a row/backend mismatch impossible; the generation-bound ETag is kept (§4.10) |
 | `cpt-cf-credstore-adr-secret-value-exposure` | Credential: metadata with a selectable secret. The credential record and its secret share one item shape: the default projection (`credentials` collection or point read) never carries a secret, and `secret` is a selectable `$select` field of that same item, disclosed only under `read_secret` — not a separate sub-resource ([ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md)) |
 | `cpt-cf-credstore-adr-upward-collection-read` | The credential-record collection is rooted at the caller's tenant and reads upward only; the tenant dimension of PDP scope gates the caller's own tenant rather than clamping rows in SQL, so inherited rows survive; **secret mode** (`$select=…,secret`) is the bounded bulk secret read, moved here from ADR-0004 ([ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md)) |
-| `cpt-cf-credstore-adr-immutable-value-versions` | Every value write creates a new immutable backend entry under a fresh `value_id`; the row points at the current version; the old version is deleted after the pointer switch, via a gc table a periodic maintenance job drains (no resident reaper); the backend key becomes `(tenant_id, value_id)` — no reference, no owner class; statuses shrink to `active`/`declared`; the fence stays as an integrity check ([ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md)) |
+| `cpt-cf-credstore-adr-immutable-value-versions` | Plugin-minted ordered value versions under one key per record `(tenant_id, record_id)`; the row holds the current `value_version`, switched by one PG transaction; on a backend with `destroy` a successful write destroys older versions inline (`destroy(Below)`); deleting a record enqueues an outbox `delete_key`; statuses shrink to `active`/`declared`; no gc table, no maintenance job, no fence ([ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md)) |
 | `cpt-cf-credstore-adr-record-write-verbs` | Two write verbs on one address: `PUT` replaces the whole credential with a tri-state `secret` (absent → 400 `SECRET_REQUIRED`, a string → written, an explicit `null` → a secret-less `declared` record); `PATCH` is an RFC 7396 merge and never creates. Write actions follow the body — `write` for metadata keys present, `write_secret` for a `secret` key present ([ADR-0007](./ADR/0007-cpt-cf-credstore-adr-record-write-verbs.md)) |
 | `cpt-cf-credstore-adr-suppression-fallback` | Suppression: a `fallback` field (`inherit`/`none`) on the tenant's own record, consulted only while it holds no secret; a `declared`+`none` row competes in resolution and, when nearest, blocks — canonical 404 for the tenant and, per `sharing`, its descendants (`inheritance: suppressed`); arming or lifting it is always one request ([ADR-0008](./ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md)) |
 | `cpt-cf-credstore-adr-no-ancestor-disclosure` | An inherited entry discloses nothing about the ancestor: `owner_tenant_id` and `is_inherited` are dropped; `inheritance` is the only hierarchy signal; `owner_id`, `fallback`, `version`, `updated_at` and a strong `ETag` are shown only for the caller's own row ([ADR-0009](./ADR/0009-cpt-cf-credstore-adr-no-ancestor-disclosure.md)) |
@@ -153,10 +155,10 @@ Authorization is delegated to the platform PDP (`authz-resolver`) via `PolicyEnf
 ├───────────────────────────────────────────────────────────────┤
 │  credstore-sdk    │ Public API traits, models, errors, GTS    │
 ├───────────────────────────────────────────────────────────────┤
-│  credstore        │ PDP authz, resolution, write sagas, REST, │
-│  (stateful)       │ reaper, metrics — owns credstore_secrets  │
+│  credstore        │ PDP authz, resolution, writes, REST,      │
+│  (stateful)       │ outbox purge, metrics, credstore_secrets  │
 ├───────────────────────────────────────────────────────────────┤
-│  Plugins          │ Pure per-tenant value stores              │
+│  Plugins          │ Versioned per-tenant value stores         │
 │  ┌────────────────────────────┐  ┌──────────────────────────┐ │
 │  │ static-credstore-plugin    │  │ production vaults        │ │
 │  │ (in-memory, dev/test)      │  │ (future: external store, │ │
@@ -171,11 +173,11 @@ Authorization is delegated to the platform PDP (`authz-resolver`) via `PolicyEnf
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
 | SDK | Public and plugin trait definitions, models, errors, GTS type declarations | Rust crate (`credstore-sdk`) |
-| Gear | PDP authorization, hierarchical resolution, sharing enforcement, write sagas, lifecycle reaper, plugin selection, REST API | Rust crate (`credstore`), Axum, SeaORM/SecureORM |
-| Plugins | Backend-specific secret **value** storage (per-tenant key-value CRUD; no policy, no hierarchy, no metadata) | Rust crates |
+| Gear | PDP authorization, hierarchical resolution, sharing enforcement, the value write protocol, outbox key purge, plugin selection, REST API | Rust crate (`credstore`), Axum, SeaORM/SecureORM |
+| Plugins | Backend-specific secret **value** storage (a versioned kv store per `(tenant_id, record_id)`: `put`/`get`/`delete_key`, plus an optional `destroy`; no policy, no hierarchy, no metadata, no list, no CAS) | Rust crates |
 | Platform | Policy decisions (PDP), tenant hierarchy, plugin discovery | authz-resolver, tenant-resolver, types-registry |
 
-The box diagram and this table's "write sagas" label the shipped implementation; **superseded by ADR-0006 (planned)**, the gear layer's write path is the value write protocol and gc drain of §6.2/§6.4, not a saga (§1.1).
+The box diagram and this table describe the gear layer after ADR-0006: its write path is the put-then-switch protocol of §6.2 and its only asynchronous work is the outbox purge of §6.3 — no saga, no reaper (§1.1).
 
 ## 2. Goals / Non-Goals
 
@@ -185,24 +187,24 @@ The box diagram and this table's "write sagas" label the shipped implementation;
 - Enable flexible sharing modes: `private` (owner-only), `tenant` (tenant-wide, default), `shared` (hierarchical)
 - Support service-to-service secret retrieval (e.g., OAGW retrieving secrets on behalf of customer tenants)
 - Enforce authorization via the platform PDP with SQL-level scope clamps (real tenant isolation at the data layer)
-- Make writes crash-safe and self-healing (shipped: saga + reaper; **superseded by ADR-0006, planned**: intent log + a gc-draining periodic maintenance job, no resident reaper, §6.2, §6.4), and reads race-free against half-written secrets
+- Make writes crash-safe (put a new immutable version, then switch the row's pointer in one PG transaction, then, where supported, destroy older versions; an interruption costs at most an unreachable version; no maintenance job, §6.2), and reads race-free against half-written secrets (one bounded retry, §4.6)
 - Enforce optimistic concurrency (version / `ETag` / mandatory `If-Match`) for lost-update detection — every update/delete states its concurrency stance; creation is the only preconditionless write
 - Support multiple backend value stores via plugin architecture with GTS-based runtime selection
 - Ensure secret values never appear in logs, error messages, debug traces, or intermediary caches
 - Enable secret shadowing: child tenants can override parent credentials without breaking existing references
 - Classify secrets by GTS-based *secret types* with enforceable traits (§5)
-- Symmetric, crash-safe deletion — shipped via a `deprovisioning` saga; **superseded by ADR-0006 (planned)**: a single row transaction plus garbage collection (§6.3)
+- Crash-safe deletion — one row transaction plus an outbox purge of the record key (§6.3); the reference is free at once
 
 ### 2.2 Non-Goals
 
 The following capabilities are explicitly out of scope:
 
 - **Granular ACL beyond hierarchical**: fine-grained per-secret ACLs (role- or attribute-based) are out of scope. The three-tier sharing model plus PDP scope covers primary use cases.
-- **Secret value history / rollback**: the `version` column supports optimistic locking only; previous values are not retained.
+- **Secret value history / rollback**: the `version` column supports optimistic locking only; superseded values are not readable through the gear, and are destroyed after every successful write on a backend that supports `destroy` (otherwise the backend retains them until record deletion).
 - **Secret rotation automation**: automatic rotation is out of scope. (Secret types may carry *advisory* rotation traits, §5.2 — enforcement/automation is future work.)
 - **Direct end-user access**: unauthenticated or untrusted client access is out of scope.
 - **Secret templates or composition**: dynamic secret generation or derivation is out of scope.
-- **Hierarchical resolution in backends**: plugins are pure per-tenant value stores — all hierarchy, sharing, and policy logic lives in the gear.
+- **Hierarchical resolution in backends**: plugins are versioned value stores — all hierarchy, sharing, and policy logic lives in the gear.
 - **Secret discovery / search**: full-text search over values or references stays out of scope. A metadata listing is **no longer** a non-goal: it is required by `cpt-cf-credstore-fr-list-credentials` and designed in [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md); it is upward-rooted, never carries values, and never enumerates descendants.
 - **MySQL support**: migrations target PostgreSQL and SQLite; MySQL fails fast with a typed error.
 
@@ -214,7 +216,7 @@ The following capabilities are explicitly out of scope:
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-principle-stateful-gear`
 
-The gear owns all secret metadata in its own `credstore_secrets` table; the backend plugin stores the value only, keyed by `(tenant_id, key, key-class)` where the key class is `private-per-owner` (`owner_id = Some`) or `tenant` (`owner_id = None`). This removes any backend metadata-schema prerequisite, eliminates encoded-external-ID collision risk, and makes resolution and authorization a single transactional query. **Superseded by ADR-0006 (planned)**: the backend key becomes `tenant_id/value_id` — `value_id` is unique store-wide, so the row alone knows which reference and sharing class a value belongs to. Private and tenant/shared rows under one reference no longer need distinct backend key classes to stay apart, only distinct `value_id`s; the coexistence rule (partial unique indexes on the metadata table, §4.7) is unchanged, and `OwnerId` stays a row-level access-control key only, never part of the backend key.
+The gear owns all secret metadata in its own `credstore_secrets` table; the backend plugin stores values only, as immutable versions under one key per record, `(tenant_id, record_id)`, where `record_id` is the row's `id` — minted at create and never reused. The row alone knows which version is current (`value_version`), so the backend needs no metadata schema, no reference, no sharing class and no owner segment; private and tenant/shared rows under one reference are separate records with separate ids and therefore separate keys. This removes any backend metadata-schema prerequisite, eliminates encoded-external-ID collision risk, and makes resolution and authorization a single transactional query. The coexistence rule (partial unique indexes on the metadata table, §4.7) is unchanged, and `OwnerId` stays a row-level access-control key only, never part of the store key.
 
 #### Authorization via PDP, Enforced in SQL
 
@@ -230,11 +232,11 @@ Every operation evaluates a PDP `AccessScope` for its action on the credential r
 
 The operating tenant is always derived from `SecurityContext.subject_tenant_id()`, and the owner from `SecurityContext.subject_id()`. This reduces API surface, prevents misuse, and aligns with platform patterns. Service-to-service consumers (OAGW) construct a `SecurityContext` for the target tenant rather than passing tenant parameters.
 
-#### Crash-Safe Writes (Saga + Reaper)
+#### Crash-Safe Writes (Immutable Versions, Pointer Switch, Inline Destroy)
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-principle-write-saga`
 
-**Shipped today, superseded by ADR-0006 (planned).** A write that spans the metadata table and the backend is a compensating saga with an explicit lifecycle status (§6). Every failure mode either rolls back, self-heals on retry, or is swept by the periodic reaper — a crash can never permanently wedge a reference or leak a readable half-written secret. **Planned, ADR-0006:** a write that spans the backend and the metadata row is an intent-logged, immutable-version protocol, not a compensating saga — the backend entry for a given `value_id` is written once and never overwritten, an intent row records it before the write and is cleared by the same transaction that switches the row's pointer, and every failure mode either leaves the row unswitched (old value still served) or leaves an orphan the periodic maintenance job reclaims (§6.2, §6.4). The guarantee — a crash can never permanently wedge a reference or leak a readable half-written secret — is unchanged; only the mechanism is.
+A write that spans the store and the metadata row is a put-then-switch protocol (ADR-0006): the plugin writes a new immutable version and returns the value version the provider assigned, one PG transaction switches the row's pointer (a CAS on `(id, version)`), and a best-effort `destroy(Below(vv))` removes older versions where the backend supports it. A version is never overwritten, so a row never points at bytes it does not describe; every failure mode either leaves the row unswitched (the old value is still served) or leaves an unreachable version that the next successful write to the record destroys on a backend with `destroy`, and otherwise stays until record deletion (§6.2, §6.5). A crash can never permanently wedge a reference or leak a readable half-written secret. The ID is kept for stability; the mechanism is no longer a saga, and there is no reaper and no maintenance job.
 
 ### 3.2 Constraints
 
@@ -264,9 +266,9 @@ All trait-boundary and REST errors follow the platform canonical error model ([A
 | `SecretValue` | Opaque byte wrapper (`Vec<u8>`) for secret data. Redacting `Debug`/`Display`, zeroize-on-drop, deliberately not `Serialize`/`Deserialize`. |
 | `SharingMode` | Enum: `Private`, `Tenant` (default), `Shared` — controls access scope within the tenant hierarchy. |
 | `OwnerId` | UUID identifying the creator (`SecurityContext.subject_id()`) — access control key for `Private` mode. |
-| `SecretStatus` | Lifecycle status of the metadata row: shipped as `Provisioning` (1), `Active` (2), `Deprovisioning` (3), and — planned with ADR-0007 — `Declared` (4) for a record whose secret was removed by a `PATCH {"secret": null}` (§4.1, §6.1). Only `Active` rows are visible to value resolution; `Declared` is additionally visible to the collection read, and no other status is visible to anything. **Superseded by ADR-0006 (planned)**: the model shrinks to two statuses only, `Active` (2) and `Declared` (4); `Provisioning` (1) and `Deprovisioning` (3) are retired — their codes are reserved, not reused — because a write is a value-and-pointer switch, not a saga state, so nothing remains that needs an in-flight status (§6.1, §6.2). |
-| `SecretRow` | Metadata row: `{ id, tenant_id, reference, sharing, owner_id, status, version, value_fp, fp_key_id }`. `value_fp` is the internal value-fingerprint fence (§4.10), never serialized to the wire. **Superseded by ADR-0006 (planned)**: gains `value_id` — a nullable pointer to the row's current backend version (`NULL ⇔ status = declared`, §6.1); the value itself is no longer looked up by the row's own key, only by `tenant_id/value_id` — `value_id` is unique store-wide, so the backend key needs no `reference` or key-class segment; distinct `value_id`s, not distinct key classes, are what keep a private and a tenant/shared row under one reference apart in the backend. |
-| `NewSecret` | Insert shape for the create saga (always carries the fence fingerprint of the value being written). **Superseded by ADR-0006 (planned)**: the insert it shapes is the row-CAS step of the write protocol (§6.2), and it also carries the freshly minted `value_id` the row is created already pointing at. |
+| `SecretStatus` | Lifecycle status of the metadata row: two resting states, `Active` (2) and `Declared` (4) — `Declared` is a record whose secret was removed by a `PATCH {"secret": null}` or that was created with an explicit `null` secret (ADR-0007, §6.1). Only `Active` rows are visible to value resolution; `Declared` is additionally visible to the collection read (and, with `fallback = none`, competes in resolution as a suppression marker); no other status exists. The shipped `Provisioning` (1) and `Deprovisioning` (3) are retired by ADR-0006 — their codes are reserved, not reused — because a write is a put plus a pointer switch, not a saga state, so nothing remains that needs an in-flight status (§6.1, §6.2). |
+| `SecretRow` | Metadata row: `{ id, tenant_id, reference, sharing, owner_id, status, version, value_version, … }`. `id` is the record identity, minted at create and never reused; it is also the record part of the store key `(tenant_id, id)`. `value_version` is the value version the provider returned from `put` for the row's current secret (`NULL ⇔ status = declared`, §6.1), distinct from the row's own optimistic-concurrency counter `version`; the gear stores and returns it verbatim and never parses or compares it. Private and tenant/shared rows under one reference are distinct records with distinct ids, hence distinct store keys; `OwnerId` is a row-level access-control key only. |
+| `NewSecret` | Insert shape for the create step of the write protocol (§6.2 step 3): carries the freshly minted record id and the `value_version` the plugin returned from `put` (`NULL` for a secret-less create). |
 | `WritePrecondition` | Parsed `If-Match`, mandatory on update/delete: `Exists` (`*`, explicit last-writer-wins) or `Version { id, version }` (quoted `"<id>.<version>"`, generation-bound). |
 | `GetSecretResponse` | SDK read result: `{ value, id, owner_tenant_id, sharing, is_inherited, version }`; `(id, version)` is the strong-validator pair. |
 | `SecretType` | Catalog-resolved secret type binding the enforceable traits (§5); immutable per secret. |
@@ -278,7 +280,7 @@ All trait-boundary and REST errors follow the platform canonical error model ([A
 
 - A secret belongs to exactly one tenant (`tenant_id`) and has exactly one owner (`owner_id`).
 - For `tenant`/`shared` modes, `(tenant_id, reference)` is unique; for `private` mode, `(tenant_id, reference, owner_id)` is unique. Both are enforced as **partial unique indexes** (§4.7), which lets one private secret per owner and one tenant/shared secret **coexist** under the same reference.
-- The uniqueness indexes ignore `status`, so an in-flight (`provisioning`) row holds the reference; failed sagas are rolled back or reaped to un-wedge it. **Superseded by ADR-0006 (planned)**: a row is only ever inserted already `active` (§6.2 step 4), so there is no in-flight row for the uniqueness indexes to hold open — a failed write leaves no row at all, not a wedged one.
+- The uniqueness indexes ignore `status`, so a `declared` record holds its reference. A row is only ever inserted `active` or `declared` (§6.2 step 3), so there is no in-flight row to hold a reference open — a failed write leaves no row at all, not a wedged one.
 
 **Sharing-mode access control** (evaluated during SQL resolution):
 
@@ -290,14 +292,14 @@ All trait-boundary and REST errors follow the platform canonical error model ([A
 
 `sharing` is a **visibility** mode (who may read the secret), not a quota/limit that composes as `min(parent, child)`; resolution picks the closest accessible secret up the ancestor chain, which is how a child tenant *shadows* a parent's `shared` secret under the same reference.
 
-**Record without a secret (planned, ADR-0007).** A `PATCH {"secret": null}` against an existing, own record, or a `PUT` whose `secret` is an explicit `null`, are the only ways to reach this state (§4.3, §6.1) — reached only on purpose, never by omission: `PUT`'s `secret` is tri-state, and an absent `secret` key is rejected as `SECRET_REQUIRED` before anything is written, so there is no accidental path to `declared` through a forgotten field; only an explicit `null`, on create or on replace of an `active` row, produces it. It is a **stored lifecycle state** — `status = 4`, `declared`, widening the initial schema's `CHECK (status IN (1, 2, 3))` — and not an inference from a missing fingerprint; §6.1 carries the reasoning and the predicate table. Naming it here without naming its column would leave each of the properties below resting on application logic over something the metadata row does not hold:
+**Record without a secret (planned, ADR-0007).** A `PATCH {"secret": null}` against an existing, own record, or a `PUT` whose `secret` is an explicit `null`, are the only ways to reach this state (§4.3, §6.1) — reached only on purpose, never by omission: `PUT`'s `secret` is tri-state, and an absent `secret` key is rejected as `SECRET_REQUIRED` before anything is written, so there is no accidental path to `declared` through a forgotten field; only an explicit `null`, on create or on replace of an `active` row, produces it. It is a **stored lifecycle state** — `status = 4`, `declared`, within the narrowed `CHECK (status IN (2, 4))` — equivalent to a null `value_version`; §6.1 carries the reasoning and the predicate table. Naming it here without naming its column would leave each of the properties below resting on application logic over something the metadata row does not hold:
 
-**Superseded by ADR-0006 (planned):** the column-level invariant is `declared ⇔ value_id IS NULL` — a `declared` row's pointer is null, an `active` row's is not. `PATCH {"secret": null}` clears the pointer and, in the same transaction, enqueues the row's old `value_id` into `credstore_value_gc` with reason `removed`, for the periodic maintenance job to delete from the backend (§6.1, §6.4, gc table in §4.7).
+**ADR-0006:** the column-level invariant is `declared ⇔ value_version IS NULL` — a `declared` row's pointer is null, an `active` row's is not. `PATCH {"secret": null}` sets the pointer to NULL in one PG CAS and then, where `destroy` is supported and best effort, destroys the old version in the store (§6.1, §6.2).
 
 - It **does not resolve** for a secret read, which is not the same as "the read returns not-found". The row is simply not a candidate: resolution already selects `status = 2`, so a `declared` row is excluded by a filter that is already there, and the walk up the ancestor chain continues past it. What the caller gets therefore depends on the chain — an ancestor's `shared` secret if one exists (next bullet), and the ordinary not-found only when the whole chain offers nothing. Reading these two bullets as "declared implies 404" is the mistake they exist to prevent.
 - It **does not shadow** an ancestor: an inherited `shared` secret from a parent keeps resolving for the tenant and its descendants exactly as if the secret-less record did not exist. Removing a secret must not silently break inheritance that was working before it started. The collection read has to honour the same rule when it reduces a reference to one item, or the listing would claim the credential is configured locally while the point read serves the ancestor's secret ([ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) "Reducing a reference to one item").
-- It is **distinct from `value_fp IS NULL`** (§4.10, out-of-band seeding): that case already has a value in the backend and is only missing its fingerprint, served on trust until backfilled; a record without a secret has no backend value at all, so there is nothing to serve on trust. This is precisely why the state is its own `status` rather than a second meaning for a null fingerprint — one column cannot mean both "serve on trust" and "there is nothing to serve". **Superseded by ADR-0006 (planned):** out-of-band seeding is withdrawn — a fingerprint exists for every value and a value-less row has none (`value_id IS NULL ⇔ value_fp IS NULL ⇔ fp_key_id IS NULL`) — so this distinction narrows to `declared` (`value_id`/`value_fp`/`fp_key_id` all NULL) vs. `active` (all three set); there is no longer a third, seeded case (a value with no fingerprint) to distinguish from either (§4.10).
-- It **is never produced by a crash**: creation is atomic in both forms — a secret-carrying `PUT` lands a fully `active` row or none, through the provisioning saga (§6.2); a `PUT` with an explicit `null` secret makes no backend call at all and is a single row insert, landing a fully `declared` row or none — so there is no in-flight state between "no record" and a resting record for the reaper to sweep. It **is not swept by the reaper** as a stuck write (§6.1, §6.4) for a different reason: it is reached by a completed write that deliberately requested it — a `PATCH {"secret": null}` or a `PUT` with an explicit `null` — not a stalled write, so it can never look like a crashed `provisioning` row to the sweep. **Superseded by ADR-0006 (planned):** creation is no longer a saga status but a protocol (§6.2); a crashed secret-carrying create still never produces a `declared` row — it leaves either no row at all (crash before the row CAS) or a fully `active` row (crash after), plus a `pending` gc entry the periodic maintenance job reconciles either way; a `null`-secret create has no backend call and mints no gc entry to crash between, so it leaves either no row at all or a fully `declared` row, never anything in between.
+- It is the only resting state **without a store version**: a `declared` row has no `value_version` and no store call is ever made for it, while an `active` row has both. Out-of-band seeding (a value served on trust without a fingerprint) is withdrawn with the fence (§4.10), so there is no third case to distinguish it from.
+- It **is never produced by a crash**: a secret-carrying create is `plugin.put` followed by one row insert, landing a fully `active` row or none (§6.2); a `PUT` with an explicit `null` secret makes no store call at all and is a single row insert, landing a fully `declared` row or none. A crashed secret-carrying create leaves at most an unreachable version under a key no row names (§6.5), never a row in some in-between state. It **is not removed by any sweep** — there is none: it is reached by a completed write that deliberately requested it (a `PATCH {"secret": null}` or a `PUT` with an explicit `null`), not a stalled one.
 - It **is visible in the catalogue**, unlike every other non-`active` status: the collection read selects `status IN (2, 4)` and surfaces the state, because an administrator who has removed a record's secret needs to see exactly that (§6.1).
 
 ### 4.2 Component Model
@@ -306,7 +308,7 @@ All trait-boundary and REST errors follow the platform canonical error model ([A
 graph TB
     Consumer[Consumers<br/>OAGW, mini-chat, gears]
     SDK[credstore-sdk<br/>traits + models + GTS]
-    GW[credstore gear<br/>service / write path / reaper]
+    GW[credstore gear<br/>service / write path / outbox purge]
     REPO[(credstore_secrets<br/>SecureORM, Scopable)]
     SP[static-credstore-plugin<br/>in-memory value store]
     PDP[authz-resolver<br/>PolicyEnforcer / PDP]
@@ -326,25 +328,25 @@ graph TB
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-component-sdk`
 
-`credstore-sdk` — trait definitions (`CredStoreClientV1`, `CredStorePluginClientV1`), models, canonical `CredStoreError`, and the GTS declarations: the plugin spec type (`gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~`) and the credential resource type (`gts.cf.core.credstore.secret.v1~` as shipped, `gts.cf.core.credstore.credential.v1~` after the ADR-0004 rename; exported as `SECRET_RESOURCE_TYPE` — the single source of truth pinned by unit tests).
+`credstore-sdk` — trait definitions (`CredStoreClientV1`, `CredStorePluginClientV2`), models, canonical `CredStoreError`, and the GTS declarations: the plugin spec type (`gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~`) and the credential resource type (`gts.cf.core.credstore.secret.v1~` as shipped, `gts.cf.core.credstore.credential.v1~` after the ADR-0004 rename; exported as `SECRET_RESOURCE_TYPE` — the single source of truth pinned by unit tests).
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-component-gear`
 
-`credstore` — the stateful gear. Layers: `api/rest` (Axum routes, DTOs with redacted `Debug`, `If-Match` parsing), `domain` (service with get/put/delete sagas — **superseded by ADR-0006, planned**: the value write protocol and delete-and-gc of §6.2/§6.3 — authz scope evaluation, resolver port, metrics port, plugin selector port), `infra` (SecureORM repo, migrations, tenant-resolver adapter with TTL+LRU ancestor cache, GTS plugin selector, OTel metrics, canonical error mapping). Declares `deps = [authz-resolver, tenant-resolver, types-registry]` and capabilities `system, db, rest, stateful`; its lifecycle entry runs the reaper loop (§6.4). **Withdrawn by ADR-0006 (planned)**: no resident reaper loop — the gear's lifecycle entry starts no background timer; the equivalent maintenance work becomes an in-process entry point, the SDK trait `CredStoreMaintenanceV1::run_gc` (no REST), invoked by the host on an operator-chosen schedule outside the gear's own lifecycle (§6.4).
+`credstore` — the stateful gear. Layers: `api/rest` (Axum routes, DTOs with redacted `Debug`, `If-Match` parsing), `domain` (service with the value write protocol and delete-and-purge of §6.2/§6.3 — authz scope evaluation, resolver port, metrics port, plugin selector port), `infra` (SecureORM repo, migrations, tenant-resolver adapter with TTL+LRU ancestor cache, GTS plugin selector, OTel metrics, canonical error mapping). Declares `deps = [authz-resolver, tenant-resolver, types-registry]` and capabilities `system, db, rest, stateful`. **ADR-0006**: no resident reaper loop and no maintenance job — the gear's lifecycle entry starts no background timer, and the only asynchronous work is the handler of the platform transactional outbox for `purge(tenant_id, record_id)` messages, which calls `delete_key` on the plugin (§6.3, §6.4).
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-component-static-plugin`
 
-`static-credstore-plugin` — in-memory per-tenant value store for development and testing, optionally seeded from YAML config, writable at runtime. Registers its GTS instance and scoped `CredStorePluginClientV1` in ClientHub.
+`static-credstore-plugin` — in-memory versioned value store for development and testing (versions minted with a per-key counter), optionally seeded from YAML config, writable at runtime; a value placed outside the API is never referenced by a row and therefore never served (§4.10). Registers its GTS instance and scoped `CredStorePluginClientV2` in ClientHub.
 
 - [ ] `p2` - **ID**: `cpt-cf-credstore-component-production-backend`
 
-Production value-store backends (external secret vault, OS keychain, KMS-backed store) — future plugins implementing the same `CredStorePluginClientV1` contract. Not part of the current codebase.
+Production value-store backends (external secret vault, OS keychain, KMS-backed store) — future plugins implementing the same `CredStorePluginClientV2` contract (§4.3: ordered versions, durable `put`, exact-bytes `get`). Not part of the current codebase.
 
 **Interactions**:
 
 - Consumer → Gear: `CredStoreClientV1` via ClientHub (in-process) or REST.
 - Gear → Repo: all metadata reads/writes clamped by the PDP `AccessScope` (SecureORM `Scopable`).
-- Gear → Plugin: `CredStorePluginClientV1` via scoped ClientHub; the plugin is resolved lazily by GTS instance query filtered by the configured `vendor`.
+- Gear → Plugin: `CredStorePluginClientV2` via scoped ClientHub; the plugin is resolved lazily by GTS instance query filtered by the configured `vendor`.
 - Gear → tenant-resolver: ancestor chain (`BarrierMode::Ignore` — inheritance crosses isolation barriers), cached in-process with TTL + LRU eviction.
 - Gear → PDP: `PolicyEnforcer.access_scope_with` per operation; no PEP capabilities advertised — the PDP hands the gear flat, pre-expanded tenant predicates (§4.4).
 
@@ -361,19 +363,63 @@ Production value-store backends (external secret vault, OS keychain, KMS-backed 
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `get` | `(ctx: &SecurityContext, key: &SecretRef) → Result<Option<GetSecretResponse>, CredStoreError>` | Hierarchical read. `Ok(None)` covers both "does not exist" and "inaccessible" (single 404 surface, anti-enumeration). |
-| `put` | `(ctx, key, value: SecretValue, sharing: SharingMode, precondition: WritePrecondition) → Result<(), CredStoreError>` | Update within the target sharing class; never creates. The mandatory precondition is `Matches { id, version }` (CAS for read-modify-write) or `Exists` (explicit last-writer-wins for rotation/provisioning and, **shipped today, superseded by ADR-0006 (planned)**, fence-heal — under ADR-0006 `Exists` is plain last-writer-wins with no healing role, §4.10). |
+| `put` | `(ctx, key, value: SecretValue, sharing: SharingMode, precondition: WritePrecondition) → Result<(), CredStoreError>` | Update within the target sharing class; never creates. The mandatory precondition is `Matches { id, version }` (CAS for read-modify-write) or `Exists` (explicit last-writer-wins for rotation/provisioning, with no healing role, §4.10). |
 | `create` | `(ctx, key, value, sharing) → Result<(), CredStoreError>` | Create-only; `Conflict` if a secret of the same sharing class exists (the 409 path behind REST `POST`). The only preconditionless write. |
 | `delete` | `(ctx, key, precondition: WritePrecondition) → Result<(), CredStoreError>` | Delete the caller's own-tenant secret, guarded by the mandatory precondition. |
 
-`CredStorePluginClientV1` (backend SPI — pure value store):
+#### Store contract
+
+The value store is a plain versioned byte store with one client: the CredStore gear of one installation (possibly several replicas). By design it is written and read only through the gear; direct access by other components is unsupported.
+
+- **No metadata.** The store knows nothing about tenants, hierarchy, PDP, references, types, sharing or any other metadata. All of that lives in PG, and PG alone decides which version is current.
+- **Required operations** (Vault, OpenBao, GCP, AWS, Azure): `put(key, value) → version` (durable, creates a new immutable version), `get(key, version)` (exactly those bytes, or not found), `delete_key(key)` (all versions; idempotent).
+- **Optional operation** (Vault, OpenBao, GCP): `destroy(key, Below(version) | Exactly(version))`. A store that supports it **MUST** return ordered versions.
+- **Required properties:**
+  1. **The store never deletes, on its own, a version the gear references.** The version a record row points at disappears only through the gear's `destroy` or `delete_key`. A store that removes versions no row references any more (AWS) is harmless. Per provider: Vault / OpenBao `max_versions = 0` and `delete_version_after = 0`; AWS a plugin-owned staging label on the version the row points at; GCP no `expire_time` / `ttl` on the secret. Azure has no automatic removal to disable.
+  2. **Encryption at rest and in transit.**
+  3. **Access only by the gear**, with permissions limited to the operations the gear uses and to its own key space under the installation prefix.
+- **Opaque key.** The key `(tenant_id, record_id)` is opaque to the store: it is part of the path under the installation prefix, and the store does not interpret `tenant_id`.
+- **Not required of the store:** CAS, listing, transactions, server-side logic.
+- **Concurrent writes.** Concurrent `put`s to one key are allowed: each creates a new version, and the PG CAS decides the winner (§6.2).
+
+#### Plugin SPI
+
+`CredStorePluginClientV2` (backend SPI — a versioned kv store). Every operation takes the record key explicitly: `key = (tenant_id, record_id)`, where `record_id` is the row's `id` (minted at create, never reused). The gear chooses the key; the plugin only maps it to a physical location under its installation prefix (for example Vault `secret/data/<installation prefix>/<tenant_id>/<record_id>`). The credential reference, type and sharing are not part of the key. `ValueVersion` is the provider's own identifier of a stored value (a Vault/OpenBao `version`, a GCP secret version, an AWS `VersionId`, an Azure secret version); the provider chooses it, `put` returns it, and the gear stores it in the row column `value_version` and passes it back verbatim. Every call also carries the request context `ctx`, used only for correlation, never for authorization. Three operations are required of every backend and one is optional:
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `get` | `(ctx, tenant_id, key, owner_id: Option<&OwnerId>) → Result<Option<SecretValue>, CredStoreError>` | `owner_id = Some` selects the owner's private key class; `None` the tenant key class. Returns the value only. **Planned, ADR-0006**: the SPI becomes exactly `get(ctx, tenant_id, value_id) → Result<Option<SecretValue>, CredStoreError>` — no `key`, no `owner_id`; `value_id` is unique store-wide, so the plugin learns nothing about references, owners, or sharing. |
-| `put` | `(ctx, tenant_id, key, value, owner_id: Option<&OwnerId>) → Result<(), CredStoreError>` | Store the value for the addressed key class. **Planned, ADR-0006**: becomes exactly `put(ctx, tenant_id, value_id, value: SecretValue) → Result<(), CredStoreError>` — no `key`, no `owner_id`; writes a new immutable entry at `tenant_id/value_id`, never overwriting an existing one. |
-| `delete` | `(ctx, tenant_id, key, owner_id: Option<&OwnerId>) → Result<(), CredStoreError>` | Delete the value; `NotFound` is treated as success by the gear (idempotent). **Planned, ADR-0006**: becomes exactly `delete(ctx, tenant_id, value_id) → Result<(), CredStoreError>` — no `key`, no `owner_id`; deletes exactly that version's entry, issued by the writer's own post-commit cleanup (§6.2 step 5, §6.3 step 3) and, for whatever that cleanup missed, by the maintenance job's gc drain (§6.4). |
+| `put` | `(ctx, key, value: SecretValue) → Result<ValueVersion, CredStoreError>` | Required. Durably store a new immutable version under the key and return the version the provider assigned. Returns only after the bytes are durable. |
+| `get` | `(ctx, key, version: &ValueVersion) → Result<Option<SecretValue>, CredStoreError>` | Required. Exactly the bytes written by the `put` that returned `version`, or `None` when that version is gone; never different bytes. |
+| `delete_key` | `(ctx, key) → Result<(), CredStoreError>` | Required. Delete the key with all its versions; idempotent. Issued only by the outbox handler after a record delete (§6.3). |
+| `destroy` | `(ctx, key, selector: DestroySelector) → Result<(), CredStoreError>` | Optional. Permanently delete versions; idempotent. `DestroySelector::Below(vv)` selects every version older than `version`; `DestroySelector::Exactly(vv)` selects that one version. Issued after a successful pointer switch (`Below`, §6.2 step 4), by a writer that lost its CAS (`Exactly`), and by secret removal (`Below(old_vv)` then `Exactly(old_vv)`). |
 
-**Design rationale**: the plugin returns **no metadata** — sharing, ownership, inheritance, and version all come from the gear's metadata row resolved *before* the backend is touched. This keeps every policy decision in one place and backends trivially simple.
+The plugin declares whether it supports `destroy` through a capability flag, and the gear never calls `destroy` on a plugin that does not declare it.
+
+**Guarantees required of a backend**: **durability** — `put` returns only after the bytes are durable; **exact bytes** — as above; **idempotent `delete_key`**. **Ordered versions per key** — a `put` that starts after another `put` on the same key has returned gets a greater version — are required only together with `destroy`, because `Below(vv)` is safe only when every version older than a committed version belongs to a writer with a stale base (§6.2). A backend without `destroy` does not need ordered versions. **Not required**: CAS, listing, cross-key transactions, linearizability beyond the version ordering, server-side logic.
+
+**Gear behaviour by capability.** With `destroy`: after a committed write, best-effort `destroy(Below(vv))`; after a definite CAS loss, best-effort `destroy(Exactly(own vv))`; on secret removal, `destroy(Below(old_vv))` then `destroy(Exactly(old_vv))`, never `delete_key`. Without `destroy`: none of these cleanups happen, and rotated, removed and orphaned versions stay in the backend, unreachable through the gear, until the record is deleted (`delete_key`) or the tenant is offboarded. This is the accepted behaviour of such backends. Record deletion is unchanged: row delete plus an outbox `delete_key`.
+
+**Backend compatibility** (`cpt-cf-credstore-fr-backend-compatibility`). Base compatibility (`put`, `get`, `delete_key`) is provided for HashiCorp Vault KV v2, OpenBao KV v2, Google Cloud Secret Manager, AWS Secrets Manager and Azure Key Vault. Full compatibility, which adds `destroy` with ordered versions, is provided for Vault, OpenBao and GCP.
+
+| Backend | `put(key, value)` → version | `get(key, version)` | `delete_key` | `destroy` | Ordered versions |
+|---------|-------------|------------|--------------|-----------|--------------|
+| Vault KV v2 | write → `version` | `GET data/…?version=N` | `DELETE metadata/…` | `POST destroy/…` (versions listed from `metadata`) | yes (integers) |
+| OpenBao KV v2 | same API as Vault | same | same | same | yes |
+| GCP Secret Manager | `addSecretVersion` → version number | access by version number | `DeleteSecret` | `destroy` version | yes (integers) |
+| AWS Secrets Manager | `PutSecretValue` → `VersionId` | `GetSecretValue` by `VersionId` | `DeleteSecret` (`ForceDeleteWithoutRecovery` or a recovery window) | not supported (a version cannot be deleted; unlabeled versions are auto-removed when more than 100 and older than 24 h) | no (UUIDs) |
+| Azure Key Vault | `SetSecret` → new version | `GetSecret` by version | `DeleteSecret` (plus purge when soft-delete is on) | not supported (a version can only be disabled; its data stays) | no (opaque ids) |
+
+Backend-specific obligations:
+
+- Vault / OpenBao: the mount **MUST** have `max_versions = 0` and `delete_version_after = 0` (the store must never evict a version on its own) and `cas_required = false` (no CAS in the store).
+- GCP: the secret **MUST** have no `expire_time` and no `ttl` (the store must never expire a version or the secret on its own).
+- AWS: the plugin **MUST** keep a plugin-owned staging label on the version the row points at (the built-in current label moves on every put), so that version is never deprecated and auto-removed; versions without the label are no longer referenced by any row, and the service's own removal of them is harmless.
+- All backends: transport is TLS, data is encrypted at rest by the provider, and the plugin's credentials are scoped to the operations in the table above and to the installation's own key prefix.
+- Azure: versions accumulate (service limit of about 500 versions per secret); the plugin is not required to disable superseded versions. A high-rotation record on Azure is bounded by that limit (accepted limitation).
+
+Other plugins: a PostgreSQL plugin uses a sequence-backed row id in an insert-only table, an in-memory plugin a per-key counter, a file plugin a per-key monotonic counter (not a random UUID); all can provide ordered versions and `destroy`.
+
+**Design rationale**: the plugin returns **no metadata** — sharing, ownership, inheritance, and version all come from the gear's metadata row resolved *before* the backend is touched, and the plugin learns nothing about references, owners or sharing: only a key (tenant and record id) and the opaque value versions it returned. This keeps every policy decision in one place and backends trivially simple.
 
 **Planned (ADR-0004, `cpt-cf-credstore-adr-secret-value-exposure`; write shape per ADR-0007).** `CredStoreClientV1` is reshaped around the one item shape, with the same nouns the REST surface uses: `get` (one `Credential`; `secret` present only when selected), `get_secret` (a convenience over `get` with `secret` selected, returning the `Secret` usage envelope), `put` (precondition-guarded create-or-replace of the record together with a tri-state `secret`, in one call), `patch` (precondition-guarded partial update — merge-patch semantics: metadata edit, secret rotate, or secret remove via a null secret; never creates), `list` (the collection of §4.4, taking an OData query — `$filter`/`$select`/`$orderby`/`limit`/`cursor` — and returning items whose `secret` is present only when selected, subject to the same cap and no-pagination rule as the REST secret mode) and `delete`. `get` changes meaning — without selecting `secret` it returns a `Credential` that never carries one, so every existing caller reading `.value` off the old combined response fails to compile instead of silently reading metadata — and `create` is removed: `put` under the create-only precondition is create, and its `secret` may be a string or an explicit `null`, so there is no separate create-then-set-secret pair. The same names appear in `credstore-sdk/README.md`; there is one spelling, not two.
 
@@ -426,7 +472,7 @@ The machine-readable API is generated from the handlers: the platform-wide OpenA
 - `version`: monotonic per-generation version; the strong `ETag` is the generation-bound pair `"<row-id>.<version>"` (the row UUID is minted fresh for every recreated secret, so validators never repeat across delete+recreate — no ABA lost update)
 - `type`: the secret type's full GTS type id (plus `expires_at` when set)
 
-**Optimistic concurrency**: `PUT` and `DELETE` **require** `If-Match` — either `*` (target must exist; an explicit last-writer-wins overwrite for rotation/provisioning flows that hold no version, and — **shipped today, superseded by ADR-0006 (planned)** — the healing path for a fence-poisoned reference whose `GET` fails closed; under ADR-0006 there is no healing path, only plain last-writer-wins, §4.10) or `If-Match: "<id>.<version>"` (both the generation id and the version must match the current row). Every write states its concurrency stance; there are no unconditional overwrites, and a `PUT` never creates (creation is `POST` only). The precondition is checked before the backend write *and* re-enforced as a `version = ?` SQL filter on the metadata commit (the id is already the UPDATE key). A mismatch — including a validator minted for an earlier generation of a recreated secret — surfaces as canonical `Aborted` / **409** with reason `OPTIMISTIC_LOCK_FAILURE` (the canonical model has no 412; 409 is the deliberate platform-correct status). A malformed `If-Match` (including a bare quoted version) is a 400 (`INVALID_IF_MATCH`); a missing `If-Match` is a 400 with its own reason (`IF_MATCH_REQUIRED` — no 428 in the canonical model); a precondition on a non-existent target is a 409.
+**Optimistic concurrency**: `PUT` and `DELETE` **require** `If-Match` — either `*` (target must exist; an explicit last-writer-wins overwrite for rotation/provisioning flows that hold no version; plain last-writer-wins, with no healing role, §4.10) or `If-Match: "<id>.<version>"` (both the generation id and the version must match the current row). Every write states its concurrency stance; there are no unconditional overwrites, and a `PUT` never creates (creation is `POST` only). The precondition is checked before the backend write *and* re-enforced as a `version = ?` SQL filter on the metadata commit (the id is already the UPDATE key). A mismatch — including a validator minted for an earlier generation of a recreated secret — surfaces as canonical `Aborted` / **409** with reason `OPTIMISTIC_LOCK_FAILURE` (the canonical model has no 412; 409 is the deliberate platform-correct status). A malformed `If-Match` (including a bare quoted version) is a 400 (`INVALID_IF_MATCH`); a missing `If-Match` is a 400 with its own reason (`IF_MATCH_REQUIRED` — no 428 in the canonical model); a precondition on a non-existent target is a 409.
 
 **Error Responses**:
 
@@ -549,15 +595,15 @@ Cache-Control: no-store
 
 **`PUT` and `PATCH` on the record, no `POST` on the collection** ([ADR-0007](./ADR/0007-cpt-cf-credstore-adr-record-write-verbs.md)). The record address carries two write verbs. `PUT` is a whole-resource replace — record and secret together — guarded by a create-only or a replace precondition; the collection needs no `POST` because `PUT` with `If-None-Match: *` is already create-only and idempotent. `PATCH` is an RFC 7396 JSON Merge Patch (`Content-Type: application/merge-patch+json`): fields present in the body replace, fields absent are untouched, and a `secret` of `null` removes the secret while the rest of the record stands. A merge-patch is exactly what lets a secret-blind caller edit `sharing` or `expires_at` without ever supplying — or being asked to supply — a secret, and what lets `fallback` and `secret` change together in one request ([ADR-0008](./ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md) Suppression, below). `PATCH` never creates: a reference with no record of the caller's own is a 404. The record's `type` stays immutable under both verbs.
 
-**Create is one request.** `PUT /credstore/v1/credentials/{ref}` with `If-None-Match: *` creates the record; `secret` is tri-state on that same body (§4.3.2 table above; [ADR-0007](./ADR/0007-cpt-cf-credstore-adr-record-write-verbs.md)): absent is rejected (400 `SECRET_REQUIRED`) before anything is written, a string creates the record and writes the secret atomically, and an explicit `null` creates the record `declared`, with no backend call at all. **A string `secret`, shipped today (superseded by ADR-0006, planned):** through the provisioning saga (§6.2) — insert a `provisioning` row, write the backend value, mark `active`. **A string `secret`, planned, ADR-0006:** through the value write protocol (§6.2) — record the write's intent, `plugin.put` the bytes under a freshly minted `value_id`, then one transaction inserts the `active` row already pointing at that `value_id`; a crash before the row insert leaves at most a `pending` gc entry over an orphan the periodic maintenance job collects, never a row. **An explicit `null` secret, both today and under ADR-0006:** a single row insert with `status = declared`, `value_id`/`value_fp`/`fp_key_id` all `NULL` — no intent record, no `plugin.put`, no gc entry, because there is no backend write to protect against a crash; the row either exists `declared` or does not exist at all. `declared` (`status = 4`) is therefore reached in exactly two ways, both deliberate: a `PATCH {"secret": null}` against an existing record, or a `PUT` with an explicit `null` secret at creation (or at replace of an `active` record) (§6.1) — never by omission, since an absent `secret` key is rejected before either path runs.
+**Create is one request.** `PUT /credstore/v1/credentials/{ref}` with `If-None-Match: *` creates the record; `secret` is tri-state on that same body (§4.3.2 table above; [ADR-0007](./ADR/0007-cpt-cf-credstore-adr-record-write-verbs.md)): absent is rejected (400 `SECRET_REQUIRED`) before anything is written, a string creates the record and writes the secret atomically, and an explicit `null` creates the record `declared`, with no backend call at all. **A string `secret`:** through the value write protocol (§6.2) — `plugin.put` the bytes under the new record's key, then one transaction inserts the `active` row already pointing at the returned `value_version`; a crash before the insert leaves at most an unreachable version under a key no row names (§6.5), never a row. **An explicit `null` secret:** a single row insert with `status = declared` and `value_version` `NULL` — no `plugin.put`, no outbox message, because there is no store write to protect against a crash; the row either exists `declared` or does not exist at all. `declared` (`status = 4`) is therefore reached in exactly two ways, both deliberate: a `PATCH {"secret": null}` against an existing record, or a `PUT` with an explicit `null` secret at creation (or at replace of an `active` record) (§6.1) — never by omission, since an absent `secret` key is rejected before either path runs.
 
 **One resource, one validator.** The record and its secret are no longer separate resources, so there is nothing to compare a secret-write precondition against but the record's own `"<id>.<version>"` — the deviation from RFC 9110 that a separate secret sub-resource would have required does not arise.
 
-**No-op and the secret path** ([ADR-0007](./ADR/0007-cpt-cf-credstore-adr-record-write-verbs.md)). A `PATCH` whose body carries no `secret` key and whose metadata fields already match the current record is a no-op (204, unchanged `ETag`, no version bump, validation still applied). A `PATCH` that carries `secret` — a string or `null` — is never a no-op: it writes the backend (or deletes it, for `null`) and bumps `version` even on identical bytes, for the same two reasons the shipped value write does today — a fingerprint-based "unchanged" check would be an equality oracle for a `write_secret` holder without `read_secret`, and — **shipped today, superseded by ADR-0006 (planned)** — it would skip the `If-Match: *` re-write that heals a fence-poisoned row (§4.10, ADR-0003). **Planned, ADR-0006:** under immutable versions a re-write of identical bytes is simply a new version, which is what a client that suspects a corrupted entry does deliberately — there is no healing re-put to skip, only an ordinary new write with a fresh `value_id` (§4.10). All failed preconditions are 409, matching the `OPTIMISTIC_LOCK_FAILURE` mapping; 412 is not used. The action set required on `PUT`/`PATCH` is derived from the request body rather than fixed per address: `write` when the body carries any metadata key — always true for a `PUT`, since a full replace's `type`/`sharing` are required fields — and `write_secret` when `secret` is a string or a `null` that removes an existing secret, but not when a `null` creates or leaves a secret-less record (`write_secret` guards changing a secret, not its absence). A `PUT` therefore requires `write_secret` only when it is writing or removing a secret, not for every create; whichever actions apply are evaluated, and must both allow, before any side effect (§4.4).
+**No-op and the secret path** ([ADR-0007](./ADR/0007-cpt-cf-credstore-adr-record-write-verbs.md)). A `PATCH` whose body carries no `secret` key and whose metadata fields already match the current record is a no-op (204, unchanged `ETag`, no version bump, validation still applied). A `PATCH` that carries `secret` — a string or `null` — is never a no-op: it writes the store (or removes the version, for `null`) and bumps `version` even on identical bytes, because an "unchanged" check on the secret would be an equality oracle for a `write_secret` holder without `read_secret`; under immutable versions a re-write of identical bytes is simply a new version (a new `put`, a new `value_version`, the old version destroyed where supported). All failed preconditions are 409, matching the `OPTIMISTIC_LOCK_FAILURE` mapping; 412 is not used. The action set required on `PUT`/`PATCH` is derived from the request body rather than fixed per address: `write` when the body carries any metadata key — always true for a `PUT`, since a full replace's `type`/`sharing` are required fields — and `write_secret` when `secret` is a string or a `null` that removes an existing secret, but not when a `null` creates or leaves a secret-less record (`write_secret` guards changing a secret, not its absence). A `PUT` therefore requires `write_secret` only when it is writing or removing a secret, not for every create; whichever actions apply are evaluated, and must both allow, before any side effect (§4.4).
 
 **Actions follow the projection** ([ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) "Read actions follow the projection"). The write side derives its action set from the request body (previous paragraph); the read side is the mirror image, deriving it from `$select` instead. On the point read, `read` is required for the item as a whole — by default with no `$select`, or for any record field named in one — and `read_secret` is required only when `$select` names `secret`, both when both apply; the same rule governs the collection, with `list` in place of `read`. A caller who selects only `secret` needs `read_secret` alone; the envelope fields `reference`, `type` and `expires_at` are readable under either action, since they describe how to use whichever half was granted. Denial has two faces matching the two surfaces: on the point read it is the canonical 404, indistinguishable from a non-resolving reference; on the collection an item or field the caller may not read is simply omitted, never reported by name (§4.4).
 
-**Bulk secret read through the collection (`$select=secret`)** (`cpt-cf-credstore-fr-bulk-read-secrets`; [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) "Secret mode"). There is no separate bulk address: naming `secret` in `$select` on `GET /credstore/v1/credentials` switches the collection into **secret mode**, exactly as it does on the point read — one item shape, one `$select` grammar, for both. Only two selectors are accepted in this mode, and only `eq`/`in`: the **explicit** form, `$filter=reference in ('a','b','c')`, and the **scoped** form, `$filter=type eq '<full GTS type id>'` or `type in (...)`. `reference` and `type` are the only filterable fields — the only ones invariant across a reference's chain (§4.4) — so no ordered or prefix operator and no `$orderby` is offered in this mode: a prefix scan over references is the enumeration primitive this surface exists to withhold. `limit` and an incoming `cursor` are rejected with 400 — secrets are never paginated, unlike the metadata-mode page, whose `limit` defaults to 50 and is capped at `list.max_limit` (default 200; a caller value above it is `400 INVALID_LIMIT`, not clamped). A selector matching more than the configured cap (`list.secret_mode_cap`, default 25) fails the whole request with `400 TOO_MANY_MATCHES` rather than truncating; the cap is enforced by fetching `cap + 1` candidate rows, never by a `COUNT` query. Filtering runs in SQL first — candidate rows across the caller's tenant and its ancestor chain, clamped by `reference`/`type` — and the hierarchy is then reduced in memory to one winner per reference, exactly as the metadata listing does (§4.4, §4.6); `read_secret` is evaluated once per distinct type present among candidates, and a type or item the caller may not read is **omitted** entirely, never reported as not-found, because the filter found it, not the caller. Every returned secret is independently re-verified against its row's fingerprint (§4.10). The response carries `Cache-Control: no-store` and one audit record per secret returned; the wire shape is the same `Page<CredentialListItem>` envelope the metadata listing uses, with `page_info.next_cursor` absent (`null`) and `page_info.limit` reporting the cap. Each item is one flat `CredentialListItem` — the selected `Credential` fields plus an optional `secret` — and selecting `type` and `expires_at` alongside it is recommended, since those are what a consumer needs to use the secret, and no other administrative field is included.
+**Bulk secret read through the collection (`$select=secret`)** (`cpt-cf-credstore-fr-bulk-read-secrets`; [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) "Secret mode"). There is no separate bulk address: naming `secret` in `$select` on `GET /credstore/v1/credentials` switches the collection into **secret mode**, exactly as it does on the point read — one item shape, one `$select` grammar, for both. Only two selectors are accepted in this mode, and only `eq`/`in`: the **explicit** form, `$filter=reference in ('a','b','c')`, and the **scoped** form, `$filter=type eq '<full GTS type id>'` or `type in (...)`. `reference` and `type` are the only filterable fields — the only ones invariant across a reference's chain (§4.4) — so no ordered or prefix operator and no `$orderby` is offered in this mode: a prefix scan over references is the enumeration primitive this surface exists to withhold. `limit` and an incoming `cursor` are rejected with 400 — secrets are never paginated, unlike the metadata-mode page, whose `limit` defaults to 50 and is capped at `list.max_limit` (default 200; a caller value above it is `400 INVALID_LIMIT`, not clamped). A selector matching more than the configured cap (`list.secret_mode_cap`, default 25) fails the whole request with `400 TOO_MANY_MATCHES` rather than truncating; the cap is enforced by fetching `cap + 1` candidate rows, never by a `COUNT` query. Filtering runs in SQL first — candidate rows across the caller's tenant and its ancestor chain, clamped by `reference`/`type` — and the hierarchy is then reduced in memory to one winner per reference, exactly as the metadata listing does (§4.4, §4.6); `read_secret` is evaluated once per distinct type present among candidates, and a type or item the caller may not read is **omitted** entirely, never reported as not-found, because the filter found it, not the caller. Each returned secret is read at its own row's `value_version`, following the point-read retry rule (§4.6). The response carries `Cache-Control: no-store` and one audit record per secret returned; the wire shape is the same `Page<CredentialListItem>` envelope the metadata listing uses, with `page_info.next_cursor` absent (`null`) and `page_info.limit` reporting the cap. Each item is one flat `CredentialListItem` — the selected `Credential` fields plus an optional `secret` — and selecting `type` and `expires_at` alongside it is recommended, since those are what a consumer needs to use the secret, and no other administrative field is included.
 
 **Suppression (`cpt-cf-credstore-fr-suppression`; [ADR-0008](./ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md)).** A record carries a `fallback` field, `inherit` (default) or `none`, its policy for the time it holds no secret; it is written under `write`, the same action as `sharing`, and never by itself touches the secret. While the record is `active` its own secret always wins and `fallback` is stored but not consulted, so a policy can be armed ahead of time and takes effect only once the secret is gone. Resolution candidates are `status = 2 OR (status = 4 AND fallback = 2)`: a `declared` row with `fallback: none` competes and, when nearest, wins, and a winner with no secret yields 404 rather than letting the walk continue — reported as `inheritance: suppressed`. Suppression propagates exactly as any other row does, through the record's `sharing`: `shared` blocks the whole subtree, `tenant` blocks only that tenant. Suppressing an *active* own credential is one request: `PATCH {"fallback": "none", "secret": null}` under `If-Match` (`write` for `fallback`, `write_secret` for `secret`, both evaluated before the row is touched) updates the row to `declared`/`none` and then best-effort deletes the backend entry — no window in which the wrong secret is served. Suppressing with **no own row at all** is also one request: `PUT {"type": …, "sharing": …, "fallback": "none", "secret": null}` under `If-None-Match: *` creates the record directly `declared`/`none`, needing only `write` — no backend call, since `secret` is an explicit `null` on create. The `smtp-default` three-tenant scenario is walked step by step in §6.1.
 
@@ -615,7 +661,7 @@ The types-registry is a hard `deps` of the gear (fail-closed `init` when `TypesR
 
 **Secret-type resolution** (§5): every operation resolves the secret's stored type UUID via `get_type_schema_by_uuid` — one lookup against the registry client's built-in TTL cache; credstore adds no cache of its own, so type re-registrations take effect within the client TTL. The resolver (`GtsSecretTypeResolver`, mirroring AM's `GtsTenantTypeChecker`) verifies the schema descends from the base type (`gts.cf.core.credstore.secret.v1~` as shipped, `…credential.v1~` after the ADR-0004 rename, §5.1), merges the chain's effective traits (`x-gts-traits`, leaf wins, base fills defaults), and deserializes them into `SecretTypeTraits`. Failure mapping is fail-closed: an unregistered/non-secret type is `UNKNOWN_SECRET_TYPE` (400) when the caller named it, 503 when it came from a stored row (deregistration is an operational inconsistency, not a caller error); registry outage / timeout (2 s probe) / malformed traits → 503. Calls are recorded on the `types_registry` dependency-health metrics.
 
-**Plugin discovery**: plugins register GTS instances derived from the plugin spec type (`…~cf.core.credstore.plugin.v1~`). The gear lazily queries instances by type-id prefix, filters by the configured `vendor`, picks the highest-priority active instance, and resolves its scoped `CredStorePluginClientV1` from ClientHub. No plugin available surfaces as a non-retryable 503 ("no storage plugin registered").
+**Plugin discovery**: plugins register GTS instances derived from the plugin spec type (`…~cf.core.credstore.plugin.v1~`). The gear lazily queries instances by type-id prefix, filters by the configured `vendor`, picks the highest-priority active instance, and resolves its scoped `CredStorePluginClientV2` from ClientHub. No plugin available surfaces as a non-retryable 503 ("no storage plugin registered").
 
 #### Sharing-mode transitions
 
@@ -658,7 +704,7 @@ sequenceDiagram
     GW->>PDP: access_scope(read, concrete type)
     PDP-->>GW: AccessScope
     GW->>DB: scope_includes_tenant(caller tenant)?
-    GW->>P: get(owner_tenant, key, owner?) — value only
+    GW->>P: get(key, value_version) — value only
     P-->>GW: SecretValue
     GW-->>C: value + {owner_tenant_id, sharing, is_inherited, version, type}
 ```
@@ -667,9 +713,9 @@ sequenceDiagram
 
 **Shadowing**: a child's accessible secret always wins over an ancestor's; an *inaccessible* child secret (e.g. someone else's private) does not block fallback to an ancestor's shared secret.
 
-**Planned (ADR-0006).** The diagram's last two steps change shape: `GW->>P: get(owner_tenant, key, owner?)` becomes `GW->>P: get(owner_tenant, value_id)` — the plugin call is keyed by `tenant_id/value_id` alone; the row's `key`/owner-class no longer reaches the plugin at all (§4.3). `value_id IS NULL` (a `declared` row) is never a resolution candidate, unchanged from today. **Retry-once on a raced switch**: if `plugin.get` returns `NotFound` for the `value_id` the row named, the read *re-reads the row once* rather than failing — the row may have been switched to a newer version, and its old entry already deleted, between the metadata query and the backend read (§6.2 step 5 runs immediately after the pointer-switch commit). The retry resolves against whatever `value_id` the re-read row now holds; a second `NotFound` after the retry is treated as an ordinary miss. This is the only race the read side has to absorb — every other failure mode is prevented upstream by the write protocol never overwriting an entry in place (§6.2).
+**Secret read (ADR-0006).** The diagram's last two steps read as follows. A metadata-only read or a listing replies from PG and never touches the store (J5). When the secret is selected, the PDP is evaluated on the decisive row's type before any store call, then `plugin.get(key, value_version)`: found → reply 200 with the secret and the `ETag` `(id, version)`; not found (a concurrent write switched the pointer and destroyed the old version) → re-read the row **once**, and if `value_version` changed, `get` again; a second miss → 503, never a stale or empty value (J6). `value_version IS NULL` (a `declared` row) is never a resolution candidate for a secret read and never a store call; resolution continues per the hierarchy rules. Expiry is evaluated from the row; an expired row is treated as absent. This is the only race the read side has to absorb — every other failure mode is prevented upstream by the write protocol never overwriting a version in place (§6.2).
 
-#### Value Write Protocol (planned, ADR-0006; shipped saga below) — see §6.2
+#### Value Write Protocol — see §6.2
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-seq-write-saga`
 
@@ -677,28 +723,27 @@ sequenceDiagram
 sequenceDiagram
     participant C as Consumer
     participant GW as credstore
-    participant DB as credstore_secrets / gc
+    participant DB as credstore_secrets
     participant P as Plugin
 
     C->>GW: put/patch(ctx, key, value, precondition)
-    GW->>DB: INSERT credstore_value_gc(new_id, pending) — intent
-    GW->>P: put(tenant, new_id, value)
-    P-->>GW: OK
-    GW->>DB: txn: CAS row (value_id = new_id, version+1, fp) + DELETE gc(new_id) + INSERT gc(old_id, superseded) if old_id existed
+    GW->>DB: read row (precondition, type); PDP on the row's type
+    GW->>P: put(key, value)
+    P-->>GW: vv
+    GW->>DB: txn: UPDATE/INSERT row (value_version = :vv, version + 1) — CAS on (id, version)
     DB-->>GW: committed
-    GW->>P: best-effort delete(old_id)
-    GW->>DB: DELETE gc(old_id)
-    GW-->>C: 201 create / 204 replace
-    Note over GW,P: plugin.put fails → best-effort mark gc(new_id) aborted (never deleted — the failure may be ambiguous); 503; nothing served changes
-    Note over GW,DB: CAS lost (row changed under us) → 409; best-effort UPDATE gc(new_id) reason=aborted + best-effort plugin.delete(new_id) + DELETE gc(new_id)
-    Note over GW,DB: DB unreachable at the CAS → 503; new bytes are an orphan already recorded pending → the maintenance job reconciles
+    GW->>P: best-effort destroy(Below(vv)) (only when supported)
+    GW-->>C: 201 create / 204 replace + ETag
+    Note over GW,P: plugin.put fails → 503; nothing changed in PG; an orphan version is destroyed by the next successful write (when supported)
+    Note over GW,DB: CAS lost (0 rows / unique violation) → best-effort destroy(Exactly(vv)) (when supported); 409 (an If-Match: * update re-reads and retries once first)
+    Note over GW,DB: PG unavailable or timeout at the CAS (commit may have happened) → vv is NOT deleted; 503
 ```
 
-**Planned, ADR-0006.** Steps: (1) validate, authorize, resolve type, read the row for the precondition; (2) record intent — `INSERT credstore_value_gc(new_id, pending)`; (3) `plugin.put` the bytes under the fresh `value_id`; (4) one transaction — CAS the row to point at `new_id` (insert for create, update for replace) plus the gc bookkeeping above; (5) best-effort `plugin.delete(old_id)` then `DELETE gc(old_id)`. Two concurrent `If-Match: *` writers both succeed in sequence — last pointer wins, the loser's value is enqueued `superseded`, never lost silently. Full failure map and the shipped saga this replaces: §6.2.
+Steps: (1) read the row, check the precondition, authorize (PDP on the row's type), resolve the type and traits — all before any store call; (2) `plugin.put` the bytes under the record's key and obtain the value version `vv`; (3) one transaction — CAS the row to point at `vv` (insert for create, update for replace); (4) when the backend supports `destroy`, best-effort `plugin.destroy(Below(vv))`. A metadata-only `PATCH` is one PG CAS with no store call. Two concurrent `If-Match: *` writers both put; the first to commit owns the pointer and the other re-reads, retries once and commits a later version, or returns 409 — never a lost silent write. Full failure map: §6.2.
 
-#### Delete (planned, ADR-0006; shipped saga below) — see §6.3
+#### Delete — see §6.3
 
-`DELETE /credentials/{ref}` (and `PATCH {"secret": null}`, which removes only the secret) are each one database transaction — row change plus a `credstore_value_gc` insert for the version being removed — followed by a best-effort `plugin.delete`. `DELETE` releases the reference at once: no successor writes to the same `value_id`, so there is no ABA hazard to guard against by holding the name. Details and the shipped deprovisioning saga this replaces: §6.3.
+`DELETE /credentials/{ref}` is one PG transaction — `DELETE` the row (CAS on `version` for a version validator) and enqueue an outbox `purge(tenant_id, record_id)` — followed by reply 204; the outbox handler calls `delete_key` and retries until it succeeds. `PATCH {"secret": null}`, which removes only the secret, is one PG CAS (`value_version = NULL`) followed, where `destroy` is supported, by best-effort `destroy(Below(old_vv))` and `destroy(Exactly(old_vv))` — never `delete_key`. `DELETE` releases the reference at once: a re-create mints a new record id and a new key, so a lagging purge cannot touch it. Details: §6.3.
 
 #### Credential listing (planned, ADR-0005)
 
@@ -734,105 +779,72 @@ The ancestor-chain fetch is the same `BarrierMode::Ignore` lookup as the point r
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-seq-bulk-read-secrets`
 
-Naming `secret` in `$select` on `GET /credstore/v1/credentials` (§4.3.2; [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) "Secret mode") is the same list flow above, not a separate sequence: the ancestor-chain fetch, the SQL-first candidate query clamped by `reference`/`type`, and the in-memory reduction to one winner per reference are unchanged. Two things differ. First, the per-type PDP call evaluates `read_secret` instead of `list` for each distinct type visible across the chain, before the candidate query; the row fetch is capped at `cap + 1` permitted candidates rather than paginated, and `limit`/`cursor` are rejected outright (400); exceeding the cap fails the request with `400 TOO_MANY_MATCHES` rather than truncating, checked without a `COUNT` query. Second, a type the caller may not `read_secret` never enters the candidate query, exactly as a `list`-denied type never enters the metadata listing — never reported as not-found, since the filter never saw the row, not the caller. Each returned secret is re-verified against its row's fingerprint (§4.10). The response is the same `Page<CredentialListItem>` envelope as the metadata listing — a flat item list with `page_info.next_cursor` absent (`null`) and `page_info.limit` reporting the cap (`list.secret_mode_cap`) — plus `Cache-Control: no-store` and one audit record per secret. Winners' values are read concurrently, at most `SECRET_READ_CONCURRENCY` (8) in flight, with the response preserving reference order regardless of completion order and one backend read failure failing the whole request.
+Naming `secret` in `$select` on `GET /credstore/v1/credentials` (§4.3.2; [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) "Secret mode") is the same list flow above, not a separate sequence: the ancestor-chain fetch, the SQL-first candidate query clamped by `reference`/`type`, and the in-memory reduction to one winner per reference are unchanged. Two things differ. First, the per-type PDP call evaluates `read_secret` instead of `list` for each distinct type visible across the chain, before the candidate query; the row fetch is capped at `cap + 1` permitted candidates rather than paginated, and `limit`/`cursor` are rejected outright (400); exceeding the cap fails the request with `400 TOO_MANY_MATCHES` rather than truncating, checked without a `COUNT` query. Second, a type the caller may not `read_secret` never enters the candidate query, exactly as a `list`-denied type never enters the metadata listing — never reported as not-found, since the filter never saw the row, not the caller. Each returned secret is read at its own row's `value_version`, with the point-read retry rule (§4.6). The response is the same `Page<CredentialListItem>` envelope as the metadata listing — a flat item list with `page_info.next_cursor` absent (`null`) and `page_info.limit` reporting the cap (`list.secret_mode_cap`) — plus `Cache-Control: no-store` and one audit record per secret. Winners' values are read concurrently, at most `SECRET_READ_CONCURRENCY` (8) in flight, with the response preserving reference order regardless of completion order and one backend read failure failing the whole request.
 
 ### 4.7 Database schemas & tables
 
-The gear owns one table, `credstore_secrets` (migration `m0001_initial_schema`; raw per-backend SQL to preserve `CHECK` and partial-index semantics; PostgreSQL and SQLite; MySQL fails fast):
+The gear owns one table, `credstore_secrets` (migration `m0001_initial_schema`, reshaped by `m0002`; raw per-backend SQL to preserve `CHECK` and partial-index semantics; PostgreSQL and SQLite; MySQL fails fast). The block below is the schema **after `m0002`** (ADR-0005, ADR-0006, ADR-0008); the delta from `m0001_initial_schema` is listed after it.
 
 ```sql
 CREATE TABLE credstore_secrets (
-    id         UUID PRIMARY KEY,
+    id         UUID PRIMARY KEY,          -- record identity: minted at create, never reused; also the store key's record part
     tenant_id  UUID NOT NULL,
     reference  TEXT NOT NULL CHECK (length(reference) BETWEEN 1 AND 255),
     sharing    SMALLINT NOT NULL CHECK (sharing IN (1,2,3)),  -- private/tenant/shared
     owner_id   UUID NOT NULL,
-    status     SMALLINT NOT NULL CHECK (status IN (1,2,3)),   -- provisioning/active/deprovisioning
+    status     SMALLINT NOT NULL CHECK (status IN (2,4)),     -- active/declared (1 and 3 retired, reserved)
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    version    BIGINT NOT NULL DEFAULT 1,
+    version    BIGINT NOT NULL DEFAULT 1,                     -- row version: +1 on every change, metadata or secret
     secret_type_uuid UUID NOT NULL DEFAULT '<generic type v5 uuid>', -- deterministic v5 of the GTS type id
-    expires_at TIMESTAMPTZ NULL,                                     -- expirable types only
-    value_fp   BYTEA NULL,      -- value-fingerprint fence: HMAC-SHA256(fence_key, value); internal-only
-    fp_key_id  SMALLINT NULL,   -- fence-key id the fp was computed under (keyring groundwork)
-    CHECK ((value_fp IS NULL) = (fp_key_id IS NULL))  -- NULL only on out-of-band seeded rows
+    expires_at TIMESTAMPTZ NULL,                              -- expirable types only
+    fallback   SMALLINT NOT NULL DEFAULT 1 CHECK (fallback IN (1, 2)),  -- 1 = inherit, 2 = none (ADR-0008, Suppression)
+    value_version  TEXT NULL,       -- value version the provider returned from put (not the row version); NULL = declared; never parsed or compared by the gear
+    CONSTRAINT credstore_secrets_value_version_check CHECK ((value_version IS NULL) = (status = 4))
 );
 -- coexistence of a private and a tenant/shared secret under one reference:
 CREATE UNIQUE INDEX uq_credstore_nonprivate ON credstore_secrets (tenant_id, reference)           WHERE sharing <> 1;
 CREATE UNIQUE INDEX uq_credstore_private    ON credstore_secrets (tenant_id, reference, owner_id) WHERE sharing = 1;
--- walk-up resolution, reaper sweep (all non-active rows), expiry sweep:
+-- walk-up resolution, expiry-aware reads, type clamp:
 CREATE INDEX idx_credstore_lookup  ON credstore_secrets (reference, tenant_id, status);
-CREATE INDEX idx_credstore_pending ON credstore_secrets (updated_at) WHERE status <> 2;
 CREATE INDEX idx_credstore_expiry  ON credstore_secrets (expires_at) WHERE expires_at IS NOT NULL AND status = 2;
+CREATE INDEX idx_credstore_type    ON credstore_secrets (tenant_id, secret_type_uuid);
 ```
 
-Created by the single `m0001_initial_schema` migration (§8). The table is a `Scopable` SecureORM entity — PDP scope clamps are applied to every query, which is what makes authorization enforceable in SQL.
+The table is a `Scopable` SecureORM entity — PDP scope clamps are applied to every query, which is what makes authorization enforceable in SQL. The store key of a record is `(tenant_id, id)`; `value_version` is meaningful only under that key. Two different versions live in the table and must not be confused: the **row version** (`version`, a monotonic counter that is bumped on every change of the row and drives the CAS and the `ETag` `(id, version)`) and the **value version** (`value_version`, the provider's identifier of the stored secret value that `put` returned). The type of `value_version` is the gear's storage choice for an opaque, bounded string; the gear stores and returns it verbatim and leaves ordering to the plugin (required only with `destroy`).
 
-**Shipped above, superseded by ADR-0006 (planned).** The `CHECK ((value_fp IS NULL) = (fp_key_id IS NULL))` backstop and its comment ("NULL only on out-of-band seeded rows") describe the shipped seeding path (§4.10); ADR-0006 withdraws seeding and replaces this constraint with one keyed to `value_id` (below). The `-- ... reaper sweep (all non-active rows) ...` comment above `idx_credstore_lookup`/`idx_credstore_pending` describes the shipped saga's use of those indexes (§6.2, §6.3); once statuses `1`/`3` are retired, `idx_credstore_pending` has no remaining non-`active` rows to distinguish beyond `declared` (which the reaper does not sweep by staleness), so the index becomes unused and may be dropped (§4.7 "Amended by ADR-0006" below, §6.4).
+**`m0001_initial_schema` as shipped** carries `status CHECK (status IN (1,2,3))`, `value_fp BYTEA NULL` and `fp_key_id SMALLINT NULL` with `CHECK ((value_fp IS NULL) = (fp_key_id IS NULL))` (the value-fingerprint fence, §4.10), and the indexes `idx_credstore_lookup`, `idx_credstore_pending (updated_at) WHERE status <> 2` (the reaper's sweep) and `idx_credstore_expiry`. No migration beyond `m0001` has shipped.
 
-**Planned: `m0002` (ADR-0005, ADR-0008).** The `fallback` field (`cpt-cf-credstore-fr-suppression`) and the filter/order allowlist behind the credential-record collection, including its secret-mode (`$select=secret`) read (§4.3.2, §4.4), require an additive migration on top of `m0001_initial_schema`, adding at least:
-
-```sql
-ALTER TABLE credstore_secrets ADD COLUMN fallback SMALLINT NOT NULL DEFAULT 1 CHECK (fallback IN (1, 2));  -- 1 = inherit, 2 = none (ADR-0008, Suppression)
-CREATE INDEX idx_credstore_type     ON credstore_secrets (tenant_id, secret_type_uuid);
-
--- The `declared` status (§6.1) needs both of these, not just the column above:
--- the initial CHECK admits 1..3 only, so `status = 4` cannot be stored, and
--- the reaper's pending index covers every non-active row, so a deliberately
--- long-lived `declared` record would be selected as a stale write and swept.
-ALTER TABLE credstore_secrets DROP CONSTRAINT credstore_secrets_status_check;
-ALTER TABLE credstore_secrets ADD  CONSTRAINT credstore_secrets_status_check
-  CHECK (status IN (1, 2, 3, 4));
-DROP INDEX idx_credstore_pending;
-CREATE INDEX idx_credstore_pending ON credstore_secrets (updated_at)
-  WHERE status IN (1, 3);   -- provisioning/deprovisioning only, never `declared`
-```
-
-**Shipped-in-this-block, superseded by ADR-0006 (planned).** The reaper's stale-row selection narrows with that index: it reads `status IN (1, 3)` rather than `status <> 2`, so `declared` is excluded by the same predicate that drives the sweep instead of by an exception inside it (§6.4) — this describes the ADR-0005/0007/0008 state of the migration, one layer before ADR-0006 removes statuses `1`/`3` outright and this sweep with them (§6.4 "Amended by ADR-0006" below). SQLite has no `DROP CONSTRAINT`, so on that backend the widened `CHECK` arrives by table rebuild or is simply absent — the domain layer is the enforcing party either way, and the constraint is a backstop.
-
-**Amended by `m0002`, ADR-0006 (planned).** Landing in the same migration, on top of the block above:
+**`m0002` (ADR-0005, ADR-0006, ADR-0008, landing together).** Schema-only; it leaves every pre-existing `active` row `declared` (§8):
 
 ```sql
--- value versioning: the row points at its current backend version; NULL ⇔ declared
-ALTER TABLE credstore_secrets ADD COLUMN value_id UUID NULL;
-CREATE UNIQUE INDEX uq_credstore_value_id ON credstore_secrets (value_id) WHERE value_id IS NOT NULL;
+-- ADR-0008 Suppression, ADR-0005 type clamp
+ALTER TABLE credstore_secrets ADD COLUMN fallback SMALLINT NOT NULL DEFAULT 1 CHECK (fallback IN (1, 2));
+CREATE INDEX idx_credstore_type ON credstore_secrets (tenant_id, secret_type_uuid);
 
--- statuses 1 (provisioning) and 3 (deprovisioning) are retired — a write is a
--- value-and-pointer switch, not a saga state, so nothing needs an in-flight
--- status any more; this replaces the (1, 2, 3, 4) check two blocks above,
--- which was never shipped on its own since ADR-0005/0007/0008 and ADR-0006 land
--- in the same migration:
+-- ADR-0006: the row points at the current store version; NULL = declared
+ALTER TABLE credstore_secrets ADD COLUMN value_version TEXT NULL;
+
+-- statuses 1 (provisioning) and 3 (deprovisioning) are retired: a write is a
+-- put plus a pointer switch, not a saga state
 ALTER TABLE credstore_secrets DROP CONSTRAINT credstore_secrets_status_check;
-ALTER TABLE credstore_secrets ADD  CONSTRAINT credstore_secrets_status_check
-  CHECK (status IN (2, 4));
+ALTER TABLE credstore_secrets ADD  CONSTRAINT credstore_secrets_status_check CHECK (status IN (2, 4));
+ALTER TABLE credstore_secrets ADD  CONSTRAINT credstore_secrets_value_version_check    CHECK ((value_version IS NULL) = (status = 4));
 
--- a fingerprint exists for every value, and a value-less row has none —
--- replaces the shipped (value_fp IS NULL) = (fp_key_id IS NULL) backstop,
--- which allowed a third case (a value with no fingerprint yet) for
--- out-of-band seeding; that case is withdrawn (§4.10):
+-- the value-fingerprint fence is withdrawn (ADR-0003): drop its columns and constraint.
+-- Applied as the closing step, only after the data migration of section 8 has verified
+-- every pre-existing value against its fingerprint and carried it to the new key.
 ALTER TABLE credstore_secrets DROP CONSTRAINT credstore_secrets_fp_check;
-ALTER TABLE credstore_secrets ADD  CONSTRAINT credstore_secrets_fp_check
-  CHECK ((value_id IS NULL) = (value_fp IS NULL) AND (value_id IS NULL) = (fp_key_id IS NULL));
+ALTER TABLE credstore_secrets DROP COLUMN value_fp;
+ALTER TABLE credstore_secrets DROP COLUMN fp_key_id;
 
--- the intent log and gc queue: every write records its target id as pending
--- before touching the backend; every superseded/removed/aborted version is
--- enqueued for the maintenance job to delete (§6.4). No `reference` or
--- `owner_id` column: `value_id` is unique store-wide, so the row alone is
--- enough to identify and delete the backend entry:
-CREATE TABLE credstore_value_gc (
-    value_id    UUID PRIMARY KEY,
-    tenant_id   UUID NOT NULL,
-    reason      SMALLINT NOT NULL CHECK (reason IN (1, 2, 3, 4)), -- 1 pending / 2 superseded / 3 removed / 4 aborted
-    enqueued_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX idx_credstore_value_gc_enqueued ON credstore_value_gc (enqueued_at);
-
--- unused once no row can carry status 1 or 3 (see the note on the shipped
--- block above); dropping it is optional cleanup, not required for correctness:
+-- the reaper's sweep index has nothing left to sweep
 DROP INDEX idx_credstore_pending;
 ```
 
-`reason` follows the same SMALLINT-code-with-`CHECK` convention as `status`, `sharing` and `fallback` (below). The gc table is deliberately two things in one: an **intent log** — a `pending` row proves bytes were about to be written for `value_id` before the backend call happened, so a crash between the intent insert and the row CAS still leaves a trace the maintenance job can reconcile — and a **work queue** — every other reason is an already-decided deletion the job has not yet drained. Both roles share one table because both are keyed by `value_id` and both are read by the same bounded, `enqueued_at`-ordered batch (§6.4); splitting them into a log and a queue would just require joining them back for that batch. The plugin key changes shape from `(tenant, key, class)` to `tenant_id/value_id`; a deployment with no rows written under the old shape needs nothing further, but one that already holds such rows needs the one-off, out-of-gear data migration this schema change depends on before the narrowed `status`/`value_id` `CHECK`s above are applied to that data — this gear ships no such job itself (§8, ADR-0006).
+SQLite has no `DROP CONSTRAINT` or, on older versions, `DROP COLUMN`, so on that backend the narrowed `CHECK`s and the column drops arrive by table rebuild or are simply absent — the domain layer is the enforcing party either way, and the constraints are backstops.
+
+There is **no value-id table, no gc table and no intent table**: nothing in the schema tracks garbage. A version is found for cleanup by position under the record's key (`destroy`, §6.2, where supported), and a deleted record's key is purged by the outbox (§6.3); the platform transactional outbox keeps its own tables, owned by the platform, not by this gear. No unique index on `value_version` exists, because a reference is unique only within one record's key, not store-wide.
 
 `fallback` follows the same SMALLINT-code-with-`CHECK` convention as `status` and `sharing`: an integer code in the database, a string name (`inherit`/`none`) on the wire — the rule types-registry documents in the header of `gears/system/types-registry/types-registry/src/infra/storage/entity/enums.rs` and account-management already follows for its own two-valued `conversion_requests.target_mode` column. With it, the resolution predicate widens from `status = 2` to `status = 2 OR (status = 4 AND fallback = 2)`, served by `idx_credstore_lookup (reference, tenant_id, status)` for both halves — the index is keyed by reference, tenant and status, so `status IN (2, 4)` is an index lookup — with `fallback` checked on the handful of rows it returns; no new index is needed.
 
@@ -840,7 +852,8 @@ DROP INDEX idx_credstore_pending;
 
 The exact column and index list is finalized with the migration; the ones above are the minimum the clamp and the allowlist rule below require.
 
-**Current index gaps (before `m0002`).** As of `m0001_initial_schema`, `created_at` carries no index at all; neither `secret_type_uuid` nor `owner_id` is indexed on its own — the only index touching either column at all is `idx_credstore_lookup (reference, tenant_id, status)`, which names neither. `updated_at` is indexed only for **non-active** rows (`idx_credstore_pending (updated_at) WHERE status <> 2`), so it is unusable for filtering or ordering **active** rows — precisely the rows a listing or a bulk selector cares about. The platform rule that OData `$filter`/`$orderby` may only name indexed fields (ADR-0004, ADR-0005) is enforced by review today; there is no automatic check that a newly allowlisted field is actually indexed. **Superseded by ADR-0006 (planned):** `idx_credstore_pending` is the shipped reaper's sweep index over non-`active` rows (§6.2, §6.3); once statuses `1`/`3` are retired it serves nothing — the maintenance job's gc drain reads `credstore_value_gc` instead (§6.4) — and it is dropped in the same migration, not carried forward as a gap.
+**Current index gaps (before `m0002`).** As of `m0001_initial_schema`, `created_at` carries no index at all; neither `secret_type_uuid` nor `owner_id` is indexed on its own — the only index touching either column at all is `idx_credstore_lookup (reference, tenant_id, status)`, which names neither. `updated_at` is indexed only for **non-active** rows (`idx_credstore_pending (updated_at) WHERE status <> 2`), so it is unusable for filtering or ordering **active** rows — precisely the rows a listing or a bulk selector cares about. The platform rule that OData `$filter`/`$orderby` may only name indexed fields (ADR-0004, ADR-0005) is enforced by review today; there is no automatic check that a newly allowlisted field is actually indexed. **Superseded by ADR-0006:** `idx_credstore_pending` is the shipped reaper's sweep index over non-`active` rows; with statuses `1`/`3` retired and no sweep of any kind, it serves nothing and is dropped in `m0002`, not carried forward as a gap.
+
 
 ### 4.8 Deployment Topology
 
@@ -869,30 +882,18 @@ Development/testing runs the in-memory `static-credstore-plugin`; production dep
 | Serialization | `serde` | Platform standard |
 | Errors | `thiserror` + toolkit canonical errors | Platform standard ([ADR 0005](../../../docs/arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md)) |
 
-### 4.10 Value-Fingerprint Fence
+### 4.10 Value-Fingerprint Fence (withdrawn)
 
-> Decision: [ADR-0003](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md) (`cpt-cf-credstore-adr-value-fingerprint-fence`). Closes the cross-tenant disclosure of two crosswise concurrent last-writer-wins (`If-Match: *`) PUTs and the ABA lost-update of a recreated secret. **Amended by ADR-0006 (planned)** — see "Planned (ADR-0006): integrity check only" below; the shipped mechanism, fence key and generation-bound validator are unaffected and described first.
+> Decision: [ADR-0003](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md) (`cpt-cf-credstore-adr-value-fingerprint-fence`), **withdrawn by [ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md)**. Section number kept for stability.
 
-**Shipped today.** A secret is a **dual write**: the value goes to the external value-store backend (`plugin.put`), the metadata (`sharing`, `version`, `expires_at`) to `credstore_secrets`. No transaction spans both stores, so two concurrent last-writer-wins PUTs (`If-Match: *`) to the same reference can interleave crosswise and commit one caller's value under the other caller's sharing label — a durable cross-tenant disclosure when the surviving label is `shared`. The mandatory write precondition does not close this: `Exists` writers still race, a version-gated writer that crashes between the metadata commit and the backend write leaves the same cross-writer mismatch, and no API-level precondition can bind two transaction-less stores — only the read-side fence can. The platform's coordination primitives deliberately exclude fencing of external effects ([cluster ADR-002](../../system/cluster/docs/ADR/002-async-boundary-no-remote-in-critical-section.md): no fencing tokens, no remote calls in a lock's critical section; `coord` leases likewise), so the fence lives at the application layer, as that ADR prescribes.
+**What the fence was for.** A secret write spans two stores with no shared transaction, so two concurrent last-writer-wins writers (or a crash between the metadata commit and the store write) could leave a value under a sharing label a different writer set. The shipped fence stamped `HMAC-SHA256(fence_key, value)` in the row and verified it on every read, failing closed on a mismatch and healing through an `If-Match: *` re-put.
 
-**Mechanism.** Each row stores `value_fp = HMAC-SHA256(fence_key, value)` of the value its metadata was written for. Every write stamps it in the same atomic `touch`/insert as `sharing`; every read recomputes it from the value the backend returned and serves the value only when the row agrees, else fails closed as an anti-enumeration miss (404) — with one deliberate exception: an out-of-band seeded row whose `value_fp` is still `NULL` is served on trust until backfilled (see **Out-of-band seeding** below); API-written rows always carry a fingerprint. Because the fingerprint and the sharing label are written by one writer in one UPDATE, a fingerprint match transitively proves the value and the metadata are from the same PUT — a value can never be served under a sharing label a different writer set. Metadata is not hashed into the fingerprint (the atomic write is what binds them).
+**Why it is withdrawn.** The mismatch it detected cannot occur under immutable versions with an exact-bytes `get`. A row's `value_version` names one version, written by one completed `put` and never overwritten; the `put` precedes the pointer switch, and the switch carries the value version together with the sharing label in one PG transaction. A reader therefore gets either exactly the bytes of the write that committed the pointer, or nothing (J2, J6). There is no torn write, no crosswise interleave and nothing to heal in place: a stale writer's CAS fails and its version is deleted (§6.2). Integrity rests on the plugin contract: a backend whose `get(version)` returns bytes other than those of the `put` that returned `version` violates it.
 
-**Fence key.** Deployment state, not configuration: auto-generated (OS RNG, 32 bytes) and stored in the value-store backend under the reserved entry `(tenant = nil, reference = "cfs-internal-fence-key", owner = None)`. It has no metadata row, so no API path resolves, overwrites, or deletes it (resolution requires a row; external callers always carry a real tenant). All replicas read the one shared entry; on a virgin deployment the first writer generates it (put-then-reread convergence). The service caches it in-process and, on a fingerprint mismatch, performs a one-shot re-read (a replica whose cached key went stale after a key re-creation self-heals before failing closed). Split knowledge: fingerprints live in the gear DB, the key with the values — a DB-only compromise yields HMACs under an unknown key (no offline dictionary attack), and backend compromise yields the plaintexts regardless, so the fence adds no attack surface.
+**What is removed.** `value_fp` and `fp_key_id` and their `CHECK`; the stored fence key and its reserved backend entry; the one-shot re-read on mismatch; out-of-band seeding (a row with a value but no fingerprint, served on trust); the healing `If-Match: *` re-put (`*` is plain last-writer-wins); the fence metrics. **What is not provided:** detection of out-of-band modification of a stored version; the gear offers no such mechanism.
 
-**Failure semantics** are always fail-closed and self-healing: a half-completed overwrite (backend write committed, metadata `touch` failed, or vice-versa) leaves the row fingerprinting a different value than the backend holds, so reads 404 until a retried PUT lands both; a lost/replaced key makes fenced reads 404 (observable via `fence_verify{outcome="mismatch"}`) and re-PUT re-stamps each secret. The healing PUT uses `If-Match: *`: the poisoned read is a fail-closed 404, so no version validator can be obtained — which is exactly why the explicit `*` form remains part of the mandatory-precondition contract. No failure mode serves a value under mismatched metadata.
+**Generation-bound validator — kept.** The strong `ETag` is `"<row-id>.<version>"`. The record id is minted fresh at create and never reused, so a validator from a deleted-and-recreated record's earlier generation never matches the new row even when the restarted version counters coincide (closing the ABA lost-update). `version` is the optimistic-lock counter, +1 on every change, metadata or secret, and the row-level CAS gates on it. The same id is the record part of the store key (§4.7), which is what keeps a lagging key purge of an old record away from the new record's versions.
 
-**Generation-bound validator.** The strong `ETag` is `"<row-id>.<version>"`. The row UUID is minted fresh per created secret, so a validator from a deleted-and-recreated secret's earlier generation never matches the new row even when the restarted version counters coincide (closing the ABA lost-update). `version` stays the per-generation optimistic-lock counter and the row-level CAS still gates on it (the id is already the UPDATE key).
-
-**Out-of-band seeding — withdrawn by ADR-0006 (planned).** Shipped today: a row provisioned directly in the DB with `value_fp = NULL` (value placed directly in the backend) is served on trust and its fingerprint backfilled — lazily on first read, or by the reaper's bounded sweep for rows nobody reads (both via a `value_fp IS NULL` CAS that never bumps the version). A re-seed of an existing row must reset `value_fp` to NULL in the same operation. This is the only path that produces a NULL fingerprint; API writes always stamp. **Planned, ADR-0006:** withdrawn outright — values enter only through the API (write protocol, §6.2), so no row is ever active with a value and no fingerprint; see below.
-
-**Planned (ADR-0006): integrity check only.** The fence keeps exactly the mechanism above — same HMAC, same fence key, same reserved backend entry, same generation-bound `ETag` — but its role in a write narrows to *stamp and verify*, with no role in recovery. Three changes:
-
-- **No seeding, no third state.** Out-of-band seeding is withdrawn (above), so the paired-nullability invariant is exact, not "NULL only on out-of-band seeded rows": `value_id IS NULL ⇔ value_fp IS NULL ⇔ fp_key_id IS NULL` (§4.7's `ck_credstore_fp_with_value` check) — a fingerprint exists for every value, and a value-less (`declared`) row has none. There is no row that holds a value but not yet a fingerprint.
-- **No healing re-put.** Today a fingerprint mismatch is repaired by an `If-Match: *` re-put of the (assumed-known) correct value onto the *same* row and key — a healing write, described in "Failure semantics" above. Under immutable versions there is nothing to heal in place: a mismatch means the backend entry at `tenant_id/value_id` was altered or corrupted out of band — an integrity violation, not a transient desync — and the row's pointer still names that same corrupted `value_id`. Recovery is an ordinary **new write**: a fresh `value_id`, a new backend entry, a row CAS to point at it (§6.2). The old, corrupted entry is enqueued for gc (reason `superseded`) like any other replaced version. `If-Match: *` keeps its meaning as plain last-writer-wins; it carries no special healing role.
-- **What still fails closed.** A read whose fingerprint check fails still 404s (anti-enumeration) exactly as today — the fence's fail-closed read-side behavior is unchanged. What changes is only how the operator responds: write a new version, never re-put the old one.
-- **Reserved entry moves with the key shape.** Since every backend key becomes `tenant_id/value_id` (§4.1, §4.3), the fence key's reserved entry moves with it: `(tenant = nil, value_id = FENCE_KEY_VALUE_ID)`, where `FENCE_KEY_VALUE_ID` is a fixed SDK constant — the UUID v5 of `cfs-internal-fence-key` — not a random v4. No row ever points at `FENCE_KEY_VALUE_ID` (a metadata row's `value_id` is always minted as a v4), so a real secret's `value_id` can never collide with it. Convergence (put-then-reread), in-process caching, and the one-shot re-read on mismatch are unchanged from "Fence key" above.
-
-Split knowledge and the generation-bound `ETag` are unchanged by ADR-0006; only the fence key's storage *address* changes shape, as above — its lifecycle (auto-generated, cached, self-healing on re-read) does not.
 
 ## 5. Secret Types (GTS-Based, Registry-Driven)
 
@@ -923,7 +924,7 @@ The type of a secret is chosen at creation (REST field `type`: the secret type's
 | `allow_sharing` | list of `SharingMode` | Sharing modes permitted for secrets of this type. A `put`/`create` with a mode outside the list is rejected (400, `SHARING_NOT_ALLOWED_FOR_TYPE`) — including a disallowed mode change on update. The traits schema constrains entries to the `SharingMode` enum, so a typo fails at registration. |
 | `value_schema` | embedded JSON Schema (optional) | Structural validation of the (JSON) value on write (400, `VALUE_SCHEMA_VIOLATION`); violation details never echo the value. Absent ⇒ opaque value. Carried in `x-gts-traits` like every other trait; the validator is compiled per write (schemas are dynamic; the registry client caches the resolution). A registered schema that fails to compile is a broken registration → 503, not 400. |
 | `max_size_bytes` | integer (optional) | Upper bound on value size (400, `VALUE_TOO_LARGE`); absent ⇒ platform default only. |
-| `expirable` | bool | Whether secrets of this type may carry `expires_at` (else 400, `EXPIRY_NOT_SUPPORTED_FOR_TYPE`; a past expiry is `EXPIRY_IN_THE_PAST`); expired secrets resolve as 404 (read-time SQL filter) and are moved into the deprovisioning saga by the reaper — **superseded by ADR-0006 (planned)**: the periodic maintenance job (§6.4) removes it exactly like `DELETE`, one transaction plus gc. |
+| `expirable` | bool | Whether secrets of this type may carry `expires_at` (else 400, `EXPIRY_NOT_SUPPORTED_FOR_TYPE`; a past expiry is `EXPIRY_IN_THE_PAST`); expired secrets resolve as 404 (the expiry is evaluated from the row on every read). **ADR-0006**: nothing sweeps an expired row; it is replaced by a create-only `PUT` over it or deleted by its owner (§6.4). |
 | `rotation_period_secs` | integer (optional, advisory) | Recommended rotation cadence; metadata-only — rotation automation stays a non-goal. |
 | `utf8_only` | bool | Whether the value must be valid UTF-8 (400, `VALUE_NOT_UTF8`; only `generic` currently allows binary, reachable via the SDK). |
 
@@ -955,7 +956,7 @@ Adding a **built-in** type (shipped with the platform, with a short REST name) =
 3. **Immutability and replace vs. merge semantics**: type immutable on both verbs (`TYPE_IMMUTABLE` when an explicit differing `type` is sent — compared by UUID; absent `type` inherits the row's). `PUT` is a whole-record replace: fields absent from the body reset to their defaults, so omitting `expires_at` clears a stored expiry. `PATCH` follows RFC 7396 merge-patch semantics instead: fields absent from the body are untouched, and only a `PATCH` that carries no `secret` key and whose metadata already matches the current record is a no-op (§4.3.2).
 4. **Read**: rows with `expires_at <= now` are filtered out in the resolution SQL (404); `type` (and `expires_at`, when set) are returned in response metadata.
 5. **Authorization**: a **single** PDP evaluation per operation targets the secret's **full concrete GTS type** — including `generic` — as returned by the type resolution (step 1). Its `AccessScope` is enforced in SQL and its gate must include the **caller's** tenant (hierarchical visibility of inherited/shared secrets is decided by the resolver, not the PDP). Denial surfaces as the anti-enumeration 404 on read and 403 on write/delete; a PDP outage is 503. Every type (incl. `generic` and custom types) reaches the PDP, so a per-type policy can be added with no credstore change. On read the PDP is consulted only for a secret that resolves (a missing secret is a 404 without a PDP or registry call).
-6. **Reaper (shipped)**: each tick first flips expired `active` rows into the ordinary deprovisioning saga (`mark_expired_deprovisioning`), which then cleans the backend value and releases the reference via the pending sweep. The reaper never resolves types — sweeping is type-agnostic. **Withdrawn, superseded by ADR-0006 (planned)**: the periodic maintenance job (§6.4) removes an expired row exactly like `DELETE` (row + gc, one transaction), then best-effort backend cleanup in its gc-drain step; the job never resolves types either — sweeping stays type-agnostic.
+6. **Expiry**: nothing sweeps expired rows (no reaper, no maintenance job, §6.4). An expired own row is treated as absent on reads; a create-only `PUT` over it is allowed — one PG transaction deletes the expired row, inserts the new one with a new record id and enqueues an outbox purge of the old key (§6.2 step 6).
 
 ### 5.5 Category Registry — withdrawn
 
@@ -966,83 +967,56 @@ Adding a **built-in** type (shipped with the platform, with a short REST name) =
 - `credstore_secrets` carries `secret_type_uuid UUID NOT NULL DEFAULT '<generic v5 uuid>'` — the deterministic v5 UUID of the type's GTS id (`GtsID::to_uuid`, pinned as `credstore_sdk::GENERIC_TYPE_UUID_STR`), like AM's `tenants.tenant_type_uuid` — and `expires_at TIMESTAMPTZ NULL`, plus the partial expiry-sweep index (§4.7, §8). The stored UUID is opaque to the storage layer; only the type resolution interprets it.
 - REST: optional `type` (the secret type's full GTS type id) and `expires_at` (RFC 3339) on `POST`/`PUT`; `GET` metadata returns `type` (the resolved full GTS type id) and `expires_at`.
 - SDK: `CredStoreClientV1` gains `put_opts`/`create_opts` taking `WriteOptions { secret_type: Option<GtsId>, expires_at }` — the gear resolves the `GtsId` to the type's deterministic UUID; `put`/`create` are provided methods delegating with defaults. The write precondition is a required `put`/`put_opts`/`delete` argument, not a `WriteOptions` field. `GetSecretResponse.secret_type` is the resolved full GTS type id.
-- Plugin SPI: **unchanged** — types are a metadata/policy concern.
+- Plugin SPI: types are a metadata/policy concern — the SPI never sees them (§4.3).
 
 ## 6. Secret Lifecycle & Write Protocol
 
+> Decision: [ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md) (`cpt-cf-credstore-adr-immutable-value-versions`). The shipped compensating saga, its `provisioning`/`deprovisioning` statuses, the reaper and the fence are replaced by the protocol below; this section is its authoritative statement. Invariants referenced as J1–J7 are the ones the protocol must hold: **J1** no dangling pointer (a row with `value_version = r` has value version `r` in the store under its key); **J2** exact bytes (the bytes at `value_version` are those of the write that committed that pointer); **J3** committed writes are not lost; **J4** versions under one key strictly increase in real-time `put` order; **J5** metadata operations never touch the store; **J6** reads are linearizable (a finished secret read returns a value that was the row's committed value at some moment during the read, or reports 503 — never an uncommitted, destroyed or deleted value); **J7** a record id is never reused, so a store key belongs to one record lifetime.
+
 ### 6.1 Status Model
 
-**Shipped today (superseded by ADR-0006, planned):**
+Two resting states only. `CHECK (status IN (2, 4))`; the shipped codes `1` (`provisioning`) and `3` (`deprovisioning`) are retired and reserved, never reused. There is no in-flight status because a write is a store `put` followed by one pointer-switching transaction, not a sequence of externally observable row states.
 
 ```
-                 create saga                     delete saga
-  ┌──────────────┐  plugin.put OK  ┌────────┐  mark deprovisioning  ┌────────────────┐
-  │ provisioning ├────────────────►│ active ├──────────────────────►│ deprovisioning │
-  └──────┬───────┘                 └────────┘                       └───────┬────────┘
-         │ backend failure → rollback (row deleted)                         │ plugin.delete OK
-         │ stuck → reaped                                                   │ → row deleted
-         ▼                                                                  ▼ stuck → reaped
-       (gone)                                                             (gone)
+                 PUT / PATCH{secret}                      PATCH{secret: null}
+  ┌────────┐  put; INSERT/UPDATE value_version = vv       ┌────────┐  UPDATE value_version = NULL  ┌──────────┐
+  │(no row)├─────────────────────────────────────►│ active ├──────────────────────────►│ declared │
+  └────────┘                                      └───┬────┘                           └────┬─────┘
+                                                      │ DELETE (row delete + outbox purge, one txn)
+                                                      ▼                                     ▼
+                                                   (gone)                                (gone)
 ```
 
-| Status | smallint | Visible to resolution | Holds unique index | Swept by reaper |
-|--------|----------|----------------------|--------------------|-----------------|
-| `provisioning` | 1 | no | yes | yes (after `provisioning_timeout_secs`) — **retired by ADR-0006 (planned)**: code reserved, never stored |
-| `active` | 2 | **yes** | yes | no |
-| `deprovisioning` | 3 | no | yes | yes (after `deprovisioning_timeout_secs`) — **retired by ADR-0006 (planned)**: code reserved, never stored |
-| `declared` (planned, ADR-0004) | 4 | no | yes | **no** |
+| Status | smallint | Visible to resolution | Holds unique index |
+|--------|----------|----------------------|--------------------|
+| `active` | 2 | **yes** | yes |
+| `declared` (ADR-0007) | 4 | no — unless `fallback = none` (Suppression, below) | yes |
 
-Only `active` rows are returned by `resolve_for_get`; a secret therefore becomes visible atomically at saga commit and invisible atomically at delete start.
+`value_version IS NULL` holds exactly for `declared`. Both `active → declared` and either state `→ (gone)` are one PG transaction; the store never blocks the transition, only the best-effort cleanup that follows it.
 
-**Planned (ADR-0006).** `CHECK (status IN (2, 4))` — only the two resting states above remain storable; codes `1` and `3` are reserved, never reused. There is no in-flight status because a write is a value-and-pointer switch inside one transaction, not a sequence of externally observable row states:
+**Declared (ADR-0007).** A record reaches this state in exactly two ways, both deliberate: a `PATCH {"secret": null}` (or a `PUT` with an explicit `null` secret replacing an `active` record) against an existing record, or a `PUT` with an explicit `null` secret at creation (§4.1, §4.3.2) — never by omission, since `PUT`'s `secret` is tri-state and an absent key is rejected (`SECRET_REQUIRED`) before either path runs. It is a distinct, deliberately long-lived resting state, not a mid-write step: no timer ever touches it, and a crash cannot produce it.
 
-```
-                    PUT / PATCH{secret}                PATCH{secret: null}
-   ┌────────┐  row CAS: value_id = new_id  ┌────────┐  row update: value_id = NULL  ┌──────────┐
-   │(no row)├──────────────────────────────►│ active ├───────────────────────────────►│ declared │
-   └────────┘                               └───┬────┘                                └────┬─────┘
-                                                 │ DELETE (row + gc insert, one txn)         │ DELETE (row + gc insert, one txn)
-                                                 ▼                                           ▼
-                                              (gone)                                      (gone)
-```
+**How a record reaches it.** Removing a secret from an existing record is one PG CAS: `UPDATE … SET value_version = NULL, status = 4, version = version + 1, <metadata keys> WHERE id = :id AND version = :v1` (§6.2, "Remove the secret"); only afterward, where `destroy` is supported, does the gear best-effort `destroy(Below(old_vv))` and `destroy(Exactly(old_vv))`. A cleanup failure, or a backend without `destroy`, leaves an unreachable old version that the next successful write destroys (on a backend with `destroy`) or that stays until record deletion — the row never points at it. `PUT` with an explicit `null` secret **at creation** is a plain `INSERT` of a `declared` row: no `put`, no store call, no outbox message, because there was never a version to account for; the row either exists `declared` or does not exist.
 
-Both `active → declared` and either state `→ (gone)` are a single database transaction; the backend never blocks the transition, only the best-effort cleanup that follows it (§6.2, §6.3).
-
-**Declared (planned, ADR-0007).** A record reaches this state in exactly two ways, both deliberate: a `PATCH {"secret": null}` against an existing, `active` record, or a `PUT` with an explicit `null` secret — at creation, or replacing an existing `active` record (§4.1, §4.3.2) — never by omission, since `PUT`'s `secret` is tri-state and an absent key is rejected (`SECRET_REQUIRED`) before either path runs. It is a distinct, deliberately long-lived resting state, not a mid-saga step. **Shipped today, superseded by ADR-0006 (planned):** it differs from `provisioning` in exactly the property the reaper cares about — `provisioning` is always mid-saga and bounded by `provisioning_timeout_secs`, so a row stuck there past that timeout is by definition a crashed write and safe to reap; a `declared` record is the result of an already-committed write, has no saga in flight, and no timeout applies to it. The stuck-`provisioning` sweep (§6.4) MUST NOT reap `declared` rows. **Planned, ADR-0006:** there is no `provisioning` status left to contrast with (§6.2); the property that matters instead is which table names the `value_id` — a `declared` row's own `value_id` column is null, while an in-flight write's target id lives only in `credstore_value_gc` (reason `pending`) and no row references it at all.
-
-It is also distinct from the existing `value_fp IS NULL` out-of-band-seeding case (§4.10), and the two behave **oppositely** on a secret read: a seeded row is `active` and has a backend value, so it resolves and is served on trust until its fingerprint is backfilled; a `declared` row has no backend value at all, is not `active`, and — while its `fallback` is `inherit`, the default — is never a resolution candidate. The non-shadowing rule (§4.1) belongs to the `declared`/`inherit` row alone, and only because it never competes: a seeded row *does* shadow an ancestor's `shared` secret, legitimately, being both nearer and resolvable — which is ordinary resolution, not an exception. Stating it as "neither state shadows" would be wrong about the seeded half. **Under ADR-0006 (planned)** the seeded case no longer exists (§4.10), so this comparison describes the shipped schema only; what remains is `declared` versus `active`. A `declared` row with `fallback: none` is the deliberate exception to this paragraph: it does compete, and winning it yields 404 rather than a shadowed secret (Suppression, above). **Superseded by ADR-0006 (planned):** out-of-band seeding is withdrawn (§4.10), so there is no longer a competing "`active` with no fingerprint" case to distinguish `declared` from — every `active` row carries both `value_id` and a fingerprint, every `declared` row carries neither.
-
-**How a record reaches it.** **As first planned by ADR-0007, superseded by ADR-0006:** three paths, one of which never touches the backend at all. `PATCH {"secret": null}` against an existing, own `active` record, and `PUT` with an explicit `null` secret replacing an existing `active` record, both reach `declared` the same way: the row is updated first — `status = 4`, `value_fp`/`fp_key_id` set to `NULL`, `version` bumped — keeping `sharing`, `fallback` and the reserved reference; only then does the gear best-effort delete the backend entry. A delete failure leaves an orphaned backend value that is never served — resolution requires `status = 2` — and is silently overwritten by the next value write under the same key (§6.2). `PUT` with an explicit `null` secret **at creation** reaches `declared` differently: a single row insert with `status = 4` and `value_id`/`value_fp`/`fp_key_id` all `NULL` — there was never a backend entry, so no best-effort delete runs. This is what makes the outcomes below distinguishable, and the distinction is the whole reason this status exists:
-
-| What happened | Status left behind | Reaped |
+| What happened | Row / store left behind | Collected |
 |---|---|---|
-| The secret was removed with `PATCH {"secret": null}`, or an existing `active` record was replaced with `PUT {"secret": null, …}` | `declared` (4) | no — a resting state; the record's `fallback` decides whether the reference now inherits or resolves to nothing |
-| A record was created with `PUT {"secret": null, …}` | `declared` (4) from the single insert — no prior row, no backend call | no — a resting state from the moment it is inserted, indistinguishable in the schema from any other `declared` row |
-| The row update (or the create insert) itself failed midway | nothing — a single row operation either commits or does not | n/a |
-| A secret-carrying create crashed between its metadata insert and its backend write | `provisioning` (1) | yes, past `provisioning_timeout_secs` — a row stuck there is by definition a crashed write |
-
-**Planned, ADR-0006:** one transaction, nothing best-effort before the commit, for the two paths that touch an existing row. `PATCH {"secret": null}`, and `PUT` with an explicit `null` secret replacing an `active` record, are each `UPDATE row SET value_id = NULL, status = 4, value_fp = NULL, fp_key_id = NULL, version = version + 1, <metadata keys>` plus `INSERT gc(old_id, removed)` in the same transaction — row and gc bookkeeping commit or roll back together; no backend call happens before that commit. Only afterward does the gear best-effort delete the old backend entry and, on success, drop its gc row — the periodic maintenance job drains it either way (§6.4). A delete failure leaves the old version enqueued and unreachable, never overwritten (immutable entries are never overwritten in place; the next write mints its own `value_id`). `PUT` with an explicit `null` secret **at creation** is a third, simpler path: a plain `INSERT` of a `declared` row — no intent record, no `plugin.put`, no gc entry, since there was never a backend write to account for:
-
-| What happened | Row / gc left behind | Collected |
-|---|---|---|
-| The secret was removed with `PATCH {"secret": null}`, or an existing `active` record was replaced with `PUT {"secret": null, …}` | row `declared`; old `value_id` enqueued, reason `removed` | the maintenance job drains the enqueued id on its next run — no grace window; the row itself is never removed by the job — a resting state; `fallback` decides whether the reference now inherits or resolves to nothing |
-| A record was created with `PUT {"secret": null, …}` | row `declared`; nothing enqueued — there was never a `value_id` to collect | nothing to collect; the row is a resting state from the moment it is inserted |
+| The secret was removed with `PATCH {"secret": null}`, or an existing `active` record was replaced with `PUT {"secret": null, …}` | row `declared`, `value_version` NULL; the old version may remain until the cleanup runs | by the cleanup that follows the commit; if it failed, by the next successful write to the record; the row itself is a resting state — `fallback` decides whether the reference now inherits or resolves to nothing |
+| A record was created with `PUT {"secret": null, …}` | row `declared`; nothing in the store | nothing to collect |
 | The transaction itself failed midway | nothing — one transaction either commits or does not | n/a |
-| A secret-carrying create crashed between the intent insert and the row CAS | **no row at all** — only a `pending` gc entry, possibly an orphaned backend write | the maintenance job reclaims the orphan (`plugin.delete` + `DELETE gc`) once the pending entry is older than `gc.pending_max_age_secs`, or just drops the gc row if nothing was ever written; there is no row state resembling a crashed `provisioning` write — a `null`-secret create has no backend call to crash mid-way through, and a secret-carrying create's crash never leaves a row at all to confuse with `declared` |
+| A secret-carrying create crashed after `put` and before the commit | **no row at all**; one unreachable version under a key that no row names | the key is never written again, so the version stays until tenant offboarding — a documented residual (§6.5); there is no row state resembling a crashed write |
 
-**It is a fourth `status`, not an inference.** `status = 4`, widening the `CHECK (status IN (1, 2, 3))` of `m0001_initial_schema`, and *not* derived from `value_fp IS NULL`, which already means "seeded out of band, fingerprint pending" and would conflate a deliberately empty record with a legacy row whose backend value must resolve on trust. Making it a stored status is what keeps every predicate that has to distinguish the two expressible in SQL rather than in application logic. **Superseded by ADR-0006 (planned):** seeding is withdrawn, so the not-inferred-from argument changes shape — `declared` becomes *equivalent* to a null pointer, not merely distinct from a seeded row: `value_id IS NULL ⇔ status = 4 ⇔ value_fp IS NULL ⇔ fp_key_id IS NULL`. It stays a stored status rather than a computed one because resolution and the collection read need to filter and index on it directly, not because a null pointer would be ambiguous with anything else:
+`declared` is a stored status, equivalent to a null pointer: `value_version IS NULL ⇔ status = 4`. It stays a stored status rather than a computed one because resolution and the collection read need to filter and index on it directly. The predicates that distinguish the two statuses:
 
 | Predicate | Today | With `declared` |
 |---|---|---|
 | Resolution (`resolve_for_get`, `list_candidates_for_records`) | `status = 2` | `status = 2 OR (status = 4 AND fallback = 2)` — a `declared` row with `fallback = 1` neither resolves nor shadows; with `fallback = 2` it competes and, when nearest, blocks (ADR-0008, Suppression) |
-| Reaper's stuck-provisioning sweep | `status = 1 AND updated_at < …` | unchanged, so `declared` is excluded by construction rather than by a new exception — **retired by ADR-0006 (planned)**: no `provisioning` status and no such sweep; see the maintenance job's gc drain (§6.4) |
 | Unique-name hold | partial unique indexes over all statuses | unchanged, so a `declared` record still reserves its reference |
 | Collection read | `status = 2` | `status IN (2, 4)`, with the record's state surfaced to the caller — a catalogue that hid declared-but-unset credentials would be useless to the administrator who is mid-configuration |
-| Pointer invariant — **planned, ADR-0006** | n/a | `value_id IS NULL ⇔ status = 4 ⇔ value_fp IS NULL ⇔ fp_key_id IS NULL` (§4.7 `credstore_secrets_fp_check`) |
+| Pointer invariant | n/a | `value_version IS NULL ⇔ status = 4` (§4.7 `credstore_secrets_value_version_check`) |
 
 The consequence worth stating: the collection read is the only surface where the two statuses diverge, and it is the reason a record's state has to appear in the record's representation rather than being inferred from a missing secret the response never carries.
 
-**Suppression (`cpt-cf-credstore-fr-suppression`; [ADR-0008](./ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md)).** Suppression is not a fifth `status`; it is `fallback`, a policy column (`inherit`/`none`, default `inherit`) a tenant sets on its own record. A `declared` record with `fallback: none` competes in resolution and, when nearest, wins: secret reads at that tenant and its descendants (per `sharing`) resolve as not-found, while the ancestor's record and secret are left untouched. An `active` record ignores `fallback` entirely — its own secret always wins — so the policy can be armed while a secret is present and takes effect only once the secret is removed. Suppressing an active credential is one request: `PATCH {"fallback": "none", "secret": null}` moves the row to `declared`/`none` and deletes the backend entry together, so the row never passes through an intermediate `declared`/`inherit` state in which the ancestor's secret would be served. Suppressing with no own row is likewise one request: `PUT {"fallback": "none", "secret": null, …}` under `If-None-Match: *` inserts the row already `declared`/`none`, with no backend call and nothing to enqueue for gc. **Superseded by ADR-0006 (planned):** "deletes the backend entry together" describes the shipped best-effort step done inline; under the planned model the row update and the gc enqueue are the same transaction, and the backend delete is a subsequent best-effort step the periodic maintenance job guarantees — the row-visible outcome (no intermediate `declared`/`inherit` state) is unchanged. Propagation follows the record's `sharing`: `shared` suppresses for the whole subtree, `tenant` for the holding tenant alone. The `smtp-default` three-tenant scenario is walked step by step below.
+**Suppression (`cpt-cf-credstore-fr-suppression`; [ADR-0008](./ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md)).** Suppression is not a third `status`; it is `fallback`, a policy column (`inherit`/`none`, default `inherit`) a tenant sets on its own record. A `declared` record with `fallback: none` competes in resolution and, when nearest, wins: secret reads at that tenant and its descendants (per `sharing`) resolve as not-found, while the ancestor's record and secret are left untouched. An `active` record ignores `fallback` entirely — its own secret always wins — so the policy can be armed while a secret is present and takes effect only once the secret is removed. Suppressing an active credential is one request: `PATCH {"fallback": "none", "secret": null}` is one PG CAS that moves the row to `declared`/`none`, followed, where `destroy` is supported, by best-effort `destroy` of the old version — the row never passes through an intermediate `declared`/`inherit` state in which the ancestor's secret would be served. Suppressing with no own row is likewise one request: `PUT {"fallback": "none", "secret": null, …}` under `If-None-Match: *` inserts the row already `declared`/`none`, with no store call. Propagation follows the record's `sharing`: `shared` suppresses for the whole subtree, `tenant` for the holding tenant alone. The `smtp-default` three-tenant scenario is walked step by step below.
 
 **Scenario** (T1 partner tenant; T2 its child; T3 T2's child):
 
@@ -1052,126 +1026,86 @@ The consequence worth stating: the collection read is the only surface where the
 3. T2: `PATCH /credentials/smtp-default {"fallback": "none", "secret": null}` `If-Match` → 204. T2's row `declared`/`none`, `suppressed`; T2 and T3 get 404; T1 and its other descendants are untouched.
 4. T2: `DELETE /credentials/smtp-default` `If-Match` → 204. T2's row gone; T2 and T3 resolve `V1` again. **Alternative to 4**: `PATCH {"fallback": "inherit"}` instead — T2 keeps its (still `declared`) record; same resolution outcome.
 
-### 6.2 Value Write Protocol (planned, ADR-0006; shipped saga below)
+### 6.2 Value Write Protocol
 
-Sequence ID: `cpt-cf-credstore-seq-write-saga` (declared in §4.6).
+Sequence ID: `cpt-cf-credstore-seq-write-saga` (declared in §4.6; the ID is kept for stability, the mechanism is no longer a saga).
 
-**Planned (ADR-0006).** Every write that carries a `secret` — `PUT` create, `PUT` replace, or a `PATCH` carrying `secret` — follows one protocol regardless of which REST verb reaches it, because the two shipped orderings (guarded CAS-then-backend vs. `If-Match: *` backend-then-CAS) collapse into one: backend first, always under a fresh id, then a single CAS.
+Every write that carries a `secret` — `PUT` create, `PUT` replace, or a `PATCH` carrying `secret` — follows one protocol regardless of which REST verb reaches it, because the two shipped orderings (guarded CAS-then-backend vs. `If-Match: *` backend-then-CAS) collapse into one: put first, then a single CAS, then (where supported) best-effort destroy.
 
-1. Validate the request, authorize by body (§4.4), resolve the secret type, and read the current row for the precondition (its `value_id`, `version`, if any).
-2. Record intent: `INSERT credstore_value_gc(new_id, pending)`, where `new_id` is a freshly minted `value_id` (UUID v4). This is the durable trace that bytes were about to be written, before any backend call.
-3. `plugin.put(tenant, new_id, value)` — writes the immutable entry at `tenant_id/value_id`; never overwrites an existing entry.
-4. One transaction: **CAS the row** — create: `INSERT` row `active` with `value_id = new_id` (a unique-index conflict is a retryable 409, same race as today); replace: `UPDATE … SET value_id = new_id, version = version + 1, value_fp, fp_key_id, <metadata> WHERE id = ? AND version = ?` (unconditional on version for `If-Match: *`; 0 matched rows → 409) — **plus**, in the same transaction, `DELETE gc(new_id)` (the intent is now realized) and, if the row previously held a different `value_id`, `INSERT gc(old_id, superseded)`. The `gc(new_id)` delete **MUST** affect exactly one row; 0 rows means the maintenance job's pending-reclaim pass (§6.4) already decided this intent was stale and deleted the backend bytes `new_id` names, so the whole transaction — CAS included — rolls back rather than commit a pointer to already-reclaimed bytes, and the caller retries with a fresh `value_id` (503).
-5. Best-effort `plugin.delete(old_id)`, then `DELETE gc(old_id)` on success. A failure here leaves `old_id` in gc with reason `superseded`; the periodic maintenance job drains it (§6.4).
+1. **Read and check.** Read the row (none for create). Check the client precondition (`Matches` = `(id, version)`, or `Exists`), the PDP on the row's type (create: the request's type) **before any store call**, and the type traits. Create over a live own row → 409 (`ALREADY_EXISTS`); create over an expired own row → allowed (step 6).
+2. **Put the value.** `vv = plugin.put(key, value)` with `key = (tenant_id, record_id)` (create: a freshly minted record id). A store error → 503; nothing changed in PG; an orphan version may exist (destroyed by the next successful write where supported, §6.5).
+3. **Switch the pointer: one PG transaction.**
+   - replace/patch: `UPDATE … SET value_version = :vv, <fields>, version = version + 1 WHERE id = :id AND version = :v1`;
+   - create: `INSERT` the row with the new id, `version = 1`, `value_version = :vv`; a unique-key violation on `(tenant, reference, class)` is a concurrent create.
+
+   Outcomes:
+   - **committed** (1 row / insert ok) → step 4;
+   - **definite loss** (0 rows, or a unique violation) → when supported, best-effort `plugin.destroy(Exactly(vv))`, return 409 (`OPTIMISTIC_LOCK_FAILURE` for an update, `ALREADY_EXISTS` for a create). For an `Exists` (last-writer-wins) update: re-read the row and retry once from step 1 before returning 409;
+   - **ambiguous** (PG unavailable or timed out: the commit may or may not have happened) → do **not** delete `vv`; return 503.
+4. **Destroy older versions.** Only when the backend supports `destroy`; best effort after commit: `plugin.destroy(key, Below(vv))`. A failure is ignored: older versions stay until the next successful write destroys them. Without `destroy` this step does nothing.
+5. **Reply** success with the new validator `(id, version)`: create 201 + `Location` + `ETag`; replace/patch 204 + `ETag`.
+6. **Create over an expired own row.** One PG transaction deletes the expired row and inserts the new one (new id) and enqueues an outbox purge of the old record key (§6.3); then step 4 for the new key.
+
+**Metadata-only patch** (no `secret` member): one PG CAS (`version + 1`); no store call at all (J5).
+
+**Remove the secret** (`PATCH {"secret": null}`, including suppression `{"fallback": "none", "secret": null}`): one PG CAS sets `value_version = NULL` (`declared`); then, where `destroy` is supported, best-effort `plugin.destroy(Below(old_vv))` and `plugin.destroy(Exactly(old_vv))`. Never `delete_key` here: a concurrent writer may already have put a newer version under the same key (below).
 
 **Failure map:**
 
-| Failure | Row | Backend | What readers see | Cleanup |
+| Failure | Row | Store | What readers see | Cleanup |
 |---|---|---|---|---|
-| Step 3 (`plugin.put`) fails | untouched — create: no row exists yet; replace: still points at the old `value_id` | no new entry written, *or* written but the failure was ambiguous (e.g. a timeout after the backend actually committed) | unchanged: 404 (create) or the old value (replace) | best-effort mark `gc(new_id)` `aborted` — never deleted, since the failure may be ambiguous; the maintenance job's drain then issues `plugin.delete(new_id)` (idempotent) and drops the row; 503 to the caller; nothing served ever changed |
-| Step 4 (CAS) fails — DB unreachable | untouched | new bytes already committed, now orphaned | unchanged | `new_id` stays `pending` in gc; the maintenance job reclaims it once older than `gc.pending_max_age_secs`; 503 to the caller |
-| Step 4 (CAS) lost — row changed concurrently (e.g. version mismatch, or a create raced) | untouched (some other writer's committed row) | new bytes written, unused | unchanged (the winner's value) | best-effort `UPDATE gc(new_id) reason = aborted` + best-effort `plugin.delete(new_id)` + `DELETE gc(new_id)` on success; 409 to the caller |
-| Step 4's `gc(new_id)` delete affects 0 rows — the pending-reclaim pass (§6.4) already reclaimed `new_id` while step 4 was still in flight | rolled back — the whole transaction, CAS included, never commits | bytes already deleted by the job | unchanged | nothing to clean up (already reclaimed); 503 to the caller, retries with a fresh `value_id` |
-| Step 5 (`plugin.delete(old_id)`) fails | already switched to `new_id` | old entry still present, now orphaned | the new value — the row already switched | `old_id` stays in gc reason `superseded`; the maintenance job drains it on its next run |
-| Crash at any point | either unswitched (old value keeps serving) or already switched | at most one orphaned entry | never a wrong value, a closed read, or a wedged name | the maintenance job reconciles everything from the gc table on its next run (§6.4) |
+| Step 1 fails, or the precondition is refused | untouched | untouched | unchanged | nothing to clean up |
+| Step 2 (`plugin.put`) fails | untouched — create: no row yet; replace: still points at the old `value_version` | no new version written, *or* written but the failure was ambiguous (e.g. a timeout after the store actually committed) | unchanged: 404 (create) or the old value (replace) | 503 to the caller; an orphan version above the pointer is removed by the next successful write's `destroy(Below)` (backend with `destroy`; otherwise it stays until record deletion) |
+| Step 3 lost — 0 rows or unique violation (row changed concurrently, or a create raced) | untouched (another writer's committed row) | new version written, unreferenced | unchanged (the winner's value) | best-effort `destroy(Exactly(vv))`; if that fails or is unsupported, the next successful write's `destroy(Below)` (backend with `destroy`); 409 (an `Exists` update retries once from step 1 first) |
+| Step 3 ambiguous — PG unavailable or timeout | unknown: the commit may have happened | `vv` is kept, because the row may point at it | either the old value or the new one, never an error state | nothing deletes `vv`; 503. If the commit did not happen, the version is an orphan the next successful write destroys (backend with `destroy`) |
+| Step 4 (`destroy(Below)`) fails, or the backend has no `destroy` | already switched to `vv` | older versions remain below the pointer | the new value | ignored; the next successful write destroys them (backend with `destroy`); without `destroy` they stay until record deletion |
+| Crash after `put`, before the commit | unswitched (old value keeps serving) | orphan version above the pointer | the old value | the next successful write's `destroy(Below)` (backend with `destroy`) |
+| Crash after the commit, before the destroy | switched | old versions below the pointer | the new value | the next successful write's `destroy(Below)` (backend with `destroy`) |
 
-**Concurrent last-writer-wins.** Two `If-Match: *` writers can both reach step 4 and both succeed, one after the other: the CAS has no version to fight over, so both commits land, the later one's `value_id` is the pointer left standing, and the earlier writer's now-superseded `value_id` is enqueued for gc exactly as an ordinary overwrite would be — last-writer-wins, not a lost write.
+A crash costs at most orphaned versions under one record key, never a wrong value, a closed read or a wedged name.
 
-**REST/SDK mapping (ADR-0007).** `PUT /credentials/{ref}` runs this protocol once per request when its `secret` is a **string**, whether the precondition is create-only or a replace; `PATCH {"secret": ...}` (non-null) runs it identically, since the secret-write half of `PATCH` is the same protocol as `PUT`'s. Neither verb runs this protocol for an explicit `null` secret — it never writes a new backend entry. `PATCH {"secret": null}` and a `PUT` with `null` replacing an `active` record instead run the secret-removal transaction of §6.1 ("How a record reaches it"); a `PUT` with `null` **at creation** runs neither — it is a plain row insert with no backend call and no gc bookkeeping at all (§6.1).
+**Why destroy is safe — ordered versions.** This argument applies to `destroy(Below(vv))` only; it relies on the plugin's ordering guarantee (J4), which a backend must provide if and only if it supports `destroy`: a `put` that starts after another `put` on the same key has returned gets a greater version. Let a writer commit `vv = r` and destroy below `r`. A concurrent writer whose `put` is **older** than `r` holds a stale base — the commit bumped `version`, so its CAS matches nothing (definite loss, step 3) and it destroys its own version; the version being destroyed was never going to become a pointer. A writer whose `put` is **newer** than `r` read the row after the commit, which happened after the first `put` returned, so its version is greater than `r` and `destroy(Below(r))` never touches it. Committed versions therefore strictly increase in commit order, the row's current `value_version` is never destroyed, and no pointer dangles (J1). `destroy(Exactly(vv))` is safe on its own: it names a version no row references (a lost CAS) or one the removal has just made unreachable. A backend without ordered versions cannot host `destroy`; it runs without it, and the protocol stays correct because nothing is ever destroyed.
 
-#### Shipped today (superseded by ADR-0006)
+**Why `delete_key` is not used on the remove-secret path.** The record survives as `declared` and its key will be reused. A concurrent writer may have put a newer version under that key and be about to commit, or may put and commit right after the removal; `delete_key` would delete that version before its pointer switch and leave a dangling pointer. The remove-secret path destroys by position and by exact version only, which can touch only versions the removal itself made unreachable. `delete_key` runs only after the row is gone, from the outbox, against a key no future record will use (J7).
 
-**Create path** (no row of the target sharing class exists):
+**Concurrent writers.** Two guarded writers: the loser's CAS matches nothing → 409, and it removes its own version. Two `If-Match: *` writers: both put; the first to commit owns the pointer, the other re-reads, retries once from step 1 and commits a later version, or returns 409. Last-writer-wins is ordinary RFC 9110 semantics with no healing role.
 
-1. Fail fast if no plugin is available (before any metadata side effect).
-2. `INSERT` row with `status = provisioning` (scope-clamped).
-3. `plugin.put(tenant, key, value, owner-class)`.
-4. `UPDATE status = active` (`mark_active`).
+**REST/SDK mapping (ADR-0007).** `PUT /credentials/{ref}` runs this protocol once per request when its `secret` is a **string**, whether the precondition is create-only or a replace; `PATCH {"secret": ...}` (non-null) runs it identically. Neither verb runs the put path for an explicit `null` secret: `PATCH {"secret": null}` and a `PUT` with `null` replacing an `active` record run the remove-the-secret CAS above; a `PUT` with `null` **at creation** runs neither — a plain row insert with no store call (§6.1).
 
-**Failure handling**:
+### 6.3 Delete Record and Outbox Purge
 
-- Step 3 fails → **compensate**: best-effort delete of the provisioning row (metric `provisioning_rollback`); a failed cleanup defers to the reaper. The reference is never permanently wedged.
-- Step 4 fails → the backend value exists but the row stays `provisioning`: never readable; a client retry overwrites it; otherwise reaped — and the reaper issues a best-effort `plugin.delete` for every row it reaps (§6.4), so the orphaned backend value is reconciled rather than leaked.
-- **Create race** (unique-index conflict on step 2): a retryable 409. Only create-only specs reach the insert — an update fails earlier on its mandatory precondition — so the loser's own retry (or the caller's create→put fallback) resolves the race once the winner marks active.
+> Requirement: `cpt-cf-credstore-fr-deprovisioning` (superseded by ADR-0006).
 
-**Overwrite path** (row of the target class exists): the ordering of the backend write vs the version-gated `touch` (version bump + sharing update + fence stamp) depends on the precondition kind. **`If-Match: *`** (explicit last-writer-wins): backend `plugin.put` first, then `touch` — a plugin failure leaves metadata untouched; a `touch` failure after a committed backend write fails closed (fence mismatch → 404) until the next put retries; a row that vanished concurrently (delete won) is reported as a retryable 409 so the caller re-runs the put. **Version validator** (optimistic concurrency): the version-gated `touch` claims the CAS **before** `plugin.put`, so a losing writer (0-row `touch` → 409) never reaches the backend and cannot clobber the winner's value; a backend failure after the claim fails closed the same way until the caller retries against the new version.
+`DELETE /credentials/{ref}` is one PG transaction plus an asynchronous key purge:
 
-`PUT /credentials/{ref}` (ADR-0007) reuses this saga unchanged **when its `secret` is a string**: a create-only request runs the create path above with the secret included from the first write, and a replacing request runs the overwrite path, both writing the record and its secret in the same request. When `secret` is an explicit `null`, `PUT` runs no saga at all: on create it is a plain row insert, `declared`, with no backend call and no provisioning step to roll back or reap; replacing an `active` record it is the same row update (→ `declared`, fingerprint columns cleared, version bumped) followed by a best-effort backend delete that `PATCH {"secret": null}` runs (§6.1); replacing an already-`declared` record it is a metadata-only update with no secret-side effect at all. `PATCH {"secret": null}` is likewise not a saga: it is a row update (→ `declared`, fingerprint columns cleared, version bumped) followed by a best-effort backend delete (§6.1).
+1. Read the row; check the precondition (`If-Match`, mandatory — `*` gates on existence only) and the PDP `delete`. No row → 404.
+2. One PG transaction: `DELETE` the row (CAS on `version` for `Matches`) and enqueue an outbox message `purge(tenant_id, record_id)` in the platform transactional outbox (`toolkit-db` outbox, same transaction).
+3. The outbox handler calls `plugin.delete_key(key)` and retries on failure (at least once; `delete_key` is idempotent).
+4. Reply 204.
 
-### 6.3 Delete and Garbage Collection (planned, ADR-0006; shipped saga below)
+**Name released at once.** Step 2 is the whole visible effect: the reference is free to reuse the instant the transaction commits, because a re-create mints a new record id and therefore a new store key, which a lagging purge cannot touch (J7). The shipped saga's `deprovisioning` status existed only to hold the name until the backend was provably clean under a shared, overwritten key; once every record has its own key, that reason is gone, and there is no ABA hazard to guard against.
 
-> Requirement: `cpt-cf-credstore-fr-deprovisioning`.
+**Failure handling.** A transaction failure in step 2 leaves the row and the reference exactly as they were — there is no partial "deleted but reference held" state to retry into. A failing `delete_key` is invisible to the caller (the row is already gone and the reference already free); the outbox retries until it succeeds, and the failure is counted (§10).
 
-**Planned (ADR-0006).** `DELETE /credentials/{ref}` is one database transaction, followed by a best-effort backend cleanup:
+The outbox is the one place in the gear where a side effect must follow a commit; it is used here because `delete_key` is idempotent and keyed by an id nothing will reuse, so at-least-once delivery is exactly right. Writes do not use the outbox.
 
-1. `find_own` + precondition check (`If-Match`, mandatory — `*` gates on existence only), as today.
-2. One transaction: `DELETE` the row, and — if its `value_id` was not `NULL` — `INSERT credstore_value_gc(value_id, removed)`.
-3. Best-effort `plugin.delete(tenant, value_id)`, then `DELETE gc(value_id)` on success; a failure leaves it enqueued for the maintenance job to drain (§6.4).
+### 6.4 Maintenance Job — withdrawn
 
-**Name released at once.** Step 2 is the whole visible effect: the reference is free to reuse the instant the transaction commits, because there is no longer anything to protect it *for* — a successor write mints its own `value_id` and its own immutable backend entry, so it can never collide with, or be clobbered by, a lagging delete of the old version. This is the direct consequence of immutable versions: the shipped saga's `deprovisioning` status exists only to hold the name until the backend is provably clean under a **shared, overwritten** key; once every version has its own key, that reason is gone.
+Withdrawn by ADR-0006. There is no resident reaper loop, no `tick_secs`, no periodic maintenance job, no `run_gc` entry point and no `gc` configuration: the gear's lifecycle entry starts no background timer, and no host-side scheduler needs to call into the gear. The shipped reaper's duties are gone because the states it repaired cannot exist (no `provisioning`, `deprovisioning` or torn overwrite), garbage is reclaimed inline by the next successful write's `destroy(Below)` (where supported) or by the outbox purge on delete (§6.2, §6.3), and fingerprint backfill belongs to the withdrawn fence (§4.10). The only asynchronous work in the system is the platform outbox's delivery of `purge` messages.
 
-**No ABA guard needed.** The shipped saga's successor-shares-the-key ABA hazard (§6.4, shipped) cannot occur here: a new row created after this delete gets a new `value_id` from step 4 of the write protocol (§6.2), so no in-flight backend operation from the deleted row can ever target the same key as a successor's.
+**Expired records.** An expired row is treated as absent on every read (evaluated from the row, §5.4) and is replaced by a create-only `PUT` over it (§6.2 step 6, which also enqueues the purge of the old key). Nothing removes an expired row on a timer: it stays in the catalogue until it is replaced or its owner deletes it, and its versions go with it through the outbox purge.
 
-**Failure handling.** A transaction failure in step 2 leaves the row and the reference exactly as they were — one transaction either commits or does not, so there is no partial "deleted but reference held" state to retry into. A step-3 backend-delete failure is invisible to the caller (the row is already gone and the reference already free); the orphaned entry is reconciled by the maintenance job's gc drain, not by a client retry.
+### 6.5 Residuals
 
-**`PATCH {"secret": null}` follows the same shape**, minus the row delete: one transaction nulls the pointer and enqueues the old version (§6.1, "How a record reaches it"), then a best-effort backend delete.
+What remains with no gc table, no `pending` intent, no maintenance job and no fence:
 
-#### Shipped today (superseded by ADR-0006)
-
-Status-driven saga symmetric to provisioning (statuses ship in `m0001_initial_schema`); replaced the earlier backend-first delete design.
-
-**Delete path**:
-
-1. `find_own` + version pre-check (`If-Match`, mandatory — `*` gates on existence only), as today.
-2. `UPDATE status = deprovisioning` gated by `version = ?` when a version validator was given. From this instant the secret is invisible to resolution (single-status filter — no read/delete race), while the row keeps holding the partial unique index.
-3. `plugin.delete(tenant, key, owner-class)` — `NotFound` is success (idempotent).
-4. `DELETE` the metadata row.
-
-**Failure handling**:
-
-- Step 3/4 fails → the row stays `deprovisioning`; the caller gets the mapped error (503 for an unavailable backend, 500 for an internal plugin fault) and can retry. A **retry of `DELETE` resumes the saga**: `find_own` sees the `deprovisioning` row and re-runs steps 3–4 (both idempotent). Absent a retry, the reaper completes it.
-- Crash between 2 and 4 → same recovery: reaper or client retry finishes cleanup. No state leaves a readable secret or a permanently held reference.
-
-**Concurrent create during deprovisioning**: the row keeps the unique index until step 4, so a `POST`/`PUT` for the same reference conflicts (409, retryable) until cleanup completes. This is deliberate: releasing the index earlier would let a new secret's backend value be deleted by the old row's lagging step 3 (the backend key is identical — the ABA hazard ADR-0006 removes, above). The window is bounded by the reaper cadence.
-
-**Interface impact**: REST/SDK signatures unchanged (`DELETE` stays 204 on success); `SecretStatus` has `Deprovisioning = 3` (status `CHECK` in §4.7); config has `reaper.deprovisioning_timeout_secs` (default 300 s); metric `deprovisioning_reaped` mirrors `provisioning_reaped`. **Superseded by ADR-0006 (planned):** `Deprovisioning = 3` is retired; the whole `reaper` config block (including `deprovisioning_timeout_secs`) is removed, replaced by `gc.pending_max_age_secs` / `gc.batch_size` (§10); `deprovisioning_reaped` is retired along with it, with the maintenance job's `gc_deleted`/`expired_deleted` counters as its nearest counterpart (§6.4, §10).
-
-### 6.4 Maintenance Job (planned, ADR-0006; shipped reaper below)
-
-**Planned (ADR-0006).** The reaper is withdrawn outright: the gear's lifecycle entry runs no resident loop, no `tick_secs`, no background timer of any kind. Its remaining duties move to a **periodic maintenance job** whose entry point is in-process, not REST: the SDK trait `CredStoreMaintenanceV1::run_gc`, registered in `ClientHub` next to `CredStoreClientV1` and resolved by the host — a `gc` subcommand of the application binary run by a Kubernetes CronJob, or a scheduler gear — on an operator-chosen schedule, daily by default, weekly acceptable; outside the request path and outside the gear's own lifecycle. The host that invokes it is out of scope for this design; the job's logic and its contract are not.
-
-The job is idempotent and concurrency-safe (safe to run from multiple replicas, safe to re-run after a partial failure), and processes work in bounded batches (`gc.batch_size`, default 256) until nothing is left:
-
-1. **Expired rows**: every `active` row with `expires_at <= now()` is removed exactly like `DELETE` (§6.3) — one transaction (row delete + a gc insert for the row's `value_id`), then a best-effort backend delete. The delete transaction **MUST** re-verify `status = active AND expires_at <= now()` against the row's current state (under a row lock) rather than deleting unconditionally by id: a row a concurrent write extended or removed between this batch's own candidate read and the delete transaction no longer matches, and is skipped, not deleted or counted. They already stopped resolving at read time (§5.4); this only reclaims storage and releases the reference.
-2. **GC drain**, bounded batches ordered by `enqueued_at`, two rules by `reason`:
-   - Every entry with `reason ≠ pending` (`superseded` / `removed` / `aborted`) → `plugin.delete(tenant_id, value_id)` (`NotFound` counts as success) then `DELETE gc(value_id)`. **No grace window**: `gc_grace_secs` is gone — with a daily (or weekly) cadence the job cannot meaningfully race the *writer's own* best-effort cleanup for the same id (step 5 of the write protocol, §6.2, or a CAS-loser's best-effort abort-and-delete), which already runs immediately after the triggering transaction commits; a duplicate `plugin.delete` on an id the writer already cleaned up is harmless (`NotFound` = success).
-   - Every `pending` entry older than `gc.pending_max_age_secs` (default 3600 s): if no row references the `value_id` → `plugin.delete(tenant_id, value_id)` + `DELETE gc(value_id)` (reclaim the orphaned write); if some row *does* reference it → `DELETE gc(value_id)` only, no backend delete. This second branch is **defensive, not a normal path**: `DELETE gc(new_id)` sits inside the very transaction that first makes an id referenced (§6.2 step 4), so a live reference to a still-`pending` id should never occur by protocol. The branch exists to guarantee the job can never delete bytes a live row points at, even after a bug, a manual repair, or a restored backup.
-
-**No inventory gauges.** The shipped reaper's per-status row-count gauges and gc-queue-depth gauge are withdrawn, not carried forward: they were `COUNT … GROUP BY` queries, forbidden by the platform's no-`COUNT` rule (§10). **Job metrics**: counters `gc_deleted` (the `reason ≠ pending` branch), `gc_pending_reclaimed` (the `reason = pending`, unreferenced branch), `expired_deleted` (step 1), plus run outcome and duration for the job invocation as a whole.
-
-**Why there is no reaper any more.** The reaper was a saga component: `provisioning`, `deprovisioning` and a torn overwrite were states that are wrong until repaired, and the reaper repaired them on a timer, so correctness depended on it running. Immutable value versions with an atomic pointer switch — the model of Vault KV v2 and the cloud secret managers, shadow paging in storage-engine terms, Git's immutable objects plus refs in content-store terms — have no intermediate state to repair: a row points at fully written bytes or at nothing. What is left is unreachable garbage, which is the textbook case for a lazy periodic collector (`git gc`), not a resident loop; see ADR-0006, "The pattern, and why the reaper goes with the saga", for the references.
-
-**Correctness never depends on this job.** Every guarantee in §6.2/§6.3 holds with the job never running at all; it only reclaims storage and catalogue entries that would otherwise linger. Consequences of a scheduled job instead of a continuous sweep:
-
-(i) An unreferenced backend entry may survive up to one job period — only when the writer's own best-effort cleanup (§6.2 step 5, §6.3 step 3) failed, or a write crashed before it could run. A tighter destruction requirement is met by running the job more often, not by a design change.
-(ii) An expired credential stops resolving at read time exactly as today (§5.4), but its record stays in the catalogue with its past `expires_at` and holds its reference until the job removes it or the owner sends `DELETE`/`PUT`/`PATCH`; a create-only `PUT` on an expired reference is 409 until then.
-(iii) No in-process timer means no per-replica sweep contention and one fewer failure mode inside the gear — the job's own crash or unavailability affects nothing already served.
-
-**Retired**: the stuck-`provisioning` sweep, completing a stuck `deprovisioning` saga, and fence backfill for out-of-band seeded rows are no longer duties of anything resident in the gear — none of the states they swept for can exist any more (§6.2, §6.3, §4.10, all shipped/superseded), and the job that takes over the reaper's remaining duties runs outside the gear's lifecycle entirely.
-
-**Config**: the whole `reaper` block is removed (§10), replaced by a `gc` block read by `run_gc` (the `CredStoreMaintenanceV1` entry point), not by the gear's own `serve` lifecycle: `gc.pending_max_age_secs` (default 3600 s) and `gc.batch_size` (default 256). **Metrics**: `provisioning_rollback`, `provisioning_reaped`, `deprovisioning_reaped` are removed with the reaper — `provisioning_rollback` has no successor (there is no compensating rollback step left to count); `provisioning_reaped`/`deprovisioning_reaped` are retired along with the statuses they counted, with `gc_pending_reclaimed`/`gc_deleted`/`expired_deleted` above as their nearest counterparts.
-
-#### Shipped today (withdrawn by ADR-0006)
-
-The gear's lifecycle entry (`serve`) runs a cancellable loop on `reaper.tick_secs` (default 60 s; delayed missed-tick behavior). Each tick:
-
-1. **Expiry sweep**: flip expired `active` rows (`expires_at <= now`) into the deprovisioning saga (they already stopped resolving at read time; this cleans the backend value and releases the reference).
-2. **List stale non-active rows** (bounded batch) older than `provisioning_timeout_secs` / `deprovisioning_timeout_secs` (both default 300 s), via the pending partial index. Planned with ADR-0007: the selection reads `status IN (1, 3)` rather than `status <> 2`, so a `declared` record — a resting state with no timeout — is never mistaken for a crashed write (§6.1, §4.7).
-3. **Backend reconciliation**: issue a best-effort `plugin.delete` for every stale row (closing the orphaned-value debt of §6.2); `NotFound` counts as success.
-4. **Remove rows**: `provisioning` rows unconditionally (the reference must not stay wedged); `deprovisioning` rows only after a successful backend delete — otherwise the row (and the name it holds) waits for the next tick. Counts → `provisioning_reaped` / `deprovisioning_reaped`. The asymmetry is deliberate: a `deprovisioning` row must hold the name until the backend is clean (releasing it early could let this saga's lagging delete erase a successor's value), while keeping a `provisioning` row on a failed backend delete would wedge the reference for as long as the backend stays unreachable. The cost is a possible orphaned backend value with no metadata row when step 3 fails for a reaped `provisioning` row — it is never readable (resolution requires a row) and is overwritten by the next create of the same reference; the accepted tradeoff mirrors §6.2's no-retry orphan.
-5. **Refresh inventory gauges** (row counts per status).
-
-Errors are logged, never propagated — the reaper must survive transient DB or plugin outages. **Withdrawn by ADR-0006 (planned)**: this entire resident loop is removed from the gear's lifecycle entry; its remaining duties move to the periodic maintenance job above, run outside the gear's own process lifetime.
+- **Orphan versions above the pointer** (a `put` whose PG commit failed ambiguously, or a writer that crashed after `put`) are unreachable and destroyed by the next successful write's `destroy(Below)` on a backend with `destroy`. If the record is never written again, or the backend has no `destroy`, they stay until the record is deleted (outbox `delete_key`) or the tenant is offboarded.
+- **Old versions below the pointer** after a failed destroy are unreachable and removed by the next successful write.
+- **Without `destroy`**, rotated, removed and orphaned versions stay in the backend, unreachable through the gear, until the record is deleted (outbox `delete_key`) or the tenant is offboarded; a rotated or removed secret is retained by such a backend until record deletion (accepted; see the backend compatibility table in §4.3).
+- **A writer that read the row before a delete and put after it** lands its version under the deleted key. Its CAS then fails (the row is gone), so it destroys its version where supported (definite loss). If it crashed in between, that version stays unreachable under a key nobody will write again — a documented residual, bounded at one version per such crash.
+- **Integrity** comes from immutable versions and the exact-bytes `get`; a backend that returns different bytes violates its contract. Out-of-band tampering detection is not provided by the gear (§4.10).
+- **The PG database is the system of record for metadata** and must be backed up together with the store; the index is not rebuildable from the store (the plugin offers no listing). Index rebuild is out of scope.
+- **Audit** (`cpt-cf-credstore-nfr-audit`): every read of a secret (point read, `get_secret`, secret mode) and every write of a secret (create or replace carrying a secret, a patch that sets or removes the secret, deleting a record that holds a secret) publishes an audit event through the platform `event-broker` gear. Events name the subject, the tenant acted in, the reference, the credential type, the operation and its outcome, and never contain the secret. Publishing is best-effort: if the broker is unavailable or rejects the event, the operation continues without interruption, the gear logs an error (without the secret) and increments the `audit_publish_failed` metric (§10 Observability); the audit never blocks, fails or rolls back a read or a write.
 
 ## 7. Risks / Trade-offs
 
@@ -1186,7 +1120,7 @@ Errors are logged, never propagated — the reaper must survive transient DB or 
 - ✅ Sharing/uniqueness rules enforced by partial unique indexes rather than by backend-specific behavior
 - ✅ No encoded-external-ID collision surface
 - ❌ The gear needs a database and migrations (`stateful` capability)
-- ❌ Metadata and backend value can diverge transiently — mitigated by the saga + reaper design (§6) and idempotent retries; **superseded by ADR-0006 (planned)**: mitigated by the write protocol's intent log and the gc-draining periodic maintenance job instead (§6.2, §6.4) — divergence is now bounded to an orphaned immutable entry, never a pointer to missing bytes
+- ❌ Metadata and backend are two stores with no shared transaction — mitigated by immutable versions, a pointer switched in one PG transaction and inline destroy where supported (§6.2); divergence is bounded to an unreachable version under one record key, never a pointer to missing bytes. The PG database becomes the system of record for metadata and must be backed up together with the store; the index is not rebuildable from the store (§6.5)
 
 #### Authorization via PDP scope in SQL (not permission strings)
 
@@ -1214,21 +1148,13 @@ Unchanged: prevents enumeration; per-secret access failures are indistinguishabl
 
 **Mitigation**: `SecretValue` redaction + zeroize; hand-written redacted `Debug` on DTOs; `Cache-Control: no-store`; no lossy UTF-8 decode; code review. **Likelihood**: Medium | **Impact**: Critical | **Priority**: P1
 
-#### Risk: Metadata/backend divergence (saga partial failure)
+#### Risk: Metadata/backend divergence (partial write or delete failure)
 
-**Shipped today, superseded by ADR-0006 (planned):**
+**Impact**: garbage — an unreachable immutable version under a record's key (a `put` whose commit failed ambiguously, a writer that crashed after `put`, or old versions left by a failed destroy, or by a backend without `destroy`). No row can point at it, so it is a storage cost only; there is no "value-less row" failure mode from a partial write — `declared` is reached only by a completed write that requested it (§6.1).
 
-**Impact**: value-less rows (404 until re-put), orphaned backend values (storage leak, never readable), wedged references behind the unique index.
+**Mitigation**: put-then-switch ordering for every precondition kind; on a backend with `destroy`, the next successful write to the record destroys everything below its pointer, which also removes orphans above older pointers (§6.2); record deletion purges the whole key through the transactional outbox, retried until it succeeds (§6.3); destroy and purge failure counters for operational visibility (§10). Residual: orphans of a record that is never written again stay until its delete or tenant offboarding, and a writer that crashed after a delete leaves at most one version per crash under a dead key (§6.5).
 
-**Mitigation**: compensating rollback on create; backend-first ordering on overwrite; the deprovisioning saga + reaper backend reconciliation (§6.3, §6.4); configurable timeouts; rollback/reap metrics for operational visibility.
-
-**Planned, ADR-0006:** the failure surface narrows because entries are immutable and no row ever points at unwritten bytes.
-
-**Impact**: garbage between maintenance-job runs (an orphaned immutable backend entry, never readable — no row can point at it), a pending intent older than `gc.pending_max_age_secs` (a write that may or may not have reached the backend, reconciled either way by the job). There is no more "value-less row" failure mode from a partial write — `declared` is reached only by a completed `PATCH`, never by a crash (§6.1).
-
-**Mitigation**: the intent log (`credstore_value_gc`, reason `pending`) recorded before the backend write; backend-first-under-a-new-id ordering, always, for every precondition kind; the periodic maintenance job's gc drain (§6.4), run on an operator-chosen schedule (daily by default) so garbage never outlives more than one period; configurable `gc.pending_max_age_secs` / `gc.batch_size`; `gc_deleted` / `gc_pending_reclaimed` / `expired_deleted` metrics for operational visibility.
-
-**Likelihood**: Medium | **Impact**: Medium | **Priority**: P1
+**Likelihood**: Medium | **Impact**: Low | **Priority**: P2
 
 #### Risk: PDP or tenant-resolver outage
 
@@ -1258,33 +1184,31 @@ Closing it needs a signal this gear does not have: a hierarchy version or change
 
 **Likelihood**: Low | **Impact**: Low | **Priority**: P3
 
-#### Risk: Reference wedged by stuck saga rows
+#### Risk: Reference wedged by stuck rows
 
-**Shipped today, superseded by ADR-0006 (planned):**
+**Impact**: none under ADR-0006. A row is only ever inserted `active` or `declared` (§6.2 step 3) and `DELETE` frees the reference the instant its transaction commits (§6.3), so there is no in-flight row state that can hold a reference. A crashed create leaves at most an unreachable version, never a row, so a retry never conflicts with a phantom. The shipped `provisioning`/`deprovisioning` timeouts and the reaper are retired.
 
-**Impact**: 409 on create for up to the reaper timeout after a crashed write (or delete, once deprovisioning ships).
-
-**Mitigation**: bounded create-race retries; rollback-before-reaper on the common failure path; configurable `provisioning_timeout_secs` / `deprovisioning_timeout_secs`; `provisioning_reaped` alerting.
-
-**Planned, ADR-0006:** this risk is retired outright — a row is only ever inserted `active` (§6.2 step 4) and `DELETE` frees the reference the instant its transaction commits (§6.3), so there is no in-flight row state that can hold a reference wedged. A crashed create leaves at most a `pending` gc entry, never a row, so a retry never conflicts with a phantom.
-
-**Likelihood**: Low | **Impact**: Low | **Priority**: P2
+**Likelihood**: n/a | **Impact**: n/a | **Priority**: retired
 
 ## 8. Migration Plan
 
 Schema is managed by SeaORM migrations (raw per-backend SQL, PostgreSQL + SQLite, MySQL fails fast). The stateful gear, the deprovisioning saga, and secret types shipped together — before any deployment of this gear — so the gear starts from one consolidated migration:
 
-- **`m0001_initial_schema`**: the full `credstore_secrets` table of §4.7 — lifecycle statuses `(1,2,3)`, the monotonic `version`, `secret_type_uuid` (default = the generic type's v5 UUID) + `expires_at`, partial unique indexes, and the lookup / pending-sweep / expiry-sweep indexes.
+- **`m0001_initial_schema`**: the full `credstore_secrets` table as shipped — lifecycle statuses `(1,2,3)`, the monotonic `version`, `secret_type_uuid` (default = the generic type's v5 UUID) + `expires_at`, the fence columns, partial unique indexes, and the lookup / pending-sweep / expiry-sweep indexes (§4.7).
 
 Future schema changes are additive migrations on top. **Backward compatibility** for clients: untyped writes behave exactly as before (`generic` type, all sharing modes, no expiry). Rollback = revert the gear and run the migration `down`.
 
-**Planned: `m0002`** (ADR-0005, ADR-0006, ADR-0008 — landing together, §4.7): the `fallback` column and collection-read indexes, plus `value_id`, the partial unique index on it, the `credstore_value_gc` table, the narrowed `status` and fingerprint `CHECK`s, and the drop of `idx_credstore_pending`. `m0002` itself is schema-only and leaves every pre-existing `active` row `declared` (§4.7) — it mints no `value_id` and moves no backend bytes. A deployment with no pre-existing rows under the old key shape (nothing written before ADR-0006 shipped) needs nothing further: `m0002` runs over an empty table and there is nothing to move. A deployment that already holds rows under the old shape additionally needs the one-off, out-of-gear data migration ADR-0006 requires (moving the fence key and copying each fingerprint-checked value to a fresh `value_id`) **before** `m0002`'s narrowed `CHECK`s are applied to that data; this gear ships no such job — it is an external, one-off script and runbook, not a resident or on-demand gear capability (ADR-0006, "Consequences"). That migration is stop-the-world by design, not a rolling/mixed-version rollout: the old and new backend key shapes cannot both serve the same reference, so the runbook's own order — snapshot, stop the old version, apply `m0002`, move the values, start the new version — is the only supported sequence, and its rollback is restoring the pre-migration database dump (and, if the backend cleanup step already ran, a backend snapshot too), not a schema `down` migration against live data. The same stop-the-world window also carries PDP grant reissuance for [ADR-0010](./ADR/0010-cpt-cf-credstore-adr-type-scoped-authorization.md)'s renamed resource type and six-action split — see that ADR's Consequences for who reissues what and why there is no dual-grant coexistence period.
+**Planned: `m0002`** (ADR-0005, ADR-0006, ADR-0008 — landing together, §4.7): the `fallback` column and collection-read indexes, plus `value_version`, the narrowed `status` `CHECK (status IN (2, 4))` and `credstore_secrets_value_version_check`, and — at its closing step — the removal of the fence artifacts (`value_fp`, `fp_key_id`, their `CHECK`) and of `idx_credstore_pending`. There is no gc table to create: ADR-0006 has none, and nothing gc-shaped ever shipped. `m0002` itself is schema-only for data: it leaves every pre-existing `active` row `declared` (§4.7) — it mints no `value_version` and moves no store bytes.
+
+A deployment with no pre-existing rows (nothing written before ADR-0006 shipped) needs nothing further. A deployment that already holds rows under the old key shape `(tenant_id, key, key-class)` additionally needs the one-off, out-of-gear data migration ADR-0006 requires: for each pre-existing `active` row, read the value from the old key, verify it against the row's fingerprint with the old fence key, `put` it under the new key `(tenant_id, row id)`, and set the returned `value_version` (status back to `active`); rows whose value could not be carried (a fingerprint mismatch, a missing value) are left `declared` and marked `fallback: none`. Only after every value has been carried does the closing step of `m0002` drop `value_fp`/`fp_key_id`, and the script then deletes the old store entries and the reserved fence-key entry. The gear ships no such job — it is an external, one-off script and runbook, not a resident or on-demand gear capability (ADR-0006, "Consequences"). The migration is stop-the-world by design, not a rolling/mixed-version rollout: the old and new key shapes and plugin contracts cannot both serve the same reference, so the order — snapshot (database and store), stop the old version, apply `m0002`, carry the values, apply the closing step, start the new version — is the only supported sequence, and its rollback is restoring the pre-migration database dump (and, if the store cleanup step already ran, a store snapshot too), not a schema `down` migration against live data. The plugin must be a `CredStorePluginClientV2` backend with ordered versions (for Vault/OpenBao, a KV v2 mount with `max_versions = 0`, §4.3) before the new version starts. The same stop-the-world window also carries PDP grant reissuance for [ADR-0010](./ADR/0010-cpt-cf-credstore-adr-type-scoped-authorization.md)'s renamed resource type and six-action split — see that ADR's Consequences for who reissues what and why there is no dual-grant coexistence period.
+
+After the migration, the PG database is the system of record for metadata and must be backed up together with the store (§6.5).
 
 ## 9. Open Questions
 
 1. ~~**Batch retrieval**~~ **Answered** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) and [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) "Secret mode": the credential collection's `$select` gains a `secret` field, non-paginated in that mode (`cpt-cf-credstore-fr-bulk-read-secrets`), selected by an explicit reference list or a `type` filter, authorized and fence-verified per item, capped by cardinality.
 2. ~~**Human vs service access**~~ **Answered** by `cpt-cf-credstore-fr-authz-action-split` ([ADR-0010](./ADR/0010-cpt-cf-credstore-adr-type-scoped-authorization.md)): the restriction is expressed by granting metadata actions without the `read_secret` action, and it applies to any principal kind rather than being derived from whether the subject is human.
-3. **Audit trail** (P2, from PRD): emit structured audit events (actor, tenant, outcome — never secrets) to a platform audit sink.
+3. ~~**Audit trail**~~ **Answered** by `cpt-cf-credstore-nfr-audit`: audit events for secret reads and writes go through the `event-broker` gear, best-effort, with an error log and the `audit_publish_failed` metric on failure (§6.5).
 4. ~~**List/metadata endpoint**~~ **Answered** by [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md): upward-rooted collection, tenant dimension as a gate rather than a SQL clamp, per-type authorization folded into the candidate query's type clamp, and a cursor pinned to reference boundaries. **Still open**: the reference-boundary reduction is the platform's first row-reducing cursor pagination, so its page-boundary behaviour needs its own test suite before the endpoint ships.
 5. **Route-level throttling of secret disclosure.** The gateway matches route policies on paths; since a secret read and a metadata read now share one address (`GET /credentials[/{ref}]`, distinguished only by `$select`), a secret-specific rate limit or WAF rule needs a query-aware gateway rule, which does not exist today ([ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md), [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md)). Same limitation for secret **writes** on `PUT`/`PATCH /credentials/{ref}`, distinguished only by body ([ADR-0007](./ADR/0007-cpt-cf-credstore-adr-record-write-verbs.md)).
 6. **Operators cannot tell a missing `list` grant from an empty catalogue** on the collection read ([ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md)). Closing that needs an operation-level PDP evaluation against the base `credential` type, which this gear does not authorize against today — a real design change, not a status-code change.
@@ -1300,7 +1224,7 @@ Future schema changes are additive migrations on top. **Backward compatibility**
 Following the ToolKit plugin pattern:
 
 1. The SDK's `CredStorePluginSpecV1` schema reaches types-registry automatically via the `toolkit-gts` link-time inventory (no per-init registration).
-2. Each plugin registers its GTS instance and its scoped `CredStorePluginClientV1` in ClientHub.
+2. Each plugin registers its GTS instance and its scoped `CredStorePluginClientV2` in ClientHub.
 3. The gear lazily resolves the active plugin: instance query by type-id prefix → filter by configured `vendor` → highest-priority active instance.
 
 **Exactly one storage plugin is active per deployment** (vendor match). The gear handles all cross-cutting concerns; plugins are per-tenant value stores only.
@@ -1321,29 +1245,15 @@ gears:
       vendor: "virtuozzo"            # selects the value-store plugin by GTS vendor (default: "virtuozzo")
       hierarchy:
         ancestor_cache_ttl_secs: 300 # ancestor-chain cache TTL (> 0)
-      reaper:
-        tick_secs: 60                      # reaper cadence (> 0)
-        provisioning_timeout_secs: 300     # stuck-provisioning sweep threshold (> 0)
-        deprovisioning_timeout_secs: 300   # stuck-deprovisioning sweep threshold (> 0)
-```
-
-Config is validated at init (`deny_unknown_fields`; non-empty vendor; all periods > 0); an invalid config fails gear startup.
-
-**Planned (ADR-0006).** The whole `reaper` block above is removed — there is no resident loop left in the gear to configure. It is replaced by a `gc` block read by the maintenance job's entry point (`CredStoreMaintenanceV1::run_gc`, in-process via `ClientHub`), not by the gear's own `serve` lifecycle:
-
-```yaml
-      gc:
-        pending_max_age_secs: 3600  # pending-intent reclaim threshold (> 0) — replaces write_timeout_secs / provisioning_timeout_secs
-        batch_size: 256             # rows processed per batch, per job invocation (> 0)
-        # tick_secs, gc_grace_secs, deprovisioning_timeout_secs: gone —
-        # no resident loop, no grace window (daily+ cadence cannot race the
-        # writer's own best-effort cleanup), no deprovisioning status to time out
+      # (the shipped `reaper` block — tick_secs, provisioning/deprovisioning timeouts — is removed by ADR-0006)
       list:
         max_limit: 200        # metadata-mode page-size cap (> 0); a caller `limit` above this is 400 INVALID_LIMIT, not clamped
         secret_mode_cap: 25   # secret-mode ($select=…,secret) match-set cap (> 0); over this is 400 TOO_MANY_MATCHES
 ```
 
-The job's own run schedule (daily by default, weekly acceptable) is operator-configured outside the gear — a Kubernetes CronJob running the application binary's `gc` subcommand, or a scheduler gear, either of which calls `CredStoreMaintenanceV1::run_gc` — not a `gears.credstore.config` key and not a REST endpoint.
+Config is validated at init (`deny_unknown_fields`; non-empty vendor; all periods > 0); an invalid config fails gear startup.
+
+**ADR-0006.** The shipped `reaper` block (`tick_secs`, `provisioning_timeout_secs`, `deprovisioning_timeout_secs`) is removed — there is no resident loop left in the gear to configure — and nothing replaces it: there is no `gc` block, no maintenance job and no `run_gc` entry point, so there is no run schedule to set up outside the gear either. The retry policy of the outbox purge is the platform outbox's own, not a `gears.credstore.config` key. The `list` block shown above is unchanged.
 
 ### Error Mapping
 
@@ -1395,15 +1305,17 @@ Typed OpenTelemetry metrics via `CredStoreMetricsPort`:
 - `read_outcome` — own / inherited / miss
 - `dependency` — latency + outcome per dependency (PDP evaluate, tenant-resolver chain, types-registry type resolution, plugin get/put/delete)
 - `cross_tenant_denied` — own-tenant gate rejections
-- `provisioning_rollback`, `provisioning_reaped`, `deprovisioning_reaped` — saga health (shipped; **withdrawn by ADR-0006, planned** — see below)
-- inventory gauge — row counts per status, refreshed by the reaper (shipped; **withdrawn by ADR-0006, planned** — see below)
+- `destroy_failed` — a best-effort `destroy` (after a write, a lost CAS or a secret removal) that failed; the next successful write to the record retries it implicitly (§6.2)
+- `outbox_purge_failed` — an outbox `delete_key` delivery attempt that failed and will be retried (§6.3); a persistently rising value means a key purge is stuck
+- `audit_publish_failed` — an audit event for a secret read or write that the `event-broker` gear could not accept (unavailable or rejected); the operation itself is unaffected and an error without the secret is logged (§6.5); a persistently rising value means audit events are being lost
+- `read_retry` — a secret read that found its version gone, re-read the row once and retried (§4.6); the outcome (recovered / second miss → 503) is a label
 
-**Planned (ADR-0006).** There is no resident reaper left to refresh anything, so both rows above are retired with it, not replaced in kind. `provisioning_rollback` has no successor — there is no compensating rollback step left to count. `provisioning_reaped` / `deprovisioning_reaped` are retired along with the statuses they counted; the periodic maintenance job (§6.4) emits its own counters instead: `gc_deleted` (gc drain, `reason ≠ pending`), `gc_pending_reclaimed` (gc drain, `reason = pending`, unreferenced), `expired_deleted` (the expiry step), plus run outcome and duration for the job invocation. **No inventory gauge replaces the withdrawn one**: a gc-queue-depth-by-`reason` gauge would itself require a `COUNT … GROUP BY`, which the platform's no-`COUNT` rule forbids — the job's counters above are the only signal.
+**ADR-0006.** The shipped saga counters (`provisioning_rollback`, `provisioning_reaped`, `deprovisioning_reaped`) and the inventory gauge (row counts per status, refreshed by the reaper) are withdrawn with the reaper; there is no resident loop and no maintenance job left to emit anything, and no `gc_*` or `fence_*` metric exists. `provisioning_rollback` has no successor — there is no compensating rollback step left to count. **No inventory gauge replaces the withdrawn one**: a gauge of row counts or of orphaned versions would itself require a `COUNT … GROUP BY`, which the platform's no-`COUNT` rule forbids — the three counters above are the only lifecycle signals. Metric labels carry no secret reference or secret.
 
 ## 11. Traceability
 
 - **PRD**: [PRD.md](./PRD.md)
-- **ADRs**: [ADR/](./ADR/) — [ADR-0001 stateful gear](./ADR/0001-cpt-cf-credstore-adr-stateful-gear.md) (accepted; amended by ADR-0006), [ADR-0002 deprovisioning saga](./ADR/0002-cpt-cf-credstore-adr-deprovisioning-saga.md) (superseded by ADR-0006), [ADR-0003 value-fingerprint fence](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md) (accepted; amended by ADR-0006), [ADR-0004 credential: metadata with a selectable secret](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) (accepted), [ADR-0005 upward-rooted collection read](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) (accepted), [ADR-0006 immutable value versions](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md) (accepted), [ADR-0007 record write verbs](./ADR/0007-cpt-cf-credstore-adr-record-write-verbs.md) (accepted), [ADR-0008 suppression fallback](./ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md) (accepted), [ADR-0009 no ancestor disclosure](./ADR/0009-cpt-cf-credstore-adr-no-ancestor-disclosure.md) (accepted), [ADR-0010 type-scoped authorization](./ADR/0010-cpt-cf-credstore-adr-type-scoped-authorization.md) (accepted)
+- **ADRs**: [ADR/](./ADR/) — [ADR-0001 stateful gear](./ADR/0001-cpt-cf-credstore-adr-stateful-gear.md) (accepted; amended by ADR-0006), [ADR-0002 deprovisioning saga](./ADR/0002-cpt-cf-credstore-adr-deprovisioning-saga.md) (superseded by ADR-0006), [ADR-0003 value-fingerprint fence](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md) (superseded by ADR-0006), [ADR-0004 credential: metadata with a selectable secret](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) (accepted), [ADR-0005 upward-rooted collection read](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) (accepted), [ADR-0006 immutable value versions](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md) (accepted), [ADR-0007 record write verbs](./ADR/0007-cpt-cf-credstore-adr-record-write-verbs.md) (accepted), [ADR-0008 suppression fallback](./ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md) (accepted), [ADR-0009 no ancestor disclosure](./ADR/0009-cpt-cf-credstore-adr-no-ancestor-disclosure.md) (accepted), [ADR-0010 type-scoped authorization](./ADR/0010-cpt-cf-credstore-adr-type-scoped-authorization.md) (accepted)
 - **Requirements added by ADR-0004 / ADR-0005** (PRD §5.8): `cpt-cf-credstore-fr-credential-record`, `-fr-list-credentials`, `-fr-get-credential`, `-fr-read-secret`, `-fr-bulk-read-secrets`, `-fr-inheritance-status`
 - **Requirements added by ADR-0006** (PRD §5.8): `cpt-cf-credstore-fr-immutable-value-versions`
 - **Requirements added by ADR-0007** (PRD §5.8): `cpt-cf-credstore-fr-write-credential-record`, `-fr-write-secret`

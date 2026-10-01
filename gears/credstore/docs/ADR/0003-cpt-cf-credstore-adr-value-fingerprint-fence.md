@@ -1,10 +1,10 @@
 ---
-status: accepted
+status: superseded by ADR-0006
 date: 2026-07-08
 ---
 
 Created:  2026-07-07 by Virtuozzo International GmbH
-Updated:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-10-01 by Constructor Tech
 
 # ADR-0003: Value-Fingerprint Fence for the Metadata/Value Dual Write
 
@@ -28,7 +28,7 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
 
 **ID**: `cpt-cf-credstore-adr-value-fingerprint-fence`
 
-**Amended by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md)**: the fence stays as an integrity check against out-of-band modification of a backend entry. Its saga role — detecting a torn write between row and backend — is gone, since a row points only at bytes fully written before the pointer moved. The healing `If-Match: *` re-put and the trust-on-`value_fp IS NULL` seeding mode are withdrawn: every value has a fingerprint, a `declared` row has none (`ck_credstore_fp_with_value`).
+**Status note (2026-10-01): the fingerprint fence is withdrawn by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md).** Under immutable value versions with an exact-bytes `get`, a mismatch between a row and the backend is impossible by construction: the row points at a `value_ref` the plugin minted for one completed `put`, a version is never overwritten, and `get(ref)` returns exactly the bytes of that `put` or nothing. There is no crosswise last-writer-wins interleave to detect, no torn write, and no healing re-put. `value_fp`, `fp_key_id`, the stored fence key and its reserved backend address, the out-of-band seeding mode and the fence metrics are all removed. A backend that returns different bytes violates the plugin contract; the gear does not detect out-of-band tampering. The generation-bound `ETag` (`"<row-id>.<version>"`) introduced here is **kept**: the record id is minted at create and never reused, so a validator from before a delete never matches a re-created record. The rest of this document is kept as history; where it speaks of an integrity check, a healing re-put or a fresh `value_id`, it describes intermediate revisions of ADR-0006 that were themselves replaced.
 
 ## Context and Problem Statement
 
@@ -96,7 +96,7 @@ The write API later made the optimistic-concurrency precondition **mandatory** o
 
 * **`Exists` writers still race crosswise.** `If-Match: *` remains part of the contract (unavoidable — see the healing point below), and two `*` writers interleave like the original LWW pair. The fence turns that from a disclosure into a fail-closed 404.
 * **A precondition cannot bind two transaction-less stores.** Even on the version-gated path the CAS guards only the metadata row. A crash or plugin failure *between* the committed `touch` (new `sharing`, new fingerprint) and the backend `plugin.put` leaves the backend holding the previous writer's value under the new writer's label — the same cross-writer mismatch, produced with no concurrency at all. Only the read-side recompute-and-compare detects it; the same applies to operational drift the API never sees: a backend restored from backup, out-of-band seeding, a replaced fence key.
-* **The fence is the healing contract's other half.** A poisoned reference reads as an anti-enumeration 404, so no validator can be obtained for it; the recovery write is the `If-Match: *` PUT. Dropping `Exists` for version-only preconditions would make poisoned references unrecoverable through the API; dropping the fence for preconditions would silently serve mismatched state. The two mechanisms are complements, not alternatives. **[Superseded by ADR-0006]**: this specific recovery path — an `If-Match: *` re-put healing a poisoned reference in place — is the healing mechanism the top-of-file amendment withdraws; under immutable value versions a poisoned reference still reads as a fail-closed 404 (the fence's role as an integrity check is unchanged), but recovery is an ordinary write minting a fresh version, not a re-put "healing" the old one.
+* **The fence is the healing contract's other half.** A poisoned reference reads as an anti-enumeration 404, so no validator can be obtained for it; the recovery write is the `If-Match: *` PUT. Dropping `Exists` for version-only preconditions would make poisoned references unrecoverable through the API; dropping the fence for preconditions would silently serve mismatched state. The two mechanisms are complements, not alternatives. **[Superseded by ADR-0006]**: this specific recovery path — an `If-Match: *` re-put healing a poisoned reference in place — is the healing mechanism the top-of-file amendment withdraws; under immutable value versions the whole condition cannot arise (see the status note at the top of this ADR).
 
 Consequence for the original text: the "LWW path" in the context above is now spelled `If-Match: *`, a caller choice instead of the default; the create saga is unchanged (creation remains the only preconditionless write).
 
