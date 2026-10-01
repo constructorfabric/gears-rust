@@ -275,7 +275,10 @@ subject family declares traits only and carries no `metadata`, so the rule does 
 | Direct-operation target | Gateway ingress of credit, rollback, commit, and release | Authorize the explicit tenant plus Quota, original-operation, or lease identity through PDP; reuse persisted subject attribution where required for idempotency. |
 
 A request with malformed public request shape maps to `InvalidArgument` before PDP. For structurally valid input,
-PDP denial maps to `PermissionDenied` before any catalogue or contract lookup. After authorization, an
+PDP denial maps to `PermissionDenied` before any catalogue or contract lookup. The order is deliberate: checking the
+catalogue first would tell an unauthorized caller which metrics and scope kinds a deployment admits. Malformed ids are
+already rejected at the shape stage and every admitted request pays the PDP call anyway, so the extra call lands only
+on an authenticated caller's own mistake. After authorization, an
 unknown/unadmitted subject kind, schema mismatch, missing metadata, or inadmissible metric maps to
 `InvalidArgument` / HTTP 400 with a stable field-level reason. Contract rejection returns a
 platform-canonical error, never `Decision::Denied`; the two surfaces remain mutually exclusive.

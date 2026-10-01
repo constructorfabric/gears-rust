@@ -513,7 +513,7 @@ While Active, an exact replay returns the stored outcome verbatim and a divergen
 
 The system **MUST** deliver `QuotaEnforcementService`
 (`cpt-cf-quota-enforcement-component-quota-enforcement-service`) as the S2S entry point for debit, credit, rollback,
-and preview, exposed as the four REST endpoints and `QuotaEnforcementClientV1` SDK methods. Debit and credit requests with
+and preview, exposed as the four REST endpoints; debit, rollback and preview are `QuotaEnforcementClientV1` methods, and credit is `QuotaManagerClientV1::credit` only. Debit and credit requests with
 `amount <= 0` **MUST** be rejected with `INVALID_AMOUNT` before idempotency lookup (and, for debit, subject resolution)
 or any other pipeline step, persisting nothing. Operations targeting a Quota on a `Direct`-classified metric **MUST** be rejected with
 `METRIC_NOT_QUOTA_GATED` with no counter mutation and no idempotency, operation-log, or lease record. Every evaluation

@@ -129,9 +129,8 @@ Realises `cpt-cf-quota-enforcement-seq-batch-debit`.
    (`cpt-cf-quota-enforcement-fr-batch-debit`); foundation admission
    (`cpt-cf-quota-enforcement-flow-authorized-admission`) and per-item ingress validation
    (`cpt-cf-quota-enforcement-flow-ingress-validation`, which covers each batch item) have already run - `inst-bde-request`
-2. [ ] - `p1` - **IF** any item carries `amount <= 0` - `inst-bde-amount-if`
-   1. [ ] - `p1` - **RETURN** an envelope-level `INVALID_AMOUNT` (`DomainError::InvalidAmount`, canonical
-      `InvalidArgument`) naming the offending item index, regardless of `mode`, before idempotency lookup or any other
+2. [ ] - `p1` - **IF** any item carries `amount <= 0` or a blank or duplicated item idempotency key, or the envelope is empty or names more than one tenant - `inst-bde-amount-if`
+   1. [ ] - `p1` - **RETURN** an envelope-level canonical `InvalidArgument` (`INVALID_AMOUNT` or `IDEMPOTENCY_KEY_REQUIRED` naming the offending item index, `BATCH_ITEM_KEY_DUPLICATE`, `BATCH_EMPTY`, or `BATCH_TENANT_MIXED`), regardless of `mode`, before idempotency lookup or any other
       pipeline step; no envelope or per-item idempotency record is persisted, no operation-log entry is written, no
       counter is mutated - `inst-bde-amount`
 3. [ ] - `p1` - Consume each item's PDP-authorized, catalogue-mapped subject set via
