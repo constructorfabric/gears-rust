@@ -183,17 +183,18 @@ consumption-operations feature), `cpt-cf-quota-enforcement-usecase-region-gated-
 **Error Scenarios**:
 - Rollback to a nonexistent version: `UNKNOWN_POLICY_VERSION`
 - Rollback to a `rolled_back` version: `VERSION_ROLLED_BACK`
+- Rollback on a deleted Policy: `POLICY_DELETED` (canonical `FailedPrecondition`, 400); a deleted Policy's versions are
+  never re-activated
 
 **Steps**:
 1. [ ] - `p1` - Operator sends `POST /v1/quota-enforcement/policies/{id}/rollback` with `target_version` and optional
    `comment` - `inst-prd-rollback-request`
 2. [ ] - `p1` - **IF** `target_version` does not exist - `inst-prd-unknown-if`
    1. [ ] - `p1` - **RETURN** `UNKNOWN_POLICY_VERSION` - `inst-prd-unknown`
-3. [ ] - `p1` - **IF** `target_version` is in `rolled_back` state - `inst-prd-rb-if`
-   1. [ ] - `p1` - **RETURN** `VERSION_ROLLED_BACK`; terminal versions are never re-activated - `inst-prd-rb`
+3. [ ] - `p1` - **IF** `target_version` is in `rolled_back` state, or the Policy is deleted - `inst-prd-rb-if`
+   1. [ ] - `p1` - **RETURN** `VERSION_ROLLED_BACK`, or `POLICY_DELETED` (400) for a deleted Policy; terminal versions are never re-activated - `inst-prd-rb`
 4. [ ] - `p1` - DB: when `target_version` is already the active version (a retry), return it unchanged with no state
-   transition, audit row, event, or `policy_version_transitions_total` increment; otherwise atomically make
-   `target_version` active again, transition the previously-active version to `rolled_back` (terminal), move the
+   transition, audit row, event, or `policy_version_transitions_total` increment; otherwise, the target being `superseded`, atomically make `target_version` active again, transition the previously-active version to `rolled_back` (terminal), move the
    latest-pointer, and enqueue `policy-changed` with `change_kind = updated` (rollback is a latest-pointer move;
    `rolled_back` is a `version_state` value, not a notification discriminator) - `inst-prd-rollback-apply`
 5. [ ] - `p1` - **RETURN** `200 OK` with the new active `PolicyVersion`; increment
