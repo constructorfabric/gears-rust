@@ -545,7 +545,7 @@ GET  /policy/effective?user_owner_id=<uuid>              compute the effective (
 - **There is no `DELETE /policy` route.** To relax a policy, `PUT` a replacement body (e.g. an empty/permissive one);
   there is no way to remove a stored policy row entirely via the API.
 - A concurrent `PUT /policy` race for the same scope is closed at the DB level by two partial unique indexes on
-  `(tenant_id, scope, scope_owner_id)` (see `docs/migration.sql`); the upsert itself is wrapped in a transaction.
+  `(tenant_id, scope, scope_owner_id)` (see migration `m20260706_000003_policies_unique_scope`); the upsert itself is wrapped in a transaction.
 
 ## P2 — Retention rules
 

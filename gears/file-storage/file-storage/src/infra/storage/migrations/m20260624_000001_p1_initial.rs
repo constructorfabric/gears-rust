@@ -1,6 +1,6 @@
 //! P1 initial migration — control-plane metadata tables.
 //!
-//! Mirrors the P1 section of `gears/file-storage/docs/migration.sql`:
+//! P1 schema of the file-storage gear:
 //!   - @cpt-cf-file-storage-dbtable-files
 //!   - @cpt-cf-file-storage-dbtable-file-versions
 //!   - @cpt-cf-file-storage-dbtable-files-custom-metadata

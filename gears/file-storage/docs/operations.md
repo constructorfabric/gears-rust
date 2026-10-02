@@ -636,7 +636,7 @@ Deletion is deliberately **not** one of these replay cases: `idempotency_keys.fi
 from `files`, so deleting a file also deletes its idempotency key. A subsequent retry with the same key then finds
 no stored ticket at all and creates a brand-new file, exactly as if the key had never been used — not a `409`.
 
-See `docs/migration.sql`'s `idempotency_keys` table and `docs/api.md`'s `409` summary for the wire-level contract.
+See the `idempotency_keys` table (`m20260701_000001_p2_initial`, extended by `m20260706_000001_idempotency_subject_id` and `m20260706_000002_idempotency_request_hash`) and `docs/api.md`'s `409` summary for the wire-level contract.
 
 ## Upgrading from v0.2.x and rolling back
 

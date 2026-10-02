@@ -271,7 +271,7 @@ merge behavior and for the enforcement helpers, independent of the database.
 the cleanup engine's own event construction — checks it before enqueuing. Every event type is enqueued
 unconditionally regardless of what a policy's `enabled_event_types` says —
 the field is inert configuration, not enforced gating. See
-[docs/migration.sql](../migration.sql)'s `events_outbox` table comment and
+the `events_outbox` table (created in `m20260701_000001_p2_initial`; every event type is enqueued unconditionally, as noted above) and
 [docs/features/audit-trail.md](audit-trail.md) for the sibling outbox's related behavior.
 
 **Implements**:

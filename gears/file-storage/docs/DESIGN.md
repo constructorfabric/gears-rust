@@ -1332,7 +1332,7 @@ sequenceDiagram
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-db-overview`
 
-**Schema**: `file_storage` in the shared Postgres cluster (`migration.sql`'s canonical target). Entities are backed
+**Schema**: `file_storage` in the shared Postgres cluster (managed by the SeaORM migrations module). Entities are backed
 by SeaORM; migrations run through `db-runner` per
 `docs/toolkit_unified_system/11_database_patterns.md`. The gear's own migrations use **flat, unqualified table
 names** on both Postgres and SQLite (each SeaORM entity declares a static `table_name`; SQLite has no schemas).
@@ -1373,13 +1373,13 @@ The file row holds **no bytes and no per-content fields** (mime, size, hash, bac
 - `(tenant_id, owner_kind, owner_id, created_at DESC, file_id DESC)` — covers `GET /files` listing
   (sorted `ORDER BY created_at DESC, file_id DESC`; the `file_id` tie-breaker keeps two
   keyset-paginated pages from skipping or repeating a row when they share a `created_at` instant).
-  `files_owner_listing_v2_idx` in `docs/migration.sql`, shipped in `m20260924_000001_upload_flow_redesign`,
+  `files_owner_listing_v2_idx`, shipped in `m20260924_000001_upload_flow_redesign`,
   superseding the released `files_owner_listing_idx (tenant_id, owner_kind, owner_id, created_at DESC)`
   (`m20260624_000001_p1_initial`), dropped in the same migration
 - `(tenant_id, gts_file_type)` — supports per-type queries
 - partial index on `(created_at, file_id) WHERE content_id IS NULL` — supports the cleanup engine's
   versionless-orphan-file sweep (a `POST /files` multipart create that crashed between the bare file insert and the
-  pending-version insert; `files_versionless_sweep_idx` in `docs/migration.sql`, see `docs/operations.md`'s
+  pending-version insert; `files_versionless_sweep_idx`, see `docs/operations.md`'s
   cleanup-sweep section)
 
 #### Table: `file_versions`
@@ -1412,11 +1412,10 @@ and is immutable.
 **Indexes**:
 - unique partial index on `(file_id) WHERE is_current` — at most one current version per file
 - partial index on `(created_at) WHERE status = 'pending'` — supports time-ordered cleanup of abandoned
-  pre-registered versions (P2); matches `file_versions_pending_idx` in migration.sql
+  pre-registered versions (P2); matches `file_versions_pending_idx` (created in `m20260624_000001_p1_initial`)
 - `(file_id, created_at, version_id)` — covers `GET /files/{id}/versions`'s `file_id = ?` filter plus its
   `created_at DESC` sort (the composite PK alone serves the filter but not the sort, and versions are never
-  pruned in P1/P2, so a long-lived file's version count is unbounded); `file_versions_file_created_idx` in
-  migration.sql, shipped in `m20260924_000001_upload_flow_redesign`
+  pruned in P1/P2, so a long-lived file's version count is unbounded); `file_versions_file_created_idx`, shipped in `m20260924_000001_upload_flow_redesign`
 
 **Constraints**: `backend_id`/`backend_path` immutable per version (a content write makes a **new** version; the P2
 `backend-migrator` may relocate a version's bytes after a verified copy). The ETag is derived from

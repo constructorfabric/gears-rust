@@ -11,7 +11,7 @@
 //!   - `audit_outbox`: transactional-outbox rows for the audit trail.
 //!   - `events_outbox`: transactional-outbox rows for file events.
 //!
-//! Mirrors the P2 section of `gears/file-storage/docs/migration.sql`; table
+//! P2 schema of the file-storage gear; table
 //! names are flat (unqualified) -- consistent with P1 and the `SeaORM` entity
 //! `table_name` attributes.
 //!
