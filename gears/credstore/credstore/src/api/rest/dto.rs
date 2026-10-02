@@ -246,9 +246,9 @@ impl std::fmt::Debug for CredentialPatchDto {
 /// addresses. `secret` is populated only when `$select` names it (point
 /// read) or in secret mode (collection) and only for an item the caller may
 /// read; absent from the wire entirely otherwise — including when the item's
-/// value could not be served (refused, missing, fingerprint mismatch —
-/// omitted by the domain layer already, never reported as an error for one
-/// item).
+/// value could not be served (refused or missing — omitted by the
+/// domain layer already — or permanently unreadable, in which case the item
+/// stays with its metadata; never reported as an error for one item).
 ///
 /// `Debug` is hand-written to redact `secret`.
 #[derive(Clone, PartialEq, Eq)]

@@ -55,7 +55,7 @@ The `cf-gears-credstore` module provides:
   unaffected
 - **Metrics** — `read_outcome`, `walkup_depth`, dependency latency/health,
   `cross_tenant_denied`, `destroy_failed`, `outbox_purge_failed`, `read_retry`,
-  `list_type_invariant_violation`, `audit_publish_failed` (`credstore_*`
+  `list_type_invariant_violation`, `audit_publish_failed`, `secret_unreadable` (`credstore_*`
   OpenTelemetry instruments); no inventory gauge
 - **Backend plugin** — a versioned value store (`CredStorePluginClientV2`: `put`, `get`, `delete_key`, optional `destroy`) keyed by `(tenant_id, record_id)`, discovered via the types registry (vendor)
 - **`ClientHub` + REST** — registers `CredStoreClientV1`; exposes `/credstore/v1/credentials`
@@ -84,11 +84,22 @@ falling through to an ancestor's value. The owner renews it in place with a
 `PATCH` of `expires_at` or a replace; a create-only `PUT` over it is
 `409 ALREADY_EXISTS`.
 
+A version the backend holds but can never return (lost or rotated decryption
+key, corrupt entry) — or one that is gone although the row's pointer did not
+move — is permanent: the read fails `409 SECRET_UNREADABLE` (SDK
+`CredStoreError::SecretUnreadable`, counted in `secret_unreadable`), unlike the
+transient `503` for a version that vanished while the pointer moved. The
+record must be rewritten or deleted; in secret-mode collection reads such an
+item is returned with its metadata and no secret, like an expired one. Rotating
+only the secret is a `PATCH` with only `secret`; `PUT` is a whole replace, so an
+omitted expiry is cleared and `fallback` resets to `inherit` (the pre-0.3 `PUT`
+preserved the expiry).
+
 ## Usage
 
 After the gear initializes, consumers obtain its client from `ClientHub`. This
 example reads a secret value (`get_secret`, the `read_secret` action) without
-formatting or logging it; the record itself is read with `get` (`read`):
+formatting or logging it; the record itself is read with `get_record` (`read`):
 
 ```no_run
 use std::error::Error;

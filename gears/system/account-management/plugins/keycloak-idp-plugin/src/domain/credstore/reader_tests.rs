@@ -20,7 +20,7 @@ struct StubClient {
 
 #[async_trait]
 impl CredStoreClientV1 for StubClient {
-    async fn get(
+    async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,

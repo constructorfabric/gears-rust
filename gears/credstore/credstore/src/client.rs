@@ -47,6 +47,7 @@ impl From<DomainError> for CredStoreError {
         match err {
             DomainError::NotFound => CredStoreError::NotFound,
             DomainError::SecretExpired => CredStoreError::SecretExpired,
+            DomainError::SecretUnreadable => CredStoreError::SecretUnreadable,
             // Both are 409-class; the SDK has no distinct optimistic-lock variant.
             DomainError::Conflict | DomainError::VersionConflict => CredStoreError::Conflict,
             DomainError::InvalidSecretRef { detail } => CredStoreError::invalid_ref(detail),
@@ -104,12 +105,12 @@ impl CredStoreLocalClient {
 
 #[async_trait]
 impl CredStoreClientV1 for CredStoreLocalClient {
-    async fn get(
+    async fn get_record(
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
     ) -> Result<Option<Credential>, CredStoreError> {
-        self.svc.get(ctx, key).await.map_err(Into::into)
+        self.svc.get_record(ctx, key).await.map_err(Into::into)
     }
 
     async fn get_secret(

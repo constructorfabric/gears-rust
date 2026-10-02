@@ -90,7 +90,7 @@ impl MemoryCredStore {
 
 #[async_trait]
 impl CredStoreClientV1 for MemoryCredStore {
-    async fn get(
+    async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,

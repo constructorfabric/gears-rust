@@ -464,8 +464,8 @@ pub struct Secret {
 /// nothing about the value changes.
 #[derive(Debug)]
 pub struct CredentialWrite {
-    /// Full GTS type id. Required on create (defaults are not inferred here —
-    /// the REST layer defaults to the generic type before constructing this);
+    /// Full GTS type id. Required on create: nothing is defaulted, and a
+    /// create without a type is rejected with `TYPE_REQUIRED` (REST: 400);
     /// on replace it must equal the stored type (`TYPE_IMMUTABLE` otherwise).
     pub secret_type: Option<GtsId>,
     /// Sharing mode for the written record.

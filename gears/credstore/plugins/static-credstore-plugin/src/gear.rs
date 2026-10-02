@@ -11,7 +11,7 @@ use toolkit::Gear;
 use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
-use tracing::info;
+use tracing::{info, warn};
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 use crate::config::StaticCredStorePluginConfig;
@@ -46,6 +46,11 @@ impl Gear for StaticCredStorePlugin {
             vendor = %cfg.vendor,
             priority = cfg.priority,
             "Loaded plugin configuration"
+        );
+
+        warn!(
+            "static credstore plugin is a non-durable in-memory value store for development \
+             and tests only: stored values do not survive a restart; do not use it in production"
         );
 
         // Create service from config (validate early, before registration).

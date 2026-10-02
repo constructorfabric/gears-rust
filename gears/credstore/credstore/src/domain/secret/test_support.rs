@@ -571,6 +571,8 @@ enum FakeGetFault {
     /// A generic backend outage (`CredStoreError::ServiceUnavailable`) - a
     /// non-`NotFound` error that fails the whole request.
     Error,
+    /// A permanently unreadable version (`CredStoreError::SecretUnreadable`).
+    Unreadable,
 }
 
 /// All versions of one key plus its monotonic counter.
@@ -862,6 +864,20 @@ impl FakePlugin {
             .insert(plugin_key(key), FakeGetFault::Error);
     }
 
+    /// Always fail `get` for `key` with the permanent
+    /// `CredStoreError::SecretUnreadable` (a lost key or corrupt entry),
+    /// targeted at one specific winner (see [`Self::deny_get_for`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn unreadable_get_for(&self, key: &StoreKey) {
+        self.get_faults
+            .lock()
+            .expect("lock")
+            .insert(plugin_key(key), FakeGetFault::Unreadable);
+    }
+
     /// Make every future `get` for `key` sleep `ms` milliseconds, with the
     /// sleep tracked by [`Self::max_in_flight`] - for asserting the
     /// secret-mode list's bounded-concurrency fan-out.
@@ -947,6 +963,7 @@ impl CredStorePluginClientV2 for FakePlugin {
                     detail: "simulated backend get failure".to_owned(),
                     retry_after: None,
                 }),
+                FakeGetFault::Unreadable => Err(CredStoreError::SecretUnreadable),
             };
         }
         if Self::take_one(&self.not_found_gets) {
@@ -1824,6 +1841,7 @@ pub struct FakeMetrics {
     pub read_retries: Mutex<Vec<ReadRetryOutcome>>,
     pub list_type_invariant_violation_total: Mutex<u64>,
     pub audit_publish_failed_total: Mutex<u64>,
+    pub secret_unreadable_total: Mutex<u64>,
 }
 
 impl FakeMetrics {
@@ -1901,6 +1919,14 @@ impl FakeMetrics {
     pub fn audit_publish_failed_total(&self) -> u64 {
         *self.audit_publish_failed_total.lock().expect("lock")
     }
+
+    /// Number of permanently unreadable secret reads recorded.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn secret_unreadable_total(&self) -> u64 {
+        *self.secret_unreadable_total.lock().expect("lock")
+    }
 }
 
 impl Default for FakeMetrics {
@@ -1914,6 +1940,7 @@ impl Default for FakeMetrics {
             read_retries: Mutex::new(Vec::new()),
             list_type_invariant_violation_total: Mutex::new(0),
             audit_publish_failed_total: Mutex::new(0),
+            secret_unreadable_total: Mutex::new(0),
         }
     }
 }
@@ -1946,6 +1973,9 @@ impl CredStoreMetricsPort for FakeMetrics {
     }
     fn audit_publish_failed(&self) {
         *self.audit_publish_failed_total.lock().expect("lock") += 1;
+    }
+    fn secret_unreadable(&self) {
+        *self.secret_unreadable_total.lock().expect("lock") += 1;
     }
 }
 

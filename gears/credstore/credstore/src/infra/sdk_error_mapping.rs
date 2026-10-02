@@ -39,6 +39,17 @@ impl From<DomainError> for CanonicalError {
                 )
                 .with_override(Http::status_code(409))
                 .create(),
+            // Permanent, like expiry: the stored version can never be read, so
+            // the record must be rewritten or deleted. Same category and 409
+            // override; the reason tells the two apart.
+            DomainError::SecretUnreadable => CredentialResource::failed_precondition()
+                .with_precondition_violation(
+                    "secret",
+                    "the credential's stored secret cannot be read; rewrite or delete the credential",
+                    "SECRET_UNREADABLE",
+                )
+                .with_override(Http::status_code(409))
+                .create(),
             DomainError::Conflict => {
                 CredentialResource::already_exists("credential already exists")
                     .with_resource("credential")
@@ -132,6 +143,7 @@ mod tests {
         assert_eq!(status_of(DomainError::NotFound), 404);
         assert_eq!(status_of(DomainError::Conflict), 409);
         assert_eq!(status_of(DomainError::SecretExpired), 409);
+        assert_eq!(status_of(DomainError::SecretUnreadable), 409);
         assert_eq!(
             status_of(DomainError::InvalidSecretRef {
                 detail: "bad".to_owned()
@@ -174,6 +186,18 @@ mod tests {
         let problem = toolkit_canonical_errors::Problem::from(err);
         let body = serde_json::to_string(&problem).expect("serialize");
         assert!(body.contains("SECRET_EXPIRED"), "{body}");
+        assert!(body.contains("failed_precondition"), "{body}");
+    }
+
+    #[test]
+    fn secret_unreadable_is_failed_precondition_with_status_409_and_reason() {
+        let err = CanonicalError::from(DomainError::SecretUnreadable);
+        assert!(matches!(err, CanonicalError::FailedPrecondition { .. }));
+        assert_eq!(err.status_code(), 409);
+        assert_eq!(err.http_status_override(), Some(409));
+        let problem = toolkit_canonical_errors::Problem::from(err);
+        let body = serde_json::to_string(&problem).expect("serialize");
+        assert!(body.contains("SECRET_UNREADABLE"), "{body}");
         assert!(body.contains("failed_precondition"), "{body}");
     }
 

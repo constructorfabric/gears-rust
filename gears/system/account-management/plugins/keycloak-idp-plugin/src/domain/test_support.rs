@@ -95,7 +95,7 @@ pub struct StubCredStore;
 
 #[async_trait]
 impl CredStoreClientV1 for StubCredStore {
-    async fn get(
+    async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
@@ -195,7 +195,7 @@ impl ConfigurableStubCS {
 
 #[async_trait]
 impl CredStoreClientV1 for ConfigurableStubCS {
-    async fn get(
+    async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,

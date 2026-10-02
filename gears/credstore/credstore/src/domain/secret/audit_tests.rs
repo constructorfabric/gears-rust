@@ -157,7 +157,13 @@ async fn a_read_without_the_secret_publishes_nothing() {
         .expect("create");
     let before = f.audit.events().len();
 
-    assert!(f.svc.get(&f.ctx, &key("db")).await.expect("get").is_some());
+    assert!(
+        f.svc
+            .get_record(&f.ctx, &key("db"))
+            .await
+            .expect("get")
+            .is_some()
+    );
     assert!(
         f.svc
             .resolve_credential(&f.ctx, &key("db"))

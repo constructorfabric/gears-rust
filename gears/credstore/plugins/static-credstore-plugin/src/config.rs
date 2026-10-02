@@ -1,4 +1,4 @@
-// Updated: 2026-09-10 by Constructor Tech — value-seeding withdrawn (ADR-0006).
+// Updated: 2026-10-02 by Constructor Tech — value-seeding withdrawn (ADR-0006).
 //! Configuration for the static credential backend.
 //!
 //! Out-of-band value seeding (secrets keyed by tenant/reference/owner in this
@@ -7,7 +7,9 @@
 //! under the record's key and never has a `reference` or `owner_id` to hand
 //! the plugin.
 //! What remains here is purely GTS-instance registration input (vendor,
-//! priority).
+//! priority); any other key is rejected (`deny_unknown_fields`) so a stale
+//! `secrets:` block fails startup instead of being ignored. The plugin holds
+//! values in memory only (development and tests) and warns about it at startup.
 use serde::Deserialize;
 
 /// Plugin configuration.

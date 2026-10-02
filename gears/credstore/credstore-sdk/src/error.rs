@@ -24,6 +24,16 @@ pub enum CredStoreError {
     /// everyone else gets [`Self::NotFound`].
     #[error("secret expired")]
     SecretExpired,
+    /// The record points at a stored version the backend holds but can never
+    /// return (a lost or rotated decryption key, a corrupt entry), or that is
+    /// gone although the pointer did not move. Permanent: retrying does not
+    /// help; the record must be rewritten or deleted. Storage plugins return
+    /// it from `get` for a permanently unreadable version; the gear surfaces
+    /// it (409 `SECRET_UNREADABLE`) only to a caller authorized to read the
+    /// secret, everyone else gets [`Self::NotFound`] or the record's
+    /// metadata.
+    #[error("secret unreadable")]
+    SecretUnreadable,
     #[error("no plugin available")]
     NoPluginAvailable,
     #[error("service unavailable: {detail}")]
@@ -37,8 +47,11 @@ pub enum CredStoreError {
     /// sharing mode, schema/size/format violation, expiry on a
     /// non-expirable type), or named a type that conflicts with the one
     /// already in play: a differing type on replace (`TYPE_IMMUTABLE`) or a
-    /// create over a reference that currently resolves to an ancestor's
-    /// `shared` record of a different type (`TYPE_MISMATCH_WITH_INHERITED`).
+    /// create over a reference that currently resolves, for the creating
+    /// caller (its tenant, owner and ancestor chain), to a record of a
+    /// different type (`TYPE_MISMATCH_WITH_INHERITED`): an ancestor's `shared`
+    /// record or, when creating a private record, the tenant's own
+    /// non-private one.
     /// `reason` is a stable machine-readable code.
     #[error("secret type violation ({reason}): {detail}")]
     TypeViolation { reason: String, detail: String },
@@ -200,6 +213,10 @@ mod error_tests {
         assert_eq!(CredStoreError::NotFound.to_string(), "secret not found");
         assert_eq!(CredStoreError::AccessDenied.to_string(), "access denied");
         assert_eq!(CredStoreError::SecretExpired.to_string(), "secret expired");
+        assert_eq!(
+            CredStoreError::SecretUnreadable.to_string(),
+            "secret unreadable"
+        );
         assert_eq!(
             CredStoreError::Conflict.to_string(),
             "secret already exists"

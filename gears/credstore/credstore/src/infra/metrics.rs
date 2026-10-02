@@ -28,6 +28,7 @@ const CREDSTORE_READ_RETRY: &str = "credstore_read_retry_total";
 const CREDSTORE_LIST_TYPE_INVARIANT_VIOLATION: &str =
     "credstore_list_type_invariant_violation_total";
 const CREDSTORE_AUDIT_PUBLISH_FAILED: &str = "credstore_audit_publish_failed_total";
+const CREDSTORE_SECRET_UNREADABLE: &str = "credstore_secret_unreadable_total";
 
 /// OpenTelemetry-backed metrics handle for the credstore module.
 pub struct CredStoreMetricsMeter {
@@ -41,6 +42,7 @@ pub struct CredStoreMetricsMeter {
     read_retry: Counter<u64>,
     list_type_invariant_violation: Counter<u64>,
     audit_publish_failed: Counter<u64>,
+    secret_unreadable: Counter<u64>,
 }
 
 impl std::fmt::Debug for CredStoreMetricsMeter {
@@ -115,6 +117,14 @@ impl CredStoreMetricsMeter {
                      unaffected",
                 )
                 .build(),
+            secret_unreadable: meter
+                .u64_counter(CREDSTORE_SECRET_UNREADABLE)
+                .with_description(
+                    "Secret reads whose stored version can never be read (the plugin reported \
+                     it unreadable, or it was gone although the record's pointer did not \
+                     move); a rising value means records need a rewrite or delete",
+                )
+                .build(),
         }
     }
 
@@ -176,6 +186,10 @@ impl CredStoreMetricsPort for CredStoreMetricsMeter {
 
     fn audit_publish_failed(&self) {
         self.audit_publish_failed.add(1, &[]);
+    }
+
+    fn secret_unreadable(&self) {
+        self.secret_unreadable.add(1, &[]);
     }
 }
 

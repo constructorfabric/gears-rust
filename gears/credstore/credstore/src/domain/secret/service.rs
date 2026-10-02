@@ -80,6 +80,9 @@ pub fn map_plugin_err(e: CredStoreError) -> DomainError {
         // Expiry is the gear's own read-time verdict, never a plugin's: a
         // plugin only stores versioned bytes. Treat it as a contract
         // violation.
+        // The one permanent read failure a plugin may report: the version is
+        // held but can never be returned. Counted where it is produced.
+        CredStoreError::SecretUnreadable => DomainError::SecretUnreadable,
         CredStoreError::SecretExpired => DomainError::Internal {
             diagnostic: "plugin returned SecretExpired".to_owned(),
             cause: None,
@@ -320,7 +323,7 @@ impl Service {
     /// # Errors
     ///
     /// Returns [`DomainError::AccessDenied`] if the caller is out of scope.
-    pub async fn get(
+    pub async fn get_record(
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
@@ -569,7 +572,7 @@ impl Service {
         // `resolve_for_get` — the same single targeted query
         // `get_secret`'s classic implementation issued — rather than reusing
         // the in-memory `winner` above: it is what carries this read's
-        // retry-once-and-verify-fingerprint protocol (ADR-0006 §6.2), and
+        // retry-once protocol (ADR-0006 §6.2), and
         // its `Secret::validator` is the row the value actually came from,
         // which a concurrent switch can make momentarily different from the
         // `winner` snapshot taken above.
@@ -790,12 +793,14 @@ impl Service {
     /// once if the plugin reports it gone - the read landed a moment before a
     /// concurrent write switched the pointer and destroyed the old version.
     /// If the re-read row carries a *changed* `value_version`, `get` again; a
-    /// second consecutive miss (or a re-read row still naming the version that
-    /// was just reported gone) is a store inconsistency, not absence - by
+    /// second consecutive miss is a store inconsistency, not absence - by
     /// protocol the `put` always precedes the CAS that names it, and a
     /// version is destroyed only after the pointer left it - mapped onto
     /// [`DomainError::ServiceUnavailable`] (retryable), never a stale or empty
-    /// value. A row found `declared` on the re-read (suppressed/removed
+    /// value. A re-read row still naming the version that was just reported
+    /// gone, or a plugin reporting the version unreadable, is permanent
+    /// instead: [`DomainError::SecretUnreadable`] (and the
+    /// `secret_unreadable` metric). A row found `declared` on the re-read (suppressed/removed
     /// concurrently) is a legitimate miss instead - `Ok(None)`.
     ///
     /// The re-read re-runs the *same* `resolve_for_get` call (same requesting
@@ -832,6 +837,7 @@ impl Service {
         {
             Ok(Some(v)) => Ok(Some((v, row.clone()))),
             Err(DomainError::AccessDenied { .. }) => Ok(None),
+            Err(DomainError::SecretUnreadable) => Err(Self::log_unreadable(row, "plugin")),
             Err(e) => Err(e),
             Ok(None) => {
                 let fresh = self.repo.resolve_for_get(req, subject, key, chain).await?;
@@ -851,9 +857,11 @@ impl Service {
                     return Ok(None);
                 };
                 if fresh_version == version {
-                    // The pointer did not move, yet its version is gone.
-                    self.metrics.read_retry(ReadRetryOutcome::SecondMiss);
-                    return Err(Self::version_missing());
+                    // The pointer did not move, yet its version is gone: no
+                    // concurrent switch explains it, and a retry cannot bring
+                    // it back - permanent, not a transient 503.
+                    self.metrics.secret_unreadable();
+                    return Err(Self::log_unreadable(row, "pointer_unchanged"));
                 }
                 match self
                     .plugin_get_timed(plugin, ctx, &fresh.store_key(), fresh_version)
@@ -868,10 +876,27 @@ impl Service {
                         Err(Self::version_missing())
                     }
                     Err(DomainError::AccessDenied { .. }) => Ok(None),
+                    Err(DomainError::SecretUnreadable) => {
+                        Err(Self::log_unreadable(&fresh, "plugin"))
+                    }
                     Err(e) => Err(e),
                 }
             }
         }
+    }
+
+    /// The permanent "unreadable" outcome for `row`: logs the identifiers
+    /// (never the value) and returns the error. The metric is counted where
+    /// the outcome arises (`plugin_get_timed`, or the unchanged-pointer miss).
+    fn log_unreadable(row: &SecretRow, cause: &'static str) -> DomainError {
+        tracing::warn!(
+            tenant_id = %row.tenant_id.0,
+            record_id = %row.id,
+            reference = %row.reference,
+            cause,
+            "credstore: stored secret version is unreadable (permanent)"
+        );
+        DomainError::SecretUnreadable
     }
 
     fn version_missing() -> DomainError {
@@ -898,6 +923,9 @@ impl Service {
             Ok(None) => Outcome::NotFound,
             Err(_) => Outcome::Error,
         };
+        if matches!(result, Err(DomainError::SecretUnreadable)) {
+            self.metrics.secret_unreadable();
+        }
         self.metrics
             .dependency(Dep::Plugin, DepOp::PluginGet, outcome, secs);
         result
@@ -952,8 +980,10 @@ impl Service {
     /// Returns [`DomainError::TypeViolation`] on a trait violation, an
     /// unresolvable type, a differing type on replace (`TYPE_IMMUTABLE`), a
     /// missing type on create (`TYPE_REQUIRED`), or a create over a reference
-    /// that currently resolves to an ancestor's `shared` record of a
-    /// different type (`TYPE_MISMATCH_WITH_INHERITED`).
+    /// that currently resolves, for the creating caller (its tenant, owner
+    /// and ancestor chain), to a record of a different type
+    /// (`TYPE_MISMATCH_WITH_INHERITED`): an ancestor's `shared` record or,
+    /// when creating a private record, the tenant's own non-private one.
     pub async fn put(
         &self,
         ctx: &SecurityContext,
@@ -1266,9 +1296,10 @@ impl Service {
             });
         }
 
-        // If the reference currently resolves to an ancestor's `shared`
-        // record of a different type, creating here would silently diverge
-        // from what a value read already serves (`fr-override-type-consistency`).
+        // If the reference currently resolves (for this caller: its tenant,
+        // owner and ancestor chain) to a record of a different type, creating
+        // here would silently diverge from what a value read already serves
+        // (`fr-override-type-consistency`).
         let chain = self.dir.ancestor_chain(ctx, tenant).await?;
         if let Some(inherited) = self
             .repo

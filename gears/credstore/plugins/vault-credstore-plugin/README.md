@@ -24,7 +24,8 @@ under one KV v2 path:
   are ordered integers).
 - `get` issues `GET .../data/...?version=N`. A `200` yields the base64-decoded
   `data.data.value`; a `404` (missing, deleted or destroyed version) maps to
-  `Ok(None)`.
+  `Ok(None)` (the version is gone; a transient failure is
+  `ServiceUnavailable`).
 - `delete_key` issues `DELETE {address}/v1/{mount}/metadata/{path_prefix}/{tenant_id}/{record_id}`,
   which removes the key with all its versions. `204` and `404` both map to
   `Ok(())` (idempotent).

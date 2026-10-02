@@ -32,7 +32,7 @@ struct StubOnce {
 
 #[async_trait]
 impl CredStoreClientV1 for StubOnce {
-    async fn get(
+    async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,

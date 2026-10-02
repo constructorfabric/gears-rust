@@ -213,7 +213,7 @@ async fn metadata_page_reports_own_inherited_overridden_and_suppressed() {
         .await
         .expect("d-suppressed own create");
     let existing = svc_t3
-        .get(&ctx3, &key("d-suppressed"))
+        .get_record(&ctx3, &key("d-suppressed"))
         .await
         .expect("get")
         .expect("own row");
@@ -718,6 +718,74 @@ async fn secret_mode_over_cap_fails_closed() {
 }
 
 #[tokio::test]
+async fn secret_mode_reference_list_longer_than_cap_is_rejected_up_front() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = service_with(repo, plugin, dir, mock_enforcer(), 200, 2);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    // None of the references exist: only the list cardinality (cap + 1) can
+    // reject this request, never a candidate-query result.
+    let query = secret_mode_query("reference in ('n1', 'n2', 'n3')");
+    let err = svc
+        .list(&ctx, &query)
+        .await
+        .expect_err("a list longer than the cap is rejected before any query");
+    assert_eq!(reason_of(&err), "TOO_MANY_MATCHES");
+}
+
+#[tokio::test]
+async fn secret_mode_unreadable_item_keeps_its_metadata_without_a_secret() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let metrics = FakeMetrics::new();
+    let svc = service_with_metrics(
+        repo.clone(),
+        plugin.clone(),
+        dir,
+        mock_enforcer(),
+        metrics.clone(),
+    );
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    for name in ["r1", "r2", "r3"] {
+        svc.put(
+            &ctx,
+            &key(name),
+            write_generic(SharingMode::Tenant, "v"),
+            create_only(),
+        )
+        .await
+        .expect("create");
+    }
+    let broken = repo
+        .rows()
+        .into_iter()
+        .find(|r| r.reference == "r2")
+        .expect("r2 row");
+    plugin.unreadable_get_for(&broken.store_key());
+
+    let query = secret_mode_query("reference in ('r1', 'r2', 'r3')");
+    let page = svc
+        .list(&ctx, &query)
+        .await
+        .expect("an unreadable item does not fail the request");
+
+    assert_eq!(references_of(&page), vec!["r1", "r2", "r3"]);
+    assert!(page.items[0].secret.is_some());
+    assert!(
+        page.items[1].secret.is_none(),
+        "metadata only for the unreadable item"
+    );
+    assert!(page.items[2].secret.is_some());
+    assert_eq!(metrics.secret_unreadable_total(), 1);
+}
+
+#[tokio::test]
 async fn secret_mode_cap_counts_only_permitted_type_references() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
@@ -760,9 +828,15 @@ async fn secret_mode_cap_counts_only_permitted_type_references() {
 
     // Cap is 2, and 4 references exist in total, but only "a1" (type A) is
     // permitted — the cap must count that one reference, not all four.
+    let api_key_gts_filter = api_key_gts.clone();
     let (enforcer, _resolver) = type_deny_enforcer(vec![api_key_gts]);
     let svc = service_with(repo, plugin, dir, enforcer, 200, 2);
-    let query = secret_mode_query("reference in ('a1', 'b1', 'b2', 'b3')");
+    // A `type` selector rather than a `reference in (…)` list: a reference
+    // list longer than the cap is rejected up front, before any query.
+    let generic_gts = SecretType::generic().gts_id().to_owned();
+    let query = secret_mode_query(&format!(
+        "type in ('{generic_gts}', '{api_key_gts_filter}')"
+    ));
     let page = svc
         .list(&ctx, &query)
         .await

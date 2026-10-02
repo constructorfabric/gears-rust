@@ -128,8 +128,10 @@ struct SecretReadJob {
 }
 
 /// One finished secret-mode read: the credential, its reference and GTS type
-/// (for the audit record), and the secret if the read found one.
-type ReadResult = (Credential, SecretRef, String, Option<Secret>);
+/// (for the audit record), and the secret if the read found one; the flag is
+/// set when the value can never be read (`SecretUnreadable`): the item is then
+/// returned with its metadata and no secret, like an expired one.
+type ReadResult = (Credential, SecretRef, String, Option<Secret>, bool);
 
 /// One secret-mode result slot, in reference order: an item already complete
 /// (an expired record: metadata only, no secret) or the index of a value read
@@ -394,6 +396,21 @@ impl Service {
             });
         }
         let type_scope = allowed.to_scope();
+
+        // The caller's own `reference in (…)` list is checked against the cap
+        // before it builds the candidate query (ADR-0005): a list longer than
+        // the cap can only match more than `cap` references.
+        if parsed_filter
+            .reference_in
+            .as_deref()
+            .is_some_and(|list| list.len() as u64 > cap)
+        {
+            return Err(DomainError::InvalidRequest {
+                field: "$filter",
+                reason: list_filter::reasons::TOO_MANY_MATCHES,
+                detail: format!("selector matches more than {cap} references; narrow it"),
+            });
+        }
 
         let cap_plus_one = cap
             .checked_add(1)
@@ -667,7 +684,16 @@ impl Service {
         let mut first_err: Option<DomainError> = None;
         while let Some((index, credential, key, gts_id, outcome)) = reads.next().await {
             match outcome {
-                Ok(secret) => read_results[index] = Some((credential, key, gts_id, secret)),
+                Ok(secret) => {
+                    read_results[index] = Some((credential, key, gts_id, secret, false));
+                }
+                // A permanently unreadable value is a property of this one
+                // record, not an outage: the item keeps its metadata, loses
+                // its secret, and the request goes on (the metric and the
+                // log line were emitted where the outcome was produced).
+                Err(DomainError::SecretUnreadable) => {
+                    read_results[index] = Some((credential, key, gts_id, None, true));
+                }
                 Err(err) => {
                     // The failed read was authorized and attempted; no
                     // secret is returned for it or for anything else.
@@ -706,11 +732,19 @@ impl Service {
             // `None` only if the loop above exited without an error before
             // visiting every index, which cannot happen: the only early
             // exit is the `Err` branch, which returns above.
-            let Some((credential, key, gts_id, secret)) = read_results[index].take() else {
+            let Some((credential, key, gts_id, secret, unreadable)) = read_results[index].take()
+            else {
                 continue;
             };
+            if unreadable {
+                items.push(CredentialListItem {
+                    credential,
+                    secret: None,
+                });
+                continue;
+            }
             let Some(secret) = secret else {
-                // A refused/missing/fingerprint-mismatched value is omitted,
+                // A refused or missing value is omitted,
                 // not reported (ADR-0004 "Bulk secret read: the collection in
                 // secret mode") — `read_value_for_row` already recorded the
                 // relevant metric.

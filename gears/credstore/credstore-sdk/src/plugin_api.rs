@@ -52,6 +52,12 @@ pub trait CredStorePluginClientV2: Send + Sync {
 
     /// Returns exactly the bytes written by the `put` that returned
     /// `version`, or `None` when that version is gone. Never different bytes.
+    ///
+    /// A version the backend holds but can never return (lost or rotated
+    /// decryption key, corrupt entry) is [`CredStoreError::SecretUnreadable`]:
+    /// permanent, unlike [`CredStoreError::ServiceUnavailable`] (transient,
+    /// retried) and unlike `Ok(None)` (the version is gone, which the gear
+    /// answers by re-reading the record's pointer once).
     async fn get(
         &self,
         ctx: &SecurityContext,

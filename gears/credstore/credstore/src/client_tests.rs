@@ -148,7 +148,7 @@ async fn local_client_round_trips_through_service() {
         .put(&ctx, &k, replace_write("v2"), PutPrecondition::Exists)
         .await
         .expect("put");
-    assert!(client.get(&ctx, &k).await.expect("get").is_some());
+    assert!(client.get_record(&ctx, &k).await.expect("get").is_some());
     assert!(
         client
             .get_secret(&ctx, &k)
@@ -160,7 +160,7 @@ async fn local_client_round_trips_through_service() {
         .delete(&ctx, &k, WritePrecondition::Exists)
         .await
         .expect("delete");
-    assert!(client.get(&ctx, &k).await.expect("get").is_none());
+    assert!(client.get_record(&ctx, &k).await.expect("get").is_none());
 }
 
 #[tokio::test]
@@ -216,7 +216,11 @@ async fn precondition_guards_in_process_write_and_delete() {
         .put(&ctx, &k, generic_write("v1"), PutPrecondition::CreateOnly)
         .await
         .expect("create");
-    let observed = client.get(&ctx, &k).await.expect("get").expect("present");
+    let observed = client
+        .get_record(&ctx, &k)
+        .await
+        .expect("get")
+        .expect("present");
     let observed_validator = observed.validator.expect("own row has a strong validator");
     let stale = WritePrecondition::Matches {
         id: observed_validator.id,
@@ -260,7 +264,11 @@ async fn precondition_guards_in_process_write_and_delete() {
     assert!(matches!(err, CredStoreError::Conflict), "got: {err:?}");
 
     // A guarded delete: the stale validator conflicts, the current one succeeds.
-    let current = client.get(&ctx, &k).await.expect("get").expect("present");
+    let current = client
+        .get_record(&ctx, &k)
+        .await
+        .expect("get")
+        .expect("present");
     let current_validator = current.validator.expect("own row has a strong validator");
     let err = client
         .delete(&ctx, &k, stale)
@@ -278,7 +286,7 @@ async fn precondition_guards_in_process_write_and_delete() {
         )
         .await
         .expect("guarded delete matches current generation");
-    assert!(client.get(&ctx, &k).await.expect("get").is_none());
+    assert!(client.get_record(&ctx, &k).await.expect("get").is_none());
 }
 
 #[tokio::test]
@@ -296,7 +304,11 @@ async fn patch_precondition_maps_sdk_matches_to_domain_version() {
         .put(&ctx, &k, generic_write("v1"), PutPrecondition::CreateOnly)
         .await
         .expect("create");
-    let cred = client.get(&ctx, &k).await.expect("get").expect("present");
+    let cred = client
+        .get_record(&ctx, &k)
+        .await
+        .expect("get")
+        .expect("present");
     let v = cred.validator.expect("some");
 
     let out = client

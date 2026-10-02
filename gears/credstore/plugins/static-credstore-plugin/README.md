@@ -24,6 +24,9 @@ The `cf-gears-static-credstore-plugin` module provides:
 - **No config seeding** - values enter the store only through the credstore
   API. A `secrets:` block in this plugin's config is rejected at startup.
 
+> **Not for production.** Values live in process memory only and do not
+> survive a restart. The plugin logs a warning once at startup saying so.
+
 The plugin registers itself via the types registry as a `CredStorePluginClientV2`
 implementation and is discovered by the `credstore` gear module.
 
@@ -47,8 +50,8 @@ static-credstore-plugin:
     priority: 100                 # Plugin priority, lower = higher (default: 100)
 ```
 
-Both keys are GTS-instance registration input; there is nothing else to
-configure. Unknown keys — including the former `secrets:` list — fail
+The config is `vendor` and `priority` only: both are GTS-instance
+registration input; there is nothing else to configure. Unknown keys — including the former `secrets:` list — fail
 validation (`deny_unknown_fields`).
 
 ## Contract
@@ -56,7 +59,7 @@ validation (`deny_unknown_fields`).
 | Method | Behaviour |
 |---|---|
 | `put(ctx, key, value)` | Stores a new immutable version under `key`; returns its version (`"1"`, `"2"`, ...). |
-| `get(ctx, key, version)` | Returns the bytes of that version, or `None`. |
+| `get(ctx, key, version)` | Returns the bytes of that version, or `None` when it is gone. |
 | `delete_key(ctx, key)` | Removes the key with all versions; a missing key is `Ok(())`. |
 | `supports_destroy()` | `true`. |
 | `destroy(ctx, key, selector)` | `Below(v)` / `Exactly(v)`; idempotent. |
@@ -74,7 +77,8 @@ domain/
 
 ### Init sequence
 
-1. Load `StaticCredStorePluginConfig` from module config
+1. Load `StaticCredStorePluginConfig` from module config and log the
+   non-durable-store warning
 2. Register GTS plugin instance in types-registry
 3. Store `Arc<Service>` in module state
 4. Register `CredStorePluginClientV2` scoped client in `ClientHub`

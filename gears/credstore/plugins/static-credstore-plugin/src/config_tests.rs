@@ -1,5 +1,5 @@
 // Created: 2026-04-07 by Constructor Tech
-// Updated: 2026-09-10 by Constructor Tech — value-seeding fields removed (ADR-0006).
+// Updated: 2026-10-02 by Constructor Tech — withdrawn-block test names the key.
 use super::*;
 
 #[test]
@@ -42,6 +42,7 @@ secrets:
     key: "openai_api_key"
     value: "sk-test-123"
 "#;
-    let parsed: Result<StaticCredStorePluginConfig, _> = serde_saphyr::from_str(yaml);
-    assert!(parsed.is_err());
+    let err = serde_saphyr::from_str::<StaticCredStorePluginConfig>(yaml)
+        .expect_err("the withdrawn `secrets` block must be rejected");
+    assert!(err.to_string().contains("secrets"), "{err}");
 }

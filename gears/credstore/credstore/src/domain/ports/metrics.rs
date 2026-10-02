@@ -140,6 +140,11 @@ pub trait CredStoreMetricsPort: Send + Sync + 'static {
     /// itself was unaffected (`cpt-cf-credstore-nfr-audit`). A persistently
     /// rising value means audit events are being lost.
     fn audit_publish_failed(&self);
+    /// A secret read produced the permanent "unreadable" outcome: the plugin
+    /// reported the version unreadable, or the version was gone although the
+    /// record's pointer did not move. Persistently rising means records
+    /// need a rewrite or delete (lost key, corrupt entry).
+    fn secret_unreadable(&self);
 }
 
 #[domain_model]
@@ -155,6 +160,7 @@ impl CredStoreMetricsPort for NoopMetrics {
     fn read_retry(&self, _: ReadRetryOutcome) {}
     fn list_type_invariant_violation(&self) {}
     fn audit_publish_failed(&self) {}
+    fn secret_unreadable(&self) {}
 }
 
 #[cfg(test)]
@@ -202,5 +208,6 @@ mod tests {
         noop.read_retry(ReadRetryOutcome::Recovered);
         noop.list_type_invariant_violation();
         noop.audit_publish_failed();
+        noop.secret_unreadable();
     }
 }

@@ -170,7 +170,7 @@ impl MockCredStoreClient {
 
 #[async_trait]
 impl CredStoreClientV1 for MockCredStoreClient {
-    async fn get(
+    async fn get_record(
         &self,
         _ctx: &SecurityContext,
         key: &SecretRef,

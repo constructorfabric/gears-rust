@@ -121,7 +121,7 @@ impl ConfigurableStubOpenBao {
 
 #[async_trait]
 impl CredStoreClientV1 for ConfigurableStubOpenBao {
-    async fn get(
+    async fn get_record(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,

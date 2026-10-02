@@ -15,7 +15,7 @@ use crate::models::{
     Secret, SecretRef, Validator, WritePrecondition,
 };
 
-/// Consumer-facing API trait for credential storage operations. Seven
+/// Consumer-facing API trait for credential storage operations. Six
 /// methods, none named `create` or `read_secrets`: `put` under
 /// [`PutPrecondition::CreateOnly`] **is** create, and [`Self::list`] is the
 /// collection read (metadata by default; `$select` containing `secret`
@@ -33,7 +33,12 @@ pub trait CredStoreClientV1: Send + Sync {
     /// the PDP evaluation itself cannot be completed.
     ///
     /// Requires the `read` action.
-    async fn get(
+    ///
+    /// Named `get_record`, not `get`: before 0.3 `get` returned the secret
+    /// value. The record read never does, so the rename makes every stale
+    /// `get` call site fail to compile instead of silently returning `Some`
+    /// for a value-less (`declared`) record.
+    async fn get_record(
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
@@ -84,9 +89,11 @@ pub trait CredStoreClientV1: Send + Sync {
     /// delete it; or replace found none) or a lost CAS.
     /// Returns [`CredStoreError::TypeViolation`] on a trait violation, an
     /// unresolvable type, or an attempted type change (`TYPE_IMMUTABLE`) —
-    /// including creating over a reference that currently resolves to an
-    /// ancestor's `shared` record of a different type
-    /// (`TYPE_MISMATCH_WITH_INHERITED`).
+    /// including creating over a reference that currently resolves, for the
+    /// creating caller (its tenant, owner and ancestor chain), to a record of
+    /// a different type (`TYPE_MISMATCH_WITH_INHERITED`): an ancestor's
+    /// `shared` record or, when creating a private record, the tenant's own
+    /// non-private one.
     async fn put(
         &self,
         ctx: &SecurityContext,

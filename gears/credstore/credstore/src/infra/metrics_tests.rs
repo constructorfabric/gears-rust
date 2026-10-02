@@ -38,6 +38,7 @@ fn global_meter_records_all_instruments() {
     m.read_retry(ReadRetryOutcome::SecondMiss);
     m.list_type_invariant_violation();
     m.audit_publish_failed();
+    m.secret_unreadable();
 }
 
 #[test]
@@ -150,4 +151,15 @@ fn audit_publish_failed_accumulates() {
         h.counter_value("credstore_audit_publish_failed_total", &[]),
         3
     );
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn secret_unreadable_accumulates() {
+    let h = MetricsHarness::new();
+    let m = h.metrics();
+    m.secret_unreadable();
+    m.secret_unreadable();
+    h.force_flush();
+    assert_eq!(h.counter_value("credstore_secret_unreadable_total", &[]), 2);
 }

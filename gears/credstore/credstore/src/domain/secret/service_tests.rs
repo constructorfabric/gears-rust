@@ -213,7 +213,11 @@ async fn get_own_tenant_secret_returns_hit_own() {
     assert_eq!(got.secret.as_bytes(), b"v1");
     assert_eq!(metrics.last_read_outcome(), Some(ReadOutcome::HitOwn));
 
-    let cred = svc.get(&ctx, &key("k")).await.expect("get").expect("some");
+    let cred = svc
+        .get_record(&ctx, &key("k"))
+        .await
+        .expect("get")
+        .expect("some");
     assert_eq!(cred.inheritance, InheritanceStatus::Own);
     assert_eq!(cred.status, CredentialStatus::Active);
 }
@@ -247,7 +251,7 @@ async fn get_inherited_shared_from_parent_sets_inherited_status() {
     assert_eq!(got.secret.as_bytes(), b"shared-v");
 
     let cred = svc
-        .get(&child_ctx, &key("shared-k"))
+        .get_record(&child_ctx, &key("shared-k"))
         .await
         .expect("get")
         .expect("some");
@@ -284,7 +288,12 @@ async fn get_tenant_mode_not_inherited_by_child() {
         .await
         .expect("get_secret");
     assert!(got.is_none(), "Tenant-mode secret must not be inherited");
-    assert!(svc.get(&child_ctx, &key("k")).await.expect("get").is_none());
+    assert!(
+        svc.get_record(&child_ctx, &key("k"))
+            .await
+            .expect("get")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -358,7 +367,7 @@ async fn get_shadowing_private_beats_inherited() {
         .expect("some");
     assert_eq!(got.secret.as_bytes(), b"private");
     let cred = svc
-        .get(&child_ctx, &key("k"))
+        .get_record(&child_ctx, &key("k"))
         .await
         .expect("get")
         .expect("some");
@@ -1250,12 +1259,19 @@ async fn read_that_misses_twice_is_503_never_a_stale_or_empty_value() {
 }
 
 #[tokio::test]
-async fn read_miss_on_an_unmoved_pointer_is_503() {
+async fn read_miss_on_an_unmoved_pointer_is_unreadable_not_503() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
     let dir = Arc::new(FakeDir::single(tenant));
-    let svc = make_service_noop(repo.clone(), plugin.clone(), dir);
+    let metrics = FakeMetrics::new();
+    let svc = make_service(
+        repo.clone(),
+        plugin.clone(),
+        dir,
+        mock_enforcer(),
+        metrics.clone(),
+    );
     let ctx = make_ctx(Uuid::new_v4(), tenant);
     create_k(&svc, &repo, &ctx, "old").await;
 
@@ -1264,7 +1280,38 @@ async fn read_miss_on_an_unmoved_pointer_is_503() {
         .get_secret(&ctx, &key("k"))
         .await
         .expect_err("the version is gone but the row still names it");
-    assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
+    assert!(matches!(err, DomainError::SecretUnreadable), "{err:?}");
+    assert_eq!(metrics.secret_unreadable_total(), 1);
+    assert!(
+        metrics.read_retries().is_empty(),
+        "no second-miss retry outcome for a permanent failure"
+    );
+}
+
+#[tokio::test]
+async fn plugin_reporting_the_version_unreadable_is_unreadable() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let metrics = FakeMetrics::new();
+    let svc = make_service(
+        repo.clone(),
+        plugin.clone(),
+        dir,
+        mock_enforcer(),
+        metrics.clone(),
+    );
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let row = create_k(&svc, &repo, &ctx, "old").await;
+
+    plugin.unreadable_get_for(&row.store_key());
+    let err = svc
+        .get_secret(&ctx, &key("k"))
+        .await
+        .expect_err("the plugin can never return this version");
+    assert!(matches!(err, DomainError::SecretUnreadable), "{err:?}");
+    assert_eq!(metrics.secret_unreadable_total(), 1);
 }
 
 #[tokio::test]
@@ -1290,7 +1337,7 @@ async fn declared_row_reads_never_call_the_plugin() {
             .expect("get_secret")
             .is_none()
     );
-    svc.get(&ctx, &key("d")).await.expect("get");
+    svc.get_record(&ctx, &key("d")).await.expect("get");
     assert_eq!(plugin.get_calls(), 0);
 }
 
@@ -1436,7 +1483,7 @@ async fn expired_own_override_is_secret_expired_not_the_ancestors_value() {
     // The metadata read still shows the record, with the derived status and
     // its normal validator.
     let cred = svc
-        .get(&child_ctx, &key("k"))
+        .get_record(&child_ctx, &key("k"))
         .await
         .expect("get")
         .expect("the record stays visible");
@@ -1501,7 +1548,7 @@ async fn expired_decisive_ancestor_shared_record_is_secret_expired() {
     // row, so its own-row status stays `none` and `expires_at` is the past
     // instant.
     let cred = svc
-        .get(&child_ctx, &key("k"))
+        .get_record(&child_ctx, &key("k"))
         .await
         .expect("get")
         .expect("visible");
@@ -1579,7 +1626,7 @@ async fn secret_expired_is_only_disclosed_to_a_caller_who_may_read_the_secret() 
     );
     // The record itself is still readable with `read`.
     let cred = svc
-        .get(&ctx, &key("k"))
+        .get_record(&ctx, &key("k"))
         .await
         .expect("get")
         .expect("visible");
@@ -1632,7 +1679,11 @@ async fn patching_expires_at_renews_in_place_and_the_secret_is_served_again() {
         .expect("get_secret")
         .expect("some");
     assert_eq!(got.secret.as_bytes(), b"tok");
-    let cred = svc.get(&ctx, &key("pt")).await.expect("get").expect("some");
+    let cred = svc
+        .get_record(&ctx, &key("pt"))
+        .await
+        .expect("get")
+        .expect("some");
     assert_eq!(cred.status, CredentialStatus::Active);
 }
 
@@ -2103,7 +2154,7 @@ async fn point_read_is_admitted_or_missing_by_reference() {
         .expect("admitted");
     assert_eq!(got.secret.as_bytes(), b"v");
     assert!(
-        svc.get(&ctx, &key("smtp-password"))
+        svc.get_record(&ctx, &key("smtp-password"))
             .await
             .expect("get")
             .is_some()
@@ -2114,7 +2165,12 @@ async fn point_read_is_admitted_or_missing_by_reference() {
             .expect("get_secret")
             .is_none()
     );
-    assert!(svc.get(&ctx, &key("other")).await.expect("get").is_none());
+    assert!(
+        svc.get_record(&ctx, &key("other"))
+            .await
+            .expect("get")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -2155,7 +2211,7 @@ async fn a_non_admitted_decisive_child_override_is_a_miss_never_the_ancestor_val
     let permissive = make_service_noop(repo.clone(), plugin.clone(), dir.clone());
     assert!(
         permissive
-            .get(&ctx, &key("r"))
+            .get_record(&ctx, &key("r"))
             .await
             .expect("get")
             .is_some()
@@ -2163,7 +2219,12 @@ async fn a_non_admitted_decisive_child_override_is_a_miss_never_the_ancestor_val
 
     let (enforcer, _) = type_deny_enforcer(vec![child_type.gts_id().to_owned()]);
     let svc = make_service(repo, plugin, dir, enforcer, Arc::new(NoopMetrics));
-    assert!(svc.get(&ctx, &key("r")).await.expect("get").is_none());
+    assert!(
+        svc.get_record(&ctx, &key("r"))
+            .await
+            .expect("get")
+            .is_none()
+    );
     assert!(
         svc.get_secret(&ctx, &key("r"))
             .await
@@ -2665,7 +2726,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
     );
     assert_eq!(
         svc_t3
-            .get(&ctx3, &name)
+            .get_record(&ctx3, &name)
             .await
             .expect("t3 get")
             .expect("cred")
@@ -2685,7 +2746,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
         .expect("T2 overrides");
     assert!(outcome.created);
     let t2_cred = svc_t2
-        .get(&ctx2, &name)
+        .get_record(&ctx2, &name)
         .await
         .expect("t2 get")
         .expect("cred");
@@ -2750,7 +2811,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
     // transaction. T2's row becomes declared/none; T2 and T3 now get None;
     // T2's record reads suppressed/declared; T1 untouched.
     let t2_after_rotate = svc_t2
-        .get(&ctx2, &name)
+        .get_record(&ctx2, &name)
         .await
         .expect("t2 get")
         .expect("cred");
@@ -2781,7 +2842,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
             .is_none()
     );
     let t2_suppressed = svc_t2
-        .get(&ctx2, &name)
+        .get_record(&ctx2, &name)
         .await
         .expect("t2 get")
         .expect("cred");
@@ -2832,7 +2893,7 @@ async fn walkthrough_t1_t2_t3_override_rotate_suppress_delete() {
         b"V1"
     );
     let t2_final = svc_t2
-        .get(&ctx2, &name)
+        .get_record(&ctx2, &name)
         .await
         .expect("t2 get")
         .expect("cred");
@@ -3190,7 +3251,7 @@ async fn declared_inherit_own_row_reports_declared_status_inherited_inheritance(
         .await
         .expect("child overrides");
     let cred_before = svc_child
-        .get(&child_ctx, &key("k"))
+        .get_record(&child_ctx, &key("k"))
         .await
         .expect("get")
         .expect("cred");
@@ -3208,7 +3269,7 @@ async fn declared_inherit_own_row_reports_declared_status_inherited_inheritance(
         .expect("remove value, keep fallback: inherit");
 
     let cred = svc_child
-        .get(&child_ctx, &key("k"))
+        .get_record(&child_ctx, &key("k"))
         .await
         .expect("get")
         .expect("cred");
@@ -3307,7 +3368,11 @@ async fn get_reports_the_creators_subject_id_as_owner_id_for_an_own_row() {
     .await
     .expect("create");
 
-    let cred = svc.get(&ctx, &key("k")).await.expect("get").expect("some");
+    let cred = svc
+        .get_record(&ctx, &key("k"))
+        .await
+        .expect("get")
+        .expect("some");
     assert_eq!(cred.owner_id, Some(OwnerId(subject)));
 }
 
@@ -3677,7 +3742,7 @@ async fn put_create_null_suppresses_an_inherited_credential_t1_t2_t3() {
 
     let svc_t2 = make_service_noop(repo.clone(), plugin.clone(), dir_t2);
     let t2_cred = svc_t2
-        .get(&ctx2, &name)
+        .get_record(&ctx2, &name)
         .await
         .expect("t2 get")
         .expect("cred");
@@ -4475,7 +4540,7 @@ async fn one_pdp_call_per_action_for_reads_and_lists_regardless_of_type_count() 
     assert_eq!(counter.calls() - base, 1, "list: one evaluation");
 
     let base = counter.calls();
-    svc.get(&ctx, &key(&refs[2].0)).await.expect("get");
+    svc.get_record(&ctx, &key(&refs[2].0)).await.expect("get");
     assert_eq!(counter.calls() - base, 1, "point read: one evaluation");
 }
 

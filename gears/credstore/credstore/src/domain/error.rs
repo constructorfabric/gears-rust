@@ -25,6 +25,11 @@ pub enum DomainError {
     /// resolution does not continue to an ancestor's value.
     #[error("secret expired")]
     SecretExpired,
+    /// The record's stored version can never be read (the backend holds it
+    /// but cannot return it, or it is gone although the pointer did not
+    /// move). Permanent: the record must be rewritten or deleted.
+    #[error("secret unreadable")]
+    SecretUnreadable,
     #[error("version precondition failed")]
     VersionConflict,
     #[error("invalid precondition: {detail}")]
