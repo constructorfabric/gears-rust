@@ -4,7 +4,7 @@ date: 2026-09-18
 ---
 
 Created:  2026-09-18 by Constructor Tech
-Updated:  2026-09-18 by Constructor Tech
+Updated:  2026-10-02 by Constructor Tech
 
 # ADR-0007: Two Write Verbs on One Address: PUT Replaces, PATCH Merges
 
@@ -49,7 +49,7 @@ Updated:  2026-09-18 by Constructor Tech
 
 ### PUT: whole replace, secret tri-state
 
-`PUT /credentials/{ref}` replaces the whole credential: `sharing` required; `type` required on create, immutable afterwards; `fallback` defaults to `inherit`, `expires_at` to none. `secret` has no default:
+`PUT /credentials/{ref}` replaces the whole credential: `sharing` required; `type` required on create, immutable afterwards; `fallback` defaults to `inherit`, `expires_at` to none. Because `PUT` is a whole replace, an omitted `expires_at` clears it and an omitted `fallback` resets to `inherit`; rotating only the secret is a `PATCH` carrying only `secret`. `secret` has no default:
 
 | `secret` in the body | Effect | Actions |
 |---|---|---|
