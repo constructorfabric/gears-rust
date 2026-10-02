@@ -22,7 +22,7 @@ use super::dry_run;
 pub use super::errors::{ItemFailure, WorkerError};
 use super::graph::BatchOrder;
 pub use super::outcome::{ItemOutcome, OperationOutcome};
-use super::outcome::{read_operation, stored_outcome};
+use super::outcome::{read_operation, registration_gts_id, stored_outcome};
 use super::revision::{CommittedUnit, RevisionCommit};
 pub use super::tuning::Tuning;
 use super::tuning::effective_force;
@@ -31,6 +31,7 @@ use super::vector::VectorDrift;
 use crate::domain::admission::AdmissionFailureReason;
 use crate::domain::admission::Precondition;
 use crate::domain::enums::{OperationItemStatus, OperationKind, OperationStatus};
+use crate::domain::key::EntityKey;
 use crate::domain::ports::metrics::{AdmissionMetrics, RefusalStage, TerminalStatus};
 use crate::domain::ports::{OperationItemRow, OperationRow, Stores, commit_write, snapshot_read};
 use crate::observability;
@@ -154,8 +155,9 @@ async fn commit_pass(
     })
 }
 
-/// Read deletion order in one snapshot: resolve candidate IDs, then their edges.
-/// Missing entities contribute no edges; their commits fail `precondition_failed`.
+/// Read deletion order in one snapshot: resolve candidate keys, then their edges.
+/// Missing entities contribute no edges; each commit resolves its key again
+/// under the write claim.
 async fn deletion_order(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
@@ -164,17 +166,17 @@ async fn deletion_order(
 ) -> Result<BatchOrder, WorkerError> {
     let stores_tx = Arc::clone(stores);
     let scope_tx = scope.clone();
-    // Only the identifiers cross into the closure: `order_deletions` reads
-    // nothing else from an item, and the rows carry the authored documents.
-    let gts_ids: Vec<String> = items.iter().map(|item| item.gts_id.clone()).collect();
+    // Only the keys cross into the closure: `order_deletions` reads nothing else
+    // from an item, and the rows carry the authored documents.
+    let keys: Vec<EntityKey> = items.iter().map(|item| item.key.clone()).collect();
     db.transaction_with_config(snapshot_read(&db.db()), move |tx| {
-        Box::pin(async move { order_deletions(stores_tx.as_ref(), tx, &scope_tx, &gts_ids).await })
+        Box::pin(async move { order_deletions(stores_tx.as_ref(), tx, &scope_tx, &keys).await })
     })
     .await
 }
 
 fn unit_span(operation_id: Uuid, item: &OperationItemRow) -> Span {
-    observability::unit_span(operation_id, &item.gts_id, item.kind, item.dry_run, item.id)
+    observability::unit_span(operation_id, &item.key, item.kind, item.dry_run, item.id)
 }
 
 /// Terminalize a candidate the batch refused before it could be evaluated — a
@@ -242,7 +244,7 @@ async fn prepare(
         db,
         scope,
         EvaluationTarget {
-            gts_id: &item.gts_id,
+            gts_id: registration_gts_id(item)?,
             canonical_body: payload,
             operation_item_id: item.id,
             precondition: item.precondition,
@@ -257,7 +259,7 @@ async fn prepare(
     let hit = matches!(&prepared, Ok(PreparedUnit::Unchanged(_)));
     tuning.metrics.unchanged_probe(hit);
     if hit {
-        tracing::debug!(operation_item_id = item.id, gts_id = %item.gts_id, "types_registry unchanged probe hit");
+        tracing::debug!(operation_item_id = item.id, gts_id = %item.key, "types_registry unchanged probe hit");
     }
     Ok(prepared)
 }
@@ -354,7 +356,7 @@ async fn process_deletion(
     let tx_scope = scope.clone();
     let tx_stores = Arc::clone(stores);
     let tx_limits = *tuning.limits;
-    let gts_id = item.gts_id.clone();
+    let key = item.key.clone();
     let item_id = item.id;
     let dry_run = item.dry_run;
     let span = Span::current();
@@ -363,38 +365,34 @@ async fn process_deletion(
         .transaction_with_retry(commit_write(&db.db()), retryable_db_err, |tx| {
             let tx_scope = tx_scope.clone();
             let tx_stores = Arc::clone(&tx_stores);
-            let gts_id = gts_id.clone();
+            let key = key.clone();
             let span = span.clone();
             Box::pin(async move {
                 let committed = deletion::commit_deletion(
                     tx_stores.as_ref(),
                     tx,
                     &tx_scope,
-                    &gts_id,
+                    &key,
                     expected,
                     &tx_limits,
                     &span,
                     now,
                 )
                 .await?;
-                match committed {
-                    Ok(commit) => {
-                        // Tombstone and item outcome must commit together: if the item
-                        // CAS loses (another pass already terminalized it), rolling back
-                        // the whole transaction ensures the tombstone does not outlive
-                        // the outcome that should accompany it.
-                        let outcome = commit.item_outcome(dry_run);
-                        let marked = tx_stores
-                            .mark_item_succeeded(tx, &tx_scope, item_id, outcome, now)
-                            .await?;
-                        if marked {
-                            Ok(Ok(commit))
-                        } else {
-                            Err(WorkerError::ItemAlreadyTerminal { item_id })
-                        }
+                if let Ok(commit) = &committed {
+                    // Tombstone and item outcome must commit together: if the item
+                    // CAS loses (another pass already terminalized it), rolling back
+                    // the whole transaction ensures the tombstone does not outlive
+                    // the outcome that should accompany it.
+                    let outcome = commit.item_outcome(dry_run);
+                    let marked = tx_stores
+                        .mark_item_succeeded(tx, &tx_scope, item_id, outcome, now)
+                        .await?;
+                    if !marked {
+                        return Err(WorkerError::ItemAlreadyTerminal { item_id });
                     }
-                    Err(failure) => Ok(Err(failure)),
                 }
+                Ok(committed)
             })
         })
         .await;
@@ -413,7 +411,8 @@ async fn process_deletion(
             tracing::info!(
                 %operation_id,
                 operation_item_id = item.id,
-                gts_id = %item.gts_id,
+                entity_key = %item.key,
+                gts_id = %commit.gts_id,
                 resource_version = commit.resource_version,
                 "types_registry entity deleted"
             );
@@ -424,7 +423,7 @@ async fn process_deletion(
             // one the tombstone now carries.
             let (revision_no, resource_version) = commit.item_outcome(item.dry_run).columns();
             Ok(ItemOutcome {
-                gts_id: item.gts_id.clone(),
+                key: item.key.clone(),
                 status: OperationItemStatus::Succeeded,
                 gts_uuid: Some(commit.gts_uuid),
                 resource_version,
@@ -494,7 +493,7 @@ async fn process_item(
                     db,
                     scope,
                     EvaluationTarget {
-                        gts_id: &item.gts_id,
+                        gts_id: registration_gts_id(item)?,
                         canonical_body: payload,
                         operation_item_id: item.id,
                         precondition: item.precondition,
@@ -564,7 +563,7 @@ async fn process_item(
                 tracing::info!(
                     %operation_id,
                     operation_item_id = item.id,
-                    gts_id = %item.gts_id,
+                    gts_id = %item.key,
                     attempt,
                     max_attempts = attempts,
                     drift = %drift,
@@ -642,7 +641,7 @@ fn committed_outcome(
             tracing::info!(
                 %operation_id,
                 operation_item_id = item.id,
-                gts_id = %item.gts_id,
+                gts_id = %item.key,
                 revision_no,
                 resource_version,
                 attempt,
@@ -650,7 +649,7 @@ fn committed_outcome(
             );
             metrics.candidate_terminalized(TerminalStatus::Succeeded, item.pass_labels());
             ItemOutcome {
-                gts_id: item.gts_id.clone(),
+                key: item.key.clone(),
                 status: OperationItemStatus::Succeeded,
                 gts_uuid: Some(gts_uuid),
                 // A dry run moved no version and allocated no revision, so
@@ -671,14 +670,14 @@ fn committed_outcome(
             tracing::info!(
                 %operation_id,
                 operation_item_id = item.id,
-                gts_id = %item.gts_id,
+                gts_id = %item.key,
                 resource_version,
                 attempt,
                 "types_registry candidate content already current"
             );
             metrics.candidate_terminalized(TerminalStatus::Unchanged, item.pass_labels());
             ItemOutcome {
-                gts_id: item.gts_id.clone(),
+                key: item.key.clone(),
                 status: OperationItemStatus::Unchanged,
                 gts_uuid: Some(gts_uuid),
                 resource_version: Some(resource_version),
@@ -737,12 +736,12 @@ async fn record_failure(
         tracing::warn!(
             %operation_id,
             operation_item_id = item.id,
-            gts_id = %item.gts_id,
+            entity_key = %item.key,
             reason = %failure.reason,
             "types_registry candidate refused"
         );
         return Ok(ItemOutcome {
-            gts_id: item.gts_id.clone(),
+            key: item.key.clone(),
             status: OperationItemStatus::Failed,
             gts_uuid: None,
             resource_version: None,

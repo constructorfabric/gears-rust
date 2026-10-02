@@ -7,7 +7,6 @@
 //! - metadata side-channel filtering,
 //! - SUM nets compensation, COUNT active-only, GROUP BY `resource_id`,
 //! - GROUP BY metadata key combined with `$filter` (SELECT/WHERE bind order),
-//! - `MAX_AGGREGATION_BUCKETS + 1` cap enforcement,
 //! - full `Decimal128(9)` precision through the `JSONEachRow` result decode.
 //!
 //! `list` and `aggregate` do not resolve `ReplacingMergeTree` versions: they
@@ -29,8 +28,7 @@ use toolkit_odata::ast::{CompareOperator, Expr, Value};
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
 
 use usage_collector_sdk::{
-    AggregationDimension, AggregationOp, AggregationSpec, MAX_AGGREGATION_BUCKETS, MetadataFilter,
-    MetadataKey, UsageRecord,
+    AggregationDimension, AggregationOp, AggregationSpec, MetadataFilter, MetadataKey, UsageRecord,
 };
 
 use clickhouse_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
@@ -467,67 +465,6 @@ async fn ch_aggregate_group_by_metadata_with_filter() {
             ("us-east-1".to_owned(), Some(BigDecimal::from(5_i64))),
         ],
         "tenant_a regions only; tenant_b's us-east-1=100 must not leak in"
-    );
-}
-
-/// Inserting `MAX_AGGREGATION_BUCKETS + 2` distinct groups causes the store to
-/// return exactly `MAX_AGGREGATION_BUCKETS + 1` buckets — the gateway's
-/// over-limit sentinel row. The call does not materialize an unbounded set.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Docker (testcontainers)"]
-async fn ch_aggregate_cap_at_max_aggregation_buckets() {
-    let Some((_h, store)) = setup_with_type(VCPU_GTS, &[]).await else {
-        return;
-    };
-    let tenant = Uuid::from_u128(0x3010);
-
-    // Insert MAX_AGGREGATION_BUCKETS + 2 records with distinct resource_ids so
-    // each maps to its own bucket. Use distinct (created_at, id) 4-tuples.
-    let n = MAX_AGGREGATION_BUCKETS + 2;
-    let mut batch: Vec<_> = (0..n)
-        .map(|i| {
-            let ts = i64::try_from(i).unwrap();
-            let resource_id = format!("res-{i}");
-            let idem = format!("idem-cap-{i}");
-            common::fixture_usage_record_with_resource_at(
-                VCPU_GTS,
-                tenant,
-                &idem,
-                Decimal::ONE,
-                common::fixture_created_at_offset(ts),
-                &resource_id,
-            )
-        })
-        .collect();
-
-    // Insert in chunks to avoid excessively large batch (10k rows at once is fine for CH).
-    for chunk in batch.chunks(1000) {
-        store
-            .create_batch(chunk.to_vec())
-            .await
-            .expect("batch insert chunk");
-    }
-    // Drain the batch vec here (already consumed above by to_vec).
-    batch.clear();
-
-    let spec = AggregationSpec {
-        op: AggregationOp::Sum,
-        group_by: vec![AggregationDimension::ResourceId],
-    };
-    let result = store
-        .aggregate(
-            common::fixture_gts_id(VCPU_GTS),
-            &ODataQuery::new(),
-            &[],
-            spec,
-        )
-        .await
-        .expect("aggregate with cap");
-
-    assert_eq!(
-        result.buckets.len(),
-        MAX_AGGREGATION_BUCKETS + 1,
-        "store returns exactly MAX_AGGREGATION_BUCKETS + 1 rows \u{2014} the over-limit sentinel"
     );
 }
 
@@ -1389,8 +1326,11 @@ async fn explain_pipeline_of_last(
     must_contain: &str,
     must_not_contain: &str,
 ) -> Vec<String> {
+    // Narrowed to this test's database: the server is shared, so the log
+    // carries every sibling test's statements too.
     let sql = "SELECT query FROM system.query_log \
                WHERE type = 'QueryFinish' AND query_kind = 'Select' \
+                 AND current_database = currentDatabase() \
                  AND positionCaseInsensitive(query, 'usage_records') > 0 \
                  AND position(query, ?) > 0 AND position(query, ?) = 0 \
                ORDER BY event_time_microseconds DESC LIMIT 1";

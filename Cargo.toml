@@ -79,6 +79,7 @@ members = [
     "libs/toolkit-stable-hash",
     "libs/toolkit-transport-grpc",
     "libs/toolkit-utils",
+    "libs/ai/toolkit-onnx-runtime",
     "libs/rustls-corecrypto-provider",
     "libs/rustls-fips-shim",
     "libs/toolkit-contract",
@@ -90,6 +91,10 @@ members = [
     "gears/credstore/credstore-sdk",
     "gears/credstore/credstore",
     "gears/credstore/plugins/static-credstore-plugin",
+    "gears/graph-storage/graph-storage-sdk",
+    "gears/graph-storage/graph-storage",
+    "gears/graph-storage/onnx-embedding-plugin",
+    "gears/graph-storage/remote-embedding-plugin",
     "gears/file-parser/file-parser-sdk",
     "gears/file-parser/file-parser",
     "gears/file-storage/file-storage-sdk",
@@ -113,7 +118,7 @@ members = [
     "gears/system/nodes-registry/nodes-registry-sdk",
     "gears/system/resource-group/resource-group-sdk",
     "gears/system/resource-group/resource-group",
-    "gears/system/gear-orchestrator",
+    "gears/system/service-discovery",
     "examples/toolkit/users-info/users-info-sdk",
     "examples/toolkit/users-info/users-info",
     "examples/toolkit/users-info/users-info-server",
@@ -339,6 +344,7 @@ toolkit-security = { package = "cf-gears-toolkit-security", version = "0.11.0", 
 toolkit-stable-hash = { package = "cf-gears-toolkit-stable-hash", version = "0.1.0", path = "libs/toolkit-stable-hash" }
 toolkit-transport-grpc = { package = "cf-gears-toolkit-transport-grpc", version = "0.9.0", path = "libs/toolkit-transport-grpc" }
 toolkit-utils = { package = "cf-gears-toolkit-utils", version = "0.7.2", path = "libs/toolkit-utils" }
+toolkit-onnx-runtime = { package = "cf-gears-toolkit-onnx-runtime", version = "0.1.0", path = "libs/ai/toolkit-onnx-runtime" }
 rustls-corecrypto-provider = { package = "cf-gears-rustls-corecrypto-provider", version = "0.1.3", path = "libs/rustls-corecrypto-provider" }
 rustls-fips-shim = { package = "cf-gears-rustls-fips-shim", version = "0.1.2", path = "libs/rustls-fips-shim" }
 # Windows CNG-backed rustls CryptoProvider (Windows-only FIPS path). Caret-pinned to 0.1.x;
@@ -430,10 +436,16 @@ aws-lc-rs = "1.17"
 
 # settings-service
 settings-service-sdk = { package = "cf-gears-settings-service-sdk", version = "0.1.0", path = "gears/settings-service/settings-service-sdk" }
-settings-service = { package = "cf-gears-settings-service", version = "0.1.2", path = "gears/settings-service/settings-service" }
+settings-service = { package = "cf-gears-settings-service", version = "0.1.3", path = "gears/settings-service/settings-service" }
 
 # credstore
 credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.17", path = "gears/credstore/credstore-sdk" }
+
+# graph-storage
+graph-storage = { package = "cf-gears-graph-storage", version = "0.1.4", path = "gears/graph-storage/graph-storage" }
+graph-storage-sdk = { package = "cf-gears-graph-storage-sdk", version = "0.1.1", path = "gears/graph-storage/graph-storage-sdk" }
+onnx-embedding-plugin = { package = "cf-gears-graph-storage-onnx-embedding-plugin", version = "0.1.0", path = "gears/graph-storage/onnx-embedding-plugin" }
+remote-embedding-plugin = { package = "cf-gears-graph-storage-remote-embedding-plugin", version = "0.1.0", path = "gears/graph-storage/remote-embedding-plugin" }
 
 # mini-chat
 mini-chat-sdk = { package = "cf-gears-mini-chat-sdk", version = "0.10.26", path = "gears/mini-chat/mini-chat-sdk" }
@@ -841,6 +853,11 @@ magika = "1.1"
 # unconditionally, not feature-gated) references an `OrtApi` struct field that only exists
 # at the api-24 ABI level; this is unrelated to which execution providers we actually use.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"] }
+# WordPiece tokenization for the MiniLM-class sentence model behind the
+# graph-storage ONNX embedding provider. Default features off deliberately:
+# they pull a progress bar, an HTTP downloader and a C++ suffix-array build,
+# none of which a gear that loads operator-supplied artifacts from disk wants.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 
 # Additional testing utilities
 mockall = "0.15"

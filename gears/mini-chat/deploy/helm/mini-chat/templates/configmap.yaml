@@ -84,7 +84,7 @@ data:
                 type: ip
               max_keys: 10000
 
-      gear-orchestrator:
+      service-discovery:
         config: {}
 
       grpc-hub:

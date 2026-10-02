@@ -1002,9 +1002,6 @@ mod integration {
     use std::time::Duration;
 
     use secrecy::ExposeSecret;
-    use testcontainers::ImageExt;
-    use testcontainers::core::WaitFor;
-    use testcontainers::runners::AsyncRunner;
 
     use super::super::{
         DEFAULT_RETENTION_SECS, INSERT_DEDUP_WINDOW_BLOCKS, apply_migrations, build_client,
@@ -1012,10 +1009,11 @@ mod integration {
         parse_ttl_seconds,
     };
     use crate::config::ClickHousePluginConfig;
+    use crate::infra::storage::test_ch_server;
 
-    /// Shared with every other `ClickHouse` fixture here; see the note on
-    /// `CH_PASSWORD` in `catalog_store_tests.rs`. MUST be non-empty.
-    const CH_PASSWORD: &str = "ch_test_pw";
+    /// Ceiling on bringing up this test's database on the shared server. Must
+    /// stay below the 300s per-test kill in the workspace `.config/nextest.toml`.
+    const START_BUDGET: Duration = Duration::from_secs(240);
 
     /// `gts_id` for the row whose `created_at` sits past `DateTime`'s 2106
     /// ceiling, proving a `DateTime64` TTL does not expire it on write.
@@ -1037,41 +1035,24 @@ mod integration {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn apply_migrations_creates_tables() {
-        // Image and tag come from `test_containers`, never a local literal:
-        // `cargo xtask check-test-container-pins` enforces it. `WaitFor::Nothing`
-        // is deliberate — see the note in `catalog_store_tests.rs`.
-        let image = test_containers::clickhouse()
-            .with_wait_for(WaitFor::Nothing)
-            .with_env_var("CLICKHOUSE_USER", "default")
-            .with_env_var("CLICKHOUSE_PASSWORD", CH_PASSWORD)
-            .with_env_var("CLICKHOUSE_DB", "default");
-
-        let container = image
-            .start()
-            .await
-            .expect("ClickHouse container must start");
-
-        let port = container
-            .get_host_port_ipv4(8123)
-            .await
-            .expect("container port 8123 must be mapped");
-        let url = format!("http://default:{CH_PASSWORD}@127.0.0.1:{port}/default");
+        let (port, database) = tokio::time::timeout(START_BUDGET, async {
+            let port = test_ch_server::server_port()
+                .await
+                .unwrap_or_else(|e| panic!("the shared ClickHouse test server must come up: {e}"));
+            let database = test_ch_server::fresh_database(port)
+                .await
+                .unwrap_or_else(|e| panic!("the per-test database must be created: {e}"));
+            (port, database)
+        })
+        .await
+        .unwrap_or_else(|_elapsed| panic!("live bring-up must finish within {START_BUDGET:?}"));
+        let password = test_ch_server::PASSWORD;
+        let url = format!("http://default:{password}@127.0.0.1:{port}/{database}");
 
         let cfg: ClickHousePluginConfig = serde_json::from_str(&format!(
             r#"{{"database_url": "{url}", "allow_insecure_http": true}}"#
         ))
         .expect("valid test config");
-
-        let probe = clickhouse::Client::default()
-            .with_url(format!("http://127.0.0.1:{port}/"))
-            .with_user("default")
-            .with_password(CH_PASSWORD);
-        for _ in 0..120u8 {
-            if probe.query("SELECT 1").fetch_one::<u8>().await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
 
         let endpoint =
             parse_endpoint(cfg.database_url.expose_secret()).expect("parseable test URL");

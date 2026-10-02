@@ -1,0 +1,7 @@
+{
+  "gts_id": "gts.cf.e2e.discovery.device.v1~cf.e2e.discovery.sensor.v1",
+  "content": {
+    "serial": "S001",
+    "payload": {}
+  }
+}

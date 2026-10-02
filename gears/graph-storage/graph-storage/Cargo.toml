@@ -1,0 +1,100 @@
+[package]
+name = "cf-gears-graph-storage"
+version = "0.1.4"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "Graph Storage gear: typed, multi-tenant knowledge graph with search and traversal over a pluggable store"
+keywords = ["constructorfabric", "cf-gears", "graph", "knowledge-graph"]
+categories = ["database"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "graph_storage"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+integration = []
+# The in-memory `GraphStoreV1` / `GraphEngineV1` double. Consumed by this
+# crate's own tests and by the conformance suite in `tests/`, which sees the
+# crate as any other dependency would -- so `#[cfg(test)]` alone cannot reach
+# it and the module would otherwise compile into a release artifact, ~2,800
+# lines of test fixture reachable by anything with an edge on this crate.
+test-support = []
+# The in-process ONNX embedding provider (ADR-0004's default). Off by default:
+# it pulls in ONNX Runtime bindings, and a deployment that has not been given
+# model artifacts cannot use it anyway. Mirrors file-parser's `magika`.
+onnx = ["dep:onnx-embedding-plugin"]
+# The remote embedding provider (ADR-0004's alternative): an OpenAI-compatible
+# `/embeddings` endpoint. Off by default for the same reason `onnx` is — a
+# deployment selects one provider, and links only what it selected.
+remote = ["dep:remote-embedding-plugin"]
+
+[dependencies]
+graph-storage-sdk = { workspace = true }
+onnx-embedding-plugin = { workspace = true, optional = true }
+remote-embedding-plugin = { workspace = true, optional = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
+jsonschema = { workspace = true }
+gts = { workspace = true }
+aws-lc-rs = { workspace = true }
+hex = { workspace = true }
+
+axum = { workspace = true, features = ["macros"] }
+http = { workspace = true }
+
+toolkit = { workspace = true }
+authz-resolver = { workspace = true }
+authz-resolver-sdk = { workspace = true }
+toolkit-canonical-errors = { workspace = true, features = ["axum", "utoipa"] }
+toolkit-http = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-odata-macros = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+sea-orm = { workspace = true, features = ["postgres-vector"] }
+sea-orm-migration = { workspace = true }
+toolkit-db = { workspace = true, features = ["pg", "pgq"] }
+toolkit-db-macros = { workspace = true }
+
+[dev-dependencies]
+# Re-imports this crate with `test-support` on, so the in-memory double is
+# available to `tests/`. Cargo unifies the lib-under-test edge with this one
+# into a single compilation, exactly as bss-pricing does for its own harness.
+graph-storage = { package = "cf-gears-graph-storage", path = ".", features = ["test-support"] }
+test-containers = { workspace = true }
+# The executable plugin contracts: every provider and store implementation
+# proves itself against the same assertions, wherever it lives.
+graph-storage-sdk = { workspace = true, features = ["test-support"] }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Deliberately *not* `integration`. That feature gates toolkit-db's own
+# Docker-backed tests, and cargo unifies features across a workspace build —
+# so asking for it here turns those tests on for every `cargo test
+# --workspace` in the repository, including the macOS lane, which has no
+# Docker and fails on them. Nothing in this gear's tests needs it:
+# `run_migrations_for_testing` is not behind it.
+toolkit-db = { workspace = true, features = ["pg", "pgq"] }
+# Drives the gear's own axum router in-process: the REST cases send real
+# requests through it rather than calling the handlers as functions.
+tower = { workspace = true }

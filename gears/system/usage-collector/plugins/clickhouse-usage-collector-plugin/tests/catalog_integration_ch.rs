@@ -593,8 +593,11 @@ async fn ch_usage_type_catalog_insert_is_synchronous() {
     // backtick-quotes the identifier (``INSERT INTO `usage_type_catalog`(…)``),
     // so a prefix match on the unquoted name finds nothing. `query_kind` already
     // restricts to inserts, and `usage_records` is not a substring of this name.
+    // Narrowed to this test's database: the server is shared, so the log
+    // carries every sibling test's inserts too.
     let sql = "SELECT Settings['async_insert'] FROM system.query_log \
                WHERE type = 'QueryFinish' AND query_kind = 'Insert' \
+                 AND current_database = currentDatabase() \
                  AND positionCaseInsensitive(query, 'usage_type_catalog') > 0 \
                ORDER BY event_time_microseconds DESC LIMIT 1";
 

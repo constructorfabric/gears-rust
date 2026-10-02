@@ -1614,22 +1614,22 @@
         "additionalProperties": false,
         "description": "One key in a batch read.",
         "properties": {
+          "entity_key": {
+            "description": "A canonical GTS identifier or a Registry Reference UUID, classified exactly\nas `GET /entities/{entity_key}` classifies its path segment.",
+            "maxLength": 1024,
+            "type": "string"
+          },
           "if_none_match": {
-            "description": "This key's validator from an earlier read, which makes just this key\nconditional. The field the two header names lowercase to — `if_none_match`\ngoing out, `etag` coming back — because one `If-None-Match` header cannot\nrepresent a batch of them (DESIGN §3.3).\n\n**No read emits a validator yet:** T29 adds `etag` to a result and the\ncomparison behind it. Until then no value a caller could hold can match, so\nevery present key is read unconditionally and answers `found` — which is\nwhat a stale validator does after T29 too. The field is declared now so the\nwire shape does not change under the callers T23 migrates.",
+            "description": "A prior `etag` for this key and `$select`; a match returns `unchanged`.\nBatch validators are per item. Exactly one entity-tag, weak or strong:\n`*`, an unquoted value or a list is refused rather than read as no condition.",
             "maxLength": 1024,
             "type": [
               "string",
               "null"
             ]
-          },
-          "key": {
-            "description": "A canonical GTS identifier or a Registry Reference UUID, classified exactly\nas `GET /entities/{entity_key}` classifies its path segment.",
-            "maxLength": 1024,
-            "type": "string"
           }
         },
         "required": [
-          "key"
+          "entity_key"
         ],
         "type": "object"
       },
@@ -5381,20 +5381,115 @@
         "additionalProperties": false,
         "description": "A batch deletion target, resolved like `GET /entities/{entity_key}`.",
         "properties": {
+          "entity_key": {
+            "description": "A canonical GTS identifier or a Registry Reference UUID.",
+            "maxLength": 1024,
+            "type": "string"
+          },
           "expected_resource_version": {
             "description": "Required positive version; optional internally for uniform validation errors.",
             "format": "int64",
             "minimum": 1,
             "type": "integer"
-          },
-          "key": {
-            "description": "A canonical GTS identifier or a Registry Reference UUID.",
-            "type": "string"
           }
         },
         "required": [
-          "key",
+          "entity_key",
           "expected_resource_version"
+        ],
+        "type": "object"
+      },
+      "DeletionItemDto": {
+        "description": "One deletion target's durable outcome.",
+        "properties": {
+          "entity_key": {
+            "description": "The target's key, whether or not it named an entity: a GTS identifier as\nthe request spelled it (only the canonical spelling is accepted), or a\nRegistry Reference in canonical lowercase hyphenated form, however the\nrequest spelled the UUID.",
+            "type": "string"
+          },
+          "error": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OperationItemErrorDto",
+                "description": "Present when this target failed."
+              }
+            ]
+          },
+          "resource_version": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationItemStatusDto"
+          }
+        },
+        "required": [
+          "entity_key",
+          "status"
+        ],
+        "type": "object"
+      },
+      "DeletionKindDto": {
+        "description": "The discriminator of a deletion operation.",
+        "enum": [
+          "deletion"
+        ],
+        "type": "string"
+      },
+      "DeletionOperationDto": {
+        "description": "A deletion operation.",
+        "properties": {
+          "completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DeletionItemDto"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DeletionKindDto"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationStatusDto",
+            "description": "Progress only — the outcomes are on the items and are deliberately not\naggregated here."
+          }
+        },
+        "required": [
+          "operation_id",
+          "kind",
+          "dry_run",
+          "status",
+          "created_at",
+          "items"
         ],
         "type": "object"
       },
@@ -6201,7 +6296,7 @@
         "type": "string"
       },
       "EntityLookupDto": {
-        "description": "One key's answer, echoing the key it was asked by.\n\nThe echo is not redundant: a caller that mixed identifiers and Registry\nReferences matches answers to questions without re-deriving either, and an\nabsence has no entity to carry the key for it.",
+        "description": "One key's answer, echoing the key it was asked by.\n\nThe echo is not redundant: batch order is not contractual, so a caller matches\nanswers to questions by it, and an absence has no entity to carry the key for\nit. A caller normalizes its own UUID keys before matching. A Registry Reference is echoed\nlowercase and hyphenated however the request spelled it, as an operation\nechoes it; an identifier is echoed as sent.",
         "properties": {
           "entity": {
             "oneOf": [
@@ -6210,33 +6305,41 @@
               },
               {
                 "$ref": "#/components/schemas/EntityDto",
-                "description": "The selected fields, exactly as the exact read returns them for the same\n`$select`. Absent on `not_found`."
+                "description": "The selected fields, exactly as the exact read returns them for the same\n`$select`. Present only on `found`."
               }
             ]
           },
-          "key": {
+          "entity_key": {
             "type": "string"
+          },
+          "etag": {
+            "description": "The validator for this key under this `$select`, byte-identical to the exact\nread's `ETag`. Present unless `not_found`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "status": {
             "$ref": "#/components/schemas/EntityLookupStatusDto"
           }
         },
         "required": [
-          "key",
+          "entity_key",
           "status"
         ],
         "type": "object"
       },
       "EntityLookupStatusDto": {
-        "description": "`found` or `not_found`.\n\nDESIGN's `unchanged` arrives with T29's validators and its `failed` needs\nfederation, which is out of P0 (SPEC §2). Declaring either now would publish a\nvocabulary value this gear never emits, which a generated client would\ntype-check against.",
+        "description": "`found`, `unchanged` or `not_found`.\n\nDESIGN's `failed` needs federation, which is out of P0 (SPEC §2); declaring it\nwould publish a value this gear never emits.",
         "enum": [
           "found",
+          "unchanged",
           "not_found"
         ],
         "type": "string"
       },
       "EntityLookupsDto": {
-        "description": "The results of one batch read, in request order.",
+        "description": "One answer per distinct key in a batch read. Result order is not contractual.",
         "properties": {
           "items": {
             "items": {
@@ -10459,112 +10562,35 @@
         "type": "object"
       },
       "OperationDto": {
-        "description": "An operation as a caller polls it.",
-        "properties": {
-          "completed_at": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
+        "description": "An operation as a caller polls it; `kind` selects the item shape.",
+        "discriminator": {
+          "mapping": {
+            "deletion": "#/components/schemas/DeletionOperationDto",
+            "registration": "#/components/schemas/RegistrationOperationDto"
           },
-          "created_at": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "dry_run": {
-            "type": "boolean"
-          },
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/OperationItemDto"
-            },
-            "type": "array"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/OperationKindDto"
-          },
-          "operation_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "started_at": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "status": {
-            "$ref": "#/components/schemas/OperationStatusDto",
-            "description": "Progress only — the outcomes are on the items and are deliberately not\naggregated here."
-          }
+          "propertyName": "kind"
         },
-        "required": [
-          "operation_id",
-          "kind",
-          "dry_run",
-          "status",
-          "created_at",
-          "items"
-        ],
-        "type": "object"
-      },
-      "OperationItemDto": {
-        "description": "One candidate's durable outcome.",
-        "properties": {
-          "error": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/OperationItemErrorDto",
-                "description": "Present when this candidate failed."
-              }
-            ]
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/RegistrationOperationDto"
           },
-          "gts_id": {
-            "type": "string"
-          },
-          "resource_version": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "status": {
-            "$ref": "#/components/schemas/OperationItemStatusDto"
+          {
+            "$ref": "#/components/schemas/DeletionOperationDto"
           }
-        },
-        "required": [
-          "gts_id",
-          "status"
-        ],
-        "type": "object"
+        ]
       },
       "OperationItemErrorDto": {
         "description": "Why a candidate failed. `reason` is a stable code and may be one the client\ndoes not know; `message` is for humans and must not be parsed.",
         "properties": {
-          "dependency_id": {
-            "description": "The missing dependency, for `dependency_not_found`.",
-            "type": "string"
-          },
-          "dependency_kind": {
-            "description": "`base`, `conforming_type` or `ref`; newer writers may add kinds.",
-            "type": "string"
-          },
-          "error_code": {
-            "description": "Stable diagnostic code of a `system_failure`.",
-            "type": "string"
+          "context": {
+            "additionalProperties": {},
+            "description": "Reason-specific details, `{}` when there are none: `dependency_id` and\n`dependency_kind` for `dependency_*`, `diagnostic_code` for `system_failure`.\nClients ignore keys they do not know.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
           },
           "message": {
-            "type": "string"
-          },
-          "operation_id": {
-            "description": "The operation a `system_failure` terminalized.",
-            "format": "uuid",
             "type": "string"
           },
           "reason": {
@@ -10573,7 +10599,8 @@
         },
         "required": [
           "reason",
-          "message"
+          "message",
+          "context"
         ],
         "type": "object"
       },
@@ -10585,14 +10612,6 @@
           "succeeded",
           "unchanged",
           "failed"
-        ],
-        "type": "string"
-      },
-      "OperationKindDto": {
-        "description": "`registration` or `deletion`.",
-        "enum": [
-          "registration",
-          "deletion"
         ],
         "type": "string"
       },
@@ -16407,6 +16426,100 @@
         ],
         "type": "object"
       },
+      "RegistrationItemDto": {
+        "description": "One registration candidate's durable outcome.",
+        "properties": {
+          "error": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OperationItemErrorDto",
+                "description": "Present when this candidate failed."
+              }
+            ]
+          },
+          "gts_id": {
+            "description": "A registration names only identifiers, so this is always the submitted one.",
+            "type": "string"
+          },
+          "resource_version": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationItemStatusDto"
+          }
+        },
+        "required": [
+          "gts_id",
+          "status"
+        ],
+        "type": "object"
+      },
+      "RegistrationKindDto": {
+        "description": "The discriminator of a registration operation.",
+        "enum": [
+          "registration"
+        ],
+        "type": "string"
+      },
+      "RegistrationOperationDto": {
+        "description": "A registration operation.",
+        "properties": {
+          "completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RegistrationItemDto"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/RegistrationKindDto"
+          },
+          "operation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/OperationStatusDto",
+            "description": "Progress only — the outcomes are on the items and are deliberately not\naggregated here."
+          }
+        },
+        "required": [
+          "operation_id",
+          "kind",
+          "dry_run",
+          "status",
+          "created_at",
+          "items"
+        ],
+        "type": "object"
+      },
       "ReidentifyRequestDto": {
         "description": "`POST …/audit/reidentify` request body: the payer to re-identify + the\nmachine `reason_code`. The free-text `reason` is the **`X-Investigation-Reason`\nheader** (§5), not a body field; both reason and `reason_code` are required\n(a missing one is rejected `MISSING_INVESTIGATION_REASON`).",
         "properties": {
@@ -19114,6 +19227,7 @@
           },
           "gts_id": {
             "description": "The canonical GTS identifier. A non-canonical spelling is refused rather\nthan normalized.",
+            "maxLength": 1024,
             "type": "string"
           }
         },
@@ -45768,106 +45882,6 @@
         ]
       }
     },
-    "/gear-orchestrator/v1/gears": {
-      "get": {
-        "description": "Returns a list of all compiled-in and out-of-process gears with their capabilities, dependencies, running instances, and deployment mode.",
-        "operationId": "gear_orchestrator.list_gears",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/GearDto"
-                  },
-                  "type": "array"
-                }
-              }
-            },
-            "description": "List of registered gears"
-          },
-          "400": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Bad Request"
-          },
-          "401": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Unauthorized"
-          },
-          "403": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Forbidden"
-          },
-          "404": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Not Found"
-          },
-          "409": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Conflict"
-          },
-          "429": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Too Many Requests"
-          },
-          "500": {
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            },
-            "description": "Internal Server Error"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "summary": "List all registered gears",
-        "tags": [
-          "Gear Orchestrator"
-        ]
-      }
-    },
     "/github-mirror/v1/health": {
       "get": {
         "description": "Reports that the github-mirror gear is loaded and serving requests",
@@ -54313,6 +54327,106 @@
         ]
       }
     },
+    "/service-discovery/v1/gears": {
+      "get": {
+        "description": "Returns a list of all compiled-in and out-of-process gears with their capabilities, dependencies, running instances, and deployment mode.",
+        "operationId": "service_discovery.list_gears",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/GearDto"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of registered gears"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List all registered gears",
+        "tags": [
+          "Service Discovery"
+        ]
+      }
+    },
     "/settings-service/v1/categories": {
       "get": {
         "description": "List categories visible to the caller, ordered by sort order then name. Supports OData `$filter` over `key`, `name` and `domain_affinity`, and `$orderby` over `key` and `name`, with cursor pagination. `$orderby` over `domain_affinity` is refused: it may be empty, and a page cursor cannot carry an empty value. `$select` is not supported and is rejected rather than ignored.",
@@ -59666,7 +59780,7 @@
     },
     "/types-registry/v2/entities/{entity_key}": {
       "delete": {
-        "description": "Delete a single entity named by canonical GTS identifier or Registry Reference UUID, resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. One item's worth of :batchDelete. Returns 202 with the operation's Location; a stale version is reported as a terminal `precondition_failed` item rather than a 412, and If-Match is refused rather than ignored.",
+        "description": "Delete a single entity named by canonical GTS identifier or Registry Reference UUID, spelled as GET /types-registry/v2/entities/{entity_key} takes it and resolved by the worker. One item's worth of :batchDelete. Returns 202 with the operation's Location; a stale version is reported as a terminal `precondition_failed` item rather than a 412, and If-Match is refused rather than ignored.",
         "operationId": "types_registry.delete_entity",
         "parameters": [
           {
@@ -59855,7 +59969,7 @@
         ]
       },
       "get": {
-        "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it; a key over 1024 bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group. Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted.",
+        "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it; a key over 1024 bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group. Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted. The `ETag` is scoped to the `$select`; `If-None-Match` with a current one returns a bodyless 304.",
         "operationId": "types_registry.get_entity",
         "parameters": [
           {
@@ -59863,6 +59977,15 @@
             "in": "path",
             "name": "entity_key",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "An earlier `ETag` of this key under the same `$select`, or `*`",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -59886,7 +60009,26 @@
                 }
               }
             },
-            "description": "The requested entity"
+            "description": "The requested entity",
+            "headers": {
+              "ETag": {
+                "description": "The validator of this key under this `$select`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "The If-None-Match validator is current",
+            "headers": {
+              "ETag": {
+                "description": "The validator of this key under this `$select`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -59982,7 +60124,7 @@
     },
     "/types-registry/v2/entities:batchDelete": {
       "post": {
-        "description": "Submit one or more entities for deletion. Each item names its target in `key` (a canonical GTS identifier or the Registry Reference UUID derived from it) and carries a required positive `expected_resource_version`. Returns 202 with the operation's Location; poll GET /types-registry/v2/operations/{operation_id} for the per-item outcome. Outcomes are keyed by GTS identifier and reported in request order, so a caller that deleted by Registry Reference matches results to requests by position. A stale version is not a 412: it is reported as a terminal `precondition_failed` item on the operation.",
+        "description": "Submit one or more entities for deletion. Each item names its target in `entity_key` (a canonical GTS identifier or the Registry Reference UUID derived from it) and carries a required positive `expected_resource_version`. Returns 202 with the operation's Location; poll GET /types-registry/v2/operations/{operation_id} for the per-item outcome. Outcomes are reported in request order and echo each key as `entity_key`, a Registry Reference in canonical lowercase hyphenated form; a Registry Reference naming no entity fails only its own item. A stale version is not a 412: it is reported as a terminal `precondition_failed` item on the operation, and If-Match is refused rather than ignored.",
         "operationId": "types_registry.batch_delete_entities",
         "parameters": [
           {
@@ -60185,7 +60327,7 @@
     },
     "/types-registry/v2/entities:batchGet": {
       "post": {
-        "description": "Read up to 100 entities in one round trip. Each item names one entity in `key` (a canonical GTS identifier or the Registry Reference UUID derived from it), resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. A top-level `$select` string applies to every key and follows that route's `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result per requested key, in request order and echoing the key it was asked by: `found` with the selected fields, exactly as the exact read returns them and always including `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`, or `not_found`. Query parameters are refused, `$select` included. A key named twice collapses onto its first mention; the two spellings of one entity are two keys and get two results. An absent key is not a 404: one missing key must not lose the answers for the others. The If-None-Match header is refused rather than ignored: validators are per key and belong in each item's `if_none_match`.",
+        "description": "Read up to 100 entities in one round trip. Each item names one entity in `entity_key` (a canonical GTS identifier or the Registry Reference UUID derived from it), resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. A top-level `$select` string applies to every key and follows that route's `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry Reference in canonical lowercase hyphenated form: `found` with the selected fields, exactly as the exact read returns them and always including `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`, or `not_found`. Every result but `not_found` carries the key's `etag`; an item whose `if_none_match` is still current answers `unchanged` without the entity. Query parameters are refused, `$select` included. A key named twice, in any UUID spelling, collapses onto its first mention and its condition; the identifier and the Registry Reference of one entity are two keys and get two results. An absent key is not a 404: one missing key must not lose the answers for the others. The If-None-Match header is refused rather than ignored: validators are per key and belong in each item's `if_none_match`.",
         "operationId": "types_registry.batch_get_entities",
         "requestBody": {
           "content": {

@@ -666,7 +666,7 @@ GEAR_COVERAGE_ARGS := $(if $(GEAR),--package $(firstword $(subst -p ,,$(GEAR_PKG
 # Base features always enabled when running a focused server.
 GEAR_SERVER_BASE_FEATURES ?= static-tenants,static-authn,static-authz
 # System gears that are non-optional deps of the example server (always linked).
-GEAR_SERVER_ALWAYS_LINKED ?= api-gateway gear-orchestrator types-registry tenant-resolver authn-resolver authz-resolver
+GEAR_SERVER_ALWAYS_LINKED ?= api-gateway service-discovery types-registry tenant-resolver authn-resolver authz-resolver
 # Check whether GEAR is a valid example-server feature or an always-linked gear.
 # When GEAR has no server feature (e.g. toolkit-db, toolkit-http), server-dependent
 # targets (run, openapi, e2e-local) are skipped; library-safe targets still work.
@@ -692,7 +692,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -740,6 +740,35 @@ test-pgq: install-tools
 	cargo nextest run -p cf-gears-toolkit-db --features pgq,integration \
 		-E 'kind(lib) | binary(mod) | binary(ui)'
 
+## Run the graph-storage gear's database-free suites: unit tests, the
+## in-memory conformance lane, the domain-service and REST lanes. The
+## PostgreSQL lanes skip here; `test-graph-storage-pg` runs them.
+test-graph-storage: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk
+
+## Run the graph-storage gear's PostgreSQL 19 lane: the same conformance
+## suite against the built-in store, plus the SQL/PGQ cases that only a real
+## server can answer. It needs an image carrying PostgreSQL 19 **and**
+## pgvector — `test_containers::postgres_graph()` pins a stock 19beta
+## alpine, which has only the former — so point GEARS_TEST_PG_GRAPH_IMAGE at
+## one until the platform pin carries both. GEARS_TEST_PG_GRAPH_REQUIRED=1
+## turns "no such image, skipping" into a failure, so CI cannot go green by
+## running nothing; that is the default here, because a target whose whole
+## purpose is the database has no business passing without one.
+## Every case in this lane gets its own PostgreSQL instance (two of them are
+## operator surgery on server-wide state), and more than a handful at once is
+## more than Docker and PostgreSQL will take: the pools time out and a
+## different case fails on each run. nextest runs each case in its own
+## process, so the bound has to be its own — GRAPH_PG_TEST_THREADS raises it
+## on a host with the memory for it. Two is what held on an 8-core, 23 GiB
+## developer machine; four failed about half its runs there.
+GRAPH_PG_TEST_THREADS ?= 2
+test-graph-storage-pg: install-tools
+	$(call print_target_banner)
+	GEARS_TEST_PG_GRAPH_REQUIRED=1 cargo nextest run -p cf-gears-graph-storage \
+		--test pg_conformance --test-threads=$(GRAPH_PG_TEST_THREADS)
+
 ## Run MySQL integration tests
 test-mysql: install-tools
 	$(call print_target_banner)
@@ -761,7 +790,9 @@ test-usage-collector-pg: install-tools
 	cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres
 
 ## Run ClickHouse usage-collector plugin integration tests (Docker required;
-## the suite spins up its own clickhouse container via testcontainers).
+## every test gets its own database on one shared, named clickhouse container,
+## `uc-clickhouse-test-harness-<tag>`, which is reused across runs — remove it
+## with `docker rm -fv` to start clean).
 ## `--run-ignored all` because the suite is double-gated: the `clickhouse`
 ## feature compiles the test files, and every Docker-backed test inside them is
 ## `#[ignore]`d. CH_REQUIRE_DOCKER=1 turns an unreachable Docker into a panic —
@@ -854,6 +885,15 @@ coverage-cluster-k8s:
 ## gears/system/resource-group/resource-group/tests/pg_smoke_test.rs)
 test-rg-pg: install-tools
 	cargo nextest run -p cf-gears-resource-group --features integration
+
+## Run the settings-service gear's PostgreSQL migration suite (Docker required;
+## spins up its own postgres container via testcontainers -- see
+## gears/settings-service/settings-service/tests/pg_migrations_test.rs). The
+## suites beside the gear's migrations run on SQLite, where a statement
+## PostgreSQL refuses can still pass; this lane runs the chain a stand's startup
+## runs, on the backend it runs it on.
+test-settings-service-pg: install-tools
+	cargo nextest run -p cf-gears-settings-service --features integration --test pg_migrations_test
 
 ## Run bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).

@@ -11,3 +11,8 @@ pub mod mapper;
 pub mod pool;
 pub mod query;
 pub mod record_store;
+
+/// The shared `ClickHouse` test server; also compiled into `tests/common`.
+#[cfg(all(test, feature = "clickhouse"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub(crate) mod test_ch_server;

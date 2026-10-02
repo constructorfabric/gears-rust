@@ -690,9 +690,6 @@ mod live {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use testcontainers::core::WaitFor;
-    use testcontainers::runners::AsyncRunner;
-    use testcontainers::{ContainerAsync, GenericImage, ImageExt};
     use tokio_util::sync::CancellationToken;
     use usage_collector_sdk::{UsageCollectorPluginError, UsageKind, UsageType, UsageTypeGtsId};
 
@@ -700,62 +697,40 @@ mod live {
     use crate::infra::metrics::Metrics;
     use crate::infra::storage::catalog_store::ChCatalogStore;
     use crate::infra::storage::pool::{apply_migrations, ensure_retention_ttl};
+    use crate::infra::storage::test_ch_server;
 
-    /// The one password every `ClickHouse` fixture in this repository uses —
-    /// `tests/common/mod.rs`, `pool_tests.rs` and `ClickHouseSidecar.DB_PASSWORD`
-    /// in `testing/e2e/lib/sidecars.py` all spell the same value. Nothing
-    /// depends on the lanes agreeing, but a single value means a reader who
-    /// greps it finds every `ClickHouse` fixture rather than one of four.
-    ///
-    /// MUST be non-empty; see the note on `CH_TEST_PASSWORD` in
-    /// `tests/common/mod.rs` for what the image's entrypoint does otherwise.
-    const CH_PASSWORD: &str = "ch_test_pw";
+    /// Ceiling on [`start`] as a whole: the shared server's boot (or the wait
+    /// for a sibling's), the per-test database, and the migrations. Must stay
+    /// below the 300s per-test kill in the workspace `.config/nextest.toml`.
+    const START_BUDGET: Duration = Duration::from_secs(240);
 
-    /// Start a `ClickHouse` container and apply migrations. Panics if Docker is unavailable.
-    async fn start() -> (
-        ChCatalogStore,
-        clickhouse::Client,
-        ContainerAsync<GenericImage>,
-    ) {
-        // Image and tag come from `test_containers`, never a local literal:
-        // `cargo xtask check-test-container-pins` enforces it. `WaitFor::Nothing`
-        // is not an oversight — this image logs to files under
-        // /var/log/clickhouse-server, so a log-based wait can only time out;
-        // readiness is the `SELECT 1` poll below.
-        let image = test_containers::clickhouse()
-            .with_wait_for(WaitFor::Nothing)
-            .with_env_var("CLICKHOUSE_USER", "default")
-            .with_env_var("CLICKHOUSE_PASSWORD", CH_PASSWORD)
-            .with_env_var("CLICKHOUSE_DB", "default");
+    /// Give this test its own database on the shared `ClickHouse` test server
+    /// and apply migrations. Panics if Docker is unavailable or the bring-up
+    /// does not finish within [`START_BUDGET`].
+    async fn start() -> (ChCatalogStore, clickhouse::Client) {
+        let client = tokio::time::timeout(START_BUDGET, async {
+            let port = test_ch_server::server_port()
+                .await
+                .unwrap_or_else(|e| panic!("the shared ClickHouse test server must come up: {e}"));
+            let database = test_ch_server::fresh_database(port)
+                .await
+                .unwrap_or_else(|e| panic!("the per-test database must be created: {e}"));
+            let client = clickhouse::Client::default()
+                .with_url(format!("http://127.0.0.1:{port}/"))
+                .with_user("default")
+                .with_password(test_ch_server::PASSWORD)
+                .with_database(database);
 
-        let container = image
-            .start()
-            .await
-            .expect("ClickHouse container must start");
-
-        let port = container
-            .get_host_port_ipv4(8123)
-            .await
-            .expect("container port 8123 must be mapped");
-        let client = clickhouse::Client::default()
-            .with_url(format!("http://127.0.0.1:{port}/"))
-            .with_user("default")
-            .with_password(CH_PASSWORD)
-            .with_database("default");
-
-        for _ in 0..120u8 {
-            if client.query("SELECT 1").fetch_one::<u8>().await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-
-        apply_migrations(&client, super::TEST_DEADLINE)
-            .await
-            .expect("schema migrations must succeed on the live test container");
-        ensure_retention_ttl(&client, 365 * 24 * 3600, super::TEST_DEADLINE)
-            .await
-            .expect("retention TTL reconcile must succeed on the live test container");
+            apply_migrations(&client, super::TEST_DEADLINE)
+                .await
+                .expect("schema migrations must succeed on the live test database");
+            ensure_retention_ttl(&client, 365 * 24 * 3600, super::TEST_DEADLINE)
+                .await
+                .expect("retention TTL reconcile must succeed on the live test database");
+            client
+        })
+        .await
+        .unwrap_or_else(|_elapsed| panic!("live bring-up must finish within {START_BUDGET:?}"));
 
         let store = ChCatalogStore::new(
             client.clone(),
@@ -763,7 +738,7 @@ mod live {
             Arc::new(Metrics::new()),
             super::TEST_DEADLINE,
         );
-        (store, client, container)
+        (store, client)
     }
 
     fn counter_gts_id(suffix: &str) -> UsageTypeGtsId {
@@ -784,7 +759,7 @@ mod live {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn create_silent_absorb_on_identical_resubmission() {
-        let (store, _client, _container) = start().await;
+        let (store, _client) = start().await;
         let ut = counter_usage_type("create_absorb_test");
 
         let first = store
@@ -808,7 +783,7 @@ mod live {
         use std::collections::BTreeSet;
         use usage_collector_sdk::MetadataKey;
 
-        let (store, _client, _container) = start().await;
+        let (store, _client) = start().await;
         let gts_id = counter_gts_id("create_conflict_test");
 
         let ut_counter = counter_usage_type("create_conflict_test");
@@ -847,7 +822,7 @@ mod live {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn delete_removes_an_unreferenced_type_synchronously() {
-        let (store, _client, _container) = start().await;
+        let (store, _client) = start().await;
         let ut = counter_usage_type("delete_unreferenced_test");
         let gts_id = ut.gts_id.clone();
         store.create(ut).await.expect("create must succeed");
@@ -872,7 +847,7 @@ mod live {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn delete_of_an_absent_type_is_not_found() {
-        let (store, _client, _container) = start().await;
+        let (store, _client) = start().await;
 
         let err = store
             .delete(counter_gts_id("delete_absent_test"))
@@ -893,7 +868,7 @@ mod live {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn a_deleted_type_can_be_recreated() {
-        let (store, _client, _container) = start().await;
+        let (store, _client) = start().await;
         let ut = counter_usage_type("delete_recreate_test");
         let gts_id = ut.gts_id.clone();
 
@@ -921,7 +896,7 @@ mod live {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn the_record_sweep_mutation_is_synchronous() {
-        let (store, client, _container) = start().await;
+        let (store, client) = start().await;
         let gts_id = counter_gts_id("sweep_mutation_test");
 
         // Seed an orphan directly: no catalog row, so this is exactly the

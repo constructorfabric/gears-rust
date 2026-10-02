@@ -107,9 +107,9 @@ gears:
       auth_disabled: true
       require_auth_by_default: true
 
-  gear-orchestrator:
+  service-discovery:
     config: {}
-    # No configuration needed for the gear orchestrator
+    # No configuration needed for service discovery
 
   grpc-hub:
     config:

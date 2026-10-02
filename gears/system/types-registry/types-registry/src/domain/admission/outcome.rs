@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use gts::GtsId;
 use toolkit_db::DBProvider;
 use toolkit_db::secure::AccessScope;
 use toolkit_macros::domain_model;
@@ -9,6 +10,7 @@ use uuid::Uuid;
 
 use super::errors::{ItemFailure, WorkerError};
 use crate::domain::enums::OperationItemStatus;
+use crate::domain::key::EntityKey;
 use crate::domain::ports::{OperationItemRow, OperationRow, Stores, snapshot_read};
 
 /// What one pass over an operation produced.
@@ -25,7 +27,10 @@ pub struct OperationOutcome {
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemOutcome {
-    pub gts_id: String,
+    /// The key the request named: always an identifier for a registration, and
+    /// for a deletion whichever key its target used — a Registry Reference stays
+    /// one whether or not it resolved. The resolved identity is `gts_uuid`.
+    pub key: EntityKey,
     pub status: OperationItemStatus,
     /// The Registry Reference of the admitted entity, on success.
     pub gts_uuid: Option<Uuid>,
@@ -62,6 +67,19 @@ pub(super) async fn read_operation(
     found.ok_or(WorkerError::OperationNotFound { operation_id })
 }
 
+/// A registration item's identifier: acceptance stores nothing else for one, and
+/// the repository refuses a row that names anything else, so this error is
+/// defence in depth rather than a path a reader handles.
+pub(super) fn registration_gts_id(item: &OperationItemRow) -> Result<&str, WorkerError> {
+    item.key
+        .gts_id()
+        .ok_or_else(|| WorkerError::StoredIdentifierUnparsable {
+            item_id: item.id,
+            gts_id: item.key.to_string(),
+            reason: "a registration item names a Registry Reference".to_owned(),
+        })
+}
+
 /// Reconstruct a terminal outcome, including Registry References on success.
 pub(super) fn stored_outcome(item: &OperationItemRow) -> Result<ItemOutcome, WorkerError> {
     let terminal_success = matches!(
@@ -70,20 +88,23 @@ pub(super) fn stored_outcome(item: &OperationItemRow) -> Result<ItemOutcome, Wor
     );
     // Do not hide corrupt identifiers behind a missing success UUID.
     let gts_uuid = if terminal_success {
-        Some(
-            gts::GtsId::try_new(&item.gts_id)
-                .map_err(|reason| WorkerError::StoredIdentifierUnparsable {
+        Some(match &item.key {
+            // Parsed here rather than through `EntityKey::gts_uuid`, which would
+            // drop the reason the operator needs to find the corruption.
+            EntityKey::GtsId(gts_id) => GtsId::try_new(gts_id)
+                .map_err(|e| WorkerError::StoredIdentifierUnparsable {
                     item_id: item.id,
-                    gts_id: item.gts_id.clone(),
-                    reason: reason.to_string(),
+                    gts_id: gts_id.clone(),
+                    reason: e.to_string(),
                 })?
                 .to_uuid(),
-        )
+            EntityKey::Uuid(gts_uuid) => *gts_uuid,
+        })
     } else {
         None
     };
     Ok(ItemOutcome {
-        gts_id: item.gts_id.clone(),
+        key: item.key.clone(),
         status: item.status,
         gts_uuid,
         resource_version: item.result_resource_version,

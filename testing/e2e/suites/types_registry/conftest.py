@@ -9,22 +9,15 @@ import uuid
 import httpx
 import pytest
 
+from .helpers import RECEIPT, TRACEPARENT, assert_operation, submit_and_poll
+
 
 SCENARIO_TESTS = pytest.StashKey[dict[str, list[str]]]()
-
-# Every request carries this valid W3C `traceparent`, so the wire `trace_id` the
-# canonical error layer echoes is deterministic. `extract_trace_id` prefers the
-# live OTel span, but the request span continues this inbound `traceparent`, so
-# its trace-id equals the header's; with OTel off the header is used directly.
-# Either way the value is TRACE_ID, the header's 32-hex trace-id segment. Uses
-# the W3C spec's example ids.
-TRACE_ID = "0af7651916cd43dd8448eb211c80319c"
-TRACEPARENT = f"00-{TRACE_ID}-b7ad6b7169203331-01"
 
 
 @pytest.fixture
 def registry_api_path():
-    """T24a changes this default to v1; there is intentionally no fallback."""
+    """Use the configured API version without an automatic fallback."""
     return f"types-registry/{os.getenv('TYPES_REGISTRY_API_VERSION', 'v2')}"
 
 
@@ -73,6 +66,62 @@ def registration_fixture():
 def deletion_fixture():
     """Load the files linked from scenarios/deletion.md."""
     return _topic_loader("deletion")
+
+
+@pytest.fixture
+def discovery_fixture():
+    """Load the inheritance trees linked from scenarios/discovery.md."""
+    return _topic_loader("discovery")
+
+
+@pytest.fixture
+def neighbour_discovery_fixture():
+    """The same trees in a second namespace, which a target pattern must exclude."""
+    return _topic_loader("discovery")
+
+
+@pytest.fixture
+def reading_fixture():
+    """Load authored documents and expected artifacts for read scenarios."""
+    return _topic_loader("reading")
+
+
+@pytest.fixture
+def given_registered(registry_http, registry_api_path):
+    """Register prerequisites and prove that every one of them committed.
+
+    The whole operation is compared, so a missing outcome fails the setup
+    instead of leaving an exclusion test with nothing to exclude.
+    """
+
+    async def register(*items):
+        operation = await submit_and_poll(
+            registry_http, registry_api_path, list(items), RECEIPT
+        )
+        assert_operation(
+            operation,
+            {
+                "operation_id": "<operation_id>",
+                "kind": "registration",
+                "dry_run": False,
+                "status": "completed",
+                "created_at": "<created_at>",
+                "started_at": "<started_at>",
+                "completed_at": "<completed_at>",
+                "items": [
+                    {
+                        "gts_id": item["gts_id"],
+                        "status": "succeeded",
+                        "resource_version": 1,
+                        "error": None,
+                    }
+                    for item in items
+                ],
+            },
+        )
+        return operation
+
+    return register
 
 
 def pytest_configure(config):

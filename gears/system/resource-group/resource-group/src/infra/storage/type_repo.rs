@@ -877,7 +877,7 @@ impl TypeRepositoryTrait for TypeRepository {
             |m: gts_type::Model| m,
         )
         .await
-        .map_err(|e| DomainError::database(e.to_string()))?;
+        .map_err(DomainError::from)?;
 
         // Resolve the junction references for the whole page in a constant
         // number of queries: one per junction table plus one combined

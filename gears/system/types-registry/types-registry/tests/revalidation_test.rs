@@ -31,7 +31,6 @@ use types_registry::domain::admission::worker::{
     OperationOutcome, Tuning, WorkerError, run_operation,
 };
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
-use types_registry::domain::enums as domain_enums;
 use types_registry::domain::enums::OperationItemStatus;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::ports::{
@@ -162,7 +161,6 @@ async fn submit(
         &dispatch,
         &SubmitRequest {
             idempotency_key: Some(key.to_owned()),
-            kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
                 gts_id: gts_id.to_owned(),
@@ -244,7 +242,10 @@ async fn submitted(
         &provider,
         &allow_all(),
         EvaluationTarget {
-            gts_id: &item.gts_id,
+            gts_id: item
+                .key
+                .gts_id()
+                .expect("a registration item names an identifier"),
             canonical_body: &payload,
             operation_item_id: item.id,
             precondition: item.precondition,
@@ -1381,4 +1382,55 @@ async fn a_commit_on_one_pod_is_visible_to_the_others_first_read() -> Result<(),
         "B reads A's newest authored document"
     );
     Ok(())
+}
+
+/// A deletion committed between a new referrer's evaluation and its commit
+/// moves the target's version, so the retry sees the tombstone and refuses.
+#[tokio::test]
+async fn a_target_deleted_after_evaluation_refuses_the_new_referrer() {
+    let dir = TestDir::new("types-registry-reval-deleted-target");
+    let db = test_db_file(&dir.path().join("registry.db")).await;
+    admit(&db, "base", BASE, base_schema("name"), None).await;
+    let operation_id = submit(&db, "referrer", REFERRER, referencing_schema("x"), None)
+        .await
+        .expect("acceptance");
+    let mutating = Arc::clone(&db);
+    let outcome = admit_with_a_mutation_in_the_gap(
+        &db,
+        worker_settings(),
+        operation_id,
+        move || async move {
+            let id = entity(&mutating, BASE).await.id;
+            let ports = stores();
+            worker(&mutating)
+                .transaction(move |tx| {
+                    Box::pin(async move {
+                        ports
+                            .claim_entity_write_order(tx, &allow_all(), LATER)
+                            .await?;
+                        assert_eq!(
+                            EntityRepo::mark_deleted(tx, &allow_all(), id, 1, LATER).await?,
+                            Some(2)
+                        );
+                        Ok(())
+                    })
+                })
+                .await
+                .expect("delete");
+        },
+    )
+    .await;
+    let failure = outcome.items[0].failure.as_ref().expect("refusal");
+    assert_eq!(failure.reason, AdmissionFailureReason::DependencyDeleted);
+    let dependency = failure.dependency.as_ref().expect("names the target");
+    assert_eq!(dependency.target, BASE);
+    assert_eq!(dependency.kind, "ref");
+    let conn = db.conn().expect("conn");
+    assert!(
+        EntityRepo::find_by_gts_id(&conn, &allow_all(), REFERRER)
+            .await
+            .expect("read")
+            .is_none(),
+        "the referrer was not admitted"
+    );
 }

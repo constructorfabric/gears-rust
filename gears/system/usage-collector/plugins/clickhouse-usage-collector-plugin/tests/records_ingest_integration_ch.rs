@@ -1024,7 +1024,9 @@ fn fixture_record_id_is_derived_from_its_own_dedup_key() {
 /// `system.query_log`.
 ///
 /// `query_log` is flushed asynchronously, so this flushes explicitly and then
-/// polls — the same shape as the harness's own readiness wait.
+/// polls — the same shape as the harness's own readiness wait. Narrowed to
+/// this test's database, because the server is shared and the log carries
+/// every sibling test's inserts too.
 ///
 /// The table is matched by *containment* of its bare name rather than against
 /// an `INSERT INTO <table>` prefix: the `clickhouse` crate backtick-quotes the
@@ -1046,6 +1048,7 @@ async fn last_insert_settings(
                       Settings['insert_deduplication_token'] \
                FROM system.query_log \
                WHERE type = 'QueryFinish' AND query_kind = 'Insert' \
+                 AND current_database = currentDatabase() \
                  AND positionCaseInsensitive(query, ?) > 0 \
                ORDER BY event_time_microseconds DESC LIMIT 1";
 

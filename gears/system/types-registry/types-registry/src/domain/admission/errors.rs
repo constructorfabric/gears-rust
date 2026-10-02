@@ -211,6 +211,21 @@ impl ItemFailure {
         }
     }
 
+    /// A new edge names a tombstone, which stays readable but is no target.
+    #[must_use]
+    pub fn deleted_dependency(dependency: DependencyEdge) -> Self {
+        let role = match dependency.kind {
+            DependencyKind::Derivation => "base type",
+            DependencyKind::InstanceOf => "conforming type",
+            DependencyKind::SchemaRef => "$ref target",
+        };
+        Self {
+            reason: AdmissionFailureReason::DependencyDeleted,
+            message: format!("{role} '{}' is deleted", dependency.target),
+            dependency: Some(dependency.into()),
+        }
+    }
+
     /// The stored `error_payload`: structured, so the reason survives the round
     /// trip as a field rather than as a substring.
     ///

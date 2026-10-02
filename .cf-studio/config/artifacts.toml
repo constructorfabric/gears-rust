@@ -50,8 +50,8 @@ reason = "Ignore module 'grpc-hub' (not SDLC-documented yet: missing required PR
 patterns = ["gears/system/grpc-hub/*"]
 
 [[ignore]]
-reason = "Ignore module 'gear-orchestrator' (not SDLC-documented yet: missing required PRD/DESIGN)."
-patterns = ["gears/system/gear-orchestrator/*"]
+reason = "Ignore module 'service-discovery' (not SDLC-documented yet: missing required PRD/DESIGN)."
+patterns = ["gears/system/service-discovery/*"]
 
 [[ignore]]
 reason = "Ignore module 'nodes-registry' (not SDLC-documented yet: missing required PRD/DESIGN)."

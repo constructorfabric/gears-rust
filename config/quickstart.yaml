@@ -157,9 +157,9 @@ gears:
             type: ip
           max_keys: 10000
 
-  gear-orchestrator:
+  service-discovery:
     config: {}
-    # No configuration needed for the gear orchestrator
+    # No configuration needed for the directory service
 
   grpc-hub:
     config:

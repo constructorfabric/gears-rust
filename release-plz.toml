@@ -207,6 +207,11 @@ name = "cf-gears-toolkit-utils"
 changelog_update = false
 git_release_enable = false
 
+[[package]]
+name = "cf-gears-toolkit-onnx-runtime"
+changelog_update = false
+git_release_enable = false
+
 # Contract layer (libs/toolkit-contract*) — same unified-release rule as the rest of the
 # framework.
 [[package]]

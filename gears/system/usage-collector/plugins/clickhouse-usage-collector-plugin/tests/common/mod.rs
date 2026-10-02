@@ -4,17 +4,19 @@
 #![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
 //! Shared `ClickHouse` test harness.
 //!
-//! Starts a `ClickHouse` container and applies the embedded schema migration.
-//! Requires Docker for `ClickHouse`. There is no coordination backend to
-//! register: the plugin uses none.
+//! Gives every test its own database on one shared `ClickHouse` container
+//! (see `src/infra/storage/test_ch_server.rs` for why one container, and how
+//! concurrent processes and runs share it) and applies the embedded schema
+//! migration. Requires Docker for `ClickHouse`. There is no coordination
+//! backend to register: the plugin uses none.
+
+#[path = "../../src/infra/storage/test_ch_server.rs"]
+mod ch_server;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use rust_decimal::Decimal;
-use testcontainers::core::WaitFor;
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -31,48 +33,52 @@ use clickhouse_usage_collector_plugin::infra::storage::pool::{
 };
 use clickhouse_usage_collector_plugin::infra::storage::record_store::ChRecordStore;
 
-/// Live testcontainer harness holding a `ClickHouse` container.
+/// Live harness: one test's own database on the shared `ClickHouse` server.
 pub struct ChHarness {
-    /// Configured `ClickHouse` HTTP client (pointing at the test container port).
+    /// Configured `ClickHouse` HTTP client, scoped to [`Self::database`].
     pub client: clickhouse::Client,
     /// Cancellation token for background workers spawned from this harness.
     pub cancel: CancellationToken,
-    /// Keep `ClickHouse` container alive.
-    _ch_container: ContainerAsync<GenericImage>,
+    /// This test's database on the shared server, for failure messages and
+    /// for poking at by hand.
+    pub database: String,
 }
 
 /// Password for the container's `default` user, exposed so tests can assert it
-/// never leaks (e.g. through a `Debug` impl).
-///
-/// MUST be non-empty. The official image's entrypoint only provisions
-/// `default` with `<networks><ip>::/0</ip></networks>` when `CLICKHOUSE_USER`
-/// is non-default **or** `CLICKHOUSE_PASSWORD` is non-empty; otherwise it
-/// writes a `users.d` override restricting `default` to `127.0.0.1`/`::1`,
-/// which rejects every connection arriving through the mapped host port.
-pub const CH_TEST_PASSWORD: &str = "ch_test_pw";
+/// never leaks (e.g. through a `Debug` impl). See [`ch_server::PASSWORD`] for
+/// why it must be non-empty.
+pub const CH_TEST_PASSWORD: &str = ch_server::PASSWORD;
 
-/// Start `ClickHouse` and apply migrations.
+/// Ceiling on [`bring_up`] as a whole: the shared server's boot (or the wait
+/// for a sibling's — a cold image pull included), the per-test database, the
+/// readiness probe and the migrations. A wedged Docker or server fails the
+/// test here instead of hanging it. Must stay below the 300s per-test kill in
+/// the workspace `.config/nextest.toml`, so this error, not a bare TIMEOUT,
+/// is what a wedged setup reports.
+pub const BRING_UP_BUDGET: Duration = Duration::from_secs(240);
+
+/// Ceiling on [`wait_until_ready`].
+const READY_BUDGET: Duration = Duration::from_secs(60);
+
+/// Give this test its own database on the shared `ClickHouse` server and apply
+/// migrations, all within [`BRING_UP_BUDGET`].
 pub async fn bring_up() -> anyhow::Result<ChHarness> {
-    // No log-based wait strategy: this image sends the server log (including
-    // "Ready for connections") to files under /var/log/clickhouse-server
-    // inside the container, so it never appears on stdout/stderr and a
-    // `message_on_stdout` wait can only ever time out. Readiness is polled
-    // over HTTP below instead.
-    //
-    // Image and tag come from `test_containers`, never a local literal:
-    // `cargo xtask check-test-container-pins` enforces it, and the pin is
-    // mirrored into `ClickHouseSidecar` in `testing/e2e/lib/sidecars.py`.
-    let ch_image = test_containers::clickhouse()
-        .with_wait_for(WaitFor::Nothing)
-        .with_env_var("CLICKHOUSE_USER", "default")
-        .with_env_var("CLICKHOUSE_PASSWORD", CH_TEST_PASSWORD)
-        .with_env_var("CLICKHOUSE_DB", "default");
-    let ch_container = ch_image.start().await?;
-    let ch_port = ch_container.get_host_port_ipv4(8123).await?;
+    tokio::time::timeout(BRING_UP_BUDGET, bring_up_inner())
+        .await
+        .map_err(|_elapsed| {
+            anyhow::anyhow!("ClickHouse test harness bring-up exceeded {BRING_UP_BUDGET:?}")
+        })?
+}
+
+async fn bring_up_inner() -> anyhow::Result<ChHarness> {
+    let ch_port = ch_server::server_port().await.map_err(anyhow::Error::msg)?;
+    let database = ch_server::fresh_database(ch_port)
+        .await
+        .map_err(anyhow::Error::msg)?;
 
     let cfg: clickhouse_usage_collector_plugin::config::ClickHousePluginConfig =
         serde_json::from_str(&format!(
-            r#"{{ "database_url": "http://default:{CH_TEST_PASSWORD}@127.0.0.1:{ch_port}/default",
+            r#"{{ "database_url": "http://default:{CH_TEST_PASSWORD}@127.0.0.1:{ch_port}/{database}",
                   "allow_insecure_http": true }}"#
         ))
         .expect("valid test config json");
@@ -117,26 +123,32 @@ pub async fn bring_up() -> anyhow::Result<ChHarness> {
     Ok(ChHarness {
         client,
         cancel,
-        _ch_container: ch_container,
+        database,
     })
 }
 
-/// Poll `SELECT 1` until the server answers, or give up after ~60s.
+/// Poll `SELECT 1` through the test's own client until the server answers, or
+/// give up after [`READY_BUDGET`].
 async fn wait_until_ready(client: &clickhouse::Client) -> anyhow::Result<()> {
     let mut last_err = None;
-    for _ in 0..120u8 {
-        match client.query("SELECT 1").fetch_one::<u8>().await {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                tokio::time::sleep(Duration::from_millis(500)).await;
+    let polled = tokio::time::timeout(READY_BUDGET, async {
+        loop {
+            match client.query("SELECT 1").fetch_one::<u8>().await {
+                Ok(_) => return,
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
             }
         }
-    }
-    Err(anyhow::anyhow!(
-        "ClickHouse container never became ready: {}",
-        last_err.map_or_else(|| "no error recorded".to_owned(), |e| e.to_string())
-    ))
+    })
+    .await;
+    polled.map_err(|_elapsed| {
+        anyhow::anyhow!(
+            "ClickHouse never became ready within {READY_BUDGET:?}: {}",
+            last_err.map_or_else(|| "no error recorded".to_owned(), |e| e.to_string())
+        )
+    })
 }
 
 /// Bring up the harness, or print a Docker-unavailable notice and return
@@ -217,9 +229,10 @@ pub fn record_store_sync(h: &ChHarness) -> ChRecordStore {
     ChRecordStore::new(h.client.clone(), metrics(), TEST_REQUEST_TIMEOUT, false)
 }
 
-/// Stop background merges on `usage_records` for the rest of the container's
-/// life, so a test asserting "before any merge runs" is guaranteed rather than
-/// probable. Every harness gets its own container, so nothing else is affected.
+/// Stop background merges on this test's `usage_records` table, so a test
+/// asserting "before any merge runs" is guaranteed rather than probable. The
+/// statement names a table in the client's current database, and every
+/// harness gets its own database, so no sibling test is affected.
 pub async fn stop_merges(h: &ChHarness) {
     h.client
         .query("SYSTEM STOP MERGES usage_records")

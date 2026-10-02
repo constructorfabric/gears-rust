@@ -847,7 +847,7 @@ impl HostRuntime {
                 });
             }
 
-            // Ordering matters: this runs after the orchestrator's init seeded
+            // Ordering matters: this runs after service-discovery's init seeded
             // operator config and before the directory-register / OoP-spawn
             // phases, so ownership is pinned before the first self-registration.
             self.gear_manager

@@ -14,6 +14,8 @@ use uuid::Uuid;
 
 use crate::domain::admission::Precondition;
 use crate::domain::admission::fingerprint::{RequestFingerprint, ScopeHash};
+use crate::domain::enums::OperationKind;
+use crate::domain::key::EntityKey;
 use crate::domain::ports::{
     ItemSuccess, NewOperation, NewOperationItem, OperationItemRow, OperationRow,
 };
@@ -56,13 +58,29 @@ fn operation_item_row(m: operation_item::Model) -> Result<OperationItemRow, Scop
     let precondition = Precondition::from_stored(m.expected_resource_version).ok_or(
         ScopeError::Invalid("stored operation-item precondition is outside the closed vocabulary"),
     )?;
+    let key = EntityKey::parse(&m.entity_key);
+    let kind: OperationKind = m.kind.into();
+    // Acceptance stores only identifiers for a registration. Refused once here,
+    // so no reader — worker, dry run, operation read — has to re-derive it.
+    if kind == OperationKind::Registration && key.gts_id().is_none() {
+        // The refusal is opaque on the wire; the log is how an operator finds the row.
+        tracing::error!(
+            operation_id = %m.operation_id,
+            operation_item_id = m.id,
+            entity_key = %key,
+            "types_registry stored registration item names a Registry Reference"
+        );
+        return Err(ScopeError::Invalid(
+            "stored registration item names a Registry Reference",
+        ));
+    }
     Ok(OperationItemRow {
         id: m.id,
         operation_id: m.operation_id,
         item_no: m.item_no,
-        gts_id: m.gts_id,
+        key,
         dry_run: m.dry_run,
-        kind: m.kind.into(),
+        kind,
         precondition,
         compat_forced: m.compat_forced,
         status: m.status.into(),
@@ -170,7 +188,7 @@ impl OperationRepo {
             .map(|item| operation_item::ActiveModel {
                 operation_id: Set(parent.id),
                 item_no: Set(item.item_no),
-                gts_id: Set(item.gts_id.clone()),
+                entity_key: Set(item.key.to_string()),
                 dry_run: Set(parent.dry_run),
                 kind: Set(parent.kind.into()),
                 expected_resource_version: Set(item.precondition.stored_value()),

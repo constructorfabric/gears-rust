@@ -26,7 +26,7 @@ STANDARDS ALIGNMENT:
 This PRD defines how ToolKit gears run as separate OS processes (on-premise) or Kubernetes pods while maintaining full
 developer transparency — the same gear code, the same ClientHub resolution, and the same OperationBuilder usage
 regardless of the deployment target. **Flight Control** is the minimal platform control-plane deployment unit that runs
-the orchestrator (`gear-orchestrator` / `DirectoryService`), transport, edge, and edge JWT validation
+the orchestrator (`service-discovery` / `DirectoryService`), transport, edge, and edge JWT validation
 (`authn-resolver`), and orchestrates gear lifecycle, discovery, and gateway registration. The AuthZ plane and
 application gears run as their own out-of-process units.
 
@@ -64,11 +64,11 @@ application code remains deployment-agnostic. ToolKit Distributed Gears bring th
 | Gear                          | The minimal unit of independent deployment in ToolKit. In Profile 1 (Embedded), gears are composed into a single process. In Profile 3 (K8s Native), each gear is an independently deployable microservice (pod). A gear has its own lifecycle, configuration, REST API (via OperationBuilder), and DB schema.                                                  |
 | Plugin                          | A gear that implements a specific plugin trait (e.g., `AuthNResolverPluginClient`) for a host gear. Plugins have no public REST API — they expose a private trait interface. Discovered via types-registry (GTS pattern), resolved via ClientHub scoped by GTS instance ID. Can be internal (in the host gear crate) or a separate gear (in-process or OoP). |
 | Plugin Host Gear              | A gear that defines a plugin trait in its SDK and discovers/consumes plugin implementations at runtime (e.g., authn-resolver, authz-resolver, mini-chat).                                                                                                                                                                                                          |
-| Flight Control                  | The **minimal** platform **control-plane deployment unit** (crate `apps/cf-gears-flight-control`): the composed process/image that links the orchestrator (`gear-orchestrator` / `DirectoryService`), transport + edge (`grpc-hub`, `api-gateway`), `types-registry`, and edge JWT validation (`authn-resolver`). Responsible for OoP gear orchestration, lifecycle management, discovery coordination, gateway registration, and authentication at the edge. In K8s Native profile, this is just another pod providing infrastructure services — not a central authority. It hosts **no** policy decision point: the AuthZ plane (`authz-resolver`, `tenant-resolver`, `resource-group`) and higher-level services (`account-management`, `credstore`) run as their own OoP units and register with this host's directory. |
+| Flight Control                  | The **minimal** platform **control-plane deployment unit** (crate `apps/cf-gears-flight-control`): the composed process/image that links the orchestrator (`service-discovery` / `DirectoryService`), transport + edge (`grpc-hub`, `api-gateway`), `types-registry`, and edge JWT validation (`authn-resolver`). Responsible for OoP gear orchestration, lifecycle management, discovery coordination, gateway registration, and authentication at the edge. In K8s Native profile, this is just another pod providing infrastructure services — not a central authority. It hosts **no** policy decision point: the AuthZ plane (`authz-resolver`, `tenant-resolver`, `resource-group`) and higher-level services (`account-management`, `credstore`) run as their own OoP units and register with this host's directory. |
 | AuthZ plane                     | The out-of-process unit bundling `authz-resolver` (the PDP) with its trust-coupled chain `tenant-resolver` and `resource-group`. Kept together in one process so the chain's internal `SecurityContext::anonymous()` calls never cross the wire; serves `/authz-resolver/v1/evaluate` over its own HTTP server, which PEPs reach via directory resolution. |
-| gear-orchestrator               | The system gear *inside* Flight Control that hosts the `DirectoryService` (service registration/discovery). This is the concrete gear that fulfils the orchestration role; "Flight Control" names the deployment unit that runs it.                                                                                                                                |
+| service-discovery               | The system gear *inside* Flight Control that hosts the `DirectoryService` (service registration/discovery). This is the concrete gear that fulfils the orchestration role; "Flight Control" names the deployment unit that runs it.                                                                                                                                |
 | OoP Worker                      | A separate OS process or k8s pod running one or more application gears.                                                                                                                                                                                                                                                                                            |
-| System Gear                   | A gear providing platform infrastructure (orchestrator, gateway, auth, types-registry).                                                                                                                                                                                                                                                                            |
+| System Gear                   | A gear providing platform infrastructure (directory, gateway, auth, types-registry).                                                                                                                                                                                                                                                                            |
 | Application Gear              | A business gear written by framework users.                                                                                                                                                                                                                                                                                                                        |
 | Deployment Profile              | A named, tested configuration of how gears are deployed (Embedded, Host+Workers, K8s Native).                                                                                                                                                                                                                                                                      |
 | ClientHub                       | A type-safe registry for inter-gear client resolution. Supports unscoped resolution (one impl per trait) and scoped resolution (keyed by GTS instance ID for plugins). The backing implementation may be in-process or a generated remote client.                                                                                                                  |
@@ -108,7 +108,7 @@ application code remains deployment-agnostic. ToolKit Distributed Gears bring th
 **ID**: `cpt-cf-actor-flight-control`
 
 - **Role**: The control-plane deployment unit. Runs the control-plane system gears, spawns OoP workers (on-premise),
-  provides DirectoryService (via `gear-orchestrator`), and optionally runs the built-in api-gateway.
+  provides DirectoryService (via `service-discovery`), and optionally runs the built-in api-gateway.
 
 #### External Gateway
 
@@ -326,7 +326,7 @@ The ToolKit OoP runtime MUST manage the full gear startup lifecycle without gear
 6. Gear developers MUST NOT write retry loops, health-check polling, or registration code. The `deps` declaration in
    `#[toolkit::gear(deps = [...])]` is the only input required.
 
-Gears with no `deps` (e.g., gear-orchestrator, types-registry) become ready immediately after `start()`.
+Gears with no `deps` (e.g., service-discovery, types-registry) become ready immediately after `start()`.
 
 - **Rationale**: Kubernetes-native — no init containers, no deployment ordering, no single point of failure. Gears
   start independently and converge to ready state. Readiness probes gate traffic naturally. The same `deps` metadata
@@ -712,7 +712,7 @@ Details body. The caller process MUST NOT crash.
 | Dependency                             | Description                                                              | Criticality |
 |----------------------------------------|--------------------------------------------------------------------------|-------------|
 | toolkit-http                            | HTTP client library used as transport for generated REST clients         | p1          |
-| DirectoryService / gear-orchestrator | Service discovery for OoP Workers                                        | p1          |
+| DirectoryService / service-discovery | Service discovery for OoP Workers                                        | p1          |
 | api-gateway                            | Built-in gateway for on-premise profiles; reverse-proxies to OoP Workers | p1          |
 | authn-resolver                         | JWT validation at the gateway edge                                       | p1          |
 | OperationBuilder / utoipa              | OpenAPI spec generation from gear routes                               | p1          |

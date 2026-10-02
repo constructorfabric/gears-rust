@@ -1,0 +1,20 @@
+{
+  "gts_id": "gts.cf.e2e.registration.person.v1~cf.e2e.registration.employee.v1~",
+  "content": {
+    "$id": "gts://gts.cf.e2e.registration.person.v1~cf.e2e.registration.employee.v1~",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "allOf": [
+      {"$ref": "gts://gts.cf.e2e.registration.person.v1~"}
+    ],
+    "type": "object",
+    "properties": {
+      "payload": {
+        "type": "object",
+        "properties": {"employee_id": {"type": "string"}},
+        "required": ["employee_id"],
+        "additionalProperties": true
+      }
+    },
+    "required": ["payload"]
+  }
+}
