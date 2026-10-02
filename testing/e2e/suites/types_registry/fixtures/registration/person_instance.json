@@ -1,4 +1,7 @@
 {
   "gts_id": "gts.cf.e2e.registration.person.v1~cf.e2e.registration.alice.v1",
-  "content": { "name": "Alice" }
+  "content": {
+    "name": "Alice",
+    "payload": {}
+  }
 }

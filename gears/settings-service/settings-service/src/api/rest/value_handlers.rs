@@ -48,11 +48,6 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-fn request_id(headers: &HeaderMap) -> String {
-    toolkit::api::error_layer::extract_trace_id(headers)
-        .unwrap_or_else(|| Uuid::new_v4().to_string())
-}
-
 pub(crate) fn actor(
     ctx: &SecurityContext,
     headers: &HeaderMap,
@@ -67,7 +62,7 @@ pub(crate) fn actor(
         .or_else(|| ctx.bearer_token().cloned());
     WriteActor {
         ctx: ctx.clone(),
-        request_id: request_id(headers),
+        request_id: super::audit_request_id(headers),
         step_up_token,
         visibility,
     }

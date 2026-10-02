@@ -623,3 +623,124 @@ async fn gear_handler_receives_connect_info_through_fallback() {
         "server should shut down promptly after cancel"
     );
 }
+
+/// An `OoP` gear must continue the caller's W3C trace, so the wire `trace_id`
+/// the canonical-error layer emits is the same id that appears in this gear's
+/// own log lines. Send a request carrying a `traceparent` through
+/// `trace_context_middleware` and assert the trace id live inside the handler
+/// equals the inbound one.
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn trace_context_middleware_continues_inbound_w3c_trace() {
+    use std::sync::Mutex;
+
+    use axum::routing::get;
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    // Install a W3C propagator so the middleware can extract the inbound parent,
+    // and an OTel subscriber so the continued span carries a live context.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let tracer = provider.tracer("oop-serve-trace-test");
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let inbound_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured_handler = Arc::clone(&captured);
+
+    let app = Router::new()
+        .route(
+            "/x",
+            get(move || {
+                let captured_handler = Arc::clone(&captured_handler);
+                async move {
+                    *captured_handler.lock().unwrap() = toolkit_trace_context::current_trace_id();
+                    StatusCode::OK
+                }
+            }),
+        )
+        .layer(from_fn(trace_context_middleware));
+
+    let req = Request::builder()
+        .uri("/x")
+        .header(
+            "traceparent",
+            format!("00-{inbound_trace_id}-00f067aa0ba902b7-01"),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some(inbound_trace_id),
+        "the gear request span must continue the inbound W3C trace"
+    );
+}
+
+/// The fix depends on the canonical-error layer running *inside* the trace span,
+/// which is a property of the layering order in [`layer_gear_router`], not of
+/// `trace_context_middleware` alone. Build the router the production way and,
+/// crucially, send **no** inbound `traceparent`: the gear span is then a fresh
+/// root, so the trace id the canonical-error layer stamps on the problem body
+/// can only be non-null if that layer sees the live span. Were the two layers
+/// swapped, the error would be built outside the span with no header to fall
+/// back on, and the problem would carry no `trace_id` — so this pins the order.
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn canonical_error_layer_runs_inside_the_trace_span_when_composed() {
+    use axum::routing::get;
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    // A gear route that fails: the canonical-error layer turns the error into a
+    // problem+json and fills its `trace_id` from the id current at that point.
+    async fn boom() -> crate::api::canonical_prelude::ApiResult<StatusCode> {
+        Err(CanonicalError::internal("boom").create())
+    }
+
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let tracer = provider.tracer("oop-serve-canonical-order-test");
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let readiness = readiness(Vec::<String>::new());
+    let options = OopServeOptions::new(
+        "order-gear".to_owned(),
+        "i-1".to_owned(),
+        "http://localhost".to_owned(),
+        free_addr(),
+        Arc::new(E2eDirectory::default()),
+    );
+    let app = layer_gear_router(
+        Router::new().route("/boom", get(boom)),
+        DrainGuard::new(readiness),
+        &options,
+    );
+
+    let resp = app
+        .oneshot(Request::builder().uri("/boom").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(resp.status().is_server_error(), "the gear route failed");
+
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let problem: Value = serde_json::from_slice(&bytes).unwrap();
+    let trace_id = problem.get("trace_id").and_then(Value::as_str);
+    assert!(
+        trace_id.is_some_and(|id| id.len() == 32),
+        "the canonical-error layer must run inside the trace span, so the problem \
+         carries the live span's 32-hex trace_id even with no inbound traceparent; got {problem}"
+    );
+}

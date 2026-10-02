@@ -415,7 +415,10 @@ impl FxConfig {
 /// whether the issued-invoice-manifest completeness check and the bill-run-finished assertion
 /// BLOCK period close — default OFF (fail-safe) until the launch-blocking cross-team feeds are
 /// live (design §0 decision 3 / §4.5 residual risk). `close_lock_timeout_ms` bounds the close
-/// drain window under a sustained bill run (design §4.5).
+/// drain window under a sustained bill run (design §4.5). `unregistered_tenants`
+/// and the `purge_*` pair govern the tick's tenant-registry lifecycle gate and the
+/// reclaim of runs accumulated for soft-deleted tenants — the tick's only delete path
+/// (see [`crate::infra::tenant_lifecycle`] for why those rows accumulate at all).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReconConfig {
@@ -434,6 +437,45 @@ pub struct ReconConfig {
     pub bill_run_enforcement: bool,
     /// Upper bound (ms) on the close drain window / lock wait. Default `5000`.
     pub close_lock_timeout_ms: u64,
+    /// What the tick does with tenants the tenant registry does not return at
+    /// all (as opposed to returning them `Deleted`). Default
+    /// [`UnregisteredTenants::Skip`]; see its variants. Unregistered tenants
+    /// are never purged either way — an omission is not proof of deletion.
+    pub unregistered_tenants: UnregisteredTenants,
+    /// Reconciliation-run rows the tick may reclaim per tick for tenants the
+    /// registry reports soft-deleted — and the purge's on/off switch.
+    ///
+    /// Default `0`: **off**. Stopping the growth (the lifecycle gate) needs no
+    /// deletes, so the purge is enabled per environment once the gate has been
+    /// observed classifying correctly there. A sizing hint when enabling:
+    /// `200_000` drains a multi-GB backlog within a day at the default cadence
+    /// without any single tick turning into a WAL spike. Only **uneventful**
+    /// runs (`DONE`, within tolerance, zero variance) are reclaimed — every run
+    /// that recorded a variance, and every unfinalized row, is kept as evidence
+    /// whatever the tenant's lifecycle.
+    pub purge_max_rows_per_tick: u64,
+    /// Ceiling on deleted tenants the purge may visit in ONE tick. Bounds the
+    /// statement count once the backlog is drained and every visit is an empty
+    /// (but still round-tripped) probe. Default `500`; the sweep resumes where
+    /// it stopped, so the deleted set is covered in rotation. Must be `>= 1`
+    /// while the purge is enabled.
+    pub purge_max_tenants_per_tick: usize,
+}
+
+/// How the reconciliation tick treats a candidate tenant the platform tenant
+/// registry does not return at all (`recon.unregistered_tenants`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnregisteredTenants {
+    /// Skip it (the default). With the AM-backed resolver plugin an omitted id
+    /// is a tenant hard-deleted from `public.tenants`, and reconciling it
+    /// forever is the unbounded growth the lifecycle gate exists to stop.
+    #[default]
+    Skip,
+    /// Keep reconciling it. For a resolver plugin that is not authoritative
+    /// for the tenants that post (`static-tr-plugin` knows only its configured
+    /// list), so runtime-created tenants are not mistaken for deleted ones.
+    Reconcile,
 }
 
 impl Default for ReconConfig {
@@ -444,6 +486,9 @@ impl Default for ReconConfig {
             manifest_enforcement: false,
             bill_run_enforcement: false,
             close_lock_timeout_ms: 5_000,
+            unregistered_tenants: UnregisteredTenants::default(),
+            purge_max_rows_per_tick: 0,
+            purge_max_tenants_per_tick: 500,
         }
     }
 }
@@ -453,8 +498,10 @@ impl ReconConfig {
     ///
     /// # Errors
     /// Returns `Err` if `recon_tick_secs` is `0` (`tokio::time::interval` panics on
-    /// `Duration::ZERO`, aborting the serve task) or if `close_lock_timeout_ms` is `0`
-    /// (a zero drain window can never let a sustained bill run drain).
+    /// `Duration::ZERO`, aborting the serve task), if `close_lock_timeout_ms` is `0`
+    /// (a zero drain window can never let a sustained bill run drain), or if the
+    /// retired-tenant purge is enabled (`purge_max_rows_per_tick > 0`) with a zero
+    /// tenant budget — it would be silently inert while looking configured.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.recon_tick_secs == 0 {
             return Err(ConfigError::MustBePositive {
@@ -464,6 +511,14 @@ impl ReconConfig {
         if self.close_lock_timeout_ms == 0 {
             return Err(ConfigError::MustBePositive {
                 field: "recon.close_lock_timeout_ms",
+            });
+        }
+        if self.purge_max_rows_per_tick > 0 && self.purge_max_tenants_per_tick == 0 {
+            return Err(ConfigError::BelowMin {
+                field: "recon.purge_max_tenants_per_tick",
+                min: 1,
+                reason: "required while the purge is enabled; set \
+                         recon.purge_max_rows_per_tick = 0 to disable the purge instead",
             });
         }
         Ok(())

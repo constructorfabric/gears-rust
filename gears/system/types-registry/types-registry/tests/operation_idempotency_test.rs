@@ -91,7 +91,6 @@ fn schema(gts_id: &str) -> Value {
 fn request(key: &str, content: Value) -> SubmitRequest {
     SubmitRequest {
         idempotency_key: Some(key.to_owned()),
-        kind: domain_enums::OperationKind::Registration,
         dry_run: false,
         candidates: vec![Candidate {
             gts_id: CF_TYPE.to_owned(),
@@ -116,7 +115,6 @@ fn batch_request(key: &str, count: usize) -> SubmitRequest {
         .collect();
     SubmitRequest {
         idempotency_key: Some(key.to_owned()),
-        kind: domain_enums::OperationKind::Registration,
         dry_run: false,
         candidates,
     }
@@ -184,7 +182,7 @@ async fn an_accepted_request_writes_one_operation_its_items_and_one_dispatch() {
         .await
         .expect("items");
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].gts_id, CF_TYPE);
+    assert_eq!(items[0].key.gts_id(), Some(CF_TYPE));
     assert_eq!(items[0].precondition, Precondition::MustNotExist);
     assert!(
         items[0].request_payload.is_some(),
@@ -233,7 +231,7 @@ async fn maximum_batch_is_inserted_across_sqlite_bind_chunks() {
     assert_eq!(
         items
             .iter()
-            .map(|item| item.gts_id.as_str())
+            .map(|item| item.key.gts_id().unwrap_or_default())
             .collect::<Vec<_>>(),
         expected_ids,
         "chunking must preserve submission order and every candidate"

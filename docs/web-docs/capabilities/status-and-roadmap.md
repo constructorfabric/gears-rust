@@ -20,7 +20,7 @@ marks it `✓`.
 
 - **Toolkit substrate** — runtime, secure ORM, canonical errors, REST/OpenAPI, OData,
   observability, gRPC transport, GTS. See [Toolkit](../toolkit/).
-- **System gears** — API Gateway, Gear Orchestrator, AuthN/AuthZ resolvers, Tenant Resolver,
+- **System gears** — API Gateway, Service Discovery, AuthN/AuthZ resolvers, Tenant Resolver,
   Outbound API Gateway, Types Registry, Nodes Registry, Resource Group, gRPC Hub. See
   [System gears](../system-gears/).
 - **Service gears (examples)** — File Parser, Credentials Store, Mini Chat, Simple User

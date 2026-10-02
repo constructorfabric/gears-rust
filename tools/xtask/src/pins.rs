@@ -261,7 +261,7 @@ impl PinVisitor<'_> {
             )),
             "new" if self.names.generic_image.contains(&ty) => Some(format!(
                 "`{ty}::new(..)` builds an unpinned image; \
-                 use test_containers::timescaledb()/mariadb() instead"
+                 use test_containers::timescaledb()/mariadb()/clickhouse() instead"
             )),
             _ => None,
         }

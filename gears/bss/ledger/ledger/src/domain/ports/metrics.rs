@@ -356,6 +356,29 @@ pub trait LedgerMetricsPort: Send + Sync + 'static {
     /// (`ledger_reconciliation_out_of_tolerance_total{check_type}`, design §9 /
     /// spec §3.5 J4). `out_of_tolerance/runs` is the breach rate per check type.
     fn reconciliation_out_of_tolerance(&self, check_type: &str);
+    /// Record how many tenants the reconciliation tick skipped because the
+    /// platform tenant registry no longer reports them live
+    /// (`ledger_reconciliation_retired_tenants{state}`), by `state`: `deleted`
+    /// (soft-deleted — the purge's input) or `unregistered` (omitted from the
+    /// registry's answer — skipped, never purged). A gauge: ledger data never
+    /// shrinks, so this is the standing backlog the tick keeps filtering out.
+    fn reconciliation_retired_tenants(&self, state: &str, tenants: i64);
+    /// Increment the purged-run counter by the number of reconciliation-run
+    /// rows the tick reclaimed for soft-deleted tenants
+    /// (`ledger_reconciliation_runs_purged_total`). The drain-progress signal
+    /// for the one path that deletes from `ledger_reconciliation_run`.
+    fn reconciliation_runs_purged(&self, rows: u64);
+    /// Increment the lifecycle-unavailable counter for one tick that could not
+    /// trust the tenant registry and fell back to reconciling every candidate
+    /// (`ledger_reconciliation_lifecycle_unavailable_total{reason}`), by
+    /// `reason`: `read_failed` or `none_recognised`. Sustained growth means
+    /// the lifecycle gate is off and the unbounded growth is back.
+    fn reconciliation_lifecycle_unavailable(&self, reason: &str);
+    /// Increment the purge-failure counter by the number of tenants whose
+    /// purge statement failed this tick
+    /// (`ledger_reconciliation_purge_failed_total`). Without it a purge that
+    /// always fails looks like a drained backlog.
+    fn reconciliation_purge_failed(&self, tenants: u64);
     /// Increment the period-close-blocked counter for one close attempt rejected
     /// by a pre-close gate, labelled by `reason`
     /// (`ledger_period_close_blocked_total{reason}`, design §9 / spec §3.5 J4) —
@@ -420,6 +443,10 @@ impl LedgerMetricsPort for NoopLedgerMetrics {
     fn reconciliation_variance_minor(&self, _: &str, _: i64) {}
     fn reconciliation_run(&self, _: &str) {}
     fn reconciliation_out_of_tolerance(&self, _: &str) {}
+    fn reconciliation_retired_tenants(&self, _: &str, _: i64) {}
+    fn reconciliation_runs_purged(&self, _: u64) {}
+    fn reconciliation_lifecycle_unavailable(&self, _: &str) {}
+    fn reconciliation_purge_failed(&self, _: u64) {}
     fn period_close_blocked(&self, _: &str) {}
     fn exception_queue_depth(&self, _: &str, _: i64) {}
 }

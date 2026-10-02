@@ -1,0 +1,43 @@
+[package]
+name = "cf-gears-graph-storage-sdk"
+version = "0.1.1"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "SDK for the graph-storage gear: client trait, transport-agnostic models, plugin contracts, GTS constants"
+keywords = ["constructorfabric", "cf-gears", "graph", "knowledge-graph"]
+categories = ["database"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "graph_storage_sdk"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The executable form of the plugin contracts, for crates implementing them.
+# Off by default: a consumer of the client trait has no use for it.
+test-support = []
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+# The embedding-space identity hash is derived here rather than per provider:
+# every plugin must arrive at the same name for the same space (ADR-0005).
+aws-lc-rs = { workspace = true }
+hex = { workspace = true }
+time = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+
+toolkit-canonical-errors = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-odata-macros = { workspace = true }
+toolkit-security = { workspace = true }

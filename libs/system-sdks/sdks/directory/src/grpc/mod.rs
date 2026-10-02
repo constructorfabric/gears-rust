@@ -1,6 +1,6 @@
-//! Gear Orchestrator gRPC Layer
+//! Directory Service gRPC Layer
 //!
-//! This crate provides gRPC transport for the gear orchestrator.
+//! This crate provides gRPC transport for the directory service.
 //! It includes generated protobuf types and client/server implementations.
 mod client;
 
@@ -13,7 +13,7 @@ mod client;
     warnings
 )] // protoc problem
 pub mod directory {
-    tonic::include_proto!("gear_orchestrator.v1.directory");
+    tonic::include_proto!("directory.v1");
 }
 
 // Re-export common types for DirectoryService

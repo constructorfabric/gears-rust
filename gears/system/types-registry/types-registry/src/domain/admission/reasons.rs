@@ -20,6 +20,9 @@ pub enum AdmissionFailureReason {
     BlockedByPredecessor,
     /// `compare_documents` returned `Unknown`, distinct from an incompatible verdict.
     CompatibilityUndecidable,
+    /// A new base, conforming type or schema reference names a tombstone;
+    /// deletion removes an entity from the valid targets (PRD §5).
+    DependencyDeleted,
     /// A required base, conforming type or schema reference is absent.
     DependencyNotFound,
     DependentInvalid,
@@ -74,6 +77,7 @@ impl AdmissionFailureReason {
             "blocked_by_dependency" => Self::BlockedByDependency,
             "blocked_by_predecessor" => Self::BlockedByPredecessor,
             "compatibility_undecidable" => Self::CompatibilityUndecidable,
+            "dependency_deleted" => Self::DependencyDeleted,
             "dependency_not_found" => Self::DependencyNotFound,
             "dependent_invalid" => Self::DependentInvalid,
             "dialect_changed" => Self::DialectChanged,
@@ -122,6 +126,7 @@ impl AdmissionFailureReason {
             Self::BlockedByDependency => "blocked_by_dependency",
             Self::BlockedByPredecessor => "blocked_by_predecessor",
             Self::CompatibilityUndecidable => "compatibility_undecidable",
+            Self::DependencyDeleted => "dependency_deleted",
             Self::DependencyNotFound => "dependency_not_found",
             Self::DependentInvalid => "dependent_invalid",
             Self::DialectChanged => "dialect_changed",

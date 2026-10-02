@@ -21,7 +21,6 @@ use types_registry::domain::admission::worker::{
     ItemOutcome, OperationOutcome, Tuning, WorkerError, run_operation,
 };
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
-use types_registry::domain::enums as domain_enums;
 use types_registry::domain::enums::OperationItemStatus;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::ports::{CurrentTypeSchemaRow, EntityRow};
@@ -142,7 +141,6 @@ async fn submit(db: &Provider, key: &str, candidates: Vec<Candidate>) -> Uuid {
         &dispatch,
         &SubmitRequest {
             idempotency_key: Some(key.to_owned()),
-            kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates,
         },
@@ -176,7 +174,7 @@ fn item<'a>(outcome: &'a OperationOutcome, gts_id: &str) -> &'a ItemOutcome {
     outcome
         .items
         .iter()
-        .find(|item| item.gts_id == gts_id)
+        .find(|item| item.key.gts_id() == Some(gts_id))
         .unwrap_or_else(|| panic!("the operation owes {gts_id} an outcome"))
 }
 
@@ -639,7 +637,7 @@ async fn a_second_pass_over_a_partially_committed_batch_is_a_no_op() {
         let mut pairs: Vec<(String, String)> = outcome
             .items
             .iter()
-            .map(|item| (item.gts_id.clone(), format!("{:?}", item.status)))
+            .map(|item| (item.key.to_string(), format!("{:?}", item.status)))
             .collect();
         pairs.sort();
         pairs

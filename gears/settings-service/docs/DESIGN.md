@@ -1809,7 +1809,7 @@ The gear-local audit store (§4.2 *Audit Emitter*). Append-only: no `UPDATE`, no
 | `actor_classification` | `DataClassification` | No | — | The actor identity is itself classified (§4.2 *Audit Emitter*) |
 | `pre_value` / `post_value` | JSONB | Yes | — | Masked before the record is built; a `secret`-classified value is never written in plaintext |
 | `outcome` | text | No | — | Check: `success`, `failure` |
-| `request_id` | text | No | — | Correlates the record with the request that produced it |
+| `request_id` | text | No | — | Correlates the record with the request that produced it: the platform **`x-request-id`** (set by the api-gateway, written to the access log, returned to the caller), so a row joins to the access-log line and the id the caller saw. **Not** the W3C `trace_id` (that lives in the Problem envelope / logs). A non-HTTP path such as the contribution reconciler mints a fresh UUID |
 | `change_set_id` | UUID | Yes | — | Set for records produced under one change set, so a change set's records are retrievable together (activation §4.7) |
 | `occurred_at` | `timestamptz` | No | current timestamp | |
 | `retain_until` | `timestamptz` | Yes | — | Retention horizon; `NULL` ⇒ the store's configured default (§4.2 *Audit Emitter*) |

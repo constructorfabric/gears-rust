@@ -17,7 +17,7 @@ use toolkit_gts::gts_id;
 use common::{PausePoint, TestStores, await_delivery, metrics, provider_for_with_outbox, stores};
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
-use types_registry::domain::enums::{OperationItemStatus, OperationKind, OperationStatus};
+use types_registry::domain::enums::{OperationItemStatus, OperationStatus};
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::registry_service::{EntityKey, RegistryService};
 use types_registry::infra::outbox::OutboxDispatch;
@@ -56,7 +56,6 @@ async fn assert_delivery(db: &Arc<DBProvider<DbError>>, backend: &str) {
 
     let request = SubmitRequest {
         idempotency_key: Some("backends-key".to_owned()),
-        kind: OperationKind::Registration,
         dry_run: false,
         candidates: vec![Candidate {
             gts_id: TARGET.to_owned(),
@@ -141,7 +140,6 @@ async fn assert_single_admission_under_two_pipelines(db: &Arc<DBProvider<DbError
         .submit(
             &SubmitRequest {
                 idempotency_key: Some("warmup-key".to_owned()),
-                kind: OperationKind::Registration,
                 dry_run: false,
                 candidates: vec![Candidate {
                     gts_id: WARMUP.to_owned(),
@@ -194,7 +192,6 @@ async fn assert_single_admission_under_two_pipelines(db: &Arc<DBProvider<DbError
         .submit(
             &SubmitRequest {
                 idempotency_key: Some("contended-key".to_owned()),
-                kind: OperationKind::Registration,
                 dry_run: false,
                 candidates: vec![Candidate {
                     gts_id: gts_id.to_owned(),

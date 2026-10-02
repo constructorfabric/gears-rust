@@ -10,6 +10,15 @@ REQUEST_TIMEOUT = 10.0
 # the shared default in ../../conftest.py's `auth_headers` fixture.
 TENANT_A_ID = "00000000-df51-5b42-9538-d2b56b7ee953"
 
+# Every client sends this valid W3C `traceparent`, so the wire `trace_id` the
+# canonical error layer echoes is deterministic. `extract_trace_id` prefers the
+# live OTel span, but the request span continues this inbound `traceparent`, so
+# its trace-id equals the header's; with OTel off the header is used directly.
+# Either way the value is TRACE_ID, the header's 32-hex trace-id segment. Uses
+# the W3C spec's example ids.
+TRACE_ID = "0af7651916cd43dd8448eb211c80319c"
+TRACEPARENT = f"00-{TRACE_ID}-b7ad6b7169203331-01"
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _check_users_info_reachable():

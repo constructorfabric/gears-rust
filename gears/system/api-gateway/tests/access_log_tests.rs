@@ -167,7 +167,8 @@ async fn emits_access_log_with_expected_fields() {
     let e = &events[0];
     assert_eq!(e.target, "access_log");
     assert_eq!(e.fields.get("method").unwrap(), "GET");
-    assert_eq!(e.fields.get("uri").unwrap(), "/test?q=1");
+    // Query values are redacted; parameter names are kept.
+    assert_eq!(e.fields.get("uri").unwrap(), "/test?q=<redacted>");
     assert_eq!(e.fields.get("request_id").unwrap(), "test-rid-42");
     assert_eq!(e.fields.get("content_length").unwrap(), "128");
     assert_eq!(e.fields.get("user_agent").unwrap(), "TestAgent/1.0");
@@ -209,7 +210,12 @@ async fn generates_request_id_when_missing() {
 }
 
 #[tokio::test]
-async fn extracts_trace_id_from_traceparent() {
+async fn does_not_emit_its_own_trace_id_field() {
+    // Even with an incoming `traceparent`, the access log must not emit its
+    // own `trace_id` event field: the JSON log-correlation formatter splices
+    // the live span's `trace_id` onto the top level of the record, and a
+    // second, middleware-supplied field would only duplicate and contradict
+    // it (empty when the client sends no `traceparent`).
     let req = Request::builder()
         .uri("/test")
         .header(
@@ -222,9 +228,127 @@ async fn extracts_trace_id_from_traceparent() {
     let (_, events) = run_with_capture(req).await;
 
     assert_eq!(events.len(), 1);
+    assert!(
+        !events[0].fields.contains_key("trace_id"),
+        "access log must not carry its own trace_id field"
+    );
+}
+
+/// Records, per `access_log` event, the trace id of the `OTel` context current
+/// at emit time — exactly what the log-correlation formatter reads to splice.
+#[derive(Clone, Default)]
+struct TraceIdProbe(Arc<Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TraceIdProbe {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        use opentelemetry::trace::TraceContextExt as _;
+        if event.metadata().target() != "access_log" {
+            return;
+        }
+        let cx = opentelemetry::Context::current();
+        let span_context = cx.span().span_context().clone();
+        let id = if span_context.is_valid() {
+            span_context.trace_id().to_string()
+        } else {
+            String::new()
+        };
+        self.0.lock().unwrap().push(id);
+    }
+}
+
+/// Drive one request through `test_app()` under an `OTel` layer plus a
+/// `TraceIdProbe`, returning the trace id of the request span and the ids the
+/// probe captured at emit time. `consume_body` selects the normal
+/// body-complete path (`true`) vs. the client-disconnect drop path (`false`).
+async fn run_with_otel_probe(consume_body: bool) -> (String, Vec<String>) {
+    use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+    use tracing::Instrument as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let tracer = provider.tracer("access-log-probe-test");
+
+    let probe = TraceIdProbe::default();
+    let captured = probe.0.clone();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(tracer))
+        .with(probe);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+
+    let span = tracing::info_span!("otel_probe_test");
+    let response = test_app()
+        .oneshot(req)
+        .instrument(span.clone())
+        .await
+        .unwrap();
+
+    // The trace the request actually ran in, read off the span's OTel context.
+    let expected = span.context().span().span_context().trace_id().to_string();
+
+    if consume_body {
+        // Normal completion: fully stream the body so `poll_frame` -> `emit`
+        // fires inside the request span.
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+    } else {
+        // Client disconnect: drop the response without consuming its body,
+        // firing `CountingBody::drop` -> `emit` outside the request span.
+        drop(response);
+    }
+
+    let ids = captured.lock().unwrap().clone();
+    (expected, ids)
+}
+
+/// The access log resolves its `trace_id` from the top-level splice the
+/// log-correlation formatter adds, which reads the `OTel` context current *when
+/// the event is emitted*. On the client-disconnect path the body is dropped
+/// outside the request span (`CountingBody::drop`), so the middleware snapshots
+/// the `OTel` context at request time and re-attaches it in `emit`. This asserts
+/// the id current at emit time is *the request's own trace id* — not merely some
+/// valid id — so a regression that started a fresh root span on the drop path
+/// would fail here.
+#[tokio::test]
+async fn splices_trace_id_on_client_disconnect_drop_path() {
+    let (expected, ids) = run_with_otel_probe(false).await;
+
     assert_eq!(
-        events[0].fields.get("trace_id").unwrap(),
-        "4bf92f3577b34da6a3ce929d0e0e4736"
+        ids.len(),
+        1,
+        "exactly one access_log event on the drop path"
+    );
+    assert_eq!(
+        ids[0], expected,
+        "the request's trace id must be current when the access log is emitted \
+         from the drop path"
+    );
+}
+
+/// Every real request reaches `emit` through `poll_frame` when the body
+/// completes normally, so the trace context must also be correct there — the
+/// drop-path test alone does not cover it. Assert the request's own trace id is
+/// current at emit time on the normal completion path.
+#[tokio::test]
+async fn splices_trace_id_on_normal_completion_path() {
+    let (expected, ids) = run_with_otel_probe(true).await;
+
+    assert_eq!(
+        ids.len(),
+        1,
+        "exactly one access_log event on the normal path"
+    );
+    assert_eq!(
+        ids[0], expected,
+        "the request's trace id must be current when the access log is emitted \
+         on the normal completion path"
     );
 }
 
@@ -248,7 +372,9 @@ async fn does_not_alter_response() {
 }
 
 #[tokio::test]
-async fn logs_uri_with_query_string_verbatim() {
+async fn logs_uri_with_query_string_values_redacted() {
+    // Secrets passed as query parameters must not be persisted in the access
+    // log: parameter names are kept for debuggability, values are redacted.
     let req = Request::builder()
         .uri("/test?user=mike&token=s3cret&page=1")
         .header("x-request-id", "qs-test")
@@ -259,7 +385,35 @@ async fn logs_uri_with_query_string_verbatim() {
 
     assert_eq!(events.len(), 1);
     let uri = events[0].fields.get("uri").unwrap();
-    assert_eq!(uri, "/test?user=mike&token=s3cret&page=1");
+    assert_eq!(
+        uri,
+        "/test?user=<redacted>&token=<redacted>&page=<redacted>"
+    );
+    assert!(
+        !uri.contains("s3cret"),
+        "query values must not appear verbatim in the access log: {uri}"
+    );
+}
+
+#[tokio::test]
+async fn logs_uri_redacts_bare_query_segments() {
+    // A bare segment (no `=`) has no parameter name, so it must be redacted
+    // whole — otherwise a secret appended without a key would leak verbatim.
+    let req = Request::builder()
+        .uri("/test?s3cretflag&page=1")
+        .header("x-request-id", "bare-qs")
+        .body(Body::empty())
+        .unwrap();
+
+    let (_, events) = run_with_capture(req).await;
+
+    assert_eq!(events.len(), 1);
+    let uri = events[0].fields.get("uri").unwrap();
+    assert_eq!(uri, "/test?<redacted>&page=<redacted>");
+    assert!(
+        !uri.contains("s3cretflag"),
+        "bare query segments must not appear verbatim in the access log: {uri}"
+    );
 }
 
 #[tokio::test]
@@ -287,7 +441,9 @@ async fn defaults_for_missing_headers() {
     let e = &events[0];
     assert_eq!(e.fields.get("content_length").unwrap(), "0");
     assert_eq!(e.fields.get("user_agent").unwrap(), "");
-    assert_eq!(e.fields.get("trace_id").unwrap(), "");
+    // No `trace_id` event field is emitted at all — not even an empty string.
+    // The formatter owns that name via the top-level splice.
+    assert!(!e.fields.contains_key("trace_id"));
     // request_id is auto-generated by SetRequestIdLayer, so still non-empty
     assert!(!e.fields.get("request_id").unwrap().is_empty());
 }
@@ -396,7 +552,7 @@ async fn e2e_full_middleware_stack_logs_remote_addr() -> anyhow::Result<()> {
     assert_eq!(e.fields.get("method").unwrap(), "GET");
     assert_eq!(
         e.fields.get("uri").unwrap(),
-        "/tests/v1/access-log-e2e?q=hello"
+        "/tests/v1/access-log-e2e?q=<redacted>"
     );
     assert_eq!(e.fields.get("request_id").unwrap(), "e2e-rid-99");
     assert_eq!(e.fields.get("user_agent").unwrap(), "E2EAgent/2.0");

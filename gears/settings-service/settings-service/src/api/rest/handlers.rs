@@ -116,19 +116,6 @@ pub async fn list_categories<R: CategoryRepository + 'static, S: AuditSink + 'st
     // @cpt-end:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-9
 }
 
-/// Read the `If-Match` header, if the client sent one.
-///
-/// Returned as `Option` rather than defaulted: an absent header and an empty
-/// one are different answers, and only the precondition evaluator may decide
-/// which is which.
-/// The id correlating a mutation's audit record with its problem document.
-///
-/// Taken from the same headers the canonical error middleware reads, so an
-/// audit entry and the response a caller saw carry one id, not two.
-fn request_id(headers: &axum::http::HeaderMap) -> String {
-    toolkit::api::error_layer::extract_trace_id(headers).unwrap_or_default()
-}
-
 /// `POST /settings-service/v1/categories`
 ///
 /// # Errors
@@ -155,7 +142,7 @@ pub async fn create_category<R: CategoryRepository + 'static, S: AuditSink + 'st
 
     // One transaction for the row and its audit record: the future owns its
     // inputs because the transaction lifetime is the database's to pick.
-    let request_id = request_id(&headers);
+    let request_id = super::audit_request_id(&headers);
     let created = db
         .db()
         .transaction_ref_mapped::<_, _, DomainError>(move |tx| {
@@ -212,7 +199,7 @@ pub async fn update_category<R: CategoryRepository + 'static, S: AuditSink + 'st
     // @cpt-end:cpt-cf-settings-service-flow-category-management-update:p1:inst-cat-update-2
     let patch = body.into_patch()?;
 
-    let request_id = request_id(&headers);
+    let request_id = super::audit_request_id(&headers);
     let if_match = if_match(&headers).map(str::to_owned);
     let updated = db
         .db()
@@ -262,7 +249,7 @@ pub async fn delete_category<R: CategoryRepository + 'static, S: AuditSink + 'st
     // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-3
     // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-2
 
-    let request_id = request_id(&headers);
+    let request_id = super::audit_request_id(&headers);
     let if_match = if_match(&headers).map(str::to_owned);
     db.db()
         .transaction_ref_mapped::<_, _, DomainError>(move |tx| {

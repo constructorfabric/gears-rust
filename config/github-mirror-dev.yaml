@@ -100,9 +100,9 @@ gears:
       auth_disabled: true
       require_auth_by_default: true
 
-  gear-orchestrator:
+  service-discovery:
     config: {}
-    # No configuration needed for the gear orchestrator
+    # No configuration needed for the directory service
 
   grpc-hub:
     config:
@@ -281,8 +281,8 @@ opentelemetry:
       record_headers: [ "user-agent", "x-forwarded-for" ]
 
     # Add top-level trace_id / span_id to JSON log records so a backend can
-    # link a log line to its span. Off by default: it costs a context lookup
-    # per event.
+    # link a log line to its span. On by default (it costs a context lookup
+    # per event); set to false to opt out.
     logs_correlation:
       inject_trace_ids_into_logs: true
 

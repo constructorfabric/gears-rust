@@ -135,7 +135,15 @@ The update flow is:
 
 The two baselines in step 4 fail differently, and ADR-0012 keeps them apart. A caller-precondition mismatch is terminal for that candidate: Types Registry does not silently rebase the update, and the caller re-reads and reconciles again. A dependency that moved during validation is internal concurrency control, and the worker revalidates the admission unit within a bounded retry policy without weakening the caller's precondition. Database-specific compare-and-swap syntax belongs in DESIGN.
 
-Creation of a new logical Type Schema carries `must_not_exist` instead. A retry submitted after the entity exists therefore fails `precondition_failed`; it is not absorbed as an idempotent no-op, whatever its content, because request-level retry safety is supplied by the `Idempotency-Key` replay of ADR-0012, which returns the original operation without consulting current state. Content equality answers a different question and is evaluated per candidate by the worker: content equal to the current authored revision creates no revision and does not advance `resource_version`, and that candidate terminates `unchanged`. An existing divergent identity follows ADR-0004's update or conflict rules.
+Creation of a new logical Type Schema carries `must_not_exist` instead. A
+fresh submission under another `Idempotency-Key` after the identifier exists
+therefore fails per item with `already_exists`, even when the authored
+content is equal. The same-key replay returns the original operation without
+consulting current entity state (ADR-0012). Content equality answers a
+different question and is evaluated for an update with a matching resource
+version: equal current authored content creates no revision and does not
+advance `resource_version`, and that candidate terminates `unchanged`. An
+existing divergent identity follows ADR-0004's update or conflict rules.
 
 Before initial admission there is no public logical Type Schema and no entity Lifecycle Status. A failed initial candidate may remain as an operation or audit artifact, but it does not create a logical entity or tombstone, issue a Registry Reference for domain persistence, or establish a permanent GTS ID reservation. While an update candidate is `pending`, an existing logical Type Schema retains its current revision and its Lifecycle Status.
 

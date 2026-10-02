@@ -85,7 +85,6 @@ async fn submit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str, content:
         &dispatch,
         &SubmitRequest {
             idempotency_key: Some(key.to_owned()),
-            kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
                 gts_id: gts_id.to_owned(),
@@ -136,7 +135,7 @@ async fn admitting_a_schema_writes_one_row_in_each_affected_table() {
     assert_eq!(outcome.items.len(), 1);
     let item = &outcome.items[0];
     assert_eq!(item.status, domain_enums::OperationItemStatus::Succeeded);
-    assert_eq!(item.gts_id, CF_TYPE);
+    assert_eq!(item.key.gts_id(), Some(CF_TYPE));
     assert_eq!(item.revision_no, Some(1));
     assert_eq!(item.resource_version, Some(1));
     // The Registry Reference is `gts-rust`'s deterministic derivation, never a
@@ -340,7 +339,10 @@ async fn a_pass_that_loses_the_item_cas_writes_nothing_at_all() {
         &provider,
         &allow_all(),
         EvaluationTarget {
-            gts_id: &item.gts_id,
+            gts_id: item
+                .key
+                .gts_id()
+                .expect("a registration item names an identifier"),
             canonical_body: &payload,
             operation_item_id: item.id,
             precondition: item.precondition,
@@ -910,8 +912,12 @@ async fn a_terminal_item_whose_stored_identifier_does_not_parse_is_an_error() {
     )
     .await
     .expect_err("a corrupt stored identifier must not be reported as a success");
+    // The library's reason, which says why the row is corrupt, survives.
+    let expected = gts::GtsId::try_new("not a gts identifier")
+        .expect_err("not an identifier")
+        .to_string();
     assert!(
-        matches!(err, WorkerError::StoredIdentifierUnparsable { .. }),
+        matches!(err, WorkerError::StoredIdentifierUnparsable { ref reason, .. } if *reason == expected),
         "got {err}"
     );
 }

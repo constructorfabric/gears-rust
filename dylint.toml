@@ -60,7 +60,7 @@ excluded_paths = [
     # gears/system/
     "gears/system/api-gateway",
     "gears/system/grpc-hub",
-    "gears/system/gear-orchestrator",
+    "gears/system/service-discovery",
     "gears/system/nodes-registry",
     "gears/system/oagw",
     "gears/system/types-registry",

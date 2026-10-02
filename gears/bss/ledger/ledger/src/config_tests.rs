@@ -216,6 +216,49 @@ fn zero_close_lock_timeout_rejected() {
 }
 
 #[test]
+#[allow(clippy::expect_used, reason = "test assertion")]
+fn enabled_purge_with_zero_tenant_budget_rejected_naming_the_real_switch() {
+    let cfg = ReconConfig {
+        purge_max_rows_per_tick: 1,
+        purge_max_tenants_per_tick: 0,
+        ..ReconConfig::default()
+    };
+    let err = cfg.validate().expect_err("inert-while-looking-configured");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("recon.purge_max_tenants_per_tick must be >= 1"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("recon.purge_max_rows_per_tick = 0"),
+        "the message points at the actual on/off switch: {msg}"
+    );
+}
+
+#[test]
+fn zero_tenant_budget_accepted_while_purge_is_off() {
+    let cfg = ReconConfig {
+        purge_max_rows_per_tick: 0,
+        purge_max_tenants_per_tick: 0,
+        ..ReconConfig::default()
+    };
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn recon_lifecycle_defaults_stop_growth_without_deleting() {
+    let cfg = ReconConfig::default();
+    assert_eq!(
+        cfg.unregistered_tenants,
+        UnregisteredTenants::Skip,
+        "the lifecycle gate is on"
+    );
+    assert_eq!(cfg.purge_max_rows_per_tick, 0, "the purge is opt-in");
+    assert_eq!(cfg.purge_max_tenants_per_tick, 500);
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
 fn default_recon_tick_interval_is_five_minutes() {
     assert_eq!(ReconConfig::default().recon_tick_interval().as_secs(), 300);
 }
@@ -280,5 +323,20 @@ fn allocation_cap_at_ceiling_accepted() {
     let cfg = PaymentsConfig {
         max_invoices_per_allocation: MAX_INVOICES_PER_ALLOCATION_CEILING,
     };
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+#[allow(clippy::expect_used, reason = "test assertion")]
+fn recon_lifecycle_knobs_deserialize_from_their_config_spelling() {
+    let cfg: ReconConfig = serde_json::from_value(serde_json::json!({
+        "unregistered_tenants": "reconcile",
+        "purge_max_rows_per_tick": 200_000,
+        "purge_max_tenants_per_tick": 50,
+    }))
+    .expect("recon block deserializes");
+    assert_eq!(cfg.unregistered_tenants, UnregisteredTenants::Reconcile);
+    assert_eq!(cfg.purge_max_rows_per_tick, 200_000);
+    assert_eq!(cfg.purge_max_tenants_per_tick, 50);
     assert!(cfg.validate().is_ok());
 }

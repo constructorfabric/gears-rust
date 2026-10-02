@@ -46,6 +46,8 @@ thiserror = { workspace = true }
 # identity. The FIPS-validated implementation the platform installs at bootstrap,
 # rather than the `sha2` crate DE0708 bans -- see `domain/admission/fingerprint.rs`.
 aws-lc-rs = { workspace = true }
+# The freshness validator's base64url wire form (SPEC §8.5).
+base64 = { workspace = true }
 parking_lot = { workspace = true }
 lru = "0.18.2"
 
