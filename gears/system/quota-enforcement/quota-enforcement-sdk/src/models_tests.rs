@@ -526,8 +526,10 @@ fn spec() -> QuotaSpec {
             projection_type: GtsTypeId::new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~"),
             subject_id: "u1".to_owned(),
         },
-        metric: MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1")
-            .expect("metric"),
+        metric: MetricId::parse(
+            "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1",
+        )
+        .expect("metric"),
         quota_type: QuotaType::Consumption,
         period: Some(PeriodType::Month),
         enforcement_mode: EnforcementMode::Hard,
