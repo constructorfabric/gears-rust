@@ -206,6 +206,42 @@ gears:
       # one. See the plugin README for a worked rule set.
       grants: []
 
+  # Requires --features admission-control.
+  # Admission gate for platform operations (gears/system/admission-control).
+  # `engine` is omitted on purpose: with no engine configured the gate refuses,
+  # with could-not-run, every operation a built-in policy does not already
+  # refuse. Add `engine: { vendor: "<vendor>" }` (optionally
+  # `instance_id: "<GTS instance id>"`) once an engine plugin is linked; a
+  # configured engine that cannot be resolved fails startup. Refusals are
+  # published best-effort to the event broker when one is linked (dropped
+  # otherwise). Timeouts are in milliseconds; unknown keys fail startup.
+  admission-control:
+    config:
+      engine_timeout_ms: 100
+      builtin_timeout_ms: 3
+      max_properties: 256
+      max_context_bytes: 65536
+      event_queue_capacity: 1024
+      builtin_policies:
+        # Refuses creating or renaming a resource whose `name` property
+        # starts with a reserved prefix, with or without an engine. The
+        # namespace wildcard needs no registered type; a concrete type id
+        # (ending in `~`) must resolve in types-registry or startup fails.
+        - id: "reserved-name-prefix"
+          description: "Resource names starting with a reserved platform prefix cannot be created or renamed"
+          resource_types: ["gts.cf.core.*"]
+          actions: ["create", "rename"]
+          content: |
+            package builtin.reserved_name_prefix
+
+            reserved_prefixes := ["cf-", "system-"]
+
+            deny if {
+                input.action in {"create", "rename"}
+                some prefix in reserved_prefixes
+                startswith(input.properties.name, prefix)
+            }
+
   account-management:
     database:
       server: "sqlite_users"
