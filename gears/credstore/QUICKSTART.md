@@ -71,8 +71,12 @@ at startup.
 byte store keyed by `(tenant_id, record_id)`: `put` returns the version, `get`
 reads one, `delete_key` drops the key (called by the outbox after a record
 delete), and `destroy` is optional (`supports_destroy`). There is no way to
-seed a value directly in the plugin's own configuration. Always create/rotate a
-credential with `PUT`/`PATCH` below so a record exists.
+seed a value directly in the plugin's own configuration: the static plugin's
+config carries only `vendor` and `priority`, and any other key (including the
+withdrawn `secrets` block) fails validation at boot. It is a non-durable
+in-memory store for development and tests only and logs a WARN saying so at
+startup. Always create/rotate a credential with `PUT`/`PATCH` below so a
+record exists.
 
 Two backend plugins currently exist: `static-credstore-plugin` (in-memory,
 for dev/test, feature `static-credstore`) and `vault-credstore-plugin`
@@ -96,11 +100,12 @@ suffix is shown.
 | `read_secret` | `GET /credentials[/{ref}]` when `$select` names `secret` | `secret_read.v1` |
 | `write_secret` | `PUT`/`PATCH` — `secret` field | `secret_write.v1` |
 
-`PUT` always requires **both** `write` and `write_secret` when it writes or
-removes a secret, and `write` alone when its `secret` is a `null` that
-creates or leaves a secret-less record. `PATCH` requires whichever of the
-two the body's keys touch (both when both are present), all evaluated
-before any side effect.
+`PUT` requires `write`, plus `write_secret` when it writes a secret or when
+a `null` removes an existing one; `write` alone suffices when its `secret`
+is a `null` that creates or leaves a secret-less record (this exemption is
+`PUT`-only). `PATCH` requires `write` for metadata keys and `write_secret`
+for any `secret` key, string or `null`, unconditionally (both when both
+are present). All required actions are evaluated before any side effect.
 
 ## Examples
 
@@ -214,7 +219,7 @@ Response: **204 No Content** (`ETag` bumped to
 `"3fa85f64-5717-4562-b3fc-2c963f66afa6.2"` — the validator the next write
 needs). `Content-Type` must be exactly `application/merge-patch+json` —
 anything else is **415** (`UNSUPPORTED_MEDIA_TYPE`). `If-Match` is
-mandatory (missing → **400**; stale → **409** `OPTIMISTIC_LOCK_FAILURE`);
+mandatory (missing → **400** `IF_MATCH_REQUIRED`; malformed → **400** `INVALID_IF_MATCH`; stale → **409** `OPTIMISTIC_LOCK_FAILURE`);
 `If-None-Match` on a `PATCH` is **400**. This call always writes and bumps
 `version`, even on identical bytes. Requires `write_secret` only.
 
@@ -351,11 +356,13 @@ always `null`; each item additionally carries the decrypted `secret`:
 
 `limit`/`cursor` are rejected (**400** `SECRET_MODE_NO_PAGINATION`),
 `$orderby` is rejected (**400** `SECRET_MODE_NO_ORDER`), and `$filter` must
-be exactly `reference in (...)` or `type eq/in (...)` (**400**
+be exactly `reference eq/in (...)` or `type eq/in (...)` (**400**
 `SECRET_MODE_SELECTOR`). A match set over `list.secret_mode_cap` (default 25)
 fails the whole request with **400** `TOO_MANY_MATCHES` rather than
 truncating it. A refused or missing item is
-omitted, never reported. Requires `read_secret`, evaluated per item.
+omitted, never reported; an expired item, or one whose stored version the
+backend cannot return (**409** `SECRET_UNREADABLE` on a point read), comes
+back with its metadata and without a secret. Requires `read_secret`, evaluated per item.
 
 ### Delete a credential
 
@@ -393,7 +400,10 @@ async fn secret_length(
 ```
 
 A missing or inaccessible credential is `Ok(None)`; an explicit denial of
-`read_secret` is `Err(CredStoreError::AccessDenied)`.
+`read_secret` is `Err(CredStoreError::AccessDenied)`. The record read (metadata
+only, never the value) is `get_record`. A version the backend cannot return is
+`Err(CredStoreError::SecretUnreadable)` (REST **409** `SECRET_UNREADABLE`):
+retrying does not help, rewrite the secret (`PUT`/`PATCH`) or delete the record.
 
 For every endpoint's full parameter and schema reference, see
 <http://127.0.0.1:8087/cf/docs>.

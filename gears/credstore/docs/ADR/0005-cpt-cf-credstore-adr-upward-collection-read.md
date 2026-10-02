@@ -4,7 +4,7 @@ date: 2026-09-08
 ---
 
 Created:  2026-09-08 by Constructor Tech
-Updated:  2026-09-18 by Constructor Tech
+Updated:  2026-10-02 by Constructor Tech
 
 # ADR-0005: Upward-Rooted Collection Read Under the No-Projection PEP Contract
 
@@ -74,9 +74,9 @@ Canonical sort `reference ASC, id ASC` keeps one reference's rows contiguous, so
 
 ### Secret mode
 
-`$select=…,secret` (`cpt-cf-credstore-fr-bulk-read-secrets`) is the bounded bulk read of [ADR-0004](0004-cpt-cf-credstore-adr-secret-value-exposure.md): the same pipeline, authorizing `read_secret` once (plus `list` when a record field rides along). No `cursor`, `limit` or `$orderby`: a secret read is never paginated. At most `cap + 1` permitted candidates are fetched; above the cap the whole request fails closed. Selectors: `reference in (...)` and `type eq/in (...)` only. An item the caller may not read is omitted, never reported; an item whose decisive record is expired is returned with status `expired` and no secret, and the request does not fail because of it; values are read with bounded concurrency (8 in flight). Reason codes and envelope: DESIGN §4.3.2.
+`$select=…,secret` (`cpt-cf-credstore-fr-bulk-read-secrets`) is the bounded bulk read of [ADR-0004](0004-cpt-cf-credstore-adr-secret-value-exposure.md): the same pipeline, authorizing `read_secret` once (plus `list` when a record field rides along). No `cursor`, `limit` or `$orderby`: a secret read is never paginated. At most `cap + 1` permitted candidates are fetched; above the cap the whole request fails closed. Selectors: `reference eq/in (...)` and `type eq/in (...)` only (`eq` is a one-element `in`). An item the caller may not read is omitted, never reported; an item whose decisive record is expired is returned with status `expired` and no secret, and the request does not fail because of it; an item whose stored version cannot be read (`SECRET_UNREADABLE`, ADR-0006) is returned with its metadata and no secret, the same way; values are read with bounded concurrency (8 in flight). Reason codes and envelope: DESIGN §4.3.2.
 
-The `reference in (...)` selector's own cardinality **MUST** be checked against the cap before it is used to build the candidate query — a caller-supplied list longer than the cap fails closed the same way an over-cap result does, so parsing and SQL-`IN`-list cost cannot scale past the cap regardless of how large a selector is submitted. Aggregate response payload is therefore bounded by the cap times the largest secret any returned type's `max_size_bytes` trait allows — except `generic` (§5.2), which declares no `max_size_bytes`, so a request scoped to it has no size bound beyond what an individual write already permitted; that gap belongs to the type trait, not to secret mode. Per-caller/tenant/type rate limiting is not this layer's job at all — it is the route-level gateway throttling named as unresolved in Open Question 5.
+The `reference` selector's own cardinality (the length of an `in (...)` list) **MUST** be checked against the cap before it is used to build the candidate query — a caller-supplied list longer than the cap fails closed the same way an over-cap result does, so parsing and SQL-`IN`-list cost cannot scale past the cap regardless of how large a selector is submitted. Aggregate response payload is therefore bounded by the cap times the largest secret any returned type's `max_size_bytes` trait allows — except `generic` (§5.2), which declares no `max_size_bytes`, so a request scoped to it has no size bound beyond what an individual write already permitted; that gap belongs to the type trait, not to secret mode. Per-caller/tenant/type rate limiting is not this layer's job at all — it is the route-level gateway throttling named as unresolved in Open Question 5.
 
 ### What stays out of the filter
 
