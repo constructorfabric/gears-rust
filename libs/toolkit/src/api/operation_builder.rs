@@ -573,6 +573,11 @@ pub struct XPagination {
 //
 pub trait OperationBuilderODataExt<S, H, R> {
     /// Adds optional `$filter` query parameter to `OpenAPI`.
+    ///
+    /// # Panics
+    /// Panics when a field's `published_ops` is empty, repeats an operator,
+    /// or names one its kind does not allow (see
+    /// `toolkit_odata::filter::published_ops_error`).
     #[must_use]
     fn with_odata_filter<T>(self) -> Self
     where
@@ -600,7 +605,16 @@ where
         T: toolkit_odata::filter::FilterField,
     {
         use std::fmt::Write as _;
-        use toolkit_odata::filter::FilterOp;
+        use toolkit_odata::filter::{FilterOp, published_ops_error};
+
+        // A field's list is a declaration; a wrong one is a bug at the
+        // declaring site, not a contract to publish narrowed.
+        if let Some(error) = published_ops_error::<T>() {
+            panic!(
+                "{} declares an invalid published_ops: {error}",
+                self.spec.path
+            );
+        }
 
         let mut filter = self
             .spec
@@ -613,25 +627,28 @@ where
             let name = field.name().to_owned();
             let kind = field.kind();
 
-            // Published straight from the parser's own table, so the contract
-            // cannot promise an operator the parser refuses, or hide one it
-            // accepts.
-            let ops: Vec<String> = [
-                FilterOp::Eq,
-                FilterOp::Ne,
-                FilterOp::Gt,
-                FilterOp::Ge,
-                FilterOp::Lt,
-                FilterOp::Le,
-                FilterOp::Contains,
-                FilterOp::StartsWith,
-                FilterOp::EndsWith,
-                FilterOp::In,
-            ]
-            .into_iter()
-            .filter(|op| kind.allows(*op))
-            .map(|op| op.to_string())
-            .collect();
+            // Published from the parser's own table, unless the field names the
+            // operators it serves; `parse_odata_filter` refuses the rest, so the
+            // contract and the parser hold to one set.
+            let ops: Vec<String> = match field.published_ops() {
+                Some(ops) => ops.iter().map(ToString::to_string).collect(),
+                None => [
+                    FilterOp::Eq,
+                    FilterOp::Ne,
+                    FilterOp::Gt,
+                    FilterOp::Ge,
+                    FilterOp::Lt,
+                    FilterOp::Le,
+                    FilterOp::Contains,
+                    FilterOp::StartsWith,
+                    FilterOp::EndsWith,
+                    FilterOp::In,
+                ]
+                .into_iter()
+                .filter(|op| kind.allows(*op))
+                .map(|op| op.to_string())
+                .collect(),
+            };
 
             _ = write!(description, "\n- {}: {}", name, ops.join("|"));
             filter.allowed_fields.insert(name.clone(), ops);
