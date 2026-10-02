@@ -2476,6 +2476,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-credstore-value-migration"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-lc-rs",
+ "cf-gears-credstore",
+ "cf-gears-credstore-sdk",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-security",
+ "chrono",
+ "clap",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-event-broker"
 version = "0.2.8"
 dependencies = [
