@@ -493,9 +493,14 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
     // Initialize logging with MERGED config (master base + local override)
     // Trace-id injection follows the same rule as the other telemetry
     // settings: it comes from the master's rendered config, never the local one.
+    //
+    // `is_none_or`, not `is_some_and`: an absent `opentelemetry` section resolves
+    // the splice ON, matching the in-process default (`bootstrap::run` over
+    // `OpenTelemetryConfig::default()` -> `unwrap_or(true)`). `is_some_and` would
+    // silently disable it for every OoP gear with no section.
     #[cfg(feature = "otel")]
     let inject_trace_ids =
-        otel_cfg.is_some_and(crate::telemetry::OpenTelemetryConfig::inject_trace_ids_into_logs);
+        otel_cfg.is_none_or(crate::telemetry::OpenTelemetryConfig::inject_trace_ids_into_logs);
     #[cfg(not(feature = "otel"))]
     let inject_trace_ids = false;
 

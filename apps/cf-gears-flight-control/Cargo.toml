@@ -47,10 +47,10 @@ mimalloc = { workspace = true }
 # ToolKit bootstrap (host mode)
 toolkit = { workspace = true, features = ["bootstrap"] }
 
-# Control-plane system gears: directory (gear-orchestrator), transport (grpc-hub),
+# Control-plane system gears: directory (service-discovery), transport (grpc-hub),
 # edge / REST host (api-gateway), GTS catalogue (types-registry), and edge JWT
 # validation (authn-resolver).
-gear_orchestrator = { package = "cf-gears-gear-orchestrator", path = "../../gears/system/gear-orchestrator" }
+service_discovery = { package = "cf-gears-service-discovery", path = "../../gears/system/service-discovery" }
 types_registry = { package = "cf-gears-types-registry", path = "../../gears/system/types-registry/types-registry" }
 api_gateway = { package = "cf-gears-api-gateway", path = "../../gears/system/api-gateway" }
 grpc_hub = { package = "cf-gears-grpc-hub", path = "../../gears/system/grpc-hub" }

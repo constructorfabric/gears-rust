@@ -16,7 +16,7 @@ import uuid
 
 import pytest
 
-from .conftest import EVENT_TYPE_STREAM, SUBJECT_TYPE, TOPIC_STREAM, XFAIL_AUTH_DISABLED
+from .conftest import EVENT_TYPE_STREAM, SUBJECT_TYPE, TOPIC_STREAM, XFAIL_AUTH_DISABLED, TRACE_ID
 
 
 async def test_create_anonymous_group_returns_201(api):
@@ -140,7 +140,7 @@ async def test_delete_group_with_active_members_returns_409(api):
         "status": 409,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.consumer_group.v1~",
             "violations": [
@@ -174,7 +174,7 @@ async def test_client_agent_too_long_returns_400(api):
         "status": 400,
         "detail": "Request validation failed",
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "field_violations": [
                 {
@@ -208,7 +208,7 @@ async def test_description_non_ascii_returns_400(api):
         "status": 400,
         "detail": "Request validation failed",
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "field_violations": [
                 {
@@ -235,7 +235,7 @@ async def test_get_unknown_group_returns_404(api):
         "status": 404,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.consumer_group.v1~",
             "resource_name": fake_id,
@@ -303,7 +303,7 @@ async def test_cross_tenant_get_anonymous_group_returns_403(api):
         "status": 403,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -329,7 +329,7 @@ async def test_cross_tenant_delete_anonymous_group_returns_403(api):
         "status": 403,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 

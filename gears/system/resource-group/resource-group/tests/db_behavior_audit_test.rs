@@ -1197,7 +1197,7 @@ async fn scale_rejected_delete_statements_do_not_grow_with_child_type_count() {
 /// N+1 audit finding (b) guard: `gts_type` SELECTs for a `type in (...)`
 /// `$filter` on `list_groups`, with `n` values in the list. No groups of
 /// any of these types are created -- this isolates
-/// `resolve_type_filter_node`'s own query cost from `resolve_type_paths_batch`'s
+/// `odata_filter::resolve_type_filter`'s own query cost from `resolve_type_paths_batch`'s
 /// (which would otherwise also touch `gts_type` once per page, but is
 /// skipped entirely when the page is empty).
 async fn gts_type_selects_for_list_groups_type_in_filter(n: usize) -> usize {
@@ -1234,11 +1234,15 @@ async fn gts_type_selects_for_list_groups_type_in_filter(n: usize) -> usize {
 
 #[tokio::test]
 async fn scale_list_groups_type_in_filter_gts_type_selects_do_not_grow_with_value_count() {
-    // resolve_type_filter_node batches every literal in a `type in (...)`
+    // odata_filter::resolve_type_filter batches every literal in a `type in (...)`
     // filter into one `WHERE schema_id IN (...)` query (N+1 audit finding
     // (b)) instead of one `resolve_id` round trip per value (pre-fix:
     // N=3 -> 4 gts_type SELECTs, N=20 -> 21, slope 1.0).
     let small = gts_type_selects_for_list_groups_type_in_filter(3).await;
+    assert_eq!(
+        small, 1,
+        "empty page must still resolve all filter types in one lookup"
+    );
     let large = gts_type_selects_for_list_groups_type_in_filter(20).await;
     assert_eq!(
         small, large,
@@ -1250,7 +1254,7 @@ async fn scale_list_groups_type_in_filter_gts_type_selects_do_not_grow_with_valu
 
 /// Same guard as the one above, but through `list_memberships`'s
 /// `resource_type in (...)` filter -- `MembershipRepository::list_memberships`
-/// calls the exact same `resolve_type_filter_node`, so
+/// calls the exact same `odata_filter::resolve_type_filter`, so
 /// this is a second call site for the same fix, not a second
 /// implementation of it.
 async fn gts_type_selects_for_list_memberships_resource_type_in_filter(n: usize) -> usize {
@@ -1302,11 +1306,13 @@ async fn gts_type_selects_for_list_memberships_resource_type_in_filter(n: usize)
 async fn scale_list_memberships_resource_type_in_filter_gts_type_selects_do_not_grow_with_value_count()
  {
     // Same fix as `scale_list_groups_type_in_filter_gts_type_selects_do_not_grow_with_value_count`,
-    // exercised through the other call site of `resolve_type_filter_node`
-    // (N+1 audit finding (b): this path was affected by the same defect,
-    // and picked it up for free from the shared tree-walk generalization
-    // in fe2d609e).
+    // exercised through the other call site of `odata_filter::resolve_type_filter`
+    // Membership filters now resolve GTS identifiers through the shared helper.
     let small = gts_type_selects_for_list_memberships_resource_type_in_filter(3).await;
+    assert_eq!(
+        small, 1,
+        "empty page must still resolve all filter types in one lookup"
+    );
     let large = gts_type_selects_for_list_memberships_resource_type_in_filter(20).await;
     assert_eq!(
         small, large,

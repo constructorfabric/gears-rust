@@ -1,0 +1,11 @@
+{
+  "gts_id": "gts.cf.e2e.discovery.person.v1~cf.e2e.discovery.employee.v1~cf.e2e.discovery.manager.v1~cf.e2e.discovery.director.v1~cf.e2e.discovery.diana.v1",
+  "content": {
+    "name": "Diana",
+    "payload": {
+      "employee_id": "E003",
+      "team": "Architecture",
+      "division": "Engineering"
+    }
+  }
+}

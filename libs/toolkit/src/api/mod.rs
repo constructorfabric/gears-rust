@@ -19,15 +19,14 @@ pub mod select;
 mod odata_policy_tests;
 
 pub use canonical_error_layer::canonical_error_middleware;
-pub use error_layer::{
-    IntoCanonical, error_mapping_middleware, extract_trace_id, map_error_to_canonical,
-};
+pub use error_layer::{IntoCanonical, error_mapping_middleware, map_error_to_canonical};
 pub use openapi_registry::{OpenApiInfo, OpenApiRegistry, OpenApiRegistryImpl, ensure_schema};
 pub use operation_builder::{
     Missing, OperationBuilder, OperationSpec, ParamLocation, ParamSpec, Present,
     ResponseHeaderSpec, ResponseHeaderType, ResponseSpec, ThrottlingSpec, state,
 };
 pub use select::{apply_select, page_to_projected_json, project_json};
+pub use toolkit_trace_context::extract_trace_id;
 
 /// Prelude that re-exports the canonical error types and common API utilities.
 pub mod canonical_prelude {

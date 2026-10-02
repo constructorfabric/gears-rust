@@ -685,3 +685,43 @@ async def test_barrier_metadata_in_descendants(
         normal_item = next(i for i in items if i["id"] == normal["id"])
         normal_meta = normal_item.get("metadata")
         assert normal_meta is None or normal_meta.get("self_managed") is not True
+
+
+async def test_membership_quoted_uuid_and_gts_filter_sql(
+    rg_base_url, rg_headers, create_type, create_group,
+):
+    """VHP-2042: quoted UUID and GTS filters bind the correct SQL value types."""
+    member_type = await create_type("quotedmember")
+    group_type = await create_type(
+        "quotedgroup", allowed_membership_types=[member_type["code"]],
+    )
+    group = await create_group(group_type["code"], "Quoted membership filters")
+    resource_id = str(uuid.uuid4())
+    membership_url = (
+        f"{_memberships(rg_base_url)}/{group['id']}/"
+        f"{member_type['code']}/{resource_id}"
+    )
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        response = await client.post(membership_url, headers=rg_headers)
+        assert response.status_code == 201, response.text
+        try:
+            for group_literal in [group["id"], f"'{group['id']}'"]:
+                response = await client.get(
+                    _memberships(rg_base_url), headers=rg_headers,
+                    params={
+                        "$filter": (
+                            f"group_id eq {group_literal} and "
+                            f"resource_type eq '{member_type['code']}'"
+                        ),
+                        "limit": 200,
+                    },
+                )
+                assert response.status_code == 200, response.text
+                assert response.json()["items"] == [{
+                    "group_id": group["id"],
+                    "resource_type": member_type["code"],
+                    "resource_id": resource_id,
+                }]
+        finally:
+            response = await client.delete(membership_url, headers=rg_headers)
+            assert response.status_code == 204, response.text

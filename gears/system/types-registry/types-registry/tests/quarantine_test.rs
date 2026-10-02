@@ -140,7 +140,6 @@ async fn admit_at(
         &dispatch,
         &SubmitRequest {
             idempotency_key: Some(key.to_owned()),
-            kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
                 gts_id: gts_id.to_owned(),

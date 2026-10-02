@@ -492,7 +492,8 @@ fn contract_ref_for_type_takes_the_major_version_of_the_last_segment() {
 #[test]
 fn projection_bindings_are_distinct_by_pair() {
     let metric =
-        MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1").expect("metric");
+        MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1")
+            .expect("metric");
     let user =
         GtsTypeId::try_new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~").expect("type");
     let tenant =

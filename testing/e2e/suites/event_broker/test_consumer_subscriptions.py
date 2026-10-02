@@ -27,6 +27,7 @@ from .conftest import (
     TOPIC_LONGPOLL,
     XFAIL_AUTH_DISABLED,
     SseFrameReader,
+    TRACE_ID,
 )
 
 
@@ -271,7 +272,7 @@ async def test_join_unauthorized_topic_returns_403(api):
         "status": 403,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -307,7 +308,7 @@ async def test_too_many_interests_returns_400(api):
         "status": 400,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -325,7 +326,7 @@ async def test_leave_unknown_subscription_returns_404(api):
         "status": 404,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.subscription.v1~",
             "resource_name": fake_sub_id,
@@ -533,7 +534,7 @@ async def test_join_group_at_capacity_returns_429(api):
         "status": 429,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
     assert "retry-after" in {k.lower() for k in sub2_resp.headers}
@@ -578,6 +579,6 @@ async def test_cross_tenant_join_anonymous_group_returns_403(api):
         "status": 403,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }

@@ -34,6 +34,7 @@ from .conftest import (
     TOPIC_STREAM,
     TOPIC_PREFILLED,
     SseFrameReader,
+    TRACE_ID,
 )
 
 
@@ -269,7 +270,7 @@ async def test_out_of_range_below_rf_rejected_400(api, prefilled_topic):
         "status": 400,
         "detail": "Request validation failed",
         "instance": f"{API_BASE}/subscriptions/{sub_id}:seek",
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "field_violations": [
                 {
@@ -327,7 +328,7 @@ async def test_offset_above_hwm_rejected_400(api, prefilled_topic):
         "status": 400,
         "detail": "Request validation failed",
         "instance": f"{API_BASE}/subscriptions/{sub_id}:seek",
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "field_violations": [
                 {
@@ -404,7 +405,7 @@ async def test_seek_while_streaming_returns_409(api, test_env):
         "status": 409,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.subscription.v1~",
             "violations": [
@@ -439,7 +440,7 @@ async def test_seek_unknown_subscription_returns_404(api):
         "status": 404,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.subscription.v1~",
             "resource_name": fake_sub_id,
@@ -501,7 +502,7 @@ async def test_seek_unassigned_partition_rejected_409(api):
         "status": 409,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 

@@ -161,6 +161,15 @@ gears:
               - "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
               - "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
             idp_provisioning: false
+      # Types-registry suite settings, kept here rather than in its manifest so
+      # the shared `make e2e-local` server has them too. Force lets TR-REG-903
+      # waive a compatibility failure; the suite's `force-disabled` profile
+      # turns it off for TR-REG-902. Vendor `acme` is open only in the suite's
+      # own namespace (TR-REG-904); every other region stays closed.
+      allow_compatibility_force: true
+      registration_policy:
+        "gts.acme.e2e.*":
+          allowed_vendors: [acme]
 
   static-tr-plugin:
     config:
@@ -467,14 +476,22 @@ gears:
   #
   bss-ledger:
     # Gear-specific database (SQLite for E2E, like the other user gears; the
-    # gear ships dual PG/SQLite migrations). No config block needed — the
-    # defaults (events_enabled=false, seller_tenant_types=partner+platform)
-    # are correct for E2E. `fx.provider_vendor` also defaults to "cf.bss", the
-    # same default the core `bss-rate-provider` gear advertises as its `vendor`,
-    # so the commented FX example above lines up without further edits.
+    # gear ships dual PG/SQLite migrations). The defaults
+    # (events_enabled=false, seller_tenant_types=partner+platform) are correct
+    # for E2E; only the recon lifecycle knob below is overridden.
+    # `fx.provider_vendor` also defaults to "cf.bss", the same default the core
+    # `bss-rate-provider` gear advertises as its `vendor`, so the commented FX
+    # example above lines up without further edits.
     database:
       server: "sqlite_users"
       file: "bss_ledger.db"
+    config:
+      recon:
+        # E2E binds `static-tr-plugin`, which knows only its fixed tenants, so
+        # tenants created at runtime through AM are absent from the resolver's
+        # answer. Keep reconciling them rather than reading the omission as
+        # "hard-deleted" (see bss_ledger::config::UnregisteredTenants).
+        unregistered_tenants: reconcile
 
   bss-pricing:
     # Gear-specific database (SQLite for E2E, like the other user gears; the
@@ -588,8 +605,8 @@ opentelemetry:
       record_headers: [ "user-agent", "x-forwarded-for" ]
 
     # Add top-level trace_id / span_id to JSON log records so a backend can
-    # link a log line to its span. Off by default: it costs a context lookup
-    # per event.
+    # link a log line to its span. On by default (it costs a context lookup
+    # per event); set to false to opt out.
     logs_correlation:
       inject_trace_ids_into_logs: true
 

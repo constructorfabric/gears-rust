@@ -280,6 +280,18 @@ fn reconciliation_slice7_metrics_are_observable() {
     // A blocked close (by reason) + an exception-queue depth (by type) gauge.
     m.period_close_blocked("open_exceptions");
     m.exception_queue_depth("unmatched_settlement", 4);
+    // The tenant-lifecycle gate: the skipped-tenant gauge by state (last write
+    // wins), the purged-row counter (accumulates across adds), and the two
+    // failure counters.
+    m.reconciliation_retired_tenants("deleted", 9);
+    m.reconciliation_retired_tenants("deleted", 7);
+    m.reconciliation_retired_tenants("unregistered", 2);
+    m.reconciliation_runs_purged(5_000);
+    m.reconciliation_runs_purged(1_234);
+    m.reconciliation_lifecycle_unavailable("none_recognised");
+    m.reconciliation_lifecycle_unavailable("none_recognised");
+    m.reconciliation_lifecycle_unavailable("read_failed");
+    m.reconciliation_purge_failed(3);
     h.force_flush();
     assert_eq!(
         h.counter_value(
@@ -315,6 +327,42 @@ fn reconciliation_slice7_metrics_are_observable() {
             &[("type", "unmatched_settlement")]
         ),
         4
+    );
+    assert_eq!(
+        h.gauge_value(
+            "ledger_reconciliation_retired_tenants",
+            &[("state", "deleted")]
+        ),
+        7
+    );
+    assert_eq!(
+        h.gauge_value(
+            "ledger_reconciliation_retired_tenants",
+            &[("state", "unregistered")]
+        ),
+        2
+    );
+    assert_eq!(
+        h.counter_value("ledger_reconciliation_runs_purged_total", &[]),
+        6_234
+    );
+    assert_eq!(
+        h.counter_value(
+            "ledger_reconciliation_lifecycle_unavailable_total",
+            &[("reason", "none_recognised")]
+        ),
+        2
+    );
+    assert_eq!(
+        h.counter_value(
+            "ledger_reconciliation_lifecycle_unavailable_total",
+            &[("reason", "read_failed")]
+        ),
+        1
+    );
+    assert_eq!(
+        h.counter_value("ledger_reconciliation_purge_failed_total", &[]),
+        3
     );
 }
 

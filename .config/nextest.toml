@@ -1,0 +1,7 @@
+# ClickHouse usage-collector plugin: per-test kill. Sized from measured runs
+# (max 1.5s per test) and kept above the harness's own 240s bring-up budget, so
+# its error, not a bare TIMEOUT, reports a wedged setup. See the plugin's
+# tests/common/mod.rs (BRING_UP_BUDGET).
+[[profile.default.overrides]]
+filter = 'package(cf-gears-clickhouse-usage-collector-plugin)'
+slow-timeout = { period = "60s", terminate-after = 5 }

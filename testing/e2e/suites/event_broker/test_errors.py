@@ -2,9 +2,12 @@
 
 Each test triggers one canonical error category and asserts the full
 Problem Details shape (``type``, ``title``, ``status``, ``detail``,
-``instance``, ``trace_id``, ``context``).  Server-generated fields
-(``detail``, ``instance``, ``trace_id``) are self-referenced so the
-assertion covers the whole envelope without hard-coding their exact text.
+``instance``, ``trace_id``, ``context``).  Server-generated ``detail`` and
+``instance`` are self-referenced so the assertion covers the whole envelope
+without hard-coding their exact text.  ``trace_id`` is deterministic: every
+client sends a fixed W3C ``traceparent`` (conftest), which the canonical
+error layer echoes into ``trace_id`` as ``TRACE_ID`` regardless of
+server-side OTel, so the envelope asserts that exact value.
 
 Unauthenticated (1.02) and PermissionDenied (1.03) are xfail because the
 standalone config has ``auth_disabled: true``.  The 500 Internal (1.08) test
@@ -19,7 +22,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from .conftest import SKIP_LIMITS, EVENT_TYPE_STREAM, SUBJECT_TYPE, TOPIC_STREAM
+from .conftest import SKIP_LIMITS, EVENT_TYPE_STREAM, SUBJECT_TYPE, TOPIC_STREAM, TRACE_ID
 
 _AUTH_DISABLED_REASON = (
     "standalone config sets auth_disabled: true; "
@@ -45,7 +48,7 @@ async def test_problem_details_envelope_shape(api):
         "status": 404,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.consumer_group.v1~",
             "resource_name": fake_id,
@@ -67,7 +70,7 @@ async def test_401_unauthenticated_envelope(api):
         "status": 401,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -97,7 +100,7 @@ async def test_403_permission_denied_envelope(api):
         "status": 403,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -119,7 +122,7 @@ async def test_404_not_found_envelope(api):
         "status": 404,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.consumer_group.v1~",
             "resource_name": fake_id,
@@ -171,7 +174,7 @@ async def test_409_failed_precondition_envelope(api):
         "status": 409,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.subscription.v1~",
             "violations": [
@@ -248,7 +251,7 @@ async def test_412_sequence_violation_envelope(api):
         "status": 412,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "violations": [
                 {
@@ -294,7 +297,7 @@ async def test_429_rate_limited_envelope(api):
         "status": 429,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
     assert "retry-after" in {k.lower() for k in resp.headers}
@@ -318,6 +321,6 @@ async def test_500_internal_error_envelope(api):
         "status": 500,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }

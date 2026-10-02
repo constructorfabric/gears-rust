@@ -28,6 +28,7 @@ use crate::domain::enums::{
     OperationKind, OperationStatus, OwnershipScope, Plane,
 };
 use crate::domain::family::FamilyKey;
+use crate::domain::key::EntityKey;
 use crate::domain::selection::FieldSelection;
 
 // The output port the admission path's instruments cross (T16).
@@ -187,7 +188,9 @@ pub struct OperationItemRow {
     pub id: i64,
     pub operation_id: Uuid,
     pub item_no: i32,
-    pub gts_id: String,
+    /// Always an identifier for a registration — the repository refuses a row
+    /// that is not — and a deletion's key as its request named it.
+    pub key: EntityKey,
     pub dry_run: bool,
     pub kind: OperationKind,
     pub precondition: Precondition,
@@ -556,7 +559,7 @@ pub struct NewOperation {
 #[derive(Clone, Debug)]
 pub struct NewOperationItem {
     pub item_no: i32,
-    pub gts_id: String,
+    pub key: EntityKey,
     pub precondition: Precondition,
     /// Persisted ADR-0004 waiver request. `compat_forced` avoids `MySQL`'s reserved `force`.
     pub compat_forced: bool,

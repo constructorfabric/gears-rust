@@ -28,7 +28,7 @@ STANDARDS ALIGNMENT:
 This design extends the ToolKit gear system to support out-of-process deployment. The core principle is **deployment
 transparency**: the same Rust trait, OperationBuilder routes, and ClientHub wiring work across all three deployment
 profiles without source changes. **Flight Control** is the minimal platform control-plane deployment unit — it runs the
-orchestrator (`gear-orchestrator` / `DirectoryService`), the transport + edge (`grpc-hub`, `api-gateway`), and edge JWT
+orchestrator (`service-discovery` / `DirectoryService`), the transport + edge (`grpc-hub`, `api-gateway`), and edge JWT
 validation (`authn-resolver`), coordinating OoP gear lifecycle, discovery, and gateway registration. The AuthZ plane and
 application gears run out-of-process. The architecture is built on four pillars:
 
@@ -242,10 +242,8 @@ token). `encode_bin` / `decode_bin` (which exclude `bearer_token`) remain in use
 ┌────────────────────────────────────────────────────────────────┐
 │                       Flight Control                           │
 │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐    │
-│  │  gear-       │  │  grpc-hub    │  │  api-gateway       │    │
-│  │  orchestrator│  │              │  │  (GatewayProvider) │    │
-│  │  (Directory  │  │              │  │                    │    │
-│  │   Service)   │  │              │  │                    │    │
+│  │  service-    │  │  grpc-hub    │  │  api-gateway       │    │
+│  │  discovery   │  │              │  │  (GatewayProvider) │    │
 │  └──────┬───────┘  └──────────────┘  └─────────┬──────────┘    │
 │         │  gRPC                         reverse-proxy          │
 │         │                                       │              │
@@ -867,8 +865,8 @@ belong on the tenant plane — they are *not* candidates for `PlatformSecurityCo
 ##### Responsibility scope
 
 - Define the `InternalCredential` enum and `attach_internal_auth` / `validate_internal_auth` helpers.
-- Profile 2: Flight Control generates a bootstrap token, passes it to spawned workers via env, and validates it at its `gear-orchestrator` DirectoryService.
-- Profile 3: read projected SA token, attach to calls, validate via TokenReview at Flight Control's `gear-orchestrator`.
+- Profile 2: Flight Control generates a bootstrap token, passes it to spawned workers via env, and validates it at its `service-discovery` DirectoryService.
+- Profile 3: read projected SA token, attach to calls, validate via TokenReview at Flight Control's `service-discovery`.
 - Provide `InternalAuthMiddleware` for both gRPC (tonic interceptor) and HTTP (Axum middleware) that validates incoming
   system calls.
 - All logic lives in ToolKit runtime — gear developers do not interact with internal auth.
@@ -1073,7 +1071,7 @@ and no bespoke gateway admin API is needed. Notes:
 
 | Dependency Gear     | Interface Used                   | Purpose                                                |
 |-----------------------|----------------------------------|--------------------------------------------------------|
-| gear-orchestrator   | DirectoryClient SDK              | Service registration and discovery for OoP gears     |
+| service-discovery   | DirectoryClient SDK              | Service registration and discovery for OoP gears     |
 | grpc-hub              | gRPC server hosting              | Hosts DirectoryService gRPC endpoint                   |
 | api-gateway           | ToolKitGatewayProvider (internal) | Reverse-proxy routes for OoP gear public APIs        |
 | authn-resolver        | AuthNResolverClient SDK          | JWT validation at gateway edge                         |
@@ -1177,7 +1175,7 @@ transparently.
 sequenceDiagram
     participant Host as Flight Control
     participant Worker as OoP Gear (ToolKit Runtime)
-    participant Dir as DirectoryService<br/>(gear-orchestrator)
+    participant Dir as DirectoryService<br/>(service-discovery)
     participant Edge as api-gateway edge<br/>(GatewayProvider)
 
     Host->>Worker: spawn process (config: listen addr, directory endpoint)
@@ -1322,7 +1320,7 @@ from an in-process implementation — the host gear code is unchanged.
 
 ### 3.7 Database schemas & tables
 
-No new database tables. Flight Control's `gear-orchestrator` uses DirectoryService (gRPC, in-memory registry) for
+No new database tables. Flight Control's `service-discovery` uses DirectoryService (gRPC, in-memory registry) for
 service discovery state. Persistent state (if needed for multi-host P2) will be addressed in a future ADR.
 
 ### 3.8 Deployment Topology
@@ -1407,7 +1405,7 @@ service discovery state. Persistent state (if needed for multi-host P2) will be 
 - Each gear is an independent k8s Deployment + Service.
 - Public API ingress follows the edge mode (§ 3.10): **Mode A** keeps the built-in api-gateway (in the platform pod) as the edge; **Mode B** uses an external gateway (Kong, Tyk, Envoy).
 - k8s DNS provides service discovery; DirectoryService is optional for metadata.
-- The minimal Flight Control control-plane unit (gear-orchestrator, grpc-hub, types-registry, api-gateway, authn-resolver) runs as the platform pod (see § Flight Control Composition). The AuthZ plane (authz-resolver + its trust-coupled chain tenant-resolver + resource-group, kept together in one unit) runs as its own pod and serves `/evaluate` via directory resolution. Higher-level platform services (account-management, credstore) run as their own pods; account-management remains trust-coupled to the AuthZ plane until `am.system` migrates to S2S credentials.
+- The minimal Flight Control control-plane unit (service-discovery, grpc-hub, types-registry, api-gateway, authn-resolver) runs as the platform pod (see § Flight Control Composition). The AuthZ plane (authz-resolver + its trust-coupled chain tenant-resolver + resource-group, kept together in one unit) runs as its own pod and serves `/evaluate` via directory resolution. Higher-level platform services (account-management, credstore) run as their own pods; account-management remains trust-coupled to the AuthZ plane until `am.system` migrates to S2S credentials.
 
 > **Amended by [ADR-0009 (Instance-Addressable Discovery)](ADR/0009-cpt-cf-adr-instance-addressable-discovery.md)** for role-split / sharded gears:
 > - *"Each gear is an independent Deployment + Service"* holds for a single-role gear, but a gear running in differentiated **roles** or **sharded** maps to *multiple* role-qualified names — hence *multiple* Deployments/StatefulSets and *multiple* Services, one per role-name — not a single Service in front of the whole gear. Shard-targeted role-names advertise a **per-instance-addressable** endpoint (not a shared VIP); the workload mechanism (`StatefulSet` + headless Service or a self-registering `Deployment`) is the gear developer's choice.
@@ -1895,7 +1893,7 @@ Flight Control itself.** OoP gears register with Flight Control's directory and 
 
 | Component | Role | State | Notes |
 |-----------|------|-------|-------|
-| gear-orchestrator (DirectoryService) | Service registration + discovery | No DB; in-memory registry. Gears re-register on heartbeat, so restart recovery is handled. | Serves gRPC via grpc-hub; its REST surface (co-hosted on api-gateway) enables k8s-native discovery. |
+| service-discovery (DirectoryService) | Service registration + discovery | No DB; in-memory registry. Gears re-register on heartbeat, so restart recovery is handled. | Serves gRPC via grpc-hub; its REST surface (co-hosted on api-gateway) enables k8s-native discovery. |
 | grpc-hub | gRPC transport for the directory + platform-plane RPCs | Stateless. | Hosts the DirectoryService gRPC endpoint. |
 | api-gateway | Edge + REST host: reverse-proxies exposed OoP routes and co-hosts the other control-plane gears' REST routes (directory, types-registry) on one HTTP server | No DB; in-memory route table populated from directory registrations. | Built-in edge in Profile 2 and Profile 3 Mode A; in Mode B an external gateway (Kong/Tyk) replaces the edge. |
 | types-registry | GTS catalogue | In-memory (link-time inventory + config seed + runtime registrations). Shared/DB persistence is a future optimization for multi-instance. | `post_init` graph validation must see a consistent view across distributed registrations. |

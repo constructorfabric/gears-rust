@@ -9,8 +9,23 @@ use crate::domain::error::DomainError;
 use crate::domain::registry_service::{MAX_BATCH_GET_KEYS, MAX_KEY_LEN, ServiceError};
 use crate::domain::selection::{EntityField, SelectionError};
 
-#[resource_error(gts_id!("cf.types_registry.registry.type.v1~"))]
+#[resource_error(gts_id!("cf.core.types_registry.entity.v1~"))]
 pub struct TypeRegistryError;
+
+/// Errors naming an admission operation rather than an entity: a missing
+/// operation, and the operation an `Idempotency-Key` is already bound to.
+/// `resource_name` is then an operation UUID, so the type says so.
+#[resource_error(gts_id!("cf.core.types_registry.operation.v1~"))]
+pub struct OperationError;
+
+/// A missing operation, from a read or from the worker: named by its id, under the
+/// operation resource type rather than the entity one.
+#[must_use]
+pub fn operation_not_found(operation_id: uuid::Uuid) -> CanonicalError {
+    OperationError::not_found(format!("No operation with id: {operation_id}"))
+        .with_resource(operation_id.to_string())
+        .create()
+}
 
 impl From<DomainError> for CanonicalError {
     fn from(e: DomainError) -> Self {
@@ -143,12 +158,6 @@ impl From<ServiceError> for CanonicalError {
             ServiceError::CorruptDocument(detail) => {
                 opaque_internal(&detail, "stored document parse")
             }
-            // Match GET's unresolved-key response (DESIGN §3.3).
-            ServiceError::UnresolvedReference { gts_uuid } => TypeRegistryError::not_found(
-                format!("No entity with Registry Reference: {gts_uuid}"),
-            )
-            .with_resource(gts_uuid.to_string())
-            .create(),
             // The three read-surface envelope refusals (T22a). Each names the
             // request field the caller has to change, and each states the bound
             // rather than the configuration key holding it — as
@@ -175,6 +184,11 @@ impl From<ServiceError> for CanonicalError {
                 field::INVALID_QUERY,
             ),
             ServiceError::KeyTooLong { len } => key_too_long(len),
+            // Only a batch item reaches the domain bound; the header is bounded
+            // when it is parsed.
+            ServiceError::ValidatorTooLong { len } => {
+                validator_too_long(violation_field::IF_NONE_MATCH_ITEM, len)
+            }
         }
     }
 }
@@ -185,11 +199,7 @@ impl From<WorkerError> for CanonicalError {
             // A candidate refused on its merits never arrives here — that is an
             // `ItemFailure` recorded on the operation item. Everything else in
             // this type is an infrastructure failure, so all of it is opaque.
-            WorkerError::OperationNotFound { operation_id } => {
-                TypeRegistryError::not_found(format!("No operation with id: {operation_id}"))
-                    .with_resource(operation_id.to_string())
-                    .create()
-            }
+            WorkerError::OperationNotFound { operation_id } => operation_not_found(operation_id),
             WorkerError::MissingPayload { item_id } => opaque_internal(
                 &format!("operation item {item_id} carries no request payload"),
                 "admission",
@@ -290,12 +300,12 @@ impl From<WorkerError> for CanonicalError {
 ///
 /// Header and query-parameter names are spelled exactly as the caller sent them,
 /// `$select` included, so a caller greps the violation for the thing it wrote.
-mod violation_field {
+pub(super) mod violation_field {
     pub const IDEMPOTENCY_KEY: &str = "Idempotency-Key";
     pub const IF_MATCH: &str = "If-Match";
     pub const IF_NONE_MATCH: &str = "If-None-Match";
     pub const ITEMS: &str = "items";
-    pub const KEY: &str = "key";
+    pub const ENTITY_KEY: &str = "entity_key";
     pub const IF_NONE_MATCH_ITEM: &str = "if_none_match";
     pub const FORCE: &str = "force";
     pub const EXPECTED_RESOURCE_VERSION: &str = "expected_resource_version";
@@ -490,22 +500,36 @@ fn selectable_fields() -> String {
     EntityField::ALL.map(EntityField::name).join(", ")
 }
 
-/// Reject a read key over [`MAX_KEY_LEN`] bytes, whichever layer spotted it.
+/// Reject a read or deletion key over [`MAX_KEY_LEN`] bytes, whichever layer
+/// spotted it.
 #[must_use]
 pub fn key_too_long(len: usize) -> CanonicalError {
     invalid_field(
-        violation_field::KEY,
+        violation_field::ENTITY_KEY,
         format!("a key must be at most {MAX_KEY_LEN} bytes; this one is {len}"),
         field::VALIDATION_FAILED,
     )
 }
 
-/// Reject a batch-get `if_none_match` longer than a key may be.
+/// Reject an entity-tag longer than a key may be, under the field that carried
+/// it: the `If-None-Match` header or a batch item's `if_none_match`.
 #[must_use]
-pub fn validator_too_long(len: usize) -> CanonicalError {
+pub fn validator_too_long(field_name: &'static str, len: usize) -> CanonicalError {
     invalid_field(
-        violation_field::IF_NONE_MATCH_ITEM,
-        format!("each if_none_match must be at most 1024 bytes; this one is {len}"),
+        field_name,
+        format!(
+            "each {field_name} entity-tag must be at most {MAX_KEY_LEN} bytes; this one is {len}"
+        ),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject a conditional value that cannot be read, rather than read unconditionally.
+#[must_use]
+pub fn malformed_condition(field_name: &'static str, detail: &str) -> CanonicalError {
+    invalid_field(
+        field_name,
+        format!("{field_name} cannot be read: {detail}"),
         field::VALIDATION_FAILED,
     )
 }
@@ -555,6 +579,16 @@ fn invalid_candidate(gts_id: &str, field_name: &str, detail: String, code: &str)
         .create()
 }
 
+/// A refused `expected_resource_version`, naming the candidate as the resource.
+fn invalid_version(gts_id: &str, detail: String) -> CanonicalError {
+    invalid_candidate(
+        gts_id,
+        violation_field::EXPECTED_RESOURCE_VERSION,
+        detail,
+        field::VALIDATION_FAILED,
+    )
+}
+
 impl From<AcceptanceError> for CanonicalError {
     fn from(e: AcceptanceError) -> Self {
         use violation_field as vf;
@@ -587,6 +621,15 @@ impl From<AcceptanceError> for CanonicalError {
             ),
 
             // --- the candidate identifier -------------------------------------
+            AcceptanceError::KeyTooLong { length } => key_too_long(*length),
+            // The code a longer identifier got before the bound: it is not one.
+            AcceptanceError::IdentifierTooLong { length } => invalid_field(
+                field::GTS_ID_FIELD,
+                format!(
+                    "a GTS identifier must be at most {MAX_KEY_LEN} bytes; this one is {length}"
+                ),
+                field::INVALID_GTS_ID,
+            ),
             AcceptanceError::InvalidIdentifier { gts_id, reason } => invalid_candidate(
                 gts_id,
                 field::GTS_ID_FIELD,
@@ -598,6 +641,16 @@ impl From<AcceptanceError> for CanonicalError {
                 field::GTS_ID_FIELD,
                 format!("'{gts_id}' appears twice in one request"),
                 field::INVALID_GTS_ID,
+            ),
+            // Positions, not keys: the two may be different kinds of key for one
+            // entity, and neither string need repeat.
+            AcceptanceError::DuplicateTarget {
+                first_index,
+                second_index,
+            } => invalid_field(
+                vf::ENTITY_KEY,
+                format!("items[{first_index}] and items[{second_index}] name the same entity"),
+                field::VALIDATION_FAILED,
             ),
             AcceptanceError::ExplicitUuidTail { gts_id } => invalid_candidate(
                 gts_id,
@@ -661,20 +714,12 @@ impl From<AcceptanceError> for CanonicalError {
             ),
             // Named on the precondition field rather than on the entity: what is
             // missing is the version, and "delete if present" is not the fallback.
-            AcceptanceError::DeletionRequiresVersion { gts_id } => invalid_candidate(
+            AcceptanceError::DeletionRequiresVersion { gts_id } => invalid_version(
                 gts_id,
-                vf::EXPECTED_RESOURCE_VERSION,
                 format!(
                     "deleting '{gts_id}' requires a positive expected_resource_version; \
                      an absent one is not a request to delete whatever is there"
                 ),
-                field::VALIDATION_FAILED,
-            ),
-            AcceptanceError::DeletionCarriesContent { gts_id } => invalid_candidate(
-                gts_id,
-                field::ENTITY_FIELD,
-                format!("deleting '{gts_id}' takes no document, and nothing would read one"),
-                field::VALIDATION_FAILED,
             ),
             AcceptanceError::AuthoredDocumentTooLarge {
                 gts_id,
@@ -710,28 +755,29 @@ impl From<AcceptanceError> for CanonicalError {
                 format!("'{gts_id}' names no readable major in its last segment"),
                 field::INVALID_GTS_ID,
             ),
-            AcceptanceError::MinorTypeSchemaRevision { gts_id } => invalid_candidate(
+            AcceptanceError::MinorTypeSchemaRevision { gts_id } => invalid_version(
                 gts_id,
-                vf::EXPECTED_RESOURCE_VERSION,
                 format!(
                     "minor-bearing Type Schema '{gts_id}' is immutable; register a new minor instead"
                 ),
-                field::VALIDATION_FAILED,
             ),
-            AcceptanceError::ZeroPrecondition { gts_id } => invalid_candidate(
+            AcceptanceError::ZeroPrecondition { gts_id } => invalid_version(
                 gts_id,
-                vf::EXPECTED_RESOURCE_VERSION,
                 format!(
                     "expected_resource_version 0 on '{gts_id}' is refused: omit the field \
                      to require absence"
                 ),
-                field::VALIDATION_FAILED,
             ),
-            AcceptanceError::NegativePrecondition { gts_id, version } => invalid_candidate(
+            AcceptanceError::DeletionZeroPrecondition { gts_id } => invalid_version(
                 gts_id,
-                vf::EXPECTED_RESOURCE_VERSION,
+                format!(
+                    "expected_resource_version 0 on '{gts_id}' is refused: deleting requires \
+                     the positive version being deleted"
+                ),
+            ),
+            AcceptanceError::NegativePrecondition { gts_id, version } => invalid_version(
+                gts_id,
                 format!("expected_resource_version {version} on '{gts_id}' is negative"),
-                field::VALIDATION_FAILED,
             ),
 
             // --- policy -------------------------------------------------------
@@ -759,7 +805,7 @@ impl From<AcceptanceError> for CanonicalError {
             // The operation id is given in both the detail and the resource: the
             // caller needs it to read what its key is already bound to.
             AcceptanceError::FingerprintConflict { operation_id } => {
-                TypeRegistryError::already_exists(format!(
+                OperationError::already_exists(format!(
                     "this Idempotency-Key is already bound to operation {operation_id} \
                      with a different request"
                 ))
@@ -846,6 +892,16 @@ mod tests {
                 field::VALIDATION_FAILED,
             ),
             (
+                AcceptanceError::KeyTooLong { length: 1025 },
+                violation_field::ENTITY_KEY,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::IdentifierTooLong { length: 1025 },
+                field::GTS_ID_FIELD,
+                field::INVALID_GTS_ID,
+            ),
+            (
                 AcceptanceError::InvalidIdentifier {
                     gts_id: id.clone(),
                     reason: "bad id".to_owned(),
@@ -857,6 +913,19 @@ mod tests {
                 AcceptanceError::DuplicateCandidate { gts_id: id.clone() },
                 field::GTS_ID_FIELD,
                 field::INVALID_GTS_ID,
+            ),
+            (
+                AcceptanceError::DuplicateTarget {
+                    first_index: 0,
+                    second_index: 1,
+                },
+                violation_field::ENTITY_KEY,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::DeletionZeroPrecondition { gts_id: id.clone() },
+                violation_field::EXPECTED_RESOURCE_VERSION,
+                field::VALIDATION_FAILED,
             ),
             (
                 AcceptanceError::ExplicitUuidTail { gts_id: id.clone() },
@@ -981,6 +1050,26 @@ mod tests {
         let conflict = acceptance_problem(AcceptanceError::FingerprintConflict { operation_id });
         assert_eq!(conflict.status, Some(409));
         assert!(conflict.detail.contains(&operation_id.to_string()));
+        assert_operation_resource(&conflict, operation_id);
+    }
+
+    /// An operation error names the operation, so its `resource_type` is the
+    /// operation type the SDK publishes, never the entity type.
+    fn assert_operation_resource(problem: &Problem, operation_id: uuid::Uuid) {
+        assert_eq!(
+            problem
+                .context
+                .get("resource_type")
+                .and_then(serde_json::Value::as_str),
+            Some(types_registry_sdk::gts::OPERATION_RESOURCE_TYPE),
+        );
+        assert_eq!(
+            problem
+                .context
+                .get("resource_name")
+                .and_then(serde_json::Value::as_str),
+            Some(operation_id.to_string().as_str()),
+        );
     }
 
     #[test]
@@ -1003,12 +1092,33 @@ mod tests {
         }
     }
 
+    /// The entity marker's literal is not the SDK constant callers dispatch on, so
+    /// only this pins the two together.
+    #[test]
+    fn entity_problems_carry_the_sdk_entity_resource_type() {
+        let id = gts_id!("cf.core.events.test.v1~");
+        for problem in [
+            problem_from(DomainError::not_found_by_id(id)),
+            problem_from(DomainError::AlreadyExists(id.to_owned())),
+        ] {
+            assert_eq!(
+                problem
+                    .context
+                    .get("resource_type")
+                    .and_then(serde_json::Value::as_str),
+                Some(types_registry_sdk::gts::TYPE_RESOURCE_TYPE),
+                "{problem:?}",
+            );
+        }
+    }
+
     #[test]
     fn worker_variants_have_stable_status_and_opaque_internal_details() {
         let missing = worker_problem(WorkerError::OperationNotFound {
             operation_id: uuid::Uuid::nil(),
         });
         assert_eq!(missing.status, Some(404));
+        assert_operation_resource(&missing, uuid::Uuid::nil());
 
         let cases = [
             worker_problem(WorkerError::MissingPayload { item_id: 42 }),

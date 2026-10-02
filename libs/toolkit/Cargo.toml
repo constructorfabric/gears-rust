@@ -79,6 +79,7 @@ otel = [
     "dep:tracing-subscriber",
     "dep:opentelemetry-otlp",
     "dep:tonic",
+    "toolkit-trace-context/otel",
 ]
 
 bootstrap = [
@@ -136,6 +137,10 @@ chrono = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 dsn = { workspace = true, optional = true }
 toolkit-utils = { workspace = true }
+# Shared W3C Trace Context propagation (single source of truth with
+# `cf-gears-toolkit-http`). Not optional: `extract_trace_id` uses the parser on
+# the always-compiled canonical-error path, independent of the `otel` feature.
+toolkit-trace-context = { workspace = true }
 rustls = { workspace = true }
 
 tokio = { workspace = true }

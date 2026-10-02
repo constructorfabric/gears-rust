@@ -502,10 +502,57 @@ fn layer_gear_router(
     // panics so the counter can never leak and stall the drain).
     gear = gear.layer(from_fn_with_state(drain_guard, drain_guard_middleware));
 
-    // Canonical-error middleware is the outermost gear layer so it post-processes
-    // every gear/auth response into `problem+json` with `trace_id` / `instance`
-    // filled — matching the in-process (`api-gateway`) path.
-    gear.layer(from_fn(canonical_error_middleware))
+    // Canonical-error middleware post-processes every gear/auth response into
+    // `problem+json` with `trace_id` / `instance` filled — matching the
+    // in-process (`api-gateway`) path.
+    gear = gear.layer(from_fn(canonical_error_middleware));
+
+    // Trace-context layer is the *outermost* gear layer so its `http_request`
+    // span is active for every inner layer, including the canonical-error layer
+    // that resolves the wire `trace_id` and emits the log line.
+    gear.layer(from_fn(trace_context_middleware))
+}
+
+/// Run every gear request inside an `http_request` span that continues the
+/// caller's W3C trace when the inbound `traceparent` carries one.
+///
+/// Without this an `OoP` gear's request span is a fresh root, so the canonical-
+/// error layer would put the caller's inbound trace id on the wire while the
+/// gear's own log lines carried a different, freshly-minted one. Seeding the
+/// parent makes the span's trace id equal the inbound one, so the wire
+/// `trace_id` and the log-correlation splice agree. (`api-gateway` does the same
+/// in-process via its own `TraceLayer`.)
+async fn trace_context_middleware(req: Request, next: Next) -> Response {
+    use tracing::Instrument as _;
+    use tracing::field::Empty;
+
+    // Record the gateway-supplied `x-request-id` (forwarded to this gear, absent
+    // when the gear is reached without the gateway) and the wire `trace_id` /
+    // `parent.trace_id` on the span, so an OoP gear's log lines join to the
+    // gateway access log and the wire trace even with the text console format,
+    // without OTel, or with the log-correlation splice off. The id is the
+    // gateway's; this gear does not mint one.
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("n/a");
+
+    let span = tracing::info_span!(
+        "http_request",
+        method = %req.method(),
+        uri = %req.uri().path(),
+        request_id = %request_id,
+        trace_id = Empty,
+        parent.trace_id = Empty,
+    );
+
+    // Seed the span's parent from the inbound W3C trace context and record
+    // `trace_id` / `parent.trace_id`. Shared with the api-gateway via
+    // `toolkit_trace_context`; without `otel` it records the ids from the header.
+    toolkit_trace_context::set_parent_from_headers(&span, req.headers());
+
+    next.run(req).instrument(span).await
 }
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use sea_orm::sea_query::{PostgresQueryBuilder, SqliteQueryBuilder, Value};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 
@@ -78,6 +79,36 @@ async fn with_rows_written_before_the_move() -> DatabaseConnection {
         .await;
     }
     db
+}
+
+#[test]
+fn the_rewrite_renders_with_every_input_bound_on_both_backends() {
+    // The regression: a custom SQL fragment spelt the placeholder as SQLite's
+    // `?`, which PostgreSQL passed through as text and read as an operator —
+    // the statement failed with a syntax error, and the two values bound to
+    // the fragment were dropped on the way. Rendered by each backend's own
+    // builder, every input is a bound value, and the SQLite run alone could
+    // never have shown the difference.
+    let statement = super::statement(super::OLD, super::NEW).expect("a prefix shorter than any id");
+    let bound = vec![
+        Value::from(super::NEW),
+        Value::from(30_i32),
+        Value::from("gts.cf.toolkit.settings.type\\_%"),
+    ];
+
+    let (sql, values) = statement.build(PostgresQueryBuilder);
+    assert_eq!(
+        sql,
+        r#"UPDATE "setting_declarations" SET "value_type_id" = $1 || SUBSTR("value_type_id", $2) WHERE "value_type_id" LIKE $3 ESCAPE E'\\'"#
+    );
+    assert_eq!(values.0, bound);
+
+    let (sql, values) = statement.build(SqliteQueryBuilder);
+    assert_eq!(
+        sql,
+        r#"UPDATE "setting_declarations" SET "value_type_id" = ? || SUBSTR("value_type_id", ?) WHERE "value_type_id" LIKE ? ESCAPE '\'"#
+    );
+    assert_eq!(values.0, bound);
 }
 
 #[tokio::test]

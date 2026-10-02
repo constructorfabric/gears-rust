@@ -6,6 +6,7 @@ pub mod entity;
 pub mod group_repo;
 pub mod membership_repo;
 pub mod migrations;
+mod odata_filter;
 pub mod odata_mapper;
 pub mod type_repo;
 

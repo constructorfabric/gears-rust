@@ -5,8 +5,18 @@
     "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
     "properties": {
-      "label": { "type": "string" }
+      "label": {
+        "type": "string"
+      },
+      "payload": {
+        "type": "object",
+        "additionalProperties": true
+      }
     },
-    "required": ["label"]
+    "required": [
+      "label",
+      "payload"
+    ],
+    "additionalProperties": false
   }
 }

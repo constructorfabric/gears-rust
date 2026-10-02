@@ -20,7 +20,7 @@ use types_registry::domain::admission::acceptance::{AcceptanceContext, Acceptanc
 use types_registry::domain::admission::dry_run::view::AdmissionView;
 use types_registry::domain::admission::worker::{Tuning, WorkerError, run_operation};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
-use types_registry::domain::enums::{OperationItemStatus, OperationKind};
+use types_registry::domain::enums::OperationItemStatus;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::ports::{
     DependencyStore, EntityEdge, ReverseImpact, Stores, snapshot_read,
@@ -83,7 +83,6 @@ async fn admit(db: &Provider, key: &str, gts_id: &str, content: Value) {
         &dispatch,
         &SubmitRequest {
             idempotency_key: Some(key.to_owned()),
-            kind: OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
                 gts_id: gts_id.to_owned(),

@@ -16,7 +16,7 @@ gears:
   calculator-gateway:
     config: { }
 
-  gear-orchestrator:
+  service-discovery:
     config: { }
 
   calculator:

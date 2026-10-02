@@ -791,7 +791,7 @@ Upload is synchronous: within the request the file is uploaded to the RAG provid
 | Unknown chat, another user's chat or a soft-deleted chat (checked before the body is read) | 404 | `not_found`, `context.resource_type = gts.cf.core.mini_chat.chat.v1~` |
 | The chat's model is no longer in the catalog (checked before the body is read) | 400 | `invalid_argument`, `field_violations[model].reason = INVALID_MODEL` |
 | No boundary in `Content-Type`, unreadable multipart body, no `file` field, `file` part without a content type | 400 | `invalid_argument`, `field_violations[].reason`: `BOUNDARY_REQUIRED` (`content_type`), `MULTIPART_ERROR` (`multipart`), `MISSING_FILE` (`file`), `MISSING_CONTENT_TYPE` (`content_type`) |
-| File larger than `min(rag.uploaded_file_max_size_kb, model max_file_size_mb)` / `min(rag.uploaded_image_max_size_kb, model max_file_size_mb)` | 400 | `out_of_range`, `FILE_TOO_LARGE` |
+| File larger than `min(rag.uploaded_file_max_size_kb, model max_file_size_mb)` / `min(rag.uploaded_image_max_size_kb, model max_file_size_mb)` | 400 | `out_of_range`, `field_violations[content_length].reason = FILE_TOO_LARGE` |
 | Unsupported MIME type | 400 | `invalid_argument`, `UNSUPPORTED_CONTENT_TYPE` |
 | Code-interpreter-only file (XLSX) while code interpreter is unavailable | 400 | `invalid_argument` |
 | Image upload while `disable_images` is on | 400 | `failed_precondition`, `violations[{subject: images, type: FEATURE_DISABLED}]` |
@@ -1084,7 +1084,7 @@ data: {"items": [{"source": "file", "title": "Q3 Report.pdf", "attachment_id": "
 | `items[].snippet` | string | Excerpt. Web citations: the annotation text, or the answer text in the annotation range. The range is applied as character offsets into the `output_text` part that carries the annotation; a range outside that text gives an empty snippet. OpenAI file citations: always `""`. |
 | `items[].score` | number (optional) | Relevance score (0-1). Not populated in P1 (never serialized). |
 
-**Provider identifier non-exposure invariant**: no provider-issued identifier — including `provider_file_id`, `provider_response_id`, `vector_store_id`, provider correlation IDs, or any other provider-scoped ID — MUST appear in any API response body, SSE event payload, or error message. This includes error message text: provider error messages that contain provider-scoped IDs MUST be sanitized or replaced with a generic message before being returned to clients. Internal systems (DB columns, structured logs, audit events, operator tooling) may store and reference these identifiers, but they MUST NOT be returned to public clients. All client-visible identifiers are internal UUIDs only (`chat_id`, `turn_id`, `request_id`, `attachment_id`, `message_id`).
+**Provider identifier non-exposure invariant**: no provider-issued identifier — including `provider_file_id`, `provider_response_id`, `vector_store_id`, provider correlation IDs, or any other provider-scoped ID — MUST appear in any API response body, SSE event payload, or error message. This includes error message text: provider error messages that contain provider-scoped IDs MUST be sanitized or replaced with a generic message before being returned to clients. Sanitization replaces each recognized provider ID with `[provider_id]`, each URL with `[url]`, and each `sk-…` key or `Bearer` token with `[credential]`; everything else in the message is left as is. Internal systems (DB columns, structured logs, audit events, operator tooling) may store and reference these identifiers, but they MUST NOT be returned to public clients. All client-visible identifiers are internal UUIDs only (`chat_id`, `turn_id`, `request_id`, `attachment_id`, `message_id`).
 
 P1: `citations` is sent once near stream completion, before `done`, only on a normally completed stream with at least one mapped citation. A provider `incomplete` response sends no `citations` event. Citations are not persisted, so an idempotent replay does not send them ([ADR-0010](./ADR/0010-cpt-cf-mini-chat-adr-runtime-consistency-limitations.md)). The contract supports multiple `citations` events per stream for future use. When web search contributes to the response, citations with `source: "web"` include `url`, `title`, and `snippet`. File citations carry `attachment_id`, the attachment filename as `title`, an empty `snippet` and no `span`.
 
@@ -1203,7 +1203,7 @@ Provider-specific streaming events are internal to `llm_provider` and the domain
 | Chat Completions, vLLM Responses and Anthropic Messages wire events | same SSE events | Each adapter maps its own wire events to the same internal events; this table shows the OpenAI Responses API names. |
 | `response.failed` | `event: error` (`code: "provider_error"`) | The error is read from `response.error`, with a top-level `error` as fallback. `message` is the sanitized provider message. `response.usage`, when present, is kept on the failed terminal outcome, and the turn settles on it when `has_known_usage` holds (section 5.7). |
 | `error` (SSE event) | `event: error` (`code: "provider_error"`) | Parsed like `response.failed`, then as flat `{code, message}`; unparseable data becomes the message. The provider code and message are kept internally; the client `message` is the sanitized provider message. |
-| Provider HTTP error / disconnect | `event: error` (`code: "provider_error"` or `"provider_timeout"`) | Error details sanitized (provider file, assistant and `vs_` identifiers are scrubbed); provider internals not exposed. |
+| Provider HTTP error / disconnect | `event: error` (`code: "provider_error"` or `"provider_timeout"`) | Error details sanitized (see the Provider identifier non-exposure invariant above); provider internals not exposed. |
 | Provider 429 | `event: error` (`code: "rate_limited"`) | OAGW does not retry; the provider's 429 is passed through and mapped directly. |
 
 This mapping is intentionally provider-agnostic in the stable contract. If the provider changes its event format or a new provider is added, only the translation layer in `llm_provider` is updated. The client contract remains unchanged.
@@ -1239,7 +1239,7 @@ The mapping is implemented in `api/rest/error.rs`:
 | `DELETE /chats/{id}`: the chat-cleanup outbox payload exceeds the outbox size limit (`OutboxError::PayloadTooLarge`) | `invalid_argument` | 400 | `detail`; the same message is also in `context.format`. The same failure on attachment `DELETE` and on turn retry, edit and delete is returned as 500 `internal` |
 | Image on a model without vision | `invalid_argument` | 400 | `VISION_NOT_SUPPORTED` (was 415) |
 | Invalid, duplicate, foreign or not-ready `attachment_ids`, or more than `rag.max_documents_per_chat + rag.max_images_per_message` of them | `invalid_argument` | 400 | `field_violations[attachment].reason = invalid_attachment` |
-| Upload larger than the limit | `out_of_range` | 400 | `FILE_TOO_LARGE` (was 413). A body above api-gateway `defaults.body_limit_bytes` (default 16 MiB) gets 413 from the gateway before it reaches mini-chat |
+| Upload larger than the limit | `out_of_range` | 400 | `field_violations[content_length].reason = FILE_TOO_LARGE` (was 413). A body above api-gateway `defaults.body_limit_bytes` (default 16 MiB) gets 413 from the gateway before it reaches mini-chat |
 | Too many images in one message | `out_of_range` | 400 | `TOO_MANY_IMAGES` |
 | Message exceeds `max_input_tokens` | `out_of_range` | 400 | `INPUT_TOO_LONG` |
 | Mandatory context does not fit the budget | `out_of_range` | 400 | `CONTEXT_BUDGET_EXCEEDED` |
@@ -3042,6 +3042,8 @@ All values are those of the effective model's catalog entry (`context_window`, `
 | Never truncated | System prompt + tool guard instructions, user message + image attachments | Always included. If these alone exceed the budget, the turn is rejected with HTTP 400 `out_of_range` (`CONTEXT_BUDGET_EXCEEDED`) before the provider call. |
 | Droppable | Thread summary | Dropped if it doesn't fit after mandatory items. |
 | Truncatable | Recent messages (whole turns), then the thread summary | Oldest whole turns are dropped first; the thread summary is dropped if it does not fit after the mandatory items. Retrieval excerpts are not part of the assembled context. There is no document-summary tier. |
+
+**Thread summary delivery format**: when kept, the thread summary is sent to the LLM as a single `user`-role message (not `system`), with a preamble prepended to the summary text; the preamble's size counts toward the thread summary's estimated token size for budget purposes.
 
 **Algorithm** (step by step):
 

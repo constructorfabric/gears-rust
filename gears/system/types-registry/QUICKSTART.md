@@ -139,7 +139,10 @@ Deletion requires a positive `expected_resource_version`. Invalid values return
 `400`; mismatches become asynchronous `precondition_failed` outcomes. `If-Match`
 is rejected.
 
-Batch deletion accepts either key form and returns GTS-ID outcomes in request order:
+Batch deletion accepts either key form and returns outcomes in request order, each echoing
+its `entity_key`, a Registry Reference in lowercase hyphenated form. Two keys of one entity
+are a duplicate and refuse the batch. This one deletes an Instance by its identifier and its
+Type Schema by its Registry Reference; the worker deletes the dependant first:
 
 ```bash
 curl -s -X POST "$BASE/types-registry/v2/entities:batchDelete" \
@@ -147,13 +150,14 @@ curl -s -X POST "$BASE/types-registry/v2/entities:batchDelete" \
   -H "Content-Type: application/json" \
   -d '{
         "items": [
-          { "key": "gts.cf.core.example.event.v1~", "expected_resource_version": 1 },
-          { "key": "d226dd5b-14c8-56da-a718-9cf29becaba1", "expected_resource_version": 2 }
+          { "entity_key": "gts.cf.core.example.event.v1~cf.core.example.first.v1", "expected_resource_version": 1 },
+          { "entity_key": "d226dd5b-14c8-56da-a718-9cf29becaba1", "expected_resource_version": 1 }
         ]
       }'
 ```
 
-Unknown Registry References return `404`; absent GTS IDs fail asynchronously.
+A key that names no entity, in either form, is still accepted; only its item fails
+`precondition_failed`.
 
 `dry_run` defaults to `false`: a body field for batches and query parameter for single deletion.
 
@@ -161,16 +165,16 @@ Unknown Registry References return `404`; absent GTS IDs fail asynchronously.
 
 `:batchGet` answers every key it is given. A `POST` because a GTS identifier runs to
 1024 characters, which a query string cannot carry safely, and portable `GET` has no body.
-Each `key` is a GTS identifier or a Registry Reference UUID:
+Each `entity_key` is a GTS identifier or a Registry Reference UUID:
 
 ```bash
 curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
   -H "Content-Type: application/json" \
   -d '{
         "items": [
-          { "key": "gts.cf.core.example.event.v1~" },
-          { "key": "d226dd5b-14c8-56da-a718-9cf29becaba1" },
-          { "key": "gts.cf.core.example.missing.v1~" }
+          { "entity_key": "gts.cf.core.example.event.v1~" },
+          { "entity_key": "d226dd5b-14c8-56da-a718-9cf29becaba1" },
+          { "entity_key": "gts.cf.core.example.missing.v1~" }
         ]
       }' | python3 -m json.tool
 ```
@@ -178,16 +182,17 @@ curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
 ```json
 {
     "items": [
-        { "key": "gts.cf.core.example.event.v1~", "status": "found", "entity": { "...": "the default fields" } },
-        { "key": "d226dd5b-14c8-56da-a718-9cf29becaba1", "status": "found", "entity": { "...": "..." } },
-        { "key": "gts.cf.core.example.missing.v1~", "status": "not_found" }
+        { "entity_key": "gts.cf.core.example.event.v1~", "status": "found", "etag": "\"A...\"", "entity": { "...": "the default fields" } },
+        { "entity_key": "d226dd5b-14c8-56da-a718-9cf29becaba1", "status": "found", "etag": "\"A...\"", "entity": { "...": "..." } },
+        { "entity_key": "gts.cf.core.example.missing.v1~", "status": "not_found" }
     ]
 }
 ```
 
-Results come back in request order, each echoing the key it was asked by, so a caller that
-mixed identifiers and Registry References matches answers to questions without re-deriving
-either. An absent key is `not_found` inside a `200`, not a `404`: one missing key must not
+Result order is not contractual, so a caller matches answers to questions by the echoed
+`entity_key`. An identifier is echoed as sent; a Registry Reference is echoed lowercase and
+hyphenated whatever UUID spelling was sent, so a caller normalizes its own UUID keys before
+matching. An absent key is `not_found` inside a `200`, not a `404`: one missing key must not
 lose the answers for the others.
 
 A top-level `"$select"` applies to every key and follows the exact read's rules, so a
@@ -196,7 +201,7 @@ A top-level `"$select"` applies to every key and follows the exact read's rules,
 ```bash
 curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
   -H "Content-Type: application/json" \
-  -d '{ "$select": "content", "items": [{ "key": "gts.cf.core.example.event.v1~" }] }'
+  -d '{ "$select": "content", "items": [{ "entity_key": "gts.cf.core.example.event.v1~" }] }'
 ```
 
 `$select` in the query string is refused on this route, as are unknown body fields.
@@ -205,8 +210,27 @@ A key named twice collapses onto its first mention. The two spellings of one ent
 keys and get two results. At most 100 keys per request; an empty `items` is a `400`. The
 key count does not bound response bytes once documents are selected.
 
-`If-None-Match` is refused rather than ignored, because validators are per key: each item
-carries its own `if_none_match` slot.
+### Skip an unchanged body
+
+An exact read's `ETag` and a batch result's `etag` are the same value, quotes included, for
+that key and `$select`. Send it back unchanged and an unchanged entity costs no body:
+
+```bash
+URL="$BASE/types-registry/v2/entities/gts.cf.core.example.event.v1~"
+ETAG=$(curl -si "$URL" | awk 'tolower($1) == "etag:" { print $2 }' | tr -d '\r')
+
+curl -si "$URL" -H "If-None-Match: $ETAG"
+# 304 Not Modified, the same ETag, no body
+
+curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
+  -H "Content-Type: application/json" \
+  -d "$(python3 -c 'import json, sys; print(json.dumps({"items": [{"entity_key": sys.argv[1], "if_none_match": sys.argv[2]}]}))' \
+        gts.cf.core.example.event.v1~ "$ETAG")"
+# {"items": [{"entity_key": "...", "status": "unchanged", "etag": "<$ETAG>"}]}
+```
+
+A revision, a refreshed dependency or another `$select` yields a new validator; discovery
+pages carry none. On `:batchGet` the `If-None-Match` header is refused: validators are per key.
 
 ### Discover what exists
 
@@ -266,7 +290,7 @@ echo "$IDS" | python3 -c 'import json,sys
 keys = sys.stdin.read().split()
 for i in range(0, len(keys), 100):
     print(json.dumps({"$select": "content",
-                      "items": [{"key": k} for k in keys[i:i + 100]]}))' \
+                      "items": [{"entity_key": k} for k in keys[i:i + 100]]}))' \
   | while read -r BODY; do
       curl -s -X POST "$BASE/types-registry/v2/entities:batchGet" \
         -H "Content-Type: application/json" -d "$BODY"
