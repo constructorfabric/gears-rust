@@ -155,7 +155,7 @@ election and Workflow **MUST NOT** independently suppress that transition reques
 ([Lifecycle `UPSTREAM_REQS.md` §2.5](../../../orders-lifecycle/docs/UPSTREAM_REQS.md));
 Lifecycle's `authorization-failed` refusal is the "begin-fulfillment not taken" of the PRD, the
 operation records it as `withheld` and the order stays `approved`. A tolerated failure proceeds
-with the risk flag Lifecycle records (Lifecycle [`06-workflow-seam.md`](../../../orders-lifecycle/docs/design/06-workflow-seam.md)
+with the risk flag Lifecycle records (Lifecycle [`06-workflow-seam.md`](../../../orders-lifecycle/docs/features/06-workflow-seam.md)
 §3.6 *Begin Fulfillment*, step 3). (decision D-89: Lifecycle is the sole
 tolerate-failure evaluator; a conclusive `failed` is carried to `begin-fulfillment` and a
 Lifecycle refusal is recorded as `withheld`; PRD §6.3 *Payment Authorization Precondition* is
@@ -211,7 +211,7 @@ does not hold (Lifecycle PRD §6.1).
 The Lifecycle begin-fulfillment call **MUST** be durably committed before any activation intent,
 and **MUST** follow a settled `evaluate-payment-auth-eligibility` answering `eligible` and a
 settled `construct-and-freeze-plan` answering `frozen` for the same order version. The first half
-is Lifecycle's rule ([`06-workflow-seam.md`](../../../orders-lifecycle/docs/design/06-workflow-seam.md)
+is Lifecycle's rule ([`06-workflow-seam.md`](../../../orders-lifecycle/docs/features/06-workflow-seam.md)
 §4.3); the whole is enforced as the *Plan* and *Waves* rows of [`10 §4.1`](./10-process-definition.md#41-the-fence)
 and as the guard of `begin-fulfillment` itself (§3.6, step `inst-bf-guard-frozen`), so a
 definition that reordered the calls would be refused before publish and, if it were published,
@@ -583,7 +583,7 @@ failure or unwind branch of §4.8. `not-dispatchable` is a settled success that 
 the held-spawn wait (`heldWait`, stage loop `heldSpawn`, a `PT5M` tick that runs this operation
 again), whose resume, amendment and cancel arms consume what the operation observed, never the
 `PT30S` barrier poll (§4.8 item 4, decision D-145)
-(Lifecycle [`03-gate-and-pin.md`](../../../orders-lifecycle/docs/design/03-gate-and-pin.md#re-check-before-first-activation)
+(Lifecycle [`03-gate-and-pin.md`](../../../orders-lifecycle/docs/features/03-gate-and-pin.md#re-check-before-first-activation)
 *What Workflow does with each outcome*). Transient downstream failures are `retryable-failure`
 (503/504) under the key left `open`; the definition's `catch.retry` re-issues the same key.
 
@@ -604,8 +604,8 @@ again), whose resume, amendment and cancel arms consume what the operation obser
 
 | Dependency Gear | Interface Used | Purpose |
 |------------------|-----------------|----------|
-| Orders Lifecycle | `OrdersLifecycleWorkflowV1` through `ClientHub` (Lifecycle D-155; [`06-workflow-seam.md`](../../../orders-lifecycle/docs/design/06-workflow-seam.md) §4.3): `begin_fulfillment`; `get` — the PDP-authorized current-order read of Lifecycle `08-read-and-authz` §4.2, for state, version and tenant axes; `get_version(orderId, orderVersion)` — the authorized immutable-version read (Lifecycle D-158) for the version's lines, service-activation dates, market, payer and per-line `activation_deadline` | `begin-fulfillment` transition; acceptance requirement and instant; service-activation dates and activation deadlines for the expected-fulfillment instant and its deadline check; the frozen market, payer and deadlines for the re-check. Called only from inside this slice's operations (seam rules R1–R5); commercial content is read by version and never crosses the engine boundary (decision D-193). |
-| Account Management | payer commercial-profile read | The payer profile the order market — the book currency of each line's plan revision and the producer-declared market applicability of its selected dimension values (Lifecycle predicate 4 as amended by D-156) — is compared against at construction (advisory) and in `re-check-pre-activation` (authoritative). Same read the Lifecycle submit gate uses ([`03-gate-and-pin.md`](../../../orders-lifecycle/docs/design/03-gate-and-pin.md) §3.4); the comparison is Lifecycle's algorithm, composed unchanged. |
+| Orders Lifecycle | `OrdersLifecycleWorkflowV1` through `ClientHub` (Lifecycle D-155; [`06-workflow-seam.md`](../../../orders-lifecycle/docs/features/06-workflow-seam.md) §4.3): `begin_fulfillment`; `get` — the PDP-authorized current-order read of Lifecycle `08-read-and-authz` §4.2, for state, version and tenant axes; `get_version(orderId, orderVersion)` — the authorized immutable-version read (Lifecycle D-158) for the version's lines, service-activation dates, market, payer and per-line `activation_deadline` | `begin-fulfillment` transition; acceptance requirement and instant; service-activation dates and activation deadlines for the expected-fulfillment instant and its deadline check; the frozen market, payer and deadlines for the re-check. Called only from inside this slice's operations (seam rules R1–R5); commercial content is read by version and never crosses the engine boundary (decision D-193). |
+| Account Management | payer commercial-profile read | The payer profile the order market — the book currency of each line's plan revision and the producer-declared market applicability of its selected dimension values (Lifecycle predicate 4 as amended by D-156) — is compared against at construction (advisory) and in `re-check-pre-activation` (authoritative). Same read the Lifecycle submit gate uses ([`03-gate-and-pin.md`](../../../orders-lifecycle/docs/features/03-gate-and-pin.md) §3.4); the comparison is Lifecycle's algorithm, composed unchanged. |
 | Subscriptions | overlap-presence read `SUB-O5` (`cpt-cf-bss-orders-workflow-upreq-overlap-presence-read`); the provisioning-intent contract is slice 05's | Construction-time observation and pre-activation re-check; this slice records the transition-request identifier and `subscription_id` supplied by slice 05's handlers. |
 | Platform (serverless-runtime) | None called — this slice is **called by** the definition through the step routes | The definition fragment `10 §3.6` (b) invokes the operations; the fixed `PT1H` `waitExpected` tick that re-checks `expected_fulfillment_at` through `evaluate-activation-eligibility`, and the `listen` arms, are the plugin's. |
 
@@ -694,7 +694,7 @@ Output: eligibility, nextEvaluationSeq
 
 1. [ ] - `p1` - Resolve the instance and its tenant axes; lock or create the `owf_fulfillment_plan` row for (`orderId`, `orderVersion`) unfrozen, copying `resource_tenant_id`, `payer_tenant_id` and `seller_tenant_id` from the instance and the order read - `inst-pa-resolve-row`
 2. [ ] - `p1` - **IF** the plan row is already `frozen_at` set **AND** `begin_fulfillment_committed_at` is set: **RETURN** `eligible` with the recorded observation — a late signal after the order entered fulfillment changes nothing - `inst-pa-if-already-begun`
-3. [ ] - `p1` - Read no acceptance state. Whether buyer acceptance is required, and recorded, is Lifecycle's begin-fulfillment guard, resolved live at each evaluation and never snapshotted ([Lifecycle `05`](../../../orders-lifecycle/docs/design/05-preconditions.md) §3.6), and Lifecycle's composed order read exposes no guard state ([Lifecycle `08 §4.2`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#42-what-a-read-exposes-normative)); `begin-fulfillment` surfaces an unmet or unevaluable acceptance as `withheld` (`inst-bf-if-withheld`) - `inst-pa-read-acceptance`
+3. [ ] - `p1` - Read no acceptance state. Whether buyer acceptance is required, and recorded, is Lifecycle's begin-fulfillment guard, resolved live at each evaluation and never snapshotted ([Lifecycle `05`](../../../orders-lifecycle/docs/features/05-preconditions.md) §3.6), and Lifecycle's composed order read exposes no guard state ([Lifecycle `08 §4.2`](../../../orders-lifecycle/docs/features/08-read-and-authz.md#42-what-a-read-exposes-normative)); `begin-fulfillment` surfaces an unmet or unevaluable acceptance as `withheld` (`inst-bf-if-withheld`) - `inst-pa-read-acceptance`
 4. [ ] - `p1` - **IF** the Lifecycle order read of step 1 is unavailable: settle `retryable-failure` (503) and leave the key `open` - `inst-pa-if-lifecycle-unavailable`
 5. [ ] - `p1` - Read the authorization outcome from Payments by the order's authorization request identity; a transport failure settles `retryable-failure` (503) with the circuit-breaker rule of `01 §4.5` - `inst-pa-read-outcome`
 6. [ ] - `p1` - Persist `payment_auth_outcome`, `payment_auth_observed_at` = database now **only when the outcome changed or was never recorded**, and `payment_auth_request_ref`; an unchanged `pending` does not move the observed instant - `inst-pa-persist-observation`
@@ -867,9 +867,9 @@ Input: correlationId, planRef, evaluationSeq, attemptId
 Output: verdict, abortReason, observed, nextEvaluationSeq
 
 1. [ ] - `p1` - **IF** slice 05's spawn-signal record exists for this plan: **RETURN** `proceed` with basis `already-spawned` — the re-check is authoritative only before the first activation intent (`PRD.md:329`) - `inst-rc-if-spawned`
-2. [ ] - `p1` - Compose Lifecycle's *Re-check Activation Preconditions* integration algorithm ([`03-gate-and-pin.md`](../../../orders-lifecycle/docs/design/03-gate-and-pin.md#re-check-before-first-activation)) unchanged, through the owning upstream SDKs — the Lifecycle current-order read `get` for state and version, the immutable-version read `get_version` for the frozen market, payer and each line's stored `overlap_scope_key` and `activation_deadline` (decision D-193), the payer's current commercial profile, the overlap occupancy for each line's stored key - `inst-rc-compose-lifecycle`
+2. [ ] - `p1` - Compose Lifecycle's *Re-check Activation Preconditions* integration algorithm ([`03-gate-and-pin.md`](../../../orders-lifecycle/docs/features/03-gate-and-pin.md#re-check-before-first-activation)) unchanged, through the owning upstream SDKs — the Lifecycle current-order read `get` for state and version, the immutable-version read `get_version` for the frozen market, payer and each line's stored `overlap_scope_key` and `activation_deadline` (decision D-193), the payer's current commercial profile, the overlap occupancy for each line's stored key - `inst-rc-compose-lifecycle`
 3. [ ] - `p1` - **IF** Lifecycle's outcome is `not-dispatchable`: **RETURN** `not-dispatchable` with `observed` ∈ `on-hold` · `superseded` · `terminal` - `inst-rc-if-not-dispatchable`
-4. [ ] - `p1` - **IF** the outcome is `defer`: increment `recheck_defer_count` and set `recheck_first_defer_at` if null; **IF** fewer than 3 defers and less than 60 s since the first (Lifecycle's `activation-recheck-retry-budget` baseline): settle `retryable-failure` (503, the unavailable port's reason) and leave the key `open`; **ELSE** write `abort_record` with the unavailable port's own reason — `identity-party-unavailable` for the identity port, `overlap-read-unevaluable` for the overlap-occupancy port — and **RETURN** `abort`; Lifecycle carries each port's reason separately on `acknowledge-failed` ([Lifecycle `06 §4.4`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#44-acknowledgement-normative), its D-127), so the two are never reduced to one - `inst-rc-if-defer`
+4. [ ] - `p1` - **IF** the outcome is `defer`: increment `recheck_defer_count` and set `recheck_first_defer_at` if null; **IF** fewer than 3 defers and less than 60 s since the first (Lifecycle's `activation-recheck-retry-budget` baseline): settle `retryable-failure` (503, the unavailable port's reason) and leave the key `open`; **ELSE** write `abort_record` with the unavailable port's own reason — `identity-party-unavailable` for the identity port, `overlap-read-unevaluable` for the overlap-occupancy port — and **RETURN** `abort`; Lifecycle carries each port's reason separately on `acknowledge-failed` ([Lifecycle `06 §4.4`](../../../orders-lifecycle/docs/features/06-workflow-seam.md#44-acknowledgement-normative), its D-127), so the two are never reduced to one - `inst-rc-if-defer`
 5. [ ] - `p1` - **IF** the outcome is `reject`: write `abort_record` with `overlap-collision` or `market-divergence` and the per-line reasons; **RETURN** `abort` - `inst-rc-if-reject`
 6. [ ] - `p1` - **IF** `payment_auth_outcome = authorized` and database now minus `payment_auth_observed_at` exceeds `payment_auth_validity` (30 days): write `abort_record` with `payment-authorization-stale`; **RETURN** `abort`. A tolerated `failed` outcome has no validity horizon — its risk was accepted by Lifecycle at begin-fulfillment - `inst-rc-if-stale`
 7. [ ] - `p1` - **IF** database now is at or after any line's `activation_deadline` read in step 2 (the deadline is exclusive, Lifecycle D-152): write `abort_record` with `order-binding-expired` and the lines whose deadline has passed; **RETURN** `abort`. This is an early check, not the authority: Subscriptions compares the accepted bindings against its own resolve at each activation admission and refuses a mismatch whatever this step answered (Lifecycle D-162, decision D-194) - `inst-rc-if-binding-expired`
@@ -1126,7 +1126,7 @@ before the first activation intent. Construction now precedes begin-fulfillment
 ([`10 §4.1`](./10-process-definition.md#41-the-fence)), when the order is `approved` and no
 Workflow seam transition out of `approved` exists (Lifecycle's `workflow-cancel` and
 `fulfillment-acknowledgement` both start from `in_fulfillment`,
-[`06-workflow-seam.md`](../../../orders-lifecycle/docs/design/06-workflow-seam.md) §3.3). The
+[`06-workflow-seam.md`](../../../orders-lifecycle/docs/features/06-workflow-seam.md) §3.3). The
 construction-time read is therefore **recorded, surfaced in the progress read, and never blocks
 the freeze**; the pre-activation read is the only one that can abort, and it runs against state
 that may have changed since. This closes the previous revision's contradiction between "a
@@ -1220,7 +1220,7 @@ this slice derives, proposed into the program-wide NFR workshop:
 | Max lines per order | **200** | An admission bound on plan size: it bounds the frozen task set, the compensation fan-out and the largest `OrderFulfillmentCompleted` payload (`01 §4.7`). Refused at start with `line-count-exceeded` (delegated by `start-instance`) and re-asserted by `construct-and-freeze-plan`; 41–200 lines execute normally outside the SLA population. |
 | Authorization validity | **30 days** (`payment_auth_validity`) | The horizon the freshness leg of `re-check-pre-activation` applies; the barrier can defer wave 2 up to the future-dated horizon inside a 90-day lifetime. |
 | Activation deadline | the version's `activation_deadline_at` (no Orders default) | Produced by the owning pricing policy per accepted line and stored by Lifecycle; this gear sets no duration and extends none (Lifecycle D-152, decision D-194). Checked at freeze, in the re-check and before each activation submit (§2.2). |
-| Re-check defer ladder | **3 attempts within 60 s** | Lifecycle's `activation-recheck-retry-budget`, executed by this gear ([`03-gate-and-pin.md`](../../../orders-lifecycle/docs/design/03-gate-and-pin.md#re-check-before-first-activation)). |
+| Re-check defer ladder | **3 attempts within 60 s** | Lifecycle's `activation-recheck-retry-budget`, executed by this gear ([`03-gate-and-pin.md`](../../../orders-lifecycle/docs/features/03-gate-and-pin.md#re-check-before-first-activation)). |
 
 (decision D-93: the SLA population is N ≤ 40 lines, the plan-size
 admission bound is 200 lines, and `payment_auth_validity` is 30 days; this replaces the
@@ -1350,7 +1350,7 @@ during cancellation (Q-11 (iv)); the platform `attempt_id` carried on the HTTP `
   definition pattern); `cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot` (the
   incompletable-void consequence binding the abort path, §2.2);
   `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition` (§4.1).
-- **Sibling seam**: [Orders Lifecycle workflow seam](../../../orders-lifecycle/docs/design/06-workflow-seam.md)
+- **Sibling seam**: [Orders Lifecycle workflow seam](../../../orders-lifecycle/docs/features/06-workflow-seam.md)
   §4.3 (begin fulfillment and the spawn signal), §4.4 (acknowledgement);
-  [Orders Lifecycle gate and pin](../../../orders-lifecycle/docs/design/03-gate-and-pin.md)
+  [Orders Lifecycle gate and pin](../../../orders-lifecycle/docs/features/03-gate-and-pin.md)
   *Re-check before first activation*.

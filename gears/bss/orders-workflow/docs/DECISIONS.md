@@ -218,6 +218,12 @@
   - [D-197 (H) The approval policy owner is this gear's approval-policy adapter; the Generic Approval service is withdrawn](#d-197-h-the-approval-policy-owner-is-this-gears-approval-policy-adapter-the-generic-approval-service-is-withdrawn)
   - [D-198 (M) The approval request carries the stored TCV as an integer in minor units with its currency and scale](#d-198-m-the-approval-request-carries-the-stored-tcv-as-an-integer-in-minor-units-with-its-currency-and-scale)
   - [D-199 (L) Seam notes: the payment amount is separate from the TCV, no Products reservation exists, and change orders wait for their own PriceBook pass](#d-199-l-seam-notes-the-payment-amount-is-separate-from-the-tcv-no-products-reservation-exists-and-change-orders-wait-for-their-own-pricebook-pass)
+  - [D-200 (H) The intent outcome event is `SubscriptionTransitionOutcome`; the two listen arms are its outcomes](#d-200-h-the-intent-outcome-event-is-subscriptiontransitionoutcome-the-two-listen-arms-are-its-outcomes)
+  - [D-201 (M) This gear mints `payment_auth_request_ref` from its intent key family; the Payments owner stays open](#d-201-m-this-gear-mints-payment_auth_request_ref-from-its-intent-key-family-the-payments-owner-stays-open)
+  - [D-202 (M) `reconcile-intent` settles a timed-out create through Subscriptions' `settle_create` before declaring it unresolved](#d-202-m-reconcile-intent-settles-a-timed-out-create-through-subscriptions-settle_create-before-declaring-it-unresolved)
+  - [D-203 (H) Lifecycle's alignment D-169…D-178 is received; the §2.4 asks and the §2.5 hand-off close as stated](#d-203-h-lifecycles-alignment-d-169d-178-is-received-the-24-asks-and-the-25-hand-off-close-as-stated)
+  - [D-204 (L) The PRD names the spawn-signal call and the shipping mode; hold and resume are event-driven](#d-204-l-the-prd-names-the-spawn-signal-call-and-the-shipping-mode-hold-and-resume-are-event-driven)
+  - [D-205 (L) The overlap key is never derived here; Q-08 is narrowed to Subscriptions' derivation answer](#d-205-l-the-overlap-key-is-never-derived-here-q-08-is-narrowed-to-subscriptions-derivation-answer)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -1779,7 +1785,7 @@ engine data as much as task inputs are: the start trigger's input is the raw `$w
 (Serverless Workflow DSL 1.0.0, dsl.md *Runtime expression arguments*) and a `listen` output is
 the array of consumed events (dsl-reference.md *Listen*), while Lifecycle's events as published
 carry tenant axes, per-line net components, the deciding authority and actor and reason fields
-([Lifecycle `01 §4.4`](../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative),
+([Lifecycle `01 §4.4`](../../orders-lifecycle/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative),
 lines 2396–2406). The start trigger and every Lifecycle, Generic Approval and Subscriptions
 `listen` **MUST** keep only references. Two routes are registered and either closes the gap: the
 platform persists only the members the definition selects
@@ -3199,7 +3205,7 @@ operator's action had no consumer and the SLA never breached (OW2-12). Nothing w
 at `pre-fence`, because the order continues, and its only meaningful resolution was always a new
 cancel. **Precedent**: Lifecycle's late authorization conflict is a refusal with an audit entry,
 "with no automatic reauthorization"; "a subsequent attempt must … obtain fresh authorization"
-([Lifecycle `08-read-and-authz.md:1286-1293`](../../orders-lifecycle/docs/design/08-read-and-authz.md)).
+([Lifecycle `08-read-and-authz.md:1286-1293`](../../orders-lifecycle/docs/features/08-read-and-authz.md)).
 
 **Propagated**: `design/08-hold-and-cancel.md` §1.2, §3.2, §3.3, §3.6, §4.3;
 `design/09-read-and-authz.md` §4.4; `design/07-manual-tasks.md` §3.2, §3.3, §4.4;
@@ -3285,7 +3291,7 @@ what a fire sends. A probe that replayed its first `available` would never detec
 `circuit-breaker-open` would, under D-114, fault the invocation exactly when the approval service
 is down. **Precedent**: Lifecycle's expiry scheduler answers `expiry-not-due` against the stored
 effective TTL and records the outcome
-([Lifecycle `07-hold-and-expiry.md:358`](../../orders-lifecycle/docs/design/07-hold-and-expiry.md)).
+([Lifecycle `07-hold-and-expiry.md:358`](../../orders-lifecycle/docs/features/07-hold-and-expiry.md)).
 The round rule is D-102.
 
 **Propagated**: `design/03-approval-execution.md` §3.2, §3.3, §3.6, §3.7.
@@ -4064,7 +4070,7 @@ calls, left 07 out of 08's dependencies, and hid the 06↔07, 06↔09, 07↔09 a
 following it could not compile 06 (OW2-84). ADR-0002's own table also ordered `10` before `01`,
 while `design/README.md` and `design/10` put the foundation first. **Precedent**: Orders
 Lifecycle builds capture and local transition tests against an `EventBrokerApi` double before the
-broker exists (`orders-lifecycle/docs/design/README.md`, *Phase 0/1*); ADR-0002's rule "a slice
+broker exists (`orders-lifecycle/docs/features/README.md`, *Phase 0/1*); ADR-0002's rule "a slice
 depends only on a slice earlier in the build order" is kept, with the stated back-edges as its
 only exceptions. Rejected: splitting every port trait into a separate build step ahead of all
 slices, which adds a build stage for a handful of edges.
@@ -5734,7 +5740,7 @@ non-blocking attempt" that "returns `DbLockError::AlreadyHeld` on contention"
 retry/backoff policy" and answers `Ok(None)` "if timed out or attempts exceeded"
 (`libs/toolkit-db/src/lib.rs:573-582`, `advisory_locks.rs:1636-1641`). **Precedent**: Lifecycle
 `01 §3.8`, "Contended passes skip/reschedule" and "release errors are reported, not treated as
-proof of ownership" (`gears/bss/orders-lifecycle/docs/design/01-foundation.md:1948-1949`). The
+proof of ownership" (`gears/bss/orders-lifecycle/docs/features/01-foundation.md:1948-1949`). The
 same section repeats the "bounded non-blocking acquisition through `Db::try_lock`" wording
 (`:1946-1947`); that is for its owner to correct.
 
@@ -6166,6 +6172,124 @@ contradict by silence; none warrants a design of its own here.
 
 **Propagated**: `design/04-fulfillment-plan.md` §3.4, §3.5; `UPSTREAM_REQS.md` §2.2, §2.5; Q-06.
 
+### D-200 (H) The intent outcome event is `SubscriptionTransitionOutcome`; the two listen arms are its outcomes
+
+**Accepted (2026-10-02).** *(co-signed with Lifecycle `cpt-cf-bss-orders-lifecycle-upreq-transition-outcome-echo`; carries `SUB-O16`)*
+
+**Decision**: the event Subscriptions emits for every provisioning intent — create, activate,
+draft void, activated cancel — is one `SubscriptionTransitionOutcome { transition_request_id,
+source { order_id, order_version, order_line_id }, wave, kind, wave_attempt, correlation_id,
+transition, outcome: applied | failed { reason_code } | oss_unconfirmed }`, the twin of
+Subscriptions' existing `SubscriptionActivated`, which carries no caller tuple and has no failure
+variant. This gear's `ProvisioningIntentConfirmed` and `ProvisioningIntentFailed` listen arms are
+the `applied` and `failed | oss_unconfirmed` outcomes of that one event and are renamed when the
+Subscriptions design lands; until then the arm names stay as the definition's `listen` filters and
+`reconcile-intent` is the fallback (D-202). The identity-envelope echo of `SUB-O16` is a field set
+of this event, not a second event.
+
+**Rationale**: three documents named three events for one moment (this gear, Subscriptions slice
+08, the Seam Atlas C03/C09); Lifecycle's register now asks for the same single event, so the two
+Orders gears present Subscriptions with one name and one payload.
+
+**Propagated**: `design/05-provisioning-intents.md` §3.3 (inbound events); `UPSTREAM_REQS.md` §2.1
+(`…-upreq-identity-envelope-echo`); Seam Atlas ticket T12.
+
+### D-201 (M) This gear mints `payment_auth_request_ref` from its intent key family; the Payments owner stays open
+
+**Accepted (2026-10-02).** *(closes the minting half of Q-06; the Payments owner half stays open)*
+
+**Decision**: the request reference a payment authorization is bound to is minted here, derived
+from the instance-scoped intent key family (`01 §2.2`), so a re-authorisation after a lease death
+or a hold presents the same reference and a Payments provider can answer `get(request_ref)`
+idempotently. Lifecycle consumes the three-valued outcome and never stores it (Lifecycle D-131) and
+has accepted this minting in its `UPSTREAM_REQS.md` §2.5 (2026-10-02). The amount stays the order
+version's Rating figure in minor units, separate from the TCV (D-199).
+
+**Rationale**: both Orders gears had designed what they receive from Payments and neither had said
+who names the request; naming it here removes the last ambiguity a future Payments specification
+would have to resolve.
+
+**Propagated**: `UPSTREAM_REQS.md` §2.2; Q-06.
+
+### D-202 (M) `reconcile-intent` settles a timed-out create through Subscriptions' `settle_create` before declaring it unresolved
+
+**Accepted (2026-10-02).** *(co-signed with Lifecycle `cpt-cf-bss-orders-lifecycle-upreq-settle-create`; extends `SUB-O13`)*
+
+**Decision**: when `reconcile-intent` finds a wave-1 create with no outcome and no row at
+Subscriptions, it calls `settle_create(create_key) → NoDraft { tombstone_id } | DraftFound {
+subscription_id, status }` — an operation Subscriptions serializes with `create` on the same unique
+dedup index, so exactly one of a late create and a settlement wins — before recording
+`never-dispatched` or `intent-unresolved`. Detection stays by re-read (§4.1); the 30-day key
+lifetime stays the fallback where the operation does not yet exist. The status read of `SUB-O13`
+(`…-upreq-nonterminal-status-read`) remains the liveness read; it is not proof that a delayed
+create cannot commit, which is what the settlement adds.
+
+**Rationale**: a status read alone cannot exclude a delayed create landing after the order has been
+acknowledged failed and attaching a subscription to a settled order (Lifecycle fixture F12).
+
+**Propagated**: `design/05-provisioning-intents.md` §3.3 (`reconcile-intent`); `UPSTREAM_REQS.md`
+§2.1 (`…-upreq-settle-create`, new).
+
+### D-203 (H) Lifecycle's alignment D-169…D-178 is received; the §2.4 asks and the §2.5 hand-off close as stated
+
+**Accepted (2026-10-02).** *(reciprocal of Lifecycle D-172, D-173, D-174, D-175, D-176)*
+
+**Decision**: (1) `…-upreq-lifecycle-workflow-key-retention` is answered: Lifecycle D-173 retains
+the receipts of the workflow-trigger class for at least 30 days, this gear's key lifetime; the
+read-by-key alternative is not provided and is no longer needed; D-188's `already-applied`
+settlement stays as defence in depth. (2) `…-upreq-lifecycle-failure-reason-coverage` is answered in
+part: Lifecycle D-172 withdraws `dependency-graph-invalid` as an emitted value (kept for replayed
+payloads), confirms `order-binding-expired`, and leaves the interim `line-execution-failed` for a
+stale authorization; the ask stands for `payment-authorization-stale` only. (3) Verdict ownership
+matches: Lifecycle D-175 records that verdicts and authorization outcomes are adapter-owned facts it
+does not verify through a port — the position D-197 took; the Seam Atlas C02/D05 carry the
+correction. (4) Lifecycle D-174 closes its Q-12 by naming the re-obtained verdict after
+`OrderAmended` as this gear's duty, which `design/02` §2.2 already performs and §4 item 2 asks the
+PRD to state. (5) Lifecycle D-176 keeps `category = change` refused at runtime for the acquisition
+slice, consistent with D-199 (4). (6) The §2.5 hand-off items are closed: Lifecycle's half is
+committed (`bss/orders-lifecycle-design-doc` at `37ac28237`, `f3f53d075`, `9d3afa3bb`), the
+unknown-topology clause is reworded (Lifecycle `UPSTREAM_REQS.md` §2.6), and this branch now carries
+the Lifecycle `features/` layout so the cross-references resolve.
+
+**Rationale**: each item is a fact the counterpart has committed; recording the reciprocal keeps
+the two registers from diverging again.
+
+**Propagated**: `UPSTREAM_REQS.md` §2.4, §2.5; `design/06-saga-and-compensation.md` §4.8.
+
+### D-204 (L) The PRD names the spawn-signal call and the shipping mode; hold and resume are event-driven
+
+**Accepted (2026-10-02).**
+
+**Decision**: PRD §9.1's Lifecycle-transition contract names `report_spawn_signal` as a required
+call made once per order between the pre-activation re-check and the first activation dispatch
+(`design/05` §3.3), and `workflow_cancel` as the cancellation path after it; it states that hold and
+resume are driven by Lifecycle's `OrderHeld`/`OrderResumed` events and that the SDK `hold`/`resume`
+methods are reserved (`design/08` §3.4). The PRD's engine rows record the ADR-0011 selection and
+that `definition_source = code` is the shipping mode until the §2.9 asks are answered (`design/01`
+§3.7, `10 §1`).
+
+**Rationale**: a reader of the PRD alone concluded that this gear never makes the spawn-signal call
+and that the engine was undecided; both were the design's facts the PRD had not caught up with.
+
+**Propagated**: `PRD.md` §9.1, §9.2, §13, §15, §16; `UPSTREAM_REQS.md` §4.
+
+### D-205 (L) The overlap key is never derived here; Q-08 is narrowed to Subscriptions' derivation answer
+
+**Accepted (2026-10-02).** *(amends Q-08; aligns with Lifecycle D-163, D-126)*
+
+**Decision**: the key this gear passes to the occupancy read is the SUB-G1 key Lifecycle stored on
+the order line at submit, read through `get_version`; this gear proposes no derivation and computes
+none. The read it asks for is Lifecycle's shape: `occupancy(payer, keys[]) → [{ key, active_count,
+draft_count, max_concurrent_active, source }]`, drafts counted separately so this gear's own wave-1
+drafts never collide with the order that created them. Q-08's remaining content is Subscriptions'
+answer on the derivation (`SUB-O5`, "neighbour-extends", not authored).
+
+**Rationale**: three keys were in circulation (plan id on the Seam Atlas, the SKU of the paid
+recurring item as a proposal, the registry key); only the registry key is stored and only
+Subscriptions may answer it.
+
+**Propagated**: `UPSTREAM_REQS.md` §2.1 (`…-upreq-overlap-presence-read`); Q-08.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -6283,6 +6407,12 @@ visibility, and reversal-artifact open questions in the PRD are resolved.
 
 **Amended by D-199 (2026-09-30)**: two items are added to the question — the amount an authorization request is bound to (the order version's Rating figure in the book currency, in integer minor units, separate from the TCV the approval request carries) and who mints `payment_auth_request_ref` (Lifecycle's acceptance path or this gear's `reauthorize-requested` signal). Ledger settlement is not authorization (Lifecycle D-168).
 
+**Amended by D-201 (2026-10-02)**: the minting half is closed — this gear mints
+`payment_auth_request_ref` from its intent key family, and Lifecycle has accepted that in its
+`UPSTREAM_REQS.md` §2.5. What remains open is the owner: no Payments gear, PRD or register exists
+anywhere; the worktree's `admission-control` is platform policy admission, a different capability
+that the Seam Atlas also calls admission (its ticket T5).
+
 ### Q-07: Tension between asynchronous outbox publication and the PRD's p95 < 30 s process-event delivery target
 
 **Owner**: Architecture.
@@ -6315,6 +6445,14 @@ consumers key on and adding one after Billing consumes the contract would be a b
 this design names the requirement and defers the value rather than inventing a placeholder.
 
 **Amended by D-195 (2026-09-30)**: the read is Lifecycle's count amendment — the active count, the effective `max_concurrent_active` and the policy provenance per `(payer, overlap_scope_key)`, drafts excluded — and the key is Subscriptions' registry-owned `catalogSubscriptionProductKey` of `SUB-G1`, stored on the order line at submit and reused as stored (Lifecycle D-126, D-153, D-163; the derivation proposed to Subscriptions is the SKU of the line's paid recurring item). `UPSTREAM_REQS.md` §2.1 carries the wording; the fail-closed posture is unchanged.
+
+**Amended by D-205 (2026-10-02)**: the key this gear passes is the SUB-G1 key Lifecycle stored on
+the order line (Lifecycle D-163); this gear proposes no derivation. The read's shape is Lifecycle's
+`occupancy(payer, keys[]) → [{ key, active_count, draft_count, max_concurrent_active, source }]`.
+What remains of this question is Subscriptions' authored answer (`SUB-O5`, "neighbour-extends", not
+written) and the `SUB-O1` reason value, now named by both Orders gears as
+`CancelReason::OrderCompensation { order_id, order_version }` accepted from draft and from active,
+with void as cancel-from-draft (Subscriptions SUB-D-11).
 
 ### Q-09: Do the Orders gears and Pricing converge on toolkit-db session advisory locks or on the `gears/bss/libs/coord` fenced lease for worker coordination?
 
@@ -6457,6 +6595,15 @@ give — the requirement verdict, positions, the escalation path — stays in th
 **Review trigger**: before the library adapter is bound; answering it closes the §15 approval row
 of the PRD and the open item of `UPSTREAM_REQS.md` §2.3.
 
+**Amended (2026-10-02)**: `gears/bss/libs/approval` (`cf-gears-bss-approval`) exists only on the
+diffora fork (`bss/products`, `bss/pricebook`); it is absent from upstream `main` and from this
+branch, and its documents describe an in-transaction engine for catalog changes, not the five
+answers of the §9.2 port. Binding the adapter therefore needs either the crate ported upstream with
+a design note mapping each port operation onto its API, or an approval SDK (`ApprovalPolicyV1
+{ requirement, submit, lookup_by_key, read_decision, escalate }`) with the stand-in as its first
+provider. Lifecycle D-175 confirms that neither Orders gear verifies the verdict through a provider
+port (Seam Atlas tickets T5, T11).
+
 ## What This Design Set Does Not Claim
 
 Following the sibling Orders Lifecycle design set's own precedent: the coherence of this design
@@ -6486,6 +6633,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | Decision | Slice | Consuming document |
 |----------|-------|---------------------|
 | D-01–D-04 | 01 Process engine | `design/01-foundation.md` |
+| D-200–D-205 | cross-cutting (Seam Atlas alignment, 2026-10-02) | `UPSTREAM_REQS.md` §2.1, §2.2, §2.4, §2.5, §4; `PRD.md` §9.1, §13, §15, §16; `design/05` §3.3; `design/06` §4.8 |
 | D-05–D-08 | 02 Triggers and start | `design/02-triggers-and-start.md` |
 | D-09–D-14 | 03 Approval execution | `design/03-approval-execution.md` |
 | D-15–D-18 | 04 Fulfillment plan | `design/04-fulfillment-plan.md` |
@@ -6654,6 +6802,12 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-197 | H Approval policy owner = this gear's approval-policy adapter (stand-in, library); Generic Approval service withdrawn | `PRD.md` §1, §3.2, §5, §6, §9.2, §12, §13, §15, §16, `DESIGN.md` §1.3, §3.1, §3.5, §4, `UPSTREAM_REQS.md` §1, §2.3, §4, `design/03` §1.1, §2.2, §3.2, §3.5, §3.6, §4.0, `design/01`, `02`, `08`, `09`, `10`, `README`, `ADR/0002`, `0006`, `0007`, `0009`, `0011`, `0013`; D-12, D-14, D-189, Q-05, Q-14 |
 | D-198 | M Approval request carries `tcv_minor`, `currency`, `currency_minor_digits` from `get_version` | `design/03` §3.2, §3.6, §3.7, `DESIGN.md` §2.2, §3.1, `PRD.md` §3.2, §5.2, §6.2, §6.5, §9.2, §12; D-09 |
 | D-199 | L Payment amount separate from TCV; no Products reservation; market wording; change orders deferred | `design/04` §3.4, §3.5, `UPSTREAM_REQS.md` §2.2, §2.5; D-17, D-90, Q-06 |
+| D-200 | H Intent outcome event is `SubscriptionTransitionOutcome`; Confirmed/Failed arms are its outcomes | `design/05` §3.3, `UPSTREAM_REQS.md` §2.1; Lifecycle `…-upreq-transition-outcome-echo`; Atlas T12 |
+| D-201 | M This gear mints `payment_auth_request_ref`; Payments owner open | `UPSTREAM_REQS.md` §2.2; Q-06; Lifecycle §2.5 |
+| D-202 | M `reconcile-intent` settles a timed-out create via `settle_create` | `design/05` §3.3, `UPSTREAM_REQS.md` §2.1 (`…-upreq-settle-create`); Lifecycle F12 |
+| D-203 | H Lifecycle D-169…D-178 received; §2.4 key retention answered (D-173), failure coverage part-answered (D-172), §2.5 hand-off closed | `UPSTREAM_REQS.md` §2.4, §2.5, `design/06` §4.8 |
+| D-204 | L PRD names `report_spawn_signal`, `workflow_cancel`, reserved hold/resume, shipping mode `code` | `PRD.md` §9.1, §13, §15, §16; `UPSTREAM_REQS.md` §4 |
+| D-205 | L Overlap key never derived here; occupancy shape per Lifecycle; Q-08 narrowed | `UPSTREAM_REQS.md` §2.1; Q-08 |
 
-Highest decision number used: **D-199**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-205**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.

@@ -262,7 +262,7 @@ defers a line past its quoted service-activation date, the quoted date travels s
 requested date, and billing/entitlement are not backdated to it. Subscriptions owns the start
 value, so this gear cannot enforce the rule unilaterally; it is raised upstream as `SUB-O10` (see
 §4.1), consistent with the sibling Orders Lifecycle design
-([`06-workflow-seam.md` §4.3](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)).
+([`06-workflow-seam.md` §4.3](../../../orders-lifecycle/docs/features/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)).
 The instant is read from database time inside `dispatch-wave2-activate` (`01 §4.15`), never from
 the definition's clock.
 
@@ -501,7 +501,7 @@ wave-1 attempt for the affected line is redone. Refuses a line whose draft is no
 
 Orders Lifecycle's cancel guard reads a recorded spawn signal — the first activation intent of the
 current attempt — rather than the order state (Lifecycle
-[`06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)).
+[`06 §4.3`](../../../orders-lifecycle/docs/features/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)).
 Its commit is the fence activation dispatch waits on, so it is a `protected` step with its own
 seam call rather than a side effect of the wave-2 call.
 
@@ -671,7 +671,7 @@ operation's round. Every step key is recomposed server-side from the body
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `re-check-pre-activation`, before `dispatch-wave2-activate` (`10 §4.1`) |
 | `input` | `ref`, `round` (0 on first entry, else the previous answer's `nextRound`) |
-| `output` | `spawnSignal` (`recorded` · `already-recorded` — Lifecycle refused `spawn-signal-already-recorded`: the fence is committed, by a report under another key or by this key's own earlier report once Lifecycle's 24-hour window has forgotten it — a self-loop row admits such a re-run to that guard, which refuses it with no second signal and no event (Lifecycle `06-workflow-seam.md:451`, `:456-459`, `:761`); a settled success that records no instant, which nothing reads, since `dispatch-wave2-activate`'s guard reads the settlement (`inst-pi-wave2-guard`, decision D-188) · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in `heldWait` — the fork of the resume arm and a `PT5M` tick, `10 §3.6` (b) — re-runs `re-check-pre-activation` after the resume, as Lifecycle prescribes, and calls again under the next round · `not-dispatchable` — Lifecycle refused `not-admissible` and the order read shows a terminal state: a cancel committed before the signal, the race Lifecycle declares normal ([`06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)), a settled success after which the definition dispatches nothing and returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled`); `nextRound` |
+| `output` | `spawnSignal` (`recorded` · `already-recorded` — Lifecycle refused `spawn-signal-already-recorded`: the fence is committed, by a report under another key or by this key's own earlier report once Lifecycle's 24-hour window has forgotten it — a self-loop row admits such a re-run to that guard, which refuses it with no second signal and no event (Lifecycle `06-workflow-seam.md:451`, `:456-459`, `:761`); a settled success that records no instant, which nothing reads, since `dispatch-wave2-activate`'s guard reads the settlement (`inst-pi-wave2-guard`, decision D-188) · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in `heldWait` — the fork of the resume arm and a `PT5M` tick, `10 §3.6` (b) — re-runs `re-check-pre-activation` after the resume, as Lifecycle prescribes, and calls again under the next round · `not-dispatchable` — Lifecycle refused `not-admissible` and the order read shows a terminal state: a cancel committed before the signal, the race Lifecycle declares normal ([`06 §4.3`](../../../orders-lifecycle/docs/features/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)), a settled success after which the definition dispatches nothing and returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled`); `nextRound` |
 | `idempotency_key` | Lifecycle-transition family: `{tenant}:{orderId}:{orderVersion}:report-spawn-signal:{round}`, the same key passed to Lifecycle, so a replay of one round returns Lifecycle's stored outcome and a refusal of one round is never replayed into the next ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4) |
 | `declared_event` | none |
 | `compensation` | none — the spawn signal is written once and never cleared (Lifecycle `06 §4.3`) |
@@ -725,12 +725,25 @@ operation's round. Every step key is recomposed server-side from the body
 | `retry_class` | `retryable-on: transient` |
 | `deadline` | 10 s |
 
+**Settlement of a timed-out create (D-202).** For a wave-1 create with no outcome and no row at
+Subscriptions, `reconcile-intent` calls Subscriptions' `settle_create(create_key)` (an operation
+serialized with `create` on the dedup index, `UPSTREAM_REQS.md` §2.1 `…-upreq-settle-create`) before
+recording `never-dispatched` or `intent-unresolved`: `NoDraft` settles the line, `DraftFound` feeds
+the status read. Where the operation does not yet exist the 30-day key lifetime and detection by
+re-read (§4.1) remain the fallback.
+
 **Inbound events** (`listen` targets of the definition, not endpoints of this gear):
 
 | Event | Meaning | Stability |
 |-------|---------|-----------|
 | `ProvisioningIntentConfirmed` | Draft-create, activation, draft-void or activated-cancel confirmation, echoing the identity envelope (`SUB-O16`, §4.1 — **UNASKED**). A wake-up: the confirmation arm exports only the line reference and wave and calls `reconcile-intent` | unstable |
 | `ProvisioningIntentFailed` | Failure outcome for either wave, echoing the identity envelope (`SUB-O16`). Treated identically | unstable |
+
+**Canonical name (D-200).** Both arms are the outcomes of one `SubscriptionTransitionOutcome`
+event — `applied` for the first, `failed | oss_unconfirmed` for the second — the twin of
+Subscriptions' `SubscriptionActivated`, co-signed with Lifecycle
+`…-upreq-transition-outcome-echo`. The arm names above stay as the definition's `listen` filters
+until the Subscriptions design lands; the payload is the identity envelope of §4.1 plus the outcome.
 
 ### 3.4 Internal Dependencies
 
@@ -768,7 +781,7 @@ operation's round. Every step key is recomposed server-side from the body
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|---------------|----------|
-| orders-lifecycle | `OrdersLifecycleWorkflowV1::report_spawn_signal(OrderRef, CallMeta)` through `ClientHub` — Lifecycle's Workflow SDK contract (Lifecycle D-155; decision D-193), the SDK form of `POST …/orders/{orderId}/spawn-signal` ([`06-workflow-seam.md` §3.3](../../../orders-lifecycle/docs/design/06-workflow-seam.md)); and `get_version(orderId, orderVersion)` for the version's explicit start intent, external references and `activation_deadline` (§2.2) | `report-spawn-signal` (seam rule R1); the intent payloads of §3.3 |
+| orders-lifecycle | `OrdersLifecycleWorkflowV1::report_spawn_signal(OrderRef, CallMeta)` through `ClientHub` — Lifecycle's Workflow SDK contract (Lifecycle D-155; decision D-193), the SDK form of `POST …/orders/{orderId}/spawn-signal` ([`06-workflow-seam.md` §3.3](../../../orders-lifecycle/docs/features/06-workflow-seam.md)); and `get_version(orderId, orderVersion)` for the version's explicit start intent, external references and `activation_deadline` (§2.2) | `report-spawn-signal` (seam rule R1); the intent payloads of §3.3 |
 
 #### serverless-runtime
 
@@ -1400,7 +1413,7 @@ slice operations (D-80, D-81).
   (`cpt-cf-bss-orders-workflow-seq-def-fulfillment`), §4.1 the fence, §4.6
 - **Foundation**: [`01-foundation.md`](./01-foundation.md) §3.3 (envelope, contract,
   `settle-from-lookup`), §3.8 (worker roster), §4.3, §4.5, §4.8, §4.12
-- **Sibling design**: [`gears/bss/orders-lifecycle/docs/design/06-workflow-seam.md`](../../../orders-lifecycle/docs/design/06-workflow-seam.md) §4.3 (spawn signal, activation-instant rule, `SUB-O10`)
+- **Sibling design**: [`gears/bss/orders-lifecycle/docs/features/06-workflow-seam.md`](../../../orders-lifecycle/docs/features/06-workflow-seam.md) §4.3 (spawn signal, activation-instant rule, `SUB-O10`)
 - **Canonical upstream register**: [`gears/bss/subscriptions/docs/SEAMS.md`](../../../subscriptions/docs/SEAMS.md) (`SUB-O1`..`SUB-O6` canonical; `SUB-O5` unagreed)
 - **Platform**: [serverless-runtime DESIGN](../../../../serverless-runtime/docs/DESIGN.md) §3.3 (*Invocation API*, *Event Trigger Management API*), `TenantRuntimePolicy`
 - **Prior slice**: [`04-fulfillment-plan.md`](./04-fulfillment-plan.md) (Fulfillment Plan / `FulfillmentTask` this slice's intents drive)

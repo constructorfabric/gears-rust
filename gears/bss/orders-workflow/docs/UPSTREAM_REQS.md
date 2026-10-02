@@ -86,6 +86,12 @@ lines 145-165) is treated as authoritative. This gear's PRD §13 previously defi
 through `SUB-O9` locally; those four numbers are **renumbered and replaced** below as `SUB-O11`
 through `SUB-O14`, not aliased. See the translation table in §2.1 ("Translation table") for the old-to-new mapping.
 
+Since 2026-10-02 the sibling Lifecycle register co-signs the provisioning-intent contract: its
+`…-upreq-settle-create`, `…-upreq-intent-status-read` and `…-upreq-transition-outcome-echo` name
+`SUB-O13` and `SUB-O16`, its `…-upreq-overlap-presence-read` names the occupancy shape of D-205,
+and its `…-upreq-compensation-cancel-reason` names the `CancelReason::OrderCompensation` value;
+Subscriptions therefore receives one list from the two Orders gears (DECISIONS D-200…D-205).
+
 #### Overlap-presence read (inherited, unagreed)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-overlap-presence-read`
@@ -131,6 +137,10 @@ enum and its ETF/credit scoping are owned by Subscriptions.
   reuse a reason value that wrongly derives an ETF/credit, or repurpose `saga_superseded`, which is
   reserved for the cancel+new pair of a plan change — either choice misrepresents the compensation
   on the audit trail and on billing-facing events.
+- **Value named by both Orders gears (2026-10-02)**: `CancelReason::OrderCompensation { order_id,
+  order_version }`, accepted from `draft` and from `active`; void is cancel-from-draft (Subscriptions
+  SUB-D-11), so this gear sends one operation with two preconditions. Lifecycle
+  `cpt-cf-bss-orders-lifecycle-upreq-compensation-cancel-reason` carries the same wording.
 - **Note**: reason values ride event payloads and downstream consumers key on them, so adding a
   value after Billing consumes the contract is a **breaking** change — this is the ask materially
   cheaper now than later.
@@ -149,7 +159,8 @@ be backdated (PRD §6.1, §6.2 wave-2 activation). The instant mapping (Lifecycl
 D-195): the actual activation instant this gear supplies is `serviceActivatedAt`;
 `customerAcceptedAt` is mapped from Lifecycle's acceptance record, which the receiver reads through
 Lifecycle's version read rather than copying a timestamp from the intent; `contractEffectiveAt`
-comes from the referenced Contract, never from an order date.
+comes from the referenced Contract, never from an order date. `start_at` wins over any instant
+Subscriptions would compute internally (Lifecycle `…-upreq-subscription-start-instant`, 2026-10-02).
 
 - **Rationale**: Registered upstream as `SUB-O10` by the sibling Orders Lifecycle design, unagreed
   — a new ask, not present in either the seam map or this gear's PRD numbering. Raised here
@@ -225,6 +236,9 @@ completion this gear records as `activated`; `oss_unconfirmed` is a failure this
   an idempotency key ages out, confirm outcomes by lookup rather than resubmission; this is the
   read-only discovery mechanism cancellation fencing's "reconcile in-flight intents" step depends
   on.
+- **Co-signed (2026-10-02)**: Lifecycle `cpt-cf-bss-orders-lifecycle-upreq-intent-status-read`
+  asks for the same read with the same states; the settlement of a timed-out create is the separate
+  ask below (D-202).
 - **Consequence if it does not land**: the sweep cannot drive aged-out intents to a terminal
   confirmation or failure by lookup, so unresolved intents can only be resolved by resubmission
   (which risks duplication) or by parking indefinitely.
@@ -234,6 +248,24 @@ completion this gear records as `activated`; `oss_unconfirmed` is a failure this
   entry today.
 
 #### `SUB-O14` — `correlationId` propagation toward Policy Engine / OSS (UNASKED)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-settle-create`
+
+Subscriptions **MUST** expose `settle_create(create_key) → NoDraft { tombstone_id } | DraftFound {
+subscription_id, status }`, serialized with `create` on the same unique dedup index so that exactly
+one of a late create and a settlement wins. `reconcile-intent` calls it for a wave-1 create with no
+outcome and no row before recording `never-dispatched` or `intent-unresolved` (D-202). An extension of
+`SUB-O13`: the status read tells this gear what Subscriptions has; the settlement is what stops a
+delayed create from committing after the order was acknowledged failed.
+
+- **Rationale**: detection stays by re-read and the 30-day key lifetime stays the fallback
+  (`design/05-provisioning-intents.md` §4.1), but neither excludes a create that commits after the
+  key aged out and attaches a subscription to a settled order (Lifecycle fixture F12; the Seam
+  Atlas states that a status read alone is not proof).
+- **Co-signed (2026-10-02)**: Lifecycle `cpt-cf-bss-orders-lifecycle-upreq-settle-create`.
+- **Agreement status**: **UNASKED** (new at `SUB-O13`'s number as its extension; Subscriptions slice
+  01 has only the dedup key today).
+- **Source**: `DECISIONS.md` D-202. Raised against `gears/bss/subscriptions/docs/SEAMS.md`.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-upreq-correlation-propagation`
 
@@ -347,6 +379,11 @@ lookup, and so a callback that echoes nothing this gear issued is rejectable as 
   alone, which cannot distinguish a genuine confirmation from a replayed or forged one, and the
   PRD's requirement that system actors not be impersonable has no enforcement on the chosen
   transport.
+- **Canonical event (D-200, 2026-10-02)**: the echo is a field set of one
+  `SubscriptionTransitionOutcome { transition_request_id, source { order_id, order_version,
+  order_line_id }, wave, kind, wave_attempt, correlation_id, transition, outcome: applied | failed
+  { reason_code } | oss_unconfirmed }`, the twin of `SubscriptionActivated`; this gear's two listen
+  arms are its outcomes. Co-signed by Lifecycle `cpt-cf-bss-orders-lifecycle-upreq-transition-outcome-echo`.
 - **Agreement status**: **UNASKED** — never registered upstream at any number.
 - **Source**: PRD §6.3 (provisioning-intent confirmations), §9.1 (actor authenticity). Raised
   against `gears/bss/subscriptions/docs/SEAMS.md`, which has no such entry.
@@ -377,6 +414,13 @@ An **authorization outcome** for a payer, distinguishing **authorized**, **pendi
 - **Agreement status**: UNASKED — no specification exists to register it against.
 - **Source**: PRD §6.3 (begin-fulfillment precondition), §13 Dependencies (Payments, `p1`);
   `DECISIONS.md` D-199.
+
+**Minting and shape (D-201, 2026-10-02).** This gear mints `payment_auth_request_ref` from its
+intent key family; the provider contract both Orders gears can transcribe is `authorize(request_ref,
+payer, amount | postpaid) → Authorized | Pending { request_ref } | Failed { reason }` and
+`get(request_ref)`, with a fail-closed fixture answering `authorized` for postpaid payers. Lifecycle
+`UPSTREAM_REQS.md` §2.5 carries the same shape and accepts the minting. The Seam Atlas's
+`AdmissionReadV1` (its D05) is not consumed by either gear (Lifecycle D-175).
 
 ### 2.3 Approval policy adapter
 
@@ -503,15 +547,15 @@ projection loses it nothing.
   (`design/05-provisioning-intents.md` §3.3). A denied or unavailable version read is
   `retryable-failure` under the existing dependency posture, never a substitution of the current
   version.
-- **Agreement status**: **ANSWERED** on the Lifecycle side (D-158, uncommitted in its worktree at the
-  time of writing); the residual above is **UNASKED**.
+- **Agreement status**: **ANSWERED** on the Lifecycle side (D-158, committed in `bss/orders-lifecycle-design-doc` at `37ac28237`,
+  2026-10-02); the residual above is **UNASKED**.
 - **Source**: `ADR/0013`; `DECISIONS.md` D-66 (as amended), D-193; `DESIGN.md` §4.2. Raised against
   `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md`.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-upreq-lifecycle-failure-reason-coverage`
 
 Orders Lifecycle **MUST** add one value to the closed `failure_reason` enumeration of
-`acknowledge-failed` ([Lifecycle `06 §4.4`](../../orders-lifecycle/docs/design/06-workflow-seam.md#44-acknowledgement-normative),
+`acknowledge-failed` ([Lifecycle `06 §4.4`](../../orders-lifecycle/docs/features/06-workflow-seam.md#44-acknowledgement-normative),
 its D-136), or name the existing value this gear should send for each:
 
 | Proposed value | Raised when | This gear's reason |
@@ -531,12 +575,16 @@ its D-136), or name the existing value this gear should send for each:
   `owf_cancellation_fence.orders_failure_reason` and in `OrderFulfillmentAborted`, so only
   Lifecycle's audit `caller_reason` and `OrderFulfillmentFailed` carry the approximation.
 - **Agreement status**: **UNASKED**.
+- **Lifecycle response (D-172, 2026-10-02)**: `dependency-graph-invalid` is withdrawn as an emitted
+  value and kept for replayed payloads only; `order-binding-expired` is confirmed; the interim
+  `line-execution-failed` for a stale authorization stays interim. This ask therefore stands for
+  `payment-authorization-stale` alone (D-203).
 - **Source**: `DECISIONS.md` D-110. Raised against `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md`.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-lifecycle-workflow-key-retention`
 
 Orders Lifecycle **MUST** either **retain the idempotency records of the workflow-trigger class**
-(the triggers of the five seam operations, [Lifecycle `01 §4.1`](../../orders-lifecycle/docs/design/01-foundation.md#41-the-transition-contract-normative)),
+(the triggers of the five seam operations, [Lifecycle `01 §4.1`](../../orders-lifecycle/docs/features/01-foundation.md#41-the-transition-contract-normative)),
 scoped to the Workflow service principal, for **at least 30 days** from the record's creation —
 this gear's key lifetime (`design/01-foundation.md` §3.7 *Key lifetime*, D-185), after which it
 never re-issues the same key — **or expose a read of a seam operation's stored outcome by its
@@ -544,8 +592,8 @@ idempotency key**, returning the outcome the key settled (committed, or the refu
 record".
 
 - **Owning upstream gear**: Orders Lifecycle (`gears/bss/orders-lifecycle`).
-- **Why this gear cannot satisfy it alone**: Lifecycle owns the registry and its 24-hour window
-  ([Lifecycle `01 §2.2`](../../orders-lifecycle/docs/design/01-foundation.md#the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound)).
+- **Why this gear cannot satisfy it alone**: Lifecycle owns the registry and, before its D-173, its 24-hour window
+  ([Lifecycle `01 §2.2`](../../orders-lifecycle/docs/features/01-foundation.md#the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound)).
   This gear re-issues an unchanged Lifecycle key after a lease death or an interruption that can
   last days — a hold, a ceiling park, an `invocation-dead` task awaiting its re-drive — and the
   keys of `begin-fulfillment`, `report-spawn-signal` and `report-outcome` carry no attempt, so
@@ -563,8 +611,10 @@ record".
   path are not in Lifecycle's order read, so a `cancelled` order is reported `terminal-event`
   rather than as this gear's cancel, and each such re-run appends one refused attempt to
   Lifecycle's audit trail.
-- **Agreement status**: **UNASKED**.
-- **Source**: `DECISIONS.md` D-188, D-185. Raised against
+- **Agreement status**: **ANSWERED** by Lifecycle D-173 (2026-10-02): receipts of the workflow-trigger
+  class are retained for at least 30 days, superseding the 24-hour window for those triggers; the
+  read-by-key alternative is not provided and is no longer needed (D-203).
+- **Source**: `DECISIONS.md` D-188, D-185; Lifecycle D-173. Raised against
   `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md`.
 
 ### 2.5 Pricing, Products and Rating
@@ -587,7 +637,9 @@ facts, read through `get_version` (§2.4). What this section records instead:
   from TCV — §2.2. The one clause this design does **not** meet as written — "its approved-instance
   constructor requires a revision-stamped complete dependency graph before begin-fulfillment" — is
   answered by D-196: acquisition lines are independent, so there is no graph to require; the
-  Lifecycle owner is asked to reword that sentence.
+  Lifecycle owner is asked to reword that sentence — **reworded on 2026-10-02** (Lifecycle D-172; its
+  `UPSTREAM_REQS.md` §2.6 now states that the graph and the unknown-topology clause are withdrawn).
+  Lifecycle's D-169…D-178 are received as D-203.
 - **Products.** SKU protection through activation is inherited from the accepted revision's
   `plan_item` references (Lifecycle D-164); this gear reserves nothing and holds no receipt. A forced
   retirement under an in-flight order surfaces as a Subscriptions refusal at activation and follows
@@ -595,7 +647,9 @@ facts, read through `get_version` (§2.4). What this section records instead:
 - **Change orders.** The Change Orders PRD (`gears/bss/orders-changes/docs/PRD.md`) asks this gear
   for a single transactional change intent against an existing subscription and a delta TCV. That is
   a later phase; its PRD still uses the retired cohort and catalog-pin vocabulary and needs its own
-  PriceBook pass before this gear designs the change intent. Nothing here designs it.
+  PriceBook pass before this gear designs the change intent. Nothing here designs it. Lifecycle D-176
+  (2026-10-02) keeps `category = change` refused at runtime for the acquisition slice, and Pricing
+  D-467 removed the plan-scoped add-on bounds the Changes PRD §17 evaluates (Lifecycle Q-33).
 
 ### 2.6 Privacy and data classification
 
@@ -920,7 +974,7 @@ Lifecycle's `OrderSubmitted` carries the tenant axes, per-line references and pi
 total's per-line net components; `OrderApproved` and `OrderRejected` the deciding authority;
 `OrderHeld` the hold reason; `OrderCancelled` the cancelling actor and the cancel reason;
 `OrderCompleted` the line-to-subscription mapping
-([Lifecycle `01 §4.4`](../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative),
+([Lifecycle `01 §4.4`](../../orders-lifecycle/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative),
 lines 2396–2406); the Subscriptions outcome event carries a `subscriptionId`; the approval policy adapter
 decision event has no specification (§2.3, Q-05). The platform has no data-classification model
 for execution history ([NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md)
@@ -1286,7 +1340,7 @@ then have to accept.
 
 | Priority | Requirements |
 |----------|-------------|
-| `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-lifecycle-thin-events`, `…-upreq-lifecycle-workflow-key-retention`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
+| `p1` (critical) | `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-explicit-start-instant`, `…-upreq-settle-create`, `…-upreq-in-flight-rejection`, `…-upreq-cancel-accepted-transition`, `…-upreq-nonterminal-status-read`, `…-upreq-provisioning-latency-budget`, `…-upreq-identity-envelope-echo`, `…-upreq-payment-authorization-outcome`, `…-upreq-generic-approval-expectations-contract`, `…-upreq-submitted-ttl-visibility`, `…-upreq-lifecycle-thin-events`, `…-upreq-lifecycle-workflow-key-retention`, `…-upreq-pii-classification-ruling`, `…-upreq-event-broker-shared-prerequisites`, `…-upreq-pdp-policy-integration` |
 | `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-trigger-version-selection`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-event-retention-between-listens`, `…-upreq-serverless-runtime-history-growth`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
 | `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target`, `…-upreq-lifecycle-failure-reason-coverage` |
 
@@ -1487,6 +1541,14 @@ it would shorten (D-105).
     the contract of a port this gear owns, whose phase-1 implementation is the stand-in and whose
     intended implementation embeds `cf-gears-bss-approval`. The PRD text was updated in place; the
     gate-to-unit mapping is `DECISIONS.md` Q-14.
+
+18. **Spawn-signal call, reserved hold/resume and the shipping mode (D-204).** PRD §9.1's
+   Lifecycle-transition contract and the §6 flow **MUST** name `report_spawn_signal` as a required
+   call made once per order between the pre-activation re-check and the first activation dispatch,
+   and `workflow_cancel` as the cancellation path after it; state that hold and resume are driven by
+   `OrderHeld`/`OrderResumed` and that the SDK `hold`/`resume` methods are reserved; and record in
+   §13, §15 and §16 that the engine is selected (ADR-0011) and that `definition_source = code` is the
+   shipping mode until the §2.9 asks are answered. Applied to the PRD on 2026-10-02.
 
 ## 5. Traceability
 

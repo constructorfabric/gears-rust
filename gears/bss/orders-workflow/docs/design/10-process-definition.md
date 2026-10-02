@@ -276,7 +276,7 @@ A `listen` filter `with.type` **MUST** be one of: the nine Orders Lifecycle stat
 `OrderAmended`, `OrderHeld`, `OrderResumed`, `OrderAcceptanceRecorded`, `OrderCancelled`,
 `OrderExpired`, `OrderRejected` as `listen` targets), whose GTS identifiers are Lifecycle's
 (`gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.<name>.v1~`,
-[Lifecycle `01 §4.4`](../../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative));
+[Lifecycle `01 §4.4`](../../../orders-lifecycle/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative));
 the approval decision event of [`03 §3.3`](./03-approval-execution.md#33-api-contracts); the
 two Subscriptions outcome events of [`05 §3.3`](./05-provisioning-intents.md#33-api-contracts)
 (`ProvisioningIntentConfirmed`, `ProvisioningIntentFailed`); Orders' own
@@ -308,7 +308,7 @@ consumer-supplied hook before publish — a pending ask
 4. [ ] - `p1` - Bounds nest, over values the definition holds: every task that calls an operation declares a `timeout` from `use.timeouts`; the operation's `deadline_ms` **<** that timeout, so one attempt fits; every task timeout and every literal `wait` **<** the literal `P90D` lifetime `wait`. The check computes no cumulative backoff, because the DSL gives `backoff.exponential` no multiplier (dsl-reference.md *Retry*) and the timeout bounds the retries whatever their curve. The one exception is a task under the `gate` timeout, whose timeout is a term of the escalation bound and so must never be what ends its retries: it **MUST** carry the `gate` retry policy, whose backoff is `constant`, and the check computes attempts × the largest `deadline_ms` called + (attempts − 1) × (delay + the jitter maximum) **<** the `gate` timeout — 4 × 10 s + 3 × 5 s = 55 s < 60 s in the canonical (decision D-162). The escalation window, the overdue window and the SLA classes are not definition values — each is a per-seller policy value that an operation pins on the order's record (decision D-134) — so their bounds are checked where the seller's policy is written (`07 §4.8` item 8) and, for the overdue window against the `wave1` timeout, also by the publish job (§4.2 step 1, decision D-159), not here (decision D-126) - `inst-def-bounds-nest`
 5. [ ] - `p1` - Every task `input`, `output`, `export` and every `body` member validates against the operation's registered reference schemas; no member outside them. Every member the definition writes into `$context`, including by `set` and `input.from`, is of one of the six vocabulary types of ADR-0013 as amended by D-131 (identity, opaque record reference, counter, closed enum or boolean, instant or duration, `stepsBase`), a string member in one of the formats that ADR lists, including the invocation, attempt and GTS callable identifier formats D-156 added; a string member of no such type or format is refused. No `set`, `output` or `export` **MAY** read an `$error` member other than `status` (`error_code` once Q-11 (ii) answers) - `inst-def-references-only`
 6. [ ] - `p1` - No `protected` operation is inside a `try` whose `catch` continues the forward path: a `catch` either only retries, so exhaustion faults the invocation, or routes to one of the named failure routes of §4.6; that a retry-only `catch` re-raises the last error once its limit is spent is Q-11 (vi), assumed until the plugin answers - `inst-def-no-swallowing-catch`
-7. [ ] - `p1` - No `run`, no `emit`, no `for`, no `schedule`: the start mechanism is exactly the two platform event triggers of §3.3, `OrderSubmitted` and `OrderAmended` — Lifecycle publishes no `OrderSubmitted` after an amendment ([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative), `02 §4.7` item 9); every `wait` is a literal duration (§3.6 *Fixed waits and re-check loops*) - `inst-def-grammar-subset`
+7. [ ] - `p1` - No `run`, no `emit`, no `for`, no `schedule`: the start mechanism is exactly the two platform event triggers of §3.3, `OrderSubmitted` and `OrderAmended` — Lifecycle publishes no `OrderSubmitted` after an amendment ([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/features/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative), `02 §4.7` item 9); every `wait` is a literal duration (§3.6 *Fixed waits and re-check loops*) - `inst-def-grammar-subset`
 8. [ ] - `p1` - Every branch of a competing `fork` that can complete ends by `set`-ting `arm` so the sibling `switch` can route; every `fork` is followed by a `switch` on `arm`; every `then` names a task of its own `do` list, `exit` or `end` (the stage dispatcher of §3.6). Every competing `fork` inside a stage carries the four shared arms of §3.6 — the hold arm and the stage-level resume arm of (e), the lifecycle arm of (f) and the cancel arm of (d) — except the unwind's forks, which carry the cancel arm and no other (`06 §4.7` item 7), the ceiling wait `awaitOperatorAfterPark`, which carries the lifecycle and cancel arms, and the resume wait `awaitResume`, which carries its resume `listen`, the lifecycle and cancel arms. **Every `wait` inside a stage is a branch of such a fork**: a stage **MUST NOT** contain a plain `wait` task, so no stage wait — a deferral, a re-issue after a read, a re-poll — leaves a hold, a resume, a lifecycle event or a cancel to signal retention for its duration; the `wait`s of the top-level `lifetimeCeiling` and `overdueMonitor` branches are outside every stage and are not covered (decision D-142); the top-level `lifetime` fork carries `process` and `lifetimeCeiling` with the literal `P90D` `wait` and **MAY** carry `overdueMonitor` (decision D-135) - `inst-def-fork-routing`
 
 #### Versioning, pinning, publish
@@ -1188,7 +1188,7 @@ The approval stage, the `do` list of `process.approval`:
 timer and the pause moved into the definition. **Start.** The invocation starts on either
 platform event trigger of §3.3 (`OrderSubmitted` for a first version, `OrderAmended` for an
 amended one — Lifecycle publishes no `OrderSubmitted` after an amendment,
-[Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative));
+[Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/features/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative));
 the document declares no `schedule`, so the trigger bindings are the one start mechanism. The
 `input.from` expression reads the trigger's event envelope as the invocation input; the shape a
 trigger passes is not stated by the platform and is part of the trigger ask
@@ -1253,7 +1253,7 @@ refused `not-admissible` and the order is `on_hold` — waits in `awaitHeldRefle
 refused `version-conflict`, or `not-admissible` on an order it holds terminal — waits in the same
 fork, whose lifecycle arm consumes the `OrderAmended` or terminal event that moved the order: a
 stale result is not a failure of the reflection it reports
-([Lifecycle `04 §4.4`](../../../orders-lifecycle/docs/design/04-versioning.md#44-stale-results-normative),
+([Lifecycle `04 §4.4`](../../../orders-lifecycle/docs/features/04-versioning.md#44-stale-results-normative),
 decision D-112). The approved path ends at `reflect-verdict`; Lifecycle
 emits `OrderApproved`, and the fulfillment stage is entered through the dispatcher in the same
 invocation rather than from a second trigger. **Lifetime.** The ceiling is the top-level
@@ -1828,7 +1828,7 @@ re-enters at the barrier's `evaluate`, never at the re-check (decisions D-144, D
 ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)). A spawn signal Lifecycle refuses `not-admissible` for an order it holds
 terminal answers `not-dispatchable`: a cancel committed before the signal, which Lifecycle
 declares the normal outcome of the race ("if cancellation commits first, the signal refuses and
-Workflow dispatches nothing", [Lifecycle `06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)),
+Workflow dispatches nothing", [Lifecycle `06 §4.3`](../../../orders-lifecycle/docs/features/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)),
 and the stage returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled` and
 unwinds on the terminal-event path (decision D-109). **Plan failure.** An exhausted plan task
 re-enters this stage at `planFailFast`, and a `planFailFast` whose `begin-fulfillment` answers
@@ -2620,7 +2620,7 @@ alone decides (`02 §4.7` items 1 and 3):
 **The new version's invocation.** `OrderAmended` has two consumers. The platform event trigger of
 §3.3 binds **both** start triggers, `OrderSubmitted` and `OrderAmended`, because Lifecycle
 publishes `OrderAmended`, not a second `OrderSubmitted`, for an amended order
-([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative),
+([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/features/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative),
 [`02 §2.2`](./02-triggers-and-start.md#22-constraints)); the amended version's invocation starts
 through `admit-trigger` with `role: start` under the new `orderVersion`, and while the old
 version's instance is still unwinding its admission answers `prior-instance-active` and the

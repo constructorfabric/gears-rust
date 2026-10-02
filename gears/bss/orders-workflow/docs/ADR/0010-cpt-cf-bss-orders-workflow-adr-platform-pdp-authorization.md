@@ -46,7 +46,7 @@ applied by `SecureConn`, and a denied, unreachable or constraint-less PDP fails 
 envelope ([`event-broker-sdk/src/typed_event.rs`](../../../../system/event-broker/event-broker-sdk/src/typed_event.rs)
 `EnvelopedEvent`) carries no producer principal and no signature. The sibling Orders Lifecycle
 design already replaced its own local evaluator with the shared PolicyEnforcer adapter
-([`08-read-and-authz.md` §3.5](../../../orders-lifecycle/docs/design/08-read-and-authz.md#35-external-dependencies),
+([`08-read-and-authz.md` §3.5](../../../orders-lifecycle/docs/features/08-read-and-authz.md#35-external-dependencies),
 D-111, D-114, D-141), following Pricing's integration
 ([`05-governance.md` *AuthZ Resource and Action Catalog*](../../../pricing/docs/design/05-governance.md#authz-resource-and-action-catalog-normative)).
 
@@ -232,7 +232,7 @@ and D-95 (platform-root event tenancy) apply by reference.
   §3.2, §3.3; [`design/07-manual-tasks.md`](../design/07-manual-tasks.md) §3.2, §3.3
 - **Decisions register**: [`DECISIONS.md`](../DECISIONS.md) — D-37 (amended), D-56, D-63, D-64, D-69, D-73, D-100, D-115
 - **Upstream asks**: [`UPSTREAM_REQS.md §2.8`](../UPSTREAM_REQS.md#28-platform-authorization-policy)
-- **Precedents**: Orders Lifecycle [`08-read-and-authz.md`](../../../orders-lifecycle/docs/design/08-read-and-authz.md)
+- **Precedents**: Orders Lifecycle [`08-read-and-authz.md`](../../../orders-lifecycle/docs/features/08-read-and-authz.md)
   §3.5, §4.3; Pricing [`05-governance.md`](../../../pricing/docs/design/05-governance.md)
   *AuthZ Resource and Action Catalog*
 

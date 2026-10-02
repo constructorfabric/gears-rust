@@ -679,7 +679,7 @@ asynchronously. Publishing inside the settlement transaction would put an extern
 the commit path, while a Workflow-owned outbox would duplicate platform sequencing, leasing, retry
 and dead-letter capabilities. The adapter binds Workflow's events to the supported platform path,
 as the sibling gear's adapter does
-([Lifecycle `01 §3.2`](../../../orders-lifecycle/docs/design/01-foundation.md#32-component-model)).
+([Lifecycle `01 §3.2`](../../../orders-lifecycle/docs/features/01-foundation.md#32-component-model)).
 Enqueuing in the same durable commit as the audit entry is what guarantees an event is never
 emitted for a step that did not actually settle — and it is why the definition has no `emit`
 task: an event emitted by the engine would be one no Orders transaction vouches for.
@@ -974,19 +974,19 @@ next round out, a per-instance counter, an attempt only from an operator retry):
 4. [ ] - `p1` - **A Lifecycle-transition key carries the round.** The key Orders passes to
    Lifecycle is `{tenant}:{orderId}:{orderVersion}:{transitionName}:{round}[:{attempt}]`, with the
    round and attempt of the Orders step key of the operation that calls it. Lifecycle settles a
-   `not-admissible` refusal under the key ([Lifecycle `01 §4.1`](../../../orders-lifecycle/docs/design/01-foundation.md#41-the-transition-contract-normative),
+   `not-admissible` refusal under the key ([Lifecycle `01 §4.1`](../../../orders-lifecycle/docs/features/01-foundation.md#41-the-transition-contract-normative),
    `01-foundation.md:2097`) and replays it "regardless of the version the retry carries"
-   ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative), `01-foundation.md:2163`),
+   ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/features/01-foundation.md#42-idempotency-semantics-normative), `01-foundation.md:2163`),
    so the same key can never pass once the refusing state has passed. On a Lifecycle
    `not-admissible`, the operation reads the order through the Lifecycle PDP-authorized order read
    (Lifecycle `08 §4`); if the order is `on_hold`, it settles **success** with the answer `held`
    and the next round, and the definition waits for the resume and calls again under that round.
    That is the handling Lifecycle prescribes for its own `not-dispatchable` answer: re-read the
    order, wait for the resume, re-run
-   ([Lifecycle `06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative),
+   ([Lifecycle `06 §4.3`](../../../orders-lifecycle/docs/features/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative),
    `06-workflow-seam.md:743`). **The same read also recognises a transition already applied**
    (decision D-188). Lifecycle keeps a key for 24 hours only, and "past the window a replayed key
-   is a new operation" ([Lifecycle `01 §2.2`](../../../orders-lifecycle/docs/design/01-foundation.md#the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound),
+   is a new operation" ([Lifecycle `01 §2.2`](../../../orders-lifecycle/docs/features/01-foundation.md#the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound),
    `01-foundation.md:238-241`), while this gear re-issues an unchanged key after a lease death or
    an interruption of days (§3.7 *Key lifetime*). A re-run of a transition that committed before
    the window closed then meets the version check, which passes because a transition changes no
@@ -1429,7 +1429,7 @@ Output: acknowledged, retained for retry, or platform dead-lettered
 
 **Description**: This algorithm documents the behaviour Workflow relies on; its implementation is
 the platform `ProducerOutboxProcessor` and toolkit leased worker, exactly as
-[Lifecycle `01 §3.6` *Platform producer-outbox publication*](../../../orders-lifecycle/docs/design/01-foundation.md#36-interactions-and-sequences)
+[Lifecycle `01 §3.6` *Platform producer-outbox publication*](../../../orders-lifecycle/docs/features/01-foundation.md#36-interactions-and-sequences)
 documents for the sibling gear. Transient retry is intentionally not capped; permanent faults
 are rejected immediately. `orderId` is the typed event's broker partition key; a permanent
 dead letter is operational evidence, not a process outcome and not an order state (§4.7).
@@ -1472,7 +1472,7 @@ and `owf_read_access_log`, keyed by the caller's `subject_tenant_id` with the or
 nullable (`09 §3.7`, decision D-191); `DESIGN.md` §3.7 lists all seven. `payer_tenant_id` is
 the billing axis and is carried only where a payment decision is recorded against the row; the
 engine tables record none. The axis names are the sibling gear's
-([`orders-lifecycle` §3.7](../../../orders-lifecycle/docs/design/01-foundation.md)). Each table
+([`orders-lifecycle` §3.7](../../../orders-lifecycle/docs/features/01-foundation.md)). Each table
 states its axis choice in **Additional info**. Without the column the platform's SecureORM
 `#[secure(tenant_col = ...)]` isolation has nothing to attach to and §4.11's tenant-scoping claim
 has no enforcing predicate.
@@ -1703,7 +1703,7 @@ No expiry is re-based: `expires_at` is written once and never extended (the colu
 split changes only when it is evaluated, and re-basing a downstream-submitting key would be exactly
 the resubmission under a forgotten key the lifetime exists to prevent. There is no exact
 precedent: Lifecycle's registry is a request cache with a 24-hour window and no process instance
-to outlive it ([Lifecycle `01 §2.2`](../../../orders-lifecycle/docs/design/01-foundation.md),
+to outlive it ([Lifecycle `01 §2.2`](../../../orders-lifecycle/docs/features/01-foundation.md),
 `01-foundation.md:234-243`). That window is shorter than this gear's re-issue of a key, and a
 successor key changes the step key only: the Lifecycle-transition key of `begin-fulfillment`,
 `report-spawn-signal` and `report-outcome`, and the approval-request key of `open-gates`, carry no
@@ -1743,7 +1743,7 @@ the enqueue and the registry change. Nothing is appended to record the failure, 
 aborted transaction cannot carry its own evidence. This is Lifecycle's rule — "roll back the
 entire transaction, including business writes, claims, audit sequence and idempotency changes",
 and abort on a failed validation, serialization or enqueue
-([Lifecycle `01 §3.6` *Transition commit*](../../../orders-lifecycle/docs/design/01-foundation.md#36-interactions-and-sequences)
+([Lifecycle `01 §3.6` *Transition commit*](../../../orders-lifecycle/docs/features/01-foundation.md#36-interactions-and-sequences)
 `inst-if-audit-fails`, `inst-enqueue-outbox`, `01-foundation.md:765-767`).
 
 - **What remains.** A single-transaction operation leaves the registry as the call found it —
@@ -1783,7 +1783,7 @@ platform's same-key re-issue runs it as a first call or re-run. A concurrent sam
 on the row lock and then resolves the committed outcome. This is Lifecycle's shape, whose in-flight
 marker, effect and settlement share one transaction so that "crash recovery normally relies on
 transaction rollback or settled-outcome replay"
-([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative),
+([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/features/01-foundation.md#42-idempotency-semantics-normative),
 `01-foundation.md:2239-2240`); only an operation that
 calls a downstream commits `in_flight` before its effect (§3.6).
 
@@ -1804,7 +1804,7 @@ trigger path's (§4.8). **Tenant axis**: `resource_tenant_id` only. **Retention*
 kept as long as a replay of its key can arrive, not for the key lifetime, and it carries the
 answer that replay returns (`settled_output`), so no replay depends on the 90-day step log — the
 shape of Lifecycle's registry, which settles an "immutable settled_response" and replays it
-([Lifecycle `01 §3.6` *Transition commit*](../../../orders-lifecycle/docs/design/01-foundation.md#36-interactions-and-sequences)
+([Lifecycle `01 §3.6` *Transition commit*](../../../orders-lifecycle/docs/features/01-foundation.md#36-interactions-and-sequences)
 `inst-settle-success`, `01-foundation.md:768`; §3.7 `orders_idempotency`, `01-foundation.md:1834`): the retention purge
 deletes it only once `expires_at` has passed **and** the owning instance has been terminal for
 30 days (`owf_process_instance.terminal_outcome` set; for a `trigger`-family row whose admission
@@ -1812,7 +1812,7 @@ started no instance, 30 days past `expires_at`). Until then an expired row stays
 **tombstone**, so an aged-out key resolves `aged-out` from the row it finds — expiry is logical,
 evaluated against `expires_at` and database time, never inferred from a missing row, which is
 Lifecycle's rule ("expiry is logical, not dependent on sweep timing",
-[Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative),
+[Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/features/01-foundation.md#42-idempotency-semantics-normative),
 `01-foundation.md:2259`). A replay that arrives
 after the purge finds an instance that answers every operation `version-mismatch` (§3.3
 `terminate-instance`). **Not partitioned** (D-104).
@@ -1909,7 +1909,7 @@ promotion carries policy rows only. It builds no slice, changes no operation, ta
 release nor a definition change in the sense of `DESIGN.md` §4.7. The promotion is applied by
 the policy load, which follows the operation registry's load (above): one transaction. It first
 locks the platform row, then every seller row it changes (the lock order of Lifecycle's
-`orders_state_ttl_policy`, [Lifecycle `07 §3.7`](../../../orders-lifecycle/docs/design/07-hold-and-expiry.md#37-database-schemas-and-tables)).
+`orders_state_ttl_policy`, [Lifecycle `07 §3.7`](../../../orders-lifecycle/docs/features/07-hold-and-expiry.md#37-database-schemas-and-tables)).
 It bumps each changed row's `policy_revision` and appends, for each changed row, one
 `owf_configuration_revision` row of kind `seller-policy` keyed by the row's `policy_id` and new
 `policy_revision` and carrying the whole row as promoted and the promotion's change identity
@@ -1943,7 +1943,7 @@ days (§3.8), outlives the pin, so neither
 is the provenance. A replay answers from the settled record and never reads the policy again, and no later read moves a pinned value. A promotion
 therefore reaches only the records pinned after it (decision D-134). This is Lifecycle's snapshot
 of the effective `orders_date_policy` row, stored with the admitted order and never re-read
-([Lifecycle `03 §4.2`](../../../orders-lifecycle/docs/design/03-gate-and-pin.md#42-the-orders-delta-normative)
+([Lifecycle `03 §4.2`](../../../orders-lifecycle/docs/features/03-gate-and-pin.md#42-the-orders-delta-normative)
 item 8).
 
 **Additional info**: **Ownership**: the foundation's policy load is the sole writer; the
@@ -2004,9 +2004,9 @@ must stay resolvable for as long as the record that pinned it. **Read by**: an a
 **precedent** is Pricing's price history, kept as retained superseded rows under append-only
 protection ([Pricing `01-foundation.md:562`](../../../pricing/docs/design/01-foundation.md));
 Lifecycle keeps no revision history for its policy rows, only `updated_by` and `updated_at`
-([Lifecycle `07 §3.7`](../../../orders-lifecycle/docs/design/07-hold-and-expiry.md#37-database-schemas-and-tables)),
+([Lifecycle `07 §3.7`](../../../orders-lifecycle/docs/features/07-hold-and-expiry.md#37-database-schemas-and-tables)),
 which suffices there because the record that uses a policy captures the effective value next to
-its revision ([Lifecycle `07 §3.6`](../../../orders-lifecycle/docs/design/07-hold-and-expiry.md), the expiry capture),
+its revision ([Lifecycle `07 §3.6`](../../../orders-lifecycle/docs/features/07-hold-and-expiry.md), the expiry capture),
 and no audit claim rests on resolving a revision to a full row.
 
 #### Table: owf_audit_entry
@@ -2069,14 +2069,14 @@ verifier and checkpoint worker of §3.8. The hash contract is unchanged: §4.17'
 field as the single byte `0x00`, distinct from any UUID's `0x01 || u32_be(16) || bytes`, so the
 digest of a NULL-seller entry is defined and D-60 needs no new version. The shape is
 Lifecycle's, whose audit leaves its tenancy axes NULL "for unresolved refusals"
-([Lifecycle `01 §3.7` `orders_transition_audit`](../../../orders-lifecycle/docs/design/01-foundation.md#37-database-schemas-and-tables),
+([Lifecycle `01 §3.7` `orders_transition_audit`](../../../orders-lifecycle/docs/features/01-foundation.md#37-database-schemas-and-tables),
 `01-foundation.md:1606-1613`).
 
 **Chain allocation** (decision D-173). Every append runs in the transaction of the transition it
 records (§4.17 *Append rule*), and every Workflow transaction runs at **READ COMMITTED**, so each
 statement sees every transaction committed before it began — Lifecycle's stated isolation, which
 its concurrency argument relies on in the same way
-([Lifecycle `01 §3.6`](../../../orders-lifecycle/docs/design/01-foundation.md#36-interactions-and-sequences),
+([Lifecycle `01 §3.6`](../../../orders-lifecycle/docs/features/01-foundation.md#36-interactions-and-sequences),
 `01-foundation.md:1017-1022`: under snapshot isolation its insert would raise a serialisation
 failure instead of reporting the conflict). Three paths allocate a sequence:
 
@@ -2200,7 +2200,7 @@ their registration, queue, body, partition and dead-letter tables are owned and 
 libraries and **MUST NOT** be forked into Workflow-specific DDL. They are operational
 infrastructure, are excluded from the Workflow-owned inventory in `DESIGN.md §3.7`, and are not
 counted among the engine's ten tables. This mirrors
-[Lifecycle `01 §3.7` *Platform-managed producer persistence*](../../../orders-lifecycle/docs/design/01-foundation.md#37-database-schemas-and-tables).
+[Lifecycle `01 §3.7` *Platform-managed producer persistence*](../../../orders-lifecycle/docs/features/01-foundation.md#37-database-schemas-and-tables).
 
 The producer queue name is `bss-orders-workflow-events`, with `Partitions::of(16)` and
 `OutboxProfile::high_throughput()`. Managed producer registration uses the stable key
@@ -2282,7 +2282,7 @@ scaffolding, and an idempotency key is a short-lived deduplication token.
 | `owf_configuration_revision` | Never purged: the provenance every recorded `sellerPolicyRevision` resolves to; small — one row per changed load or promoted row (decision D-160) | None |
 
 **No Workflow-owned table is partitioned** (decision D-104), in any slice. The rule is Lifecycle's
-D-91, adopted with its grounds ([Lifecycle `01 §3.7`](../../../orders-lifecycle/docs/design/01-foundation.md#37-database-schemas-and-tables)):
+D-91, adopted with its grounds ([Lifecycle `01 §3.7`](../../../orders-lifecycle/docs/features/01-foundation.md#37-database-schemas-and-tables)):
 PostgreSQL requires every PRIMARY KEY and UNIQUE constraint of a partitioned table to include the
 partition columns, so a `created_at`-partitioned table can enforce `UNIQUE (idempotency_key)`, the
 registry's `(operation, idempotency_key)` or a one-open-row partial index only *within* a month —
@@ -2333,7 +2333,7 @@ order to protect the rare order whose invocation dies.
 
 This is the authoritative roster and coordination contract for the **three Workflow-owned
 workers** (D-62 as amended by ADR-0011), in the shape of
-[Lifecycle `01 §3.8`](../../../orders-lifecycle/docs/design/01-foundation.md#38-deployment-topology):
+[Lifecycle `01 §3.8`](../../../orders-lifecycle/docs/features/01-foundation.md#38-deployment-topology):
 
 | Worker | Advisory key within gear namespace `bss-orders-workflow` | Correctness check independent of scheduler ownership |
 |--------|-----------------------------------------------------------|-----------------------------------------------------|
@@ -2377,7 +2377,7 @@ LockConfig)`, holding the `DbLockGuard` for one bounded pass and awaiting `relea
 completion ([`toolkit-db/advisory_locks.rs`](../../../../../libs/toolkit-db/src/advisory_locks.rs)).
 The two differ, and a worker handles each answer as the SDK states it (decision D-187). The
 handling is Lifecycle's: "contended passes skip/reschedule", and "release errors are reported, not
-treated as proof of ownership" ([Lifecycle `01 §3.8`](../../../orders-lifecycle/docs/design/01-foundation.md),
+treated as proof of ownership" ([Lifecycle `01 §3.8`](../../../orders-lifecycle/docs/features/01-foundation.md),
 `01-foundation.md:1948-1949`):
 
 - **`Db::lock`** is "a single non-blocking attempt" that "returns `DbLockError::AlreadyHeld` on
@@ -2525,7 +2525,7 @@ exactly one of them:
 | **Absorbed duplicate** | `settled`, `request_fingerprint` matches | Return the stored outcome unchanged, from `settled_output` (§3.7); the effect is **never** re-run. |
 | **Key conflict** | Any state, `request_fingerprint` does **not** match | Refuse the call (`idempotency-key-conflict`, `permanent-failure`). The same key was presented for a materially different request, which is a caller defect — a wrongly authored definition input — not a duplicate. |
 | **Still-processing** | `in_flight`, lease **live** | **MUST NOT** be inferred as success and **MUST NOT** be resubmitted under a new key; the definition re-issues the same key after backoff (`still-processing`, 409 `Aborted`). |
-| **Lease-expired** | `in_flight`, `lease_expires_at` passed, the key **not** aged out (§3.7 *Key lifetime*) | Resolved by the key's family (D-103). **The intent-submitting operations** — `dispatch-wave1-create`, `dispatch-wave2-activate` and `compensate-order` — treat it as **still-processing** (`idempotency-lease-expired`, 409 `Aborted`): the real outcome is confirmed by lookup and settled only by `settle-from-lookup` (§3.3); the effect is **never** re-run blind, because the holder may have crashed *after* Subscriptions accepted an intent. **Every other operation** re-runs it as a re-run under a new `lease_holder`: its outbound call is either a read or a submission the downstream de-duplicates under the key the step derives — Lifecycle answers a committed transition with its stored outcome ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/design/01-foundation.md#42-idempotency-semantics-normative), first row), and the approval-request key does the same at the approval policy adapter (`../ADR/0006`) — so a crash after the downstream accepted is absorbed downstream (past Lifecycle's 24-hour window, by the read-back of §3.3 *Rounds and attempts* rule 4, and at the approval policy adapter by `open-gates`' look-up of the gate's request before it submits, decisions D-188, D-189), and the old holder's late settlement fails the fence. A record-only operation never leaves this state behind (§3.7). |
+| **Lease-expired** | `in_flight`, `lease_expires_at` passed, the key **not** aged out (§3.7 *Key lifetime*) | Resolved by the key's family (D-103). **The intent-submitting operations** — `dispatch-wave1-create`, `dispatch-wave2-activate` and `compensate-order` — treat it as **still-processing** (`idempotency-lease-expired`, 409 `Aborted`): the real outcome is confirmed by lookup and settled only by `settle-from-lookup` (§3.3); the effect is **never** re-run blind, because the holder may have crashed *after* Subscriptions accepted an intent. **Every other operation** re-runs it as a re-run under a new `lease_holder`: its outbound call is either a read or a submission the downstream de-duplicates under the key the step derives — Lifecycle answers a committed transition with its stored outcome ([Lifecycle `01 §4.2`](../../../orders-lifecycle/docs/features/01-foundation.md#42-idempotency-semantics-normative), first row), and the approval-request key does the same at the approval policy adapter (`../ADR/0006`) — so a crash after the downstream accepted is absorbed downstream (past Lifecycle's 24-hour window, by the read-back of §3.3 *Rounds and attempts* rule 4, and at the approval policy adapter by `open-gates`' look-up of the gate's request before it submits, decisions D-188, D-189), and the old holder's late settlement fails the fence. A record-only operation never leaves this state behind (§3.7). |
 | **Aged-out key** | `expires_at` passed with no settled record, on an operation that submits downstream; on any other operation, only once the instance is terminal (§3.7 *Key lifetime*, D-185) | Evaluated on the retained row — the tombstone rule of §3.7 keeps it until no replay can arrive, so expiry is logical and never inferred from a missing row. `settle-from-lookup` is read-only past this point. The next attempt is a **new operation under a new key** — it appends the key's `attempt` component (minted by `retry-step`; for an intent key, the per-line `wave_attempt` minted by the rebuild path or by an operator's retry of a `failed` intent, slice 05) — never a resume of the old one and never a replay of the identical key string. **The successor key** (D-185): when the family holds an `attempt` minted after the aged key's `created_at`, the envelope resolves the re-issued aged key under its successor — the same key with the latest such `attempt` in its attempt component — through this table: a first call the first time, and thereafter whatever the successor's own record resolves to, so a definition that keeps presenting the key it holds reaches the same successor every time; the first arrival is recorded in the family's `presented` history with the key it arrived under (§3.3 *Rounds and attempts*, rule 3, D-174). Without such an attempt it answers `aged-out`. The attempt is minted only by an operator's decision: the `retry` of the order-scope task the answer reaches — the `invocation-dead` task, because no `catch` of the canonical definition routes a 400 of these operations (`10 §4.6`; `reflect-verdict`'s refusal is an answer, not a 400, decision D-190) — in the transaction that records the request (`09 §3.6` `inst-cs-record`), and the dead-instance unwind after a recorded cancel (§4.16 item 2). |
 
 No seventh outcome exists. **These six are registry outcomes, not additional step outcomes.**
@@ -2690,7 +2690,7 @@ decision D-177).
 
 The six events derive from the platform event base type through one abstract process-event base,
 mirroring
-[Lifecycle `01 §4.7`](../../../orders-lifecycle/docs/design/01-foundation.md#47-gts-types-for-the-cross-gear-contract-surface-normative),
+[Lifecycle `01 §4.7`](../../../orders-lifecycle/docs/features/01-foundation.md#47-gts-types-for-the-cross-gear-contract-surface-normative),
 so a consumer can grant or restrict access to the whole family with a single wildcard:
 
 ```text
@@ -2725,7 +2725,7 @@ registers no subject type of its own, because the subject of a process event is 
 ([`gts.rs`](../../../../system/event-broker/event-broker-sdk/src/gts.rs)) rejects unknown keys and
 gives `topic` no default, so a derived type that declares none cannot be registered. The abstract
 `cf.bss.orders_workflow.event.v1~` declares the following traits, exactly as
-[Lifecycle `01 §4.7` *Traits, and versioning*](../../../orders-lifecycle/docs/design/01-foundation.md#47-gts-types-for-the-cross-gear-contract-surface-normative)
+[Lifecycle `01 §4.7` *Traits, and versioning*](../../../orders-lifecycle/docs/features/01-foundation.md#47-gts-types-for-the-cross-gear-contract-surface-normative)
 does for its abstract event, and each of the six concrete types' resolved schema **MUST** retain
 these values:
 
@@ -2906,7 +2906,7 @@ variant of the gear's `ContractError` enum, so a slice that raises an unregister
 fail at configuration load — it does not compile. The properties the former load-time check
 promised (no unknown reason, no duplicate) are compile-time properties plus one contract test
 (`../DECISIONS.md` D-64, mirroring Lifecycle
-[`01 §4.7`](../../../orders-lifecycle/docs/design/01-foundation.md#refusal-reasons-are-derived-gts-error-types)).
+[`01 §4.7`](../../../orders-lifecycle/docs/features/01-foundation.md#refusal-reasons-are-derived-gts-error-types)).
 
 #### Reasons are derived GTS error types
 
@@ -3290,7 +3290,7 @@ offers them:
 Workflow retains its gear-owned transactional audit following Pricing and Orders Lifecycle
 (D-59) rather than an event-only replacement; D-60 freezes the byte contract below and D-61
 makes actor references immutable. Where a rule here is identical to Lifecycle's, it is cited
-from [Lifecycle `01 §4.4` *Audit*](../../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative)
+from [Lifecycle `01 §4.4` *Audit*](../../../orders-lifecycle/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative)
 and not restated; only what is Workflow-specific is written out.
 
 **Append rule.** The audit entry **MUST** be appended in the transaction of the transition it

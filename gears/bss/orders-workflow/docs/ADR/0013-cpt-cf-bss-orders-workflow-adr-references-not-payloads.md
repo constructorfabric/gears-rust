@@ -173,7 +173,7 @@ reach. Concretely:
   `OrderApproved` and `OrderRejected` the deciding authority; `OrderHeld` the hold reason;
   `OrderCancelled` the cancelling actor and the cancel reason; `OrderCompleted` the
   line-to-subscription mapping
-  ([Lifecycle `01 §4.4`](../../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative));
+  ([Lifecycle `01 §4.4`](../../../orders-lifecycle/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative));
   the Subscriptions outcome event carries a `subscriptionId`. The start trigger
   and every Lifecycle, approval-decision and Subscriptions `listen` **MUST** therefore keep only the
   members of the permitted list above — the envelope's event identity, `orderId`, `orderVersion`

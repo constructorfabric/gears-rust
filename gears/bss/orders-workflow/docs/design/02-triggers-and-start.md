@@ -145,7 +145,7 @@ The process starts or advances on exactly nine Orders Lifecycle triggers and no 
 `admit-trigger` input schema declares `triggerKind` as this closed enum, so an unlisted kind is a
 schema refusal at the envelope (`01 §3.3` step 3). On the start path the definition derives
 `triggerKind` from the event's **exact** GTS type — `…cf.bss.orders.submitted.v1~` or
-`…cf.bss.orders.amended.v1~` ([Lifecycle `01 §4.4`](../../../orders-lifecycle/docs/design/01-foundation.md#44-events-audit-and-the-outbox-normative))
+`…cf.bss.orders.amended.v1~` ([Lifecycle `01 §4.4`](../../../orders-lifecycle/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative))
 — and any other type yields no value, which the schema refuses; it never defaults an unknown type
 to `OrderSubmitted` (`10 §3.6` (a), decision D-107). The validation hook refuses a definition
 whose `listen` names any other Lifecycle type (ADR-0012 rule 3). A closed list is what makes "does
@@ -264,7 +264,7 @@ principal and its explicit `order × read` grant.
 
 Before any admission outcome is returned, `admit-trigger` reads current order state and
 `orderVersion` from Orders Lifecycle (seam R1, see
-[`../../../orders-lifecycle/docs/design/06-workflow-seam.md`](../../../orders-lifecycle/docs/design/06-workflow-seam.md)
+[`../../../orders-lifecycle/docs/features/06-workflow-seam.md`](../../../orders-lifecycle/docs/features/06-workflow-seam.md)
 §4.1). A trigger carrying a superseded `orderVersion` is ignored for start and advance purposes;
 where the running instance itself is behind the order, the outcome is `supersede` and the
 definition unwinds it (§4.2). This is what makes out-of-order and stale triggers safe without a
@@ -274,7 +274,7 @@ global sequencing guarantee from the broker, and it is why the definition compar
 The comparison has **three** branches — the event's version can be equal to, older than, or
 newer than what the read returns. The third is **not replica lag**: Lifecycle forbids replica
 reads and serves the aggregate row itself
-([Lifecycle `08 §3.8`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#38-deployment-topology),
+([Lifecycle `08 §3.8`](../../../orders-lifecycle/docs/features/08-read-and-authz.md#38-deployment-topology),
 Lifecycle [D-51](../../../orders-lifecycle/docs/DECISIONS.md)), and it publishes only after the state write commits, so an event ahead of the read is a
 divergence between the stream and the system of record. The full rule is §4.2.
 
@@ -296,7 +296,7 @@ running invocation's `listen` tasks, which the plugin matches with its backend's
 mechanism (`DESIGN.md:808`). Two start bindings are needed, because Lifecycle publishes no
 `OrderSubmitted` for an amended version — an amendment returns the order to `submitted` and
 publishes `OrderAmended` only
-([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/design/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative)):
+([Lifecycle `04 §4.3`](../../../orders-lifecycle/docs/features/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative)):
 one trigger on `OrderSubmitted` and one on `OrderAmended` (decision D-73:
 the start-trigger set is `{OrderSubmitted, OrderAmended}`, which amends `10 §2.2` rule 7 and the
 event-trigger row of `10 §3.3`). Whether one broker event can both start an invocation through a
@@ -578,11 +578,11 @@ order that closed before this gear acted on it has nothing to compensate.
 | Dependency Gear | Interface Used | Purpose |
 |--------------------|----------------|----------|
 | `serverless-runtime` | Event triggers and the running invocation's `listen` (by reference, `10 §3.3`) | Delivers the nine triggers to the definition, which calls this slice's operations; **no code today** (`10 §1`) |
-| `orders-lifecycle` | Versioned contract / SDK client: `order × read` (R1), per [`../../../orders-lifecycle/docs/design/06-workflow-seam.md`](../../../orders-lifecycle/docs/design/06-workflow-seam.md) §3.3 | Read current order state and version inside `admit-trigger`; the five seam operations (`approval-reflection`, `begin-fulfillment`, `spawn-signal`, `fulfillment-acknowledgement`, `workflow-cancel`) are called by slices 03, 04, 05 and 06, not by this slice |
+| `orders-lifecycle` | Versioned contract / SDK client: `order × read` (R1), per [`../../../orders-lifecycle/docs/features/06-workflow-seam.md`](../../../orders-lifecycle/docs/features/06-workflow-seam.md) §3.3 | Read current order state and version inside `admit-trigger`; the five seam operations (`approval-reflection`, `begin-fulfillment`, `spawn-signal`, `fulfillment-acknowledgement`, `workflow-cancel`) are called by slices 03, 04, 05 and 06, not by this slice |
 | `authz-resolver` | `PolicyEnforcer` adapter, through the envelope | The `execute` decision on both step routes |
 
 **By-reference binding to the Orders Lifecycle seam (R1–R5)**: per Orders Lifecycle seam R1–R5,
-see [`../../../orders-lifecycle/docs/design/06-workflow-seam.md`](../../../orders-lifecycle/docs/design/06-workflow-seam.md)
+see [`../../../orders-lifecycle/docs/features/06-workflow-seam.md`](../../../orders-lifecycle/docs/features/06-workflow-seam.md)
 §4.1–§4.6. This slice does not restate those rules; it states only the execution consequences it
 is bound by:
 
@@ -688,7 +688,7 @@ Output: `admission`, `correlationId`, `currentOrderVersion`, or a retryable fail
 1. [ ] - `p1` - **IF** `role = start` **AND** `triggerKind` ∉ {`OrderSubmitted`, `OrderAmended`}, or `role = listen` **AND** `correlationId` is absent: **RETURN** a validation refusal (400); the input schema carries this rule - `inst-at-role-check`
 2. [ ] - `p1` - Derive `derivedCorrelationId` = UUIDv5(`resourceTenantId`, `orderId`, `orderVersion`); on `start` it is the output `correlationId`, on `listen` the output is the input `correlationId` - `inst-at-derive-correlation`
 3. [ ] - `p1` - Read the order through the Lifecycle SDK `order × read` under this gear's service principal and the propagated deadline; **IF** the read times out, answers 503, or is refused for authorization or configuration: **RETURN** `retryable-failure` with `trigger-applicability-unverified`, no outcome recorded - `inst-at-read`
-4. [ ] - `p1` - **IF** the read order's `resource_tenant_id` differs from `resourceTenantId`: **RETURN** `permanent-failure` with `not-found` (404), no outcome recorded and no instance started — the body's tenant is the axis the `correlationId` is derived from and the instance would be scoped by, so it **MUST** be the order's own, never the event's claim alone (D-107; the record-derived-axis rule of D-76, and Lifecycle's rule that identifier equality alone never confers cross-tenant access, [Lifecycle `08 §4`](../../../orders-lifecycle/docs/design/08-read-and-authz.md)) - `inst-at-tenant`
+4. [ ] - `p1` - **IF** the read order's `resource_tenant_id` differs from `resourceTenantId`: **RETURN** `permanent-failure` with `not-found` (404), no outcome recorded and no instance started — the body's tenant is the axis the `correlationId` is derived from and the instance would be scoped by, so it **MUST** be the order's own, never the event's claim alone (D-107; the record-derived-axis rule of D-76, and Lifecycle's rule that identifier equality alone never confers cross-tenant access, [Lifecycle `08 §4`](../../../orders-lifecycle/docs/features/08-read-and-authz.md)) - `inst-at-tenant`
 5. [ ] - `p1` - **IF** the event's `orderVersion` is greater than the read version: **RETURN** `retryable-failure` with `trigger-applicability-unverified` (divergence, §4.2) - `inst-at-ahead`
 6. [ ] - `p1` - Lock the order's instance rows (`owf_process_instance` by `order_id`) for the rest of the transaction; select the active instance, if any, and whether an instance ever existed at the event's version - `inst-at-lock-instances`
 7. [ ] - `p1` - **IF** `role = listen` **AND** the running instance's pinned `order_version` is less than the read version: **RETURN** `supersede` - `inst-at-supersede`
@@ -868,7 +868,7 @@ read returns. Every admission takes exactly one branch:
 |------------|--------|------|
 | event version **==** read version | agree | Proceed to the trigger-to-outcome table (§3.3) |
 | event version **<** read version | superseded | The event speaks for a version the order has moved past. On the listen role, when the running instance is itself pinned below the read version, the outcome is `supersede`; otherwise `ignored-superseded` |
-| event version **>** read version | ahead | **Divergence**, not lag: Lifecycle serves no replica ([Lifecycle `08 §3.8`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#38-deployment-topology)) and publishes after commit. The attempt **MUST** settle `retryable-failure` with `trigger-applicability-unverified` and **MUST NOT** be treated as superseded or as agreement |
+| event version **>** read version | ahead | **Divergence**, not lag: Lifecycle serves no replica ([Lifecycle `08 §3.8`](../../../orders-lifecycle/docs/features/08-read-and-authz.md#38-deployment-topology)) and publishes after commit. The attempt **MUST** settle `retryable-failure` with `trigger-applicability-unverified` and **MUST NOT** be treated as superseded or as agreement |
 
 The ahead branch is kept defensively. It performs no effect, and it is bounded by the definition's
 retry policy on the call: on the start path, exhaustion fails the invocation, which is the
@@ -907,7 +907,7 @@ ADR-0011 the new version's invocation is created durably by the platform trigger
 side runs, and its admission key is `open` — never settled — until the start can be admitted, so a
 crash on either side resumes into the same ordering. The cost is a bounded wait: amendment is
 admissible only before `in_fulfillment` (Lifecycle
-[`04 §2.2`](../../../orders-lifecycle/docs/design/04-versioning.md#22-constraints)), so the prior
+[`04 §2.2`](../../../orders-lifecycle/docs/features/04-versioning.md#22-constraints)), so the prior
 instance holds no provisioning intent and its unwind is gate cancellation plus the fence's checks.
 
 **Why unwinding first, not overlapping.** Letting the new version start while the prior one
@@ -991,11 +991,11 @@ canonical-definition guidance, which the canonical version carries and the behav
   *Trigger*, §3.3 *Event Trigger Management API*;
   [DESIGN_GTS_SCHEMAS](../../../../serverless-runtime/docs/DESIGN_GTS_SCHEMAS.md#trigger) *Trigger*
   (`dead_letter_queue`)
-- **Boundary reference (by-reference, not restated)**: [`../../../orders-lifecycle/docs/design/06-workflow-seam.md`](../../../orders-lifecycle/docs/design/06-workflow-seam.md)
+- **Boundary reference (by-reference, not restated)**: [`../../../orders-lifecycle/docs/features/06-workflow-seam.md`](../../../orders-lifecycle/docs/features/06-workflow-seam.md)
   §3.3 (the five seam operations), §4.1–§4.6 (normative R1–R5 consequences);
-  [`../../../orders-lifecycle/docs/design/04-versioning.md`](../../../orders-lifecycle/docs/design/04-versioning.md)
+  [`../../../orders-lifecycle/docs/features/04-versioning.md`](../../../orders-lifecycle/docs/features/04-versioning.md)
   §4.3 (amendment publishes `OrderAmended`, not `OrderSubmitted`);
-  [`../../../orders-lifecycle/docs/design/08-read-and-authz.md`](../../../orders-lifecycle/docs/design/08-read-and-authz.md)
+  [`../../../orders-lifecycle/docs/features/08-read-and-authz.md`](../../../orders-lifecycle/docs/features/08-read-and-authz.md)
   §3.8 (no replica reads)
 - **Consumers**: `03-approval-execution.md` (verdict path after `start`), `04-fulfillment-plan.md`
   (`OrderAcceptanceRecorded` admitted to `evaluate-payment-auth-eligibility`),

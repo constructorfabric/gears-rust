@@ -237,7 +237,7 @@ endpoint (seam rules R1–R5, `10 §2`).
 
 Operational compensation **MUST NOT** block on, or wait for, a Billing credit note. Posted at-sale
 billable facts are reversed in the billing chain, a distinct concern with a distinct owner (Orders
-Lifecycle DESIGN §4.4, `gears/bss/orders-lifecycle/docs/design/06-workflow-seam.md`).
+Lifecycle DESIGN §4.4, `gears/bss/orders-lifecycle/docs/features/06-workflow-seam.md`).
 `report-outcome` reports the operational outcome as soon as `compensate-order` answers `complete`.
 
 **ADRs**: none — a boundary constraint carried from the Lifecycle seam.
@@ -513,9 +513,9 @@ report mode follows the fence row's (possibly promoted) trigger:
 version whose `begin-fulfillment` committed (`owf_fulfillment_plan.begin_fulfillment_committed_at`,
 slice 04): Lifecycle admits `acknowledge-failed` and `cancel-workflow-mediated` from
 `in_fulfillment`, or from `on_hold` with pre-hold `in_fulfillment`, and from nothing else
-([Lifecycle `01 §4.3`](../../../orders-lifecycle/docs/design/01-foundation.md#43-the-state-machine-normative)
+([Lifecycle `01 §4.3`](../../../orders-lifecycle/docs/features/01-foundation.md#43-the-state-machine-normative)
 rows 14, 16, 26, 27), and its permission matrix gives this gear's principal no other cancel
-([Lifecycle `08 §4.3`](../../../orders-lifecycle/docs/design/08-read-and-authz.md#43-the-permission-model-normative)).
+([Lifecycle `08 §4.3`](../../../orders-lifecycle/docs/features/08-read-and-authz.md#43-the-permission-model-normative)).
 A cancel of an order not yet in fulfillment is Lifecycle's ordinary cancel: the Workflow cancel
 route refuses it and `authorize-cancel` does not authorize it while the order is live (`09 §3.3`,
 `08 §3.6`); a plan-level failure passes `begin-fulfillment` before its unwind (`04 §4.3`). A run
@@ -627,7 +627,7 @@ routes above; the operation names are the definition's `call` targets.
 
 - **Contracts**: `cpt-cf-bss-orders-workflow-contract-owf-lifecycle-transition`
 - **Technology**: Lifecycle SDK client, called only from inside `report-outcome`
-- **Location**: `gears/bss/orders-lifecycle/docs/design/06-workflow-seam.md` §3.3 and §4.4 (Acknowledgement, normative)
+- **Location**: `gears/bss/orders-lifecycle/docs/features/06-workflow-seam.md` §3.3 and §4.4 (Acknowledgement, normative)
 
 **Endpoints Overview** (outbound, owned by Orders Lifecycle; the SDK methods of Lifecycle's
 Workflow SDK contract, Lifecycle D-155, obtained through `ClientHub` — decision D-193 — each the
@@ -784,7 +784,7 @@ Output: `reportedOutcome`, `lifecycleCall`, `nextRound`
 1. [ ] - `p1` - **IF** `outcome = completed`: **IF** a fence row exists for the version, or slice 04's completion predicate does not hold: **RETURN** `permanent-failure` with `outcome-not-reportable`; **ELSE** read the per-line subscription identifiers from Orders' record and go to step 4 with trigger `acknowledge-completed` - `inst-ro-completed`
 2. [ ] - `p1` - Read the fence row; **IF** none: **RETURN** `permanent-failure` with `fence-not-claimed`; **IF** `no_active_verified_at` is null: **RETURN** `permanent-failure` with `outcome-not-reportable` - `inst-ro-gate`
 3. [ ] - `p1` - Take the mode from the fence row's `trigger`; **IF** it differs from `outcome` other than by the §4.3 promotion `failure` → `cancel`: **RETURN** `permanent-failure` with `version-mismatch`; build the evidence from `owf_compensation_record`; **MATCH** the mode: `failure` → trigger `acknowledge-failed` with the row's mapped `failure_reason` (§4.8); `cancel` → trigger `cancel-workflow-mediated` with the `cancel_reason` of the request `cancel_request_ref` names ([`09 §3.7`](./09-read-and-authz.md#37-database-schemas--tables) `owf_cancel_request`); `supersede` or `terminal-event` → no Lifecycle call, go to step 6 - `inst-ro-mode`
-4. [ ] - `p1` - **Only from fulfillment, and no re-check** (decisions D-109, D-84 as amended). This operation runs no cancel-authority re-check: the walk has verified that no active subscription remains, so the submission records a fact rather than performing a destructive act. **IF** the mode is `failure` or `cancel` **AND** the plan row's `begin_fulfillment_committed_at` is null: make no Lifecycle call, because Lifecycle has no Workflow transition out of a state before `in_fulfillment` ([Lifecycle `01 §4.3`](../../../orders-lifecycle/docs/design/01-foundation.md#43-the-state-machine-normative) rows 14, 16, 26, 27); read the order through the Lifecycle PDP-authorized order read; **IF** it is terminal, go to step 6 with `reportedOutcome = terminal-event` and `lifecycleCall = none`; **ELSE RETURN** `permanent-failure` with `outcome-not-reportable` — no rule reaches it, since `authorize-cancel` admits a cancel before fulfillment only for an order Lifecycle already holds terminal ([`08 §3.6`](./08-hold-and-cancel.md#36-interactions--sequences)) and a plan-level failure passes `begin-fulfillment` first ([`04 §4.3`](./04-fulfillment-plan.md#43-plan-level-failures)) - `inst-ro-reauthorize`
+4. [ ] - `p1` - **Only from fulfillment, and no re-check** (decisions D-109, D-84 as amended). This operation runs no cancel-authority re-check: the walk has verified that no active subscription remains, so the submission records a fact rather than performing a destructive act. **IF** the mode is `failure` or `cancel` **AND** the plan row's `begin_fulfillment_committed_at` is null: make no Lifecycle call, because Lifecycle has no Workflow transition out of a state before `in_fulfillment` ([Lifecycle `01 §4.3`](../../../orders-lifecycle/docs/features/01-foundation.md#43-the-state-machine-normative) rows 14, 16, 26, 27); read the order through the Lifecycle PDP-authorized order read; **IF** it is terminal, go to step 6 with `reportedOutcome = terminal-event` and `lifecycleCall = none`; **ELSE RETURN** `permanent-failure` with `outcome-not-reportable` — no rule reaches it, since `authorize-cancel` admits a cancel before fulfillment only for an order Lifecycle already holds terminal ([`08 §3.6`](./08-hold-and-cancel.md#36-interactions--sequences)) and a plan-level failure passes `begin-fulfillment` first ([`04 §4.3`](./04-fulfillment-plan.md#43-plan-level-failures)) - `inst-ro-reauthorize`
 5. [ ] - `p1` - Call the Lifecycle endpoint under the lifecycle-transition key `{tenant}:{orderId}:{orderVersion}:{trigger}:{round}` with the fence's effective deadline, and answer every outcome by the table of §4.9: a committed or replayed outcome goes to step 6; unavailability, `still-processing` and `authorization-context-changed` are `retryable-failure`; `not-admissible` on an order the read shows at `orderVersion` in the trigger's own target state — `completed` for `acknowledge-completed`, with the per-line read (Lifecycle `GET …/orders/{orderId}/lines`) showing every line `activated` with the subscription identifier this report carries, or `fulfillment_failed` for `acknowledge-failed` — is this report applied before Lifecycle's 24-hour key window closed and goes to step 6 with `reportedOutcome` = the mode and `lifecycleCall = already-applied` ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4, decision D-188); `not-admissible` on an order the Lifecycle PDP-authorized order read shows `on_hold` answers `lifecycleCall = held` with `nextRound` for `completed`, settling and stamping nothing — the definition waits for the resume and reports again under the next round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4); `not-admissible` on an order the read shows terminal goes to step 6 with `reportedOutcome = terminal-event` and `lifecycleCall = none` for `failed` or `cancelled`, and answers `permanent-failure` with `version-mismatch` for `completed`, which cannot meet a terminal order (§4.9, decision D-166); every other refusal is the `permanent-failure` §4.9 names - `inst-ro-call`
 6. [ ] - `p1` - In one transaction: stamp `reported_at` and `reported_outcome` (the `reportedOutcome`) on the fence row (or, for `completed`, on the step record), enqueue the declared event where §3.2's table names one for the `reportedOutcome`, write `step-completion`, settle; **RETURN** `reportedOutcome`, `lifecycleCall` and `nextRound` - `inst-ro-record`
 
@@ -1161,7 +1161,7 @@ canonical-definition guidance, which the canonical version carries and the behav
 cause step 2 found (`inst-fence-cause`) names the Orders catalogue reason, and the fence records
 it as `orders_failure_reason` together with the one value of Lifecycle's closed `failure_reason`
 enumeration the table below maps it to
-([Lifecycle `06 §4.4`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#44-acknowledgement-normative),
+([Lifecycle `06 §4.4`](../../../orders-lifecycle/docs/features/06-workflow-seam.md#44-acknowledgement-normative),
 Lifecycle D-136). Lifecycle refuses any other value `request-invalid` at its boundary, and a
 missing one `failure-reason-missing`. The per-subject `reason` in the definition's `$context.failureSubjects`
 is fragment (c)'s manual-task reason and never reaches the fence (decisions D-110, D-116).
@@ -1169,7 +1169,7 @@ is fragment (c)'s manual-task reason and never reaches the fence (decisions D-11
 | Cause the fence found | `orders_failure_reason` | Lifecycle `failure_reason` |
 |-----------------------|-------------------------|----------------------------|
 | A forward line task resolved `exhausted`, or under `fail-fast` a forward line in `failed` | the line's reason — `wave1-create-failed`, `wave2-activation-failed`, `never-dispatched` or `intent-unresolved`; for several lines, the line with the lowest `execution_seq` | `line-execution-failed` |
-| The same, for a wave-2 line whose activation Subscriptions refused as an overlap collision | `wave2-activation-failed` | `overlap-collision` (a collision raised after the re-check, [Lifecycle `06 §4.3`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)). Inert until `SUB-O11` gives slice 05 a machine-readable refusal kind ([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.1); until then such a line maps to `line-execution-failed` |
+| The same, for a wave-2 line whose activation Subscriptions refused as an overlap collision | `wave2-activation-failed` | `overlap-collision` (a collision raised after the re-check, [Lifecycle `06 §4.3`](../../../orders-lifecycle/docs/features/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)). Inert until `SUB-O11` gives slice 05 a machine-readable refusal kind ([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.1); until then such a line maps to `line-execution-failed` |
 | A plan task resolved `exhausted` for a plan that could not freeze because the expected-fulfillment instant is at or after the version's accepted-binding deadline (`04 §3.6`, `planState = binding-expired`) | `order-binding-expired` | `order-binding-expired` (decision D-194; Lifecycle `06 §4.4` lists it) |
 | A settled `re-check-pre-activation` abort on an elapsed accepted-binding deadline (`04 §3.6`) | `order-binding-expired` | `order-binding-expired` |
 | The wave-2 guard's `bindingExpired: true` answer (`05 §3.6` `inst-pi-wave2-guard`), or a wave-2 line Subscriptions refused on the accepted-binding comparison or for lost SKU protection (Lifecycle D-162, D-164; the closed refusal kind is the cause on the intent row) — in both cases after any line may already be `activated`, so the fence voids the drafts and cancels the activated lines first and reports only with `no_active_subscription_remains = true`; never a pre-activation abort once a line is active | `order-binding-expired` (the line's own `wave2-activation-failed` stays on the task) | `order-binding-expired` |
@@ -1186,13 +1186,19 @@ the exact reason in `orders_failure_reason` and in `OrderFulfillmentAborted`'s `
 Only Lifecycle's audit `caller_reason` and `OrderFulfillmentFailed` are approximate, and this is
 the residual the ask closes.
 
+**Lifecycle D-172 (2026-10-02).** Lifecycle withdrew `dependency-graph-invalid` as an emitted value
+(it stays in its closed set for replayed payloads), confirmed `order-binding-expired`, and keeps
+`line-execution-failed` as the interim for a stale authorization; the table above already emits no
+dependency-graph value since D-196. Lifecycle's receipt floor for these triggers is 30 days (D-173),
+so a fence re-run after day one replays the stored outcome rather than refusing `not-admissible`.
+
 ### 4.9 Every Lifecycle answer to `report-outcome` (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-report-outcome-answers`
 
 `report-outcome` **MUST** answer each outcome of `fulfillment-acknowledgement` and `workflow-cancel`
-([Lifecycle `06 §3.3`, `§3.6`](../../../orders-lifecycle/docs/design/06-workflow-seam.md#36-interactions-and-sequences);
-refusal registry [Lifecycle `01 §4.7`](../../../orders-lifecycle/docs/design/01-foundation.md#refusal-reasons-are-derived-gts-error-types))
+([Lifecycle `06 §3.3`, `§3.6`](../../../orders-lifecycle/docs/features/06-workflow-seam.md#36-interactions-and-sequences);
+refusal registry [Lifecycle `01 §4.7`](../../../orders-lifecycle/docs/features/01-foundation.md#refusal-reasons-are-derived-gts-error-types))
 as below. A permanent failure is not caught by the definition and faults the invocation
 (`10 §3.6` (c)), which the liveness pass raises as an `invocation-dead` task (`01 §4.16`), so
 no row is left to a builder's choice (decision D-111).
@@ -1200,7 +1206,7 @@ no row is left to a builder's choice (decision D-111).
 | Lifecycle answer | When it can arise | `report-outcome` answers |
 |------------------|-------------------|--------------------------|
 | A committed `completed`, `fulfillment_failed` or `cancelled`, or the stored outcome replayed under the same key | The report landed | Step 6 |
-| `not-admissible`, the order read shows this report's transition applied: at `orderVersion`, `completed` with every line `activated` under the subscription identifier the report carries (`acknowledge-completed`), or `fulfillment_failed` (`acknowledge-failed`) | A re-run of a report that committed, after Lifecycle's 24-hour key window forgot the key ([Lifecycle `01-foundation.md:238-241`](../../../orders-lifecycle/docs/design/01-foundation.md#the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound)): the version check passes and the state table has no row from the state reached. Only this gear's rows 13, 14 and 26 reach those states. `cancelled` is not such evidence — an ordinary cancel (row 15) reaches it too, and the read does not show which — so a `cancel-workflow-mediated` re-run takes the terminal row below | Step 6 with `reportedOutcome` = the mode, `lifecycleCall = already-applied` (decision D-188) |
+| `not-admissible`, the order read shows this report's transition applied: at `orderVersion`, `completed` with every line `activated` under the subscription identifier the report carries (`acknowledge-completed`), or `fulfillment_failed` (`acknowledge-failed`) | A re-run of a report that committed, after Lifecycle's 24-hour key window forgot the key ([Lifecycle `01-foundation.md:238-241`](../../../orders-lifecycle/docs/features/01-foundation.md#the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound)): the version check passes and the state table has no row from the state reached. Only this gear's rows 13, 14 and 26 reach those states. `cancelled` is not such evidence — an ordinary cancel (row 15) reaches it too, and the read does not show which — so a `cancel-workflow-mediated` re-run takes the terminal row below | Step 6 with `reportedOutcome` = the mode, `lifecycleCall = already-applied` (decision D-188) |
 | Unavailable (503), a 5xx, a timeout; `still-processing` (409); `authorization-context-changed` (409) | Transient, a concurrent attempt of the same key, or a changed authorization context that a retry with fresh authorization resolves | `retryable-failure`, key left open |
 | `not-admissible`, the order read shows `on_hold` | `acknowledge-completed` has no `on_hold` row (Lifecycle rows 13, 26) | `completed`: `lifecycleCall = held` with `nextRound`. It cannot arise for `failed` or `cancelled`, which rows 26 and 27 admit from a held order |
 | `not-admissible`, the order read shows a terminal state, other than the applied transition above | The order ended by another path first — an ordinary cancel before the spawn signal (row 15) — while the unwind, which has no lifecycle arm, was walking. It cannot arise for `completed`: the definition reports completion only after `report-spawn-signal` was recorded (`10 §3.6` (b)), and once `spawn_signal_at` is set Lifecycle leaves `in_fulfillment`, and an `on_hold` whose pre-hold state is `in_fulfillment`, only by this gear's own reports (Lifecycle rows 13, 14, 16, 26, 27): row 15 requires no spawn signal, row 23 applies the pre-hold state's own cancel guard, and row 24 and the missing `in_fulfillment → expired` row exclude expiry | `failed`, `cancelled`: step 6 with `reportedOutcome = terminal-event`, `lifecycleCall = none`; the walk has already removed what the version created. `completed`: `permanent-failure` `version-mismatch`, as the next row, so the definition needs no terminal-event route after its completion report (decision D-166) |
@@ -1213,7 +1219,7 @@ no row is left to a builder's choice (decision D-111).
 ## 5. Traceability
 
 - **PRD**: [PRD.md](../PRD.md) §6.4 (Saga and Compensation), Acceptance Criteria 9, 9a, 10, 11; §6.1 `cpt-cf-bss-orders-workflow-fr-owf-process-state-nonauth` (the saga log is Orders')
-- **Orders Lifecycle seam**: [06-workflow-seam.md](../../../orders-lifecycle/docs/design/06-workflow-seam.md) §3.3 (`fulfillment-acknowledgement`, `workflow-cancel`), §4.4 (Acknowledgement, normative — compensation evidence and no-Billing-wait rule, bound by reference, not restated)
+- **Orders Lifecycle seam**: [06-workflow-seam.md](../../../orders-lifecycle/docs/features/06-workflow-seam.md) §3.3 (`fulfillment-acknowledgement`, `workflow-cancel`), §4.4 (Acknowledgement, normative — compensation evidence and no-Billing-wait rule, bound by reference, not restated)
 - **ADRs**: `cpt-cf-bss-orders-workflow-adr-saga-compensable-no-pivot` (as amended by ADR-0011), `cpt-cf-bss-orders-workflow-adr-idempotency-key-composition`, `cpt-cf-bss-orders-workflow-adr-outbox-process-events`,
   [`ADR/0011`](../ADR/0011-cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition.md)
   `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`,
