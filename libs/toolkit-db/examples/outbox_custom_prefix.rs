@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use toolkit_db::outbox::{
-    LeasedMessageHandler, MessageResult, Outbox, OutboxMessage, Partitions, WorkerTuning,
+    LeasedMessageHandler, MessageResult, Outbox, OutboxMessage, Partitions, Record, WorkerTuning,
     outbox_migrations_with_prefix,
 };
 use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
@@ -61,17 +61,16 @@ async fn main() -> anyhow::Result<()> {
         .start()
         .await?;
 
-    handle
+    let pending = handle
         .outbox()
         .enqueue(
             &db.conn()?,
-            "messages",
-            0,
-            b"hello from a prefixed outbox".to_vec(),
-            "text/plain",
+            Record::to("messages", 0)
+                .payload(b"hello from a prefixed outbox".to_vec(), "text/plain")
+                .build()?,
         )
         .await?;
-    handle.outbox().flush();
+    pending.fire();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while processed.load(Ordering::Relaxed) == 0 {

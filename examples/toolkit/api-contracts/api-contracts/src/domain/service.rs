@@ -17,6 +17,10 @@ use uuid::Uuid;
 /// In-memory payment record.
 struct PaymentRecord {
     payment_id: Uuid,
+    /// The tenant that created the record, captured from the charging caller's
+    /// `ctx.subject_tenant_id()`. Every read path filters on it so one tenant
+    /// never sees another's payments (#4740).
+    owner_tenant_id: Uuid,
     amount_cents: i64,
     currency: String,
     description: String,
@@ -63,12 +67,13 @@ impl PaymentDomainService {
     #[allow(clippy::unnecessary_wraps, reason = "real impl would be fallible")]
     pub fn charge(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         req: &ChargeRequest,
     ) -> Result<ChargeResponse, CanonicalError> {
         let payment_id = Uuid::new_v4();
         let record = PaymentRecord {
             payment_id,
+            owner_tenant_id: ctx.subject_tenant_id(),
             amount_cents: req.amount_cents,
             currency: req.currency.clone(),
             description: req.description.clone(),
@@ -115,6 +120,7 @@ impl PaymentDomainService {
         let payment_id = Uuid::new_v4();
         let record = PaymentRecord {
             payment_id,
+            owner_tenant_id: ctx.subject_tenant_id(),
             // v2 renamed the field; the stored amount is the same minor unit.
             amount_cents: req.amount_minor,
             currency: req.currency.clone(),
@@ -166,23 +172,38 @@ impl PaymentDomainService {
         ))
     }
 
+    /// The filtered payments as a plain `Vec`, shared by both streaming
+    /// methods. They differ only in their item error type, so the selection
+    /// itself has no business being written twice.
+    ///
+    /// Scoped to `tenant` (the caller's `subject_tenant_id`) first, so a stream
+    /// only ever yields the caller's own tenant's payments — the isolation
+    /// `charge_v2` already applies to its idempotency store, now on the read
+    /// path too (#4740).
+    fn snapshot(
+        self: &Arc<Self>,
+        tenant: Uuid,
+        filter: &ListPaymentsFilter,
+    ) -> Vec<PaymentSummary> {
+        let payments = self.payments.read();
+        payments
+            .values()
+            .filter(|r| r.owner_tenant_id == tenant)
+            .filter(|r| filter.status.as_ref().is_none_or(|s| *s == r.status))
+            .filter(|r| filter.currency.as_ref().is_none_or(|c| *c == r.currency))
+            .map(|r| {
+                PaymentSummary::new(r.payment_id, r.amount_cents, r.currency.clone(), r.status)
+            })
+            .collect()
+    }
+
     /// List payments as a stream, optionally filtered.
     pub fn list_payments(
         self: &Arc<Self>,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         filter: &ListPaymentsFilter,
     ) -> api_contracts_sdk::contract::PaymentStream<PaymentSummary> {
-        let snapshot: Vec<PaymentSummary> = {
-            let payments = self.payments.read();
-            payments
-                .values()
-                .filter(|r| filter.status.as_ref().is_none_or(|s| *s == r.status))
-                .filter(|r| filter.currency.as_ref().is_none_or(|c| *c == r.currency))
-                .map(|r| {
-                    PaymentSummary::new(r.payment_id, r.amount_cents, r.currency.clone(), r.status)
-                })
-                .collect()
-        };
+        let snapshot = self.snapshot(ctx.subject_tenant_id(), filter);
 
         Box::pin(async_stream::try_stream! {
             for item in snapshot {
@@ -190,10 +211,134 @@ impl PaymentDomainService {
             }
         })
     }
+
+    /// Open a payment feed: validate the filter first, then hand back the
+    /// items.
+    ///
+    /// The validation is the whole point of the separate open. `list_payments`
+    /// above has nowhere to report a bad filter except as the stream's first
+    /// item, which a consumer only discovers after it already holds a stream it
+    /// believes is live. Here a rejected filter is an `Err` before any stream
+    /// exists, so "the feed is open" and "the feed is usable" are the same
+    /// statement.
+    ///
+    /// Its error is a `CanonicalError`, like every other method. A fallible
+    /// open would ideally hand the caller a *typed variant with payload fields*
+    /// (which partitions are `unseeded`, and a `recovery_hint`), but
+    /// `CanonicalError` cannot yet carry that as a first-class typed payload —
+    /// so the failure is reported through the canonical AIP-193 violation slots
+    /// instead (`field_violation` / `precondition_violation`), and the richer
+    /// typed form is deferred to a future canonical-error-macro change. See
+    /// #4734.
+    ///
+    /// # Errors
+    ///
+    /// - A `FailedPrecondition` `CanonicalError` when `filter.status` is
+    ///   [`PaymentStatus::Failed`], standing in for event-broker's
+    ///   `409 PositionsNotSet`: a feed over partitions with no committed
+    ///   position cannot be opened. Each unseeded `(topic, partition)` is
+    ///   reported as a precondition violation so the caller still learns *which*
+    ///   ones to seed.
+    /// - An `InvalidArgument` `CanonicalError` when `filter.currency` is not a
+    ///   three-letter ISO 4217 code — the "unacceptable filter" open failure,
+    ///   carried as a field violation on `currency`.
+    pub fn open_feed(
+        self: &Arc<Self>,
+        ctx: &SecurityContext,
+        filter: &ListPaymentsFilter,
+    ) -> Result<api_contracts_sdk::contract::PaymentStream<PaymentSummary>, CanonicalError> {
+        // The precondition open failure. Two unseeded partitions rather than
+        // one, so a test cannot pass by accident on a single-element collection.
+        if filter.status == Some(PaymentStatus::Failed) {
+            return Err(PaymentResourceError::failed_precondition()
+                .with_precondition_violation(
+                    "payments:0",
+                    "partition has no committed position; seek it before opening the feed",
+                    "POSITIONS_NOT_SET",
+                )
+                .with_precondition_violation(
+                    "payments:3",
+                    "partition has no committed position; seek it before opening the feed",
+                    "POSITIONS_NOT_SET",
+                )
+                .create());
+        }
+
+        if let Some(currency) = filter.currency.as_deref()
+            && !(currency.len() == 3 && currency.chars().all(|c| c.is_ascii_uppercase()))
+        {
+            return Err(PaymentResourceError::invalid_argument()
+                .with_field_violation(
+                    "currency",
+                    format!("must be a three-letter ISO 4217 code, got `{currency}`"),
+                    "INVALID_FILTER",
+                )
+                .create());
+        }
+
+        let snapshot = self.snapshot(ctx.subject_tenant_id(), filter);
+        Ok(Box::pin(async_stream::try_stream! {
+            for item in snapshot {
+                yield item;
+            }
+        }))
+    }
 }
 
 impl Default for PaymentDomainService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use api_contracts_sdk::models::ChargeRequest;
+    use futures_util::StreamExt as _;
+
+    fn tenant_ctx(tenant: Uuid) -> SecurityContext {
+        SecurityContext::builder()
+            .subject_id(Uuid::new_v4())
+            .subject_tenant_id(tenant)
+            .subject_type("user")
+            .build()
+            .expect("a fully-specified context builds")
+    }
+
+    /// A read path only yields the caller's own tenant's payments: two tenants
+    /// charge into one store, and neither `list_payments` nor `open_feed` leaks
+    /// the other's records (#4740 #26).
+    #[tokio::test]
+    async fn read_paths_only_yield_the_callers_own_tenants_payments() {
+        let svc = Arc::new(PaymentDomainService::new());
+        let ctx_a = tenant_ctx(Uuid::new_v4());
+        let ctx_b = tenant_ctx(Uuid::new_v4());
+
+        svc.charge(&ctx_a, &ChargeRequest::new(100, "USD", "a1"))
+            .expect("charge a1");
+        svc.charge(&ctx_a, &ChargeRequest::new(200, "USD", "a2"))
+            .expect("charge a2");
+        svc.charge(&ctx_b, &ChargeRequest::new(300, "USD", "b1"))
+            .expect("charge b1");
+
+        let a_listed: Vec<_> = svc
+            .list_payments(&ctx_a, &ListPaymentsFilter::default())
+            .collect()
+            .await;
+        let b_listed: Vec<_> = svc
+            .list_payments(&ctx_b, &ListPaymentsFilter::default())
+            .collect()
+            .await;
+        assert_eq!(a_listed.len(), 2, "tenant A sees only its two payments");
+        assert_eq!(b_listed.len(), 1, "tenant B sees only its one payment");
+
+        // `open_feed` reads through the same tenant-scoped snapshot.
+        let a_feed: Vec<_> = svc
+            .open_feed(&ctx_a, &ListPaymentsFilter::default())
+            .expect("open succeeds")
+            .collect()
+            .await;
+        assert_eq!(a_feed.len(), 2, "open_feed is tenant-scoped too");
     }
 }

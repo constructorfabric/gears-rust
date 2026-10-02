@@ -26,6 +26,10 @@
 pub mod admission;
 // Materialized effective artifacts and the resolution fingerprint (SPEC D3).
 pub mod artifacts;
+// Compatibility against one baseline: which definition, and the verdict (ADR-0003).
+pub mod compat;
+// The three direct dependency edge kinds, extracted from authored content and the identifier.
+pub mod dependency;
 // Version-family key derivation and the three family rules.
 pub mod family;
 // The transient `gts-rust` store, one per admission unit (SPEC D2, §8.2).
@@ -36,6 +40,10 @@ pub mod policy;
 pub mod ports;
 // The database-backed domain surface every transport adapter calls (SPEC §8.4).
 pub mod registry_service;
+// Whether redelivering an admission can reach a different answer (T21).
+pub mod retry;
+// The normalized field set all three reads project by (T22b, SPEC §10.2).
+pub mod selection;
 
 // ---------------------------------------------------------------------------
 // Shared by both paths

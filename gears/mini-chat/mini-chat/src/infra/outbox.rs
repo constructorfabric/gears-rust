@@ -8,10 +8,11 @@ use mini_chat_sdk::{
 use toolkit_db::outbox::Outbox;
 use tracing::{info, warn};
 
-use crate::domain::error::DomainError;
 use crate::domain::model::audit_envelope::AuditEnvelope;
 use crate::domain::ports::{MiniChatMetricsPort, metric_labels};
-use crate::domain::repos::{AttachmentCleanupEvent, ChatCleanupEvent, OutboxEnqueuer};
+use crate::domain::repos::{
+    AttachmentCleanupEvent, ChatCleanupEvent, OutboxEnqueuer, OutboxError, Wake,
+};
 use crate::infra::audit_gateway::AuditGateway;
 
 const AUDIT_PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -35,6 +36,30 @@ pub struct InfraOutboxEnqueuer {
     thread_summary_queue_name: String,
     audit_queue_name: String,
     num_partitions: u32,
+}
+
+/// Build one outbox message for this gear.
+///
+/// Every queue here carries JSON, so the payload type is stated once rather
+/// than at each of the six call sites, and a rejected request becomes a domain
+/// error before any statement runs.
+fn outbox_message(
+    queue: &str,
+    partition: u32,
+    payload: Vec<u8>,
+) -> Result<toolkit_db::outbox::Record<'_>, OutboxError> {
+    toolkit_db::outbox::Record::to(queue, partition)
+        .payload(payload, "application/json")
+        .build()
+        .map_err(|e| match e {
+            // A caller-driven oversize payload is a bad request, not a server
+            // fault: queue and payload type are gear constants here, so this is
+            // the only build rejection a caller can actually provoke.
+            toolkit_db::outbox::OutboxError::PayloadTooLarge { size, max } => {
+                OutboxError::PayloadTooLarge { size, max }
+            }
+            other => OutboxError::enqueue(other.to_string()),
+        })
 }
 
 impl InfraOutboxEnqueuer {
@@ -95,19 +120,17 @@ impl InfraOutboxEnqueuer {
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         chat_id: uuid::Uuid,
         payload: Vec<u8>,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Wake, OutboxError> {
         let partition = Self::compute_partition(chat_id, self.num_partitions);
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
-                &self.thread_summary_queue_name,
-                partition,
-                payload,
-                "application/json",
+                outbox_message(&self.thread_summary_queue_name, partition, payload)?,
             )
             .await
-            .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
+            .map_err(|e| OutboxError::enqueue(e.to_string()))?;
 
         info!(
             queue = %self.thread_summary_queue_name,
@@ -116,7 +139,7 @@ impl InfraOutboxEnqueuer {
             "thread summary task enqueued"
         );
 
-        Ok(())
+        Ok(Wake::from_wake(handle))
     }
 }
 
@@ -126,21 +149,21 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: UsageEvent,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Wake, OutboxError> {
         let partition = self.partition_for(event.tenant_id);
-        let payload = serde_json::to_vec(&event)
-            .map_err(|e| DomainError::internal(format!("serialize UsageEvent: {e}")))?;
+        let payload = serde_json::to_vec(&event).map_err(|e| OutboxError::Serialize {
+            event: "UsageEvent",
+            source: e,
+        })?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
-                &self.usage_queue_name,
-                partition,
-                payload,
-                "application/json",
+                outbox_message(&self.usage_queue_name, partition, payload)?,
             )
             .await
-            .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
+            .map_err(|e| OutboxError::enqueue(e.to_string()))?;
 
         info!(
             queue = %self.usage_queue_name,
@@ -150,28 +173,28 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
             "usage event enqueued"
         );
 
-        Ok(())
+        Ok(Wake::from_wake(handle))
     }
 
     async fn enqueue_attachment_cleanup(
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: AttachmentCleanupEvent,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Wake, OutboxError> {
         let partition = self.partition_for(event.tenant_id);
-        let payload = serde_json::to_vec(&event)
-            .map_err(|e| DomainError::internal(format!("serialize AttachmentCleanupEvent: {e}")))?;
+        let payload = serde_json::to_vec(&event).map_err(|e| OutboxError::Serialize {
+            event: "AttachmentCleanupEvent",
+            source: e,
+        })?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
-                &self.cleanup_queue_name,
-                partition,
-                payload,
-                "application/json",
+                outbox_message(&self.cleanup_queue_name, partition, payload)?,
             )
             .await
-            .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
+            .map_err(|e| OutboxError::enqueue(e.to_string()))?;
 
         info!(
             queue = %self.cleanup_queue_name,
@@ -181,30 +204,30 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
             "attachment cleanup event enqueued"
         );
 
-        Ok(())
+        Ok(Wake::from_wake(handle))
     }
 
     async fn enqueue_chat_cleanup(
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: ChatCleanupEvent,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Wake, OutboxError> {
         // Partition by chat_id so all cleanup messages for the same chat
         // are serialized within one partition.
         let partition = Self::compute_partition(event.chat_id, self.num_partitions);
-        let payload = serde_json::to_vec(&event)
-            .map_err(|e| DomainError::internal(format!("serialize ChatCleanupEvent: {e}")))?;
+        let payload = serde_json::to_vec(&event).map_err(|e| OutboxError::Serialize {
+            event: "ChatCleanupEvent",
+            source: e,
+        })?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
-                &self.chat_cleanup_queue_name,
-                partition,
-                payload,
-                "application/json",
+                outbox_message(&self.chat_cleanup_queue_name, partition, payload)?,
             )
             .await
-            .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
+            .map_err(|e| OutboxError::enqueue(e.to_string()))?;
 
         info!(
             queue = %self.chat_cleanup_queue_name,
@@ -214,33 +237,33 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
             "chat cleanup event enqueued"
         );
 
-        Ok(())
+        Ok(Wake::from_wake(handle))
     }
 
     async fn enqueue_audit_event(
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: AuditEnvelope,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Wake, OutboxError> {
         let tenant_id = match &event {
             AuditEnvelope::Turn(e) => e.tenant_id,
             AuditEnvelope::Mutation(e) => e.tenant_id,
             AuditEnvelope::Delete(e) => e.tenant_id,
         };
         let partition = self.partition_for(tenant_id);
-        let payload = serde_json::to_vec(&event)
-            .map_err(|e| DomainError::internal(format!("serialize AuditEnvelope: {e}")))?;
+        let payload = serde_json::to_vec(&event).map_err(|e| OutboxError::Serialize {
+            event: "AuditEnvelope",
+            source: e,
+        })?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
-                &self.audit_queue_name,
-                partition,
-                payload,
-                "application/json",
+                outbox_message(&self.audit_queue_name, partition, payload)?,
             )
             .await
-            .map_err(|e| DomainError::internal(format!("audit outbox enqueue: {e}")))?;
+            .map_err(|e| OutboxError::enqueue(e.to_string()))?;
 
         info!(
         queue = %self.audit_queue_name,
@@ -249,29 +272,28 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
         "audit event enqueued"
         );
 
-        Ok(())
+        Ok(Wake::from_wake(handle))
     }
 
     async fn enqueue_thread_summary(
         &self,
         runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         payload: crate::domain::repos::ThreadSummaryTaskPayload,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Wake, OutboxError> {
         let partition = Self::compute_partition(payload.chat_id, self.num_partitions);
-        let serialized = serde_json::to_vec(&payload).map_err(|e| {
-            DomainError::internal(format!("serialize ThreadSummaryTaskPayload: {e}"))
+        let serialized = serde_json::to_vec(&payload).map_err(|e| OutboxError::Serialize {
+            event: "ThreadSummaryTaskPayload",
+            source: e,
         })?;
 
-        self.outbox()
+        let handle = self
+            .outbox()
             .enqueue(
                 runner,
-                &self.thread_summary_queue_name,
-                partition,
-                serialized,
-                "application/json",
+                outbox_message(&self.thread_summary_queue_name, partition, serialized)?,
             )
             .await
-            .map_err(|e| DomainError::internal(format!("outbox enqueue: {e}")))?;
+            .map_err(|e| OutboxError::enqueue(e.to_string()))?;
 
         info!(
             queue = %self.thread_summary_queue_name,
@@ -281,14 +303,7 @@ impl OutboxEnqueuer for InfraOutboxEnqueuer {
             "thread summary task enqueued"
         );
 
-        Ok(())
-    }
-
-    fn flush(&self) {
-        // flush is a no-op if outbox isn't set yet (before start).
-        if let Some(outbox) = self.outbox.get() {
-            outbox.flush();
-        }
+        Ok(Wake::from_wake(handle))
     }
 }
 
@@ -413,9 +428,21 @@ impl toolkit_db::outbox::LeasedMessageHandler for UsageEventHandler {
 /// - `Ok(())` → `Ok`
 /// - `Transient` → `Retry`
 /// - `Permanent` → `Reject` (dead-letter)
-/// - Deserialization failure → `Reject` (corrupt payload)
-/// - Plugin not configured → `Ok` (audit is optional; skip silently)
-/// - Plugin resolution error → `Retry` (transient; plugin may not be ready yet)
+/// - Deserialization failure → `Reject` (corrupt payload), checked before
+///   the plugin is resolved, so it is dead-lettered with or without a plugin
+/// - Plugin not configured → `Ok` (audit is optional; the gateway logs a
+///   warning once and the event is dropped; the next delivery looks again)
+/// - Plugin resolution error, or an instance registered in types-registry
+///   whose client is not in `ClientHub` → `Retry` (plugin may not be ready yet)
+/// - A `Retry` on the last of [`AUDIT_MAX_ATTEMPTS`] attempts → `Reject`
+///   (dead-letter), so a misconfigured plugin does not block the partition
+///
+/// Every outcome is counted in `mini_chat_audit_emit_total{result}`; a
+/// "plugin not configured" drop as `result = dropped`.
+/// Delivery attempts per audit event before it is dead-lettered. With the
+/// outbox backoff capped at 30 s this is about an hour of retries.
+pub const AUDIT_MAX_ATTEMPTS: u32 = 120;
+
 pub struct AuditEventHandler {
     pub(crate) audit_gateway: Arc<AuditGateway>,
     pub(crate) metrics: Arc<dyn MiniChatMetricsPort>,
@@ -428,18 +455,6 @@ impl toolkit_db::outbox::LeasedMessageHandler for AuditEventHandler {
         &self,
         msg: &toolkit_db::outbox::OutboxMessage,
     ) -> toolkit_db::outbox::MessageResult {
-        let plugin = match self.audit_gateway.get_plugin().await {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                // No audit plugin registered - audit is optional; ack and advance.
-                return toolkit_db::outbox::MessageResult::Ok;
-            }
-            Err(e) => {
-                warn!(error = %e, "audit plugin resolution failed - will retry");
-                return toolkit_db::outbox::MessageResult::Retry;
-            }
-        };
-
         let envelope = match serde_json::from_slice::<AuditEnvelope>(&msg.payload) {
             Ok(e) => e,
             Err(e) => {
@@ -449,9 +464,32 @@ impl toolkit_db::outbox::LeasedMessageHandler for AuditEventHandler {
                     payload_len = msg.payload.len(),
                     "audit event deserialization failed: {e}"
                 );
+                self.metrics
+                    .record_audit_emit(metric_labels::result::REJECT);
                 return toolkit_db::outbox::MessageResult::Reject(format!(
                     "deserialization failed: {e}"
                 ));
+            }
+        };
+
+        let plugin = match self.audit_gateway.get_plugin().await {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                // No audit plugin registered - audit is optional; ack and
+                // advance, counted so operators can alert on dropped events.
+                self.metrics
+                    .record_audit_emit(metric_labels::result::DROPPED);
+                return toolkit_db::outbox::MessageResult::Ok;
+            }
+            Err(e) => {
+                warn!(
+                    partition_id = msg.partition_id,
+                    seq = msg.seq,
+                    attempts = msg.attempts,
+                    error = %e,
+                    "audit plugin resolution failed - will retry"
+                );
+                return self.retry_or_dead_letter(msg, "audit plugin resolution failed");
             }
         };
 
@@ -492,11 +530,11 @@ impl toolkit_db::outbox::LeasedMessageHandler for AuditEventHandler {
                 warn!(
                     partition_id = msg.partition_id,
                     seq = msg.seq,
+                    attempts = msg.attempts,
                     error = %e,
                     "audit emit transient failure - will retry"
                 );
-                self.metrics.record_audit_emit(metric_labels::result::RETRY);
-                toolkit_db::outbox::MessageResult::Retry
+                self.retry_or_dead_letter(msg, "audit emit transient failure")
             }
             Err(e) => {
                 tracing::error!(
@@ -513,7 +551,35 @@ impl toolkit_db::outbox::LeasedMessageHandler for AuditEventHandler {
     }
 }
 
+impl AuditEventHandler {
+    /// `Retry`, or `Reject` once this is the last of [`AUDIT_MAX_ATTEMPTS`]:
+    /// an audit event that keeps failing must not block its partition.
+    fn retry_or_dead_letter(
+        &self,
+        msg: &toolkit_db::outbox::OutboxMessage,
+        what: &str,
+    ) -> toolkit_db::outbox::MessageResult {
+        let this_attempt = u32::try_from(msg.attempts).unwrap_or(0).saturating_add(1);
+        if this_attempt >= AUDIT_MAX_ATTEMPTS {
+            tracing::error!(
+                partition_id = msg.partition_id,
+                seq = msg.seq,
+                attempts = this_attempt,
+                "{what}: max attempts reached - dead-lettering"
+            );
+            self.metrics
+                .record_audit_emit(metric_labels::result::REJECT);
+            return toolkit_db::outbox::MessageResult::Reject(format!(
+                "{what}: max attempts ({AUDIT_MAX_ATTEMPTS}) reached"
+            ));
+        }
+        self.metrics.record_audit_emit(metric_labels::result::RETRY);
+        toolkit_db::outbox::MessageResult::Retry
+    }
+}
+
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use mini_chat_sdk::{
@@ -549,6 +615,27 @@ mod tests {
             dedupe_key: None,
             system_task_type: None,
         }
+    }
+
+    #[test]
+    fn oversize_payload_is_a_validation_error_not_internal() {
+        // 64 KiB is the outbox cap; one byte over is caller-driven and must
+        // surface as a 4xx, not a 500.
+        let too_big = vec![0u8; 64 * 1024 + 1];
+        let err = outbox_message("q", 0, too_big).unwrap_err();
+        assert!(
+            matches!(err, OutboxError::PayloadTooLarge { .. }),
+            "expected a payload-too-large error, got {err:?}"
+        );
+        // Preserved as `Outbox(PayloadTooLarge)` so the source survives and the
+        // REST layer can render it as a client (4xx) error rather than a 500.
+        assert!(
+            matches!(
+                crate::domain::error::DomainError::from(err),
+                crate::domain::error::DomainError::Outbox(OutboxError::PayloadTooLarge { .. })
+            ),
+            "oversize must be preserved as an Outbox error carrying its source",
+        );
     }
 
     fn make_outbox_message(payload: Vec<u8>) -> OutboxMessage {
@@ -904,16 +991,14 @@ mod tests {
     }
 
     // ── AuditEventHandler: invalid payload → Reject ──
-    //
-    // Note: the handler only deserializes payloads when a plugin is present.
-    // Use an `ok` plugin so the handler reaches the deserialization step.
 
     #[tokio::test]
     async fn audit_handler_reject_for_invalid_payload() {
         let plugin = MockAuditPlugin::ok();
+        let metrics = Arc::new(crate::domain::service::test_helpers::TestMetrics::new());
         let handler = AuditEventHandler {
-            audit_gateway: AuditGateway::from_plugin(plugin),
-            metrics: Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            audit_gateway: AuditGateway::from_plugin(Arc::clone(&plugin) as _),
+            metrics: Arc::clone(&metrics) as _,
         };
         let msg = make_outbox_message(b"not json".to_vec());
         let result = LeasedMessageHandler::handle(&handler, &msg).await;
@@ -921,15 +1006,40 @@ mod tests {
             matches!(result, MessageResult::Reject(_)),
             "expected Reject for corrupt payload"
         );
+        assert_eq!(plugin.calls(), 0);
+        assert_eq!(
+            *metrics.audit_emit_results.lock().unwrap(),
+            [metric_labels::result::REJECT]
+        );
+    }
+
+    // A corrupt payload is rejected before the plugin is resolved: a missing
+    // client must not turn it into an endless retry.
+    #[tokio::test]
+    async fn audit_handler_rejects_invalid_payload_when_plugin_unresolvable() {
+        let handler = AuditEventHandler {
+            audit_gateway: AuditGateway::with_lookup(
+                Arc::new(toolkit::client_hub::ClientHub::new()),
+                || Some("test.audit.plugin.v1~test._.missing.v1".to_owned()),
+            ),
+            metrics: Arc::new(crate::domain::ports::metrics::NoopMetrics),
+        };
+        let msg = make_outbox_message(b"not json".to_vec());
+        let result = LeasedMessageHandler::handle(&handler, &msg).await;
+        assert!(
+            matches!(result, MessageResult::Reject(_)),
+            "expected Reject for corrupt payload, got {result:?}"
+        );
     }
 
     // ── AuditEventHandler: no plugin configured → Ok ──
 
     #[tokio::test]
     async fn audit_handler_success_when_no_plugin_configured() {
+        let metrics = Arc::new(crate::domain::service::test_helpers::TestMetrics::new());
         let handler = AuditEventHandler {
             audit_gateway: AuditGateway::noop(),
-            metrics: Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            metrics: Arc::clone(&metrics) as _,
         };
         let payload = make_audit_envelope_payload();
         let msg = make_outbox_message(payload);
@@ -938,6 +1048,117 @@ mod tests {
             matches!(result, MessageResult::Ok),
             "expected Ok when no plugin configured"
         );
+        // The drop is counted (result = dropped), not silent.
+        assert_eq!(
+            *metrics.audit_emit_results.lock().unwrap(),
+            [metric_labels::result::DROPPED]
+        );
+    }
+
+    // ── AuditEventHandler: instance resolved, client missing → Retry ──
+
+    #[tokio::test]
+    async fn audit_handler_retry_when_plugin_client_missing() {
+        let metrics = Arc::new(crate::domain::service::test_helpers::TestMetrics::new());
+        let handler = AuditEventHandler {
+            audit_gateway: AuditGateway::with_lookup(
+                Arc::new(toolkit::client_hub::ClientHub::new()),
+                || Some("test.audit.plugin.v1~test._.missing.v1".to_owned()),
+            ),
+            metrics: Arc::clone(&metrics) as _,
+        };
+        let msg = make_outbox_message(make_audit_envelope_payload());
+        let result = LeasedMessageHandler::handle(&handler, &msg).await;
+        assert!(
+            matches!(result, MessageResult::Retry),
+            "expected Retry when the plugin client is not in ClientHub"
+        );
+        assert_eq!(
+            *metrics.audit_emit_results.lock().unwrap(),
+            [metric_labels::result::RETRY]
+        );
+    }
+
+    // ── AuditEventHandler: retries are bounded ──
+
+    // A plugin that never becomes available must not block the partition:
+    // the last attempt dead-letters instead of retrying.
+    #[tokio::test]
+    async fn audit_handler_dead_letters_on_last_attempt() {
+        let metrics = Arc::new(crate::domain::service::test_helpers::TestMetrics::new());
+        let handler = AuditEventHandler {
+            audit_gateway: AuditGateway::with_lookup(
+                Arc::new(toolkit::client_hub::ClientHub::new()),
+                || Some("test.audit.plugin.v1~test._.missing.v1".to_owned()),
+            ),
+            metrics: Arc::clone(&metrics) as _,
+        };
+        let mut msg = make_outbox_message(make_audit_envelope_payload());
+        msg.attempts = i16::try_from(AUDIT_MAX_ATTEMPTS - 2).unwrap();
+        assert!(matches!(
+            LeasedMessageHandler::handle(&handler, &msg).await,
+            MessageResult::Retry
+        ));
+        msg.attempts += 1;
+        assert!(matches!(
+            LeasedMessageHandler::handle(&handler, &msg).await,
+            MessageResult::Reject(_)
+        ));
+
+        let plugin = MockAuditPlugin::transient("network blip");
+        let handler = AuditEventHandler {
+            audit_gateway: AuditGateway::from_plugin(plugin.clone()),
+            metrics: Arc::clone(&metrics) as _,
+        };
+        assert!(matches!(
+            LeasedMessageHandler::handle(&handler, &msg).await,
+            MessageResult::Reject(_)
+        ));
+        assert_eq!(
+            *metrics.audit_emit_results.lock().unwrap(),
+            [
+                metric_labels::result::RETRY,
+                metric_labels::result::REJECT,
+                metric_labels::result::REJECT
+            ]
+        );
+    }
+
+    // ── AuditEventHandler: plugin registered after a no-plugin delivery ──
+
+    #[tokio::test]
+    async fn audit_handler_uses_plugin_registered_later() {
+        use std::sync::atomic::AtomicBool;
+
+        const ID: &str = "test.audit.plugin.v1~test._.late.v1";
+        let hub = Arc::new(toolkit::client_hub::ClientHub::new());
+        let registered = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&registered);
+        let handler = AuditEventHandler {
+            audit_gateway: AuditGateway::with_lookup(Arc::clone(&hub), move || {
+                flag.load(Ordering::SeqCst).then(|| ID.to_owned())
+            }),
+            metrics: Arc::new(crate::domain::ports::metrics::NoopMetrics),
+        };
+
+        let msg = make_outbox_message(make_audit_envelope_payload());
+        assert!(matches!(
+            LeasedMessageHandler::handle(&handler, &msg).await,
+            MessageResult::Ok
+        ));
+
+        let plugin = MockAuditPlugin::ok();
+        hub.register_scoped::<dyn MiniChatAuditPluginClientV1>(
+            toolkit::client_hub::ClientScope::gts_id(ID),
+            plugin.clone() as Arc<dyn MiniChatAuditPluginClientV1>,
+        );
+        registered.store(true, Ordering::SeqCst);
+
+        assert!(matches!(
+            LeasedMessageHandler::handle(&handler, &msg).await,
+            MessageResult::Ok
+        ));
+        assert_eq!(plugin.calls(), 1, "the late plugin must receive the event");
     }
 
     // ── AuditEventHandler: transient plugin error → Retry ──
@@ -1047,11 +1268,11 @@ mod tests {
         let payload = make_audit_envelope_payload();
         let envelope: AuditEnvelope = serde_json::from_slice(&payload).unwrap();
         let conn = db.conn().expect("conn");
-        enqueuer
+        let wake = enqueuer
             .enqueue_audit_event(&conn, envelope)
             .await
             .expect("enqueue");
-        enqueuer.flush();
+        wake.fire();
 
         tokio::time::timeout(Duration::from_secs(5), plugin.notifier.notified())
             .await
@@ -1116,11 +1337,11 @@ mod tests {
         enqueuer.set_outbox(Arc::clone(handle.outbox()));
         let event = make_usage_event();
         let conn = db.conn().expect("conn");
-        enqueuer
+        let wake = enqueuer
             .enqueue_usage_event(&conn, event)
             .await
             .expect("enqueue");
-        enqueuer.flush();
+        wake.fire();
 
         // Wait for the handler to process (notification-based, no fixed sleep).
         tokio::time::timeout(Duration::from_secs(5), plugin.notifier.notified())

@@ -16,24 +16,39 @@
 
 use std::sync::Arc;
 
-use gts::{GTS_IMPLEMENTATION_VERSION, GTS_SPECIFICATION_VERSION, GtsId};
+use gts::{CompatibilityVerdict, GTS_IMPLEMENTATION_VERSION, GTS_SPECIFICATION_VERSION, GtsId};
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{DBProvider, DbTx};
 use toolkit_macros::domain_model;
+use tracing::Span;
 use uuid::Uuid;
 
+use super::bounds::{check_resolution_inputs, materialize_bounded};
 use super::errors::{ItemFailure, WorkerError};
 use super::fingerprint::canonical_text;
-use crate::domain::artifacts::{MaterializedArtifacts, content_hash, materialize};
-use crate::domain::enums::{EntityKind, LifecycleStatus, OwnershipScope};
-use crate::domain::family::{FamilyKey, admits_new_member, family_key};
-use crate::domain::gts_store::{UnitDocument, UnitStore, load_unit_store};
-use crate::domain::ports::{
-    NewCurrentInstance, NewCurrentTypeSchema, NewEntity, NewInstanceRevision, NewRevision, Stores,
-    snapshot_read,
+use super::refresh::refresh_dependents;
+use super::revision::{
+    CommittedUnit, CurrentContent, RevisionCommit, read_current_content, revision_entity,
+    stale_precondition, terminalize_unchanged,
 };
+use super::unchanged::{self, UnchangedCandidate};
+use super::vector::{self, RevisionVector, VectorDrift};
+use crate::config::Limits;
+use crate::domain::admission::{AdmissionFailureReason, Precondition};
+use crate::domain::artifacts::MaterializedArtifacts;
+use crate::domain::compat::{self, Baseline};
+use crate::domain::dependency::{DependencyEdge, extract_edges};
+use crate::domain::enums::{DependencyKind, EntityKind, LifecycleStatus, OwnershipScope};
+use crate::domain::family::{FamilyKey, admits_new_member, family_key};
+use crate::domain::gts_store::{CommittedSchema, UnitDocument, UnitStore, load_unit_store};
+use crate::domain::ports::metrics::{AdmissionMetrics, PassLabels};
+use crate::domain::ports::{
+    ItemSuccess, NewCurrentInstance, NewCurrentTypeSchema, NewEntity, NewInstanceRevision,
+    NewRevision, OperationItemRow, Stores, snapshot_read,
+};
+use crate::observability::{self, CompatFacts};
 
 /// The owning gear recorded on a P0 admission.
 ///
@@ -50,7 +65,11 @@ pub const P0_OWNING_GEAR: &str = "types-registry";
 pub enum EvaluatedOutcome {
     /// D3's artifacts, materialized at admission so the read path recomputes
     /// nothing.
-    TypeSchema { artifacts: MaterializedArtifacts },
+    TypeSchema {
+        artifacts: MaterializedArtifacts,
+        /// GTS's root modifier, carried to the commit-time live-Instance guard.
+        is_abstract: bool,
+    },
     /// The Type Schema revision this value was validated against. Recorded rather
     /// than re-derived: the schema's current revision may move afterwards, and this
     /// is the record of which rules the value passed.
@@ -81,178 +100,607 @@ pub struct EvaluatedUnit {
     pub gts_uuid: Uuid,
     pub family_key: FamilyKey,
     pub canonical_body: String,
-    pub content_hash: Vec<u8>,
     pub outcome: EvaluatedOutcome,
     pub operation_item_id: i64,
+    /// The effective ADR-0004 waiver, persisted as `compat_forced`.
+    /// Remains true for a compatible candidate if the waiver is still authorized;
+    /// ADR-0003 withdraws the whole-history guarantee for any forced step.
+    pub compat_forced: bool,
+    /// The candidate's outgoing edges, by target **identifier** (T13).
+    pub edges: Vec<DependencyEdge>,
+    /// The database state on which this evaluation's verdict rests.
+    pub vector: RevisionVector,
+    /// Which pass produced this unit, for the series its commit emits (T20).
+    /// Carried on the unit rather than threaded through every commit signature:
+    /// each commit already takes the unit, and a separate argument would be one
+    /// more place the two could disagree.
+    pub labels: PassLabels,
 }
 
-/// The commit's result for one item that wrote a revision.
+/// Owned baseline snapshot passed into `spawn_blocking`, with refusal provenance.
 #[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CommittedUnit {
-    pub gts_uuid: Uuid,
-    pub revision_no: i32,
-    pub resource_version: i64,
+#[derive(Clone, Debug)]
+enum BaselineDocument {
+    /// No comparison is owed. Which exemption it was stays on the [`Baseline`] the
+    /// choice came from, so it is not carried a second time here.
+    Exempt,
+    /// Baseline content for comparison; identifier and revision for tracing.
+    Present {
+        gts_id: String,
+        revision_no: i32,
+        content: Value,
+    },
+    /// No predecessor to compare yet. The commit-time family gate checks existence
+    /// after shape conflicts, which take precedence. This is always a creation.
+    ///
+    /// The absent predecessor remains in the revision vector: if it appears before
+    /// commit, `VectorDrift::Appeared` triggers rollback and a fresh comparison.
+    PredecessorAbsent,
 }
 
-/// What committing a *revision* produced. The outcome is the variant: an
-/// `unchanged` candidate allocates no revision number (ADR-0005), and
-/// [`commit_creation`] cannot reach that outcome at all.
+/// Read the baseline from the comparison store's snapshot (SPEC §8.1 step 3).
+///
+/// Cross-minor content is already in `loaded`; only `CurrentRevision` needs
+/// a query because the candidate overlay replaced its committed document.
+/// Its observed version must match the accepted precondition: the commit CAS
+/// then protects the same baseline that evaluation compared against.
+/// Take `loaded` by value: `UnitStore` is not `Sync` and cannot be borrowed
+/// across awaits.
+async fn read_baseline(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    candidate_id: &str,
+    precondition: Precondition,
+    choice: &Baseline,
+    loaded: Option<CommittedSchema>,
+) -> Result<Result<BaselineDocument, ItemFailure>, WorkerError> {
+    let gts_id = match choice {
+        Baseline::Exempt(_) => return Ok(Ok(BaselineDocument::Exempt)),
+        Baseline::PrecedingMinor { gts_id } => {
+            // Absent from the loaded closure is absent from the database: the
+            // identifier was passed as a root, so a row would have been read.
+            return Ok(Ok(match loaded {
+                Some(committed) => BaselineDocument::Present {
+                    gts_id: gts_id.clone(),
+                    revision_no: committed.revision_no,
+                    content: committed.content,
+                },
+                None => BaselineDocument::PredecessorAbsent,
+            }));
+        }
+        Baseline::CurrentRevision => candidate_id,
+    };
+    // Match revision_entity's refusal order in the evaluation snapshot. Deleted
+    // predecessors remain valid baselines; that creation arm returned above.
+    let Some(entity) = stores.find_by_gts_id(tx, scope, gts_id).await? else {
+        return Ok(Err(ItemFailure::new(
+            AdmissionFailureReason::PreconditionFailed,
+            format!("'{gts_id}' does not exist, so a revision has no baseline to compare against"),
+        )));
+    };
+    if entity.lifecycle_status == LifecycleStatus::Deleted {
+        return Ok(Err(ItemFailure::new(
+            AdmissionFailureReason::EntityDeleted,
+            format!("'{gts_id}' is deleted; a revision cannot be admitted onto a withdrawn entity"),
+        )));
+    }
+    // A future precondition must not become valid after comparison against an
+    // older baseline. The candidate itself is excluded from the revision vector.
+    if let Precondition::Version(expected) = precondition
+        && entity.resource_version != expected
+    {
+        return Ok(Err(ItemFailure::new(
+            AdmissionFailureReason::PreconditionFailed,
+            format!(
+                "'{gts_id}' has resource_version {}, not expected {expected}, \
+                 in the evaluation snapshot",
+                entity.resource_version
+            ),
+        )));
+    }
+    let current = stores
+        .current_documents(tx, scope, &[entity.id])
+        .await?
+        .pop()
+        .ok_or_else(|| WorkerError::CurrentStateMissing {
+            gts_id: gts_id.to_owned(),
+            entity_id: entity.id,
+        })?;
+    let content = serde_json::from_str(&current.raw_schema).map_err(|source| {
+        WorkerError::BaselineUnparsable {
+            gts_id: gts_id.to_owned(),
+            source,
+        }
+    })?;
+    Ok(Ok(BaselineDocument::Present {
+        gts_id: gts_id.to_owned(),
+        revision_no: current.revision_no,
+        content,
+    }))
+}
+
+/// Claim the write order as the first statement of every commit transaction.
+///
+/// The database owns the wait timeout; cancelling a client-side timeout would not
+/// cancel the statement. See SPEC §4.
+async fn claim_entity_write_order(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    now: OffsetDateTime,
+) -> Result<(), WorkerError> {
+    Ok(stores.claim_entity_write_order(tx, scope, now).await?)
+}
+
+/// The snapshot either proves equality or supplies everything evaluation needs.
 #[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RevisionCommit {
-    /// A new immutable revision, the current pointer moved onto it, and
-    /// `resource_version` advanced.
-    Admitted(CommittedUnit),
-    /// The authored content already equalled the current revision: no revision, no
-    /// version move. `resource_version` is the one that did not move.
-    Unchanged {
-        gts_uuid: Uuid,
-        resource_version: i64,
+enum EvaluationSnapshot {
+    Unchanged(UnchangedCandidate),
+    Loaded {
+        store: Box<UnitStore>,
+        schema_pair: Option<(i64, i32)>,
+        vector: RevisionVector,
+        edges: Vec<DependencyEdge>,
+        /// Parsed inside the snapshot, after a probe miss, and carried out because
+        /// the comparison in the blocking task reads it.
+        content: Value,
+        /// Boxed to keep the variant's size off the `Unchanged` arm.
+        baseline: Box<BaselineDocument>,
     },
 }
 
-/// Evaluate one candidate. **No transaction is open here.**
-///
-/// Builds the unit's transient store from the database (D2), asks `gts-rust` to
-/// validate the candidate, and materializes D3's artifacts. The store is dropped
-/// when this returns: nothing is retained anywhere, and the next invocation reads
-/// the database again.
-///
-/// # Errors
-/// [`WorkerError`] for an infrastructure failure, which the outbox handler must
-/// retry. A content failure is an [`ItemFailure`] in the `Ok(Err(..))` position: an
-/// *outcome*, not a fault, and retrying it would answer the same forever.
-pub async fn evaluate(
-    stores: &Arc<dyn Stores>,
-    db: &DBProvider<WorkerError>,
+/// A revision may prove equality without evaluating any effective content.
+#[domain_model]
+#[derive(Clone, Debug)]
+pub enum PreparedUnit {
+    Evaluated(Arc<EvaluatedUnit>),
+    Unchanged(Arc<UnchangedCandidate>),
+}
+
+/// Inputs for applying a prepared registration in the caller's transaction.
+#[domain_model]
+pub(super) struct CommitRequest<'a> {
+    pub prepared: &'a PreparedUnit,
+    pub precondition: Precondition,
+    pub now: OffsetDateTime,
+    pub limits: Limits,
+    pub metrics: &'a Arc<dyn AdmissionMetrics>,
+}
+
+/// Select the commit from the stored precondition for both execution modes.
+/// The caller supplies either persistent stores or the dry-run view, and owns
+/// the transaction boundary and any retries.
+pub(super) async fn commit_prepared_in(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
     scope: &AccessScope,
-    gts_id: &str,
-    canonical_body: &str,
+    request: CommitRequest<'_>,
+) -> Result<Result<RevisionCommit, ItemFailure>, WorkerError> {
+    let CommitRequest {
+        prepared,
+        precondition,
+        now,
+        limits,
+        metrics,
+    } = request;
+    let unit = match prepared {
+        PreparedUnit::Unchanged(candidate) => {
+            return unchanged::commit(stores, tx, scope, candidate, now).await;
+        }
+        PreparedUnit::Evaluated(unit) => unit,
+    };
+    match precondition {
+        Precondition::MustNotExist => commit_creation(stores, tx, scope, unit, &limits, now)
+            .await
+            .map(|result| result.map(RevisionCommit::Admitted)),
+        Precondition::Version(expected) => {
+            commit_revision(stores, tx, scope, unit, expected, &limits, now, metrics).await
+        }
+    }
+}
+
+/// Stored inputs for one evaluation, named to prevent positional mix-ups.
+#[domain_model]
+#[derive(Clone, Copy, Debug)]
+pub struct EvaluationTarget<'a> {
+    pub gts_id: &'a str,
+    /// The canonicalized authored document, as acceptance stored it.
+    pub canonical_body: &'a str,
+    pub operation_item_id: i64,
+    /// The accepted optimistic precondition. It is what separates a creation from a
+    /// revision, and therefore which definition the candidate is compared against.
+    pub precondition: Precondition,
+    /// Accepted waiver request, subject to worker and baseline re-authorization.
+    pub force: bool,
+    /// Which pass this evaluation belongs to, for the series it emits (T20).
+    pub labels: PassLabels,
+}
+
+/// Plan evaluation before reading state, shared by committing and dry-run paths.
+#[domain_model]
+#[derive(Clone, Debug)]
+struct EvaluationPlan {
+    id: GtsId,
+    candidate_id: String,
+    canonical_body: String,
+    baseline_choice: Baseline,
+    /// The preceding minor, when there is one: an entity no candidate names, so
+    /// its own bases and stored `$ref` targets reach the store only as an extra
+    /// closure root.
+    baseline_roots: Vec<String>,
+    conforming_type: Option<String>,
+    precondition: Precondition,
     operation_item_id: i64,
-) -> Result<Result<EvaluatedUnit, ItemFailure>, WorkerError> {
+    force: bool,
+    labels: PassLabels,
+}
+
+/// Decide the plan, or refuse the candidate on what its identifier alone says.
+fn plan_evaluation(target: EvaluationTarget<'_>) -> Result<EvaluationPlan, ItemFailure> {
+    let EvaluationTarget {
+        gts_id,
+        canonical_body,
+        operation_item_id,
+        precondition,
+        force,
+        labels,
+    } = target;
     let id = match GtsId::try_new(gts_id) {
         Ok(id) => id,
         // Acceptance already refused a non-canonical identifier, so reaching here
         // means the stored row disagrees with the rules that admitted it.
         Err(e) => {
-            return Ok(Err(ItemFailure::new(
-                "invalid_identifier",
+            return Err(ItemFailure::new(
+                AdmissionFailureReason::InvalidIdentifier,
                 format!("stored identifier '{gts_id}' does not parse: {e}"),
-            )));
+            ));
         }
     };
-    let content: Value = match serde_json::from_str(canonical_body) {
+    // Select from the identifier and accepted precondition before reading storage.
+    let baseline_choice = match compat::select_baseline(&id, precondition) {
+        Ok(choice) => choice,
+        // Acceptance rejects unreadable versions; fail closed if a stored row contains one.
+        Err(unreadable) => {
+            return Err(ItemFailure::new(
+                compat::UnreadableVersion::REASON,
+                unreadable.to_string(),
+            ));
+        }
+    };
+    let baseline_roots: Vec<String> = match &baseline_choice {
+        Baseline::PrecedingMinor { gts_id } => vec![gts_id.clone()],
+        _ => Vec::new(),
+    };
+    // The conforming type's `(entity_id, revision_no)` is read in the same snapshot as
+    // the store: the recorded revision must be the one that validated the value.
+    let conforming_type = (!id.is_type()).then(|| id.get_type_id()).flatten();
+    let candidate_id = id.id().to_owned();
+    Ok(EvaluationPlan {
+        id,
+        candidate_id,
+        canonical_body: canonical_body.to_owned(),
+        baseline_choice,
+        baseline_roots,
+        conforming_type,
+        precondition,
+        operation_item_id,
+        force,
+        labels,
+    })
+}
+
+/// Read evaluation inputs from the caller's snapshot.
+async fn read_evaluation_snapshot(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    plan: &EvaluationPlan,
+    probe_item: Option<&OperationItemRow>,
+    limits: &Limits,
+) -> Result<Result<EvaluationSnapshot, ItemFailure>, WorkerError> {
+    if let Some(item) = probe_item
+        && let Some(candidate) =
+            unchanged::probe(stores, tx, scope, item, &plan.canonical_body).await?
+    {
+        return Ok(Ok(EvaluationSnapshot::Unchanged(candidate)));
+    }
+    let content: Value = match serde_json::from_str(&plan.canonical_body) {
         Ok(content) => content,
         Err(e) => {
             return Ok(Err(ItemFailure::new(
-                "invalid_document",
+                AdmissionFailureReason::InvalidDocument,
                 format!("stored request payload is not valid JSON: {e}"),
             )));
         }
     };
 
-    // The store's reads are one snapshot, and the transaction ends with the load:
-    // everything after it runs with no transaction open (see the module header).
+    // Extract only after a probe miss, before loading the dependency store.
+    let edges = match extract_edges(&plan.id, &content) {
+        Ok(edges) => edges,
+        Err(e) => {
+            return Ok(Err(ItemFailure::new(
+                AdmissionFailureReason::InvalidSchema,
+                e.to_string(),
+            )));
+        }
+    };
+
+    // SPEC §8.1 step 7: quarantine the extracted dependency edges before loading
+    // targets. Their identifiers suffice; unchanged content never reaches this check.
+    if let Err(breach) = compat::quarantine(&plan.id, &edges) {
+        return Ok(Err(ItemFailure::new(breach.reason(), breach.to_string())));
+    }
+
     let candidates = vec![UnitDocument {
-        gts_id: id.id().to_owned(),
-        content,
+        gts_id: plan.candidate_id.clone(),
+        content: content.clone(),
     }];
-    // The conforming type's `(entity_id, revision_no)` is read in the same snapshot as
-    // the store: the recorded revision must be the one that validated the value.
-    let conforming_type = (!id.is_type()).then(|| id.get_type_id()).flatten();
-    let (store, schema_pair) = {
+    let store = load_unit_store(stores, tx, scope, candidates, &plan.baseline_roots)
+        .await
+        .map_err(WorkerError::StoreBuild)?;
+    // Looked up before the await: `UnitStore` is not `Sync`, so the
+    // borrow must end before the future may be sent.
+    let loaded = match &plan.baseline_choice {
+        Baseline::PrecedingMinor { gts_id } => store.committed_schema(gts_id).cloned(),
+        Baseline::Exempt(_) | Baseline::CurrentRevision => None,
+    };
+    let baseline = match read_baseline(
+        stores,
+        tx,
+        scope,
+        &plan.candidate_id,
+        plan.precondition,
+        &plan.baseline_choice,
+        loaded,
+    )
+    .await?
+    {
+        Ok(baseline) => baseline,
+        Err(failure) => return Ok(Err(failure)),
+    };
+    let pair = match &plan.conforming_type {
+        Some(type_id) => {
+            let entity = stores.find_by_gts_id(tx, scope, type_id).await?;
+            match entity {
+                Some(row) => stores
+                    .current_schema_projections(tx, scope, &[row.id])
+                    .await?
+                    .into_iter()
+                    .find(|current| current.entity_id == row.id)
+                    .map(|current| (row.id, current.cas.revision_no)),
+                None => None,
+            }
+        }
+        None => None,
+    };
+    // Derive the vector from the same snapshot as the validated documents (D4).
+    let vector = vector::derive_from(
+        stores,
+        tx,
+        scope,
+        &plan.candidate_id,
+        store.roots(),
+        store.closure_entities(),
+        limits.activation_write_set,
+    )
+    .await?;
+    let vector = match vector {
+        Ok(vector) => vector,
+        Err(failure) => return Ok(Err(failure)),
+    };
+    Ok(Ok(EvaluationSnapshot::Loaded {
+        store: Box::new(store),
+        schema_pair: pair,
+        vector,
+        edges,
+        content,
+        baseline: Box::new(baseline),
+    }))
+}
+
+/// Validate and materialize, away from the executor.
+///
+/// No transaction is open on [`evaluate`]'s path: it closes its snapshot before
+/// calling this. [`evaluate_in`] is the exception, and deliberately so — see its
+/// documentation for what that costs and why the pass cannot avoid it.
+async fn finish_evaluation(
+    plan: EvaluationPlan,
+    snapshot: EvaluationSnapshot,
+    limits: Limits,
+    metrics: &Arc<dyn AdmissionMetrics>,
+) -> Result<Result<PreparedUnit, ItemFailure>, WorkerError> {
+    let (store, schema_pair, vector, edges, content, baseline) = match snapshot {
+        EvaluationSnapshot::Loaded {
+            store,
+            schema_pair,
+            vector,
+            edges,
+            content,
+            baseline,
+        } => (store, schema_pair, vector, edges, content, baseline),
+        EvaluationSnapshot::Unchanged(candidate) => {
+            return Ok(Ok(PreparedUnit::Unchanged(Arc::new(candidate))));
+        }
+    };
+
+    // Capture the unit span before `spawn_blocking`, which does not inherit it.
+    let span = Span::current();
+    let metrics = Arc::clone(metrics);
+    tokio::task::spawn_blocking(move || {
+        evaluate_loaded(
+            *store,
+            &plan.id,
+            plan.conforming_type.clone(),
+            schema_pair,
+            plan.canonical_body,
+            &content,
+            &baseline,
+            CompatReporting::new(
+                &span,
+                metrics.as_ref(),
+                &plan.baseline_choice,
+                plan.force,
+                plan.labels,
+            ),
+            plan.operation_item_id,
+            edges,
+            vector,
+            &limits,
+        )
+    })
+    .await
+    .map(|result| result.map(|unit| PreparedUnit::Evaluated(Arc::new(unit))))
+    .map_err(WorkerError::EvaluationTask)
+}
+
+/// Probe once when requested, then evaluate a miss from the same snapshot.
+/// After closing it, validate via `gts-rust`, materialize artifacts and drop the
+/// transient store. Resolution budgets apply before commit;
+/// `activation_write_set` also bounds reverse impact.
+///
+/// # Errors
+/// [`WorkerError`] for infrastructure failure; `Ok(Err(ItemFailure))` for refusal.
+pub async fn evaluate(
+    stores: &Arc<dyn Stores>,
+    db: &DBProvider<WorkerError>,
+    scope: &AccessScope,
+    target: EvaluationTarget<'_>,
+    limits: &Limits,
+    metrics: &Arc<dyn AdmissionMetrics>,
+    probe_item: Option<&OperationItemRow>,
+) -> Result<Result<PreparedUnit, ItemFailure>, WorkerError> {
+    let plan = match plan_evaluation(target) {
+        Ok(plan) => plan,
+        Err(failure) => return Ok(Err(failure)),
+    };
+    let limits = *limits;
+    let snapshot = {
         let stores = Arc::clone(stores);
         let scope = scope.clone();
-        let conforming_type = conforming_type.clone();
+        let plan = plan.clone();
+        let probe_item = probe_item.cloned();
         db.transaction_with_config(snapshot_read(&db.db()), move |tx| {
             Box::pin(async move {
-                let store = load_unit_store(stores.as_ref(), tx, &scope, candidates)
-                    .await
-                    .map_err(WorkerError::StoreBuild)?;
-                let pair = match conforming_type {
-                    Some(type_id) => {
-                        let entity = stores.find_by_gts_id(tx, &scope, &type_id).await?;
-                        match entity {
-                            Some(row) => stores
-                                .find_current_schema(tx, &scope, row.id)
-                                .await?
-                                .map(|current| (row.id, current.revision_no)),
-                            None => None,
-                        }
-                    }
-                    None => None,
-                };
-                Ok((store, pair))
+                read_evaluation_snapshot(
+                    stores.as_ref(),
+                    tx,
+                    &scope,
+                    &plan,
+                    probe_item.as_ref(),
+                    &limits,
+                )
+                .await
             })
         })
         .await?
     };
+    match snapshot {
+        Ok(snapshot) => finish_evaluation(plan, snapshot, limits, metrics).await,
+        Err(failure) => Ok(Err(failure)),
+    }
+}
 
-    let canonical_body = canonical_body.to_owned();
-    tokio::task::spawn_blocking(move || {
-        evaluate_loaded(
-            store,
-            &id,
-            conforming_type,
-            schema_pair,
-            canonical_body,
-            operation_item_id,
-        )
-    })
-    .await
-    .map_err(WorkerError::EvaluationTask)?
+/// [`evaluate`] within the caller's snapshot, used by whole-batch dry runs.
+///
+/// Hold one pooled connection across validation so each candidate sees earlier
+/// virtual commits. The hold spans at most `limits.batch_candidates` validations
+/// (default 100); moving validation outside would lose batch semantics.
+///
+/// # Errors
+/// As [`evaluate`].
+pub async fn evaluate_in(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    target: EvaluationTarget<'_>,
+    limits: &Limits,
+    metrics: &Arc<dyn AdmissionMetrics>,
+    probe_item: Option<&OperationItemRow>,
+) -> Result<Result<PreparedUnit, ItemFailure>, WorkerError> {
+    let plan = match plan_evaluation(target) {
+        Ok(plan) => plan,
+        Err(failure) => return Ok(Err(failure)),
+    };
+    match read_evaluation_snapshot(stores, tx, scope, &plan, probe_item, limits).await? {
+        Ok(snapshot) => finish_evaluation(plan, snapshot, *limits, metrics).await,
+        Err(failure) => Ok(Err(failure)),
+    }
 }
 
 /// Run the CPU-heavy `gts-rust` validation and artifact materialization away from
 /// the async executor. All database reads have completed before this function is
 /// scheduled, so the blocking task owns a closed, in-memory unit store.
+#[allow(clippy::too_many_arguments)]
 fn evaluate_loaded(
     mut store: UnitStore,
     id: &GtsId,
     conforming_type: Option<String>,
     schema_pair: Option<(i64, i32)>,
     canonical_body: String,
+    content: &Value,
+    baseline: &BaselineDocument,
+    reporting: CompatReporting<'_>,
     operation_item_id: i64,
-) -> Result<Result<EvaluatedUnit, ItemFailure>, WorkerError> {
+    edges: Vec<DependencyEdge>,
+    vector: RevisionVector,
+    limits: &Limits,
+) -> Result<EvaluatedUnit, ItemFailure> {
+    check_resolution_inputs(store.store_mut(), id.id(), limits.resolution_closure)?;
     let outcome = if id.is_type() {
-        let resolved = match store.store_mut().validate_schema(id.id()) {
-            Ok(resolved) => resolved,
-            Err(e) => {
-                return Ok(Err(ItemFailure::new("invalid_schema", e.to_string())));
-            }
-        };
+        let resolved = store
+            .store_mut()
+            .validate_schema(id.id())
+            .map_err(|error| {
+                ItemFailure::new(AdmissionFailureReason::InvalidSchema, error.to_string())
+            })?;
+        let artifacts = materialize_bounded(&resolved, limits)?;
         EvaluatedOutcome::TypeSchema {
-            artifacts: materialize(&resolved),
+            artifacts,
+            is_abstract: resolved.is_abstract,
         }
     } else {
         // `Some` for every parsed Instance identifier: `get_type_id()` is `None` only
         // for a single segment, which `try_new` above already refused.
         let Some(type_id) = conforming_type else {
-            return Ok(Err(ItemFailure::new(
-                "invalid_identifier",
+            return Err(ItemFailure::new(
+                AdmissionFailureReason::InvalidIdentifier,
                 format!("instance '{}' has no conforming type", id.id()),
-            )));
+            ));
         };
         // Checked before validation, so the failure names the cause:
         // `validate_instance` would report a missing schema as a content fault.
         let Some((type_schema_entity_id, type_schema_revision_no)) = schema_pair else {
-            return Err(WorkerError::ConformingTypeAbsent {
-                gts_id: id.id().to_owned(),
-                type_id,
-            });
+            return Err(ItemFailure::missing_dependency(DependencyEdge {
+                kind: DependencyKind::InstanceOf,
+                target: type_id,
+            }));
         };
-        if let Err(e) = store.store_mut().validate_instance(id.id()) {
-            return Ok(Err(ItemFailure::new("invalid_value", e.to_string())));
-        }
+        // A type admitted under an older, larger budget must not bypass the
+        // current resolution budget when it is used to validate an Instance.
+        let resolved = store
+            .store_mut()
+            .validate_schema(&type_id)
+            .map_err(|error| {
+                ItemFailure::new(AdmissionFailureReason::InvalidSchema, error.to_string())
+            })?;
+        materialize_bounded(&resolved, limits)?;
+        store
+            .store_mut()
+            .validate_instance(id.id())
+            .map_err(|error| {
+                ItemFailure::new(AdmissionFailureReason::InvalidValue, error.to_string())
+            })?;
         EvaluatedOutcome::Instance {
             type_schema_entity_id,
             type_schema_revision_no,
         }
     };
 
-    let content_hash = content_hash(&canonical_body);
-    Ok(Ok(EvaluatedUnit {
+    // Validate the candidate before judging its compatibility with another document.
+    check_compatibility(&mut store, id, content, baseline, reporting)?;
+
+    Ok(EvaluatedUnit {
         gts_id: id.id().to_owned(),
         // Derived by `gts-rust`, never locally: the Registry Reference is a
         // deterministic UUIDv5 over the identifier and its namespace, and
@@ -261,10 +709,248 @@ fn evaluate_loaded(
         gts_uuid: id.to_uuid(),
         family_key: family_key(id),
         canonical_body,
-        content_hash,
         outcome,
         operation_item_id,
-    }))
+        compat_forced: reporting.forced,
+        edges,
+        vector,
+        labels: reporting.labels,
+    })
+}
+
+/// Report compatibility to both the unit span and verdict counter.
+/// Capture the span before crossing the `spawn_blocking` boundary.
+#[derive(Clone, Copy)]
+struct CompatReporting<'a> {
+    span: &'a Span,
+    /// The port itself, not a reference to the `Arc` holding it: the only thing
+    /// done through it is a trait call.
+    metrics: &'a dyn AdmissionMetrics,
+    /// Which baseline was selected, known before any row is read.
+    choice: &'a Baseline,
+    /// Effective waiver shared by the refusal decision, metrics, and revision provenance.
+    forced: bool,
+    /// Which pass this verdict belongs to; only `dry_run` reaches the counter.
+    labels: PassLabels,
+}
+
+impl<'a> CompatReporting<'a> {
+    /// Re-authorize the stored waiver against the selected baseline.
+    /// Only cross-minor checks are waivable (ADR-0004).
+    fn new(
+        span: &'a Span,
+        metrics: &'a dyn AdmissionMetrics,
+        choice: &'a Baseline,
+        accepted_force: bool,
+        labels: PassLabels,
+    ) -> Self {
+        Self {
+            span,
+            metrics,
+            choice,
+            forced: accepted_force && choice.waivable(),
+            labels,
+        }
+    }
+
+    /// Record one check's outcome. A `verdict` of `None` means no comparison ran, so
+    /// nothing is counted — there is no fourth label value for "no baseline".
+    fn record(
+        &self,
+        baseline_gts_id: Option<&str>,
+        baseline_revision: Option<i32>,
+        verdict: Option<CompatibilityVerdict>,
+    ) {
+        observability::record_compat_facts(
+            self.span,
+            CompatFacts {
+                baseline: self.choice,
+                gts_id: baseline_gts_id,
+                revision: baseline_revision,
+                verdict,
+            },
+        );
+        if let Some(verdict) = verdict {
+            self.metrics
+                .compat_verdict(verdict, self.forced, self.labels);
+        }
+    }
+}
+
+/// Compare the candidate with its baseline (ADR-0003).
+///
+/// Admit compatible, waived, or exempt candidates. Refusals are terminal
+/// [`ItemFailure`] values; an unresolvable baseline has its own reason.
+fn check_compatibility(
+    store: &mut UnitStore,
+    id: &GtsId,
+    candidate: &Value,
+    baseline: &BaselineDocument,
+    reporting: CompatReporting<'_>,
+) -> Result<(), ItemFailure> {
+    let (baseline_id, baseline_revision, baseline_content) = match baseline {
+        // The family gate handles an absent predecessor. Neither case emits a verdict.
+        BaselineDocument::Exempt | BaselineDocument::PredecessorAbsent => {
+            reporting.record(None, None, None);
+            return Ok(());
+        }
+        BaselineDocument::Present {
+            gts_id,
+            revision_no,
+            content,
+        } => (gts_id, *revision_no, content),
+    };
+
+    // Pin the dialect before comparison so drift has its own refusal and no verdict.
+    // Instances have no declared dialect and are exempt.
+    if id.is_type()
+        && let Err(drift) = compat::dialect_pin(
+            compat::BaselineDoc::new(baseline_content),
+            compat::CandidateDoc::new(candidate),
+        )
+    {
+        reporting.record(Some(baseline_id), Some(baseline_revision), None);
+        return Err(ItemFailure::new(
+            compat::DialectDrift::REASON,
+            format!(
+                "'{}' cannot revise baseline '{baseline_id}': {drift}",
+                id.id()
+            ),
+        ));
+    }
+
+    let comparison = match compat::backward_comparison(
+        store.store_mut(),
+        compat::BaselineDoc::new(baseline_content),
+        compat::CandidateDoc::new(candidate),
+    ) {
+        Ok(comparison) => comparison,
+        Err(error) => {
+            // No verdict is recorded and none is counted: the check did not run,
+            // which is not the same fact as running and coming out undecided.
+            reporting.record(Some(baseline_id), Some(baseline_revision), None);
+            return Err(ItemFailure::new(
+                AdmissionFailureReason::BaselineUnresolvable,
+                format!(
+                    "'{}' could not be compared against baseline '{baseline_id}': {error}",
+                    id.id()
+                ),
+            ));
+        }
+    };
+    let verdict = comparison.backward_compatibility();
+    reporting.record(Some(baseline_id), Some(baseline_revision), Some(verdict));
+    let waived = reporting.forced;
+    if waived && verdict != CompatibilityVerdict::Compatible {
+        // Log the waiver decision; commit-time checks may still refuse the candidate.
+        // Enter the captured span because this runs inside `spawn_blocking`.
+        let _entered = reporting.span.enter();
+        tracing::warn!(
+            gts_id = %id.id(),
+            baseline_gts_id = %baseline_id,
+            baseline_revision,
+            verdict = verdict.as_str(),
+            "types_registry waived a non-compatible verdict on ADR-0004 force; the \
+             candidate remains subject to the commit-time checks"
+        );
+    }
+    match compat::refusal(verdict, waived) {
+        None => Ok(()),
+        // Include offending paths to locate the incompatible levels (ADR-0003).
+        Some(reason) => Err(ItemFailure::new(
+            reason,
+            format!(
+                "'{}' is not backward compatible with baseline '{baseline_id}' \
+                 (verdict {}): {}",
+                id.id(),
+                verdict.as_str(),
+                diagnostics_summary(&comparison),
+            ),
+        )),
+    }
+}
+
+/// Maximum diagnostics included in a refusal message.
+const MAX_REPORTED_DIAGNOSTICS: usize = 20;
+
+/// Maximum path bytes per diagnostic; property names are caller-controlled,
+/// so the entry cap alone cannot bound the payload.
+const MAX_REPORTED_PATH_BYTES: usize = 200;
+
+/// The backward diagnostics as `finding at path` pairs, in the order `gts-rust`
+/// reported them, capped at [`MAX_REPORTED_DIAGNOSTICS`] entries of
+/// [`MAX_REPORTED_PATH_BYTES`] each, with the remainder counted.
+fn diagnostics_summary(comparison: &gts::SchemaComparison) -> String {
+    let total = comparison.backward_diagnostics.len();
+    if total == 0 {
+        return "no diagnostic evidence".to_owned();
+    }
+    let shown = comparison
+        .backward_diagnostics
+        .iter()
+        .take(MAX_REPORTED_DIAGNOSTICS)
+        .map(|d| {
+            let prefix = path_prefix(&d.path);
+            // Keep the persisted marker ASCII, as required by the workspace lint.
+            let marker = if prefix.len() < d.path.len() {
+                "...(truncated)"
+            } else {
+                ""
+            };
+            format!("{:?} at {prefix}{marker}", d.finding)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    match total.saturating_sub(MAX_REPORTED_DIAGNOSTICS) {
+        0 => shown,
+        remaining => format!("{shown}; and {remaining} more"),
+    }
+}
+
+/// Truncate at a UTF-8 boundary, without adding presentation markers.
+fn path_prefix(path: &str) -> &str {
+    // `floor_char_boundary` is unstable, so walk back to one.
+    let mut cut = path.len().min(MAX_REPORTED_PATH_BYTES);
+    while cut > 0 && !path.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &path[..cut]
+}
+
+#[cfg(test)]
+#[path = "unit_tests.rs"]
+mod unit_tests;
+
+/// Resolve and replace an admitted entity's outgoing edges.
+async fn replace_edges(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    entity_id: i64,
+    edges: &[DependencyEdge],
+) -> Result<(), WorkerError> {
+    // An empty set must still delete the previous revision's edges.
+    let targets: Vec<String> = edges.iter().map(|e| e.target.clone()).collect();
+    let rows = stores.find_by_gts_ids(tx, scope, &targets).await?;
+    let resolved: std::collections::HashMap<&str, i64> =
+        rows.iter().map(|r| (r.gts_id.as_str(), r.id)).collect();
+
+    let pairs: Vec<(DependencyKind, i64)> = edges
+        .iter()
+        .map(|edge| {
+            resolved
+                .get(edge.target.as_str())
+                .copied()
+                .map(|to| (edge.kind, to))
+                .ok_or_else(|| WorkerError::DependencyTargetAbsent {
+                    gts_id: edge.target.clone(),
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    stores
+        .replace_outgoing(tx, scope, entity_id, &pairs)
+        .await?;
+    Ok(())
 }
 
 /// Commit one evaluated unit: family, entity, revision, current-state projection,
@@ -282,15 +968,17 @@ pub async fn commit_creation(
     tx: &DbTx<'_>,
     scope: &AccessScope,
     unit: &EvaluatedUnit,
+    limits: &Limits,
     now: OffsetDateTime,
 ) -> Result<Result<CommittedUnit, ItemFailure>, WorkerError> {
+    claim_entity_write_order(stores, tx, scope, now).await?;
     if stores
         .find_by_gts_id(tx, scope, &unit.gts_id)
         .await?
         .is_some()
     {
         return Ok(Err(ItemFailure::new(
-            "already_exists",
+            AdmissionFailureReason::AlreadyExists,
             format!(
                 "'{}' already exists; a creation requires the identifier to be absent",
                 unit.gts_id
@@ -298,13 +986,7 @@ pub async fn commit_creation(
         )));
     }
 
-    // Created here if absent: ownership must be fixed before the first member, and
-    // the family and that member commit together.
-    //
-    // `uq_tr_version_family_key` decides which of two concurrent admissions founds
-    // the family, and nothing more — the rules below are check-then-act reads. What
-    // serializes *those* is the advisory lock `admission::worker` holds on the
-    // family key across the whole of this transaction.
+    // Create the family with its first member; the write-order claim serializes its rules.
     let (family, created) = stores
         .create_or_get(
             tx,
@@ -315,6 +997,21 @@ pub async fn commit_creation(
             now,
         )
         .await?;
+
+    // Step 4.3: the revision vector, re-derived and compared inside this transaction, which the
+    // `entity_write_order` claim above made exclusive.
+    if let Err(failure) = vector::guard(
+        stores,
+        tx,
+        scope,
+        &unit.gts_id,
+        &unit.vector,
+        limits.activation_write_set,
+    )
+    .await?
+    {
+        return Ok(Err(failure));
+    }
 
     // The three family rules — kind, minor shape, minor contiguity — in one call,
     // asked of a **new member** only: a revision adds nobody to the family and is
@@ -327,7 +1024,7 @@ pub async fn commit_creation(
         Ok(id) => id,
         Err(e) => {
             return Ok(Err(ItemFailure::new(
-                "invalid_identifier",
+                AdmissionFailureReason::InvalidIdentifier,
                 format!("stored identifier '{}' does not parse: {e}", unit.gts_id),
             )));
         }
@@ -371,7 +1068,7 @@ pub async fn commit_creation(
     // stays usable (`repo::conflict_do_nothing`).
     let Some(entity) = inserted else {
         return Ok(Err(ItemFailure::new(
-            "already_exists",
+            AdmissionFailureReason::AlreadyExists,
             format!(
                 "'{}' was created concurrently; a creation requires the identifier to be absent",
                 unit.gts_id
@@ -381,7 +1078,7 @@ pub async fn commit_creation(
 
     let revision_no = 1;
     match &unit.outcome {
-        EvaluatedOutcome::TypeSchema { artifacts } => {
+        EvaluatedOutcome::TypeSchema { artifacts, .. } => {
             stores
                 .insert_schema_revision(
                     tx,
@@ -390,13 +1087,12 @@ pub async fn commit_creation(
                         entity_id: entity.id,
                         revision_no,
                         raw_schema: unit.canonical_body.clone(),
-                        content_hash: unit.content_hash.clone(),
                         // Recorded for *every* revision, including one with no
                         // compatibility comparison at all: it identifies the engine,
                         // and that cannot be reconstructed later (ADR-0003).
                         gts_spec_version: GTS_SPECIFICATION_VERSION.to_owned(),
                         gts_impl_version: GTS_IMPLEMENTATION_VERSION.to_owned(),
-                        compat_forced: false,
+                        compat_forced: unit.compat_forced,
                         operation_item_id: unit.operation_item_id,
                         now,
                     },
@@ -431,7 +1127,6 @@ pub async fn commit_creation(
                         entity_id: entity.id,
                         revision_no,
                         canonical_value: unit.canonical_body.clone(),
-                        content_hash: unit.content_hash.clone(),
                         // From evaluation's snapshot, not a fresh lookup: re-reading
                         // could pin a revision that landed after validation.
                         type_schema_entity_id: *type_schema_entity_id,
@@ -458,6 +1153,8 @@ pub async fn commit_creation(
         }
     }
 
+    replace_edges(stores, tx, scope, entity.id, &unit.edges).await?;
+
     // The write is a CAS on the item's status, and its `false` must roll this
     // transaction back rather than be discarded: an overlapping pass already
     // recorded an outcome, and committing would leave an entity and a revision
@@ -468,8 +1165,12 @@ pub async fn commit_creation(
             tx,
             scope,
             unit.operation_item_id,
-            revision_no,
-            entity.resource_version,
+            // On the dry-run path `stores` is the `AdmissionView`, so this
+            // write issues no SQL: the overlay keeps it and the pass publishes
+            // it to the real row afterwards. The shape still has to be the
+            // dry-run one, because that is the row publication writes and
+            // `ck_tr_operation_item_state` checks.
+            ItemSuccess::registration(unit.labels.dry_run, revision_no, entity.resource_version),
             now,
         )
         .await?
@@ -486,184 +1187,126 @@ pub async fn commit_creation(
     }))
 }
 
-/// The current revision's number, authored content and digest, whichever kind the
-/// candidate is.
-///
-/// The **authored** content, never the effective artifacts: those move when a
-/// dependency moves while the authored document stands still, so including them
-/// would report a revision for a document nobody edited.
-///
-/// TODO(toolkit): a genuine edit fails the `content_hash` prefilter and never
-/// compares the bytes, so the body travels for nothing. Fetching it only on a hash
-/// match needs a column projection `SecureSelect` does not expose — no
-/// `select_only` / `into_tuple`.
-///
-/// # Errors
-/// [`WorkerError::CurrentStateMissing`] when the entity row has no current-state
-/// row of its kind — corruption, since one transaction writes both (D3).
-async fn read_current_content(
+/// Record an unchanged candidate without creating a revision.
+async fn commit_unchanged(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
     scope: &AccessScope,
     unit: &EvaluatedUnit,
     entity_id: i64,
-) -> Result<(i32, String, Vec<u8>), WorkerError> {
-    let missing = || WorkerError::CurrentStateMissing {
-        gts_id: unit.gts_id.clone(),
-        entity_id,
-    };
-    Ok(match &unit.outcome {
-        EvaluatedOutcome::TypeSchema { .. } => {
-            let current = stores
-                .current_documents(tx, scope, &[entity_id])
-                .await?
-                .pop()
-                .ok_or_else(missing)?;
-            (
-                current.revision_no,
-                current.raw_schema,
-                current.content_hash,
-            )
-        }
-        EvaluatedOutcome::Instance { .. } => {
-            let current = stores
-                .current_values(tx, scope, &[entity_id])
-                .await?
-                .pop()
-                .ok_or_else(missing)?;
-            (
-                current.revision_no,
-                current.canonical_value,
-                current.content_hash,
-            )
-        }
-    })
+    expected_resource_version: i64,
+    now: OffsetDateTime,
+) -> Result<Result<RevisionCommit, ItemFailure>, WorkerError> {
+    // This re-read detects a vanished entity, not missing kind-specific state.
+    let still = stores
+        .find_by_gts_id(tx, scope, &unit.gts_id)
+        .await?
+        .ok_or_else(|| WorkerError::EntityVanished {
+            gts_id: unit.gts_id.clone(),
+            entity_id,
+        })?;
+    if still.resource_version != expected_resource_version {
+        return Ok(Err(stale_precondition(
+            &unit.gts_id,
+            expected_resource_version,
+            still.resource_version,
+        )));
+    }
+    terminalize_unchanged(stores, tx, scope, &still, unit.operation_item_id, now).await
 }
 
-/// Commit one evaluated unit as a **revision** of an entity that already exists:
-/// the `expected_resource_version` precondition, the immutable revision insert,
-/// the current-state pointer move, and the item outcome.
-///
-/// # The order of the three statements is the concurrency design
-///
-/// 1. read the entity, refuse a tombstone, and compare `resource_version` to
-///    `expected`, so a stale caller gets a message naming both versions rather
-///    than a bare CAS failure;
-/// 2. read the current revision's authored content, to decide `unchanged`;
-/// 3. **re-ask the precondition** — as a compare-and-swap for a real revision, and
-///    as a plain re-read for an `unchanged` one.
-///
-/// Step 3 is not redundant with step 1. The commit transaction runs at
-/// `READ COMMITTED` ([`commit_write`](crate::domain::ports::commit_write)), so a
-/// concurrent admission can commit between steps 1 and 2 and this pass would
-/// otherwise answer `unchanged` against content that is no longer current. The
-/// compare-and-swap closes that window by construction — its precondition is in the
-/// `WHERE` — and the re-read closes it for `unchanged`, which writes nothing and so
-/// has no `WHERE` to put it in. A re-read that still sees `expected` means the other
-/// admission had not committed yet, so this pass genuinely came first.
-///
-/// ponytail: ceiling C6 (SPEC §9) — nothing authorizes this path. The registration
-/// policy is asked of creations only, and P0 has no principal to check in its place,
-/// so any caller that reaches the submit route can revise the authored content of
-/// any entity the registry holds. Bounded by transport rather than by policy: the
-/// mutation routes are internal-only (ceiling C8). Upgrade: the
-/// identity-to-permission binding, then an owner check before this call.
+/// Commit an evaluated unit as a revision with compare-and-swap protection.
+/// The final CAS closes the `READ COMMITTED` window after validation.
 ///
 /// # Errors
-/// [`WorkerError`] for an infrastructure failure, including a corrupt row with no
-/// current state. A lost or stale precondition, and a revision aimed at a
-/// tombstone, are [`ItemFailure`]s in the `Ok(Err(..))` position — terminal, and
-/// never rebased onto the current version.
+/// [`WorkerError`] for infrastructure failures; candidate refusals are returned as
+/// [`ItemFailure`] without committing.
+#[allow(clippy::too_many_arguments)]
 pub async fn commit_revision(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
     scope: &AccessScope,
     unit: &EvaluatedUnit,
     expected_resource_version: i64,
+    limits: &Limits,
     now: OffsetDateTime,
+    metrics: &Arc<dyn AdmissionMetrics>,
 ) -> Result<Result<RevisionCommit, ItemFailure>, WorkerError> {
-    let Some(entity) = stores.find_by_gts_id(tx, scope, &unit.gts_id).await? else {
-        return Ok(Err(ItemFailure::new(
-            "precondition_failed",
-            format!(
-                "'{}' does not exist; expected_resource_version {expected_resource_version} \
-                 requires it to exist at that version",
-                unit.gts_id
-            ),
-        )));
-    };
-    // Before the version, because a tombstone is not a stale version: reporting
-    // `precondition_failed` would send the caller to retry against a row that will
-    // never accept a revision. This is the only write path that reaches a `DELETED`
-    // row — `find_by_gts_id` returns tombstones because the family rules need them.
-    // The compare-and-swap below carries the same clause for the race this read
-    // cannot see.
-    if entity.lifecycle_status == LifecycleStatus::Deleted {
-        return Ok(Err(ItemFailure::new(
-            "entity_deleted",
-            format!(
-                "'{}' is deleted; a revision cannot be admitted onto a withdrawn entity",
-                unit.gts_id
-            ),
-        )));
-    }
-    if entity.resource_version != expected_resource_version {
-        return Ok(Err(stale_precondition(
-            &unit.gts_id,
-            expected_resource_version,
-            entity.resource_version,
-        )));
-    }
+    claim_entity_write_order(stores, tx, scope, now).await?;
+    let entity =
+        match revision_entity(stores, tx, scope, &unit.gts_id, expected_resource_version).await? {
+            Ok(entity) => entity,
+            Err(failure) => return Ok(Err(failure)),
+        };
 
-    let (current_revision_no, current_body, current_hash) =
-        read_current_content(stores, tx, scope, unit, entity.id).await?;
+    // Keep the artifact CAS token with the content that supplied it.
+    let current = read_current_content(
+        stores,
+        tx,
+        scope,
+        &unit.gts_id,
+        unit.outcome.entity_kind(),
+        entity.id,
+    )
+    .await?;
 
-    // The hash is a prefilter and the bytes are the decision (ADR-0012): a digest
-    // collision would otherwise silently swallow a real edit. Equality against an
+    // The canonical bytes are the decision (ADR-0012). Equality against an
     // *older* revision is deliberately not asked — that is an ordinary update which
     // allocates a new number rather than moving the pointer backwards (ADR-0005).
-    if current_hash == unit.content_hash && current_body == unit.canonical_body {
-        // `EntityVanished`, not `CurrentStateMissing`: the row that disappeared is
-        // the *entity*, read twice in one transaction. Naming the current-state
-        // tables would point an operator at the wrong half of the corruption.
-        let still = stores
-            .find_by_gts_id(tx, scope, &unit.gts_id)
-            .await?
-            .ok_or_else(|| WorkerError::EntityVanished {
-                gts_id: unit.gts_id.clone(),
-                entity_id: entity.id,
-            })?;
-        if still.resource_version != expected_resource_version {
-            return Ok(Err(stale_precondition(
-                &unit.gts_id,
-                expected_resource_version,
-                still.resource_version,
-            )));
-        }
-        if !stores
-            .mark_item_unchanged(
-                tx,
-                scope,
-                unit.operation_item_id,
-                still.resource_version,
-                now,
-            )
-            .await?
-        {
-            return Err(WorkerError::ItemAlreadyTerminal {
-                item_id: unit.operation_item_id,
-            });
-        }
-        return Ok(Ok(RevisionCommit::Unchanged {
-            gts_uuid: unit.gts_uuid,
-            resource_version: still.resource_version,
-        }));
+    if current.matches_authored(&unit.canonical_body) {
+        return commit_unchanged(
+            stores,
+            tx,
+            scope,
+            unit,
+            entity.id,
+            expected_resource_version,
+            now,
+        )
+        .await;
     }
 
     if expected_resource_version == i64::MAX {
         return Err(WorkerError::ResourceVersionExhausted {
             gts_id: unit.gts_id.clone(),
         });
+    }
+
+    // Step 4.3: re-derive and compare the complete revision vector.
+    if let Err(failure) = vector::guard(
+        stores,
+        tx,
+        scope,
+        &unit.gts_id,
+        &unit.vector,
+        limits.activation_write_set,
+    )
+    .await?
+    {
+        return Ok(Err(failure));
+    }
+
+    // JSON Schema compatibility does not enforce GTS's abstract modifier. This
+    // read shares the write-order claim with Instance creation, so an Instance
+    // cannot appear between the check and this revision becoming current.
+    if matches!(
+        unit.outcome,
+        EvaluatedOutcome::TypeSchema {
+            is_abstract: true,
+            ..
+        }
+    ) && stores
+        .has_live_direct_instances(tx, scope, entity.id)
+        .await?
+    {
+        return Ok(Err(ItemFailure::new(
+            AdmissionFailureReason::DependentInvalid,
+            format!(
+                "'{}' cannot become abstract while it has live direct Instances; \
+                 nothing was committed",
+                unit.gts_id
+            ),
+        )));
     }
 
     // One statement carrying the precondition, so there is no window between
@@ -675,7 +1318,7 @@ pub async fn commit_revision(
         .await?
     else {
         return Ok(Err(ItemFailure::new(
-            "precondition_failed",
+            AdmissionFailureReason::PreconditionFailed,
             format!(
                 "'{}' moved past resource_version {expected_resource_version}, or was deleted, \
                  while this revision was being admitted",
@@ -683,15 +1326,21 @@ pub async fn commit_revision(
             ),
         )));
     };
-    let revision_no =
-        current_revision_no
-            .checked_add(1)
-            .ok_or_else(|| WorkerError::RevisionNumberExhausted {
-                gts_id: unit.gts_id.clone(),
-            })?;
+    let revision_no = current.revision_no().checked_add(1).ok_or_else(|| {
+        WorkerError::RevisionNumberExhausted {
+            gts_id: unit.gts_id.clone(),
+        }
+    })?;
 
     match &unit.outcome {
-        EvaluatedOutcome::TypeSchema { artifacts } => {
+        EvaluatedOutcome::TypeSchema { artifacts, .. } => {
+            let CurrentContent::TypeSchema { cas, .. } = &current else {
+                // A mismatched variant means the stored kind-specific rows disagree.
+                return Err(WorkerError::CurrentStateMissing {
+                    gts_id: unit.gts_id.clone(),
+                    entity_id: entity.id,
+                });
+            };
             stores
                 .insert_schema_revision(
                     tx,
@@ -700,10 +1349,9 @@ pub async fn commit_revision(
                         entity_id: entity.id,
                         revision_no,
                         raw_schema: unit.canonical_body.clone(),
-                        content_hash: unit.content_hash.clone(),
                         gts_spec_version: GTS_SPECIFICATION_VERSION.to_owned(),
                         gts_impl_version: GTS_IMPLEMENTATION_VERSION.to_owned(),
-                        compat_forced: false,
+                        compat_forced: unit.compat_forced,
                         operation_item_id: unit.operation_item_id,
                         now,
                     },
@@ -722,13 +1370,16 @@ pub async fn commit_revision(
                         resolution_fingerprint: artifacts.resolution_fingerprint.clone(),
                         now,
                     },
+                    cas.clone(),
                 )
                 .await?
             {
-                return Err(WorkerError::CurrentStateMissing {
-                    gts_id: unit.gts_id.clone(),
-                    entity_id: entity.id,
-                });
+                // A CAS miss is retryable drift, not corrupt state.
+                return Err(WorkerError::RevalidationRequired(
+                    VectorDrift::CurrentProjectionMoved {
+                        gts_id: unit.gts_id.clone(),
+                    },
+                ));
             }
         }
         EvaluatedOutcome::Instance {
@@ -743,7 +1394,6 @@ pub async fn commit_revision(
                         entity_id: entity.id,
                         revision_no,
                         canonical_value: unit.canonical_body.clone(),
-                        content_hash: unit.content_hash.clone(),
                         // Re-recorded per revision, not inherited: this value was
                         // validated against whatever the schema's current revision
                         // was at *this* evaluation.
@@ -776,14 +1426,20 @@ pub async fn commit_revision(
         }
     }
 
+    // Every authored revision replaces its outgoing edges.
+    replace_edges(stores, tx, scope, entity.id, &unit.edges).await?;
+
+    refresh_reverse_impact(stores, tx, scope, unit, entity.id, limits, now, metrics).await?;
+
     // Last, and its `false` rolls everything above back — see `commit_creation`.
     if !stores
         .mark_item_succeeded(
             tx,
             scope,
             unit.operation_item_id,
-            revision_no,
-            resource_version,
+            // See `commit_creation`: the shape a dry run records is the one
+            // publication will write, so it must satisfy the item CHECK.
+            ItemSuccess::registration(unit.labels.dry_run, revision_no, resource_version),
             now,
         )
         .await?
@@ -800,18 +1456,35 @@ pub async fn commit_revision(
     })))
 }
 
-/// The refusal for a precondition that was already wrong when read — the entry
-/// check and the `unchanged` re-read. The lost compare-and-swap words it
-/// differently on purpose, knowing only that the version *moved*, not what to; both
-/// carry the same `reason`, so a client branching on it sees one outcome.
-fn stale_precondition(gts_id: &str, expected: i64, found: i64) -> ItemFailure {
-    ItemFailure::new(
-        "precondition_failed",
-        format!(
-            "'{gts_id}' is at resource_version {found}, not the expected {expected}; a revision \
-             is never rebased onto the current version"
-        ),
-    )
+/// Step 4.6: re-materialize artifacts of all dependents.
+#[allow(clippy::too_many_arguments)]
+async fn refresh_reverse_impact(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    unit: &EvaluatedUnit,
+    entity_id: i64,
+    limits: &Limits,
+    now: OffsetDateTime,
+    metrics: &Arc<dyn AdmissionMetrics>,
+) -> Result<(), WorkerError> {
+    if !matches!(unit.outcome, EvaluatedOutcome::TypeSchema { .. }) {
+        return Ok(());
+    }
+    match refresh_dependents(stores, tx, scope, &[entity_id], limits, now).await? {
+        Ok(outcome) => {
+            // Record only write sets that actually commit.
+            metrics.observe_activation_write_set(outcome.refreshed.len(), unit.labels);
+            tracing::debug!(
+                gts_id = %unit.gts_id,
+                refreshed = outcome.refreshed.len(),
+                examined = outcome.examined,
+                "types_registry refreshed the dependents of a revision"
+            );
+            Ok(())
+        }
+        Err(failure) => Err(WorkerError::RefusedAfterWrite(failure)),
+    }
 }
 
 /// Canonicalize a document the way acceptance did, for a caller that has a `Value`

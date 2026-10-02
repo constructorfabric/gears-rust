@@ -1,12 +1,30 @@
 """Tests for the models endpoint."""
 
-import pytest
+import re
+
 import httpx
 
-from .conftest import API_PREFIX, DEFAULT_MODEL, STANDARD_MODEL
+from .conftest import (
+    API_PREFIX, DEFAULT_MODEL, DISABLED_MODEL, MODULE_DIR, RESOURCE_MODEL, assert_problem,
+)
 
 
-@pytest.mark.multi_provider
+def enabled_catalog_model_ids() -> set[str]:
+    """Ids of the `model_catalog` entries of config/base.yaml (the rig's
+    static model policy catalog) with `enabled: true`."""
+    text = (MODULE_DIR / "config" / "base.yaml").read_text()
+    catalog = text[text.index("model_catalog:"):]
+    catalog = catalog[:catalog.index("\n  static-mini-chat-audit-plugin:")]
+    entries = re.split(r"\n\s+- id: ", catalog)[1:]
+    ids = set()
+    for entry in entries:
+        model_id = entry.split("\n", 1)[0].strip().strip('"')
+        flag = re.search(r"\n\s+enabled: (true|false)\n", entry).group(1)
+        if flag == "true":
+            ids.add(model_id)
+    return ids
+
+
 class TestListModels:
     """GET /v1/models"""
 
@@ -19,42 +37,48 @@ class TestListModels:
         assert DEFAULT_MODEL in [m["model_id"] for m in body["items"]]
 
     def test_catalog_models_present(self, server):
-        """All models from mini-chat.yaml catalog should appear."""
+        """11-02: the list holds exactly the enabled catalog models of config/base.yaml."""
+        expected = enabled_catalog_model_ids()
         resp = httpx.get(f"{API_PREFIX}/models")
-        model_ids = {m["model_id"] for m in resp.json()["items"]}
-        assert DEFAULT_MODEL in model_ids
-        assert STANDARD_MODEL in model_ids
+        assert resp.status_code == 200
+        assert {m["model_id"] for m in resp.json()["items"]} == expected
 
     def test_model_has_required_fields(self, server):
+        """Every model has the required fields; `multiplier_display` is the
+        catalog value of config/base.yaml."""
         resp = httpx.get(f"{API_PREFIX}/models")
-        for m in resp.json()["items"]:
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        for m in items:
             assert "model_id" in m
             assert "display_name" in m
             assert "tier" in m, "model must have tier"
             assert "context_window" in m, "model must have context_window"
+        assert {m["model_id"]: m["multiplier_display"] for m in items} == {
+            "gpt-5.2": "1x",
+            "gpt-5-mini": "1x",
+            "gpt-5-nano": "0.5x",
+            "azure-gpt-4.1": "3x",
+            "gpt-5-bare": "0.5x",
+            "gpt-4.1-mini-tiny-ctx": "0.5x",
+            "gpt-4.1-mini-tiny-ctx-no-input-limit": "0.5x",
+        }
 
 
-@pytest.mark.multi_provider
 class TestGetModel:
     """GET /v1/models/{model_id}"""
 
-    def test_get_existing_model(self, server):
+    def test_get_nonexistent_model(self, server):
+        resp = httpx.get(f"{API_PREFIX}/models/fake-model-xyz")
+        body = assert_problem(resp, 404, "not_found", resource_type=RESOURCE_MODEL)
+        assert body["context"]["resource_name"] == "fake-model-xyz", body
+
+    def test_internal_fields_not_exposed(self, server):
+        """11-04, 11-06: GET returns the requested model without internal fields."""
         resp = httpx.get(f"{API_PREFIX}/models/{DEFAULT_MODEL}")
         assert resp.status_code == 200
         body = resp.json()
         assert body["model_id"] == DEFAULT_MODEL
-        assert "provider_id" not in body, "provider_id must not be exposed"
-        assert "provider_model_id" not in body, "provider_model_id must not be exposed"
-
-    def test_get_nonexistent_model(self, server):
-        resp = httpx.get(f"{API_PREFIX}/models/fake-model-xyz")
-        assert resp.status_code == 404
-
-    def test_internal_fields_not_exposed(self, server):
-        """11-06: Internal fields must not be in model response."""
-        resp = httpx.get(f"{API_PREFIX}/models/{DEFAULT_MODEL}")
-        assert resp.status_code == 200
-        body = resp.json()
         for field in (
             "provider_id",
             "provider_model_id",
@@ -68,21 +92,20 @@ class TestGetModel:
         resp = httpx.get(f"{API_PREFIX}/models/{DEFAULT_MODEL}")
         assert resp.status_code == 200
         body = resp.json()
+        assert body["model_id"] == DEFAULT_MODEL
         for field in ("context_window", "tier", "multimodal_capabilities", "description"):
             assert field in body, f"Extended field '{field}' missing from model response"
 
 
-@pytest.mark.multi_provider
-class TestModelFieldPresence:
-    """Verify only enabled models are exposed and all have required fields."""
+class TestDisabledModel:
+    """A catalog entry with `enabled: false` is invisible to users."""
 
-    def test_all_listed_models_have_required_fields(self, server):
-        resp = httpx.get(f"{API_PREFIX}/models")
-        assert resp.status_code == 200
-        items = resp.json()["items"]
-        assert len(items) >= 1
-        for model in items:
-            assert "model_id" in model, f"model missing model_id: {model}"
-            assert "display_name" in model, f"model missing display_name: {model}"
-            assert "tier" in model, f"model missing tier: {model}"
-            assert "context_window" in model, f"model missing context_window: {model}"
+    def test_disabled_model_not_listed(self, server):
+        ids = {m["model_id"] for m in httpx.get(f"{API_PREFIX}/models").json()["items"]}
+        assert DISABLED_MODEL not in ids
+
+    def test_get_disabled_model_404(self, server):
+        assert_problem(
+            httpx.get(f"{API_PREFIX}/models/{DISABLED_MODEL}"), 404, "not_found",
+            resource_type=RESOURCE_MODEL,
+        )

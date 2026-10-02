@@ -35,6 +35,7 @@ mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
+use types_registry::domain::ports::ListFilter;
 
 use gts::GtsIdPattern;
 use sea_orm::sea_query::Expr;
@@ -51,7 +52,9 @@ use common::{
     seed_pending_revision_item, seed_type_schema_revision,
 };
 use types_registry::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
-use types_registry::domain::ports::{NewCurrentTypeSchema, NewEntity, commit_write, snapshot_read};
+use types_registry::domain::ports::{
+    CurrentSchemaCas, NewCurrentTypeSchema, NewEntity, ReverseImpact, commit_write, snapshot_read,
+};
 use types_registry::infra::storage::entity::type_schema;
 use types_registry::infra::storage::repo::{
     DependencyRepo, EntityRepo, OperationRepo, PageRequest, TypeSchemaRepo, VersionFamilyRepo,
@@ -170,14 +173,14 @@ async fn keyset_pages_in_byte_order(db: &Provider, family_id: i64, backend: &str
     let mut seen: Vec<String> = Vec::new();
     let mut request = PageRequest::first(2);
     loop {
-        let page = EntityRepo::list_page(&conn, &allow_all(), None, request)
+        let page = EntityRepo::list_page(&conn, &allow_all(), &ListFilter::default(), request)
             .await
             .expect("page");
         seen.extend(page.items.iter().map(|m| m.gts_id.clone()));
-        if !page.has_more {
+        let Some(next) = page.next_after else {
             break;
-        }
-        request = PageRequest::after(page.next_after.expect("cursor when more remains"), 2);
+        };
+        request = PageRequest::after(next, 2);
     }
 
     let mut expected: Vec<String> = BYTE_ORDERED.iter().map(|s| (*s).to_owned()).collect();
@@ -189,19 +192,24 @@ async fn keyset_pages_in_byte_order(db: &Provider, family_id: i64, backend: &str
     );
 }
 
-/// The prefix range narrows in SQL and `GtsId::matches_pattern` decides, on every
-/// backend. `ab` shares the range with `a_b` but not the pattern.
+/// The segment filter is exact on every backend: `ab` shares a byte prefix with
+/// `a_b` but not the pattern.
 async fn pattern_list_agrees_with_gts(db: &Provider, backend: &str) {
     let conn = db.conn().expect("conn");
     let pattern = GtsIdPattern::try_new(gts_id!("acme.crm.a_b.type.v1~")).expect("pattern");
-    let page = EntityRepo::list_page(&conn, &allow_all(), Some(&pattern), PageRequest::first(10))
-        .await
-        .expect("list");
+    let page = EntityRepo::list_page(
+        &conn,
+        &allow_all(),
+        &by_pattern(&pattern),
+        PageRequest::first(10),
+    )
+    .await
+    .expect("list");
     let ids: Vec<&str> = page.items.iter().map(|m| m.gts_id.as_str()).collect();
     assert_eq!(
         ids,
         vec![gts_id!("acme.crm.a_b.type.v1~")],
-        "only matches_pattern may decide, on {backend}"
+        "exactly the pattern's match on {backend}"
     );
 }
 
@@ -296,6 +304,79 @@ async fn closure_walks_a_chain(db: &Provider, family_id: i64, backend: &str) {
     assert!(closure.missing_roots.is_empty());
 }
 
+async fn reverse_impact_walks_back_up_a_chain(db: &Provider, family_id: i64, backend: &str) {
+    let conn = db.conn().expect("conn");
+    let scope = allow_all();
+    let chain = [
+        gts_id!("acme.crm.rev_a.type.v1~"),
+        gts_id!("acme.crm.rev_b.type.v1~"),
+        gts_id!("acme.crm.rev_c.type.v1~"),
+    ];
+    let mut ids = Vec::new();
+    for id in chain {
+        ids.push(
+            EntityRepo::insert(&conn, &scope, new_entity(id, family_id))
+                .await
+                .expect("insert chain member")
+                .expect("the identifier is free")
+                .id,
+        );
+    }
+    // a -> b -> c, so the reverse impact of c is b and a.
+    DependencyRepo::replace_outgoing(
+        &conn,
+        &scope,
+        ids[0],
+        &[(DependencyKind::SchemaRef, ids[1])],
+    )
+    .await
+    .expect("a -> b");
+    DependencyRepo::replace_outgoing(
+        &conn,
+        &scope,
+        ids[1],
+        &[(DependencyKind::SchemaRef, ids[2])],
+    )
+    .await
+    .expect("b -> c");
+    DependencyRepo::replace_outgoing(
+        &conn,
+        &scope,
+        ids[2],
+        &[(DependencyKind::SchemaRef, ids[0])],
+    )
+    .await
+    .expect("c -> a");
+
+    match DependencyRepo::reverse_impact(&conn, &scope, &[ids[2]], 512)
+        .await
+        .expect("reverse impact")
+    {
+        ReverseImpact::Within(rows) => {
+            let got: Vec<&str> = rows.iter().map(|r| r.gts_id.as_str()).collect();
+            assert_eq!(
+                got,
+                vec![chain[0], chain[1]],
+                "both dependents once each, gts_id-sorted, with the root excluded \
+                 even though a row leads back to it, on {backend}"
+            );
+        }
+        ReverseImpact::OverBound { at_least, bound } => {
+            panic!("unexpected refusal on {backend}: {at_least} against a bound of {bound}")
+        }
+    }
+
+    assert!(
+        matches!(
+            DependencyRepo::reverse_impact(&conn, &scope, &[ids[2]], 1)
+                .await
+                .expect("reverse impact"),
+            ReverseImpact::OverBound { .. }
+        ),
+        "two dependents must exceed a bound of one on {backend}"
+    );
+}
+
 /// A document too large for any `varchar`, so the column really is large text on
 /// both backends. Built rather than written out: what matters is the size and that
 /// it round-trips byte-identically.
@@ -387,6 +468,63 @@ async fn current_documents_reads_the_current_revision_only(
     assert_eq!(single_doc.raw_schema, only);
 }
 
+async fn current_projections_read_every_named_entity_that_has_one(
+    db: &Provider,
+    family_id: i64,
+    backend: &str,
+) {
+    let conn = db.conn().expect("conn");
+    let scope = allow_all();
+
+    let first_id = gts_id!("acme.crm.vector_a.type.v1~");
+    let second_id = gts_id!("acme.crm.vector_b.type.v1~");
+    let bare_id = gts_id!("acme.crm.vector_c.type.v1~");
+    let mut inserted = Vec::new();
+    for id in [first_id, second_id, bare_id] {
+        inserted.push(
+            EntityRepo::insert(&conn, &scope, new_entity(id, family_id))
+                .await
+                .expect("insert")
+                .expect("the identifier is free"),
+        );
+    }
+
+    let body = r#"{"$schema":"http://json-schema.org/draft-07/schema#","title":"vector"}"#;
+    for (row, id) in inserted.iter().take(2).zip([first_id, second_id]) {
+        let item = seed_operation_item(&conn, id, 1, NOW).await;
+        seed_type_schema_revision(&conn, row.id, 1, item, body, NOW).await;
+        seed_current_type_schema(&conn, row.id, 1, body, NOW).await;
+    }
+
+    let ids: Vec<i64> = inserted.iter().map(|row| row.id).collect();
+    let states = TypeSchemaRepo::current_projections(&conn, &scope, &ids)
+        .await
+        .expect("current states");
+
+    assert_eq!(
+        states.iter().map(|row| row.entity_id).collect::<Vec<_>>(),
+        ids[..2].to_vec(),
+        "one row per entity that has one, entity_id-sorted, and the third simply \
+         absent on {backend}"
+    );
+    for row in &states {
+        assert_eq!(
+            row.cas.resolution_fingerprint,
+            vec![0x11],
+            "the fingerprint must round-trip byte-identically on {backend}: the \
+             guard compares it for equality and nothing else"
+        );
+    }
+
+    assert!(
+        TypeSchemaRepo::current_projections(&conn, &scope, &[])
+            .await
+            .expect("empty read")
+            .is_empty(),
+        "an empty id set is an empty read, not a full scan, on {backend}"
+    );
+}
+
 /// The two revision writes, on a real backend — neither demonstrable on `SQLite`.
 ///
 /// `update_current` rebinds `resolution_fingerprint` in an `UPDATE`: a binary column
@@ -433,6 +571,10 @@ async fn a_revision_moves_the_pointer_and_can_report_unchanged(
                 resolution_fingerprint: fingerprint.clone(),
                 now: NOW,
             },
+            CurrentSchemaCas {
+                revision_no: 1,
+                resolution_fingerprint: vec![0x11],
+            },
         )
         .await
         .expect("move the pointer"),
@@ -469,6 +611,10 @@ async fn a_revision_moves_the_pointer_and_can_report_unchanged(
                 effective_traits_schema: "{}".to_owned(),
                 resolution_fingerprint: vec![0x01],
                 now: NOW,
+            },
+            CurrentSchemaCas {
+                revision_no: 1,
+                resolution_fingerprint: vec![0x11],
             },
         )
         .await
@@ -756,7 +902,9 @@ async fn assert_repo_primitives_behave(db: &Provider, backend: &str) {
     pattern_list_agrees_with_gts(db, backend).await;
     cas_reports_by_affected_rows(db, family.id, backend).await;
     closure_walks_a_chain(db, family.id, backend).await;
+    reverse_impact_walks_back_up_a_chain(db, family.id, backend).await;
     current_documents_reads_the_current_revision_only(db, family.id, backend).await;
+    current_projections_read_every_named_entity_that_has_one(db, family.id, backend).await;
     a_revision_moves_the_pointer_and_can_report_unchanged(db, family.id, backend).await;
     snapshot_read_does_not_see_a_mid_read_commit(db, family.id, backend).await;
 
@@ -812,4 +960,11 @@ async fn repository_primitives_behave_on_mysql() {
 
     let db = provider_for(&format!("mysql://root@{host}:{port}/test"), 8).await;
     assert_repo_primitives_behave(&db, "mysql").await;
+}
+
+fn by_pattern(pattern: &GtsIdPattern) -> ListFilter {
+    ListFilter {
+        pattern: Some(pattern.clone()),
+        ..ListFilter::default()
+    }
 }

@@ -4,10 +4,12 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use super::super::core::Outbox;
 use super::super::handler::HandlerResult;
 use super::super::statements::OutboxStatements;
 use super::super::store::OutboxStore;
 use super::super::strategy::{ProcessContext, ProcessingStrategy};
+use super::super::subscription::TraceMailbox;
 use super::super::taskward::{Directive, WorkerAction};
 use super::super::types::OutboxError;
 use crate::Db;
@@ -159,6 +161,7 @@ pub struct PartitionProcessor<S: ProcessingStrategy> {
     tuning: super::super::types::WorkerTuning,
     db: Db,
     statements: Arc<OutboxStatements>,
+    trace_mailbox: Arc<TraceMailbox>,
     partition_mode: PartitionMode,
 }
 
@@ -168,14 +171,19 @@ impl<S: ProcessingStrategy> PartitionProcessor<S> {
         partition_id: i64,
         tuning: super::super::types::WorkerTuning,
         db: Db,
-        statements: Arc<OutboxStatements>,
+        // Both the statements and the trace mailbox hang off the outbox, so it is
+        // one argument in place of two.
+        outbox: &Arc<Outbox>,
     ) -> Self {
+        let statements = outbox.statements_arc();
+        let trace_mailbox = outbox.trace_mailbox();
         Self {
             strategy,
             partition_id,
             tuning,
             db,
             statements,
+            trace_mailbox,
             partition_mode: PartitionMode::new(),
         }
     }
@@ -187,7 +195,7 @@ impl<S: ProcessingStrategy> WorkerAction for PartitionProcessor<S> {
 
     async fn execute(
         &mut self,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<Directive<ProcessorReport>, OutboxError> {
         let backend = {
             let sea_conn = self.db.sea_internal();
@@ -204,6 +212,9 @@ impl<S: ProcessingStrategy> WorkerAction for PartitionProcessor<S> {
             db: &self.db,
             store,
             partition_id: self.partition_id,
+            trace_mailbox: &self.trace_mailbox,
+            cancel,
+            stop_grace: self.tuning.stop_grace,
         };
 
         let result = self.strategy.process(&ctx, effective_size).await?;

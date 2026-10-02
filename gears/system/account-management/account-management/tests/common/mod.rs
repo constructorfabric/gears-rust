@@ -1451,6 +1451,44 @@ pub fn build_services_full_with_sa_enforcer(
     types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
     sa_enforcer: PolicyEnforcer,
 ) -> TestServices {
+    build_services_with_enforcers(
+        harness,
+        idp,
+        metadata_registry,
+        types_registry,
+        mock_enforcer(),
+        sa_enforcer,
+    )
+}
+
+/// Default fakes everywhere except the tenant service's enforcer.
+#[must_use]
+pub fn build_services_with_tenant_enforcer(
+    harness: &Harness,
+    tenant_enforcer: PolicyEnforcer,
+) -> TestServices {
+    build_services_with_enforcers(
+        harness,
+        fake_idp(),
+        empty_metadata_registry(),
+        types_registry_for_users(),
+        tenant_enforcer,
+        mock_enforcer(),
+    )
+}
+
+/// Full variant that also takes the tenant service's enforcer. Every
+/// other service keeps `mock_enforcer()` unless `sa_enforcer` says
+/// otherwise. Used to prove a listing verb is independently required.
+#[must_use]
+pub fn build_services_with_enforcers(
+    harness: &Harness,
+    idp: Arc<dyn IdpPluginClient>,
+    metadata_registry: Arc<dyn MetadataSchemaRegistry>,
+    types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+    tenant_enforcer: PolicyEnforcer,
+    sa_enforcer: PolicyEnforcer,
+) -> TestServices {
     use account_management::config::AccountManagementConfig;
 
     let cfg = AccountManagementConfig::default();
@@ -1461,7 +1499,7 @@ pub fn build_services_full_with_sa_enforcer(
             Arc::clone(&idp),
             inert_resource_checker(),
             inert_tenant_type_checker(),
-            mock_enforcer(),
+            tenant_enforcer,
             cfg,
         )
         .with_types_registry(Arc::clone(&types_registry)),
@@ -1649,6 +1687,148 @@ pub async fn seed_active_child(
 // =====================================================================
 // END E2E HTTP harness
 // =====================================================================
+
+// =====================================================================
+// Barrier topology shared by the carve-out and recursive-listing suites
+// =====================================================================
+
+/// `InTenantSubtree(root)` scope as the PDP emits it (barrier-respecting).
+#[must_use]
+pub fn respect_scope(root: Uuid) -> AccessScope {
+    AccessScope::single(toolkit_security::ScopeConstraint::new(vec![
+        toolkit_security::ScopeFilter::InTenantSubtree(
+            toolkit_security::InTenantSubtreeScopeFilter::new(
+                toolkit_security::pep_properties::RESOURCE_ID,
+                root,
+            ),
+        ),
+    ]))
+}
+
+/// Barrier-relaxed clone of [`respect_scope`] — what
+/// `scope_util::relax_barriers` produces for the enumeration query, and
+/// what a barrier-ignoring PDP scope looks like.
+#[must_use]
+pub fn relaxed_scope(root: Uuid) -> AccessScope {
+    AccessScope::single(toolkit_security::ScopeConstraint::new(vec![
+        toolkit_security::ScopeFilter::InTenantSubtree(
+            toolkit_security::InTenantSubtreeScopeFilter::with_descendant_status(
+                toolkit_security::pep_properties::RESOURCE_ID,
+                root,
+                false,
+                Vec::new(),
+            ),
+        ),
+    ]))
+}
+
+/// `$filter=contains(name,'<needle>')`.
+#[must_use]
+pub fn contains_name(needle: &str) -> toolkit_odata::ODataQuery {
+    use toolkit_odata::ast::{Expr, Value};
+    toolkit_odata::ODataQuery::default().with_filter(Expr::Function(
+        "contains".to_owned(),
+        vec![
+            Expr::Identifier("name".to_owned()),
+            Expr::Value(Value::String(needle.to_owned())),
+        ],
+    ))
+}
+
+/// Sort a set of ids so order-insensitive assertions compare equal.
+#[must_use]
+pub fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
+    ids.sort();
+    ids
+}
+
+/// Fixed ids for the barrier topology the recursive children listing is
+/// pinned against (FEATURE `tenant-hierarchy-management`, section
+/// "Recursive Visible-Set Resolution"; the expected visible sets are the
+/// table at the top of `tests/list_descendants_integration.rs`):
+///
+/// ```text
+/// root ─ x (managed, depth 1) ─ y (self-managed, depth 2) ─ yc (depth 3)
+///      │                      └ xc (managed, depth 2)
+///      └ s (self-managed, depth 1) ─ sc (managed, depth 2)
+/// ```
+pub struct BarrierTopology {
+    pub root: Uuid,
+    pub x: Uuid,
+    pub xc: Uuid,
+    pub s: Uuid,
+    pub sc: Uuid,
+    pub y: Uuid,
+    pub yc: Uuid,
+}
+
+impl BarrierTopology {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            root: Uuid::from_u128(0x7000_0001),
+            x: Uuid::from_u128(0x7000_0002),
+            xc: Uuid::from_u128(0x7000_0003),
+            s: Uuid::from_u128(0x7000_0004),
+            sc: Uuid::from_u128(0x7000_0005),
+            y: Uuid::from_u128(0x7000_0006),
+            yc: Uuid::from_u128(0x7000_0007),
+        }
+    }
+}
+
+impl Default for BarrierTopology {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Seed the topology with hand-pinned closure rows (`barrier = 1` iff a
+/// self-managed tenant sits on the strict `(ancestor, descendant]`
+/// path). Provider-based so the SQLite and Postgres harnesses share it.
+/// Every tenant is `active`; `tenant_type_uuid` is nil.
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "linear, hand-wired seed of a small fixed topology; splitting it into per-subtree helpers would obscure the closure-row table the design spec pins"
+)]
+pub async fn seed_barrier_topology(
+    provider: &Arc<AmDbProvider>,
+    t: &BarrierTopology,
+) -> Result<()> {
+    // root
+    insert_tenant(provider, t.root, None, "root", ACTIVE, false, 0).await?;
+    insert_closure(provider, t.root, t.root, 0, ACTIVE).await?;
+    // x — managed direct child of root
+    insert_tenant(provider, t.x, Some(t.root), "x", ACTIVE, false, 1).await?;
+    insert_closure(provider, t.x, t.x, 0, ACTIVE).await?;
+    insert_closure(provider, t.root, t.x, 0, ACTIVE).await?;
+    // s — self-managed direct child of root (barrier from root)
+    insert_tenant(provider, t.s, Some(t.root), "s", ACTIVE, true, 1).await?;
+    insert_closure(provider, t.s, t.s, 0, ACTIVE).await?;
+    insert_closure(provider, t.root, t.s, 1, ACTIVE).await?;
+    // xc — managed grandchild via x
+    insert_tenant(provider, t.xc, Some(t.x), "xc", ACTIVE, false, 2).await?;
+    insert_closure(provider, t.xc, t.xc, 0, ACTIVE).await?;
+    insert_closure(provider, t.x, t.xc, 0, ACTIVE).await?;
+    insert_closure(provider, t.root, t.xc, 0, ACTIVE).await?;
+    // sc — managed child under self-managed s (barrier from root)
+    insert_tenant(provider, t.sc, Some(t.s), "sc", ACTIVE, false, 2).await?;
+    insert_closure(provider, t.sc, t.sc, 0, ACTIVE).await?;
+    insert_closure(provider, t.s, t.sc, 0, ACTIVE).await?;
+    insert_closure(provider, t.root, t.sc, 1, ACTIVE).await?;
+    // y — self-managed direct child of x (barrier from root and x)
+    insert_tenant(provider, t.y, Some(t.x), "y", ACTIVE, true, 2).await?;
+    insert_closure(provider, t.y, t.y, 0, ACTIVE).await?;
+    insert_closure(provider, t.x, t.y, 1, ACTIVE).await?;
+    insert_closure(provider, t.root, t.y, 1, ACTIVE).await?;
+    // yc — managed child under y (barrier from root and x, not from y)
+    insert_tenant(provider, t.yc, Some(t.y), "yc", ACTIVE, false, 3).await?;
+    insert_closure(provider, t.yc, t.yc, 0, ACTIVE).await?;
+    insert_closure(provider, t.y, t.yc, 0, ACTIVE).await?;
+    insert_closure(provider, t.x, t.yc, 1, ACTIVE).await?;
+    insert_closure(provider, t.root, t.yc, 1, ACTIVE).await?;
+    Ok(())
+}
 
 // ---------------------------------------------------------------------
 // Postgres bring-up (testcontainers).

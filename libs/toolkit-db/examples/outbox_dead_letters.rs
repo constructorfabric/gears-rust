@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use toolkit_db::outbox::{
     DeadLetterFilter, DeadLetterScope, LeasedMessageHandler, MessageResult, Outbox, OutboxMessage,
-    Partitions, WorkerTuning, outbox_migrations,
+    Partitions, Record, Wake, WorkerTuning, outbox_migrations,
 };
 use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
 
@@ -48,18 +48,22 @@ async fn main() -> anyhow::Result<()> {
         .start()
         .await?;
     let conn = db.conn()?;
+    let mut wake = Wake::empty();
     for i in 0..3 {
-        h1.outbox()
+        wake += h1
+            .outbox()
             .enqueue(
                 &conn,
-                "events",
-                0,
-                format!("evt-{i}").into_bytes(),
-                "text/plain;events.logged.v1",
+                Record::to("events", 0)
+                    .payload(
+                        format!("evt-{i}").into_bytes(),
+                        "text/plain;events.logged.v1",
+                    )
+                    .build()?,
             )
             .await?;
     }
-    h1.outbox().flush();
+    wake.fire();
     tokio::time::sleep(Duration::from_secs(1)).await;
     let outbox = std::sync::Arc::clone(h1.outbox());
     h1.stop().await;

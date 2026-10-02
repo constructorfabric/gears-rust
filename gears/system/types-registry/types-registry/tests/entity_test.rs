@@ -39,8 +39,8 @@ use types_registry::infra::storage::entity::enums::{
     OwnershipScope, Plane,
 };
 use types_registry::infra::storage::entity::{
-    entity, instance, instance_revision, operation, operation_item, type_schema,
-    type_schema_revision, version_family,
+    entity, entity_gts_segment, instance, instance_revision, operation, operation_item,
+    type_schema, type_schema_revision, version_family,
 };
 
 const CREATED: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
@@ -107,6 +107,7 @@ async fn entity_round_trips_including_its_nullable_tenant_and_tombstone_columns(
         gts_uuid: Set(gts_uuid),
         gts_id: Set(GTS_TYPE.to_owned()),
         entity_kind: Set(EntityKind::TypeSchema),
+        chain_depth: Set(1),
         family_id: Set(family_id),
         ownership_scope: Set(OwnershipScope::Global),
         owner_tenant_id: Set(None),
@@ -131,6 +132,7 @@ async fn entity_round_trips_including_its_nullable_tenant_and_tombstone_columns(
     assert_eq!(found.id, inserted.id);
     assert_eq!(found.gts_uuid, gts_uuid);
     assert_eq!(found.entity_kind, EntityKind::TypeSchema);
+    assert_eq!(found.chain_depth, 1);
     assert_eq!(found.lifecycle_status, LifecycleStatus::Active);
     assert_eq!(found.owning_gear.as_deref(), Some("types-registry"));
     assert_eq!(found.owner_tenant_id, None);
@@ -152,6 +154,7 @@ async fn entity_writes_a_tombstone_the_lifecycle_check_accepts() {
         gts_uuid: Set(Uuid::from_u128(0xC2)),
         gts_id: Set(GTS_TYPE.to_owned()),
         entity_kind: Set(EntityKind::TypeSchema),
+        chain_depth: Set(1),
         family_id: Set(family_id),
         ownership_scope: Set(OwnershipScope::Global),
         owner_tenant_id: Set(None),
@@ -360,6 +363,7 @@ async fn instance_revision_cannot_reference_a_missing_schema_revision() {
         gts_uuid: Set(Uuid::from_u128(0xC7)),
         gts_id: Set(INSTANCE_GTS_ID.to_owned()),
         entity_kind: Set(EntityKind::Instance),
+        chain_depth: Set(2),
         family_id: Set(family_id),
         ownership_scope: Set(OwnershipScope::Global),
         owner_tenant_id: Set(None),
@@ -380,7 +384,6 @@ async fn instance_revision_cannot_reference_a_missing_schema_revision() {
         entity_id: Set(ent.id),
         revision_no: Set(1),
         canonical_value: Set(r#"{"name":"orphan"}"#.to_owned()),
-        content_hash: Set(vec![0x09]),
         type_schema_entity_id: Set(ent.id),
         type_schema_revision_no: Set(999),
         gts_spec_version: Set("0.13".to_owned()),
@@ -468,6 +471,7 @@ async fn type_schema_revision_and_current_pointer_round_trip() {
         gts_uuid: Set(Uuid::from_u128(0xC3)),
         gts_id: Set(GTS_TYPE.to_owned()),
         entity_kind: Set(EntityKind::TypeSchema),
+        chain_depth: Set(1),
         family_id: Set(family_id),
         ownership_scope: Set(OwnershipScope::Global),
         owner_tenant_id: Set(None),
@@ -483,12 +487,10 @@ async fn type_schema_revision_and_current_pointer_round_trip() {
     .await
     .expect("insert entity");
 
-    let hash = vec![0xDE_u8, 0xAD, 0xBE, 0xEF];
     type_schema_revision::ActiveModel {
         entity_id: Set(ent.id),
         revision_no: Set(1),
         raw_schema: Set(r#"{"type":"object"}"#.to_owned()),
-        content_hash: Set(hash.clone()),
         gts_spec_version: Set("0.13".to_owned()),
         gts_impl_version: Set("0.12.0".to_owned()),
         compat_forced: Set(false),
@@ -521,7 +523,7 @@ async fn type_schema_revision_and_current_pointer_round_trip() {
         .await
         .expect("query revision")
         .expect("the row just inserted");
-    assert_eq!(revision.content_hash, hash);
+    assert_eq!(revision.raw_schema, r#"{"type":"object"}"#);
     assert_eq!(revision.gts_spec_version, "0.13");
     assert_eq!(revision.gts_impl_version, "0.12.0");
     assert!(!revision.compat_forced);
@@ -572,6 +574,7 @@ fn every_core_entity_is_declared_unrestricted_while_ceiling_c6_stands() {
 
     assert_unrestricted::<version_family::Entity>("version_family");
     assert_unrestricted::<entity::Entity>("entity");
+    assert_unrestricted::<entity_gts_segment::Entity>("entity_gts_segment");
     assert_unrestricted::<type_schema_revision::Entity>("type_schema_revision");
     assert_unrestricted::<type_schema::Entity>("type_schema");
     assert_unrestricted::<operation::Entity>("operation");

@@ -74,7 +74,7 @@ async fn every_primitive_resolves_against_a_bound_backend() {
         panic!("cache must resolve against the bound linearizable backend");
     };
     // The resolved facade reflects the bound backend's declared characteristics.
-    assert!(cache.features().prefix_watch);
+    assert!(cache.features().prefix_watch());
 
     assert!(
         LeaderElectionV1::resolver(&hub)

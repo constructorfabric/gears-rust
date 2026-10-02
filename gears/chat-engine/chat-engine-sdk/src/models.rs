@@ -399,8 +399,12 @@ pub enum MessageRole {
     System,
 }
 
-/// Type discriminant for a [`MessagePart`]. The base set is fixed; plugin
-/// vendors extend it via GTS without forking Chat Engine core.
+/// Type discriminant for a [`MessagePart`]. The set is closed in the current
+/// implementation: a part whose `type` falls outside it fails deserialization.
+/// Vendor-defined discriminants via GTS (PRD FR-022 /
+/// `cpt-cf-chat-engine-fr-schema-extensibility`) are specified but not built
+/// yet; until they are, a vendor extends a part through its `content`, which
+/// the engine validates structurally and otherwise treats as opaque.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessagePartType {
@@ -416,6 +420,18 @@ pub enum MessagePartType {
     Links,
     /// Progress/status indicators: `{ statuses: [{ code, detail? }] }`.
     Statuses,
+    /// A single tool invocation the backend decided to make:
+    /// `{ tool_call_id, name, arguments, title? }`. `arguments` is the
+    /// plugin-defined call payload (an object); `tool_call_id` pairs the call
+    /// with its [`MessagePartType::ToolResult`]. One call per part — a turn
+    /// that calls several tools emits several parts.
+    ToolCall,
+    /// The outcome of one tool invocation:
+    /// `{ tool_call_id, name?, result, is_error? }`. `tool_call_id` echoes the
+    /// `tool_call` part this answers; `result` is the tool's payload
+    /// (any JSON); `is_error` marks a failed invocation whose `result` carries
+    /// the error instead.
+    ToolResult,
 }
 
 /// The wire / plugin shape of a message part before persistence: a `type`
@@ -909,6 +925,43 @@ pub struct StreamingToolEvent {
     pub tool: String,
     /// Tool-specific payload (query, results, status).
     pub payload: serde_json::Value,
+}
+
+#[cfg(test)]
+mod message_part_type_wire_tests {
+    //! Pins the `type` discriminant strings of [`MessagePartType`]. They are
+    //! the persisted column values (`message_parts.type`) as well as the wire
+    //! form, so renaming one is a storage migration, not just a wire change.
+
+    use super::MessagePartType;
+
+    #[test]
+    fn part_types_serialize_as_snake_case() {
+        let cases = [
+            (MessagePartType::Text, "text"),
+            (MessagePartType::Code, "code"),
+            (MessagePartType::Images, "images"),
+            (MessagePartType::Videos, "videos"),
+            (MessagePartType::Links, "links"),
+            (MessagePartType::Statuses, "statuses"),
+            (MessagePartType::ToolCall, "tool_call"),
+            (MessagePartType::ToolResult, "tool_result"),
+        ];
+        for (ty, wire) in cases {
+            assert_eq!(serde_json::to_value(ty).unwrap(), serde_json::json!(wire));
+            assert_eq!(
+                serde_json::from_value::<MessagePartType>(serde_json::json!(wire)).unwrap(),
+                ty
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_part_type_is_rejected() {
+        // The set is closed — an unknown discriminant fails deserialization
+        // rather than silently degrading to `text`.
+        assert!(serde_json::from_value::<MessagePartType>(serde_json::json!("audio")).is_err());
+    }
 }
 
 #[cfg(test)]

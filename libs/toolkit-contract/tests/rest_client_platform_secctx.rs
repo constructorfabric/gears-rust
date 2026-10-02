@@ -439,7 +439,7 @@ async fn streaming_platform_reconnect_attaches_internal_token_each_connection() 
     let counter = Arc::new(AtomicU32::new(0));
     let provider_counter = Arc::clone(&counter);
     let cfg = ClientConfig::new(base_url)
-        .with_sse_reconnect(ReconnectConfig::enabled(
+        .with_stream_reconnect(ReconnectConfig::enabled(
             3,
             std::time::Duration::from_millis(1),
         ))

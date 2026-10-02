@@ -78,12 +78,12 @@ makes the reader check two places for every question.
 
 * The correctness core is reviewable in isolation, and its own review found defects that a 1 500-line combined document would very likely have buried.
 * Each capability's guards, reasons and sequences live with the capability, so a slice author touches one file and a reviewer reads one file.
-* The dependency table in `design/README.md` becomes the build-order authority and must be kept truthful; the 2026-09-08 review found six missing edges, which is the recurring cost of this shape.
+* The dependency table in [DECOMPOSITION.md](../DECOMPOSITION.md) is the build-order authority and must be kept truthful; the 2026-09-08 review found six missing edges, which is the recurring cost of this shape.
 * Facts derived across the set — table inventories, endpoint inventories, event counts, worker counts — must be reconciled deliberately after any change, because no single document owns them. The same review found seven count inconsistencies of exactly this kind.
 * Template sections that belong to the gear rather than a capability (`§3.4`, `§3.5`, `§3.8`) are thin or inherited in most slices. This is accepted as the price of uniform structure rather than padded.
 * **A handler cannot be deployed independently of the engine.** It has no write path of its own, so the decomposition is a boundary inside one deployable, not a service split. Anything wanting independent deployment would need its own aggregate, which is `ADR/0001`'s decision to reverse rather than this one's.
 * **Seven handlers means seven guard sets registered against one table**, so the engine's startup registration is the integration point where a handler's mistake surfaces — a guard declared against a row that does not exist fails the boot rather than a request.
-* The layout consequence is **ten design documents** — `DESIGN.md`, `design/README.md` and the eight slices — inside a nineteen-artifact gear set that also carries seven ADRs, the decisions register and the upstream-requirements register. That matches the four sibling gears, so reviewers and tooling encounter a familiar shape; the recurring cost of the shape is derived facts drifting between documents, requiring explicit cross-document review.
+* The layout is one DESIGN with shared architecture, a DECOMPOSITION with build order, and eight FEATURE specifications. Derived inventories remain mechanically checked across those contracts.
 
 ### Confirmation
 
@@ -91,13 +91,13 @@ makes the reader check two places for every question.
 verifiable today or planned.
 
 **Verifiable today, with its two exceptions named.** No slice handler writes any of the seven
-Orders table families `01 §2.2`'s single-writer constraint covers — aggregate, version, line,
+Orders table families [01 §2.2](../DESIGN.md#contract-01-2-2)'s single-writer constraint covers — aggregate, version, line,
 resolved-total, audit and idempotency — a property a reader can confirm by reading that
 constraint against every slice's §3.7; nothing mechanises it, so it stays a review property. The
 broader claim that *no* handler writes *anything* would be false, and the two exceptions are
 deliberate rather than leaks: `orders_draft_content` is declared **mutable** and written by
 capture, because a basket is edited freely and versioning it would make every keystroke a version;
-and `orders_read_access_log` is written by the read surface itself (`08 §3.7`), because the fact it
+and `orders_read_access_log` is written by the read surface itself ([08 §3.7](../DESIGN.md#contract-08-3-7)), because the fact it
 records is the read, which no transition causes. Both sit outside §2.2's list for those reasons,
 and neither carries commercial state the audit guarantee depends on. Review must check that
 business refusals flow through the engine, that each slice-owned table appears in `DESIGN.md`
@@ -140,11 +140,11 @@ behaviour.
 
 ## More Information
 
-The location convention was decided separately: slices live in `docs/design/NN-*.md` following
-the BSS sibling gears, rather than in `docs/features/` where the platform's registered FEATURE
-artifacts live. That choice trades away registry visibility — `cfs where-used`, per-artifact
-validation and `cfs spec-coverage` marker tracing do not reach these paths — and is recorded as
-D-02 in [`../DECISIONS.md`](../DECISIONS.md).
+D-02 now uses the standard Gear document layout: `DESIGN.md` owns architecture and shared
+contracts; [`DECOMPOSITION.md`](../DECOMPOSITION.md) owns build order and coverage; eight
+FEATURE documents own full implementation behavior. The migration preserves runtime boundaries,
+stable IDs, schemas and open dependencies. The prior separate slice directory is removed.
+Registry validation and runtime evidence remain separate from document correctness.
 
 ## Traceability
 
@@ -157,5 +157,5 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-bss-orders-lifecycle-fr-order-atomic-fulfillment` — the workflow seam is a handler, which is what lets the sibling gear's contract change without touching the engine
 * `cpt-cf-bss-orders-lifecycle-component-transition-engine` — seven handlers register their guards against this component at startup, making registration the integration point where a handler's error becomes a boot failure
 - **PRD**: [`../PRD.md`](../PRD.md) — §6 functional requirements, §12 acceptance criteria
-- **DESIGN**: [`../DESIGN.md`](../DESIGN.md) §1.3, §3.2; [`../design/README.md`](../design/README.md)
+- **DESIGN**: [`../DESIGN.md`](../DESIGN.md) §1.3, §3.2; [Decomposition](../DECOMPOSITION.md)
 - **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-02, D-03

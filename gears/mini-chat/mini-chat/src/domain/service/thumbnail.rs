@@ -140,6 +140,7 @@ pub fn generate(cfg: &ThumbnailConfig, raw: &[u8]) -> Option<Thumbnail> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

@@ -885,6 +885,14 @@ fn integrity_check_in_progress_maps_to_429_with_quota_violation() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn root_binding_mismatch_maps_to_500() {
+    let canonical = round_trip(DomainError::RootBindingMismatch {
+        detail: "configured root binding differs".to_owned(),
+    });
+    assert_eq!(canonical.status_code(), 500);
+}
+
+#[test]
 fn internal_maps_to_500() {
     let canonical = round_trip(DomainError::Internal {
         diagnostic: "unclassified".to_owned(),

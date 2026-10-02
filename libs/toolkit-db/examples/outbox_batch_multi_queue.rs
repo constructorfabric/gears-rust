@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use toolkit_db::outbox::{
     Batch, HandlerResult, LeasedHandler, LeasedMessageHandler, MessageResult, Outbox,
-    OutboxMessage, Partitions, WorkerTuning, outbox_migrations,
+    OutboxMessage, Partitions, Record, Wake, WorkerTuning, outbox_migrations,
 };
 use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
 
@@ -90,33 +90,32 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let conn = db.conn()?;
+    let mut wake = Wake::empty();
     for i in 0..8u32 {
         let payload = format!(r#"{{"order_id": {i}}}"#);
-        handle
+        wake += handle
             .outbox()
             .enqueue(
                 &conn,
-                "orders",
-                i % 2,
-                payload.into_bytes(),
-                "application/json;orders.placed.v1",
+                Record::to("orders", i % 2)
+                    .payload(payload.into_bytes(), "application/json;orders.placed.v1")
+                    .build()?,
             )
             .await?;
     }
     for i in 0..3u32 {
         let payload = format!("user_{i}_welcome");
-        handle
+        wake += handle
             .outbox()
             .enqueue(
                 &conn,
-                "notifications",
-                0,
-                payload.into_bytes(),
-                "text/plain;notifications.welcome.v1",
+                Record::to("notifications", 0)
+                    .payload(payload.into_bytes(), "text/plain;notifications.welcome.v1")
+                    .build()?,
             )
             .await?;
     }
-    handle.outbox().flush();
+    wake.fire();
     println!("Enqueued 8 orders + 3 notifications");
 
     for _ in 0..100 {

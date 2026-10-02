@@ -24,7 +24,7 @@ COMMA := ,
 EXAMPLE_SERVER_BIN ?= cf-gears-example-server
 EXAMPLE_SERVER_DEBUG_BINARY ?= target/debug/$(EXAMPLE_SERVER_BIN)
 EXAMPLE_SERVER_MANIFEST ?= apps/cf-gears-example-server/Cargo.toml
-EXAMPLE_SERVER_FEATURE_EXCLUDES ?= default fips k8s otel oop-example timescaledb-usage-collector
+EXAMPLE_SERVER_FEATURE_EXCLUDES ?= default fips k8s otel oop-example timescaledb-usage-collector magika
 EXAMPLE_SERVER_ALL_FEATURES := $(strip $(shell cargo gears ls features --manifest $(EXAMPLE_SERVER_MANIFEST) 2>/dev/null))
 EXAMPLE_SERVER_FEATURES ?= $(subst $(SPACE),$(COMMA),$(filter-out $(EXAMPLE_SERVER_FEATURE_EXCLUDES),$(EXAMPLE_SERVER_ALL_FEATURES)))
 EXAMPLE_SERVER_FEATURE_ARGS ?= $(if $(EXAMPLE_SERVER_FEATURES),--features $(EXAMPLE_SERVER_FEATURES),)
@@ -214,7 +214,7 @@ setup: .setup-stamp py-env
 	@echo "Installing required development tools..."
 	rustup component add clippy
 	cargo install lychee
-	cargo install cargo-geigerfi
+	cargo install cargo-geiger
 	cargo install cargo-deny
 	cargo install cargo-gears
 	cargo install cargo-fuzz
@@ -274,7 +274,7 @@ setup: .setup-stamp py-env
 # |             | - Ensures clean compilation across all targets and features          |
 # +-------------+----------------------------------------------------------------------+
 
-.PHONY: fmt clippy clippy-deep lychee docs-preview kani geiger safety lint dylint dylint-list dylint-test shear gts-docs cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage ensure-submodules
+.PHONY: fmt clippy clippy-deep lychee docs-preview kani geiger safety lint dylint dylint-list dylint-test shear gts-docs docker-pins cfs-ensure cfs-repair cfs-validate cfs-validate-kits cfs-validate-kit-local cfs-spec-coverage ensure-submodules
 
 ## Verify git submodules (e.g. guidelines/DNA) are initialized; fails otherwise.
 ensure-submodules:
@@ -375,6 +375,13 @@ lint:
 ## Validate GTS identifiers in .md and .json files (DE0903)
 # Uses gts-validator binary (install via: cargo install gts-validator)
 
+## Check Dockerfile base images are digest-pinned and match rust-toolchain.toml
+# Uses PYTHON_BOOTSTRAP, not the venv: this check is pure stdlib text parsing,
+# so it must stay runnable without `make py-env` first.
+docker-pins:
+	$(call print_target_banner)
+	$(PYTHON_BOOTSTRAP) tools/scripts/ci.py docker-pins
+
 gts-docs:
 	$(call print_target_banner)
 	$(call check_tool,gts-validator)
@@ -417,6 +424,16 @@ safety: clippy kani lint dylint # geiger
 validate-gear-names: py-env
 	$(call print_target_banner)
 	@$(PYTHON) tools/scripts/validate_gear_names.py
+
+## Check the toolkit-pr-review rule set agrees with the orchestrators, Cargo.toml and the toolchain
+pr-review-lint: py-env
+	$(call print_target_banner)
+	@$(PYTHON) tools/scripts/toolkit-pr-review/lint.py
+
+## Run the toolkit-pr-review script tests (saved fixtures, no network)
+pr-review-test: py-env
+	$(call print_target_banner)
+	@$(PYTHON) -m unittest discover -s tools/scripts/toolkit-pr-review/tests
 
 ## Validate readme/license-file paths declared by publishable crates exist
 check-packaging-metadata: py-env
@@ -506,7 +523,7 @@ cfs-validate-kit-local: cfs-repair
 
 # -------- API and docs --------
 
-.PHONY: openapi md-fabric slides web-docs-preview .example-server-build
+.PHONY: openapi md-fabric slides web-docs-preview .example-server-build arch_status_svg_update
 
 .example-server-build:
 	$(call print_target_banner)
@@ -570,6 +587,11 @@ slides:
 web-docs-preview:
 	$(call print_target_banner)
 	@bash tools/scripts/docs-preview.sh
+
+## Regenerate docs/img/architecture.drawio.svg with live gear status from the GitHub board
+arch_status_svg_update: py-env
+	$(call print_target_banner)
+	@$(PYTHON) tools/scripts/architecture_status_svg.py -v
 
 # -------- Development and auto fix --------
 
@@ -651,7 +673,11 @@ GEAR_SERVER_ALWAYS_LINKED ?= api-gateway gear-orchestrator types-registry tenant
 GEAR_HAS_SERVER_FEATURE := $(or $(filter $(GEAR),$(GEAR_SERVER_ALWAYS_LINKED)),$(filter $(GEAR),$(EXAMPLE_SERVER_ALL_FEATURES)))
 # The gear itself as an optional feature (empty if it's an always-linked gear).
 GEAR_SERVER_OPTIONAL_FEATURES := $(if $(GEAR_HAS_SERVER_FEATURE),$(filter-out $(GEAR_SERVER_ALWAYS_LINKED),$(GEAR)),)
-GEAR_SERVER_FEATURES ?= $(GEAR_SERVER_OPTIONAL_FEATURES)$(if $(GEAR_SERVER_OPTIONAL_FEATURES),$(COMMA),)$(GEAR_SERVER_BASE_FEATURES)
+# Extra local-dev plugins a gear needs to start (GEAR_SERVER_EXTRA_FEATURES_<gear>).
+# mini-chat registers OAGW upstreams whose secret_ref OAGW checks in credstore.
+GEAR_SERVER_EXTRA_FEATURES_mini-chat ?= static-credstore
+GEAR_SERVER_EXTRA_FEATURES := $(GEAR_SERVER_EXTRA_FEATURES_$(GEAR))
+GEAR_SERVER_FEATURES ?= $(GEAR_SERVER_OPTIONAL_FEATURES)$(if $(GEAR_SERVER_OPTIONAL_FEATURES),$(COMMA),)$(GEAR_SERVER_BASE_FEATURES)$(if $(GEAR_SERVER_EXTRA_FEATURES),$(COMMA)$(GEAR_SERVER_EXTRA_FEATURES),)
 GEAR_SERVER_FEATURE_ARGS := $(if $(GEAR),$(if $(GEAR_HAS_SERVER_FEATURE),--no-default-features --features $(GEAR_SERVER_FEATURES),),$(EXAMPLE_SERVER_FEATURE_ARGS))
 
 # --- OpenAPI ---
@@ -666,7 +692,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -701,13 +727,26 @@ test-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-toolkit-db --features pg,integration
 
+## Run the SQL/PGQ lane: toolkit-db's unit suites under the `pgq` feature (the
+## secure graph builder and its tests compile only there), the PostgreSQL 19
+## integration suite (tests/pg, Docker required; a testcontainers PG19) and the
+## trybuild guards. `pgq` implies `pg`, so without the filter this would re-run
+## every PG18 Docker suite `make test-pg` just ran; the filter keeps only what
+## this lane adds. The PG19 suite skips itself while the pre-GA image is
+## unavailable; CI sets GEARS_TEST_PG_GRAPH_REQUIRED=1 so there the skip is a
+## failure — do the same locally once the image is expected to be present.
+test-pgq: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-toolkit-db --features pgq,integration \
+		-E 'kind(lib) | binary(mod) | binary(ui)'
+
 ## Run MySQL integration tests
 test-mysql: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-toolkit-db --features mysql,integration
 
 # Run all database integration tests
-test-db: test-sqlite test-pg test-mysql
+test-db: test-sqlite test-pg test-pgq test-mysql
 	$(call print_target_banner)
 
 ## Run users-info gear integration tests
@@ -724,8 +763,9 @@ test-usage-collector-pg: install-tools
 ## Run types-registry PostgreSQL + MySQL integration tests (Docker required;
 ## each test spins up its own postgres or mysql container via testcontainers).
 test-types-registry-db: install-tools
+	$(call print_target_banner)
 	cargo nextest run -p cf-gears-types-registry --features integration \
-	  --test migration_backends_test --test repo_backends_test
+	  -E 'binary(/_backends_test$$/)'
 
 ## Run the Postgres cluster plugin's conformance (Layer 2) and Layer 3
 ## integration suites (Docker required;
@@ -740,6 +780,63 @@ test-types-registry-db: install-tools
 test-cluster-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-postgres-cluster-plugin --features integration --retries 1
+
+## Kubernetes cluster plugin: L2 (conformance) + L3 (integration) against a real
+## k3s API server (docs/TESTING.md 4, 7). Docker required, and k3s needs
+## **privileged** mode -- the one CI capability beyond a Docker daemon.
+##
+## Uses `cargo test`, not `nextest` (unlike test-cluster-pg): k3s takes ~20s to
+## become ready, so the fixture starts ONE k3s container (a `static` OnceCell,
+## see tests/integration/common) and isolates every scenario by namespace. All
+## scenarios live in a SINGLE test binary (`tests/integration/main.rs`) so that
+## one static -- hence one container -- serves the whole suite; nextest's
+## process-per-test, or the former file-per-binary layout, would each start a
+## fresh k3s per process. `--test-threads` caps how many scenarios hit the shared
+## cluster at once so they do not overload it.
+##
+## The container lives in a `static` (never `Drop`ped) and **testcontainers 0.27
+## ships no ryuk reaper**, so it keeps running after the test process exits: the
+## `trap` cleans up that single leftover, and a leading `k3s_cleanup` (plus the
+## fixture's own `reap_stale_fixture_containers` on startup) clears any from a
+## prior run. Cleanup filters on the fixture's own label so it never touches an
+## unrelated k3s container. One retry guards a flaky boot.
+test-cluster-k8s: install-tools
+	$(call print_target_banner)
+	@set -e; \
+	k3s_cleanup() { docker ps -aq --filter label=org.cf-gears.test-fixture=cf-k8s-cluster-plugin | xargs -r docker rm -f >/dev/null 2>&1 || true; }; \
+	trap k3s_cleanup EXIT; \
+	k3s_cleanup; \
+	echo "=== cf-gears-cluster: k8s provider registration (lib, no k3s) ==="; \
+	cargo test -p cf-gears-cluster --features k8s --lib provider_registry_resolves_k8s_for_every_primitive; \
+	echo "=== k8s-cluster-plugin: integration (single shared k3s) ==="; \
+	cargo test -p cf-k8s-cluster-plugin --features integration --test integration -- --test-threads=4 \
+		|| { echo "=== integration failed; retrying once (flake guard, cf. test-cluster-pg's --retries 1) ==="; k3s_cleanup; \
+			cargo test -p cf-k8s-cluster-plugin --features integration --test integration -- --test-threads=4; } \
+		|| exit 1
+
+## Accumulate the k8s plugin's L2/L3 coverage into the CURRENT cargo-llvm-cov
+## session -- the coverage sibling of `test-cluster-k8s`: the same single-binary
+## `cargo test` becomes `cargo llvm-cov test --no-report`. Deliberately does NOT
+## `clean` or `report`, and deliberately has no `install-tools` prereq: the
+## caller brackets it (a workspace pass before, `cargo llvm-cov report` after) so
+## it composes into one lcov, and supplies cargo-llvm-cov + CARGO_LLVM_COV_TARGET_DIR
+## itself. The single-container k3s handling is identical to test-cluster-k8s --
+## see that target's comment for the why. Called by the coverage job in
+## .github/workflows/ci.yml.
+##
+## Standalone (local): a report needs a bracketing clean + report --
+##   cargo llvm-cov clean --workspace && make coverage-cluster-k8s && cargo llvm-cov report --summary-only
+coverage-cluster-k8s:
+	$(call print_target_banner)
+	@set -e; \
+	k3s_cleanup() { docker ps -aq --filter label=org.cf-gears.test-fixture=cf-k8s-cluster-plugin | xargs -r docker rm -f >/dev/null 2>&1 || true; }; \
+	trap k3s_cleanup EXIT; \
+	k3s_cleanup; \
+	echo "=== coverage: k8s-cluster-plugin: integration (single shared k3s) ==="; \
+	cargo llvm-cov test --no-report -p cf-k8s-cluster-plugin --features integration --test integration -- --test-threads=4 \
+		|| { echo "=== integration failed; retrying once (flake guard) ==="; k3s_cleanup; \
+			cargo llvm-cov test --no-report -p cf-k8s-cluster-plugin --features integration --test integration -- --test-threads=4; } \
+		|| exit 1
 
 ## Run resource-group gear PostgreSQL smoke tests (Docker required; spins up
 ## its own postgres container via testcontainers -- see
@@ -807,6 +904,28 @@ test-coord-pg: install-tools
 ## consumer is the example server's release build, which never runs a test.
 test-fixtures-narrow: install-tools
 	cargo nextest run -p cf-gears-bss-fixtures --no-default-features --test production_surface
+
+## Run the Redis cluster plugin's conformance (Layer 2) and Layer 3 integration
+## suites (Docker required; each spins up its own redis container via
+## testcontainers — see
+## gears/system/cluster/plugins/redis-cluster-plugin/docs/TESTING.md §7).
+##
+## Several container shapes run per PR, all single-node: a stock server (declares
+## EventuallyConsistent), an `--appendonly yes --appendfsync always` node (declares
+## Linearizable, which the leader-election conformance suite requires), and the
+## variants the declaration-and-environment scenarios need — no keyspace
+## notifications, an unsafe `maxmemory-policy`, a tiny `maxmemory` that forces real
+## eviction, `appendfsync everysec`, a `CONFIG`-denied ACL user, and one Redis 6.
+## The Sentinel and 3-node Cluster fixtures run here too — `RD-SPEC-002` on
+## Sentinel, `RD-SPEC-008/009/010` and `RD-LOCK-014` on the Cluster. A quorum or a
+## slot assignment costs tens of seconds, but nextest overlaps that startup with
+## the rest of the suite, so it is not wall clock the run as a whole pays.
+##
+## `--retries 1` for the same reason as test-cluster-pg: container setup is
+## load-sensitive on a busy host, and a genuine logic regression fails both
+## attempts, so this absorbs Docker churn without masking one.
+test-cluster-redis: install-tools
+	cargo nextest run -p cf-redis-cluster-plugin --features integration --retries 1
 
 ## Run FIPS-mode integration tests (requires Go for aws-lc-fips-sys).
 ## Covers:
@@ -911,7 +1030,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-event-broker
 
 E2E_TARGET ?=
 # E2E selectors for `make e2e-local`:
@@ -989,6 +1108,13 @@ e2e-mini-chat:
 e2e-usage-collector:
 	$(call print_target_banner)
 	$(MAKE) e2e-local SUITE=usage-collector
+
+## Run event-broker E2E tests (its own standalone binary, not a cf-gears-example-server feature)
+e2e-event-broker: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv
 
 # -------- Code coverage --------
 
@@ -1246,7 +1372,7 @@ oop-example:
 	cargo run --bin cf-gears-example-server --features oop-example,users-info-example,static-authn,static-authz,static-tenants,static-credstore -- --config config/quickstart.yaml run
 
 # Run all quality checks
-check: fmt cfs-validate clippy lychee security dylint gts-docs test
+check: fmt cfs-validate docker-pins clippy lychee security dylint gts-docs test
 	$(call print_target_banner)
 
 # Lightweight quality check for gear-scoped CI (gear-scoped-ci.yml).

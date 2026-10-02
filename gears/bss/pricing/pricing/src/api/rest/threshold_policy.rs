@@ -135,9 +135,8 @@ use axum::http::HeaderMap;
 use axum::http::header::ETAG;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
-use chrono::{DateTime, SubsecRound, Utc};
 use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit::api::operation_builder::{ParamLocation, ParamSpec};
+use toolkit::api::operation_builder::ParamSpec;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::AccessScope;
 use toolkit_security::SecurityContext;
@@ -152,10 +151,13 @@ use crate::api::rest::error::authz_error_to_canonical;
 use crate::api::rest::preconditions;
 use crate::api::rest::state::GovernanceState;
 use crate::domain::error::DomainError;
+use crate::domain::instant::rfc3339;
+use crate::domain::instant::truncate_millis;
 use crate::domain::materiality::triggers::Trigger;
 use crate::domain::materiality::{self, ChangeSet, ThresholdBasis, ThresholdEntry};
 use crate::domain::money::CurrencyCode;
 use crate::infra::threshold::AssertedPolicy;
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to both operations (DE0205).
 const TAG: &str = "BSS Pricing Governance";
@@ -191,31 +193,20 @@ pub const MAX_PERCENT_BP: u32 = 10_000;
 /// plus D-186. Reusing the sentence would have declared a true header under a false
 /// reason.
 fn if_match_param() -> ParamSpec {
-    ParamSpec {
-        name: "If-Match".to_owned(),
-        location: ParamLocation::Header,
-        required: true,
-        description: Some(
-            "Mandatory precondition (RFC 9110), and the governance section 5 `ETag` cell for this \
-             row. The value is \
-             the **opaque** tag the `GET` returns in its `ETag` header - copy it back verbatim. \
-             It is not a row version: this store is append-only and has no version column, so \
-             the tag is a digest over the representation the `GET` serves, which means it moves \
-             when a version takes effect **and** when a proposal opens or closes. A tenant with \
-             no policy at all is answered `200` and carries a tag, so the first proposal a \
-             tenant ever makes satisfies this like any other. A tag that no longer describes \
-             the policy is `409` `STALE_VERSION`; an absent or malformed one is `400`. Weak \
-             validators, the wildcard `*` and tag lists are all refused - a wildcard would \
-             author a governance policy over whatever happens to be current, which is what the \
-             precondition exists to prevent."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
+    ParamSpec::header("If-Match").required(true).description(
+        "Mandatory precondition (RFC 9110), and the governance section 5 `ETag` cell for this \
+         row. The value is \
+         the **opaque** tag the `GET` returns in its `ETag` header - copy it back verbatim. \
+         It is not a row version: this store is append-only and has no version column, so \
+         the tag is a digest over the representation the `GET` serves, which means it moves \
+         when a version takes effect **and** when a proposal opens or closes. A tenant with \
+         no policy at all is answered `200` and carries a tag, so the first proposal a \
+         tenant ever makes satisfies this like any other. A tag that no longer describes \
+         the policy is `409` `STALE_VERSION`; an absent or malformed one is `400`. Weak \
+         validators, the wildcard `*` and tag lists are all refused - a wildcard would \
+         author a governance policy over whatever happens to be current, which is what the \
+         precondition exists to prevent.",
+    )
 }
 
 /// The tenant's policy as it stands: what is in force, and what is under review.
@@ -247,7 +238,8 @@ pub struct PutThresholdPolicyRequest {
     /// When the thresholds start applying, once approved. UTC, millisecond
     /// precision (D-144). Required on a threshold proposal; **must be absent on a
     /// retirement**, which is not schedulable — see `retire`.
-    pub effective_from: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_from: Option<OffsetDateTime>,
     /// The per-currency entries. **The whole policy**, not a patch: a version is a
     /// complete entry set, so a currency left out of this list is a currency with
     /// no threshold — which is material by `inst-mat-percurrency`'s fail-safe
@@ -440,7 +432,7 @@ async fn put_threshold_policy(
     let correlation = require_correlation(extension_correlation)?;
     let scope = write_scope(&enforcer, &ctx).await?;
     let tenant = ctx.subject_tenant_id();
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
 
     // **After the gate, deliberately.** A caller who may not touch this resource is
     // told that, rather than being told their header is malformed — the ordering
@@ -483,7 +475,7 @@ async fn put_threshold_policy(
         }
         // Quantized to the millisecond (D-144) and **truncated**, so the instant is
         // never later than the moment asked for.
-        let at = now.trunc_subsecs(3);
+        let at = truncate_millis(now);
         state
             .thresholds
             .retire(

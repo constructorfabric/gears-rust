@@ -76,8 +76,8 @@ The canonical representation of registry contracts is based on [Global Type Syst
 | GTS Type Identifier | Canonical GTS Identifier ending with `~`. |
 | GTS Type Schema | JSON Schema document annotated with GTS keywords and defining a GTS Type's shape, traits, and derivation. |
 | JSON Schema Dialect | Draft declared by a Type Schema's top-level `$schema`; the managed profile is defined by `cpt-cf-types-registry-fr-gts-validation`. |
-| Resolution Closure | Documents inlined into a Type Schema's effective form: its base chain and reachable `$ref` targets, including those in `x-gts-traits-schema`; unlike the availability closure it excludes `x-gts-ref`. |
-| Availability Closure | Managed Entities reachable from a subject through outgoing availability-blocking relationships, including the subject itself. |
+| Resolution Closure | Documents inlined into a Type Schema's effective form: its base chain and reachable `$ref` targets, including those in `x-gts-traits-schema`. It excludes `x-gts-ref`, whose target is never inlined. |
+| Availability Closure | Managed Entities reachable from a subject through outgoing availability-blocking relationships, including the subject itself. An `x-gts-ref` is not such a relationship. |
 | GTS Instance | Concrete value or document conforming to a GTS Type. |
 | GTS Instance Identifier | Canonical GTS Identifier without a trailing `~`, naming a well-known Instance. |
 | GTS Identifier | Canonical user-facing identifier of a GTS Type or Instance. |
@@ -101,7 +101,7 @@ The canonical representation of registry contracts is based on [Global Type Syst
 | External Registry Source | Registry or catalog outside Types Registry that remains authoritative for its entities. |
 | Registry Source Plugin | Governed read-only plugin through which Types Registry queries an External Registry Source. |
 | Source Claim | Rooted single-segment GTS wildcard declaring the non-overlapping identifier space served by one plugin. |
-| External Revision | Opaque source freshness token; equal revisions identify equal canonical content and content hash. |
+| External Revision | Opaque source freshness token for one entity and tenant; it changes whenever any source-owned response field that affects the platform-visible result changes — canonical content, effective artifacts, source lifecycle, ownership scope, or source-owned tenant enablement. Platform-owned availability and visibility inputs are separate validator inputs and do not move it. Conditional reads against it are delegated to the owning plugin. |
 | Managed Entity | Entity for which Types Registry is the source of truth. |
 | Externally Managed Entity | Entity obtained live from an External Registry Source while Types Registry applies platform visibility and usage semantics. |
 | Tenant Subtree | Tenant and all of its descendants in the platform hierarchy. |
@@ -285,7 +285,7 @@ The waiver **MUST** be disabled by default and governed by one deployment-wide, 
 
 A forced admission **MUST** record the waiver and expose it on read. The flag describes the edge entering that minor: an upgrade from `s` to `t` is compatibility-established only if none of `s+1 … t` carries it.
 
-`$ref`, `x-gts-ref`, and derivation-base references **MUST NOT** cross a minor boundary. Admitting one minor **MUST NOT** revalidate, recompute, or invalidate entities of another minor, and resolving a major-only identifier **MUST NOT** select its highest minor.
+`$ref` and derivation-base references **MUST NOT** cross a minor boundary. Admitting one minor **MUST NOT** revalidate, recompute, or invalidate entities of another minor, and resolving a major-only identifier **MUST NOT** select its highest minor. `x-gts-ref` is not resolution-bearing and imposes no minor-boundary restriction on the payload identifiers it accepts.
 
 Platform-declared schemas and Instances under `gts.cf.*` **MUST** be major-only. An architecture lint over their declaring source, not Types Registry admission, enforces that rule; the registry **MUST NOT** reserve any prefix against minor-bearing schemas.
 
@@ -310,9 +310,11 @@ Where no baseline exists, no comparison or pass verdict exists. A revision of a 
 
 For a stable, unforced chain evaluated under one compatibility semantics, the highest minor of a major **MUST** accept every instance accepted anywhere earlier in that major. A major-0 Type Schema is exempt only from this evolution check: major-only `v0~` revisions and the next contiguous `v0.n~` **MUST** be admitted without a compatibility verdict, while derivation compatibility, dependent revalidation, dialect, reference, lifecycle, ownership, and authority rules remain in force.
 
-**Quarantine.** A managed entity whose own last segment carries major 1 or higher **MUST NOT** reference or derive from a major-0 entity through `$ref`, its immediate derivation base, or an entity-naming `x-gts-ref`. The reverse direction is allowed. Non-entity `x-gts-ref` forms are outside this rule, as defined by `cpt-cf-types-registry-fr-ref-tracking`.
+**Quarantine.** A managed Type Schema whose own last segment carries major 1 or higher **MUST NOT** reference or derive from a major-0 entity through `$ref` or its immediate derivation base. The reverse direction is allowed.
 
-Only rejection reports compatibility: it **MUST** carry structured diagnostics naming the cause and offending schema location. Successful admission and ordinary reads **MUST NOT** expose a compatibility verdict, mode, or per-level evolvability. Forward-direction results may appear only as `p3` advisory diagnostics, and operational claims about producers, readers, casting, or default materialization **MUST NOT** be presented as schema compatibility.
+`x-gts-ref` is outside the quarantine because it validates an Instance value without resolving or inlining the named entity. It creates no dependency or guarantee over that entity, as defined by `cpt-cf-types-registry-fr-ref-tracking`.
+
+Only rejection reports compatibility: it **MUST** carry a stable machine-readable refusal `reason` and a bounded human-readable `message` explaining the cause and naming the offending schema location where available. Omitted findings and truncated paths **MUST** be indicated in the message. Individual findings and paths are not a machine-readable API; clients **MUST NOT** parse the message or depend on its wording. A separate structured diagnostics field is not part of the current contract. Successful admission and ordinary reads **MUST NOT** expose a compatibility verdict, mode, or per-level evolvability. Forward-direction results may appear only as `p3` advisory diagnostics, and operational claims about producers, readers, casting, or default materialization **MUST NOT** be presented as schema compatibility.
 
 - **Rationale**: In-place evolution must not silently break producers, consumers, or historical payload processing. A contract still being designed is the exception, and marking it in the identifier makes the risk legible while the quarantine rule keeps it with the owners who accepted it. ADR-0003 and ADR-0015 record the alternatives.
 - **Actors**: `cpt-cf-types-registry-actor-gears-developer`, `cpt-cf-types-registry-actor-xaas-vendor-architect`, `cpt-cf-types-registry-actor-xaas-vendor-developer`, `cpt-cf-types-registry-actor-ci-pipeline`
@@ -330,25 +332,25 @@ The system **MUST** check every derived GTS Type Schema against its immediate ba
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-fr-ref-tracking`
 
-The system **MUST** track dependencies between Managed Entities: `$ref` targets, an entity's immediate derivation base, an Instance's conforming Type Schema, and an `x-gts-ref` **that names an entity**.
+The system **MUST** track dependencies between Managed Entities: `$ref` targets, an entity's immediate derivation base, and an Instance's conforming Type Schema. An `x-gts-ref` **MUST NOT** create a dependency, however concretely it names an entity.
 
 Before a managed Type Schema revision becomes current, the system **MUST** revalidate every affected registered dependent in its transitive reverse dependency closure, including current registered Instances, and reject the candidate if any would cease to satisfy its conformance, derivation, or reference rules. It **MUST NOT** rewrite dependent references or publish replacement dependents automatically.
 
-That last qualification is normative, because GTS 0.13 §9.6 gives `x-gts-ref` three value forms and only some of them name an entity. The keyword constrains what an instance *value* may hold rather than declaring that a document is inlined. The system **MUST** classify each form as follows, and a form yielding no edge **MUST** still be accepted as valid:
+Consequently, the system **MUST** permit deletion of an entity named only by `x-gts-ref` and **MUST NOT** revalidate the schema when that entity changes or is deleted. For the managed–external boundary, admission **MUST** classify each value as follows without storing a relation:
 
-| `x-gts-ref` value | Dependency edge |
+| `x-gts-ref` value | Identifier used for authority classification |
 |---|---|
-| a literal whole identifier | to that entity |
-| a literal prefix or wildcard | to the longest prefix of itself that is a valid identifier |
-| `gts.*`, or a relative JSON pointer such as `/$id` or `./properties/id` | none — accepted as valid, contributes no edge |
+| a literal whole identifier | the exact identifier |
+| a literal prefix or wildcard | the longest prefix of itself that is a valid identifier |
+| `gts.*`, or a relative JSON pointer such as `/$id` | none |
 
-The system **MUST NOT** treat the open set of entities a pattern matches as a dependency, so admitting a new entity under an existing pattern **MUST NOT** require any edge to be re-expanded.
+The open match set of a pattern **MUST NOT** be treated as named or re-expanded when a new entity is admitted.
 
 Under ADR-0011 every tracked dependency has a Managed Entity at both ends, so the tracked set is authoritative for deletion safety and that decision is reached from local state without plugin availability, plugin cooperation, or plugin-supplied data. No plugin operation contributes to that set, and none is asked to.
 
 Types Registry **MUST NOT** expose a client-facing operation for enumerating dependents. What a caller needs — whether a deletion or a revision would be refused, and by what — is answered by the Dry Run of that same mutation.
 
-Any visible and tenant-available entity **MUST** remain a valid target for both existing and newly admitted GTS and JSON Schema references. Deletion removes a target from that set, and so does the quarantine rule of `cpt-cf-types-registry-fr-validate-schema-compat`. In P1 there is no lifecycle status between `ACTIVE` and `DELETED`, so no additional exclusion applies.
+Any visible and tenant-available entity **MUST** remain a valid target for existing and new `$ref` and derivation references. Deletion and the quarantine rule remove it from that set. `x-gts-ref` is not resolution-bearing and makes no target-validity promise. P1 has no lifecycle status between `ACTIVE` and `DELETED`.
 
 - **Rationale**: Platform teams need predictable blast-radius analysis for type changes.
 - **Actors**: `cpt-cf-types-registry-actor-gears-developer`, `cpt-cf-types-registry-actor-xaas-vendor-architect`, `cpt-cf-types-registry-actor-xaas-vendor-developer`, `cpt-cf-types-registry-actor-ci-pipeline`
@@ -357,7 +359,7 @@ Any visible and tenant-available entity **MUST** remain a valid target for both 
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-fr-registry-federation`
 
-The system **MUST** support multiple Registry Sources, including Types Registry's own managed storage and External Registry Sources integrated through governed Registry Source Plugins. Types Registry **MUST NOT** persist external entity definitions, identifiers, revisions, content hashes, lifecycle state, Registry Reference mappings, query indexes, caches, or tombstones, and the owning plugin **MUST** serve that state live through the Types Registry federation contract. Under ADR-0011 this prohibition has no exception, and Registry Source Plugins **MUST NOT** have any write path into Types Registry state.
+The system **MUST** support multiple Registry Sources, including Types Registry's own managed storage and External Registry Sources integrated through governed Registry Source Plugins. Types Registry **MUST NOT** persist external entity definitions, identifiers, revisions, lifecycle state, Registry Reference mappings, query indexes, caches, or tombstones, and the owning plugin **MUST** serve that state live through the Types Registry federation contract. Under ADR-0011 this prohibition has no exception, and Registry Source Plugins **MUST NOT** have any write path into Types Registry state.
 
 - **Rationale**: Vendor products may already have authoritative type registries, but platform gears still need one Types Registry contract for resolving, discovery, and platform governance.
 - **Actors**: `cpt-cf-types-registry-actor-xaas-vendor-architect`, `cpt-cf-types-registry-actor-gears-developer`, `cpt-cf-types-registry-actor-registry-source-plugin`
@@ -373,7 +375,7 @@ The Types Registry federation contract is total: across its whole claimed identi
 - batch forward and reverse resolution, with reverse resolution retained after deletion;
 - complete bounded candidate queries with opaque pagination;
 - lifecycle, ownership/visibility, and tenant-state assertions;
-- revision/hash and conditional-read semantics; and
+- External Revision and conditional-read semantics; and
 - structured source failures.
 
 For a Type Schema result — an identifier with a trailing `~` — it **MUST** also return resolved effective schema and trait artifacts. A claim covers both entity kinds in its space, so a source holding none of one kind **MUST** report that kind's identifiers absent exactly as it reports any other absent identifier, with no separate outcome for an unheld kind. These obligations are mandatory and authoritative; dependency registration and reverse-impact lookup are absent from the contract under the closed boundary.
@@ -381,6 +383,8 @@ For a Type Schema result — an identifier with a trailing `~` — it **MUST** a
 Candidate queries **MUST NOT** have false negatives; Types Registry **MUST** accept a broader candidate set and apply normalized platform filtering. A source response that is non-conforming or incomplete for the identifier it returns **MUST** be rejected rather than interpreted, and the affected request **MUST** fail closed; conformance is therefore established on every response and by plugin conformance tests, never by an activation-time check against a plugin's own declaration.
 
 P1 Source Claims **MUST NOT** overlap one another or managed identifier space, including by nesting a Managed Entity beneath a claim. Source Claims are declared by ordinary platform-plane admission of an Instance of the Registry Source Plugin type, never through the plugin contract itself, which keeps no write path; that Instance is a Managed Entity of the platform's own plugin region and so lies outside every vendor claim. A claim's lifecycle is therefore that Instance's: it routes while the Instance is `ACTIVE`, deleting the Instance retires its claims — they no longer route but **MUST** remain reservations, so overlapping managed registration or claim activation remains forbidden — and only ADR-0013 purge of that Instance releases the reserved space. Managed storage **MUST** be consulted first, then plugins in deterministic priority order. Because no source declares which kinds it serves, a kind filter **MUST NOT** narrow the set of sources consulted: a kind-filtered query goes to every source whose claim intersects the queried identifier space. Absence **MUST** be authoritative — Types Registry **MUST NOT** report an identifier absent until every source required to establish that has answered authoritatively. An exact or batch source failure **MUST** remain distinct from absence; a batch **MUST** report it per affected key while returning unaffected keys. List and search operations **MUST** fail closed on any selected source failure or invalid/incomplete response and **MUST NOT** return partial pages or reinterpret failure as exhaustion or absence.
+
+Source Claim activation **MUST** also reject a pattern covering an `x-gts-ref` authority identifier already present in Managed Type Schema content. This check reclassifies current content and stores no dependency.
 
 - **Rationale**: Live federation requires deterministic ownership and routing without a per-external-entity index or identifier shadowing.
 - **Actors**: `cpt-cf-types-registry-actor-platform-gear`, `cpt-cf-types-registry-actor-registry-source-plugin`
@@ -391,11 +395,11 @@ P1 Source Claims **MUST NOT** overlap one another or managed identifier space, i
 
 The system **MUST** distinguish Managed from Externally Managed Entities and **MUST NOT** persist source-authoritative state (ADR-0011).
 
-Their identifier spaces **MUST** be disjoint, with no reference or derivation across the boundary in either direction. Managed admission **MUST** reject a crossing edge; a vendor deriving from a platform contract **MUST** register the result as Managed. External derivation chains remain within one source by Source Claim routing.
+Their identifier spaces **MUST** be disjoint, with no reference or derivation across the boundary in either direction. Managed admission **MUST** reject a crossing `$ref` or derivation edge and an `x-gts-ref` that names an externally managed target; the latter is classified from candidate content and creates no dependency. A vendor deriving from a platform contract **MUST** register the result as Managed. External derivation chains remain within one source by Source Claim routing.
 
 Types Registry **MUST NOT** parse external content to detect a source-authored `$ref` or `x-gts-ref` to a Managed Entity. Such a reference receives no platform guarantee: no managed-target deletion safety, availability propagation, dependent revalidation, lifecycle notification, or protection from purge and identifier rebinding. This limitation does not weaken the managed target's own compatibility guarantee.
 
-The External Registry Source **MUST** remain sole authority for source-owned entity validity; Types Registry **MUST NOT** require, interpret, or reproduce its validation results. Before exposure, Types Registry validates only platform-owned response invariants: identifier and Registry Reference integrity, Source Claim, entity kind as determined by the identifier's trailing `~`, authorization, visibility, lifecycle mapping, availability, and freshness. Every result **MUST** carry External Revision and canonical content hash, neither persisted by Types Registry.
+The External Registry Source **MUST** remain sole authority for source-owned entity validity; Types Registry **MUST NOT** require, interpret, or reproduce its validation results. Before exposure, Types Registry validates only platform-owned response invariants: identifier and Registry Reference integrity, Source Claim, entity kind as determined by the identifier's trailing `~`, authorization, visibility, lifecycle mapping, availability, and freshness. Every result **MUST** carry its External Revision, which Types Registry does not persist.
 
 - **Rationale**: External source ownership must not bypass platform contract governance, while source-owned entity validation policies and results remain outside the Types Registry responsibility boundary.
 - **Actors**: `cpt-cf-types-registry-actor-platform-gear`, `cpt-cf-types-registry-actor-domain-gear`, `cpt-cf-types-registry-actor-registry-source-plugin`
@@ -525,7 +529,7 @@ Initial admission **MUST** atomically create an `ACTIVE` entity at revision `1`;
 
 **Version families.** Admitting a Version Successor **MUST NOT** alter another family member, and the system **MUST** permit multiple members to be `ACTIVE`. Major members may be admitted in any order; minor members follow `cpt-cf-types-registry-fr-minor-version-profile`. The system **MUST NOT** compute or expose a newest family member, while discovery **MUST** enumerate all family members, including every minor. P2 Aliases **MUST** use this lifecycle model unless their decision explicitly supersedes it.
 
-**Deletion.** The system **MUST** permit an authorized deletion to move an `ACTIVE` entity directly to `DELETED`, without a successor or constraint from other family members, but **MUST** fail while a live registered dependent exists. P1 decides this entirely from managed dependencies: derived types, schemas with `$ref` or entity-naming `x-gts-ref`, and registered Instances conforming to the target. It neither calls plugins nor sees runtime domain objects, so it may delete a schema still used by domain data; owning-gear deletion validation is deferred to `cpt-cf-types-registry-fr-validation-hooks`.
+**Deletion.** The system **MUST** permit an authorized deletion to move an `ACTIVE` entity directly to `DELETED`, without a successor or constraint from other family members, but **MUST** fail while a live registered dependent exists. P1 derives dependants from managed `$ref`, derivation, and Instance-conformance edges; `x-gts-ref` creates no edge and **MUST NOT** block deletion. The registry neither calls plugins nor sees runtime domain objects, so owning-gear validation is deferred to `cpt-cf-types-registry-fr-validation-hooks`.
 
 A deleted GTS Identifier **MUST NOT** be restored or reused. Admitted identity and content **MUST NOT** expire through retention, TTL, or background policy; only ADR-0013's explicit platform purge physically removes them. Purge **MUST** be operator-invoked on the platform plane, disabled by default, and restricted to `DELETED` entities with no live registered dependent; its contract **MUST** state that releasing an identifier may rebind its deterministic Registry Reference. Unreferenced terminal operation records may expire without affecting any entity, revision, tombstone, or identifier. Deletion **MUST** preserve resolution of previously issued Registry References.
 
@@ -546,14 +550,15 @@ The availability-blocking relationships are:
 |---|---|
 | Registered Instance → conforming Type Schema | yes |
 | Type Schema → each derivation base | yes |
-| Type Schema → `$ref` and entity-naming `x-gts-ref` targets | yes |
+| Type Schema → `$ref` targets | yes |
+| Type Schema → `x-gts-ref` targets | no — the target contributes no content to the schema's semantic contract |
 | P2 Alias → target | yes |
 | Target → reverse dependents | no |
 | Entity → Version Family siblings | no |
 
 A new relationship kind **MUST** be classified by the same semantic-contract rule before it affects availability. Blocking edges exist only between Managed Entities; an Externally Managed Entity's availability is obtained live from its source and has no registry-composed Availability Closure.
 
-P1 has no managed enablement override. A visible `ACTIVE` Managed Entity is eligible for `AVAILABLE` but **MUST** be reasoned `UNAVAILABLE` when a blocking target is unavailable. A `DELETED` entity **MUST** be unavailable yet still be returned by exact read as deleted; discovery, search, and query assistance exclude it. Admission Candidates **MUST NOT** participate.
+P1 has no managed enablement override. A visible `ACTIVE` Managed Entity is eligible for `AVAILABLE` but **MUST** be reasoned `UNAVAILABLE` when a blocking target is unavailable. A `DELETED` entity **MUST** be unavailable yet still be returned by exact read as deleted; discovery excludes it by default but includes it on explicit `lifecycle_status=deleted|all`, while search and query assistance exclude it. Admission Candidates **MUST NOT** participate.
 
 The Context Tenant defaults to the subject tenant on the tenant plane. A caller may name a descendant only when the platform PDP authorizes the subject-to-context ancestor relation. The platform plane has no default; without an explicit Context Tenant the verdict **MUST** be absent, with no synthetic not-evaluated state.
 
@@ -590,7 +595,7 @@ Every exact resolution, by either key or as a batch member, **MUST** return meta
 
 The validator **MUST** cover the complete projected result, including tenant availability, rather than only entity `resource_version`. It **MUST** be scoped to the entity, Context Tenant, visibility context, and field projection for which it was issued; a validator from another scope or projection **MUST** yield the full result, never a false unchanged response.
 
-For an Externally Managed Entity, the validator **MUST** derive from the source's opaque revision and content hash, remain unpersisted by Types Registry, and change whenever the platform-visible result for that entity and tenant changes, including source-owned tenant enablement. Validation **MUST** delegate to the owning source's conditional-read semantics under the federation contract.
+For an Externally Managed Entity, the validator **MUST** derive from the source's opaque External Revision together with the platform-owned availability and visibility inputs, remain unpersisted by Types Registry, and change whenever the platform-visible result for that entity and tenant changes, including source-owned tenant enablement. Validation **MUST** delegate to the owning source's conditional-read semantics under the federation contract.
 
 Single and batch reads **MUST** accept caller-supplied validators and return an unchanged outcome instead of the full result when current; batch evaluation is per item. Types Registry **MUST NOT** report unchanged unless currentness is established (`cpt-cf-types-registry-principle-fail-closed`). Callers may use this contract directly or through the P1 SDK cache of `cpt-cf-types-registry-fr-client-cache`.
 
@@ -618,15 +623,15 @@ Registration and deletion **MUST** always be asynchronous and return an operatio
 
 A registration batch **MUST** be non-empty, contain at most 100 candidates, and use one plane and ownership/authorization scope. Every distinct identifier **MUST** be authorized independently.
 
-P1 uses ADR-0012's **dependency-aware partial admission**, not one all-or-nothing transaction. Each acyclic candidate is admitted independently, while a mutually dependent cycle **MUST** commit or fail as one atomic unit. Independent valid units **MUST** commit despite failures elsewhere. A candidate whose selected in-batch dependency failed **MUST NOT** commit and **MUST** be distinguished from one evaluated and failed on its own checks. Every member **MUST** receive an outcome keyed by exact GTS Identifier, with actionable diagnostics.
+P1 uses ADR-0012's **dependency-aware partial admission**, not one all-or-nothing transaction. Each candidate is admitted independently, in dependency order. Independent valid candidates **MUST** commit despite failures elsewhere. A candidate whose selected in-batch dependency failed **MUST NOT** commit and **MUST** be distinguished from one evaluated and failed on its own checks. Every member **MUST** receive an outcome keyed by exact GTS Identifier, with actionable diagnostics.
 
 An admitted initial candidate creates `ACTIVE` revision `1`; a failed or blocked initial candidate creates nothing and leaves committed state unchanged.
 
-Types Registry **MUST NOT** implement a global startup barrier or expected startup set. It **MUST** publish ready state when its own storage is ready and **MUST NOT** wait for registrants. At startup, a registrant **MUST** read and reconcile its declared inventory, omit equal content, and conditionally submit missing or changed definitions. It **MUST** retry missing-dependency failures and **MUST NOT** become ready until its registrations succeed; such a failure **MUST** be retryable and succeed once the dependency exists.
+Types Registry **MUST NOT** implement a global startup barrier or expected startup set. It **MUST** publish ready state when its own storage is ready and **MUST NOT** wait for registrants. At startup, a registrant **MUST** read and reconcile its declared inventory, omit equal content, and conditionally submit missing or changed definitions. It **MUST NOT** become ready until its registrations succeed. A missing dependency **MUST** produce an immediate terminal candidate refusal with `dependency_not_found`, `dependency_id` and `dependency_kind`; the registry **MUST NOT** wait for it through outbox redelivery. Once the prerequisite is admitted, the registrant **MUST** retry through a new submission with a new idempotency key. Replaying the original key returns the original terminal outcome.
 
-A reference cycle spanning two owners cannot be admitted, because neither owner can submit both members in one batch. This is intentional.
+Cycles in the combined `$ref` and derivation graph **MUST NOT** be admitted, in one batch or across operations, because both edge kinds are inlined into the effective form. The resulting dependency relation is acyclic, so no candidate group requires atomic admission (ADR-0012).
 
-- **Rationale**: A gear can have interdependent definitions, including reference cycles, that cannot be admitted one at a time, while an unrelated invalid candidate should not prevent valid independent registrations. Separately, the registry cannot know the membership of a platform-wide startup set, and making its readiness depend on every registrant would put the slowest gear on the platform boot path.
+- **Rationale**: A gear can have interdependent definitions whose admission order matters, while an unrelated invalid candidate should not prevent valid independent registrations. Separately, the registry cannot know the membership of a platform-wide startup set, and making its readiness depend on every registrant would put the slowest gear on the platform boot path.
 - **Actors**: `cpt-cf-types-registry-actor-platform-gear`
 
 #### Dry Run
@@ -802,7 +807,7 @@ The system **MUST** prevent SDK clients from treating invalidated registry looku
 
 **Main Flow**:
 1. Types Registry checks managed storage and selects the owning Registry Source Plugin using the ordered Source Claim model.
-2. The plugin resolves or queries the externally managed entity live and returns canonical content, opaque revision, content hash, source lifecycle and ownership/visibility assertions, and authoritative tenant state when required.
+2. The plugin resolves or queries the externally managed entity live and returns canonical content, opaque External Revision, source lifecycle and ownership/visibility assertions, and authoritative tenant state when required.
 3. Types Registry validates federation response conformance, the Registry Reference, and the Source Claim, then applies platform-owned authorization, visibility, lifecycle mapping, availability, and cache/freshness rules.
 4. The domain gear resolves or discovers the entity through the normal Types Registry SDK or REST contract.
 
@@ -821,8 +826,8 @@ The system **MUST** prevent SDK clients from treating invalidated registry looku
 **Main Flow**:
 1. CI submits the proposed Type Schemas as a Dry Run of the ordinary registration operation.
 2. Types Registry performs the complete admission check sequence and commits nothing.
-3. CI polls the operation and reads the per-GTS-ID outcome: for each candidate, whether the real operation would have been accepted, and for each refusal the structured cause — a compatibility violation with its schema location, a derivation violation against a named base, or a lifecycle or dependency conflict.
-4. CI reads the per-candidate diagnostics, which name the dependents a change would break that are visible to the requesting tenant, and report a count for the rest — the disclosure rule of ADR-0009 governs a Dry Run exactly as it governs the operation it rehearses. The Dry Run performs the same dependent revalidation admission does, so nothing further needs asking.
+3. CI polls the operation and reads the per-GTS-ID outcome: for each candidate, whether the real operation would have been accepted, and for each refusal a stable reason code and a human-readable explanation — a compatibility violation with its schema location, a derivation violation against a named base, or a lifecycle or dependency conflict. CI branches on the reason code and displays the message without parsing it.
+4. CI displays the per-candidate refusal messages, which name the dependents a change would break that are visible to the requesting tenant, and report a count for the rest — the disclosure rule of ADR-0009 governs a Dry Run exactly as it governs the operation it rehearses. The Dry Run performs the same dependent revalidation admission does, so nothing further needs asking.
 5. CI accepts or blocks the deployment based on those results.
 
 **Postconditions**:
@@ -837,13 +842,13 @@ The system **MUST** prevent SDK clients from treating invalidated registry looku
 Acceptance of this PRD requires automated evidence for the cross-cutting outcomes below. Product P1 is gated only by criteria whose referenced capabilities belong to Product P1; Product P2 criteria become gates when those capabilities are delivered. Detailed edge cases, concurrency interleavings, and storage-level verification remain with the referenced requirements and ADR confirmation sections rather than being repeated here.
 
 - [ ] **Managed registration** — authorized actors can register, retrieve, discover, revise where permitted, and delete Managed Type Schemas and registered Instances; invalid candidates create no logical entity or revision. (`cpt-cf-types-registry-fr-register-schemas`, `cpt-cf-types-registry-fr-register-instances`)
-- [ ] **Batch admission and startup** — registration and deletion use idempotent asynchronous operations with optimistic candidate preconditions; in-batch references resolve against submitted candidates, independent valid branches may succeed, dependency cycles are atomic, every candidate receives a keyed outcome, and registry readiness never waits for registrants. (`cpt-cf-types-registry-fr-two-phase-init`)
+- [ ] **Batch admission and startup** — registration and deletion use idempotent asynchronous operations with optimistic candidate preconditions; in-batch references resolve against submitted candidates, independent valid branches may succeed, cycles in the combined `$ref` and derivation graph are refused, every candidate receives a keyed outcome, and registry readiness never waits for registrants. (`cpt-cf-types-registry-fr-two-phase-init`)
 - [ ] **Dry Run** — registration, deletion, and purge Dry Runs execute the real check sequence with the same authorization and diagnostics, commit nothing, and are documented as state-relative predictions rather than admission guarantees. (`cpt-cf-types-registry-fr-dry-run`)
 - [ ] **Managed GTS profile** — managed identifiers and documents satisfy the platform profile, including derived Registry Reference uniqueness, Instance version restrictions, and the Draft-07 root declaration; external content is not reinterpreted under that profile. (`cpt-cf-types-registry-fr-gts-validation`)
 - [ ] **Minor-version profile** — a major is permanently major-only or minor-bearing; minors are immutable, contiguous from `M.0`, and released only as a suffix; major-only identifiers never resolve to a minor. Platform-owned `gts.cf.*` declarations remain major-only through the architecture lint rather than admission policy. (`cpt-cf-types-registry-fr-minor-version-profile`)
 - [ ] **Compatibility** — every stable candidate with a baseline is admitted only when backward compatibility is established, an undecidable verdict fails closed, and `force` can waive only an enabled cross-minor check and remains visible afterwards. (`cpt-cf-types-registry-fr-validate-schema-compat`)
-- [ ] **Unstable quarantine** — major-0 Type Schemas remain subject to all checks except evolution compatibility; stable entities cannot depend on them, registered Instances cannot use the unstable profile or conform to an unstable schema, and unstable schemas may depend on stable ones. (`cpt-cf-types-registry-fr-validate-schema-compat`, `cpt-cf-types-registry-fr-register-instances`)
-- [ ] **Derivation and dependency safety** — derived schemas remain substitutable for their complete base chain; every entity-naming dependency is tracked, revalidated when affected, and blocks deletion while live, while valid non-entity `x-gts-ref` forms create no edge. (`cpt-cf-types-registry-fr-validate-type-derivation`, `cpt-cf-types-registry-fr-ref-tracking`)
+- [ ] **Unstable quarantine** — major-0 Type Schemas remain subject to all checks except evolution compatibility; stable schemas cannot derive from them or include them through `$ref`; registered Instances cannot use or conform to the unstable profile; unstable schemas may depend on stable ones; `x-gts-ref` is outside the quarantine. (`cpt-cf-types-registry-fr-validate-schema-compat`, `cpt-cf-types-registry-fr-register-instances`)
+- [ ] **Derivation and dependency safety** — derived schemas remain substitutable for their complete base chain; `$ref`, immediate derivation, and Instance conformance dependencies are tracked, revalidated when affected, and block deletion while live. `x-gts-ref` creates no dependency. (`cpt-cf-types-registry-fr-validate-type-derivation`, `cpt-cf-types-registry-fr-ref-tracking`)
 - [ ] **Lifecycle and identity** — admitted entities expose only `ACTIVE` or terminal `DELETED` in P1; content revisions and lifecycle transitions remain distinct; deletion retains identity and reverse resolution, and only explicitly enabled operator purge releases them. (`cpt-cf-types-registry-fr-lifecycle`)
 - [ ] **Federation ownership boundary** — Externally Managed Entity state is obtained live and never projected into registry storage; plugins have no registry write path, and no managed dependency guarantee crosses the managed–external boundary. (`cpt-cf-types-registry-fr-registry-federation`, `cpt-cf-types-registry-fr-externally-managed-entities`)
 - [ ] **Source routing and completeness** — valid non-overlapping Source Claims route to conforming sources; managed storage is consulted first; a non-conforming or incomplete source response is rejected; exact source failures remain distinct from absence; discovery fails rather than returning a partial page. (`cpt-cf-types-registry-fr-registry-source-routing`)

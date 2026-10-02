@@ -78,6 +78,29 @@ pub enum LifecycleStatus {
     Deleted,
 }
 
+/// Which lifecycle states a discovery page lists. `Active` is the default: a
+/// tombstone leaves discovery unless asked for.
+#[domain_model]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LifecycleFilter {
+    #[default]
+    Active,
+    Deleted,
+    All,
+}
+
+impl LifecycleFilter {
+    /// The one status listed, or `None` for both.
+    #[must_use]
+    pub const fn status(self) -> Option<LifecycleStatus> {
+        match self {
+            Self::Active => Some(LifecycleStatus::Active),
+            Self::Deleted => Some(LifecycleStatus::Deleted),
+            Self::All => None,
+        }
+    }
+}
+
 /// What an operation was asked to do (ADR-0012).
 ///
 /// Dry run is **not** a kind: it is orthogonal, carried alongside, and part of the
@@ -138,15 +161,22 @@ pub enum OperationItemStatus {
 
 /// Why one entity depends on another.
 ///
-/// `GtsRef` constrains what a value may *name* and is not itself a
-/// schema-resolution dependency, which is why the strict reference extractor in
-/// `gts-rust` excludes it from resolution. Its edge protects the entity the value
-/// or the constraint names, not constraint satisfiability.
+/// `x-gts-ref` is excluded because it validates identifier syntax without reading a target.
 #[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DependencyKind {
     SchemaRef,
-    GtsRef,
     Derivation,
     InstanceOf,
+}
+
+impl DependencyKind {
+    /// Edge verb used in quarantine refusal messages.
+    pub(crate) const fn quarantine_verb(self) -> &'static str {
+        match self {
+            Self::SchemaRef => "$ref",
+            Self::Derivation => "derive from",
+            Self::InstanceOf => "conform to",
+        }
+    }
 }

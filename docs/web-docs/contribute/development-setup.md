@@ -3,30 +3,22 @@ title: Development setup
 description: Prerequisites, cloning with submodules, and building the Gears framework locally.
 sidebar:
   label: Development setup
-  order: 2
+  order: 3
 ---
 
 Set up a local environment to build, run, and test the framework.
 
 ## Prerequisites
 
-- **Rust stable** with Cargo (Edition 2024, MSRV 1.95.0).
-- **Protocol Buffers compiler** (`protoc`) — see the repository `README.md`.
-- **Git** for version control.
+Complete the [cross-platform setup](../setup/) before building or contributing. It covers macOS, Linux, and Windows, including Rust and Cargo through rustup, native build tools, and Constructor Studio.
+
 - **An editor** — VS Code with rust-analyzer is recommended.
 
 ## Clone and build
 
 ```bash
-# Clone gears-rust repository
-git clone https://github.com/constructorfabric/gears-rust
+git clone --recurse-submodules https://github.com/constructorfabric/gears-rust
 cd gears-rust
-
-# Install Rust if needed
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup component add clippy rustfmt
-
-# Build and test
 make build
 make test
 ```

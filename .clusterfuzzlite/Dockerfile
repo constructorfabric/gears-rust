@@ -1,5 +1,5 @@
 # Copyright 2026 CyberFabric Foundation
-# Copyright 2026 Constructro Fabric Foundation
+# Copyright 2026 Constructor Fabric Foundation
 # SPDX-License-Identifier: Apache-2.0
 
 FROM gcr.io/oss-fuzz-base/base-builder-rust
@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install latest nightly toolchain (project requires Rust 1.95+)
+# Install latest nightly toolchain (project floor is rust-toolchain.toml's channel)
 # rust-src is required for sanitizer builds
 RUN rustup toolchain install nightly --force && \
     rustup default nightly && \

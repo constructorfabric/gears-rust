@@ -74,7 +74,7 @@ The architectural rules of the selected model are:
   * batch forward and reverse resolution, retaining reverse resolution after deletion;
   * complete bounded candidate queries with opaque pagination;
   * lifecycle, ownership/visibility, and tenant-state assertions;
-  * revision/hash and conditional-read semantics;
+  * opaque `external_revision` and conditional-read semantics (ADR-0002);
   * structured source failures; and
   * for a Type Schema result — an identifier with a trailing `~` — resolved effective schema and trait artifacts, because Types Registry does not compute them for external content and consumers cannot obtain them otherwise (ADR-0002).
 * ADR-0011 keeps two operations out of the contract rather than making them optional:

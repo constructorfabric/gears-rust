@@ -12,6 +12,10 @@
 //! means *must not exist*; `>= 1` is the version to match. On the wire an absent
 //! field means must-not-exist and a literal 0 is rejected.
 //!
+//! `compat_forced` persists the ADR-0004 waiver request for the worker.
+//! Added by `m20260908_000003_operation_item_compat_forced`; the name avoids
+//! `MySQL`'s reserved `force`.
+//!
 //! `request_payload` is dropped at terminality. Failed and dry-run receipts keep
 //! the structured outcome but not the submitted content, because keeping it would
 //! retain rejected content for the lifetime of unrelated successful revisions.
@@ -43,6 +47,10 @@ pub struct Model {
     pub kind: OperationKind,
     /// 0 means the candidate must not exist; otherwise the version to match.
     pub expected_resource_version: i64,
+    /// Accepted, write-once ADR-0004 waiver request. The worker re-authorizes it;
+    /// `type_schema_revision.compat_forced` records the effective waiver and may
+    /// be false when this field is true.
+    pub compat_forced: bool,
     pub status: OperationItemStatus,
     /// Dropped at terminality — NULL for every terminal status.
     pub request_payload: Option<String>,

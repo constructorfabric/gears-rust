@@ -122,7 +122,7 @@ impl K8sTokenReviewAuthenticator {
 
         let review = TokenReview {
             spec: TokenReviewSpec {
-                token: Some(token.to_owned()),
+                token: token.to_owned(),
                 audiences,
             },
             ..Default::default()
@@ -215,6 +215,14 @@ impl InternalAuthenticator for K8sTokenReviewAuthenticator {
 /// function so they cannot drift on caching behavior or on what a
 /// construction failure means.
 ///
+/// `authentication_timeout`, when `Some`, overrides
+/// [`DEFAULT_AUTHENTICATION_TIMEOUT`](toolkit_security::DEFAULT_AUTHENTICATION_TIMEOUT)
+/// on the cache -- the deadline applied to the whole `authenticate` call,
+/// including the per-token lock wait. It has no effect when `cache_ttl` is
+/// `None`, since there is then no cache to configure. No caller currently
+/// overrides it; the parameter exists so one can, at this single point,
+/// without depending on `toolkit-security` directly.
+///
 /// # Errors
 /// Returns [`K8sAuthError`] if the Kubernetes client cannot be constructed,
 /// or a caching-TTL error (via [`InvalidCacheTtl`](toolkit_security::InvalidCacheTtl),
@@ -222,11 +230,15 @@ impl InternalAuthenticator for K8sTokenReviewAuthenticator {
 pub async fn build_cached_k8s_authenticator(
     audiences: Vec<String>,
     cache_ttl: Option<std::time::Duration>,
+    authentication_timeout: Option<std::time::Duration>,
 ) -> Result<DynInternalAuthenticator, K8sAuthError> {
     let validator = K8sTokenReviewAuthenticator::try_default(audiences).await?;
     match cache_ttl {
         Some(ttl) => {
-            let cached = CachingInternalAuthenticator::new(validator, ttl)?;
+            let mut cached = CachingInternalAuthenticator::new(validator, ttl)?;
+            if let Some(timeout) = authentication_timeout {
+                cached = cached.with_authentication_timeout(timeout);
+            }
             Ok(DynInternalAuthenticator::new(cached))
         }
         None => Ok(DynInternalAuthenticator::new(validator)),

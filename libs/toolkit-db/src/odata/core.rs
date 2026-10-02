@@ -816,9 +816,12 @@ where
     };
 
     // Validate cursor consistency (filter hash only) if cursor present
+    // A cursor issued for a filter carries only its hash, so a continuation
+    // must send the same filter: a missing or different one is a mismatch.
+    // A cursor without a hash is accepted (an added filter only narrows it).
     if let Some(cur) = &q.cursor
-        && let (Some(h), Some(cf)) = (q.filter_hash.as_deref(), cur.f.as_deref())
-        && h != cf
+        && let Some(cf) = cur.f.as_deref()
+        && q.filter_hash.as_deref() != Some(cf)
     {
         return Err(ODataError::FilterMismatch);
     }

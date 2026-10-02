@@ -1,0 +1,5 @@
+error: expected `#[streaming]` with an optional framing selector (`sse` or `multipart_mixed`) and/or an open selector (`open = fallible` or `open = immediate`), e.g. `#[streaming(multipart_mixed, open = fallible)]`
+  --> tests/ui/fail/rest_streaming_framing_with_value.rs:17:17
+   |
+17 |     #[streaming(sse = true)]
+   |                 ^^^

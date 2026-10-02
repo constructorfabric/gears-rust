@@ -169,9 +169,12 @@ async fn build_internal_authenticator(
         return Ok(None);
     };
 
-    // Shared-secret (and any future dependency-light provider) builds here.
-    if let Some(auth) = cfg.build_authenticator() {
-        return Ok(Some(auth));
+    // Shared-secret (and any future dependency-light provider) builds here. An
+    // unusable secret fails the build rather than falling through to the kube
+    // branch, which would report the wrong problem.
+    match cfg.build_authenticator()? {
+        toolkit_security::BuiltAuthenticator::Built(auth) => return Ok(Some(auth)),
+        toolkit_security::BuiltAuthenticator::RequiresExternalBackend => {}
     }
 
     #[cfg(feature = "k8s-auth")]
@@ -182,7 +185,7 @@ async fn build_internal_authenticator(
             // short-lived positive cache.
             let cache_ttl =
                 (cache_ttl_secs > 0).then(|| std::time::Duration::from_secs(cache_ttl_secs));
-            let auth = toolkit_k8s_auth::build_cached_k8s_authenticator(audiences, cache_ttl)
+            let auth = toolkit_k8s_auth::build_cached_k8s_authenticator(audiences, cache_ttl, None)
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!("failed to init Kubernetes TokenReview authenticator: {e}")
@@ -943,7 +946,7 @@ mod tests {
     #[tokio::test]
     async fn build_internal_authenticator_builds_shared_secret() {
         let cfg = InternalAuthConfig::SharedSecret {
-            secret: "test-secret".to_owned(),
+            secret: secrecy::SecretString::from("test-secret"),
             peer_name: "test-peer".to_owned(),
         };
         let auth = build_internal_authenticator(Some(&cfg), 30).await.unwrap();

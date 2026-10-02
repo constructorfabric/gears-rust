@@ -365,6 +365,7 @@ impl TenantFacade {
         ctx: &SecurityContext,
         req: &IdpProvisionTenantRequest,
     ) -> Result<TenantIdpMetadataV1, PluginError> {
+        let started = std::time::Instant::now();
         let timeout = std::time::Duration::from_millis(self.cfg.provision_timeout_ms);
         match tokio::time::timeout(timeout, self.provision_tenant_saga(ctx, req)).await {
             Ok(result) => result,
@@ -375,6 +376,19 @@ impl TenantFacade {
                 // `keycloak_idp_plugin_failure_total{op=provision_tenant,
                 // failure_variant=ambiguous_created}` alongside the
                 // structured error returned to AM.
+                //
+                // The in-body duration sample died with the same cancellation,
+                // so record it here too — otherwise no timeout ever reaches the
+                // histogram. `parse_input` is replayed solely to recover the
+                // `realm_binding` label; malformed input fast-fails inside the
+                // saga and cannot reach this arm, so the "no sample without a
+                // binding" invariant holds either way.
+                if let Ok(parsed) = Self::parse_input(req) {
+                    self.tenant_metrics.provision_tenant_duration(
+                        parsed.realm_binding,
+                        started.elapsed().as_secs_f64(),
+                    );
+                }
                 let err = PluginError::AmbiguousCreated {
                     stage: AmbiguousStage::Timeout,
                     detail: format!(

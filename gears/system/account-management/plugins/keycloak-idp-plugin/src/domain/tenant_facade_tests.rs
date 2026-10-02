@@ -2870,6 +2870,122 @@ async fn provision_tenant_returns_ambiguous_timeout_when_saga_exceeds_provision_
     );
 }
 
+/// Tenant-lifecycle metrics spy; only `provision_tenant_duration` is observed.
+#[derive(Default)]
+struct RecordingTenantMetrics {
+    durations: Mutex<Vec<(RealmBinding, f64)>>,
+}
+
+impl RecordingTenantMetrics {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn durations(&self) -> Vec<(RealmBinding, f64)> {
+        self.durations.lock().clone()
+    }
+}
+
+impl TenantLifecycleMetricsPort for RecordingTenantMetrics {
+    fn provision_tenant_duration(&self, realm_binding: RealmBinding, secs: f64) {
+        self.durations.lock().push((realm_binding, secs));
+    }
+    fn realm_bound(&self, _realm_binding: RealmBinding, _realm_name: &str) {}
+    fn realm_unbound(&self, _realm_binding: RealmBinding, _realm_name: &str) {}
+    fn deprovision_missing_metadata(&self) {}
+}
+
+/// DESIGN §4.4 — a provision that exceeds `provision_timeout_ms` must still
+/// contribute a sample to `keycloak_idp_plugin_provision_tenant_duration_seconds`.
+/// Same 50ms-budget / 200ms-token-delay setup as the timeout-classification test above.
+#[tokio::test]
+async fn provision_tenant_records_duration_when_saga_times_out() {
+    use std::time::Duration;
+
+    let server = wiremock::MockServer::start().await;
+    mount_kc_health_probe_ok(&server).await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/realms/master/protocol/openid-connect/token",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(serde_json::json!({
+                    "access_token": "tok",
+                    "expires_in": 600
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let kc_cfg = keycloak_cfg(&server.uri());
+    let realm_admin_cfg = kc_cfg.realm_admin.clone();
+    let tenant_cfg = TenantFacadeConfig {
+        realm_defaults: serde_json::Value::Null,
+        tenant_group_root: "/tenants".into(),
+        provision_timeout_ms: 50,
+    };
+
+    let client: Arc<dyn CredStoreClientV1> = Arc::new(StubCredStore);
+    let cs_reader = CredStoreReader::new(Arc::clone(&client), build_system_ctx(Uuid::nil()));
+    let cs_writer = CredStoreWriter::new(client, build_system_ctx(Uuid::nil()));
+    let transport: Arc<dyn KcTransport> = Arc::new(ReqwestKcTransport::new(reqwest::Client::new()));
+    let factory = Arc::new(crate::domain::kc::factory::KeycloakAdminClientFactory::new(
+        kc_cfg,
+        transport,
+        cs_reader,
+        Arc::new(crate::domain::test_support::NoopMetrics),
+    ));
+
+    let tenant_metrics = RecordingTenantMetrics::new();
+    let facade = TenantFacade::new(
+        tenant_cfg,
+        realm_admin_cfg,
+        factory,
+        Arc::new(crate::domain::metadata_codec::MetadataCodec),
+        cs_writer,
+        Arc::clone(&tenant_metrics) as Arc<dyn TenantLifecycleMetricsPort>,
+        noop_credstore_metrics(),
+        noop_metadata_metrics(),
+        noop_failure_metrics(),
+        noop_purge_hook(),
+    );
+
+    let ctx = build_system_ctx(Uuid::nil());
+    let req = req_for_root(Uuid::nil());
+    let result = facade.provision_tenant_inner(&ctx, &req).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(PluginError::AmbiguousCreated {
+                stage: AmbiguousStage::Timeout,
+                ..
+            })
+        ),
+        "precondition: the saga must have timed out, got: {result:?}"
+    );
+
+    let recorded = tenant_metrics.durations();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "a timed-out provision must contribute exactly one duration sample, got: {recorded:?}"
+    );
+    let (binding, secs) = recorded[0];
+    assert_eq!(
+        binding,
+        RealmBinding::Shared,
+        "the sample must carry the realm_binding the request asked for"
+    );
+    assert!(
+        secs >= 0.05,
+        "the sample must cover at least the 50ms timeout budget, got {secs}"
+    );
+}
+
 // ── the admin-bind scope note §A — admin_user_id bind tests ────────────────────────────────────
 
 /// Mount the Shared-mode happy-path KC calls (realm probe + token endpoints +

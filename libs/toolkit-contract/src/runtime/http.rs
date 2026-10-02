@@ -68,6 +68,41 @@ where
     })
 }
 
+/// Maximum error-body prefix buffered when classifying a non-success streaming
+/// open. The body only feeds a diagnostic — an RFC 9457 [`Problem`], or a
+/// truncated `HttpStatus.body` — so a short prefix is all it is ever used for,
+/// mirroring toolkit-http's own `ERROR_BODY_PREVIEW_LIMIT`.
+pub(crate) const ERROR_BODY_PREVIEW_LIMIT: usize = 8 * 1024;
+
+/// Read at most [`ERROR_BODY_PREVIEW_LIMIT`] bytes of `body`'s data frames,
+/// abandoning the rest of the body unread once the cap is reached.
+///
+/// The streaming open's error path needs only a short prefix to build its
+/// diagnostic. `HttpResponse::bytes()` would instead buffer the whole body up
+/// to the client's `max_body_size` (megabytes by default), so a peer could make
+/// a failed open allocate far more than the message ever uses. Capping the read
+/// itself — not merely truncating the resulting string — is what bounds that
+/// allocation. A transport error encountered before the cap surfaces as `Err`.
+pub(crate) async fn read_error_body_prefix<B>(body: B) -> Result<Bytes, B::Error>
+where
+    B: Body<Data = Bytes>,
+{
+    use http_body_util::BodyExt as _;
+
+    let mut body = std::pin::pin!(body);
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < ERROR_BODY_PREVIEW_LIMIT {
+        let Some(frame) = body.frame().await else {
+            break;
+        };
+        if let Ok(data) = frame?.into_data() {
+            let take = (ERROR_BODY_PREVIEW_LIMIT - buf.len()).min(data.len());
+            buf.extend_from_slice(&data[..take]);
+        }
+    }
+    Ok(Bytes::from(buf))
+}
+
 /// Build a fully-qualified URL by substituting path parameters and appending a
 /// pre-encoded query string, returning [`TransportError`] on failure.
 ///
@@ -241,7 +276,36 @@ fn truncate(mut s: String, max: usize) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::ir::binding::{HttpFieldBinding, HttpMethodBindingIr};
+    use crate::ir::binding::{HttpFieldBinding, HttpMethodBindingIr, StreamFraming};
+
+    /// Build an `http_body::Body` whose data arrives across several frames, so
+    /// the prefix reader is exercised on the cross-frame accumulation path (not
+    /// just a single buffered chunk).
+    fn framed_body(chunks: Vec<Vec<u8>>) -> impl http_body::Body<Data = Bytes, Error = String> {
+        use http_body::Frame;
+        let frames = chunks
+            .into_iter()
+            .map(|c| Ok::<_, String>(Frame::data(Bytes::from(c))));
+        http_body_util::StreamBody::new(futures_util::stream::iter(frames))
+    }
+
+    #[tokio::test]
+    async fn error_prefix_returns_a_short_body_intact() {
+        let body = framed_body(vec![b"service ".to_vec(), b"unavailable".to_vec()]);
+        let bytes = read_error_body_prefix(body).await.unwrap();
+        assert_eq!(&bytes[..], b"service unavailable");
+    }
+
+    #[tokio::test]
+    async fn error_prefix_caps_an_oversized_body_at_the_limit() {
+        // Two frames that each fit under the cap but together exceed it: the
+        // reader must stop at exactly ERROR_BODY_PREVIEW_LIMIT and abandon the
+        // rest rather than buffering the whole body.
+        let big = vec![b'x'; ERROR_BODY_PREVIEW_LIMIT];
+        let body = framed_body(vec![big.clone(), big]);
+        let bytes = read_error_body_prefix(body).await.unwrap();
+        assert_eq!(bytes.len(), ERROR_BODY_PREVIEW_LIMIT);
+    }
 
     fn binding(template: &str, fields: Vec<HttpFieldBinding>) -> HttpMethodBindingIr {
         HttpMethodBindingIr {
@@ -251,6 +315,7 @@ mod tests {
             field_bindings: fields,
             retryable: false,
             streaming: false,
+            stream_framing: StreamFraming::default(),
             optional: false,
         }
     }

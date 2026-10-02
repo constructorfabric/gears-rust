@@ -15,20 +15,19 @@
 //! | 2 candidate identifiers | here |
 //! | 3 registration policy | here (via [`RegistrationPolicy`]), for creations only |
 //! | 4 managed identifier profile | here |
-//! | 5 declared dialect | here |
+//! | 5 declared identity and dialect | here |
 //! | 6 `force` | here |
-//! | 7 ADR-0015 major-0 quarantine | **T18** — it needs the reference extractor |
+//! | 7 ADR-0015 major-0 quarantine | **the worker** — see below |
 //! | 8 canonicalize, fingerprint, idempotency | here |
 //!
-//! Step 7 is a gap by dependency: it refuses a stable candidate whose base, `$ref`
-//! or `x-gts-ref` targets include a major-0 identifier, and the extractor that
-//! finds those targets is T13's. A `TODO` marks its position between steps 6 and 8,
-//! so it lands as an insertion rather than a reordering.
-
+//! Step 7 runs in the worker over the dependency edges extracted by
+//! [`unit::evaluate`](super::unit), keeping malformed references and quarantine
+//! refusals in the admission-stage vocabulary (P16).
+//!
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use gts::{GtsId, GtsIdSegment};
+use gts::{GTS_ID_URI_PREFIX, GtsId, GtsIdSegment};
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, ScopeError};
@@ -42,22 +41,14 @@ use super::fingerprint::{
 };
 use super::{Accepted, OperationDispatch, Precondition, SubmitRequest};
 use crate::config::TypesRegistryConfig;
+use crate::domain::compat::{normalize_dialect, select_baseline};
 use crate::domain::enums::{OperationKind, OwnershipScope, Plane};
 use crate::domain::policy::{PolicyRefusal, RegistrationPolicy};
+use crate::domain::ports::metrics::{AdmissionMetrics, PassLabels, RefusalStage};
 use crate::domain::ports::{NewOperation, NewOperationItem, OperationRow, Stores};
 
 /// Largest `Idempotency-Key` the column accepts (`varchar(255)`).
 pub(crate) const MAX_IDEMPOTENCY_KEY: usize = 255;
-
-/// The canonical Draft-07 dialect, and the closed set that normalizes onto it
-/// (ADR-0014, SPEC §8.1 step 5).
-const DRAFT_07: &str = "http://json-schema.org/draft-07/schema#";
-const DRAFT_07_SPELLINGS: [&str; 4] = [
-    "http://json-schema.org/draft-07/schema#",
-    "http://json-schema.org/draft-07/schema",
-    "https://json-schema.org/draft-07/schema#",
-    "https://json-schema.org/draft-07/schema",
-];
 
 /// Why a request is refused before it becomes an operation.
 ///
@@ -84,6 +75,15 @@ pub enum AcceptanceError {
     ExplicitUuidTail { gts_id: String },
     #[error("registered Instance '{gts_id}' must name a stable version: {reason}")]
     InstanceVersionProfile { gts_id: String, reason: String },
+    #[error("Type Schema '{gts_id}' declares no string top-level $id")]
+    MissingSchemaId { gts_id: String },
+    /// The declared value is deliberately not carried: it is unbounded caller
+    /// input, checked before the document size limit, and would otherwise be
+    /// echoed into the Problem detail and the refusal log.
+    #[error(
+        "Type Schema '{gts_id}' declares a top-level $id other than '{GTS_ID_URI_PREFIX}{gts_id}'"
+    )]
+    SchemaIdMismatch { gts_id: String },
     #[error("'{gts_id}' declares no top-level $schema")]
     MissingDialect { gts_id: String },
     #[error("'{gts_id}' declares dialect '{found}', which is not the Draft-07 spelling set")]
@@ -92,6 +92,12 @@ pub enum AcceptanceError {
     ConflictingDialect { gts_id: String, path: String },
     #[error("'{gts_id}' carries no document, which a registration requires")]
     MissingContent { gts_id: String },
+    /// Never "delete if present": the only other reading of an absent version is
+    /// a deletion that races whoever last wrote the entity.
+    #[error("deleting '{gts_id}' requires a positive expected_resource_version")]
+    DeletionRequiresVersion { gts_id: String },
+    #[error("deleting '{gts_id}' takes no document, and nothing would read one")]
+    DeletionCarriesContent { gts_id: String },
     #[error("'{gts_id}' is {size} bytes, over limits.authored_document ({limit})")]
     AuthoredDocumentTooLarge {
         gts_id: String,
@@ -102,8 +108,9 @@ pub enum AcceptanceError {
     ForceNotPermitted { gts_id: String },
     #[error("force on '{gts_id}' is refused: it has no cross-minor check to waive")]
     ForceHasNothingToWaive { gts_id: String },
-    #[error("force on '{gts_id}' is not accepted until T17 implements compatibility evaluation")]
-    ForceCompatibilityUnavailable { gts_id: String },
+    /// The last segment has no readable major, so baseline selection fails.
+    #[error("'{gts_id}' names no readable major, so no compatibility baseline exists")]
+    UnreadableVersion { gts_id: String },
     #[error("minor-bearing Type Schema '{gts_id}' is content-immutable")]
     MinorTypeSchemaRevision { gts_id: String },
     #[error(
@@ -112,10 +119,6 @@ pub enum AcceptanceError {
     ZeroPrecondition { gts_id: String },
     #[error("expected_resource_version {version} on '{gts_id}' is negative")]
     NegativePrecondition { gts_id: String, version: i64 },
-    #[error("operation kind is not accepted yet: deletion arrives with T20")]
-    UnsupportedOperationKind,
-    #[error("dry_run is not accepted yet: rollback-only evaluation arrives with T20")]
-    DryRunNotAccepted,
     /// The `409` case: the key exists with a different request behind it.
     #[error(
         "Idempotency-Key is already bound to operation {operation_id} with a different request"
@@ -127,6 +130,43 @@ pub enum AcceptanceError {
     Storage(#[from] ScopeError),
     #[error("database failure during acceptance: {0}")]
     Db(#[from] DbError),
+}
+
+impl AcceptanceError {
+    /// The stable machine reason this refusal is counted and logged under.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::MissingIdempotencyKey => "missing_idempotency_key",
+            Self::IdempotencyKeyTooLong { .. } => "idempotency_key_too_long",
+            Self::EmptyBatch => "empty_batch",
+            Self::BatchTooLarge { .. } => "batch_too_large",
+            Self::InvalidIdentifier { .. } => "invalid_identifier",
+            Self::DuplicateCandidate { .. } => "duplicate_candidate",
+            Self::PolicyRefused(_) => "policy_refused",
+            Self::ExplicitUuidTail { .. } => "explicit_uuid_tail",
+            Self::InstanceVersionProfile { .. } => "instance_version_profile",
+            Self::MissingSchemaId { .. } => "missing_schema_id",
+            Self::SchemaIdMismatch { .. } => "schema_id_mismatch",
+            Self::MissingDialect { .. } => "missing_dialect",
+            Self::UnsupportedDialect { .. } => "unsupported_dialect",
+            Self::ConflictingDialect { .. } => "conflicting_dialect",
+            Self::MissingContent { .. } => "missing_content",
+            Self::DeletionRequiresVersion { .. } => "deletion_requires_version",
+            Self::DeletionCarriesContent { .. } => "deletion_carries_content",
+            Self::AuthoredDocumentTooLarge { .. } => "authored_document_too_large",
+            Self::ForceNotPermitted { .. } => "force_not_permitted",
+            Self::ForceHasNothingToWaive { .. } => "force_has_nothing_to_waive",
+            Self::UnreadableVersion { .. } => "unreadable_version",
+            Self::MinorTypeSchemaRevision { .. } => "minor_type_schema_revision",
+            Self::ZeroPrecondition { .. } => "zero_precondition",
+            Self::NegativePrecondition { .. } => "negative_precondition",
+            Self::FingerprintConflict { .. } => "fingerprint_conflict",
+            Self::Dispatch(_) => "dispatch_failure",
+            Self::Storage(_) => "storage_failure",
+            Self::Db(_) => "database_failure",
+        }
+    }
 }
 
 /// Wrapper so [`PolicyRefusal`] — which is a value, not an error — can be a
@@ -142,6 +182,8 @@ pub struct PolicyRefusalError(pub PolicyRefusal);
 pub struct AcceptanceContext<'a> {
     pub policy: &'a RegistrationPolicy,
     pub config: &'a TypesRegistryConfig,
+    /// Admission metrics.
+    pub metrics: &'a Arc<dyn AdmissionMetrics>,
 }
 
 /// A validated request: everything the transaction needs, and nothing that would
@@ -166,26 +208,22 @@ pub fn validate(
     request: &SubmitRequest,
 ) -> Result<Validated, AcceptanceError> {
     // --- step 1: envelope and batch size ---------------------------------
-    let key = request.idempotency_key.trim();
+    // An absent header and a blank one are one refusal: both leave acceptance
+    // without the key a replay would have to match.
+    let key = request
+        .idempotency_key
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
     if key.is_empty() {
         return Err(AcceptanceError::MissingIdempotencyKey);
     }
     if key.len() > MAX_IDEMPOTENCY_KEY {
         return Err(AcceptanceError::IdempotencyKeyTooLong { length: key.len() });
     }
-    if request.kind != OperationKind::Registration {
-        // Deletion has its own short protocol and its own precondition rule
-        // (T20). Refusing loudly beats accepting an operation whose rules are not
-        // implemented, which would fail later in the worker with a worse message.
-        return Err(AcceptanceError::UnsupportedOperationKind);
-    }
-    if request.dry_run {
-        // Dry Run needs a rollback-only evaluation transaction and a separate
-        // terminal-outcome write (T20). Letting it reach the ordinary creation
-        // worker makes `mark_item_succeeded` violate the dry-run result-column
-        // CHECK and strands the accepted operation in `running`.
-        return Err(AcceptanceError::DryRunNotAccepted);
-    }
+    // Registration and Deletion are the whole vocabulary; `OperationKind` is
+    // closed, so there is no third kind to refuse.
+    let deletion = request.kind == OperationKind::Deletion;
     if request.candidates.is_empty() {
         return Err(AcceptanceError::EmptyBatch);
     }
@@ -226,6 +264,11 @@ pub fn validate(
 
         // --- preconditions ------------------------------------------------
         let expected = match candidate.expected_resource_version {
+            None if deletion => {
+                return Err(AcceptanceError::DeletionRequiresVersion {
+                    gts_id: id.id().to_owned(),
+                });
+            }
             None => Precondition::MustNotExist,
             Some(0) => {
                 return Err(AcceptanceError::ZeroPrecondition {
@@ -255,20 +298,12 @@ pub fn validate(
         }
 
         // --- step 3: registration policy ---------------------------------
-        // **Creations only** (SPEC §8.1 step 3, DESIGN §3.2). The policy governs
-        // what may *appear* in a region; applying it to a revision would let closing
-        // a region freeze the entities already inside it, which is a different — and
-        // unasked-for — power.
+        // Creations only (SPEC §8.1 step 3, DESIGN §3.2). Revision and deletion
+        // require an existing entity downstream, so neither can bypass the allowlist
+        // by creating one.
         //
-        // Safe only because the declared kind is enforced downstream: a revision
-        // naming a version for an identifier the registry does not hold is refused
-        // terminally by `commit_revision`, having created nothing. Without that, the
-        // bypass would be a way past the deployment allowlist.
-        //
-        // ponytail: ceiling C6 — the bypass leaves **no** authorization on the
-        // revision path. The right control is an owner or principal check, which P0
-        // has nothing to check against. The residual exposure is recorded on
-        // `unit::commit_revision`.
+        // ponytail: ceiling C6 — neither path checks owner/principal authority in P0.
+        // See `unit::commit_revision` and `deletion::commit_deletion`.
         if expected == Precondition::MustNotExist {
             ctx.policy
                 .admits(&id, OwnershipScope::Global)
@@ -306,47 +341,61 @@ pub fn validate(
             }
         }
 
-        // --- step 5: declared dialect ------------------------------------
-        let content =
-            candidate
-                .content
-                .as_ref()
-                .ok_or_else(|| AcceptanceError::MissingContent {
+        // --- step 5: declared identity and dialect -----------------------
+        // Deletion skips document checks (steps 5 and 8). Store JSON `null` because
+        // `ck_tr_operation_item_state` requires a non-null pending payload.
+        let content = match (&candidate.content, deletion) {
+            (Some(_), true) => {
+                return Err(AcceptanceError::DeletionCarriesContent {
                     gts_id: id.id().to_owned(),
-                })?;
-        if id.is_type() {
+                });
+            }
+            (None, true) => None,
+            (Some(content), false) => Some(content),
+            (None, false) => {
+                return Err(AcceptanceError::MissingContent {
+                    gts_id: id.id().to_owned(),
+                });
+            }
+        };
+        if let Some(content) = content
+            && id.is_type()
+        {
+            check_schema_id(id.id(), content)?;
             check_dialect(id.id(), content)?;
         }
 
         // --- step 6: force ------------------------------------------------
+        // Check the deployment flag and baseline eligibility here; the worker
+        // evaluates compatibility and re-authorizes the waiver.
         if candidate.force {
             if !ctx.config.allow_compatibility_force {
                 return Err(AcceptanceError::ForceNotPermitted {
                     gts_id: id.id().to_owned(),
                 });
             }
-            if !has_cross_minor_check(&id) {
-                return Err(AcceptanceError::ForceHasNothingToWaive {
-                    gts_id: id.id().to_owned(),
-                });
+            // Use baseline selection so acceptance and evaluation agree on waiver eligibility.
+            match select_baseline(&id, expected) {
+                Ok(baseline) if baseline.waivable() => {}
+                Ok(_) => {
+                    return Err(AcceptanceError::ForceHasNothingToWaive {
+                        gts_id: id.id().to_owned(),
+                    });
+                }
+                // No baseline exists to waive, which is not the same refusal as a
+                // baseline that nothing may waive.
+                Err(unreadable) => {
+                    return Err(AcceptanceError::UnreadableVersion {
+                        gts_id: unreadable.gts_id,
+                    });
+                }
             }
-            // ponytail: ceiling C9 — T14/T17 close Checkpoints 3–4.
-            // T17 owns both the compatibility comparison and the durable
-            // `compat_forced` provenance bit. Accepting the flag before those two
-            // arrive would silently record `false` on a creation whose check was
-            // actually waived.
-            return Err(AcceptanceError::ForceCompatibilityUnavailable {
-                gts_id: id.id().to_owned(),
-            });
         }
 
-        // TODO(T18): step 7, the ADR-0015 quarantine — refuse a stable candidate
-        // whose immediate base, `$ref` or `x-gts-ref` targets include a major-0
-        // identifier. It needs T13's reference extractor, so it slots in here
-        // rather than being reordered in later.
+        // Step 7 runs in the worker over the extracted dependency edges.
 
         // --- step 8: canonicalize ----------------------------------------
-        let canonical = canonical_text(content);
+        let canonical = content.map_or_else(|| canonical_text(&Value::Null), canonical_text);
         let authored_limit = ctx.config.limits.authored_document.bytes();
         if canonical.len() > authored_limit {
             return Err(AcceptanceError::AuthoredDocumentTooLarge {
@@ -365,6 +414,9 @@ pub fn validate(
             item_no,
             gts_id: id.id().to_owned(),
             precondition: expected,
+            // The wire and ADR-0004 say `force`; the column says `compat_forced`.
+            // This is the one place the two names meet.
+            compat_forced: candidate.force,
             request_payload: canonical,
         });
     }
@@ -383,6 +435,7 @@ pub fn validate(
     Ok(Validated {
         kind: request.kind,
         dry_run: request.dry_run,
+        // Past the check above, so a plain `String`: this key exists.
         idempotency_key: key.to_owned(),
         // ponytail: ceiling C2 — the three inputs are constants in P0, so the key
         // namespace is global. See `fingerprint::P0_PRINCIPAL_ID`.
@@ -410,6 +463,44 @@ pub fn validate(
 /// Any [`AcceptanceError`], including [`AcceptanceError::FingerprintConflict`]
 /// for a key already bound to a different request.
 pub async fn accept(
+    stores: &Arc<dyn Stores>,
+    db: &DBProvider<AcceptanceError>,
+    scope: &AccessScope,
+    ctx: &AcceptanceContext<'_>,
+    dispatch: &Arc<dyn OperationDispatch>,
+    request: &SubmitRequest,
+    now: OffsetDateTime,
+) -> Result<Accepted, AcceptanceError> {
+    let accepted = accept_inner(stores, db, scope, ctx, dispatch, request, now).await;
+    // Count at the shared exit so every refusal is covered.
+    if let Err(error) = &accepted {
+        let reason = error.reason();
+        // The request's own kind and mode: a synchronous refusal has no stored item
+        // to read them from, and both are top-level fields it always carries.
+        ctx.metrics.refused(
+            RefusalStage::Acceptance,
+            reason,
+            PassLabels::new(request.kind, request.dry_run),
+        );
+        // The `warn` is for client refusals only.
+        let infrastructure = matches!(
+            error,
+            AcceptanceError::Storage(_) | AcceptanceError::Db(_) | AcceptanceError::Dispatch(_)
+        );
+        if !infrastructure {
+            tracing::warn!(
+                reason,
+                candidates = request.candidates.len(),
+                %error,
+                "types_registry refused a submission"
+            );
+        }
+    }
+    accepted
+}
+
+/// [`accept`]'s body.
+async fn accept_inner(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<AcceptanceError>,
     scope: &AccessScope,
@@ -465,26 +556,36 @@ pub async fn accept(
                 tx_stores
                     .insert_items(tx, &tx_scope, &parent, &validated.items)
                     .await?;
-                tx_dispatch
+                // Enqueue last, so any earlier failure rolls back before a wake
+                // exists: an escaped wake means the rows are about to commit.
+                let wake = tx_dispatch
                     .enqueue(tx, parent.id)
                     .await
-                    .map_err(AcceptanceError::Dispatch)?;
-                Ok(Accepted {
-                    operation_id: parent.id,
-                    replayed: false,
-                    status: parent.status,
-                })
+                    .map_err(|e| AcceptanceError::Dispatch(e.into()))?;
+                Ok((
+                    Accepted {
+                        operation_id: parent.id,
+                        replayed: false,
+                        status: parent.status,
+                    },
+                    wake,
+                ))
             })
         })
         .await;
 
     match insert {
-        Ok(accepted) => Ok(accepted),
+        Ok((accepted, wake)) => {
+            // The rows are durable now; wake the sequencer against them.
+            wake.fire();
+            Ok(accepted)
+        }
         // The unique constraint on (idempotency_scope_hash, idempotency_key) is the
         // serialization point between two concurrent acceptances — this layer has no
         // row to lock, and the read above cannot close the window. The loser re-reads
         // the winner outside the rolled-back transaction; see `load_replay`.
         Err(AcceptanceError::Storage(e)) if e.is_unique_violation() => {
+            // The transaction rolled back before `enqueue`, so no wake exists to drop.
             let winner = find_operation_by_key(stores, db, scope, &validated)
                 .await?
                 .ok_or(AcceptanceError::Storage(ScopeError::Invalid(
@@ -515,6 +616,28 @@ fn resolve_replay(
     }
 }
 
+/// Step 5. The document names the entity the item names: a Type Schema's
+/// top-level `$id` is exactly `gts://<gts_id>`.
+///
+/// `gts_id` is already canonical (step 2), so exact string equality is the
+/// canonical comparison. Nothing is trimmed or normalized: like step 2, a second
+/// spelling of the same identity is refused as ambiguous rather than repaired,
+/// and a bare `gts.` spelling is not a schema URI (GTS forbids it in `$id`).
+/// Instances are not checked: their identity lives in the item alone.
+fn check_schema_id(gts_id: &str, content: &Value) -> Result<(), AcceptanceError> {
+    let declared = content.get("$id").and_then(Value::as_str).ok_or_else(|| {
+        AcceptanceError::MissingSchemaId {
+            gts_id: gts_id.to_owned(),
+        }
+    })?;
+    if declared.strip_prefix(GTS_ID_URI_PREFIX) != Some(gts_id) {
+        return Err(AcceptanceError::SchemaIdMismatch {
+            gts_id: gts_id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Step 5. A top-level `$schema` in the closed Draft-07 set, and no differing
 /// `$schema` below the root.
 fn check_dialect(gts_id: &str, content: &Value) -> Result<(), AcceptanceError> {
@@ -538,10 +661,6 @@ fn check_dialect(gts_id: &str, content: &Value) -> Result<(), AcceptanceError> {
         });
     }
     Ok(())
-}
-
-fn normalize_dialect(declared: &str) -> Option<&'static str> {
-    DRAFT_07_SPELLINGS.contains(&declared).then_some(DRAFT_07)
 }
 
 /// The path of the first `$schema` below the root that does not normalize onto
@@ -583,20 +702,6 @@ fn conflicting_dialect_at(value: &Value, path: &str) -> Option<String> {
         }
     }
     conflicting_dialect_below(value, path)
-}
-
-/// Whether the candidate has a cross-minor compatibility check for `force` to
-/// waive: a minor-bearing segment past `M.0`, at a stable major. Request-static,
-/// which is why it belongs to acceptance — whether the waived comparison *would*
-/// have failed stays a worker decision under the family lock.
-fn has_cross_minor_check(id: &GtsId) -> bool {
-    let Some(last) = id.segments().last() else {
-        return false;
-    };
-    match (last.ver_major_opt(), last.ver_minor()) {
-        (Some(0) | None, _) | (_, None | Some(0)) => false,
-        (Some(_), Some(_)) => true,
-    }
 }
 
 /// ADR-0004 makes a minor-bearing Type Schema an immutable published contract.

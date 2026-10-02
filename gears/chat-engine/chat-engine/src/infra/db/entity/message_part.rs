@@ -56,6 +56,10 @@ pub enum MessagePartType {
     Links,
     #[sea_orm(string_value = "statuses")]
     Statuses,
+    #[sea_orm(string_value = "tool_call")]
+    ToolCall,
+    #[sea_orm(string_value = "tool_result")]
+    ToolResult,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

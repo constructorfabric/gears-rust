@@ -1,6 +1,6 @@
 //! Anthropic Messages API adapter.
 //!
-//! Implements [`LlmProvider`] using the Anthropic Messages API (`/v1/messages`).
+//! Implements [`LlmProvider`](crate::infra::llm::LlmProvider) using the Anthropic Messages API (`/v1/messages`).
 //! Translates [`LlmRequest`] to the Anthropic wire format, processes named SSE
 //! events via a stateful scan pass, and converts them to the shared
 //! `TranslatedEvent` contract.
@@ -573,18 +573,24 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
     //
     // Anthropic 4.x reasoning models reject requests that specify both
     // `temperature` and `top_p` ("cannot both be specified for this model").
-    // Treat `top_p == 1.0` (the no-op identity) as "operator left top_p alone"
-    // and forward only `temperature`. If `top_p` is genuinely tuned (< 1.0),
-    // forward `top_p` only and drop `temperature`.
+    // Treat an unset `top_p` or `top_p == 1.0` (the no-op identity) as
+    // "operator left top_p alone" and forward only `temperature` (when set).
+    // If `top_p` is genuinely tuned (< 1.0), forward `top_p` only and drop
+    // `temperature`.
     if let Some(p) = request.api_params.as_ref() {
-        if p.top_p < 1.0 {
-            body["top_p"] = serde_json::json!(p.top_p);
-            debug!(
-                top_p = p.top_p,
-                "Anthropic adapter: forwarding top_p only (temperature dropped)"
-            );
-        } else {
-            body["temperature"] = serde_json::json!(p.temperature);
+        match p.top_p {
+            Some(top_p) if top_p < 1.0 => {
+                body["top_p"] = serde_json::json!(top_p);
+                debug!(
+                    top_p,
+                    "Anthropic adapter: forwarding top_p only (temperature dropped)"
+                );
+            }
+            _ => {
+                if let Some(temperature) = p.temperature {
+                    body["temperature"] = serde_json::json!(temperature);
+                }
+            }
         }
         if !p.stop.is_empty() {
             body["stop_sequences"] = serde_json::json!(&p.stop);
@@ -653,14 +659,14 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
 
     if let Some(ref identity) = request.user_identity {
         body["metadata"] = serde_json::json!({
-            "user_id": format!("{}:{}", identity.tenant_id, identity.user_id)
+            "user_id": identity.provider_user()
         });
     }
 
     // WebSearch and CodeInterpreter map to Anthropic's native server-side
-    // tools; Function tools pass through. FileSearch is silently dropped —
-    // RAG on Anthropic is delivered via a custom function tool, not a native
-    // server tool.
+    // tools; Function tools pass through. FileSearch is dropped: Anthropic
+    // has no native file search, and the planned `search_files`/`load_files`
+    // function tools are not implemented (ADR-0007).
     let tools: Vec<serde_json::Value> = request
         .tools
         .iter()
@@ -683,7 +689,7 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
                 "name": "code_execution"
             })),
             LlmTool::FileSearch { .. } => {
-                debug!("Anthropic adapter: skipping FileSearch (handled via custom function tool)");
+                debug!("Anthropic adapter: skipping FileSearch (not supported on Anthropic)");
                 None
             }
         })
@@ -1112,6 +1118,9 @@ impl crate::infra::llm::LlmProvider for AnthropicMessagesProvider {
             }
             ServerEventsResponse::Response(resp) => {
                 let (parts, resp_body) = resp.into_parts();
+                if let Some(e) = crate::infra::llm::error_from_status(&parts) {
+                    return Err(e);
+                }
                 match resp_body.into_bytes().await {
                     Ok(bytes) => {
                         log_anthropic_error_response(
@@ -1264,6 +1273,7 @@ fn build_complete_result(
 // ════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(clippy::str_to_string)]
 mod tests {
     use oagw_sdk::sse::{FromServerEvent, ServerEvent};
@@ -2324,5 +2334,49 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["role"], "assistant");
         assert_eq!(msgs[1]["role"], "user");
+    }
+
+    fn sampling(
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        penalty: Option<f64>,
+    ) -> mini_chat_sdk::ModelApiParams {
+        mini_chat_sdk::ModelApiParams {
+            temperature,
+            top_p,
+            frequency_penalty: penalty,
+            presence_penalty: penalty,
+            stop: vec![],
+            extra_body: None,
+            reasoning_effort: None,
+        }
+    }
+
+    /// Anthropic rejects `temperature` together with `top_p`: a tuned `top_p`
+    /// (< 1.0) is sent alone; otherwise only `temperature`, when set.
+    #[test]
+    fn api_params_top_p_or_temperature() {
+        use crate::infra::llm::{LlmMessage, llm_request};
+        let body_for = |p| {
+            let r = llm_request("claude-sonnet")
+                .message(LlmMessage::user("Hi"))
+                .api_params(p)
+                .build_streaming();
+            build_request_body(&r, true)
+        };
+        let body = body_for(sampling(Some(0.5), Some(0.8), Some(0.1)));
+        assert_eq!(body["top_p"], 0.8);
+        assert!(body.get("temperature").is_none(), "{body}");
+        assert!(body.get("frequency_penalty").is_none(), "{body}");
+
+        let body = body_for(sampling(Some(0.5), Some(1.0), None));
+        assert_eq!(body["temperature"], 0.5);
+        assert!(body.get("top_p").is_none(), "{body}");
+
+        let body = body_for(sampling(None, None, None));
+        assert!(
+            body.get("temperature").is_none() && body.get("top_p").is_none(),
+            "{body}"
+        );
     }
 }

@@ -59,6 +59,19 @@ pub enum TransportError {
     #[error("network error: {0}")]
     Network(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
+    /// The client-side concurrency limiter shed this request before it left the
+    /// process: more than `max_concurrent_requests`
+    /// ([`ClientConfig::max_concurrent_requests`](crate::runtime::config::ClientConfig::max_concurrent_requests))
+    /// were already in flight.
+    ///
+    /// Deliberately **not** transient (see [`Self::is_transient`]): the request
+    /// never reached the network, so re-issuing it — especially with backoff on
+    /// an already-saturated client — would only add load. Distinct from
+    /// [`Network`](Self::Network) so a caller can tell a locally-shed request
+    /// (never sent) apart from a mid-flight reset (maybe sent).
+    #[error("client concurrency limit reached (request shed before send)")]
+    Overloaded,
+
     /// The total deadline elapsed before the response was complete.
     #[error("timeout after {0:?}")]
     Timeout(std::time::Duration),
@@ -67,9 +80,25 @@ pub enum TransportError {
     #[error("serialization error: {0}")]
     Serialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
-    /// Server-Sent Events stream error (frame parse, malformed event, etc.).
-    #[error("SSE protocol error: {0}")]
-    Sse(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// Streaming framing-protocol error: the peer's bytes do not conform to
+    /// the wire framing in use — a malformed SSE frame, a bad multipart
+    /// delimiter or part header, a part length that overruns its delimiter, an
+    /// accumulation guard trip.
+    ///
+    /// Distinct from [`TransportError::Serialization`], which is a
+    /// well-framed frame or part whose *payload* would not decode.
+    ///
+    /// Replaces an earlier SSE-only variant: naming the framing is what keeps
+    /// a fault attributable once more than one framing exists, so there is
+    /// deliberately no framing-specific variant to reach for instead.
+    #[error("{} framing error: {source}", framing.media_type())]
+    Framing {
+        /// Which wire framing produced the fault.
+        framing: crate::ir::binding::StreamFraming,
+        /// Underlying cause.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
 
     /// URL construction error (missing path parameter, invalid template).
     #[error("URL build error: {0}")]
@@ -106,13 +135,16 @@ impl TransportError {
         Self::Serialization(err.into())
     }
 
-    /// Convenience constructor for [`TransportError::Sse`] from any boxable
-    /// error. Preserves the source via `Error::source()`.
-    pub fn sse<E>(err: E) -> Self
+    /// Convenience constructor for [`TransportError::Framing`] from any
+    /// boxable error. Preserves the source via `Error::source()`.
+    pub fn framing<E>(framing: crate::ir::binding::StreamFraming, err: E) -> Self
     where
         E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
     {
-        Self::Sse(err.into())
+        Self::Framing {
+            framing,
+            source: err.into(),
+        }
     }
 
     /// Convenience constructor for [`TransportError::Unresolved`].
@@ -152,9 +184,11 @@ impl TransportError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
+            // `Framing` is transient deliberately: that classification is
+            // what makes a mid-stream framing fault reconnect-eligible.
             TransportError::Network(_)
             | TransportError::Timeout(_)
-            | TransportError::Sse(_)
+            | TransportError::Framing { .. }
             | TransportError::Unresolved { .. } => true,
             TransportError::HttpStatus { status, .. } => is_retryable_status(*status),
             #[cfg(feature = "canonical-errors")]
@@ -170,7 +204,11 @@ impl TransportError {
                     | tonic::Code::Aborted
                     | tonic::Code::ResourceExhausted
             ),
-            TransportError::Serialization(_) | TransportError::UrlBuild(_) => false,
+            // `Overloaded` is a local shed, not a network condition: retrying it
+            // adds load to an already-saturated client, so it fails fast.
+            TransportError::Serialization(_)
+            | TransportError::UrlBuild(_)
+            | TransportError::Overloaded => false,
         }
     }
 }
@@ -201,8 +239,51 @@ mod tests {
     }
 
     #[test]
+    fn overloaded_is_not_transient() {
+        // A locally-shed request never left the process; retrying it only adds
+        // load to an already-saturated client, so it must fail fast.
+        assert!(!TransportError::Overloaded.is_transient());
+    }
+
+    #[test]
     fn unresolved_is_transient() {
         assert!(TransportError::unresolved("billing").is_transient());
+    }
+
+    #[test]
+    fn framing_is_transient_for_every_framing() {
+        // Q9: a framing fault is transient on purpose — that classification is
+        // what makes it reconnect-eligible, and it must not depend on which
+        // framing faulted.
+        for framing in [
+            crate::ir::binding::StreamFraming::ServerSentEvents,
+            crate::ir::binding::StreamFraming::MultipartMixed,
+        ] {
+            assert!(
+                TransportError::framing(framing, "bad frame").is_transient(),
+                "expected {framing:?} framing errors to be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn framing_display_names_the_media_type() {
+        assert_eq!(
+            TransportError::framing(
+                crate::ir::binding::StreamFraming::MultipartMixed,
+                "bad delimiter",
+            )
+            .to_string(),
+            "multipart/mixed framing error: bad delimiter"
+        );
+        assert_eq!(
+            TransportError::framing(
+                crate::ir::binding::StreamFraming::ServerSentEvents,
+                "bad frame",
+            )
+            .to_string(),
+            "text/event-stream framing error: bad frame"
+        );
     }
 
     #[cfg(feature = "grpc-client")]

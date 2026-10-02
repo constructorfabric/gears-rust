@@ -1,11 +1,14 @@
-FROM python:3.11-slim@sha256:5be45dbade29bebd6886af6b438fd7e0b4eb7b611f39ba62b430263f82de36d2
+FROM python:3.14-slim@sha256:51dafde81dbdb6ebde285137a295cf18a47ca95234fe388a343719cb97305b3d
 
 WORKDIR /app
 
-# Copy testdata and server files
-COPY ../e2e/testdata /app/testdata
-COPY ../e2e/helpers/mock_server.py /app/mock_server.py
-COPY ../e2e/helpers/run_mock_server.py /app/run_mock_server.py
+# Copy testdata and server files.
+# Paths are relative to the build context, which docker-compose.yml sets to
+# `testing/` (context: ..). A leading `../` escapes the context and Docker
+# rejects the COPY outright.
+COPY e2e/testdata /app/testdata
+COPY e2e/helpers/mock_server.py /app/mock_server.py
+COPY e2e/helpers/run_mock_server.py /app/run_mock_server.py
 
 # Expose port 8080
 EXPOSE 8080

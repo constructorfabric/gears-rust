@@ -72,6 +72,10 @@ pub fn generate(input: DeriveInput) -> syn::Result<TokenStream> {
 
     let to_arms: Vec<TokenStream> = parsed.iter().map(|v| emit_to_arm(&ident, v)).collect();
     let from_arms: Vec<TokenStream> = parsed.iter().map(|v| emit_from_arm(&ident, v)).collect();
+    let category_arms: Vec<TokenStream> = parsed
+        .iter()
+        .map(|v| emit_category_arm(&ident, v))
+        .collect();
 
     // Optional total `From<TransportError>` (client-side reconstruction),
     // generated only when a fallback variant is designated.
@@ -84,6 +88,26 @@ pub fn generate(input: DeriveInput) -> syn::Result<TokenStream> {
     let category_path = quote! { ::toolkit_canonical_errors::ProblemCategory };
 
     Ok(quote! {
+        #[automatically_derived]
+        impl #ident {
+            /// The canonical AIP-193 [`ProblemCategory`] this variant declares
+            /// via `#[canonical(..)]`.
+            ///
+            /// Generated from the same attribute that drives
+            /// `From<Self> for Problem`, so it cannot drift from the wire
+            /// category the way a hand-written `match` beside the enum would.
+            ///
+            /// [`ProblemCategory`]: ::toolkit_canonical_errors::ProblemCategory
+            #[must_use]
+            pub fn category(&self) -> #category_path {
+                #[allow(unused_imports)]
+                use #category_path as __Cat;
+                match self {
+                    #(#category_arms),*
+                }
+            }
+        }
+
         #[automatically_derived]
         impl ::std::convert::From<#ident> for #problem_path {
             fn from(__value: #ident) -> #problem_path {
@@ -117,14 +141,23 @@ pub fn generate(input: DeriveInput) -> syn::Result<TokenStream> {
     })
 }
 
-/// Emit a **total** `From<TransportError> for MyError` (gated on the SDK
-/// `rest-client` feature) so the generated REST client reconstructs typed
-/// variants and routes un-reconstructable failures into the fallback variant.
+/// Emit a **total** `From<TransportError> for MyError` so a generated client
+/// reconstructs typed variants and routes un-reconstructable failures into the
+/// fallback variant.
 ///
 /// A `Problem` payload is first offered to `TryFrom<Problem>`; on success the
 /// exact variant is returned. On failure (unknown code/domain) or for any
 /// non-`Problem` transport error, a canonical `Problem` is routed into the
 /// fallback variant (unit → discarded; single named field → receives it).
+///
+/// Gated on the SDK carrying **either** generated-client feature. Both need
+/// this impl: `From<TransportError> for E` is what the REST and the gRPC client
+/// bodies alike call on every failure, and a gRPC-only SDK (`grpc-client`
+/// without `rest-client`, which is a legal combination — neither implies the
+/// other) would otherwise be missing it and fail to compile the moment a
+/// contract method declares a `ContractError` type. Everything the emitted body
+/// needs is present under either feature, since both pull
+/// `toolkit-contract/canonical-errors`.
 fn emit_from_transport(enum_ident: &Ident, fb: &ParsedVariant) -> syn::Result<TokenStream> {
     let support = crate::support::contract_support_path();
     let fb_ident = &fb.ident;
@@ -138,7 +171,23 @@ fn emit_from_transport(enum_ident: &Ident, fb: &ParsedVariant) -> syn::Result<To
         },
         VariantFields::Named(fields) if fields.len() == 1 => {
             let field = &fields[0];
-            quote! { #enum_ident::#fb_ident { #field: __problem } }
+            // `From::from` rather than a bare move, so the field may be either
+            // `Problem` or `Box<Problem>`: the identity `From<T> for T` and
+            // `From<T> for Box<T>` both apply, and the field's declared type
+            // drives inference. That lets an author box the payload without the
+            // derive inspecting the field's type.
+            //
+            // Worth offering, because a `Problem` is ~208 bytes and the fallback
+            // variant sets the size of the whole enum — which is the size of
+            // every `Result<_, MyError>` in the contract, tripping
+            // `clippy::result_large_err` at each generated method.
+            // `TransportError::Problem` already boxes its own `Problem` for this
+            // reason, so an unboxed fallback was the inconsistent case.
+            quote! {
+                #enum_ident::#fb_ident {
+                    #field: ::std::convert::From::from(__problem)
+                }
+            }
         }
         VariantFields::Named(_) => {
             return Err(syn::Error::new(
@@ -151,7 +200,7 @@ fn emit_from_transport(enum_ident: &Ident, fb: &ParsedVariant) -> syn::Result<To
 
     Ok(quote! {
         #[automatically_derived]
-        #[cfg(feature = "rest-client")]
+        #[cfg(any(feature = "rest-client", feature = "grpc-client"))]
         impl ::std::convert::From<#support::runtime::transport_error::TransportError> for #enum_ident {
             fn from(
                 __err: #support::runtime::transport_error::TransportError,
@@ -313,6 +362,24 @@ fn parse_variant(variant: &Variant, enum_attrs: &EnumAttrs) -> syn::Result<Parse
 // ---------------------------------------------------------------------------
 // Codegen
 // ---------------------------------------------------------------------------
+
+/// One arm of the generated `category()` accessor: `Variant { .. } =>
+/// __Cat::<Category>`. Fields are ignored — the category is per-variant, not
+/// per-value. The enum is matched in its own crate, so this is exhaustive with
+/// no wildcard even when the enum is `#[non_exhaustive]`; a new variant gets its
+/// arm automatically from the same `#[canonical(..)]` the wire conversion reads.
+fn emit_category_arm(enum_ident: &Ident, v: &ParsedVariant) -> TokenStream {
+    let variant_ident = &v.ident;
+    let category_ident = &v.category;
+    match &v.fields {
+        VariantFields::Unit => quote! {
+            #enum_ident::#variant_ident => __Cat::#category_ident
+        },
+        VariantFields::Named(_) => quote! {
+            #enum_ident::#variant_ident { .. } => __Cat::#category_ident
+        },
+    }
+}
 
 fn emit_to_arm(enum_ident: &Ident, v: &ParsedVariant) -> TokenStream {
     let variant_ident = &v.ident;

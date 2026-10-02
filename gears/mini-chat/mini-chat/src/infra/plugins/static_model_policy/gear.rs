@@ -35,6 +35,8 @@ impl Default for StaticMiniChatModelPolicyPlugin {
 impl Gear for StaticMiniChatModelPolicyPlugin {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         let cfg: StaticMiniChatPolicyPluginConfig = ctx.config_or_default()?;
+        cfg.validate()
+            .map_err(|e| anyhow::anyhow!("static model policy config: {e}"))?;
         info!(
             vendor = %cfg.vendor,
             priority = cfg.priority,

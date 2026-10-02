@@ -3,9 +3,9 @@
 Reliable async message production with per-partition ordering guarantees.
 Supports PostgreSQL, MySQL/MariaDB, and SQLite.
 
-Four-stage pipeline: enqueue (inside your transaction) -> sequencer
-(assigns per-partition sequence numbers) -> processor (calls your handler)
--> vacuum (GC). Two processing modes: transactional (exactly-once) and
+Four-stage pipeline: enqueue (inside your transaction, then flush the returned
+handle after commit) -> sequencer (assigns per-partition sequence numbers) ->
+processor (calls your handler) -> vacuum (GC). Two processing modes: transactional (exactly-once) and
 leased (at-least-once with lease-based locking and framework-managed
 cancellation).
 
@@ -126,17 +126,41 @@ let handle = Outbox::builder(db)
 
 ### Enqueue (inside a business transaction)
 
+A submission is built, not constructed as a literal: everything checkable
+without the database is checked while it is built, so a rejected submission has
+issued no statement.
+
+Enqueue is atomic with your business logic, but it does **not** wake the
+sequencer on its own: it returns a `Wake` that must be flushed *after*
+the transaction commits. `outbox::in_transaction` owns that contract — it runs
+the closure in a transaction and flushes the handle only if the commit succeeds,
+so no call site holds a handle across the commit boundary:
+
 ```rust
 let outbox = handle.outbox();
-// Atomic with your business logic:
-outbox.enqueue( & txn, "orders", partition, payload, "application/json").await?;
 
-// Batch enqueue:
-outbox.enqueue_batch( & txn, "orders", & [
-EnqueueMessage { partition: 0, payload: p1, payload_type: "application/json" },
-EnqueueMessage { partition: 1, payload: p2, payload_type: "application/json" },
-]).await?;
+// Enqueue inside the closure and hand the resulting handle back; in_transaction
+// flushes it after the commit. Several enqueues in one unit of work combine
+// with `+=` into a single handle.
+outbox::in_transaction(&db, |txn| Box::pin(async move {
+    let mut pending = outbox.enqueue(txn, Record::to("orders", partition)
+        .payload(payload, "application/json")
+        .build()?).await?;
+
+    // A batch states the queue and the payload type once:
+    wake += outbox.enqueue_batch(txn, Records::to("orders")
+        .payload_type("application/json")
+        .push(0, first)
+        .push(1, second)
+        .push_with_type(2, legacy, "application/vnd.legacy+json")
+        .build()?).await?;
+
+    Ok(((), wake))
+})).await?;
 ```
+
+A batch is all-or-nothing: one entity that breaks a rule rejects the whole
+submission, and nothing is written.
 
 ### Multi-queue with tuning
 
@@ -161,6 +185,151 @@ handle.stop().await;
 
 ---
 
+## Traces: being told when a batch is done
+
+Submit a batch under a trace, and the outbox tells you once every entity in it
+has reached a terminal state - handler success or permanent rejection. The
+batch is the unit: you are told once, not per message.
+
+```rust
+// Subscribe before the transaction commits. A completion cannot precede that
+// commit, so registering first means nothing can be missed.
+let waiting = outbox.subscribe("import-2026-09-08")?;
+
+// in_transaction flushes after the commit, so the sequencer wakes promptly -
+// otherwise completion would wait on the cold reconciler.
+outbox::in_transaction(&db, |txn| Box::pin(async move {
+    orders_repo.insert(txn, &orders).await?;
+    let pending = outbox.enqueue_batch(txn, Records::to("orders")
+        .payload_type("application/json")
+        .trace("import-2026-09-08")
+        .push(0, first)
+        .push(1, second)
+        .build()?).await?;
+    Ok(((), wake))
+})).await?;
+
+match waiting.completion().await {
+    Some(outcome) if outcome.is_clean() => info!(entities = outcome.entities, "all delivered"),
+    Some(outcome) => warn!(failures = outcome.failures, "batch finished with failures"),
+    // This process can no longer answer - it was stopped, for instance.
+    // The trace row still can; see `trace_status` below.
+    None => {}
+}
+```
+
+Dropping the subscription releases it and issues no statement. A trace is
+optional per submission: a batch that names none records nothing and costs
+nothing.
+
+The trace is your own id and must be unique per batch - use a UUID or similar.
+The outbox does not detect or resolve collisions: if two live batches share a
+trace, completion delivery and retry reporting cannot tell them apart, so one
+batch finishing can resolve the other's subscriber. Keeping traces unique is the
+caller's responsibility.
+
+### The completion goes to the instance that submitted it
+
+Any instance may process the work, because partitions are leased rather than
+owned. Only the instance that submitted the batch is told. Two marks make that
+work, with two different owners:
+
+| mark | who sets it | means |
+|---|---|---|
+| `completed_at` | whichever instance acks the last entity | the work is done |
+| `notified_at` | only the submitting instance | you have been told |
+
+When the submitting instance is also the one that finishes the work - the
+common case, and every single-instance deployment - the ack delivers the
+completion itself and no notification query runs at all. Otherwise the
+submitter collects it, and an instance with nothing outstanding issues no query
+either.
+
+There is nothing to configure for this. Each running outbox generates its own
+identity, which only has to be unique among *running* processes: a restarted
+process holds no subscription for a completion to be delivered to, so a stable
+name would buy nothing. Mail addressed to a process that is gone is collected
+by the sweep, and a restarted process asks `trace_status` instead.
+
+### Being told when a batch is stuck
+
+A subscription is one channel of state: `InFlight`, `Retrying` while a handler
+keeps failing one entity, and finally `Completed`. `completion()` awaits just
+the result; `next()` yields every change, so you hear about retries while the
+batch is in flight:
+
+```rust
+let mut sub = outbox.subscribe("import-2026-09-08")?;
+while let Some(state) = sub.next().await {
+    match state {
+        TraceState::Retrying { attempts, last_error, .. } =>
+            warn!(attempts, error = ?last_error, "import is stuck"),
+        TraceState::Completed(outcome) => { handle(outcome); break; }
+        TraceState::InFlight => {} // moving again
+    }
+}
+```
+
+Or hand a callback to `watch_trace` (completion only) or `watch_trace_events`
+(every state); both run on a spawned task and return a `TraceWatch` guard that
+stops the watch when dropped:
+
+```rust
+let _guard = outbox.watch_trace("import-2026-09-08", |outcome| match outcome {
+    Some(o) if o.is_clean() => info!("done"),
+    Some(o)                 => warn!(failures = o.failures, "done with failures"),
+    None                    => { /* process gone; read trace_status */ }
+})?;
+```
+
+The outbox decides nothing about what a retry means, which is the point - a
+batch retrying for ten seconds against a rate-limited API is healthy, and the
+same batch retrying for an hour is not.
+
+Following state changes is what makes an instance look for retries. A caller
+that only awaits the completion never does, and an instance whose callers all do
+that issues no retry query at all.
+
+### Asking instead of waiting
+
+The trace row outlives both the messages it describes and the process that
+submitted them, so it is also the durable answer after a restart:
+
+```rust
+if let Some(status) = outbox.trace_status(&conn, "import-2026-09-08").await? {
+    if status.is_retrying() {
+        // A batch stuck retrying rather than merely slow: `attempts`,
+        // `retrying_since` and `last_error` say why and for how long.
+        warn!(attempts = status.attempts, since = ?status.retrying_since, "import stuck");
+    }
+}
+```
+
+`retrying_since` keeps the *first* retry time rather than the latest attempt, so
+what you read is how long it has been stuck. Progress clears it.
+
+Which entities failed is answerable too: a dead letter carries the trace it
+belonged to, so the failures of one batch can be listed without deserializing
+any payload.
+
+### Trace rows are collected when they are finished
+
+The sweep reads **one table**: liveness comes from the trace row's own fields,
+so a five-minute background sweep never touches the body or dead-letter tables.
+
+| condition | action |
+|---|---|
+| delivered, no failures, past `retention` | collected |
+| completed but never collected, past `orphan_after` | collected: the owner is evidently gone |
+| delivered **with** failures, past `leftover_after` | collected: a dead letter outlives the delivery it failed, so its trace has to outlive the dead letter |
+| never completed, past `leftover_after` | collected |
+
+The last rule is worth knowing about: a trace whose handler has been retrying
+for longer than `leftover_after` is collected even though its messages still
+exist, and `trace_status` then answers `None` for it. The window is seven days
+by default, so this means a handler that has made no progress for a week. The
+messages themselves are untouched - only the notification aid is.
+
 ## Use-Case Scenarios
 
 ### Handler makes a remote HTTP call
@@ -169,9 +338,11 @@ The most common case. Implement `LeasedMessageHandler` - one message, one
 result. Use `HttpClient` from `cf-gears-toolkit-http` for the outgoing call.
 
 **Cancellation is framework-managed.** The processor drops the handler
-future when the lease cancel point is reached (`lease_duration - ack_headroom`).
-In-flight `HttpClient` calls are cancelled via drop - hyper closes the
-connection.
+future when the lease cancel point is reached (`lease_duration - ack_headroom`),
+or `WorkerTuning::stop_grace` (default 5s) after `stop()`, whichever comes
+first. Shutdown never waits out the lease. In-flight `HttpClient` calls are
+cancelled via drop - hyper closes the connection. The ack still runs after a
+drop, so the unfinished message is retried and the partition is released.
 
 ```rust
 use toolkit_db::outbox::{LeasedMessageHandler, MessageResult, OutboxMessage};
@@ -266,7 +437,9 @@ use toolkit_db::outbox::{Batch, HandlerResult, LeasedHandler};
 #[async_trait::async_trait]
 impl LeasedHandler for BulkExportHandler {
     async fn handle(&self, batch: &mut Batch<'_>) -> HandlerResult {
-        while !batch.is_empty() {
+        // should_stop() turns true once the lease budget is spent or the
+        // outbox is shutting down; acked chunks are kept, the rest retried.
+        while !batch.is_empty() && !batch.should_stop() {
             let chunk = batch.next_chunk(10);
             if chunk.is_empty() {
                 break;

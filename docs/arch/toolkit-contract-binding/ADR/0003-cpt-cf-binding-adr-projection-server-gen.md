@@ -299,8 +299,12 @@ pub trait BillingApiGrpc: BillingApi {
 * `#[server_manual]` on a projection method excludes that method from `register_<name>_routes()`
   while keeping it in the client and the binding IR. The author writes a manual `OperationBuilder`
   call and composes it with the generated function.
-* ADR-0002 scope is preserved: union bodies, multipart, response headers, and per-status schemas
-  still require a manual `impl Base for MyClient`; the macro does not gain new coverage.
+* ADR-0002 scope is preserved: union bodies, `multipart/form-data` requests and general multipart
+  document assembly, response headers, and per-status schemas still require a manual
+  `impl Base for MyClient`; the macro does not gain new coverage. The one narrowing since is
+  ADR-0002's own amendment: `multipart/mixed` **response streaming** — one JSON item per part,
+  selected by `#[streaming(multipart_mixed)]` — is in scope for the *client* and the binding IR.
+  Its server side is still hand-written, like SSE's.
 
 #### Attribute shape: bare marker vs. `#[rest(...)]` group
 
@@ -315,6 +319,13 @@ The rule for choosing:
   a tag string, a license scope). Grouping these under one attribute keeps the method signature quiet
   when several are set and namespaces them as projection config rather than contract semantics. A bare
   flag gains nothing from the group, so it stays out of it.
+
+A marker may take an argument of its own without becoming `#[rest(...)]` config, where that argument
+is *intrinsic to what the marker means* rather than orthogonal projection configuration:
+`#[streaming(sse | multipart_mixed)]` selects the stream's wire framing, and a stream has no meaning
+apart from a framing — which is why the framing parameterises `#[streaming]` instead of joining the
+`#[rest(...)]` group, where it would read as an independently-settable knob that could be present
+without a stream or absent with one.
 
 Rationale: the existing `#[get("…")]` / `#[streaming]` / `#[retryable]` vocabulary already splits this
 way (value-carrying verb vs. bare markers); the rule just makes the split explicit and forward-looking.
@@ -347,10 +358,14 @@ actually builds (the macro crate is `toolkit-contract-macros`, attribute `#[tool
   via `Json` (first non-ctx/non-path param on POST/PUT), remaining params via `Query`. The handler
   calls `svc.method(ctx, ..).await.map(Json)`; the error type (`CanonicalError`) renders the RFC 9457
   `Problem` via its existing `IntoResponse`.
-* **Streaming (SSE) generation is deferred.** A `#[streaming]` method that is *not*
-  `#[server_manual]` raises a `compile_error!` directing the author to opt out and register it by
-  hand. The `api-contracts` PoC marks `list_payments` `#[server_manual]` and keeps the existing
-  hand-written SSE route.
+* **Streaming server-handler generation is deferred, for every framing.** A `#[streaming]` method
+  that is *not* `#[server_manual]` raises a `compile_error!` directing the author to opt out and
+  register it by hand. This is unchanged by the framing selector: `#[streaming(multipart_mixed)]`
+  gets a generated *client* and binding IR, and its server side is registered by hand via
+  `OperationBuilder::multipart_json` plus `toolkit::http::multipart::MultipartJsonStream`, exactly
+  as SSE's is via `sse_json`. That is the intended shape until handler generation is picked up, not
+  an interim measure. The `api-contracts` PoC marks its streaming methods `#[server_manual]` and
+  keeps the hand-written routes.
 * **PoC migration is hybrid**: `api-contracts` registers `charge` + `get_invoice` via the generated
   function and `list_payments` via a manual `register_manual_routes()` chained on the same router,
   composed by `register_routes()`.
@@ -363,7 +378,8 @@ actually builds (the macro crate is `toolkit-contract-macros`, attribute `#[tool
   feature-independently — by the delegating default methods, rather than by the separate `const _`
   witness blocks the DESIGN sketched.
 * **Not yet implemented** (follow-up): doc-comment → `summary`/`description` extraction,
-  `#[rest(...)]` grouped attributes (`status`, `tag`, `license`), and streaming-handler generation.
+  `#[rest(...)]` grouped attributes (`status`, `tag`, `license`), and streaming-handler generation
+  (for SSE and `multipart/mixed` alike — the client and IR sides of both are done).
   `operation_id`/`tag` currently use a generated default (`<trait_snake>_<method>`) rather than
   `<module>.<method>`.
 

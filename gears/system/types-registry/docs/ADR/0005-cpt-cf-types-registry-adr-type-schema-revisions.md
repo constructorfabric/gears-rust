@@ -68,7 +68,6 @@ This ADR does not define concrete table names, route paths, cache transport, rev
 | Admission candidate | Proposed canonical content undergoing validation before initial admission or before it can replace the current revision. It is not yet a Schema revision. |
 | Candidate status | Per-candidate workflow and outcome state — `pending`, `running`, `succeeded`, `unchanged`, or `failed` under ADR-0012 — distinct from operation progress and logical-entity Lifecycle Status. |
 | Revision number | A server-assigned monotonically increasing integer scoped to one logical Type Schema. |
-| Content hash | A digest of the canonical schema content used to bind validation, idempotency, and diagnostics to exact bytes or canonical semantics. |
 | Dependency revision vector | The exact revisions or equivalent freshness tokens of registered dependencies used while validating a candidate. It is in-flight concurrency-control state held for the duration of one validation attempt, not part of the admitted revision. |
 
 ## Decision Drivers
@@ -97,12 +96,12 @@ Chosen option: every admitted managed GTS Type Schema definition is an immutable
 * Initial successful admission atomically creates the logical Type Schema in lifecycle `ACTIVE`, creates revision `1`, and makes it current.
 * Each subsequent successful content update allocates the next monotonically increasing revision number for that logical Type Schema.
 * Revision numbering is scoped to the logical entity and never to a major. **A minor-bearing Type Schema is immutable under ADR-0004**, so it is admitted with revision `1` and never allocates another: it accepts no content update, its current-revision pointer never moves, and the model here applies to it as the degenerate case of one revision. What continues across the minors of a major is the compatibility chain of ADR-0003, not the numbering, and each minor counts from `1` because each is a separate logical entity. Everything below therefore describes a major-only entity unless it says otherwise.
-* A revision contains at least the logical entity reference, revision number, canonical content, content hash, creation and admission metadata, the GTS specification and platform GTS implementation versions in force when it was admitted, and whether ADR-0004's `force` waived its compatibility check. The versions are **admission-engine provenance rather than verdict provenance**: they are present on every revision, including the ones admitted with no comparison at all — a first admission, an `M.0`, and any major-0 candidate — and where a comparison did happen they are also the rules that produced it. The waiver records the same category of fact, that the verdict was not reached, and the waiver is recorded because it is the one property of the minor-version profile derivable from neither the identifier nor the retained content.
+* A revision contains at least the logical entity reference, revision number, canonical content, creation and admission metadata, the GTS specification and platform GTS implementation versions in force when it was admitted, and whether ADR-0004's `force` waived its compatibility check. The versions are **admission-engine provenance rather than verdict provenance**: they are present on every revision, including the ones admitted with no comparison at all — a first admission, an `M.0`, and any major-0 candidate — and where a comparison did happen they are also the rules that produced it. The waiver records the same category of fact, that the verdict was not reached, and the waiver is recorded because it is the one property of the minor-version profile derivable from neither the identifier nor the retained content.
 * A revision does **not** retain the dependency revision vector it was validated against, nor the effective artifacts that resolution produced. **Nothing reads the admission-time resolution**: compatibility compares a candidate against its baseline, and no P1 operation looks backwards at all. Reconstructing a retained revision's historical resolved form would reproduce a shape no consumer ever validated against, since resolution has since moved with its dependencies.
 * Revision numbers are allocated only when admission succeeds. Only a `succeeded` candidate allocates one; a `pending`, `running`, `failed`, or `unchanged` candidate is not an admitted revision and consumes no revision number — `unchanged` because its content already equals the current revision (ADR-0012).
-* Once created, revision content, revision number, and content hash are immutable.
+* Once created, revision content and revision number are immutable.
 * The logical Type Schema owns a current-revision pointer. Ordinary resolving returns only the current revision unless an authorized management or CI operation explicitly requests history.
-* Re-submitting content whose canonical content hash equals the current revision is an idempotent no-op and does not allocate a new revision.
+* Re-submitting content whose canonical form is byte-for-byte equal to the current revision's canonical content is an idempotent no-op and does not allocate a new revision. No digest stands in for that comparison.
 * Re-submitting content equal to an older non-current revision is a new update. If admitted, it allocates a new monotonically increasing revision rather than moving the current pointer backward.
 
 ### Admission and compatibility
@@ -114,7 +113,7 @@ An admission candidate becomes an admitted revision and current only after:
 3. derivation-chain, `$ref`, `x-gts-ref`, ownership, and lifecycle rules succeed;
 4. every affected registered dependent in the transitive dependency closure remains valid under the candidate and the exact dependency revision vector;
 5. every registered GTS Instance whose Type Schema dependency can be affected remains valid under ADR-0006;
-6. when P2 Validation Hooks are enabled and a required binding matches, every selected owning-gear semantic validator accepts the same candidate content hash;
+6. when P2 Validation Hooks are enabled and a required binding matches, every selected owning-gear semantic validator accepts exactly the candidate canonical content being admitted — admission re-checks that the content it commits is byte-for-byte the content the validator accepted;
 7. optimistic concurrency and dependency freshness preconditions still hold at commit time.
 
 Types Registry must not automatically rewrite dependent `$ref` values or create derived Type Schemas. Revalidation proves whether the existing floating dependency remains safe; an owner-driven update is required when a dependent definition itself must change.
@@ -153,7 +152,7 @@ Before initial admission there is no public logical Type Schema and no entity Li
 Ordinary Type Schema resolution returns:
 
 * stable GTS ID and Registry Reference;
-* current content hash and the freshness validator;
+* the freshness validator;
 * lifecycle and tenant availability metadata.
 
 This list is the **default field projection**: what an ordinary read returns when the caller selects nothing. Field selection follows OData, so a caller may narrow below it as well as reach past it. What is never returned unasked is the schema documents — the authored definition, the resolved effective schema, and the trait artifacts are large and are not returned unless asked for, because the batch and discovery paths dominate and would otherwise transfer them by default.
@@ -167,7 +166,7 @@ The revision number is deliberately absent from the P1 contract. No operation ac
 * conditional reads take the validator;
 * ordinary resolution cannot select historical revisions.
 
-Exposing an unusable number invites comparison across installations whose counters are unrelated. Content hash is the portable diagnostic handle because equal content hashes equally anywhere.
+Exposing an unusable number invites comparison across installations whose counters are unrelated. The canonical content itself, selected explicitly, is the portable comparison handle: equal canonical content compares equal anywhere, with no digest to trust.
 
 Revision numbers remain internal identity, foreign-key targets, and ordering. They return to the contract only with a revision-history surface that accepts them.
 
@@ -209,7 +208,7 @@ This decision is confirmed when:
 * a minor-bearing Type Schema is numbered `1` and is checked against the preceding minor, while any content update submitted for it is refused and allocates no revision;
 * an update whose target `resource_version` changed after the caller read it fails `precondition_failed` and creates no revision, while a dependency that moved during validation is revalidated rather than reported to the caller;
 * a lifecycle transition that creates no content revision still advances `resource_version`, so an update prepared before it is rejected;
-* ordinary resolution returns the current content hash and the freshness validator while domain references remain logical, and returns no revision number, since §*Resolution, caching, and historical access* keeps it out of the contract;
+* ordinary resolution returns the freshness validator while domain references remain logical, and returns no revision number, since §*Resolution, caching, and historical access* keeps it out of the contract;
 * dependency-closure and registered-Instance validation are exercised before a base or referenced schema revision becomes current;
 * P2 hook tests cover initial admission and content revisions, including Version Successor admission, which under ADR-0008 changes no other member of its family and therefore triggers no further hook;
 * rollback is documented as P2 and a future rollback creates a new monotonically increasing revision.
@@ -266,8 +265,8 @@ This decision directly addresses:
 * `cpt-cf-types-registry-fr-validate-schema-compat` - records the check baseline and the rule versions used, so a superseded verdict can be identified later.
 * `cpt-cf-types-registry-fr-validate-type-derivation` - revalidates derivation chains against the exact dependency revisions used for admission.
 * `cpt-cf-types-registry-fr-ref-tracking` - revalidates the affected dependency closure against exact revision baselines.
-* `cpt-cf-types-registry-fr-validation-hooks` - binds P2 owning-gear validation to the exact candidate content hash before admission.
-* `cpt-cf-types-registry-fr-cache-freshness-metadata` - provides the per-entity revision and content hash that validate a resolution result.
+* `cpt-cf-types-registry-fr-validation-hooks` - binds P2 owning-gear validation to the exact candidate canonical content before admission.
+* `cpt-cf-types-registry-fr-cache-freshness-metadata` - provides the per-entity revision state that validates a resolution result.
 * `cpt-cf-types-registry-fr-two-phase-init` - defines the per-schema candidate, initial revision, and publication semantics used by the dependency-aware partial batch admission of ADR-0012.
 * `cpt-cf-types-registry-nfr-multi-pod-correctness` - requires atomic current-revision publication after commit.
 * `cpt-cf-types-registry-usecase-validate-type-evolution` - makes CI compatibility and dependency reports reproducible against retained revisions.

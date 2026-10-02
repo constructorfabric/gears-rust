@@ -75,8 +75,14 @@ async fn aborts_on_unterminated_line_exceeding_max_size() {
         parse_sse_stream::<Item, _, _>(s).collect().await;
     assert_eq!(parsed.len(), 1, "expected exactly one terminal error item");
     assert!(
-        matches!(parsed[0], Err(TransportError::Sse(_))),
-        "expected TransportError::Sse, got {:?}",
+        matches!(
+            parsed[0],
+            Err(TransportError::Framing {
+                framing: StreamFraming::ServerSentEvents,
+                ..
+            })
+        ),
+        "expected a ServerSentEvents framing error, got {:?}",
         parsed[0]
     );
 }

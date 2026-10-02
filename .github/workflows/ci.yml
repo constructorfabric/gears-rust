@@ -63,10 +63,10 @@ jobs:
       ci:     ${{ steps.filter.outputs.ci }}
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Detect changed paths
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
@@ -119,7 +119,7 @@ jobs:
       RUSTFLAGS: "-C debuginfo=0"
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
           android: true
@@ -129,10 +129,10 @@ jobs:
           swap-storage: true
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 
@@ -148,7 +148,7 @@ jobs:
           rustup show
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-hack
 
@@ -208,7 +208,7 @@ jobs:
     steps:
       - name: Free disk space
         if: runner.os == 'Linux'
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
           android: true
@@ -225,15 +225,21 @@ jobs:
           git config --global core.eol lf
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 
       - name: Validate gear naming conventions
         run: python3 tools/scripts/validate_gear_names.py
+
+      - name: Validate PR-review rule set
+        run: python3 tools/scripts/toolkit-pr-review/lint.py
+
+      - name: PR-review script tests
+        run: python3 -m unittest discover -s tools/scripts/toolkit-pr-review/tests
 
       - name: Validate packaging metadata (readme/license-file paths)
         run: make check-packaging-metadata
@@ -253,7 +259,7 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: nextest
 
@@ -305,7 +311,7 @@ jobs:
       RUSTFLAGS: "-C debuginfo=0"
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
           android: true
@@ -315,10 +321,10 @@ jobs:
           swap-storage: true
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 
@@ -334,7 +340,7 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: nextest
 
@@ -372,6 +378,12 @@ jobs:
       - name: Test postgres-cluster-plugin (pg integration)
         run: make test-cluster-pg
 
+      - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
+        # k3s runs in a **privileged** container (testcontainers-modules sets it);
+        # GitHub-hosted ubuntu runners permit that. The target uses `cargo test`, not
+        # nextest, so one k3s container is shared per test binary -- see the Makefile.
+        run: make test-cluster-k8s
+
       - name: Test resource-group (pg smoke, integration)
         # Fail if Docker is unreachable instead of letting the suite skip itself
         # into a green step that asserted nothing.
@@ -393,14 +405,31 @@ jobs:
       - name: Test coord with Postgres (integration)
         run: make test-coord-pg
 
+      - name: Test redis-cluster-plugin (redis integration)
+        run: make test-cluster-redis
+
       - name: Test toolkit-db (sqlite integration)
         run: make test-sqlite
 
       - name: Test toolkit-db (pg integration)
         run: make test-pg
 
+      - name: Test toolkit-db (pgq unit + PG19 integration)
+        # Compiles and runs everything behind the `pgq` feature — the secure
+        # graph builder, its unit suites and the trybuild guards — and the
+        # PostgreSQL 19 integration suite. Locally that suite skips itself while
+        # the pre-GA PG19 image is unavailable; here the skip is a failure, so
+        # the isolation suite cannot pass green and empty (see
+        # libs/test-containers::graph_lane_required).
+        env:
+          GEARS_TEST_PG_GRAPH_REQUIRED: "1"
+        run: make test-pgq
+
       - name: Test toolkit-db (mysql integration)
         run: make test-mysql
+
+      - name: Test types-registry (db integration)
+        run: make test-types-registry-db
 
   test-fips:
     name: FIPS verification (${{ matrix.os }})
@@ -422,7 +451,7 @@ jobs:
     steps:
       - name: Free disk space
         if: runner.os == 'Linux'
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
           android: true
@@ -439,10 +468,10 @@ jobs:
           git config --global core.eol lf
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 
@@ -460,7 +489,7 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: nextest
 
@@ -544,7 +573,7 @@ jobs:
       ONNXRUNTIME_SHA256: "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba"
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -559,14 +588,14 @@ jobs:
           rustup show
 
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-magika
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Probe sccache & set RUSTC_WRAPPER
         shell: bash
@@ -594,7 +623,7 @@ jobs:
         run: cargo test -p cf-gears-file-parser --features magika
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-deny@0.20.2
 
@@ -617,7 +646,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain from rust-toolchain.toml
         run: |
@@ -626,7 +655,7 @@ jobs:
 
       # Install tools via prebuilt binaries for speed.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-deny@0.20.2
 
@@ -649,7 +678,7 @@ jobs:
       id-token: write
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
           android: true
@@ -659,10 +688,10 @@ jobs:
           swap-storage: true
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 
@@ -670,7 +699,7 @@ jobs:
         uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
-          components: llvm-tools-preview
+          components: llvm-tools-preview, rust-src
 
       # Override rust-toolchain.toml (which pins stable) for all cargo
       # commands in this job.
@@ -685,11 +714,29 @@ jobs:
           shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-llvm-cov, nextest
 
       # Generate lcov.info for upload. Customize flags/features as needed.
+      #
+      # The instrumented passes are accumulated (`--no-report`) into one target
+      # dir and merged into a single lcov.info at the end (`report`):
+      #
+      #   1. `nextest --workspace` — the whole workspace at default features.
+      #   2. The redis-cluster-plugin integration suites. These live behind
+      #      `required-features = ["integration"]`.
+      #   3. The postgres-cluster-plugin integration suites. These live behind
+      #      `required-features = ["integration"]`. Keep in sync with
+      #      `test-cluster-pg`.
+      #   4. The k8s-cluster-plugin L2/L3 k3s suites. These live behind
+      #      `required-features = ["integration"]`.
+      #
+      # The per-binary k3s loop (one container per binary, cleaned between —
+      # nextest's process-per-test would start ~70 of them) lives in the
+      # `coverage-cluster-k8s` Makefile target so this step stays readable; it
+      # inherits this step's CARGO_LLVM_COV_* env and accumulates into the same
+      # session. Keep it in sync with `test-cluster-k8s`.
       - name: Coverage (lcov)
         env:
           RUSTFLAGS: "-C debuginfo=0 --cfg coverage_nightly"
@@ -697,7 +744,18 @@ jobs:
           CARGO_LLVM_COV_BUILD_DIR: llvm-cov-build
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
+          # Pass 1: whole workspace, default features. Accumulate, don't report.
+          cargo llvm-cov nextest --workspace --no-report
+          # Pass 2: redis-cluster-plugin integration suites (real Redis via
+          # testcontainers).
+          cargo llvm-cov nextest --no-report -p cf-redis-cluster-plugin --features integration --retries 1
+          # Pass 3: postgres-cluster-plugin integration suites (real Postgres
+          # via testcontainers).
+          cargo llvm-cov nextest --no-report -p cf-postgres-cluster-plugin --features integration --retries 1
+          # Pass 4: k8s-cluster-plugin k3s suites
+          make coverage-cluster-k8s
+          # Merge into the single report that gets uploaded.
+          cargo llvm-cov report --lcov --output-path lcov.info
 
       # Upload LCOV report as a GitHub Actions artifact so it is always
       # available, even when Codecov is unavailable or rejects the upload.
@@ -718,7 +776,7 @@ jobs:
       # disable_search prevents auto-discovery of unrelated files (e.g.
       # coverage_guard.rs) — only lcov.info is sent.
       - name: Upload to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           use_oidc: ${{ github.event_name != 'pull_request' }}
           files: lcov.info
@@ -730,12 +788,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 

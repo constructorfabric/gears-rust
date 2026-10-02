@@ -14,8 +14,8 @@ date: 2026-04-07
 ## Context and Problem Statement
 
 ToolKit gears are independently deployable units. In Profile 3 (K8s Native), each gear runs as a separate pod and
-needs a Helm chart for packaging, configuration, and deployment. The platform also needs a way to deploy a full set of
-gears (Flight Control + system gears + application gears) as a cohesive system. How should we organize Helm charts
+needs a Helm chart for packaging, configuration, and deployment. The platform also needs a way to deploy a full system
+— the Flight Control control plane plus application gears — as a cohesive whole. How should we organize Helm charts
 so that (a) each gear is deployable standalone, (b) the full platform can be installed in one command, (c) charts are
 DRY (no duplicated templates), and (d) users with existing k8s clusters can easily adapt and extend the charts?
 
@@ -79,8 +79,8 @@ chart), while remaining publishable to OCI registries.
 ### Confirmation
 
 * CI validation: `helm lint` and `helm template` pass for every gear chart and the umbrella chart.
-* Integration test: `helm install toolkit-platform` with `values-minimal.yaml` successfully deploys Flight Control +
-  api-gateway + authn-resolver in a test k8s cluster.
+* Integration test: `helm install toolkit-platform` with `values-minimal.yaml` successfully deploys the Flight Control
+  control plane (directory + edge + authn) in a test k8s cluster.
 * New gear check: a newly scaffolded gear's chart renders correctly with only `Chart.yaml`, `values.yaml`, and 2-3
   template files that include `toolkit-common` helpers.
 

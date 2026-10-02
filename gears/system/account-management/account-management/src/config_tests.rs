@@ -1,10 +1,115 @@
 use super::*;
+use crate::domain::bootstrap::BootstrapConfig;
+use crate::domain::root_type::RootTypeConfig;
+use toolkit_gts::gts_id;
+use uuid::Uuid;
+
+const ROOT_TYPE: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.platform.v1~");
+const OTHER_ROOT_TYPE: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.alternate.v1~");
+
+fn root_type(idp_provisioning: bool) -> RootTypeConfig {
+    RootTypeConfig {
+        gts_id: gts::GtsTypeId::new(ROOT_TYPE),
+        idp_provisioning,
+    }
+}
+
+fn bootstrap() -> BootstrapConfig {
+    BootstrapConfig {
+        root_id: Uuid::from_u128(1),
+        root_name: "root".to_owned(),
+        ..BootstrapConfig::default()
+    }
+}
 
 #[test]
 fn default_validates_clean() {
     AccountManagementConfig::default()
         .validate()
         .expect("default config must always validate; it is the production fallback");
+}
+
+#[test]
+fn independent_root_type_resolves_without_bootstrap() {
+    let cfg = AccountManagementConfig {
+        root_tenant_type: Some(root_type(false)),
+        ..AccountManagementConfig::default()
+    };
+    assert_eq!(
+        cfg.resolved_root_type().expect("valid"),
+        cfg.root_tenant_type
+    );
+}
+
+#[test]
+fn deprecated_bootstrap_root_type_is_migrated() {
+    let cfg = AccountManagementConfig {
+        bootstrap: Some(BootstrapConfig {
+            root_tenant_type: Some(gts::GtsTypeId::new(ROOT_TYPE)),
+            root_tenant_type_idp_provisioning: Some(true),
+            ..bootstrap()
+        }),
+        ..AccountManagementConfig::default()
+    };
+    assert_eq!(
+        cfg.resolved_root_type().expect("legacy config"),
+        Some(root_type(true))
+    );
+}
+
+#[test]
+fn modern_and_legacy_root_type_id_conflict_is_fatal() {
+    let cfg = AccountManagementConfig {
+        root_tenant_type: Some(root_type(false)),
+        bootstrap: Some(BootstrapConfig {
+            root_tenant_type: Some(gts::GtsTypeId::new(OTHER_ROOT_TYPE)),
+            root_tenant_type_idp_provisioning: Some(false),
+            ..bootstrap()
+        }),
+        ..AccountManagementConfig::default()
+    };
+    let error = cfg
+        .validate()
+        .expect_err("GTS ID conflict must fail globally");
+    assert_eq!(
+        error,
+        format!(
+            "account-management configuration is invalid: root_tenant_type.gts_id `{ROOT_TYPE}` conflicts with deprecated bootstrap.root_tenant_type `{OTHER_ROOT_TYPE}`"
+        )
+    );
+}
+
+#[test]
+fn modern_and_legacy_idp_provisioning_conflict_is_fatal() {
+    let cfg = AccountManagementConfig {
+        root_tenant_type: Some(root_type(true)),
+        bootstrap: Some(BootstrapConfig {
+            root_tenant_type: Some(gts::GtsTypeId::new(ROOT_TYPE)),
+            root_tenant_type_idp_provisioning: Some(false),
+            ..bootstrap()
+        }),
+        ..AccountManagementConfig::default()
+    };
+    let error = cfg
+        .validate()
+        .expect_err("IdP provisioning conflict must fail globally");
+    assert_eq!(
+        error,
+        "account-management configuration is invalid: root_tenant_type.idp_provisioning=true conflicts with deprecated bootstrap.root_tenant_type_idp_provisioning=false"
+    );
+}
+
+#[test]
+fn bootstrap_without_root_type_is_fatal_even_when_nonstrict() {
+    let cfg = AccountManagementConfig {
+        bootstrap: Some(bootstrap()),
+        ..AccountManagementConfig::default()
+    };
+    let error = cfg.validate().expect_err("schema contract is mandatory");
+    assert!(
+        error.contains("bootstrap requires root_tenant_type.gts_id"),
+        "{error}"
+    );
 }
 
 #[test]

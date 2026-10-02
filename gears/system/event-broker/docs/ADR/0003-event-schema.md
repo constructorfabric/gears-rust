@@ -114,7 +114,7 @@ A top-level publish-input field `meta` (marked `writeOnly`) carries producer-pro
 - **Transport-agnostic**: same shape over REST, gRPC, message-queue replay, or file import. No header/body split per transport.
 - **Stripped on read**: the public read API does NOT echo `meta` to consumers. Storage MAY retain `meta` for audit; the read projection layer strips it. The `writeOnly` marker makes this contract explicit in the schema.
 
-`meta` namespacing eliminates the body↔header duplication that an HTTP-header design (`Producer-Id` header vs. `event.producer_id` body field) would create — there is only one canonical location for each field.
+`meta` namespacing gives every producer-protocol field exactly one canonical location in the body, shared unchanged across every transport.
 
 ### Field-Level Changes
 
@@ -239,7 +239,7 @@ The decision is verified by:
 
 * Good, because external interop is "free" — CloudEvents consumers can read events without translation
 * Good, because the field set is normalized against a public standard
-* Bad, because broker-specific concerns (topic identity, partition, idempotent-producer chain) need to be expressed as CloudEvents extensions — adds attribute-name boilerplate (`io.cyberfabric.broker.topic`) for every internal field
+* Bad, because broker-specific concerns (topic identity, partition, idempotent-producer chain) need to be expressed as CloudEvents extensions — adds attribute-name boilerplate (`io.constructorfabric.broker.topic`) for every internal field
 * Bad, because the per-direction surface still needs the marker treatment; CloudEvents conformance does not solve the input/output problem
 * Bad, because CloudEvents-conformance cost is paid on every event on every code path, against a hypothetical future requirement; YAGNI
 * Bad, because future CloudEvents-spec changes become broker-version dependencies

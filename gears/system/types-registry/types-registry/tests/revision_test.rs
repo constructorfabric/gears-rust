@@ -29,8 +29,11 @@ use toolkit_gts::gts_id;
 use uuid::Uuid;
 
 use types_registry::config::{PolicyEntry, TypesRegistryConfig};
+use types_registry::domain::admission::AdmissionFailureReason;
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
-use types_registry::domain::admission::worker::{OperationOutcome, WorkerError};
+use types_registry::domain::admission::worker::{
+    OperationOutcome, Tuning, WorkerError, run_operation,
+};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
 use types_registry::domain::policy::RegistrationPolicy;
@@ -40,7 +43,7 @@ use types_registry::infra::storage::entity::{
 use types_registry::infra::storage::repo::EntityRepo;
 
 mod common;
-use common::{allow_all, run_operation, stores, test_db};
+use common::{allow_all, stores, test_db};
 
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-18 10:20:40 UTC);
@@ -54,8 +57,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -101,10 +108,11 @@ async fn submit_with(
         &AcceptanceContext {
             policy,
             config: &config,
+            metrics: &common::metrics(),
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: Some(key.to_owned()),
             kind: domain_enums::OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
@@ -136,9 +144,21 @@ async fn admit(
     let op = submit_with(db, &policy, key, gts_id, content, expected_resource_version)
         .await
         .expect("accepted");
-    run_operation(&stores(), &worker(db), &allow_all(), op, LATER)
-        .await
-        .expect("the worker itself must not fail")
+    run_operation(
+        &stores(),
+        &worker(db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+            allow_compatibility_force: false,
+        },
+        op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail")
 }
 
 /// Every `type_schema_revision` row of one entity, in revision order.
@@ -251,6 +271,9 @@ async fn an_instance_revises_and_re_records_its_schema_revision() {
     admit(&db, "type", CF_TYPE, schema(CF_TYPE, "t"), None).await;
     admit(&db, "i1", CF_INSTANCE, json!({ "name": "first" }), None).await;
 
+    let revised_type = admit(&db, "type-2", CF_TYPE, schema(CF_TYPE, "revised"), Some(1)).await;
+    assert_eq!(revised_type.items[0].revision_no, Some(2));
+
     let outcome = admit(&db, "i2", CF_INSTANCE, json!({ "name": "second" }), Some(1)).await;
 
     let item = &outcome.items[0];
@@ -272,8 +295,8 @@ async fn an_instance_revises_and_re_records_its_schema_revision() {
     assert_eq!(revisions.len(), 2);
     assert!(revisions[1].canonical_value.contains("second"));
     assert_eq!(
-        revisions[1].type_schema_revision_no, 1,
-        "the schema has not moved, so both values were validated against revision 1",
+        revisions[1].type_schema_revision_no, 2,
+        "the changed value records the revised conforming schema",
     );
 
     let current = instance::Entity::find()
@@ -306,7 +329,7 @@ async fn a_stale_expected_resource_version_fails_terminally_and_writes_nothing()
     assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
     assert_eq!(
         item.failure.as_ref().expect("a recorded failure").reason,
-        "precondition_failed",
+        AdmissionFailureReason::PreconditionFailed,
     );
     assert_eq!(item.revision_no, None);
 
@@ -330,7 +353,7 @@ async fn a_precondition_on_an_absent_entity_is_refused_rather_than_created() {
     assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
     assert_eq!(
         item.failure.as_ref().expect("a recorded failure").reason,
-        "precondition_failed",
+        AdmissionFailureReason::PreconditionFailed,
     );
 
     let provider = worker(&db);
@@ -376,25 +399,27 @@ async fn a_revision_is_refused_on_a_tombstoned_entity() {
     );
     let after_delete = resource_version_of(&db, CF_TYPE).await;
 
-    // The precondition names the version the deletion left behind, so nothing but
-    // the lifecycle can refuse this.
-    let outcome = admit(
-        &db,
-        "k2",
-        CF_TYPE,
-        schema(CF_TYPE, "second"),
-        Some(after_delete),
-    )
-    .await;
+    // Both an old GET's version and the tombstone's current version must identify
+    // withdrawal, rather than advising the caller to retry with a newer version.
+    for expected in [entity.resource_version, after_delete] {
+        let outcome = admit(
+            &db,
+            &format!("revision-{expected}"),
+            CF_TYPE,
+            schema(CF_TYPE, "second"),
+            Some(expected),
+        )
+        .await;
 
-    let item = &outcome.items[0];
-    assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
-    assert_eq!(
-        item.failure.as_ref().expect("a recorded failure").reason,
-        "entity_deleted",
-        "a withdrawn entity is not a stale version, and must not be reported as one",
-    );
-    assert_eq!(item.revision_no, None);
+        let item = &outcome.items[0];
+        assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
+        assert_eq!(
+            item.failure.as_ref().expect("a recorded failure").reason,
+            AdmissionFailureReason::EntityDeleted,
+            "a withdrawn entity is not a stale version, and must not be reported as one",
+        );
+        assert_eq!(item.revision_no, None);
+    }
 
     let entity_id = entity_id_of(&db, CF_TYPE).await;
     assert_eq!(
@@ -447,6 +472,68 @@ async fn an_instance_value_equal_to_its_current_revision_is_unchanged() {
     assert_eq!(resource_version_of(&db, CF_INSTANCE).await, 1);
 }
 
+/// An identical Instance resubmission retains its schema-revision pointer after
+/// a compatible type revision. A title edit moves the schema without changing validation.
+#[tokio::test]
+async fn unchanged_instance_is_not_revalidated_against_a_new_conforming_schema() {
+    let db = test_db().await;
+    admit(&db, "type", CF_TYPE, schema(CF_TYPE, "t"), None).await;
+    admit(&db, "value", CF_INSTANCE, json!({ "name": "first" }), None).await;
+
+    // A title edit preserves compatibility while advancing the type to revision 2.
+    let changed_type = admit(
+        &db,
+        "type-revised",
+        CF_TYPE,
+        schema(CF_TYPE, "retitled"),
+        Some(1),
+    )
+    .await;
+    assert_eq!(
+        changed_type.items[0].status,
+        domain_enums::OperationItemStatus::Succeeded,
+        "{:?}",
+        changed_type.items[0].failure,
+    );
+    assert_eq!(changed_type.items[0].revision_no, Some(2));
+
+    let outcome = admit(
+        &db,
+        "same",
+        CF_INSTANCE,
+        json!({ "name": "first" }),
+        Some(1),
+    )
+    .await;
+    let item = &outcome.items[0];
+    assert_eq!(
+        item.status,
+        domain_enums::OperationItemStatus::Unchanged,
+        "{item:?}"
+    );
+    assert_eq!(item.resource_version, Some(1));
+    assert_eq!(item.revision_no, None);
+
+    let id = entity_id_of(&db, CF_INSTANCE).await;
+    let revisions = instance_revision::Entity::find()
+        .filter(instance_revision::Column::EntityId.eq(id))
+        .secure()
+        .scope_with(&allow_all())
+        .all(&db.conn().expect("conn"))
+        .await
+        .expect("revisions");
+    assert_eq!(
+        revisions.len(),
+        1,
+        "no second Instance revision was written"
+    );
+    assert_eq!(
+        revisions[0].type_schema_revision_no, 1,
+        "the recorded revision is the one that validated the value, not the type's \
+         current one",
+    );
+}
+
 /// ADR-0005: content equal to an **older, non-current** revision is a new update.
 /// It allocates a new revision rather than moving the current pointer backwards.
 #[tokio::test]
@@ -467,7 +554,7 @@ async fn content_equal_to_an_older_revision_creates_a_new_revision() {
     let revisions = schema_revisions(&db, entity_id).await;
     assert_eq!(revisions.len(), 3);
     assert_eq!(
-        revisions[0].content_hash, revisions[2].content_hash,
+        revisions[0].raw_schema, revisions[2].raw_schema,
         "the fixture really is the same content under a new revision number",
     );
 }
@@ -485,7 +572,7 @@ async fn a_creation_of_existing_content_is_already_exists_and_never_unchanged() 
     assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
     assert_eq!(
         item.failure.as_ref().expect("a recorded failure").reason,
-        "already_exists",
+        AdmissionFailureReason::AlreadyExists,
     );
 }
 
@@ -512,9 +599,21 @@ async fn a_revision_survives_a_region_the_policy_has_since_closed() {
     )
     .await
     .expect("the open policy admits the creation");
-    run_operation(&stores(), &worker(&db), &allow_all(), created, LATER)
-        .await
-        .expect("admission");
+    run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+            allow_compatibility_force: false,
+        },
+        created,
+        LATER,
+    )
+    .await
+    .expect("admission");
 
     // The region is closed from here on.
     let outcome = {
@@ -528,9 +627,21 @@ async fn a_revision_survives_a_region_the_policy_has_since_closed() {
         )
         .await
         .expect("a revision bypasses the policy gate");
-        run_operation(&stores(), &worker(&db), &allow_all(), op, LATER)
-            .await
-            .expect("admission")
+        run_operation(
+            &stores(),
+            &worker(&db),
+            &allow_all(),
+            Tuning {
+                limits: &common::limits(),
+                worker: &common::worker_settings(),
+                metrics: &common::metrics(),
+                allow_compatibility_force: false,
+            },
+            op,
+            LATER,
+        )
+        .await
+        .expect("admission")
     };
     assert_eq!(
         outcome.items[0].status,

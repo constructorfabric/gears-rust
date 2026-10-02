@@ -1,3 +1,4 @@
+use crate::sequence::Sequence;
 use std::time::Duration;
 use toolkit_gts::{GTS_ID_PREFIX, gts_id};
 
@@ -6,6 +7,15 @@ use uuid::Uuid;
 use super::*;
 use crate::error::EventBrokerError;
 use crate::ids::{ConsumerGroupId, EventTypeId, TopicId};
+use gts::{GtsIdPattern, GtsInstanceId};
+
+fn ginst(id: impl AsRef<str>) -> GtsInstanceId {
+    GtsInstanceId::try_new(id.as_ref()).expect("valid GTS instance id")
+}
+
+fn gpat(id: impl AsRef<str>) -> GtsIdPattern {
+    GtsIdPattern::try_new(id.as_ref()).expect("valid GTS pattern")
+}
 
 struct NoSecurityContextHandler;
 
@@ -72,14 +82,16 @@ fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
     let payload = serde_json::json!({ "order_id": "order-1" });
     let raw = RawEvent {
         id: Uuid::new_v4(),
-        type_id: gts_id!("cf.core.events.event.v1~example.orders.order_created.x.v1~").to_owned(),
-        topic: topic.to_owned(),
+        type_id: gts::GtsTypeId::new(gts_id!(
+            "cf.core.events.event.v1~example.orders.order_created.x.v1~"
+        )),
+        topic: gts::GtsInstanceId::try_new(topic).unwrap(),
         tenant_id: Uuid::new_v4(),
         subject: "order-1".to_owned(),
-        subject_type: "order".to_owned(),
+        subject_type: gts::GtsTypeId::new("gts.x.eb.test.subject.v1~"),
         partition: 3,
-        sequence: 42,
-        offset: 42,
+        sequence: Sequence::assigned(42),
+        offset: Sequence::assigned(42),
         occurred_at: chrono::Utc::now(),
         sequence_time: chrono::Utc::now(),
         trace_parent: Some("00-test".to_owned()),
@@ -96,23 +108,16 @@ fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
     assert_eq!(record.topic_id, Some(topic_id));
     assert_eq!(record.topic, topic);
     assert_eq!(record.partition, 3);
-    assert_eq!(record.offset, 42);
+    assert_eq!(record.offset, Sequence::assigned(42));
     assert_eq!(record.payload, payload);
     assert_eq!(record.reason, "schema mismatch");
     assert_eq!(record.attempts, Some(2));
 }
 
 #[test]
-fn refs_convert_from_resolved_ids() {
-    let topic_id = TopicId::new(Uuid::new_v4());
-    let event_type_id = EventTypeId::new(Uuid::new_v4());
+fn consumer_group_ref_converts_from_resolved_id() {
     let group_id = ConsumerGroupId::new(Uuid::new_v4());
 
-    assert_eq!(TopicRef::from(topic_id), TopicRef::Id(topic_id));
-    assert_eq!(
-        EventTypeRef::from(event_type_id),
-        EventTypeRef::Id(event_type_id)
-    );
     assert_eq!(
         ConsumerGroupRef::from(group_id),
         ConsumerGroupRef::Id(group_id)
@@ -122,14 +127,14 @@ fn refs_convert_from_resolved_ids() {
 #[test]
 fn subscription_interest_builder_keeps_types_and_filter_per_topic() {
     let interest = SubscriptionInterest::builder()
-        .topic(TopicRef::gts(gts_id!(
+        .topic(ginst(gts_id!(
             "cf.core.events.topic.v1~example.orders.x.x.v1"
         )))
         .types([
-            EventTypeRef::gts(gts_id!(
+            gpat(gts_id!(
                 "cf.core.events.event.v1~example.orders.order_created.x.v1~"
             )),
-            EventTypeRef::gts_pattern(format!(
+            gpat(format!(
                 "{GTS_ID_PREFIX}cf.core.events.event.v1~example.orders.*"
             )),
         ])
@@ -139,7 +144,7 @@ fn subscription_interest_builder_keeps_types_and_filter_per_topic() {
 
     assert_eq!(
         interest.topic,
-        TopicRef::gts(gts_id!("cf.core.events.topic.v1~example.orders.x.x.v1"))
+        gts_id!("cf.core.events.topic.v1~example.orders.x.x.v1")
     );
     assert_eq!(interest.event_types.len(), 2);
     assert_eq!(
@@ -151,7 +156,7 @@ fn subscription_interest_builder_keeps_types_and_filter_per_topic() {
 #[test]
 fn subscription_interest_builder_rejects_missing_required_fields() {
     let missing_topic = SubscriptionInterest::builder()
-        .types([EventTypeRef::gts_pattern(format!(
+        .types([gpat(format!(
             "{GTS_ID_PREFIX}cf.core.events.event.v1~example.orders.*"
         ))])
         .build()
@@ -162,7 +167,7 @@ fn subscription_interest_builder_rejects_missing_required_fields() {
     ));
 
     let missing_types = SubscriptionInterest::builder()
-        .topic(TopicRef::gts(gts_id!(
+        .topic(ginst(gts_id!(
             "cf.core.events.topic.v1~example.orders.x.x.v1"
         )))
         .build()
@@ -179,10 +184,8 @@ fn cel_filter_uses_broker_filter_engine_ref() {
 
     assert_eq!(filter.expression, "event.data.amount > 100");
     assert_eq!(
-        filter.engine,
-        FilterEngineRef::gts(gts_id!(
-            "cf.core.events.filter.v1~cf.core.expression.cel.v1"
-        ))
+        filter.engine.as_ref(),
+        gts_id!("cf.core.events.filter.v1~cf.core.expression.cel.v1")
     );
 }
 

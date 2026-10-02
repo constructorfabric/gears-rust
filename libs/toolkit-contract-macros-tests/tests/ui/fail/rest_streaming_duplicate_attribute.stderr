@@ -1,0 +1,5 @@
+error: duplicate `#[streaming]` attribute: a streaming method declares it exactly once (all framing and open selectors go in that one attribute)
+  --> tests/ui/fail/rest_streaming_duplicate_attribute.rs:20:5
+   |
+20 |     #[streaming(sse, open = immediate)]
+   |     ^

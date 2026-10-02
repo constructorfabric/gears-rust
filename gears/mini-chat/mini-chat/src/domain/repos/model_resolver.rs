@@ -21,6 +21,17 @@ pub trait ModelResolver: Send + Sync {
         model: Option<String>,
     ) -> Result<ResolvedModel, DomainError>;
 
+    /// Resolve the model an existing chat is locked to.
+    ///
+    /// Unlike [`Self::resolve_model`], a globally disabled model is returned
+    /// as-is so the quota cascade can downgrade it (`model_disabled`).
+    /// Fails with `InvalidModel` only when the model is gone from the catalog.
+    async fn resolve_chat_model(
+        &self,
+        user_id: Uuid,
+        model_id: &str,
+    ) -> Result<ResolvedModel, DomainError>;
+
     /// List all globally enabled models visible to the user.
     async fn list_visible_models(&self, user_id: Uuid) -> Result<Vec<ResolvedModel>, DomainError>;
 

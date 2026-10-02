@@ -46,4 +46,28 @@ pub trait PaymentApiRest: PaymentApi {
         ctx: SecurityContext,
         filter: ListPaymentsFilter,
     ) -> Result<PaymentSummary, CanonicalError>;
+
+    // The same items over the second framing, with a fallible open. Two
+    // declarations do all the work:
+    //
+    // - `#[streaming(multipart_mixed)]` puts `Accept: multipart/mixed` on the
+    //   connect request and selects the runtime's multipart reader, which takes
+    //   the boundary from the response's `Content-Type`. A bare `#[streaming]`
+    //   still means SSE, so `list_payments` above is untouched.
+    // - `async fn` (from the base trait's shape) makes the open awaited and
+    //   fallible. Because the boundary lookup happens at open time too, a
+    //   multipart open can still fail *after* a `200`.
+    //
+    // `#[server_manual]` for the same reason as `list_payments`: streaming
+    // *handler* generation is deferred for every framing, so the route is
+    // registered by hand with `OperationBuilder::multipart_json` and
+    // `toolkit::http::multipart::MultipartJsonStream`. See `register_feed_routes`.
+    #[get("/payments/feed")]
+    #[streaming(multipart_mixed, open = fallible)]
+    #[server_manual]
+    async fn stream_payments(
+        &self,
+        ctx: SecurityContext,
+        filter: ListPaymentsFilter,
+    ) -> Result<PaymentSummary, toolkit_canonical_errors::CanonicalError>;
 }

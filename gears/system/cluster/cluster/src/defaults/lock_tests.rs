@@ -158,6 +158,57 @@ async fn blocking_lock_waits_then_acquires_on_release() {
     assert_eq!(acquired.name(), "ledger");
 }
 
+#[tokio::test]
+async fn blocking_lock_acquires_uncontended_over_a_watchless_cache() {
+    // A cache that serves no exact watch (features().watch == false, watch()
+    // -> Unsupported) must not fail a blocking lock(). The pre-fix code
+    // subscribed *before* the first claim, so even an uncontended acquisition
+    // failed at that `?`. Now the wait degrades to bounded polling. Regression
+    // for the live redis `watch_mode: disabled` bug (plan D3).
+    let cache = MemoryCache::linearizable_without_watch();
+    let Ok(backend) = CasBasedDistributedLockBackend::new(cache) else {
+        panic!("linearizable cache must construct");
+    };
+    let Ok(guard) = backend
+        .lock("ledger", Duration::from_secs(30), Duration::from_secs(30))
+        .await
+    else {
+        panic!("uncontended blocking lock must acquire without a cache watch");
+    };
+    assert_eq!(guard.name(), "ledger");
+}
+
+#[tokio::test]
+async fn blocking_lock_polls_to_acquire_over_a_watchless_cache() {
+    // Contended: with no watch to wake on, the waiter must poll the claim on the
+    // bounded interval and acquire once the holder releases.
+    let cache = MemoryCache::linearizable_without_watch();
+    let Ok(backend) = CasBasedDistributedLockBackend::new(cache) else {
+        panic!("linearizable cache must construct");
+    };
+    let backend = Arc::new(backend);
+    let Ok(guard) = backend.try_lock("ledger", Duration::from_secs(30)).await else {
+        panic!("first holder acquires");
+    };
+    let waiter_backend = Arc::clone(&backend);
+    let waiter = tokio::spawn(async move {
+        waiter_backend
+            .lock("ledger", Duration::from_secs(30), Duration::from_secs(30))
+            .await
+    });
+    // Let the waiter block (its first claim contends), then release; the waiter
+    // acquires on its next poll rather than on a watch event.
+    settle().await;
+    assert!(guard.release().await.is_ok());
+    let Ok(joined) = waiter.await else {
+        panic!("waiter task must join");
+    };
+    let Ok(acquired) = joined else {
+        panic!("waiter must acquire after release via polling");
+    };
+    assert_eq!(acquired.name(), "ledger");
+}
+
 #[tokio::test(start_paused = true)]
 async fn blocking_lock_on_unusable_watch_fails_fast_without_spinning() {
     // A backend whose `watch` ends immediately on every subscribe would make
@@ -543,6 +594,142 @@ async fn acquire_waiting_takes_the_lease_when_the_incumbent_lapses() {
     settle().await;
     let Ok(Ok(taken)) = waiter.await else {
         panic!("the waiter must take the lease once it lapses");
+    };
+    assert!(
+        taken.fence > held.fence,
+        "and it must fence its predecessor"
+    );
+}
+
+// Watchless wait policy (§3.11, plan D3) — the poll-fallback helpers and the two
+// failure/steal exits of a watchless blocking `lock()`.
+
+#[test]
+fn watchless_poll_interval_is_floored_and_jittered() {
+    use super::{WATCHLESS_POLL_INTERVAL, watchless_poll_interval};
+    // U(base, 2*base): a floor of one full base (so a poll never degenerates into
+    // a spin) plus up to one base of jitter. Draw a handful and check the range.
+    let base = WATCHLESS_POLL_INTERVAL;
+    for _ in 0..64 {
+        let d = watchless_poll_interval(base);
+        assert!(d >= base, "never below the one-interval floor: {d:?}");
+        assert!(d < 2 * base, "never at or above 2x base: {d:?}");
+    }
+}
+
+#[test]
+fn grow_watchless_doubles_then_saturates_at_the_cap() {
+    use super::{WATCHLESS_POLL_INTERVAL, WATCHLESS_POLL_INTERVAL_CAP, grow_watchless};
+    // Doubles while below the cap.
+    assert_eq!(
+        grow_watchless(WATCHLESS_POLL_INTERVAL),
+        WATCHLESS_POLL_INTERVAL * 2
+    );
+    // Saturates at the cap and never exceeds it, however many times grown.
+    let mut base = WATCHLESS_POLL_INTERVAL;
+    for _ in 0..16 {
+        base = grow_watchless(base);
+        assert!(
+            base <= WATCHLESS_POLL_INTERVAL_CAP,
+            "never past the cap: {base:?}"
+        );
+    }
+    assert_eq!(base, WATCHLESS_POLL_INTERVAL_CAP, "reaches the cap");
+    assert_eq!(
+        grow_watchless(WATCHLESS_POLL_INTERVAL_CAP),
+        WATCHLESS_POLL_INTERVAL_CAP,
+        "and stays there"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn next_wait_step_watchless_classifies_tick_vs_elapse() {
+    use super::{WATCHLESS_POLL_INTERVAL, WaitStep, next_wait_step};
+    let base = WATCHLESS_POLL_INTERVAL;
+    // `wait >= 2*base`: the jittered poll is always strictly below `wait`, so the
+    // step is a poll tick → Retry (deterministic despite jitter).
+    let wide = 4 * base;
+    assert!(
+        matches!(next_wait_step(None, base, wide).await, WaitStep::Retry),
+        "a poll shorter than the budget is a retry tick"
+    );
+    // `wait <= base`: the poll clamps to `wait` (jitter >= base >= wait), consuming
+    // the whole budget → Elapsed (deterministic).
+    let tight = base / 2;
+    assert!(
+        matches!(next_wait_step(None, base, tight).await, WaitStep::Elapsed),
+        "a poll that consumes the whole budget is an elapse"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocking_lock_times_out_when_held_over_a_watchless_cache() {
+    // The only failure exit of the watchless wait is `poll == wait ⇒ Elapsed ⇒
+    // LockTimeout`. With no watch to wake on, the waiter polls the claim against a
+    // lock held past its own patience and must still time out on time.
+    let cache = MemoryCache::linearizable_without_watch();
+    let Ok(backend) = CasBasedDistributedLockBackend::new(cache) else {
+        panic!("linearizable cache must construct");
+    };
+    let backend = Arc::new(backend);
+    // Held with a long TTL so it is never reaped during the test.
+    let Ok(_held) = backend.try_lock("ledger", Duration::from_secs(100)).await else {
+        panic!("hold the lock");
+    };
+    let waiter_backend = Arc::clone(&backend);
+    let waiter = tokio::spawn(async move {
+        waiter_backend
+            .lock("ledger", Duration::from_secs(100), Duration::from_secs(1))
+            .await
+    });
+    // Advance past the acquisition timeout; the polling waiter bounds out.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let Ok(joined) = waiter.await else {
+        panic!("waiter task must join");
+    };
+    assert!(
+        matches!(joined, Err(ClusterError::LockTimeout { ref name, .. }) if name == "ledger"),
+        "a watchless waiter must time out via polling, got {joined:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocking_lock_steals_a_lapsed_lease_over_a_watchless_cache() {
+    // A lapsing lease writes nothing, so even a native watch sees no event — the
+    // waiter wakes itself at the incumbent's deadline. Over a watchless cache the
+    // same steal must land off the poll timer: the watchless twin of
+    // `acquire_waiting_takes_the_lease_when_the_incumbent_lapses`.
+    let cache = MemoryCache::linearizable_without_watch();
+    let Ok(backend) = CasBasedDistributedLockBackend::new(cache)
+        .map(CasBasedDistributedLockBackend::with_virtual_clock)
+    else {
+        panic!("construct");
+    };
+    let Ok(held) = backend
+        .acquire("ledger", "owner-a", Duration::from_secs(5))
+        .await
+    else {
+        panic!("acquire");
+    };
+    // The holder "crashes" — no release, no renewal.
+    let waiter = tokio::spawn({
+        let backend = Arc::new(backend);
+        let handle = Arc::clone(&backend);
+        async move {
+            handle
+                .acquire_waiting(
+                    "ledger",
+                    "owner-b",
+                    Duration::from_secs(5),
+                    Duration::from_secs(30),
+                )
+                .await
+        }
+    });
+    tokio::time::advance(Duration::from_secs(6)).await;
+    settle().await;
+    let Ok(Ok(taken)) = waiter.await else {
+        panic!("the waiter must take the lease once it lapses, off the poll timer");
     };
     assert!(
         taken.fence > held.fence,

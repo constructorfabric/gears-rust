@@ -29,7 +29,7 @@ pub mod rest;
 pub mod rest_v2;
 
 pub use contract::{PaymentApi, PaymentStream, payment_api_ir};
-pub use error::{PaymentError, PaymentResourceError};
+pub use error::PaymentResourceError;
 pub use rest::{PaymentApiRest, payment_api_rest_http_binding};
 
 #[cfg(feature = "rest-client")]

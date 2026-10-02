@@ -120,22 +120,74 @@ impl From<WireCacheConsistency> for CacheConsistency {
     feature = "grpc-client",
     proto_bridge(stub = "crate::grpc::stubs::profile::WireCacheFeatures")
 )]
+// Matches the domain twin `CacheFeatures`: a wire mirror expected to grow fields
+// (this one just gained `watch`) must stay `#[non_exhaustive]` so the next
+// addition is additive for out-of-crate constructors, not a breaking change.
+#[non_exhaustive]
 pub struct WireCacheFeatures {
     /// Whether the backend natively supports prefix watches.
     pub prefix_watch: bool,
+    /// Whether the backend supports exact-key watches. `None` from a peer that
+    /// predates this field (an older server), decoded as `true` — every backend
+    /// served exact watch before the field existed, so absence means "supported"
+    /// rather than the proto3 default of `false`.
+    pub watch: Option<bool>,
+}
+
+impl WireCacheFeatures {
+    /// Builds a wire value directly, including the `watch: None` shape an old peer
+    /// (one predating the `watch` field) sends.
+    ///
+    /// [`From<CacheFeatures>`](CacheFeatures) is the encode path and can only ever
+    /// emit `watch: Some(_)`, and `#[non_exhaustive]` blocks out-of-crate struct
+    /// literals — so this is the only way for another crate (a decode test, a
+    /// hand-built descriptor) to construct the absent-watch wire shape the decoder
+    /// is designed around.
+    #[must_use]
+    pub fn new(watch: Option<bool>, prefix_watch: bool) -> Self {
+        Self {
+            prefix_watch,
+            watch,
+        }
+    }
 }
 
 impl From<CacheFeatures> for WireCacheFeatures {
     fn from(value: CacheFeatures) -> Self {
         Self {
-            prefix_watch: value.prefix_watch,
+            prefix_watch: value.prefix_watch(),
+            watch: Some(value.watch()),
         }
     }
 }
 
 impl From<WireCacheFeatures> for CacheFeatures {
     fn from(value: WireCacheFeatures) -> Self {
-        Self::new(value.prefix_watch)
+        // Absent (`None`) means an old peer that predates the field: it served
+        // exact watch, so decode to `true` rather than the proto3 default.
+        let watch = value.watch.unwrap_or(true);
+        // Enforce the `without_watch()` invariant at the wire trust boundary — a
+        // backend that cannot watch one key cannot watch a family of them — so a
+        // skewed or hand-crafted peer that pairs `watch: Some(false)` with
+        // `prefix_watch: true` is normalized to the honest state rather than
+        // admitted as the impossible one the domain constructors forbid. A
+        // conforming peer never sends it (`CacheFeatures` is constructor-only),
+        // so this only ever narrows a malformed input. Routing through the
+        // constructors (rather than a struct literal) is also what upholds the
+        // invariant now that the fields are private.
+        //
+        // The narrowing is intentionally silent *here* — this is a pure, hot
+        // conversion run on every descriptor decode, and the narrowing is
+        // harmless unless a consumer actually requires `PrefixWatch`. When it
+        // does, `validate_cache_capabilities_from` logs the contradiction (a raw
+        // `prefix_watch: true` that decoded to false) next to the resulting
+        // `CapabilityNotMet`, so an operator chasing a skewed peer has a trace at
+        // the point the requirement fails rather than on every decode.
+        if watch {
+            CacheFeatures::new(value.prefix_watch)
+        } else {
+            CacheFeatures::without_watch()
+        }
     }
 }
 

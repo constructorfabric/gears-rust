@@ -69,7 +69,7 @@ async fn main() -> Result<(), ClusterError> {
     };
     println!(
         "resolved cache: consistency={consistency}, prefix_watch={}",
-        cache.features().prefix_watch
+        cache.features().prefix_watch()
     );
 
     // 3. Versioned writes and reads.

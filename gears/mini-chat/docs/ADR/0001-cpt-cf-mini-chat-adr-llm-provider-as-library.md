@@ -38,9 +38,9 @@ Chosen option: "Library crate", because `llm_provider` has no independent lifecy
 
 ### Confirmation
 
-* Code review: `llm_provider` is a Rust crate with `mini_chat_service` as its only dependent
-* No `Dockerfile`, no `main.rs`, no health endpoint in the `llm_provider` crate
-* Cancellation integration test: verify `CancellationToken` propagates from `mini_chat_service` to `llm_provider`'s HTTP client abort
+* Code review: `llm_provider` is the in-crate module `mini-chat/src/infra/llm` (one adapter per provider kind, see `cpt-cf-mini-chat-adr-multi-provider-adapters`) and is used only by the Mini Chat gear
+* No `Dockerfile`, no `main.rs`, no health endpoint for `llm_provider`
+* Cancellation: unit tests `cancellation_stops_stream` and `disconnect_finalizes_turn_to_cancelled` (`mini-chat/src/domain/service/stream_service/mod.rs`) and `cancellation_terminates_stream` (`mini-chat/src/infra/llm/providers/openai_responses_tests.rs`) verify that the `CancellationToken` reaches the provider stream. They use mock providers/gateways; abort of the real upstream HTTP connection is not covered by an automated test
 
 ## Pros and Cons of the Options
 

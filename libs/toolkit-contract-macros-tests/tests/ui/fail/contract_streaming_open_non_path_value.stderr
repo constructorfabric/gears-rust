@@ -1,0 +1,5 @@
+error: expected `open = fallible` or `open = immediate`
+ --> tests/ui/fail/contract_streaming_open_non_path_value.rs:9:24
+  |
+9 |     #[streaming(open = "fallible")]
+  |                        ^^^^^^^^^^

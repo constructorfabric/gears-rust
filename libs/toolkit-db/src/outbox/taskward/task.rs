@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::FutureExt as _;
 use tokio::sync::Notify;
@@ -37,6 +38,18 @@ pub enum PanicPolicy {
     Propagate,
 }
 
+/// How long a pass may keep running once the worker is cancelled before its
+/// future is dropped. Short, so shutdown never waits on a pass that ignores
+/// the token; a caller whose passes need longer to wind down sets its own.
+pub const DEFAULT_STOP_GRACE: Duration = Duration::from_millis(100);
+
+/// Resolves once `cancel` has been cancelled for `grace`: the point past which
+/// work still running at shutdown is dropped rather than awaited.
+pub async fn stop_deadline(cancel: &CancellationToken, grace: Duration) {
+    cancel.cancelled().await;
+    tokio::time::sleep(grace).await;
+}
+
 /// Builder for [`WorkerTask`]. Flat configuration — no type-state markers.
 ///
 /// ```text
@@ -55,6 +68,7 @@ pub struct WorkerBuilder<P = ()> {
     listeners: Vec<Arc<dyn WorkerListener<P>>>,
     panic_policy: PanicPolicy,
     pacing: Option<PacingConfig>,
+    stop_grace: Duration,
 }
 
 impl<P: Send + Sync + 'static> WorkerBuilder<P> {
@@ -68,6 +82,7 @@ impl<P: Send + Sync + 'static> WorkerBuilder<P> {
             listeners: Vec::new(),
             panic_policy: PanicPolicy::default(),
             pacing: None,
+            stop_grace: DEFAULT_STOP_GRACE,
         }
     }
 
@@ -100,6 +115,15 @@ impl<P: Send + Sync + 'static> WorkerBuilder<P> {
         self
     }
 
+    /// Bound a pass that is running when the worker is cancelled: once
+    /// `grace` has elapsed since cancellation, the pass future is dropped and
+    /// the worker stops. Defaults to [`DEFAULT_STOP_GRACE`].
+    #[must_use]
+    pub fn stop_grace(mut self, grace: Duration) -> Self {
+        self.stop_grace = grace;
+        self
+    }
+
     /// Register a lifecycle listener.
     #[must_use]
     pub fn listener(mut self, listener: impl WorkerListener<P> + 'static) -> Self {
@@ -123,6 +147,7 @@ impl<P: Send + Sync + 'static> WorkerBuilder<P> {
             listeners: self.listeners,
             panic_policy: self.panic_policy,
             pacing,
+            stop_grace: self.stop_grace,
         }
     }
 }
@@ -141,6 +166,7 @@ pub struct WorkerTask<A: WorkerAction> {
     listeners: Vec<Arc<dyn WorkerListener<A::Payload>>>,
     panic_policy: PanicPolicy,
     pacing: PacingConfig,
+    stop_grace: Duration,
 }
 
 /// Race all notifiers — returns when any one fires.
@@ -236,13 +262,32 @@ impl<A: WorkerAction> WorkerTask<A> {
 
             self.notify_listeners(|l| l.on_execute_start());
             last_execute = tokio::time::Instant::now();
-            let result = match self.panic_policy {
-                PanicPolicy::CatchAndRetry => {
-                    AssertUnwindSafe(self.action.execute(&self.cancel))
-                        .catch_unwind()
-                        .await
+            // The token is handed to the pass so it can stop cooperatively;
+            // this deadline is the backstop for a pass that does not.
+            let stop_grace = self.stop_grace;
+            let cancel = self.cancel.clone();
+            let pass = async {
+                match self.panic_policy {
+                    PanicPolicy::CatchAndRetry => {
+                        AssertUnwindSafe(self.action.execute(&self.cancel))
+                            .catch_unwind()
+                            .await
+                    }
+                    PanicPolicy::Propagate => Ok(self.action.execute(&self.cancel).await),
                 }
-                PanicPolicy::Propagate => Ok(self.action.execute(&self.cancel).await),
+            };
+            let result = tokio::select! {
+                biased;
+                r = pass => r,
+                () = stop_deadline(&cancel, stop_grace) => {
+                    // The enclosing `worker` span names the worker.
+                    tracing::warn!(
+                        grace = ?stop_grace,
+                        "shutting down: worker was still busy when the stop grace ran out, \
+                         so its unfinished work was abandoned"
+                    );
+                    break;
+                }
             };
             match result {
                 Ok(Ok(d)) => {
@@ -313,6 +358,31 @@ mod tests {
             if cancel.is_cancelled() {
                 self.saw_cancelled = true;
             }
+            Ok(Directive::sleep(Duration::from_mins(1)))
+        }
+    }
+
+    /// A pass that never returns and ignores the token.
+    struct NeverReturns;
+    impl WorkerAction for NeverReturns {
+        type Payload = ();
+        type Error = String;
+        async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, String> {
+            std::future::pending().await
+        }
+    }
+
+    /// A pass that takes `work` to finish, whatever the token says.
+    struct FinishesAfter {
+        work: Duration,
+        finished: Arc<AtomicU32>,
+    }
+    impl WorkerAction for FinishesAfter {
+        type Payload = ();
+        type Error = String;
+        async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, String> {
+            tokio::time::sleep(self.work).await;
+            self.finished.fetch_add(1, Ordering::SeqCst);
             Ok(Directive::sleep(Duration::from_mins(1)))
         }
     }
@@ -870,6 +940,71 @@ mod tests {
 
         worker.run().await;
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_that_ignores_cancel_is_dropped_after_the_stop_grace() {
+        let cancel = CancellationToken::new();
+        let notify = Arc::new(Notify::new());
+        notify.notify_one(); // break initial Idle
+        let worker = WorkerBuilder::new("test", cancel.clone())
+            .pacing(zero_pacing())
+            .notifier(notify)
+            .stop_grace(Duration::from_millis(200))
+            .build(NeverReturns);
+
+        let cancel_c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_c.cancel();
+        });
+
+        let started = Instant::now();
+        worker.run().await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_millis(260),
+            "worker should stop at cancel + grace (250ms), took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_that_finishes_within_the_stop_grace_keeps_its_result() {
+        let cancel = CancellationToken::new();
+        let notify = Arc::new(Notify::new());
+        notify.notify_one(); // break initial Idle
+        let listener = RecordingListener::default();
+        let events = listener.events();
+        let finished = Arc::new(AtomicU32::new(0));
+        let worker = WorkerBuilder::new("test", cancel.clone())
+            .pacing(zero_pacing())
+            .notifier(notify)
+            .listener(listener)
+            .stop_grace(Duration::from_millis(200))
+            .build(FinishesAfter {
+                work: Duration::from_millis(100),
+                finished: finished.clone(),
+            });
+
+        let cancel_c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_c.cancel();
+        });
+
+        worker.run().await;
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "start",
+                "idle",
+                "execute_start",
+                "complete",
+                "sleep",
+                "stop"
+            ]
+        );
     }
 
     // ---- Error Absorption Tests ----

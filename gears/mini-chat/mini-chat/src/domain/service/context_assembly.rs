@@ -30,6 +30,9 @@ pub struct TokenBudget {
     pub context_window: u32,
     /// Max output tokens applied after preflight (reserved for generation).
     pub max_output_tokens_applied: i32,
+    /// Provider input limit of the effective model (`max_input_tokens`).
+    /// Caps the input budget; `0` means no separate limit.
+    pub max_input_tokens: u32,
     /// Per-model estimation budgets (bytes-per-token, surcharges, etc.).
     pub budgets: EstimationBudgets,
     /// Whether `file_search` tool is enabled (contributes tool surcharge).
@@ -150,8 +153,9 @@ fn build_user_message(text: &str, image_file_ids: &[String]) -> LlmMessage {
     }
 }
 
-/// Compute the available input token budget after deducting output reservation
-/// and tool surcharges.
+/// Compute the available input token budget:
+/// `min(max_input_tokens, context_window - max_output_tokens_applied)`
+/// minus tool surcharges and the fixed overhead.
 ///
 /// Returns `Err(BudgetExceeded)` if the budget is zero or negative.
 pub fn compute_available_budget(budget: &TokenBudget) -> Result<u64, ContextAssemblyError> {
@@ -170,19 +174,28 @@ pub fn compute_available_budget(budget: &TokenBudget) -> Result<u64, ContextAsse
     };
 
     #[allow(clippy::cast_sign_loss)]
-    let deductions = budget.max_output_tokens_applied as u64
-        + tool_surcharge
-        + u64::from(budget.budgets.fixed_overhead_tokens);
-
+    let max_output = budget.max_output_tokens_applied as u64;
     let context_window = u64::from(budget.context_window);
-    if deductions >= context_window {
+    if max_output >= context_window {
         return Err(ContextAssemblyError::BudgetExceeded {
-            required_tokens: deductions,
+            required_tokens: max_output,
             available_tokens: context_window,
         });
     }
+    let mut input_limit = context_window - max_output;
+    if budget.max_input_tokens > 0 {
+        input_limit = input_limit.min(u64::from(budget.max_input_tokens));
+    }
 
-    Ok(context_window - deductions)
+    let deductions = tool_surcharge + u64::from(budget.budgets.fixed_overhead_tokens);
+    if deductions >= input_limit {
+        return Err(ContextAssemblyError::BudgetExceeded {
+            required_tokens: deductions,
+            available_tokens: input_limit,
+        });
+    }
+
+    Ok(input_limit - deductions)
 }
 
 /// Estimate token count for a text item.
@@ -319,6 +332,14 @@ pub fn assemble_context(
                 break;
             }
         }
+        // Truncate by turns: never keep an answer whose question was dropped.
+        while keep_from_index < input.recent_messages.len()
+            && matches!(input.recent_messages[keep_from_index].role, Role::Assistant)
+        {
+            let dropped = &input.recent_messages[keep_from_index];
+            remaining += estimate_item_tokens(dropped.content.len() as u64, budgets);
+            keep_from_index += 1;
+        }
 
         // ── Build messages in chronological order ──
         let mut messages = Vec::new();
@@ -412,6 +433,7 @@ fn build_system_instructions(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -855,6 +877,7 @@ mod tests {
         TokenBudget {
             context_window,
             max_output_tokens_applied: max_output,
+            max_input_tokens: 0,
             budgets: test_budgets(),
             tools_enabled: false,
             web_search_enabled: false,
@@ -877,6 +900,7 @@ mod tests {
         let budget = TokenBudget {
             context_window: 128_000,
             max_output_tokens_applied: 4096,
+            max_input_tokens: 0,
             budgets: test_budgets(),
             tools_enabled: true,
             web_search_enabled: true,
@@ -988,8 +1012,87 @@ mod tests {
         })
         .unwrap();
 
-        // 1 kept recent message + 1 current user message = 2
-        assert_eq!(result.messages.len(), 2);
+        // The answer fits, but its question does not: the whole turn is
+        // dropped, leaving only the current user message.
+        assert_eq!(result.messages.len(), 1);
+    }
+
+    // Truncation keeps whole turns: with room for three messages out of
+    // [U1, A1, U2, A2], A1 would fit alone and is dropped with U1.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn truncation_drops_whole_turns() {
+        let budgets = test_budgets();
+        let msg_cost = estimate_item_tokens(3, &budgets);
+        let user_cost = estimate_item_tokens(5, &budgets);
+        let overhead = 4096u64 + 100;
+        let context_window = (overhead + user_cost + 3 * msg_cost) as u32;
+
+        let recent = vec![
+            make_message(Role::User, "u-1"),
+            make_message(Role::Assistant, "a-1"),
+            make_message(Role::User, "u-2"),
+            make_message(Role::Assistant, "a-2"),
+        ];
+        let result = assemble_context(&ContextInput {
+            system_prompt: "",
+            web_search_guard: "",
+            file_search_guard: "",
+            thread_summary: None,
+            recent_messages: &recent,
+            user_message: "hello",
+            web_search_enabled: false,
+            file_search_enabled: false,
+            vector_store_ids: &[],
+            file_search_filters: None,
+            web_search_context_size: crate::domain::llm::WebSearchContextSize::Low,
+            file_search_max_num_results: 5,
+            code_interpreter_file_ids: vec![],
+            token_budget: Some(test_budget(context_window, 4096)),
+            knowledge_search_enabled: false,
+            knowledge_search_guard: "",
+            image_file_ids: &[],
+        })
+        .unwrap();
+
+        // The newest whole turn (u-2, a-2) and the current message, in order;
+        // the older turn is dropped.
+        assert!(result.messages_truncated);
+        let got: Vec<(Role, String)> = result
+            .messages
+            .iter()
+            .map(|m| {
+                let text = match &m.content[0] {
+                    crate::domain::llm::ContentPart::Text { text } => text.clone(),
+                    crate::domain::llm::ContentPart::Image { .. } => panic!("expected text"),
+                };
+                (m.role, text)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Role::User, "u-2".to_owned()),
+                (Role::Assistant, "a-2".to_owned()),
+                (Role::User, "hello".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn max_input_tokens_caps_the_budget() {
+        let mut budget = test_budget(100_000, 4096);
+        let uncapped = compute_available_budget(&budget).unwrap();
+        budget.max_input_tokens = 8_000;
+        let capped = compute_available_budget(&budget).unwrap();
+        assert_eq!(
+            uncapped,
+            100_000 - 4096 - u64::from(budget.budgets.fixed_overhead_tokens)
+        );
+        assert_eq!(
+            capped,
+            8_000 - u64::from(budget.budgets.fixed_overhead_tokens)
+        );
     }
 
     // 5.21: truncation drops thread summary (P3) when it doesn't fit
@@ -1183,6 +1286,7 @@ mod tests {
         let budget = TokenBudget {
             context_window: 128_000,
             max_output_tokens_applied: 4096,
+            max_input_tokens: 0,
             budgets: test_budgets(),
             tools_enabled: false,
             web_search_enabled: false,
@@ -1191,6 +1295,32 @@ mod tests {
         // available = 128_000 - 4096 - 1000 (code_interpreter) - 100 (overhead)
         let available = compute_available_budget(&budget).unwrap();
         assert_eq!(available, 128_000 - 4096 - 1000 - 100);
+    }
+
+    // Tool surcharges and the fixed overhead that use up the whole input
+    // limit leave no room for history: BudgetExceeded, not a zero budget.
+    #[test]
+    fn deductions_filling_the_input_limit_exceed_budget() {
+        let budget = TokenBudget {
+            context_window: 128_000,
+            max_output_tokens_applied: 4096,
+            // input limit 1100 = code_interpreter surcharge 1000 + overhead 100
+            max_input_tokens: 1100,
+            budgets: test_budgets(),
+            tools_enabled: false,
+            web_search_enabled: false,
+            code_interpreter_enabled: true,
+        };
+        match compute_available_budget(&budget) {
+            Err(ContextAssemblyError::BudgetExceeded {
+                required_tokens,
+                available_tokens,
+            }) => {
+                assert_eq!(required_tokens, 1100);
+                assert_eq!(available_tokens, 1100);
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
     }
 
     // ── Image inlining tests ──

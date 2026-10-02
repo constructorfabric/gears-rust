@@ -51,11 +51,28 @@ gears:
         description: "Mini-Chat development server"
       defaults:
         body_limit_bytes: 64000000
-        rate_limit:
-          rps: 1000
-          burst: 200
-          in_flight: 64
       auth_disabled: true
+      # Throttling zones referenced by the mini-chat create_chat route
+      # (ThrottlingSpec in gears/mini-chat/.../api/rest/routes/chats.rs).
+      # These must be defined or gateway startup fails validation.
+      rate_limit_zones:
+        rl_mini_chat_chat:
+          rate_limit: 10/s
+          burst_limit: 10
+          response_status_code: 429
+          response_retry_after: auto
+          key:
+            type: ip
+          max_keys: 10000
+      in_flight_limit_zones:
+        ifl_mini_chat_chat:
+          in_flight_limit: 100
+          backlog_limit: 0
+          backlog_timeout: 0s
+          response_status_code: 429
+          key:
+            type: ip
+          max_keys: 10000
 
   gear-orchestrator:
     config: {}
@@ -135,6 +152,12 @@ gears:
       orphan_watchdog:
         scan_interval_secs: 10
         timeout_secs: 90
+      # Upload reaper (on by default): fails attachments left in pending/uploaded
+      # by a dropped upload request and schedules the provider file delete.
+      # upload_reaper:
+      #   enabled: true
+      #   scan_interval_secs: 60
+      #   stale_after_secs: 300    # 60-86400
       # S2S credentials for obtaining SecurityContext
       # that will be used for communication with other gears.
       client_credentials:
@@ -154,7 +177,6 @@ gears:
           host: "${AZURE_OPENAI_API_HOST}"
           api_path: "/openai/v1/responses"
           api_version: "2025-03-01-preview"
-          supports_file_search_filters: false
           auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
           auth_config:
             header: "api-key"
@@ -164,9 +186,11 @@ gears:
       # ── Azure OpenAI example (uncomment and set your endpoint) ──────────
       #   azure_openai:
       #     kind: openai_responses
+      #     storage_kind: azure                             # required; azure needs api_version
       #     host: "<your-resource>.openai.azure.com"       # Azure endpoint
       #     # upstream_alias: "custom-alias"               # optional, defaults to host
       #     api_path: "/openai/v1/responses"
+      #     api_version: "2025-03-01-preview"             # required for storage_kind: azure
       #     auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
       #     auth_config:
       #       header: "api-key"
@@ -180,8 +204,10 @@ gears:
       #
       #   azure_openai:
       #     kind: openai_responses
+      #     storage_kind: azure                             # required; azure needs api_version
       #     host: "default.openai.azure.com"
       #     api_path: "/openai/v1/responses"
+      #     api_version: "2025-03-01-preview"             # required for storage_kind: azure
       #     auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
       #     auth_config:
       #       header: "api-key"

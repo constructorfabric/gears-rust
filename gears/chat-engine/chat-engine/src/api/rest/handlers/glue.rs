@@ -76,7 +76,7 @@ pub async fn send_message_in_session(
 ) -> Result<Response> {
     let req = SendMessageRequest {
         session_id,
-        parts: parts_into_sdk(body.parts),
+        parts: parts_into_sdk(body.parts)?,
         file_ids: body.file_ids.unwrap_or_default(),
         parent_message_id: body.parent_message_id,
         capabilities: capabilities_into_sdk(body.capabilities),

@@ -39,6 +39,13 @@ impl From<TransportError> for CanonicalError {
             #[cfg(feature = "grpc-client")]
             TransportError::Grpc { code, message } => grpc_code_to_canonical(code, message),
             TransportError::Network(_msg) => CanonicalError::service_unavailable().create(),
+            // The client's own concurrency limiter shed this request before it
+            // was sent: the local client is saturated. Surfaced as
+            // service-unavailable (the caller's dependency is momentarily
+            // overloaded), with the cause named in the detail.
+            TransportError::Overloaded => CanonicalError::service_unavailable()
+                .with_detail("client concurrency limit reached (request shed before send)")
+                .create(),
             // Provider not registered / no live instance: same canonical shape
             // as a network failure — retryable service-unavailable. Keep the
             // gear name in the detail so operators can triage which dependency
@@ -52,9 +59,13 @@ impl From<TransportError> for CanonicalError {
             TransportError::Serialization(msg) => {
                 CanonicalError::internal(format!("serialization error: {msg}")).create()
             }
-            TransportError::Sse(msg) => {
-                CanonicalError::internal(format!("SSE protocol error: {msg}")).create()
-            }
+            // A peer that does not conform to the wire framing is an internal
+            // fault; naming the framing is what makes the detail actionable.
+            TransportError::Framing { framing, source } => CanonicalError::internal(format!(
+                "{} framing error: {source}",
+                framing.media_type()
+            ))
+            .create(),
             TransportError::UrlBuild(msg) => {
                 CanonicalError::internal(format!("URL build error: {msg}")).create()
             }
@@ -187,6 +198,21 @@ mod tests {
         }
         .into();
         assert!(matches!(err, CanonicalError::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn overloaded_maps_to_service_unavailable_with_detail() {
+        // A locally-shed request (concurrency limiter) is surfaced as a
+        // retryable service-unavailable, with the shed named in the detail so
+        // operators can tell it apart from an upstream 503.
+        let err: CanonicalError = TransportError::Overloaded.into();
+        let problem = Problem::from_error(&err).expect("problem from overloaded");
+        assert_eq!(problem.status, Some(503));
+        assert!(
+            problem.detail.contains("concurrency limit reached"),
+            "detail names the shed: {}",
+            problem.detail
+        );
     }
 
     #[test]

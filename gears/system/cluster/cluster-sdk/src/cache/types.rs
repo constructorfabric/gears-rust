@@ -118,15 +118,59 @@ impl CacheEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CacheFeatures {
-    /// Whether the backend natively supports prefix watches.
-    pub prefix_watch: bool,
+    /// Whether the backend supports exact-key watches at all. Nearly every
+    /// backend does; a backend answers `false` only when it has an operator mode
+    /// in which no watch can be served (e.g. redis `watch_mode: disabled`), in
+    /// which case [`watch`](crate::cache::ClusterCacheBackend::watch) must return
+    /// [`ClusterError::Unsupported`](crate::ClusterError::Unsupported) with
+    /// `feature: "watch"`.
+    ///
+    /// Private so the `!watch ⇒ !prefix_watch` invariant (see
+    /// [`without_watch`](Self::without_watch)) cannot be broken by field
+    /// assignment on a held `Copy` value — the resolver's `PrefixWatch` /`Watch`
+    /// arms and the wire decoder both rely on it. Read via [`watch`](Self::watch).
+    watch: bool,
+    /// Whether the backend natively supports prefix watches. Private for the same
+    /// invariant reason as [`watch`](Self::watch); read via
+    /// [`prefix_watch`](Self::prefix_watch).
+    prefix_watch: bool,
 }
 
 impl CacheFeatures {
-    /// Creates a features descriptor.
+    /// Exact watch supported; `prefix_watch` as given. The common case, and the
+    /// meaning [`new`](Self::new) has always carried.
     #[must_use]
     pub fn new(prefix_watch: bool) -> Self {
-        Self { prefix_watch }
+        Self {
+            watch: true,
+            prefix_watch,
+        }
+    }
+
+    /// A backend that cannot serve watches at all. `prefix_watch` is forced off
+    /// too — a backend that cannot watch one key cannot watch a family of them.
+    #[must_use]
+    pub fn without_watch() -> Self {
+        Self {
+            watch: false,
+            prefix_watch: false,
+        }
+    }
+
+    /// Whether the backend supports exact-key watches (see the field). Takes
+    /// `self` by value: `CacheFeatures` is a two-field `Copy` value, so a getter
+    /// by reference is needless (`clippy::trivially_copy_pass_by_ref`).
+    #[must_use]
+    pub fn watch(self) -> bool {
+        self.watch
+    }
+
+    /// Whether the backend natively supports prefix watches. Always `false` when
+    /// [`watch`](Self::watch) is `false` — the constructors are the only way to
+    /// build a value, and both uphold `!watch ⇒ !prefix_watch`.
+    #[must_use]
+    pub fn prefix_watch(self) -> bool {
+        self.prefix_watch
     }
 }
 
@@ -137,6 +181,9 @@ impl CacheFeatures {
 pub enum CacheCapability {
     /// Require the backend's [`CacheConsistency`] to be `Linearizable`.
     Linearizable,
+    /// Require exact-key watch support, so a consumer that needs a reactive feed
+    /// is refused at resolution rather than at first `watch()` call.
+    Watch,
     /// Require native prefix-watch support.
     PrefixWatch,
 }

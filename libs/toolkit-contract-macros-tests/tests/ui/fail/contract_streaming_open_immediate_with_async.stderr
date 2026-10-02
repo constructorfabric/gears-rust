@@ -1,0 +1,5 @@
+error: `#[streaming(open = immediate)]` conflicts with `async fn`. Remove `async` for the immediate shape, or write `open = fallible` for the awaited fallible open.
+  --> tests/ui/fail/contract_streaming_open_immediate_with_async.rs:11:14
+   |
+11 |     async fn frames(&self, since: u64) -> Result<u64, std::io::Error>;
+   |              ^^^^^^

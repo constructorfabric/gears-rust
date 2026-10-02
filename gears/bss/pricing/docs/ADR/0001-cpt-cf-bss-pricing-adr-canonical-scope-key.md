@@ -4,6 +4,9 @@ date: 2026-07-09
 decision-makers: "BSS Product Catalog team"
 ---
 
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 # ADR-0001: Canonical Price-Row Scope Key — Extend the Manifest Key Additively
 
 <!-- toc -->
@@ -43,7 +46,7 @@ That key is too narrow for the commercial shapes this PRD MUST support on a sing
 - A **hybrid plan** carries a `recurring` base row **and** a `usage` row (optionally a `one_time_setup` row) at the same time — under the manifest key these collide as "duplicates" of one identity.
 - A **one-time plan's** base row and a recurring/hybrid plan's setup row are different charge components that must not collide.
 - **Grandfathering** must keep a legacy price live for pre-cutover subscribers while a new price serves new subscribers — two prices that are active **concurrently** for what the manifest key would call one identity, which reads as a non-overlap violation.
-- **Plan phases** (trial/intro/evergreen) each carry their own price schedule for one plan.
+- **Plan phases** (trial/interim/evergreen — `interim` was `intro` until D-358) each carry their own price schedule for one plan.
 
 What is the canonical identity of a price row, such that all four invariants hold without
 banning legitimate multi-component / grandfathered / phased plans?

@@ -9,7 +9,7 @@ fn text_part_input_string_is_canonicalized_to_object() {
         part_type: "text".into(),
         content: json!("hello"),
     };
-    let sdk = SdkMessagePartInput::from(dto);
+    let sdk = SdkMessagePartInput::try_from(dto).expect("known part type");
     assert_eq!(sdk.part_type, MessagePartType::Text);
     assert_eq!(sdk.content, json!({ "text": "hello" }));
 }
@@ -21,7 +21,9 @@ fn text_part_input_object_passes_through() {
         content: json!({ "text": "hi" }),
     };
     assert_eq!(
-        SdkMessagePartInput::from(dto).content,
+        SdkMessagePartInput::try_from(dto)
+            .expect("known part type")
+            .content,
         json!({ "text": "hi" })
     );
 }
@@ -32,11 +34,76 @@ fn non_text_part_content_is_untouched() {
         part_type: "links".into(),
         content: json!({ "links": [{ "url": "https://e.com" }] }),
     };
-    let sdk = SdkMessagePartInput::from(dto);
+    let sdk = SdkMessagePartInput::try_from(dto).expect("known part type");
     assert_eq!(sdk.part_type, MessagePartType::Links);
     assert_eq!(
         sdk.content,
         json!({ "links": [{ "url": "https://e.com" }] })
+    );
+}
+
+#[test]
+fn tool_part_types_round_trip_through_the_wire_mapping() {
+    // Tool calls and their results are first-class parts, so a backend that
+    // does tool calling can persist both sides of the exchange.
+    for (wire, ty) in [
+        ("tool_call", MessagePartType::ToolCall),
+        ("tool_result", MessagePartType::ToolResult),
+    ] {
+        assert_eq!(part_type_from_wire(wire), Some(ty));
+        assert_eq!(part_type_to_wire(ty), wire);
+    }
+}
+
+#[test]
+fn tool_call_part_content_is_untouched() {
+    let dto = MessagePartInputDto {
+        part_type: "tool_call".into(),
+        content: json!({
+            "tool_call_id": "call_1",
+            "name": "search",
+            "arguments": { "query": "rust" },
+        }),
+    };
+    let sdk = SdkMessagePartInput::try_from(dto).expect("known part type");
+    assert_eq!(sdk.part_type, MessagePartType::ToolCall);
+    assert_eq!(sdk.content["arguments"]["query"], json!("rust"));
+}
+
+#[test]
+fn unknown_part_type_is_rejected_as_bad_request() {
+    // Coercing an unrecognized `type` to `text` would persist a body the
+    // client never sent (e.g. an `audio` part stored as its raw JSON blob),
+    // so the request is refused instead.
+    let dto = MessagePartInputDto {
+        part_type: "audio".into(),
+        content: json!({ "audio_id": "00000000-0000-0000-0000-000000000001" }),
+    };
+    let err = SdkMessagePartInput::try_from(dto).expect_err("unknown type must be rejected");
+    assert!(
+        matches!(&err, ChatEngineError::BadRequest { reason } if reason.contains("audio")),
+        "expected a 400 naming the offending type; got {err:?}"
+    );
+}
+
+#[test]
+fn one_unknown_part_rejects_the_whole_body() {
+    let parts = vec![
+        MessagePartInputDto {
+            part_type: "text".into(),
+            content: json!("hello"),
+        },
+        MessagePartInputDto {
+            part_type: String::new(),
+            content: json!({}),
+        },
+    ];
+    assert!(
+        matches!(
+            parts_into_sdk(parts),
+            Err(ChatEngineError::BadRequest { .. })
+        ),
+        "a single unknown part type must fail the request, not be dropped"
     );
 }
 

@@ -1,11 +1,7 @@
 //! Real up/down of the P0 initial migration on `PostgreSQL` and `MySQL`.
 //!
-//! `SQLite` is covered unconditionally by `migration_test.rs`; the other two
-//! dialects — identity columns, `bytea` / `VARBINARY`, `COLLATE "C"` / `ascii_bin`,
-//! `DATETIME(6)`, FK `RESTRICT`, and `MySQL`'s inline `KEY` declarations — cannot be
-//! reached from `SQLite` at all. Each test spins up a container, applies the
-//! migration, asserts the nine tables answer, checks the two CHECK constraints by
-//! hand, and rolls back.
+//! Covers backend-specific schema behavior unavailable in `SQLite`, including an
+//! idempotent coordination-state seed, then rolls the migration back.
 //!
 //! `constraint-multi-backend` makes this a correctness requirement: the CHECK
 //! expressions lower differently on each engine (`NOT dry_run` over `TINYINT(1)`
@@ -26,6 +22,8 @@ use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
+use time::macros::datetime;
 use toolkit_gts::gts_id;
 
 use types_registry::infra::storage::Migrator;
@@ -40,14 +38,22 @@ const P0_TABLES: &[&str] = &[
     "types_registry__type_schema",
     "types_registry__instance",
     "types_registry__dependency",
+    "types_registry__entity_gts_segment",
 ];
 
 const OP_ID: &str = "00000000-0000-0000-0000-0000000000a1";
 const PRINCIPAL: &str = "00000000-0000-0000-0000-0000000000b1";
 const ENTITY_UUID: &str = "00000000-0000-0000-0000-0000000000c1";
 const TS: &str = "2026-08-18 00:00:00";
+const PRESERVED_AT: OffsetDateTime = datetime!(2026-09-01 10:00:00.123456 UTC);
 const GTS_TYPE: &str = gts_id!("acme.crm.customer.type.v1~");
 const FAMILY_KEY: &str = "gts.acme.crm.customer.type";
+
+/// Tables intentionally absent in P0.
+const NOT_CREATED_TABLES: &[&str] = &[
+    "types_registry__routing_config",
+    "types_registry__source_claim",
+];
 
 async fn wait_for_tcp(host: &str, port: u16, timeout: Duration) {
     use tokio::net::TcpStream;
@@ -87,17 +93,15 @@ async fn assert_schema_behaves(db: &DatabaseConnection) {
             .await
             .unwrap_or_else(|e| panic!("{table} missing after migration: {e}"));
     }
-    for table in [
-        "types_registry__routing_config",
-        "types_registry__source_claim",
-    ] {
+    for table in NOT_CREATED_TABLES {
         assert!(
             exec(db, format!("SELECT COUNT(*) FROM {table}"))
                 .await
                 .is_err(),
-            "{table} is federation-only and must not exist in P0"
+            "{table} must not exist in P0"
         );
     }
+    assert_coordination_state_behaves(db).await;
 
     exec(
         db,
@@ -126,9 +130,9 @@ async fn assert_schema_behaves(db: &DatabaseConnection) {
         db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({entity_uuid}, '{GTS_TYPE}', 1, {family_id}, 1, NULL, NULL, 1, 1, \
+             VALUES ({entity_uuid}, '{GTS_TYPE}', 1, 1, {family_id}, 1, NULL, NULL, 1, 1, \
                      '{TS}', '{TS}')"
         ),
     )
@@ -139,9 +143,9 @@ async fn assert_schema_behaves(db: &DatabaseConnection) {
         db,
         format!(
             "INSERT INTO types_registry__entity \
-             (gts_uuid, gts_id, entity_kind, family_id, ownership_scope, owner_tenant_id, \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
               owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
-             VALUES ({entity_uuid}, '{GTS_TYPE}', 1, {family_id}, 1, NULL, 'types-registry', \
+             VALUES ({entity_uuid}, '{GTS_TYPE}', 1, 1, {family_id}, 1, NULL, 'types-registry', \
                      1, 1, '{TS}', '{TS}')"
         ),
     )
@@ -161,6 +165,18 @@ async fn assert_schema_behaves(db: &DatabaseConnection) {
     )
     .await
     .expect("insert pending registration operation");
+
+    exec(
+        db,
+        format!(
+            "INSERT INTO types_registry__operation_item \
+             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, \
+              compat_forced, status, request_payload, created_at) \
+             VALUES ({op_id}, 0, '{GTS_TYPE}', FALSE, 1, 0, 7, 1, '{{}}', '{TS}')"
+        ),
+    )
+    .await
+    .expect_err("compat_forced must reject values outside the boolean domain");
 
     exec(
         db,
@@ -194,6 +210,264 @@ async fn assert_schema_behaves(db: &DatabaseConnection) {
     exec(db, "DELETE FROM types_registry__version_family".to_owned())
         .await
         .expect_err("fk_tr_entity_family RESTRICT must block dropping a family with members");
+
+    assert_segments_behave(db).await;
+}
+
+/// `chain_depth` is required and positive; segment rows are checked and cascade
+/// with their entity.
+async fn assert_segments_behave(db: &DatabaseConnection) {
+    exec(
+        db,
+        "UPDATE types_registry__entity SET chain_depth = 0".to_owned(),
+    )
+    .await
+    .expect_err("ck_tr_entity_chain_depth must reject depth 0");
+    let row = db
+        .query_one_raw(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT id FROM types_registry__entity".to_owned(),
+        ))
+        .await
+        .expect("read entity id")
+        .expect("one entity");
+    let entity_id: i64 = row.try_get_by_index(0).expect("entity id");
+    let segment = |segment_no: i64, is_type: &str| {
+        format!(
+            "INSERT INTO types_registry__entity_gts_segment \
+             (entity_id, segment_no, segment_name, major, minor, is_type) \
+             VALUES ({entity_id}, {segment_no}, 'acme.crm.customer.type', 1, NULL, {is_type})"
+        )
+    };
+    exec(db, segment(-1, "TRUE"))
+        .await
+        .expect_err("ck_tr_entity_gts_segment_no must reject a negative position");
+    exec(db, segment(0, "2"))
+        .await
+        .expect_err("is_type must stay in the boolean domain");
+    exec(db, segment(0, "TRUE")).await.expect("segment 0");
+    exec(db, "DELETE FROM types_registry__entity".to_owned())
+        .await
+        .expect("delete the entity");
+    let row = db
+        .query_one_raw(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT COUNT(*) FROM types_registry__entity_gts_segment".to_owned(),
+        ))
+        .await
+        .expect("count segments")
+        .expect("one row");
+    assert_eq!(
+        row.try_get_by_index::<i64>(0).expect("count"),
+        0,
+        "rows cascade"
+    );
+}
+
+/// Check the seed, backend-specific column types, and constraints.
+async fn assert_coordination_state_behaves(db: &DatabaseConnection) {
+    let seeded = db
+        .query_one_raw(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT state_seq FROM types_registry__coordination_state \
+             WHERE state_name = 'entity_write_order'"
+                .to_owned(),
+        ))
+        .await
+        .expect("query the seeded state")
+        .expect("the seed exists");
+    assert_eq!(
+        seeded.try_get::<i64>("", "state_seq").expect("state_seq"),
+        0,
+        "seeded at zero",
+    );
+
+    for expected in expected_column_types(db) {
+        let column = expected.column;
+        let sql = format!(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_name = 'types_registry__coordination_state' AND column_name = '{column}'"
+        );
+        let row = db
+            .query_one_raw(Statement::from_string(db.get_database_backend(), sql))
+            .await
+            .expect("query information_schema")
+            .unwrap_or_else(|| panic!("{column} present"));
+        let data_type: String = row.try_get_by_index(0).expect("data_type");
+        assert_eq!(
+            normalize_type(&data_type),
+            expected.data_type,
+            "{column} lowers to {}",
+            expected.data_type,
+        );
+
+        // Verify declared width or precision from the catalog.
+        if let Some((attribute, value)) = expected.attribute {
+            let sql = format!(
+                "SELECT {attribute} FROM information_schema.columns \
+                 WHERE table_name = 'types_registry__coordination_state' \
+                 AND column_name = '{column}'"
+            );
+            let row = db
+                .query_one_raw(Statement::from_string(db.get_database_backend(), sql))
+                .await
+                .expect("query information_schema")
+                .unwrap_or_else(|| panic!("{column} present"));
+            let actual = catalog_int(db, &row, attribute);
+            assert_eq!(
+                actual,
+                i64::from(value),
+                "{column}.{attribute} must be {value}"
+            );
+        }
+    }
+
+    exec(
+        db,
+        "INSERT INTO types_registry__coordination_state \
+         (state_name, state_seq, updated_at) VALUES ('entity_write_order', 5, \
+         CURRENT_TIMESTAMP)"
+            .to_owned(),
+    )
+    .await
+    .expect_err("the primary key on state_name must reject a duplicate state");
+
+    exec(
+        db,
+        "UPDATE types_registry__coordination_state SET state_seq = -1".to_owned(),
+    )
+    .await
+    .expect_err("ck_tr_coordination_state_seq must reject a negative sequence");
+}
+
+/// Re-run the coordination migration against an advanced live seed.
+async fn assert_coordination_seed_is_idempotent(db: &DatabaseConnection) {
+    let preserved_at = match db.get_database_backend() {
+        sea_orm::DatabaseBackend::Postgres => "'2026-09-01 10:00:00.123456+00'",
+        _ => "'2026-09-01 10:00:00.123456'",
+    };
+    exec(
+        db,
+        format!(
+            "UPDATE types_registry__coordination_state \
+             SET state_seq = 7, updated_at = {preserved_at} \
+             WHERE state_name = 'entity_write_order'"
+        ),
+    )
+    .await
+    .expect("advance the coordination state before re-running its migration");
+
+    let deleted = db
+        .execute_raw(Statement::from_string(
+            db.get_database_backend(),
+            "DELETE FROM seaql_migrations \
+             WHERE version = 'm20260904_000002_coordination_state'"
+                .to_owned(),
+        ))
+        .await
+        .expect("mark only the coordination-state migration pending");
+    assert_eq!(
+        deleted.rows_affected(),
+        1,
+        "the coordination-state migration must have one history row",
+    );
+
+    Migrator::up(db, None)
+        .await
+        .expect("re-run the coordination-state migration against its existing seed");
+
+    let row = db
+        .query_one_raw(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT state_seq, updated_at FROM types_registry__coordination_state \
+             WHERE state_name = 'entity_write_order'"
+                .to_owned(),
+        ))
+        .await
+        .expect("read the preserved state")
+        .expect("the state row remains present");
+    assert_eq!(
+        row.try_get::<i64>("", "state_seq").expect("state_seq"),
+        7,
+        "re-running the seed must not reset an advanced sequence",
+    );
+    assert_eq!(
+        row.try_get::<OffsetDateTime>("", "updated_at")
+            .expect("updated_at"),
+        PRESERVED_AT,
+        "re-running the seed must not restamp the row",
+    );
+}
+
+/// Expected backend catalog representation of a column.
+struct ColumnExpectation {
+    column: &'static str,
+    data_type: &'static str,
+    /// Optional catalog width or precision.
+    attribute: Option<(&'static str, i32)>,
+}
+
+fn expected_column_types(db: &DatabaseConnection) -> [ColumnExpectation; 3] {
+    match db.get_database_backend() {
+        // `varchar(64)` and `timestamptz`, spelled out by the catalog.
+        sea_orm::DatabaseBackend::Postgres => [
+            ColumnExpectation {
+                column: "state_name",
+                data_type: "character varying",
+                attribute: Some(("character_maximum_length", 64)),
+            },
+            ColumnExpectation {
+                column: "state_seq",
+                data_type: "bigint",
+                attribute: None,
+            },
+            ColumnExpectation {
+                column: "updated_at",
+                data_type: "timestamp with time zone",
+                attribute: None,
+            },
+        ],
+        // MySQL reports width and precision in separate columns.
+        _ => [
+            ColumnExpectation {
+                column: "state_name",
+                data_type: "varchar",
+                attribute: Some(("character_maximum_length", 64)),
+            },
+            ColumnExpectation {
+                column: "state_seq",
+                data_type: "bigint",
+                attribute: None,
+            },
+            ColumnExpectation {
+                column: "updated_at",
+                data_type: "datetime",
+                attribute: Some(("datetime_precision", 6)),
+            },
+        ],
+    }
+}
+
+/// Decode a catalog integer using the backend's reported type.
+fn catalog_int(db: &DatabaseConnection, row: &sea_orm::QueryResult, attribute: &str) -> i64 {
+    match db.get_database_backend() {
+        sea_orm::DatabaseBackend::MySql if attribute == "character_maximum_length" => {
+            row.try_get_by_index::<i64>(0).expect(attribute)
+        }
+        sea_orm::DatabaseBackend::MySql => {
+            let v: u32 = row.try_get_by_index(0).expect(attribute);
+            i64::from(v)
+        }
+        _ => {
+            let v: i32 = row.try_get_by_index(0).expect(attribute);
+            i64::from(v)
+        }
+    }
+}
+
+/// Normalize backend catalog type names for comparison.
+fn normalize_type(data_type: &str) -> String {
+    data_type.trim().to_lowercase()
 }
 
 /// `uuid` takes different literal syntax as well. Postgres has a native `uuid`
@@ -239,6 +513,7 @@ async fn migration_applies_and_rolls_back_on_postgres() {
 
     Migrator::up(&db, None).await.expect("apply on postgres");
     assert_schema_behaves(&db).await;
+    assert_coordination_seed_is_idempotent(&db).await;
     Migrator::down(&db, None)
         .await
         .expect("roll back on postgres");
@@ -276,6 +551,7 @@ async fn migration_applies_and_rolls_back_on_mysql() {
 
     Migrator::up(&db, None).await.expect("apply on mysql");
     assert_schema_behaves(&db).await;
+    assert_coordination_seed_is_idempotent(&db).await;
     Migrator::down(&db, None).await.expect("roll back on mysql");
     for table in P0_TABLES {
         assert!(

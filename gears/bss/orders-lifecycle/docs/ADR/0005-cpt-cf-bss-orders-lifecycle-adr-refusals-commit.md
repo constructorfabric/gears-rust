@@ -20,6 +20,7 @@ decision-makers: BSS Orders team
   - [Audit refusals but do not settle them](#audit-refusals-but-do-not-settle-them)
   - [Audit only authorization denials](#audit-only-authorization-denials)
 - [More Information](#more-information)
+- [Hold and resume guard rationale](#hold-and-resume-guard-rationale)
 - [Traceability](#traceability)
 
 <!-- /toc -->
@@ -54,13 +55,13 @@ requests.
 
 ## Decision Outcome
 
-Chosen option: **refusals commit**. `design/01-foundation.md` §4.1 is normative: every refused
+Chosen option: **refusals commit**. [01 §4.1](../DESIGN.md#contract-01-4-1) is normative: every refused
 transition appends an audit entry and commits, across **all seven refusal classes without
 exception**. A failed audit append aborts the attempt.
 
 **Settlement is narrower than auditing, and deliberately so.** **Four of the seven classes settle**
 their idempotency record — unresolvable guard input (`§3.6` step 3.1), not-admissible (11.1),
-version conflict (12.1, or 10.1.1 for a workflow-class trigger, whose version `01 §4.1` checks before admissibility — D-110) and failed slice guard (13.2). The other three do not, and in each case
+version conflict (12.1, or 10.1.1 for a workflow-class trigger, whose version [01 §4.1](../DESIGN.md#contract-01-4-1) checks before admissibility — D-110) and failed slice guard (13.2). The other three do not, and in each case
 because there is no record it would be correct to settle:
 
 * **Authorization denial** refuses *before* the registry is read (step 1), so no caller-supplied key is consulted. This is the security carve-out: an unauthorized caller must not be able to learn a stored outcome, nor to squat a key ahead of the authorized one.
@@ -68,7 +69,7 @@ because there is no record it would be correct to settle:
 * **Still-processing** (8.1) means the record is in-flight and owned by another request. Settling it would steal that request's marker — and still-processing is not a final answer but "not yet decided", so the property below does not apply to it.
 
 An earlier statement of this decision claimed all seven settled "with one deliberate scoping
-caveat", and `01 §4.1` propagated it as "six of the seven". Both overcounted: the algorithm settles
+caveat", and [01 §4.1](../DESIGN.md#contract-01-4-1) propagated it as "six of the seven". Both overcounted: the algorithm settles
 four. The correction does not weaken the decision — every refusal is still audited and committed —
 but it matters, because the argument against the rejected third option below is a claim about
 *settled* refusals and must not be read as covering classes that have nothing to settle.
@@ -94,7 +95,7 @@ which is what lets a client retry safely without a branch on the previous answer
 * **A refusal is a durable write.** On a request mix dominated by refusals, the engine writes on most requests. This is the cost, and it is bounded rather than unbounded: refusal audit rows carry a **90-day retention** distinct from committed transitions, and repeated refusals against one order are **rate-limited** (`DECISIONS.md` D-49). Those two mechanisms exist *because* of this decision.
 * **A settled refusal is frozen for the idempotency window.** A transient guard failure — a port that was briefly unavailable, a contract that was momentarily unresolvable — replays as that refusal for **24 hours** under the same key. A caller who wants a genuine retry must use a **new** idempotency key. This is the sharpest caller-visible consequence of the decision and the one most likely to surprise.
 * Every refusal reason must be **registered** and machine-readable, since it is persisted and replayed rather than formatted for a human once.
-* Slice pre-checks cannot short-circuit ahead of the engine: a check that refuses before the engine is consulted produces no audit row and no settled record, which is why `01 §2.1` requires slice checks to be **registered guards** the engine evaluates.
+* Slice pre-checks cannot short-circuit ahead of the engine: a check that refuses before the engine is consulted produces no audit row and no settled record, which is why [01 §2.1](../DESIGN.md#contract-01-2-1) requires slice checks to be **registered guards** the engine evaluates.
 * The audit store's growth is driven by traffic, not by commercial activity, so its capacity planning and its retention differ from the commercial trail's.
 * An auditor can answer "who tried and was refused" as easily as "who succeeded", which is what makes the trail evidence rather than a changelog.
 
@@ -103,14 +104,14 @@ which is what lets a client retry safely without a branch on the previous answer
 **This gear has no implementation and no runtime tests**, so the checks below are labelled either
 verifiable today or planned.
 
-**Verifiable today, by reading `design/01-foundation.md` §3.6 *Attempt Transition*.** Every one
+**Verifiable today, by reading [01 §3.6](../features/01-foundation.md#contract-01-3-6) *Attempt Transition*.** Every one
 of the seven refusal branches carries an audit append and a commit — that half is uniform, and it
 is what "zero silent drops" rests on. **Settlement is not uniform, and the branches say which is
 which.** Four branches settle: unresolvable guard input, not-admissible, version conflict (reached
 at step 12, or at step 10.1 ahead of admissibility for a workflow-class trigger — the one declared
 exception to the guard order, D-110) and failed slice guard. Three do not, and none of the three is an omission:
 
-* **Authorization denial** is the deliberate pre-probe exception. It refuses at the algorithm's first step, before the registry is read, and opens its refusal transaction *without loading or locking the aggregate row* — so it consults and settles no caller-supplied key, and an unauthorized caller can neither learn a stored outcome nor squat a key ahead of the authorized one. This is the carve-out `01 §4.1` cites this section for.
+* **Authorization denial** is the deliberate pre-probe exception. It refuses at the algorithm's first step, before the registry is read, and opens its refusal transaction *without loading or locking the aggregate row* — so it consults and settles no caller-supplied key, and an unauthorized caller can neither learn a stored outcome nor squat a key ahead of the authorized one. This is the carve-out [01 §4.1](../DESIGN.md#contract-01-4-1) cites this section for.
 * **Idempotency-fingerprint mismatch** audits and commits against a record carrying a *different* request, and must leave its stored outcome or in-flight ownership intact.
 * **Still-processing** audits and commits against a live in-flight lease owned by another request, and must not steal its marker.
 
@@ -122,7 +123,7 @@ claim or an atomically reclaimed matching expired lease permits settlement with 
 reason. A pre-transaction probe miss is not evidence that the key remains absent. A replay is
 not a new refusal and creates no additional refusal audit entry.
 The four-and-three split above is the contract, stated identically here, in the Decision Outcome
-and in `01 §4.1`; review must verify that those statements do not drift apart.
+and in [01 §4.1](../DESIGN.md#contract-01-4-1); review must verify that those statements do not drift apart.
 
 Foundation §4.2 requires concurrent-settlement regression tests: a missed probe followed by a
 port failure must not replace another request's stored success or refusal. The tests also cover
@@ -130,11 +131,11 @@ mismatched fingerprints, live/expired leases, competing absent-key claims and au
 These checks remain pending implementation.
 
 **Planned, not yet written.** A fault-injection check that a failed audit append aborts the
-transition (recorded as a verification approach under the audit-completeness NFR in `01 §1.2`); a
+transition (recorded as a verification approach under the audit-completeness NFR in [01 §1.2](../DESIGN.md#contract-01-1-2)); a
 replay check that a key whose stored outcome is a refusal returns that refusal rather than
 re-attempting (recorded under the idempotency NFR); and a check that neither the mismatch nor the
 still-processing branch writes to the record it found. The last is recorded nowhere yet and
-`01 §1.2` is its home — it is the check that would catch the overwrite this scoping exists to
+[01 §1.2](../DESIGN.md#contract-01-1-2) is its home — it is the check that would catch the overwrite this scoping exists to
 prevent.
 
 ## Pros and Cons of the Options
@@ -174,6 +175,29 @@ Superseded by nothing. This decision is why ADR-0001's four-durable-effects cons
 effects still occur. The two register entries it consolidates (D-05, D-08) remain in place and
 cite it; D-49 records the retention and rate limit that bound its cost.
 
+## Hold and resume guard rationale
+
+Preserved from the Hold and Expiry contract during feature review. Step numbers name Foundation’s Attempt Transition algorithm; local step 5.1 names Hold and Resume.
+
+**No step here refuses ahead of the engine, and two that did have been removed.** Earlier versions
+of this algorithm returned `not-on-hold` and `resume-target-missing` from the slice before the
+engine was called. Both violated [01 §2.1](../DESIGN.md#contract-01-2-1): a check that refuses before the engine produces **no
+audit entry and no settled idempotency record**, which is precisely the silent drop ADR-0005 exists
+to prevent, and `not-on-hold` was additionally a **second name** for the engine's `not-admissible`,
+which D-38's one-name-per-condition rule forbids. The engine already decides both — admissibility
+at step 11 on the `(state, trigger)` lookup, and the missing pre-hold target at step 15 — and
+decides them with an audit row and a settlement. `not-on-hold` is therefore deregistered as a
+reason; `resume-target-missing` stays registered, because it names a condition the engine has no
+other name for, and the engine returns it.
+
+**Why the cap is a guard rather than a pre-check.** Step 5.1 declares it, so the engine evaluates it
+at [01 §3.6](../features/01-foundation.md#contract-01-3-6) *Attempt Transition* step 13 — under the aggregate row lock taken at step 5 — and
+increments the counter at step 20.4 under that same lock, in the same transaction. A pre-check outside the
+transaction would let two concurrent resumes both read a count below the cap and both commit, so
+the cap would be exceeded by exactly the concurrency the engine's single-writer rule exists to
+exclude — and a slice check that refuses ahead of the engine produces no audit row and no settled
+idempotency record, which [01 §2.1](../DESIGN.md#contract-01-2-1) forbids for that reason.
+
 ## Traceability
 
 - **Governing requirements**: `cpt-cf-bss-orders-lifecycle-nfr-order-audit-completeness`, `cpt-cf-bss-orders-lifecycle-fr-order-idempotency`
@@ -185,6 +209,6 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-bss-orders-lifecycle-component-gate-and-pin` — a refused submit is replayable and diagnosable, so a caller can distinguish "refused" from "never arrived"
 * `cpt-cf-bss-orders-lifecycle-component-transition-engine` — the engine writes on the majority of its requests as a direct result, which is why the refusal retention and the rate limit exist and why the retention needs a worker behind it
 - **PRD**: [`../PRD.md`](../PRD.md) — §7.1 audit completeness, §12 show-stopper 19
-- **DESIGN**: [`../design/01-foundation.md`](../design/01-foundation.md) §2.1, §3.6, §4.1, §4.2
+- **DESIGN**: [01 §2.1](../DESIGN.md#contract-01-2-1), §3.6, §4.1, §4.2
 - **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-05, D-08, D-49
 - **Related ADR**: [`./0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md`](./0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md)

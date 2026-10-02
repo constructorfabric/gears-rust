@@ -19,7 +19,9 @@
 //! profile against any database engine.
 //!
 //! **Tiers** (controlled by env vars):
-//!   - Validation (default) — 1p1c, 16p16c, 4q×64p. ~100K msgs, ~90s/engine.
+//!   - Validation (default) - 1p1c, 16p16c, 4q x 64p, plus the
+//!     1p1c_batch{,_traced,_limited} triple that isolates the cost of a
+//!     traced batch and of a bounded queue. ~100K msgs, ~100s/engine.
 //!   - Longhaul (`BENCH_LONGHAUL=1`) — 1M msgs, single-queue.
 //!   - Stress  (`BENCH_STRESS=1`)  — multi-queue (10Q/100Q), multi-instance,
 //!     and realistic (hot/cold) load distributions. 1M msgs.
@@ -47,7 +49,7 @@
 //!   ```
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -58,10 +60,14 @@ use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 
 use toolkit_db::outbox::{
-    Batch, EnqueueMessage, HandlerResult, LeasedHandler, Outbox, OutboxHandle, OutboxProfile,
-    Partitions, outbox_migrations, outbox_migrations_with_prefix,
+    Batch, HandlerResult, LeasedHandler, Outbox, OutboxHandle, OutboxProfile, Partitions, Record,
+    Records, TraceSubscription, outbox_migrations, outbox_migrations_with_prefix,
 };
 use toolkit_db::{ConnectOpts, Db, connect_db, migration_runner::run_migrations_for_testing};
+
+/// One queue's share of an enqueue chunk: the queue, and the `(partition,
+/// payload)` entities destined for it.
+type QueueBucket = (String, Vec<(u32, Vec<u8>)>);
 
 // Global counter — ensures process-wide unique queue names across iterations.
 static GLOBAL_ITER_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -115,6 +121,10 @@ struct BenchProfile {
     message_count: usize,
     #[serde(default)]
     load_distribution: LoadDistribution,
+    /// Enqueue every batch under a trace and wait to be told it finished, so
+    /// the cost of the trace row and its countdown is in the measurement.
+    #[serde(default)]
+    traced: bool,
 
     // -- Pool sizing (None = auto-calculate) --
     #[serde(default)]
@@ -336,6 +346,7 @@ fn validation_profiles() -> Vec<BenchProfile> {
             num_instances: 1,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion,
         },
@@ -352,6 +363,7 @@ fn validation_profiles() -> Vec<BenchProfile> {
             num_instances: 1,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion,
         },
@@ -368,6 +380,61 @@ fn validation_profiles() -> Vec<BenchProfile> {
             num_instances: 1,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
+            pool_size: None,
+            criterion,
+        },
+        BenchProfile {
+            name: "16p16c_batch_traced".into(),
+            tier: Tier::Validation,
+            producer_mode: ProducerMode::FullBatch,
+            num_producers: 16,
+            num_processors: 8,
+            maintenance: MaintenanceConfig::default(),
+            num_queues: 1,
+            partitions_per_queue: 64,
+            message_count: 100_000,
+            num_instances: 1,
+            table_prefixes: Vec::new(),
+            load_distribution: LoadDistribution::Uniform,
+            traced: true,
+            pool_size: None,
+            criterion,
+        },
+        // A triple with identical topology, so the delta between the three is
+        // the feature and nothing else. One producer, so every engine runs
+        // them - SQLite skips anything with more.
+        BenchProfile {
+            name: "1p1c_batch".into(),
+            tier: Tier::Validation,
+            producer_mode: ProducerMode::FullBatch,
+            num_producers: 1,
+            num_processors: 8,
+            maintenance: MaintenanceConfig::default(),
+            num_queues: 1,
+            partitions_per_queue: 64,
+            message_count: 10_000,
+            num_instances: 1,
+            table_prefixes: Vec::new(),
+            load_distribution: LoadDistribution::Uniform,
+            traced: false,
+            pool_size: None,
+            criterion,
+        },
+        BenchProfile {
+            name: "1p1c_batch_traced".into(),
+            tier: Tier::Validation,
+            producer_mode: ProducerMode::FullBatch,
+            num_producers: 1,
+            num_processors: 8,
+            maintenance: MaintenanceConfig::default(),
+            num_queues: 1,
+            partitions_per_queue: 64,
+            message_count: 10_000,
+            num_instances: 1,
+            table_prefixes: Vec::new(),
+            load_distribution: LoadDistribution::Uniform,
+            traced: true,
             pool_size: None,
             criterion,
         },
@@ -384,6 +451,7 @@ fn validation_profiles() -> Vec<BenchProfile> {
             num_instances: 1,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion,
         },
@@ -400,6 +468,7 @@ fn validation_profiles() -> Vec<BenchProfile> {
             num_instances: 1,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion,
         },
@@ -422,6 +491,7 @@ fn longhaul_profiles() -> Vec<BenchProfile> {
             num_instances: 1,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion,
         },
@@ -438,6 +508,7 @@ fn longhaul_profiles() -> Vec<BenchProfile> {
             num_instances: 1,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion,
         },
@@ -445,8 +516,14 @@ fn longhaul_profiles() -> Vec<BenchProfile> {
 }
 
 fn stress_profiles() -> Vec<BenchProfile> {
+    let mut profiles = multi_queue_stress_profiles();
+    profiles.extend(multi_instance_stress_profiles());
+    profiles
+}
+
+/// Many queues against one outbox instance.
+fn multi_queue_stress_profiles() -> Vec<BenchProfile> {
     let criterion = longhaul_settings();
-    let validation = validation_settings();
     vec![
         BenchProfile {
             name: "10q_1m_single".into(),
@@ -461,6 +538,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             num_instances: 1,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion,
         },
@@ -477,6 +555,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             num_instances: 1,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion,
         },
@@ -496,6 +575,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             num_instances: 1,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion,
         },
@@ -515,6 +595,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             num_instances: 1,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion,
         },
@@ -534,10 +615,18 @@ fn stress_profiles() -> Vec<BenchProfile> {
             num_instances: 1,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Realistic { hot_queues: 8 },
+            traced: false,
             pool_size: None,
             criterion,
         },
-        // --- Multi-instance tier (competing outbox instances) ---
+    ]
+}
+
+/// Competing outbox instances against one database.
+fn multi_instance_stress_profiles() -> Vec<BenchProfile> {
+    let criterion = longhaul_settings();
+    let validation = validation_settings();
+    vec![
         BenchProfile {
             name: "2i_16p16c_single".into(),
             tier: Tier::Stress,
@@ -551,6 +640,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             num_instances: 2,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion: validation,
         },
@@ -567,6 +657,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             num_instances: 2,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion: validation,
         },
@@ -583,6 +674,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             num_instances: 2,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion: validation,
         },
@@ -599,6 +691,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             num_instances: 2,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion,
         },
@@ -615,6 +708,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             num_instances: 2,
             table_prefixes: Vec::new(),
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion,
         },
@@ -631,6 +725,7 @@ fn stress_profiles() -> Vec<BenchProfile> {
             num_instances: 2,
             table_prefixes: vec!["bench_outbox_a".into(), "bench_outbox_b".into()],
             load_distribution: LoadDistribution::Uniform,
+            traced: false,
             pool_size: None,
             criterion: validation,
         },
@@ -678,6 +773,17 @@ struct BenchState {
     counter: Arc<AtomicUsize>,
     notify: Arc<Notify>,
     expected_total: usize,
+    /// One watcher task per traced batch. Each awaits its completion and, at
+    /// the instant it resolves, checks that every entity of the batch had
+    /// already been processed - a completion delivered before its work is a
+    /// correctness bug that a throughput number alone cannot see. Awaited
+    /// during verification so a run that delivered nothing still fails.
+    trace_watchers: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Entities processed so far per trace, keyed by trace id. The handler
+    /// bumps it; a watcher reads it the moment its completion lands.
+    trace_processed: Arc<DashMap<String, Arc<AtomicUsize>>>,
+    /// Entities accounted for by completions that passed their checks.
+    traced_entities: Arc<AtomicI64>,
 }
 
 impl BenchState {
@@ -688,7 +794,43 @@ impl BenchState {
             counter: Arc::new(AtomicUsize::new(0)),
             notify: Arc::new(Notify::new()),
             expected_total,
+            trace_watchers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            trace_processed: Arc::new(DashMap::new()),
+            traced_entities: Arc::new(AtomicI64::new(0)),
         }
+    }
+
+    fn processed_handle(&self, trace: &str) -> Arc<AtomicUsize> {
+        Arc::clone(&self.trace_processed.entry(trace.to_owned()).or_default())
+    }
+
+    /// Subscribe-time bookkeeping for one traced batch. The subscription is
+    /// created by the caller before its transaction commits (the ordering the
+    /// delivery relies on) and handed here; the watcher only awaits it.
+    fn watch_trace(&self, trace: &str, subscription: TraceSubscription) {
+        let processed = self.processed_handle(trace);
+        let total = Arc::clone(&self.traced_entities);
+        let name = trace.to_owned();
+        let handle = tokio::spawn(async move {
+            let outcome = subscription
+                .completion()
+                .await
+                .unwrap_or_else(|| panic!("trace {name} lost its notification"));
+            let done = processed.load(Ordering::Relaxed);
+            assert!(
+                i64::try_from(done).unwrap() >= outcome.entities,
+                "trace {name} was reported complete after only {done} of {}                  entities had been processed",
+                outcome.entities,
+            );
+            assert!(
+                outcome.is_clean(),
+                "trace {name} dead-lettered {} of {} entities",
+                outcome.failures,
+                outcome.entities,
+            );
+            total.fetch_add(outcome.entities, Ordering::Relaxed);
+        });
+        self.trace_watchers.lock().unwrap().push(handle);
     }
 }
 
@@ -703,6 +845,7 @@ struct BenchHandler {
     notify: Arc<Notify>,
     expected_total: usize,
     partition_key_offset: i64,
+    trace_processed: Arc<DashMap<String, Arc<AtomicUsize>>>,
 }
 
 #[async_trait::async_trait]
@@ -710,7 +853,20 @@ impl LeasedHandler for BenchHandler {
     async fn handle(&self, batch: &mut Batch<'_>) -> HandlerResult {
         while let Some(msg) = batch.next_msg() {
             let payload = std::str::from_utf8(&msg.payload).unwrap();
-            let (_, seq_str) = payload.split_once(':').unwrap();
+            // A traced payload is prefixed `<trace>|`; count the entity against
+            // its trace so a watcher can tell whether the batch was really done
+            // when its completion arrived.
+            let body = match payload.split_once('|') {
+                Some((trace, rest)) => {
+                    self.trace_processed
+                        .entry(trace.to_owned())
+                        .or_default()
+                        .fetch_add(1, Ordering::Relaxed);
+                    rest
+                }
+                None => payload,
+            };
+            let (_, seq_str) = body.split_once(':').unwrap();
             let seq: u64 = seq_str.parse().unwrap();
 
             let partition_key = self.partition_key_offset + msg.partition_id;
@@ -736,6 +892,7 @@ fn make_handler(state: &BenchState, partition_key_offset: i64) -> BenchHandler {
         notify: Arc::clone(&state.notify),
         expected_total: state.expected_total,
         partition_key_offset,
+        trace_processed: Arc::clone(&state.trace_processed),
     }
 }
 
@@ -770,6 +927,40 @@ async fn wait_for_completion(state: &BenchState, timeout: Duration) {
 ///
 /// For uniform distributions, checks exact per-partition counts.
 /// For realistic distributions, checks total count and per-partition ordering only.
+/// Every trace the producers submitted must have been reported finished.
+///
+/// A traced run that measured a good number while delivering no completions
+/// would be measuring the wrong thing, so this asserts the feature actually
+/// ran rather than assuming it.
+async fn verify_traces(state: &BenchState, profile: &BenchProfile, timeout: Duration) {
+    let watchers = std::mem::take(&mut *state.trace_watchers.lock().unwrap());
+    if !profile.traced {
+        assert!(
+            watchers.is_empty(),
+            "an untraced profile must submit no traces"
+        );
+        return;
+    }
+
+    let submitted = watchers.len();
+    assert!(submitted > 0, "a traced profile must submit traces");
+    for handle in watchers {
+        let joined = tokio::time::timeout(timeout, handle)
+            .await
+            .unwrap_or_else(|_| panic!("a trace was never reported finished"));
+        // Re-raise the watcher's own assertion with its message intact.
+        if let Err(join_err) = joined {
+            std::panic::resume_unwind(join_err.into_panic());
+        }
+    }
+    let entities = state.traced_entities.load(Ordering::Relaxed);
+    assert_eq!(
+        usize::try_from(entities).unwrap(),
+        profile.aligned_message_count(),
+        "{submitted} traces accounted for {entities} entities"
+    );
+}
+
 fn verify_results(state: &BenchState, profile: &BenchProfile) {
     let msg_count = profile.aligned_message_count();
     let verification_parts = profile.verification_partitions();
@@ -946,29 +1137,46 @@ async fn produce_range(
     queue_prefix: &str,
     profile: &BenchProfile,
     counters: Option<&PartitionCounters>,
-    start: usize,
-    end: usize,
+    state: &BenchState,
+    range: std::ops::Range<usize>,
 ) {
+    let (start, end) = (range.start, range.end);
     let batch_size = profile.batch_size();
 
     if batch_size <= 1 {
         // Single-message path
         for i in start..end {
             let (queue, partition, seq) = message_addr(i, queue_prefix, profile, counters);
-            let payload = format!("{partition}:{seq}").into_bytes();
+            let trace = profile.traced.then(|| format!("{queue_prefix}-t{i}"));
+            let payload = match &trace {
+                Some(t) => format!("{t}|{partition}:{seq}").into_bytes(),
+                None => format!("{partition}:{seq}").into_bytes(),
+            };
+            if let Some(t) = &trace {
+                state.watch_trace(t, outbox.subscribe(t).expect("valid trace"));
+            }
             let o = Arc::clone(outbox);
-            let (_, result) = o
-                .transaction(db.clone(), |tx| {
+            let (_, result) = db
+                .clone()
+                .transaction(|tx| {
                     let o2 = Arc::clone(&o);
+                    let trace = trace.clone();
                     Box::pin(async move {
-                        o2.enqueue(tx, &queue, partition, payload, "bench/seq")
+                        let mut record =
+                            Record::to(&queue, partition).payload(payload, "bench/seq");
+                        if let Some(trace) = &trace {
+                            record = record.trace(trace);
+                        }
+                        let msg = record.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+                        let handle = o2
+                            .enqueue(tx, msg)
                             .await
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        Ok(())
+                        Ok(handle)
                     })
                 })
                 .await;
-            result.unwrap();
+            result.unwrap().fire();
         }
     } else {
         // Batched path — bucket messages by queue, then enqueue_batch per queue.
@@ -976,35 +1184,61 @@ async fn produce_range(
             let chunk_end = (chunk_start + batch_size).min(end);
 
             // Bucket by queue index.
-            let mut buckets: Vec<(String, Vec<EnqueueMessage<'_>>)> = Vec::new();
+            let mut buckets: Vec<QueueBucket> = Vec::new();
             for i in chunk_start..chunk_end {
                 let (queue, local_part, seq) = message_addr(i, queue_prefix, profile, counters);
-                let msg = EnqueueMessage {
-                    partition: local_part,
-                    payload: format!("{local_part}:{seq}").into_bytes(),
-                    payload_type: "bench/seq",
-                };
+                let entity = (local_part, format!("{local_part}:{seq}").into_bytes());
                 if let Some(bucket) = buckets.iter_mut().find(|(q, _)| q == &queue) {
-                    bucket.1.push(msg);
+                    bucket.1.push(entity);
                 } else {
-                    buckets.push((queue, vec![msg]));
+                    buckets.push((queue, vec![entity]));
                 }
             }
 
-            for (queue, msgs) in buckets {
+            for (bucket_idx, (queue, msgs)) in buckets.into_iter().enumerate() {
+                // One trace per batch, named so concurrent producers cannot
+                // collide. Interest is registered before the transaction
+                // commits, which is the only ordering the delivery relies on.
+                let trace = profile.traced.then(|| {
+                    let trace = format!("{queue_prefix}-t{chunk_start}-{bucket_idx}");
+                    state.watch_trace(&trace, outbox.subscribe(&trace).expect("valid trace"));
+                    trace
+                });
                 let o = Arc::clone(outbox);
-                let (_, result) = o
-                    .transaction(db.clone(), |tx| {
+                let (_, result) = db
+                    .clone()
+                    .transaction(|tx| {
                         let o2 = Arc::clone(&o);
+                        let trace = trace.clone();
                         Box::pin(async move {
-                            o2.enqueue_batch(tx, &queue, &msgs)
+                            let mut records = msgs.into_iter().fold(
+                                Records::to(&queue).payload_type("bench/seq"),
+                                |b, (partition, payload)| {
+                                    let payload = match &trace {
+                                        Some(t) => {
+                                            let mut p = t.as_bytes().to_vec();
+                                            p.push(b'|');
+                                            p.extend_from_slice(&payload);
+                                            p
+                                        }
+                                        None => payload,
+                                    };
+                                    b.push(partition, payload)
+                                },
+                            );
+                            if let Some(trace) = &trace {
+                                records = records.trace(trace);
+                            }
+                            let batch = records.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+                            let handle = o2
+                                .enqueue_batch(tx, batch)
                                 .await
                                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-                            Ok(())
+                            Ok(handle)
                         })
                     })
                     .await;
-                result.unwrap();
+                result.unwrap().fire();
             }
         }
     }
@@ -1013,7 +1247,13 @@ async fn produce_range(
 /// Produce messages, distributing producers round-robin across outbox instances.
 /// Each producer task picks one outbox instance to enqueue through, ensuring
 /// all instances receive enqueue traffic (and thus trigger their prioritizers).
-async fn produce(outboxes: &[Arc<Outbox>], db: &Db, queue_prefix: &str, profile: &BenchProfile) {
+async fn produce(
+    outboxes: &[Arc<Outbox>],
+    db: &Db,
+    queue_prefix: &str,
+    profile: &BenchProfile,
+    state: &Arc<BenchState>,
+) {
     let total = profile.aligned_message_count();
     let np = profile.num_producers.max(1);
 
@@ -1042,8 +1282,18 @@ async fn produce(outboxes: &[Arc<Outbox>], db: &Db, queue_prefix: &str, profile:
         let qp = queue_prefix.to_owned();
         let profile = profile.clone();
         let counters = counters.clone();
+        let state = Arc::clone(state);
         handles.push(tokio::spawn(async move {
-            produce_range(&outbox, &db, &qp, &profile, counters.as_deref(), start, end).await;
+            produce_range(
+                &outbox,
+                &db,
+                &qp,
+                &profile,
+                counters.as_deref(),
+                &state,
+                start..end,
+            )
+            .await;
         }));
     }
     for h in handles {
@@ -1092,8 +1342,8 @@ async fn start_instance(
     }
 
     for name in queue_names(queue_prefix, profile) {
-        builder = builder
-            .queue(&name, Partitions::of(profile.partitions_per_queue))
+        let queue = builder.queue(&name, Partitions::of(profile.partitions_per_queue));
+        builder = queue
             .leased(make_handler(state, partition_key_offset))
             .done();
     }
@@ -1169,14 +1419,18 @@ fn cleanup_prefixes(profile: &BenchProfile) -> Vec<&str> {
     }
 }
 
-fn table_family(prefix: &str) -> [String; 7] {
+fn table_family(prefix: &str) -> [String; 8] {
+    // Ordered by the foreign keys: an outgoing row points at a body, and the
+    // per-partition bookkeeping tables point at a partition. Everything
+    // referencing a table has to be emptied before it.
     [
         format!("{prefix}_dead_letters"),
         format!("{prefix}_outgoing"),
         format!("{prefix}_incoming"),
+        format!("{prefix}_body"),
+        format!("{prefix}_trace"),
         format!("{prefix}_vacuum_counter"),
         format!("{prefix}_processor"),
-        format!("{prefix}_body"),
         format!("{prefix}_partitions"),
     ]
 }
@@ -1189,24 +1443,51 @@ fn sequence_tables(prefix: &str) -> [String; 2] {
 }
 
 /// Delete all data from the configured outbox table families after each iteration.
+/// Empty the outbox tables between iterations.
+///
+/// `TRUNCATE` on every engine that has it, not just Postgres. A row-by-row
+/// `DELETE` of ten thousand rows across nine tables leaves InnoDB with an undo
+/// purge backlog that is still being worked off while the *next* iteration's
+/// measured window runs - so the harness's teardown shows up as pipeline
+/// latency, and gets worse with every iteration. MySQL and MariaDB refuse to
+/// truncate a table another table references, so the foreign keys are switched
+/// off for the duration; this is a bench fixture, and the tables are being
+/// emptied wholesale anyway.
 async fn cleanup_outbox_tables(db_url: &str, profile: &BenchProfile) {
-    use sea_orm::{ConnectionTrait, Database, Statement};
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
 
-    let db = Database::connect(db_url).await.unwrap();
+    // One connection, because `FOREIGN_KEY_CHECKS` is a session variable: on a
+    // pool, the `SET` and the `TRUNCATE` land on different connections and the
+    // truncate is refused.
+    let mut opts = ConnectOptions::new(db_url.to_owned());
+    opts.max_connections(1).min_connections(1);
+    let db = Database::connect(opts).await.unwrap();
     let backend = db.get_database_backend();
+    let mysql_family = backend == sea_orm::DbBackend::MySql;
+
+    if mysql_family {
+        db.execute_raw(Statement::from_string(
+            backend,
+            "SET FOREIGN_KEY_CHECKS = 0",
+        ))
+        .await
+        .unwrap();
+    }
+
     for prefix in cleanup_prefixes(profile) {
         for table in table_family(prefix) {
             let sql = match backend {
                 sea_orm::DbBackend::Postgres => format!("TRUNCATE TABLE {table} CASCADE"),
-                // `DbBackend` is `#[non_exhaustive]` as of SeaORM 2.0; plain
-                // DELETE is the portable fallback for a bench cleanup.
+                sea_orm::DbBackend::MySql => format!("TRUNCATE TABLE {table}"),
+                // SQLite has no TRUNCATE, and its `DELETE FROM` with no WHERE
+                // is already the optimised truncate path.
                 _ => format!("DELETE FROM {table}"),
             };
             db.execute_raw(Statement::from_string(backend, sql))
                 .await
                 .unwrap();
         }
-        if backend == sea_orm::DbBackend::MySql {
+        if mysql_family {
             for table in sequence_tables(prefix) {
                 db.execute_raw(Statement::from_string(
                     backend,
@@ -1216,6 +1497,15 @@ async fn cleanup_outbox_tables(db_url: &str, profile: &BenchProfile) {
                 .unwrap();
             }
         }
+    }
+
+    if mysql_family {
+        db.execute_raw(Statement::from_string(
+            backend,
+            "SET FOREIGN_KEY_CHECKS = 1",
+        ))
+        .await
+        .unwrap();
     }
 }
 
@@ -1263,8 +1553,12 @@ fn run_profile(
                         handles.iter().map(|h| Arc::clone(h.outbox())).collect();
 
                     let start = Instant::now();
-                    produce(&outboxes, &db, &queue_prefix, &profile).await;
+                    produce(&outboxes, &db, &queue_prefix, &profile, &state).await;
                     wait_for_completion(&state, timeout).await;
+                    // Awaiting the trace completions is part of what a traced
+                    // profile costs, so it belongs inside the timed interval. For
+                    // an untraced profile there are no watchers, so this is free.
+                    verify_traces(&state, &profile, timeout).await;
                     total += start.elapsed();
 
                     verify_results(&state, &profile);
@@ -1382,6 +1676,14 @@ mod mysql_container {
                         "--transaction-isolation=READ-COMMITTED",
                         "--skip-log-bin",
                         "--innodb-flush-log-at-trx-commit=2",
+                        // Perf flags kept identical to the MariaDB container so
+                        // the two engines are compared on the same footing, not
+                        // on whichever defaults each happens to ship. `io-capacity`
+                        // in particular defaults 50x apart (MySQL 10000, MariaDB
+                        // 200), so both set it explicitly.
+                        "--innodb-io-capacity=10000",
+                        "--innodb-buffer-pool-size=1G",
+                        "--innodb-flush-method=O_DIRECT",
                     ])
                     .start()
                     .await
@@ -1447,6 +1749,10 @@ mod mariadb_container {
                         "--transaction-isolation=READ-COMMITTED",
                         "--skip-log-bin",
                         "--innodb-flush-log-at-trx-commit=2",
+                        // Kept identical to the MySQL container - see the note there.
+                        "--innodb-io-capacity=10000",
+                        "--innodb-buffer-pool-size=1G",
+                        "--innodb-flush-method=O_DIRECT",
                     ])
                     .start()
                     .await

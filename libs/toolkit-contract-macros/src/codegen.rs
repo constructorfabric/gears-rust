@@ -2,7 +2,9 @@ use heck::{ToShoutySnakeCase, ToSnakeCase};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use crate::model::{ContractKind, ContractModel, Idempotency, MethodKind, MethodModel, ParamRole};
+use crate::model::{
+    ContractKind, ContractModel, Idempotency, MethodKind, MethodModel, ParamRole, StreamOpen,
+};
 use crate::support::contract_support_path;
 
 pub fn generate(model: &ContractModel) -> TokenStream {
@@ -51,11 +53,32 @@ fn generate_trait_method(method: &MethodModel) -> TokenStream {
             let output = &method.output_type;
             let error = &method.error_type;
 
-            sig.output = syn::parse_quote! {
-                -> ::std::pin::Pin<Box<
-                    dyn ::futures_core::Stream<Item = Result<#output, #error>> + Send + 'static
-                >>
-            };
+            match method.open {
+                // Historical shape: the stream is handed back synchronously.
+                // `sig.asyncness` is already `None` here — `Immediate` on a
+                // streaming method *means* the author wrote a plain `fn`.
+                StreamOpen::Immediate => {
+                    sig.output = syn::parse_quote! {
+                        -> ::std::pin::Pin<Box<
+                            dyn ::futures_core::Stream<Item = Result<#output, #error>> + Send + 'static
+                        >>
+                    };
+                }
+                // Fallible open: `async` is *retained* and the stream is
+                // wrapped in the method's own `Result`, so the open can fail
+                // before any item exists. The declared `E` serves both the
+                // open failure and the per-item failure.
+                StreamOpen::Awaited => {
+                    sig.output = syn::parse_quote! {
+                        -> ::std::result::Result<
+                            ::std::pin::Pin<Box<
+                                dyn ::futures_core::Stream<Item = Result<#output, #error>> + Send + 'static
+                            >>,
+                            #error,
+                        >
+                    };
+                }
+            }
         }
     }
 

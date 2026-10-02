@@ -3,36 +3,35 @@
 //! Every method takes `runner: &impl DBRunner`, so one body serves both a pooled
 //! connection and a transaction; the last test exercises the transaction path.
 //!
-//! Two primitives are worth reading the tests for:
-//!
-//! * **The list read never translates GTS matching into SQL.** SQL narrows by a
-//!   prefix range over `gts_id` — exact, because the column has binary collation on
-//!   every backend — and `GtsId::matches_pattern` decides. Translating the pattern
-//!   grammar into SQL would be the local approximation of GTS semantics that
-//!   `constraint-gts-implementation` forbids.
-//! * **The closure walks direct edges iteratively, not with a recursive CTE.** A CTE
-//!   cannot be expressed through the typed builder, and `11_database_patterns.md`
-//!   forbids raw SQL outside migrations (SPEC D5).
+//! Covers GTS-filtered listing and bounded recursive dependency closure.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
 mod common;
 
 use std::sync::Arc;
+use types_registry::domain::ports::ListFilter;
 
 use gts::GtsIdPattern;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use time::OffsetDateTime;
 use time::macros::datetime;
-use toolkit_db::secure::ScopeError;
+use toolkit_db::secure::{ScopeError, SecureEntityExt};
 use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::gts_id;
 use uuid::Uuid;
 
 use common::{TestDir, allow_all, test_db, test_db_file};
-use types_registry::domain::enums::{DependencyKind, EntityKind, LifecycleStatus, OwnershipScope};
-use types_registry::domain::ports::NewEntity;
+use types_registry::domain::admission::Precondition;
+use types_registry::domain::admission::fingerprint::{RequestFingerprint, ScopeHash};
+use types_registry::domain::enums::{
+    DependencyKind, EntityKind, LifecycleStatus, OperationItemStatus, OperationKind,
+    OwnershipScope, Plane,
+};
+use types_registry::domain::ports::{ItemSuccess, NewEntity, NewOperation, NewOperationItem};
+use types_registry::infra::storage::entity::dependency;
 use types_registry::infra::storage::repo::{
-    DependencyRepo, EntityRepo, PageRequest, VersionFamilyRepo,
+    DependencyRepo, EntityRepo, OperationRepo, PageRequest, VersionFamilyRepo,
 };
 
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
@@ -291,12 +290,10 @@ async fn insert_starts_the_resource_version_at_one() {
 // entity — pattern list and keyset paging
 // ---------------------------------------------------------------------------
 
-/// The prefilter is a prefix range, deliberately wider than the pattern: it stops
-/// short of the last literal segment so version and minor flexibility cannot make
-/// it exclude a real match. Everything it over-admits is rejected in Rust by
-/// `GtsId::matches_pattern`, the only authority on GTS semantics.
+/// The pattern is exact in SQL: siblings inside the identifier range, another
+/// major and another type never reach the page.
 #[tokio::test]
-async fn list_returns_exactly_what_the_pattern_accepts_not_what_sql_admits() {
+async fn list_returns_exactly_what_the_pattern_accepts() {
     let db = test_db().await;
     seed(
         &db,
@@ -311,24 +308,27 @@ async fn list_returns_exactly_what_the_pattern_accepts_not_what_sql_admits() {
     let conn = db.conn().expect("conn");
 
     let pattern = GtsIdPattern::try_new(CUSTOMER_V1).expect("pattern");
-    let page = EntityRepo::list_page(&conn, &allow_all(), Some(&pattern), PageRequest::first(10))
-        .await
-        .expect("list");
+    let page = EntityRepo::list_page(
+        &conn,
+        &allow_all(),
+        &by_pattern(&pattern),
+        PageRequest::first(10),
+    )
+    .await
+    .expect("list");
 
     let ids: Vec<&str> = page.items.iter().map(|m| m.gts_id.as_str()).collect();
     assert_eq!(
         ids,
         vec![CUSTOMER_V1],
-        "the prefix range admits the sibling `other.v1~` and `type.v2~`; only \
-         matches_pattern may decide"
+        "neither `other.v1~` nor `type.v2~` matches"
     );
 }
 
 /// A trailing `~*` covers the derived chain **and the base itself**: a bare
 /// segment is an "implicit derived-type coverage" envelope in the GTS spec
 /// (§3.6), so `…v1~` and `…v1~*` accept the same set. The point of the test is
-/// that the prefix range does not lose the longer chained identifiers, whose
-/// bytes extend past the base — under-narrowing is the failure this guards.
+/// that the chained identifiers, whose bytes extend past the base, are kept.
 #[tokio::test]
 async fn list_with_a_trailing_wildcard_returns_the_base_and_its_derived_identifiers() {
     let db = test_db().await;
@@ -345,15 +345,20 @@ async fn list_with_a_trailing_wildcard_returns_the_base_and_its_derived_identifi
     let conn = db.conn().expect("conn");
 
     let pattern = GtsIdPattern::try_new(gts_id!("acme.crm.customer.type.v1~*")).expect("pattern");
-    let page = EntityRepo::list_page(&conn, &allow_all(), Some(&pattern), PageRequest::first(10))
-        .await
-        .expect("list");
+    let page = EntityRepo::list_page(
+        &conn,
+        &allow_all(),
+        &by_pattern(&pattern),
+        PageRequest::first(10),
+    )
+    .await
+    .expect("list");
     let ids: Vec<&str> = page.items.iter().map(|m| m.gts_id.as_str()).collect();
     assert_eq!(
         ids,
         vec![CUSTOMER_V1, CUSTOMER_V1_DERIVED_A, CUSTOMER_V1_DERIVED_B],
     );
-    assert!(!page.has_more);
+    assert_eq!(page.next_after, None);
 }
 
 #[tokio::test]
@@ -370,9 +375,14 @@ async fn list_excludes_deleted_rows() {
         Some(2)
     );
 
-    let page = EntityRepo::list_page(&conn, &scope, None, PageRequest::first(10))
-        .await
-        .expect("list");
+    let page = EntityRepo::list_page(
+        &conn,
+        &scope,
+        &ListFilter::default(),
+        PageRequest::first(10),
+    )
+    .await
+    .expect("list");
     assert!(
         page.items.is_empty(),
         "a tombstone stays reverse-resolvable by key but leaves discovery"
@@ -445,15 +455,16 @@ async fn keyset_paging_yields_every_row_exactly_once() {
     let mut seen: Vec<String> = Vec::new();
     let mut request = PageRequest::first(3);
     loop {
-        let page = EntityRepo::list_page(&conn, &allow_all(), None, request)
+        let page = EntityRepo::list_page(&conn, &allow_all(), &ListFilter::default(), request)
             .await
             .expect("page");
         assert!(page.items.len() <= 3, "a page never exceeds its limit");
         seen.extend(page.items.iter().map(|m| m.gts_id.clone()));
-        if !page.has_more {
+        let Some(next) = page.next_after else {
             break;
-        }
-        request = PageRequest::after(page.next_after.expect("cursor when more remains"), 3);
+        };
+        assert_eq!(page.items.len(), 3, "a page with a continuation is full");
+        request = PageRequest::after(next, 3);
     }
 
     let mut expected = ids.clone();
@@ -480,7 +491,7 @@ async fn a_row_inserted_mid_traversal_neither_duplicates_nor_hides() {
     let conn = db.conn().expect("conn");
     let scope = allow_all();
 
-    let first = EntityRepo::list_page(&conn, &scope, None, PageRequest::first(2))
+    let first = EntityRepo::list_page(&conn, &scope, &ListFilter::default(), PageRequest::first(2))
         .await
         .expect("first page");
     assert_eq!(
@@ -505,9 +516,14 @@ async fn a_row_inserted_mid_traversal_neither_duplicates_nor_hides() {
             .expect("insert mid-traversal");
     }
 
-    let second = EntityRepo::list_page(&conn, &scope, None, PageRequest::after(cursor, 10))
-        .await
-        .expect("second page");
+    let second = EntityRepo::list_page(
+        &conn,
+        &scope,
+        &ListFilter::default(),
+        PageRequest::after(cursor, 10),
+    )
+    .await
+    .expect("second page");
     let ids: Vec<&str> = second.items.iter().map(|m| m.gts_id.as_str()).collect();
     assert_eq!(
         ids,
@@ -520,19 +536,13 @@ async fn a_row_inserted_mid_traversal_neither_duplicates_nor_hides() {
     );
 }
 
-/// The list read must never load the whole match set to slice it in memory. That is
-/// a claim about work, not results, so the fixture makes the two differ: a range
-/// full of rows the pattern rejects, with the single match sorted last.
+/// A sparse pattern costs no extra round trips: the only match, sorted after
+/// thousands of rows in its identifier range, arrives on the first page with no
+/// continuation.
 ///
-/// A read that materialised the range would return the match on the first page; a
-/// bounded scan cannot, and says so with `has_more`. So the observable signature is
-/// *at least one page that found nothing and asked to be called again*, then the
-/// match arriving exactly once.
-///
-/// `v9~` sorts after every `v2xxx~` in byte order (`'9' > '2'`), which puts the
-/// match beyond the first scan. The decoy count only has to exceed the scan budget.
+/// `v9~` sorts after every `v2xxx~` in byte order (`'9' > '2'`).
 #[tokio::test]
-async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
+async fn a_sparse_pattern_returns_its_match_on_the_first_page() {
     const MATCH: &str = gts_id!("acme.crm.customer.type.v9~");
     const DECOYS: i32 = 2100;
 
@@ -542,8 +552,7 @@ async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
         Box::pin(async move {
             let scope = allow_all();
             for i in 0..DECOYS {
-                // In the prefix range `gts.acme.crm.customer.type.`, rejected by
-                // the pattern, and sorted ahead of the match.
+                // Inside `gts.acme.crm.customer.type.`, sorted ahead of the match.
                 let id = format!("{}acme.crm.customer.type.v2{i:04}~", gts::GTS_ID_PREFIX);
                 EntityRepo::insert(tx, &scope, new_entity(&id, family_id))
                     .await
@@ -557,35 +566,20 @@ async fn a_page_over_a_sparse_pattern_stays_bounded_and_still_progresses() {
 
     let conn = db.conn().expect("conn");
     let pattern = GtsIdPattern::try_new(MATCH).expect("pattern");
-    let mut found: Vec<String> = Vec::new();
-    let mut empty_pages = 0;
-    let mut completed = false;
-    let mut request = PageRequest::first(10);
-    for _ in 0..64 {
-        let page = EntityRepo::list_page(&conn, &allow_all(), Some(&pattern), request)
-            .await
-            .expect("page");
-        if page.items.is_empty() {
-            empty_pages += 1;
-        }
-        found.extend(page.items.iter().map(|m| m.gts_id.clone()));
-        if !page.has_more {
-            completed = true;
-            break;
-        }
-        request = PageRequest::after(page.next_after.expect("cursor when more remains"), 10);
-    }
-
-    assert!(
-        completed,
-        "the bounded page walk exhausted its 64-request test budget"
+    let page = EntityRepo::list_page(
+        &conn,
+        &allow_all(),
+        &by_pattern(&pattern),
+        PageRequest::first(10),
+    )
+    .await
+    .expect("page");
+    let ids: Vec<&str> = page.items.iter().map(|m| m.gts_id.as_str()).collect();
+    assert_eq!(ids, vec![MATCH]);
+    assert_eq!(
+        page.next_after, None,
+        "no continuation after the last match"
     );
-    assert!(
-        empty_pages > 0,
-        "a bounded scan must return at least one page that found nothing; a read \
-         that materialised the range would have found the match immediately"
-    );
-    assert_eq!(found, vec![MATCH], "the match arrives exactly once");
 }
 
 // ---------------------------------------------------------------------------
@@ -631,10 +625,8 @@ async fn closure_over_a_chain_returns_the_whole_chain_and_nothing_outside_it() {
     assert!(closure.missing_roots.is_empty());
 }
 
-/// A cycle is valid (ADR-0012), so the walk must terminate on one. This is why the
-/// traversal keeps a `seen` set rather than assuming the graph is acyclic.
 #[tokio::test]
-async fn closure_terminates_on_a_cycle() {
+async fn closure_terminates_on_a_row_that_contradicts_acyclicity() {
     let db = test_db().await;
     let pair = [
         gts_id!("acme.crm.a.type.v1~"),
@@ -691,9 +683,6 @@ async fn closure_reports_candidates_that_have_no_entity_row() {
     );
 }
 
-/// The closure bound applies to roots resolved before the first dependency hop.
-/// A large independent root set must not bypass it merely because no edge is
-/// discovered and the worklist loop exits immediately.
 #[tokio::test]
 async fn closure_rejects_more_than_512_resolved_roots_before_the_first_hop() {
     let db = test_db().await;
@@ -713,6 +702,93 @@ async fn closure_rejects_more_than_512_resolved_roots_before_the_first_hop() {
             toolkit_db::secure::ScopeError::Invalid(message)
                 if message.contains("512-entity store-build bound")
         ),
+        "unexpected closure error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn closure_refuses_a_fan_out_past_the_bound_and_admits_the_boundary() {
+    let db = test_db().await;
+    let hub = gts_id!("acme.crm.hub.type.v1~");
+    let leaves: Vec<String> = (0..512)
+        .map(|i| format!("gts.acme.crm.leaf{i:03}.type.v1~"))
+        .collect();
+    let mut all: Vec<&str> = vec![hub];
+    all.extend(leaves.iter().map(String::as_str));
+    seed(&db, &all).await;
+
+    let conn = db.conn().expect("conn");
+    let scope = allow_all();
+    let hub_id = entity_id(&db, hub).await;
+    let leaf_ids: Vec<i64> = EntityRepo::find_by_gts_ids(&conn, &scope, &leaves)
+        .await
+        .expect("leaves")
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(leaf_ids.len(), 512);
+
+    // 511 leaves plus the hub is exactly the bound, and must come back whole.
+    let edges: Vec<(DependencyKind, i64)> = leaf_ids[..511]
+        .iter()
+        .map(|id| (DependencyKind::SchemaRef, *id))
+        .collect();
+    DependencyRepo::replace_outgoing(&conn, &scope, hub_id, &edges)
+        .await
+        .expect("511 edges");
+    let closure = DependencyRepo::closure(&conn, &scope, &[hub.to_owned()])
+        .await
+        .expect("512 entities is the bound, not past it");
+    assert_eq!(closure.entities.len(), 512);
+
+    let edges: Vec<(DependencyKind, i64)> = leaf_ids
+        .iter()
+        .map(|id| (DependencyKind::SchemaRef, *id))
+        .collect();
+    DependencyRepo::replace_outgoing(&conn, &scope, hub_id, &edges)
+        .await
+        .expect("512 edges");
+    let err = DependencyRepo::closure(&conn, &scope, &[hub.to_owned()])
+        .await
+        .expect_err("the hub plus 512 dependencies exceeds the store-build bound");
+    assert!(
+        matches!(err, ScopeError::Invalid(message) if message.contains("512-entity store-build bound")),
+        "unexpected closure error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn closure_refuses_rather_than_truncating_a_chain_deeper_than_the_bound() {
+    let db = test_db().await;
+    let chain: Vec<String> = (0..600)
+        .map(|i| format!("gts.acme.crm.deep{i:03}.type.v1~"))
+        .collect();
+    let refs: Vec<&str> = chain.iter().map(String::as_str).collect();
+    seed(&db, &refs).await;
+
+    let conn = db.conn().expect("conn");
+    let scope = allow_all();
+    let mut rows = EntityRepo::find_by_gts_ids(&conn, &scope, &chain)
+        .await
+        .expect("chain");
+    // Zero-padded names, so lexicographic order is the chain's order.
+    rows.sort_by(|a, b| a.gts_id.cmp(&b.gts_id));
+    for pair in rows.windows(2) {
+        DependencyRepo::replace_outgoing(
+            &conn,
+            &scope,
+            pair[0].id,
+            &[(DependencyKind::SchemaRef, pair[1].id)],
+        )
+        .await
+        .expect("chain edge");
+    }
+
+    let err = DependencyRepo::closure(&conn, &scope, &[chain[0].clone()])
+        .await
+        .expect_err("a 600-deep chain is refused, never shortened to fit");
+    assert!(
+        matches!(err, ScopeError::Invalid(message) if message.contains("512-entity store-build bound")),
         "unexpected closure error: {err}"
     );
 }
@@ -783,10 +859,18 @@ async fn replace_outgoing_treats_a_repeated_edge_as_one() {
     .await
     .expect("a repeated edge is one edge, not a constraint violation");
 
-    let direct = DependencyRepo::direct_dependencies(&conn, &scope, &[from])
+    let rows = dependency::Entity::find()
+        .filter(dependency::Column::FromEntityId.eq(from))
+        .secure()
+        .scope_with(&scope)
+        .all(&conn)
         .await
         .expect("edges");
-    assert_eq!(direct, vec![to], "exactly one row, not two");
+    assert_eq!(
+        rows.iter().map(|r| r.to_entity_id).collect::<Vec<_>>(),
+        vec![to],
+        "exactly one row, not two"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -830,4 +914,123 @@ async fn the_same_repository_methods_run_inside_a_transaction() {
         .expect("read")
         .expect("committed row");
     assert_eq!(row.id, committed);
+}
+
+#[tokio::test]
+async fn a_system_failure_fails_every_undecided_item_of_one_operation_and_no_other() {
+    const SYSTEM_FAILURE: &str = r#"{"reason":"system_failure"}"#;
+
+    let db = test_db().await;
+    let conn = db.conn().expect("conn");
+    let scope = allow_all();
+
+    let operation = OperationRepo::insert(
+        &conn,
+        &scope,
+        NewOperation {
+            id: Uuid::new_v4(),
+            kind: OperationKind::Registration,
+            dry_run: false,
+            plane: Plane::Platform,
+            tenant_id: None,
+            principal_id: Uuid::nil(),
+            idempotency_key: "system-failure-batch".to_owned(),
+            idempotency_scope_hash: ScopeHash::from_stored(vec![0x01; 32]).expect("32 bytes"),
+            request_fingerprint: RequestFingerprint::from_stored(vec![0x02; 32]).expect("32 bytes"),
+            now: NOW,
+        },
+    )
+    .await
+    .expect("insert operation");
+
+    let items: Vec<NewOperationItem> = [CUSTOMER_V1, CUSTOMER_V1_DERIVED_A, CUSTOMER_V1_DERIVED_B]
+        .iter()
+        .enumerate()
+        .map(|(index, gts_id)| NewOperationItem {
+            item_no: i32::try_from(index).expect("three items"),
+            gts_id: (*gts_id).to_owned(),
+            precondition: Precondition::MustNotExist,
+            compat_forced: false,
+            request_payload: "{}".to_owned(),
+        })
+        .collect();
+    OperationRepo::insert_items(&conn, &scope, &operation, &items)
+        .await
+        .expect("insert items");
+
+    let seeded = OperationRepo::find_items(&conn, &scope, operation.id)
+        .await
+        .expect("read items");
+    let decided = seeded
+        .iter()
+        .find(|item| item.gts_id == CUSTOMER_V1)
+        .expect("the first candidate");
+    assert!(
+        OperationRepo::mark_item_succeeded(
+            &conn,
+            &scope,
+            decided.id,
+            ItemSuccess::Registered {
+                revision_no: 1,
+                resource_version: 1,
+            },
+            NOW,
+        )
+        .await
+        .expect("terminalize one item")
+    );
+
+    let failed = OperationRepo::fail_nonterminal_items(
+        &conn,
+        &scope,
+        operation.id,
+        SYSTEM_FAILURE.to_owned(),
+        NOW,
+    )
+    .await
+    .expect("fail the undecided items");
+    assert_eq!(
+        failed, 2,
+        "one statement must cover every undecided item, and only those",
+    );
+
+    let after = OperationRepo::find_items(&conn, &scope, operation.id)
+        .await
+        .expect("reread items");
+    for item in &after {
+        if item.gts_id == CUSTOMER_V1 {
+            assert_eq!(
+                item.status,
+                OperationItemStatus::Succeeded,
+                "an item an earlier pass decided keeps its outcome",
+            );
+            assert_eq!(item.result_revision_no, Some(1));
+        } else {
+            assert_eq!(item.status, OperationItemStatus::Failed, "{}", item.gts_id);
+            assert_eq!(
+                item.error_payload.as_deref(),
+                Some(SYSTEM_FAILURE),
+                "{}: every failed item carries the one system-failure reason",
+                item.gts_id,
+            );
+        }
+    }
+
+    let again = OperationRepo::fail_nonterminal_items(
+        &conn,
+        &scope,
+        operation.id,
+        SYSTEM_FAILURE.to_owned(),
+        NOW,
+    )
+    .await
+    .expect("second failure write");
+    assert_eq!(again, 0, "the guard makes a repeated failure write a no-op");
+}
+
+fn by_pattern(pattern: &GtsIdPattern) -> ListFilter {
+    ListFilter {
+        pattern: Some(pattern.clone()),
+        ..ListFilter::default()
+    }
 }

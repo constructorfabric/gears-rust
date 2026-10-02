@@ -210,7 +210,7 @@ fn the_unbound_backends_declare_the_weakest_reading_of_every_capability() {
     // cache: a declared requirement must fail rather than be falsely satisfied.
     let cache = unbound_cache(PROFILE);
     assert_eq!(cache.consistency(), CacheConsistency::EventuallyConsistent);
-    assert!(!cache.features().prefix_watch);
+    assert!(!cache.features().prefix_watch());
     assert_eq!(cache.provider_name(), "unbound");
 
     assert!(!unbound_lock(PROFILE).features().linearizable);

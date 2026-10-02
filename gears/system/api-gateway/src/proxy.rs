@@ -628,9 +628,10 @@ mod tests {
         )
         .await;
 
-        // Precondition: the snapshot is spec-less.
+        // Precondition: the snapshot is spec-less — it carries only the hash,
+        // never the inlined document.
         let snapshot = dir.list_all_instances().await.unwrap();
-        assert!(snapshot.iter().all(|i| i.openapi_spec.is_none()));
+        assert!(snapshot.iter().all(|i| i.openapi_spec_hash.is_some()));
 
         let registry = Arc::new(ProxyRegistry::new());
         let provider = ToolKitGatewayProvider::new(Arc::clone(&registry));

@@ -111,6 +111,7 @@ Notes:
 - Each multipart part carries **exactly one** event (no server-side batching).
 - Heartbeats arrive at the broker's configured cadence (default 5 s) on idle subscriptions; busy subscriptions suppress them.
 - Cursor advance (SEEK) is out-of-band via `POST /v1/subscriptions/{id}:seek`. The stream connection plays no role in cursor management.
+- **Only `subscription_id` is recognised.** Both `:stream` and `:sse` reject any unrecognised query parameter with `400 Invalid Argument`; a legacy `timeout`/`collect` parameter is thus rejected rather than silently ignored. The rejection names the offending parameter, never a value.
 - **Pre-stream SEEK is required.** The SDK MUST call `POST /v1/subscriptions/{id}:seek` after JOIN (with positions resolved via `OffsetStore::load_position(...)`) before opening the stream. Opening `:stream` without seeded cursors returns `409 PositionsNotSet { unseeded: [(topic, partition), ...], recovery_hint }` — a defensive backstop the well-behaved SDK never observes on the happy path. See `features/0002-consumer-subscription-lifecycle.md` §2.1 for the full flow and `DESIGN.md` §3.3 for the start-position resolution semantics.
 
 ### 2.2 Server-Sent Events (`/events:sse`)
@@ -200,6 +201,8 @@ A subscription survives a loss (it simply streams fewer partitions) but a gain t
 
 **Handoff fence.** When a partition moves from consumer A to consumer B, the gain/loss asymmetry prevents both reading it at once: A (losing) stops on its `topology` frame immediately, while B (gaining) reaches the partition only after terminate → re-JOIN → SEEK → reopen — strictly later. No broker-held barrier is needed.
 
+**Pre-stream window.** On the open stream, a subscription reads its post-rebalance assignment from the `topology` frame (loss / version bump) - never by re-reading over REST. That in-band frame does not exist before the stream opens, so a JOIN→SEEK race is covered instead by the SEEK `topology_version` fence: a stale `topology_version` is rejected `412 topology_version_mismatch` and the caller re-reads the subscription for the fresh assignment and re-seeks. See [`0002-consumer-subscription-lifecycle.md`](0002-consumer-subscription-lifecycle.md) §2.2 and DESIGN.md §3.3.
+
 **Livelock fencing.** A rebalance computes the assignment for the final membership set once and stamps `topology_version = N+1`; a forced re-JOIN settles into generation N+1 without recomputing the assignment or disrupting peers. A fixed stabilization window (default ~`PT1S`, advertised in the JOIN response) batches a burst of membership changes into one generation bump; consumers re-JOIN with backoff + jitter.
 
 **Admission.** A subscription always holds ≥1 partition. When a group already has as many members as partitions, a further JOIN that would receive zero partitions is refused with `429` + `Retry-After` and body `code: "GroupAtCapacity"` (distinct from the rate-limit `RateLimitExceeded`); the consumer retries the JOIN later. There are no zero-partition standbys, no standby streams, and no assignment-polling channel.
@@ -253,10 +256,12 @@ A **loss** or a bare `topology_version` change stays within `Streaming` — the 
   - `multipart/mixed` over chunked transfer encoding
   - Long-lived response
   - `Accept` header negotiation: `multipart/mixed` or `*/*` → served; anything else → `406 Not Acceptable`
+  - Only `subscription_id` recognised; any other query parameter → `400 Invalid Argument`
   - Heartbeats at 5 s cadence on idle
 - **`/v1/events:sse`**:
   - `text/event-stream`
   - Same frame kinds via SSE `event:` lines
+  - Only `subscription_id` recognised; any other query parameter → `400 Invalid Argument`
   - Opt-in via deployment configuration
 
 ## 6. Acceptance Criteria
@@ -269,6 +274,7 @@ A **loss** or a bare `topology_version` change stays within `Streaming` — the 
 - AC-5b: A partition **gain** (or lose-all) emits a `terminal` control frame with complete final `positions` as the last frame, then the broker closes gracefully; reuse of the terminated `subscription_id` returns `410 SubscriptionTerminated`.
 - AC-5c: A JOIN that would receive zero partitions (group already full) returns `429` + `Retry-After` with body `code: "GroupAtCapacity"`.
 - AC-6: `Accept: application/json` against `/v1/events:stream` returns `406 Not Acceptable`.
+- AC-6b: `GET /v1/events:stream?subscription_id=<uuid>&timeout=20` (an unrecognised query parameter) returns `400 Invalid Argument`; the same holds for `/v1/events:sse`.
 - AC-7: `GET /v1/events:poll` (legacy path) returns `404 Not Found`.
 
 ## 7. Unit Test Plan

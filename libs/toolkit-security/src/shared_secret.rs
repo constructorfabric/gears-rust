@@ -18,10 +18,11 @@
 //! use toolkit_security::{InternalAuthenticator, SharedSecretInternalAuthenticator};
 //!
 //! # async fn demo() {
-//! let auth = SharedSecretInternalAuthenticator::new(
+//! let auth = SharedSecretInternalAuthenticator::try_new(
 //!     SecretString::from("dev-internal-token"),
 //!     "toolkit-host".to_owned(),
-//! );
+//! )
+//! .expect("a non-empty secret");
 //! assert!(auth.authenticate("dev-internal-token").await.is_ok());
 //! assert!(auth.authenticate("wrong").await.is_err());
 //! # }
@@ -49,12 +50,45 @@ impl std::fmt::Debug for SharedSecretInternalAuthenticator {
     }
 }
 
+/// The placeholder written in place of a secret when a config is serialized.
+///
+/// Rejected as a secret: a config dumped by `--print-config` would otherwise
+/// round-trip into a working one whose platform credential is this literal —
+/// a value published in the repository.
+pub const REDACTED_PLACEHOLDER: &str = "<redacted>";
+
+/// Why a shared secret was refused.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InvalidSharedSecret {
+    /// The secret was empty, which would authenticate an empty token.
+    #[error("shared secret must not be empty")]
+    Empty,
+    /// The secret is the redaction placeholder, i.e. a dumped config was fed
+    /// back in as a real one.
+    #[error(
+        "shared secret is the literal `{REDACTED_PLACEHOLDER}` placeholder, which a serialized \
+         config writes in place of the real secret"
+    )]
+    RedactedPlaceholder,
+}
+
 impl SharedSecretInternalAuthenticator {
     /// Build an authenticator that accepts exactly `secret` and resolves valid
     /// callers to [`PlatformIdentity::Shared`] with the label `peer_name`.
-    #[must_use]
-    pub fn new(secret: SecretString, peer_name: String) -> Self {
-        Self { secret, peer_name }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidSharedSecret`] if the secret is empty or is the
+    /// [`REDACTED_PLACEHOLDER`]. An empty secret is the dangerous one: the
+    /// comparison in [`InternalAuthenticator::authenticate`] is over bytes, and
+    /// an empty secret matches an empty token — so anyone sending the internal
+    /// header with no value would authenticate as `peer_name`.
+    pub fn try_new(secret: SecretString, peer_name: String) -> Result<Self, InvalidSharedSecret> {
+        match secret.expose_secret() {
+            "" => Err(InvalidSharedSecret::Empty),
+            REDACTED_PLACEHOLDER => Err(InvalidSharedSecret::RedactedPlaceholder),
+            _ => Ok(Self { secret, peer_name }),
+        }
     }
 }
 
@@ -65,6 +99,14 @@ impl InternalAuthenticator for SharedSecretInternalAuthenticator {
                 name: self.peer_name.clone(),
             })
         } else {
+            // A rejected platform-plane credential left no trace at all, so a
+            // peer configured with the wrong secret looked identical to one
+            // that was never configured. The peer name is the configured label,
+            // not anything the caller supplied, and the token never appears.
+            tracing::warn!(
+                peer_name = %self.peer_name,
+                "platform-plane authentication rejected: shared secret did not match"
+            );
             Err(InternalAuthNError::InvalidToken)
         }
     }
@@ -91,8 +133,42 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_empty_secret_is_refused() {
+        // The comparison is over bytes, so an empty secret matches an empty
+        // token: anyone sending the internal header with no value would
+        // authenticate. Refusing at construction is the only place to catch it.
+        assert_eq!(
+            SharedSecretInternalAuthenticator::try_new(SecretString::from(""), "peer".to_owned())
+                .unwrap_err(),
+            InvalidSharedSecret::Empty
+        );
+    }
+
+    #[test]
+    fn the_redaction_placeholder_is_refused() {
+        // A config dumped by `--print-config` writes this in place of the
+        // secret and deserializes cleanly, so without this the platform plane
+        // would come up accepting a literal published in the repository.
+        assert_eq!(
+            SharedSecretInternalAuthenticator::try_new(
+                SecretString::from(REDACTED_PLACEHOLDER),
+                "peer".to_owned()
+            )
+            .unwrap_err(),
+            InvalidSharedSecret::RedactedPlaceholder
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_token_is_rejected_by_a_real_secret() {
+        let rejected = auth().authenticate("").await;
+        assert!(matches!(rejected, Err(InternalAuthNError::InvalidToken)));
+    }
+
     fn auth() -> SharedSecretInternalAuthenticator {
-        SharedSecretInternalAuthenticator::new(SecretString::from("s3cr3t"), "peer".to_owned())
+        SharedSecretInternalAuthenticator::try_new(SecretString::from("s3cr3t"), "peer".to_owned())
+            .expect("a non-empty secret")
     }
 
     #[tokio::test]

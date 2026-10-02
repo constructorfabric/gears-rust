@@ -107,7 +107,7 @@ This is exactly the guarantee the architecture requires. Because a domain object
 
 Both edges are the same `Valid(baseline) ⊆ Valid(candidate)`, so no second mode is introduced and no verdict means something different depending on which produced it. They differ only in who is protected: within one identifier a dependent that is *carried onto* the new revision, across a minor boundary one that *chooses* to move — which is exactly why only the second may be waived.
 
-One profile is exempt, and it is exempt rather than weaker. ADR-0015 gives major version 0 the meaning of an unstable Type Schema: no mode is enforced for it, so it carries no whole-history guarantee to protect. That exemption is safe for everything decided here only because the same ADR forbids any entity outside the profile from referencing or deriving from one — without that rule a floating reference would carry the exemption upward into a chain this ADR does guarantee.
+One profile is exempt, and it is exempt rather than weaker. ADR-0015 gives major version 0 the meaning of an unstable Type Schema: no mode is enforced for it, so it carries no whole-history guarantee to protect. That exemption is safe for everything decided here only because the same ADR forbids a stable schema from including one through `$ref` or deriving from one — without that rule a floating resolution-bearing reference would carry the exemption upward into a chain this ADR does guarantee.
 
 `FULL` is not enforced. Under GTS 0.13 full compatibility requires the accepted-instance sets to be equal, so the only admissible in-place changes would be annotations such as `description`, `examples`, and `default`. That would make ADR-0004's mutable logical entity inert: no content update could ever preserve the GTS ID, and every change would require a new major identity.
 
@@ -182,7 +182,9 @@ Owners that want in-place evolution **SHOULD** use the closed envelope with desi
 
 ### Reporting is confined to refusal
 
-**A refused candidate carries structured diagnostics naming the cause and the offending schema location. A candidate that was admitted carries nothing about the check.** The forward-direction result **MAY** ride along as advisory diagnostics, since the implementation computes both directions in one call.
+**A refused candidate carries a stable refusal `reason` and a bounded human-readable `message` explaining the cause and naming the offending schema location where available. A candidate that was admitted carries nothing about the check.** The message marks omitted findings and truncated paths. Its wording is not a machine-readable contract; clients branch on `reason` and display `message` without parsing it. The forward-direction result **MAY** ride along as advisory diagnostics, since the implementation computes both directions in one call.
+
+There is no separate structured diagnostics field in the current contract. Authors and operators need an actionable explanation, and CI can distinguish refusal categories through the stable reason code. A per-finding API would additionally commit the registry to a finding vocabulary, location format, and truncation metadata without an established consumer requiring them. That API is deferred until a concrete consumer needs to process individual findings. The engine's structured findings remain an internal input to the verdict and message, not a public schema.
 
 The asymmetry is not an economy. Everything a successful result could have said is already available to the caller, or unreachable, or a fold this decision set declined elsewhere:
 

@@ -797,6 +797,14 @@ struct ListObjectsPage {
     next_continuation_token: Option<String>,
 }
 
+/// Text of a `quick-xml` 0.42 event: already UTF-8 (`Deref<Target = str>`),
+/// then XML-unescaped. A broken entity falls back to the raw text, matching
+/// the previous `decode` + `unescape` fallback.
+fn xml_text(t: &quick_xml::events::BytesText<'_>) -> String {
+    let raw = t.as_ref();
+    quick_xml::escape::unescape(raw).map_or_else(|_| raw.to_owned(), std::borrow::Cow::into_owned)
+}
+
 /// Parse a `ListObjectsV2` XML response body via `quick-xml`, extracting just
 /// the fields `list_paths` needs. Deliberately does **not** use rusty-s3's own
 /// `ListObjectsV2Response` (`instant-xml`-based) — see this module's doc
@@ -825,25 +833,21 @@ fn parse_list_objects_response(body: &[u8]) -> Result<ListObjectsPage, quick_xml
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(e) => {
-                let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                let name = e.local_name().as_ref().to_owned();
                 if name == "Contents" {
                     in_contents = true;
                 }
                 current_tag = Some(name);
             }
             Event::End(e) => {
-                let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                let name = e.local_name().as_ref().to_owned();
                 if name == "Contents" {
                     in_contents = false;
                 }
                 current_tag = None;
             }
             Event::Text(t) => {
-                let decoded = t.decode()?;
-                let text = quick_xml::escape::unescape(&decoded).map_or_else(
-                    |_| decoded.clone().into_owned(),
-                    std::borrow::Cow::into_owned,
-                );
+                let text = xml_text(&t);
                 match current_tag.as_deref() {
                     Some("Key") if in_contents => keys.push(percent_decode(&text)),
                     Some("IsTruncated") => is_truncated = text == "true",
@@ -881,16 +885,12 @@ fn parse_upload_id(body: &[u8]) -> Option<String> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                current_tag = Some(String::from_utf8_lossy(e.local_name().as_ref()).into_owned());
+                current_tag = Some(e.local_name().as_ref().to_owned());
             }
             Ok(Event::End(_)) => current_tag = None,
             Ok(Event::Text(t)) => {
                 if current_tag.as_deref() == Some("UploadId") {
-                    let Ok(decoded) = t.decode() else { continue };
-                    return Some(quick_xml::escape::unescape(&decoded).map_or_else(
-                        |_| decoded.clone().into_owned(),
-                        std::borrow::Cow::into_owned,
-                    ));
+                    return Some(xml_text(&t));
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -925,15 +925,11 @@ fn parse_error_body(body: &[u8]) -> Option<(String, String)> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
-                current_tag = Some(String::from_utf8_lossy(e.local_name().as_ref()).into_owned());
+                current_tag = Some(e.local_name().as_ref().to_owned());
             }
             Ok(Event::End(_)) => current_tag = None,
             Ok(Event::Text(t)) => {
-                let Ok(decoded) = t.decode() else { continue };
-                let text = quick_xml::escape::unescape(&decoded).map_or_else(
-                    |_| decoded.clone().into_owned(),
-                    std::borrow::Cow::into_owned,
-                );
+                let text = xml_text(&t);
                 match current_tag.as_deref() {
                     Some("Code") => code = Some(text),
                     Some("Message") => message = Some(text),

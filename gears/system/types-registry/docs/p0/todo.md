@@ -2,6 +2,10 @@
 
 Plan: [`plan.md`](./plan.md) · Spec: [`SPEC.md`](./SPEC.md)
 
+34 P0 implementation tasks; existing IDs retained. T22 is deferred to P1 as
+[#4827](https://github.com/constructorfabric/gears-rust/issues/4827) under #4628 (plan P18),
+not marked complete. Phase 6 executes T22a → T22b → T22c → T23.
+
 Standing bar for every task, on top of its own acceptance criteria: `make fmt`, `make clippy` and
 gear tests green, no regression in other gears, behaviour verified at runtime, docs updated.
 **The full `make ci` is a checkpoint gate, not a per-task one** — it ends in `dylint` and pulls in
@@ -87,14 +91,17 @@ nothing in this phase can regress another gear.
 `version_family`, `entity`, `type_schema_revision`, `instance_revision`, `type_schema`,
 `instance`, `dependency`, `operation`, `operation_item`. Tenant columns and their CHECK
 constraints are created exactly as specified and never populated with tenant scope, so P1
-tenancy needs no migration. `source_claim` and `routing_config` are not created.
+tenancy needs no migration. The database scope, stated once: `coordination_state` exists
+(the second migration), only `entity_write_order` is seeded and used in P0,
+`source_claim` is not created, the `routing` state row arrives with federation, and a
+standalone `routing_config` table is never created in any phase.
 
 **Acceptance criteria:**
 - [x] All 9 tables, their PKs, FKs, UNIQUE and CHECK constraints, and the 4 indexes from `database.sql` are created — `idx_tr_operation_status`, `idx_tr_entity_family`, `idx_tr_entity_visibility`, `idx_tr_dependency_to`. Conformance was **measured**, not argued: the Postgres list reproduced `database.sql`'s P0 constraint set 48 for 48 and all three dialects declared the same columns in the same order. That was a one-time measurement — the standing guard behind it was removed after Checkpoint 1
 - [x] Identifier columns are `varchar(1024)` with binary collation and ASCII charset where the backend default is multi-byte — `family_key`, `entity.gts_id`, `operation_item.gts_id`: `varchar(1024) COLLATE "C"` on Postgres, `VARCHAR(1024) CHARACTER SET ascii COLLATE ascii_bin` on `MySQL`, `TEXT COLLATE BINARY` on `SQLite` (its default, stated so a later `COLLATE NOCASE` cannot creep in)
 - [x] Enumerations stored as smallint with CHECKs enumerating allowed values. Two forms, both present and both tested: an explicit `IN` list for `kind`, `status`, `entity_kind` and `dependency.kind`; and the branch CHECK for `ownership_scope`, `plane` and `lifecycle_status`, where no branch matches a third value — `ck_tr_version_family_owner`, `ck_tr_entity_owner`, `ck_tr_operation_plane` and `ck_tr_entity_lifecycle` already close those domains, so adding an `IN` list would have been a constraint `database.sql` does not have
-- [x] `DatabaseCapability::migrations()` returns the Migrator; outbox tables come from `outbox_migrations_with_prefix("types_registry_outbox")`, not from this migration. Both halves are tested: one test asserts the initial migration alone creates **no** outbox table, another applies the gear capability's full set and asserts the 9 managed tables and the prefixed outbox tables all exist
-- [x] Raw SQL appears only here (`11_database_patterns.md` invariant) — the three statement lists plus the drop list live in `m20260817_000001_initial.rs`; no other file gained SQL
+- [x] `DatabaseCapability::migrations()` returns the Migrator; outbox tables come from `outbox_migrations_with_prefix("types_registry__outbox")`, not from this migration. Both halves are tested: one test asserts the initial migration alone creates **no** outbox table, another applies the gear capability's full set and asserts the 9 managed tables and the prefixed outbox tables all exist
+- [x] Raw SQL appears only in migration infrastructure (`11_database_patterns.md` invariant) — the three statement lists plus the drop list live in `m20260817_000001_initial.rs`, and `m20260904_000002_coordination_state.rs` carries its own three lists plus drop list the same way; no gear code gained SQL
 
 **Verification:**
 - [x] Migration up and down on **SQLite** — `tests/migration_test.rs`, 41 tests, in-memory `SQLite` with `PRAGMA foreign_keys = ON`, including a full `up` → `down` → `up` roundtrip
@@ -112,8 +119,8 @@ tenancy needs no migration. `source_claim` and `routing_config` are not created.
 - `TR/tests/migration_backends_test.rs` — NEW, 2 container-backed tests behind `integration`
 - `TR/src/gear.rs` — capabilities `[system, db, rest]`, `DatabaseCapability`
 - `TR/src/infra/storage/mod.rs`, `TR/src/infra/mod.rs`, `TR/src/lib.rs` — re-export `Migrator`
-- `TR/Cargo.toml` — `sea-orm`, `sea-orm-migration`, `toolkit-db`, `toolkit` feature
-  `preview-outbox`, `integration` feature, `testcontainers` dev-deps
+- `TR/Cargo.toml` — `sea-orm`, `sea-orm-migration`, `toolkit`, `toolkit-db` feature
+  `sqlite`, `integration` feature, `testcontainers` dev-deps
 **Scope:** M — one long DDL file; deliberately not split, because splitting it orders FKs across tasks
 
 ---
@@ -137,7 +144,7 @@ tenancy needs no migration. `source_claim` and `routing_config` are not created.
 - [x] **Known open gap, by decision.** `every_core_entity_declares_exactly_the_columns_database_sql_defines` was written, mutation-checked by deleting `operation.request_fingerprint`, then removed after Checkpoint 1 along with the shared `database.sql` parser. The gap it closed is therefore open: the round-trip tests in `tests/entity_test.rs` prove the columns an entity *names* exist, and cannot notice one it **omits**, because `SeaORM` simply never selects it and the read succeeds. `every_core_entity_binds_to_its_table_in_the_migration` survives in `entity/columns_tests.rs` — it needs no DDL parser
 - [x] Added: `tests/entity_test.rs`, 7 tests writing and reading every core entity against the real migrated schema. The timestamp round-trip is the specific risk worth covering — `timestamptz` lowers to `TEXT` on `SQLite`, so an `OffsetDateTime` through `SeaORM` is a real conversion — and two tests write shapes `ck_tr_entity_lifecycle` and `ck_tr_operation_item_state` constrain, so a successful write is itself evidence the mapping agrees with the DDL
 
-**Three of the nine tables have no entity yet, deliberately.** `instance` and
+**Three of the tables have no entity yet, deliberately.** `instance` and
 `instance_revision` arrive with Registered Instances (T10), `dependency` with edge extraction
 (T13). An entity with no reader is code the compiler cannot check against the DDL, which is
 exactly the drift these mirrors exist to prevent.
@@ -177,23 +184,22 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 - [x] No raw SQL; all queries go through the typed builder
 - [x] Compare-and-swap on `resource_version` is a single statement whose affected-row count is the success signal. A stale precondition is `Ok(false)`, not an error — an ordinary concurrent-writer outcome the caller turns into `412`
 - [x] Family create-then-read works on all three backends. **The "locked read" half of the original criterion is not achievable:** `DBRunner` hides the raw executor and the secure builder exposes no lock clause, so a repository cannot take `SELECT … FOR UPDATE`. `create_or_get` makes `uq_tr_version_family_key` the serialization point instead — the loser's conflict is **absorbed** (`ON CONFLICT DO NOTHING`), not raised, and then re-read. Serializing the *validation* window needs the toolkit advisory lock on the `Db` handle, which is service-layer (T12); `lock_order` is the ordering half. Now **run** on both container backends, inside a transaction as well as on a pooled connection — see the correction below
-- [x] Read primitives for the database read path (SPEC D2, §8.2): a keyed exact read, and a list read that prefilters in SQL on the stored columns and then applies `GtsId::matches_pattern` in Rust. **GTS identifier matching is never translated into SQL** — the prefix range is deliberately *wider* than the pattern (it drops the final segment, because minor-version flexibility would otherwise make the range exclude a real match), and `GtsId::matches_pattern` alone decides
-- [x] The list read is a **keyset page**: `gts_id > :after ORDER BY gts_id LIMIT :n`, excluding deleted rows, so a page boundary cannot drift or duplicate (D12). It reports whether more remains — `has_more` may over-report, which is the safe direction — and never loads the whole match set: SQL is asked for bounded batches, each row is tested as it arrives, and the scan stops on the page limit or the scan budget
+- [x] Read primitives for the database read path (SPEC D2, §8.2): a keyed exact read, and a list read decided entirely in SQL over stored columns (SPEC D14)
+- [x] The list read is a **keyset page**: `gts_id > :after ORDER BY gts_id LIMIT :n + 1`, excluding deleted rows, so a page boundary cannot drift or duplicate (D12). It returns a cursor exactly when another row matches and never loads the whole match set
 - [x] A dependency-closure read: given candidate identifiers, return them plus the transitive closure of what they consume, walking `dependency` edges (D5), `gts_id`-sorted. Candidates with no entity row are **reported** in `missing_roots` rather than failing the read, because a first admission's own candidate is exactly that case
 
 **Verification:**
-- [x] Gear tests (see [Commands](#commands)) — 161 lib + 149 integration tests, of which 18 are `repo_test.rs` and 7 are `repo_tests.rs`
+- [x] Gear tests (see [Commands](#commands)) — 161 lib + 149 integration tests, of which 18 are `repo_test.rs`
 - [x] Test: concurrent `version_family` creation yields exactly one row — 8 tasks against a file-backed pool; `SQLITE_BUSY` is retried rather than pretended away, and the assertion is on the end state
 - [x] Test: CAS with a stale version affects zero rows and is reported as such
-- [x] Test: list read with a wildcard pattern returns exactly what `GtsId::matches_pattern` accepts, including a case the SQL prefilter admits but the pattern rejects. **Two fixture identifiers had to be fixed first:** `…v1~x.a.type.v1~` does not parse (a chain segment is a full `vendor.package.namespace.type.vMAJOR`), so `matches_pattern` rejected it and the test had been passing for the wrong reason. The `v1~*` expectation was also wrong — a bare segment is an implicit derived-type envelope (GTS spec §3.6), so `…v1~` and `…v1~*` accept the same set, base included
+- [x] Test: list read with a wildcard pattern returns exactly what `GtsId::matches_pattern` accepts, including siblings in the same identifier range. A chain segment is a full `vendor.package.namespace.type.vMAJOR`, and a bare segment is an implicit derived-type envelope (GTS spec §3.6), so `…v1~` and `…v1~*` accept the same set, base included
 - [x] Test: keyset paging over a set larger than one page yields every row exactly once, and a row inserted mid-traversal neither duplicates an earlier row nor hides a later one
-- [x] Test: closure read over a chain returns the whole chain and nothing outside it — plus termination on a cycle (valid per ADR-0012, so the `seen` set is a correctness requirement)
+- [x] Test: closure read over a chain returns the whole chain and nothing outside it — plus termination on a row that contradicts acyclicity. The relation is a DAG (ADR-0012), so the `seen` set is what keeps the walk linear in entities rather than in converging paths; termination on a contradicting row is defence in depth, retitled at T14 when the invariant gained a test of its own
 - [x] `cargo test --workspace` (excluding the two macro crates, as `make test-no-macros` does) — passes, so no regression in any other gear
 - [x] PostgreSQL / MySQL repository primitives — **run, and they found two defects.** `tests/repo_backends_test.rs` covers the properties `SQLite` cannot demonstrate: the unique-conflict handling, the keyset cursor's binary collation, and now the same two races **inside a transaction**, which is the only shape production uses. Both container suites pass; see the correction below. Run: `cargo test -p cf-gears-types-registry --features integration --test repo_backends_test`
 
 **Added beyond the acceptance criteria:**
-- **Boundedness is tested, not asserted.** 2100 rows inside the prefix range that the pattern rejects, with the single match sorted last: a read that materialised the range would return it on the first page, a bounded scan cannot. Mutation-checked by raising `SCAN_BUDGET`
-- **The SQL batch adapts.** With a pattern, 256 rows per round trip so a sparse match set does not cost one trip per match; without one, the page's own remainder, because nothing can be rejected and reading ahead is waste. Still capped at 256 either way — the remainder is caller-supplied, and one round trip's memory must not be
+- **Sparse matches cost no extra pages.** 2100 rows share the match's identifier prefix and sort ahead of it; the match still arrives on the first page, with no cursor after it
 - **`replace_outgoing` treats its edge list as a set** — `(from, kind, to)` is the primary key, so a schema that `$ref`s one base twice would otherwise be a PK violation mid-admission. Mutation-checked
 - **A second deletion is proved to be a no-op** — `mark_deleted` requires `Active`, so a repeated call reports failure and leaves `deleted_at` where it was; the read-back also pins the `LifecycleStatus` enum lowering through `Expr::value`, which no `ActiveModel` covers
 - **Two pre-existing T3 clippy failures fixed** (`make clippy` runs `--all-features`, so both would have failed CI): `entity_test.rs`'s bare-connection reads, allowed at file scope with the reason that the file tests the entity rather than the scope; and an unbackticked `PostgreSQL` in `migration_backends_test.rs`'s module header
@@ -215,7 +221,6 @@ in-transaction backends test, and each was confirmed to fail with its fix revert
 **Dependencies:** T3
 **Files touched:**
 - `TR/src/infra/storage/repo.rs` — NEW, three repositories (**split into `repo/` — one file per repository — after Checkpoint 1**, see the Phase 2 preamble)
-- `TR/src/infra/storage/repo_tests.rs` — NEW, 7 in-source tests for the SQL prefilter
 - `TR/src/infra/storage/mod.rs` — `pub mod repo`
 - `TR/tests/repo_test.rs` — NEW, 17 `SQLite` tests against the migrated schema
 - `TR/tests/repo_backends_test.rs` — NEW, 2 container-backed tests behind `integration`
@@ -282,7 +287,7 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 - [x] `tenant_ownable` is **parsed and validated but inert** (SPEC §10.3). `RegistrationPolicy::tenant_ownable` resolves it by the same rules as the vendor set and is asserted to return the configured value — which is what makes it inert rather than dropped — while `admits` refuses any candidate asking for tenant ownership whatever the entry says. §9 makes that request shape unreachable, so it is a fail-closed assertion, not a feature
 - [x] Per-parameter resolution implemented: longest literal prefix wins, an exact key beats any pattern, entries omitting a parameter are skipped, closed default otherwise. Specificity is `(is_exact, literal_prefix_len)` — the exact-beats-pattern rule is a separate tuple element rather than left to fall out of prefix lengths, because DESIGN states it separately
 - [x] Global `cf` vendor is implicitly admitted; nothing else is. Keyed on the **last** segment's vendor, so a `cf`-rooted identifier with an `acme` derivation is an `acme` candidate — tested, since reading the first segment would open the whole platform namespace to derivations
-- [x] `worker.family_lock_timeout` is positive, defaults to 5s and is enforced by the admission worker; unlike the future lease timeout it is not reported as inert
+- [x] ~~`worker.write_lock_timeout` is positive, defaults to 5s and is enforced by the admission worker~~ — **the key is gone.** It bounded the family advisory locks, which T15 retired; the `entity_write_order` claim's wait is the database's own (`lock_timeout`, `innodb_lock_wait_timeout`, `busy_timeout`) and a gear-side budget is not expressible — see SPEC §8.1 and the `TxConfig` ask in §4
 
 **Verification:**
 - [x] `cargo test -p cf-gears-types-registry` — 255 lib + 259 integration tests on SQLite; the operator-facing configuration boundary has 21 `config_test.rs` cases
@@ -301,7 +306,7 @@ T21's shapes:
 
 - every field now says **enforced** or **accepted, not enforced in P0**, and the latter names the
   task that binds it (T14 for the write set, T15 for `max_revalidation_attempts`, T21 for
-  `operation_timeout`, T27 for the page-size pair, T13/T19 for `resolution_closure`) — the honest
+  `operation_timeout`, T22a for the page-size pair) — the honest
   shape `tenant_ownable` already had;
 - `CLOSURE_BOUND` says it is *its own* bound over what a store build **reads**, not SPEC §8.1
   step 4.6's write set, and its error message no longer borrows the other bound's name;
@@ -309,6 +314,16 @@ T21's shapes:
   not act on, and `init` names them in one `warn!`. Not a boot failure: a P1-ready configuration
   legitimately carries every one of them. The test over it is exhaustive, so binding a key breaks
   that test — which is the reminder to take it out of the list.
+
+**Resolution budgets:**
+
+- [x] `resolution_closure` bounds each candidate or refreshed schema's distinct authored
+  resolution graph, including its own document and the candidate overlay. Converging paths
+  count once; `x-gts-ref` and unrelated documents in the shared refresh store do not count
+- [x] `resolved_document` bounds the canonical UTF-8 bytes of each effective artifact,
+  including the conforming schema used by an Instance. Exactly-at-bound passes; exceeding
+  either budget refuses admission and rolls back any revision and dependent refresh
+- [x] Both settings reject zero at startup and are removed from `inert_limit_keys()`
 
 **Dependencies:** T2
 **Files touched:**
@@ -332,7 +347,7 @@ operation, its items and the outbox message. Reads no entity state.
 Outcome and evidence: the criteria below. The per-task report was folded into these and deleted.
 
 **Acceptance criteria:**
-- [x] Checks run in SPEC §8.1 order; policy precedes any existence lookup so a refusal cannot probe the namespace. Kept **structurally**, not by review: `validate` takes the request and the config and has no runner, provider or repository in its signature, so mid-validation existence checking would require changing that signature. Steps 1–6 and 8 are here; **step 7 (the ADR-0015 quarantine) is T18's** — it needs T13's reference extractor — and a `TODO(T18)` marks its position between steps 6 and 8 so it lands as an insertion rather than a reordering. Step 6 fail-closes every otherwise-applicable `force` until T17 can compare and persist its provenance
+- [x] SPEC §8.1 ordering: `validate` has no database access, so policy precedes existence checks. Acceptance handles steps 1–6 and 8; T18 implements step 7 in the worker using its extracted dependency edges (see SPEC §8.1). T17 replaces the temporary `force` refusal with compatibility checks and provenance.
 - [x] Policy gates **every accepted candidate**, because P0 accepts only declared creations: a positive `expected_resource_version` is refused (`AcceptanceError::RevisionNotAccepted`) and deletion is refused with the envelope. SPEC §8.1's revision/deletion bypass is deliberately *not* implemented yet — gating on the caller's declared kind while nothing verified the claim let a request name a version and skip the gate outright (found at the Checkpoint 1 review). The bypass returns at T11, together with the commit-side precondition that makes the claim checkable. A refusal names the region and the parameter
 - [x] Fingerprint covers canonical body, operation kind, owner, preconditions and each `force` flag — plus dry-run mode, plane, tenant and principal, as one table-driven test over all nine inputs. Every field is **length-prefixed**, so a digest cannot confuse `("ab", "c")` with `("a", "bc")`, and the digest carries a version tag so a future change to its coverage cannot read as a matching replay
 - [x] Replay with a matching fingerprint returns the stored operation (`202` non-terminal, `200` terminal); a different fingerprint under the same key returns `409`. The replay test submits a deliberately **reordered** body, because canonicalization is the thing that makes a replay a replay
@@ -395,8 +410,9 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 
 **Not done, deliberately:** `insert_current` is an insert rather than an upsert — moving an
 existing pointer is a revision with its own preconditions (T11), and a silent overwrite would
-hide a missing recheck. One item is one unit, in `item_no` order; in-batch references and SCC
-ordering are T19. `run_operation` takes no config, because nothing in T8 reads a limit.
+hide a missing recheck. One item is one unit, in `item_no` order; in-batch references and
+topological ordering are T19. `run_operation` takes no config, because nothing in T8 reads a
+limit — T14 gives it `&Limits`.
 
 **Duplicate delivery is already a no-op**, ahead of T21 asking for it: a completed operation is
 recognized and its stored outcomes returned, and an item already terminal from an earlier pass is
@@ -425,7 +441,7 @@ shape (D10).
 Outcome and evidence: the criteria below. The per-task report was folded into these and deleted.
 
 **Acceptance criteria:**
-- [x] `POST /entities` returns `202` with operation `Location` and advisory `Retry-After`; `200` only on terminal replay. The `Location` is built from the path the request **arrived on** and is therefore followable under api-gateway's `prefix_path` — the credstore precedent, with one correction to it: `OriginalUri`, not `Uri`, because `apply_prefix` mounts every gear with `Router::nest`, which rewrites away exactly the prefix that has to survive (found at the Checkpoint 1 review). The receipt reports the operation's **real** status — with inline admission a fresh submission is already `completed`, and telling a caller to poll for something that has happened is worse than useless. It comes from `Accepted.status`, which `submit` already knows, rather than from the read-back this used to do: that read cost a second snapshot transaction over two statements and carried a `"pending"` fallback for an operation that had just been committed and so cannot be absent (found at the Checkpoint 1 review)
+- [x] `POST /entities` returns `202` with operation `Location` and advisory `Retry-After`; `200` only on terminal replay. The `Location` is built from the path the request **arrived on** and is therefore followable under api-gateway's `prefix_path` — the credstore precedent, with one correction to it: `OriginalUri`, not `Uri`, because `apply_prefix` mounts every gear with `Router::nest`, which rewrites away exactly the prefix that has to survive (found at the Checkpoint 1 review). The receipt reports the operation's **real** status: `pending` for a fresh submission, the stored value for a replay. It comes from `Accepted.status`, which `submit` already knows, rather than from the read-back this used to do: that read cost a second snapshot transaction over two statements and carried a `"pending"` fallback for an operation that had just been committed and so cannot be absent (found at the Checkpoint 1 review)
 - [x] `Idempotency-Key` is required; absence is a synchronous refusal. **A toolkit gap:** `OperationBuilder` exposes `path_param` / `query_param` and no header equivalent, so the requirement cannot be declared as an OpenAPI parameter from this gear. The route description states it *and* states that it is undeclared; fixing the builder is toolkit work outside this gear
 - [x] Errors are RFC-9457 problem details via `.standard_errors(openapi)`, never raw status tuples — one match arm per `AcceptanceError` variant, exhaustive, so a new refusal reason cannot reach the wire as an opaque `500` by omission
 - [x] Routes are `/types-registry/v1/...` and `.authenticated()`; DTOs live only in `api/rest/dto.rs`
@@ -443,11 +459,8 @@ restores v1 and moves this surface to `/types-registry/v2/`, for the reasons in 
 DTOs, handlers and tests below are the ones T9a re-registers under v2 — nothing here is discarded,
 only re-addressed.
 
-**Three interim shapes, each marked in code.** Admission runs **inline** until T21 starts the
-outbox worker — not a throwaway path, because seeding does exactly this permanently (SPEC §8.1),
-and the dispatch call still happens inside the acceptance transaction through `NullDispatch`, so
-T21 changes one implementation rather than the transaction's shape. The scope is `allow_all`
-(ceiling C6). Ceiling C8 is commented at the routes.
+**Two interim shapes, each marked in code.** The scope is `allow_all` (ceiling C6).
+Ceiling C8 is commented at the routes.
 
 **The database is optional.** `ctx.db()` rather than `db_required()`: `no-db.yaml` and `--mock`
 bind none, and failing their boot for a path they do not use would be a regression. Where none is
@@ -464,7 +477,6 @@ in no deployment at all.
 - `TR/src/api/rest/handlers.rs` — three new handlers; the two replaced ones deleted
 - `TR/src/api/rest/dto.rs` — the submit-then-poll DTOs and mappings; the old shape's four DTOs deleted
 - `TR/src/api/rest/error.rs` — `From<ServiceError>` / `From<WorkerError>` / `From<AcceptanceError>`
-- `TR/src/domain/admission/mod.rs` — `NullDispatch`
 - `TR/src/infra/storage/repo.rs` — `EntityRepo::find_by_gts_uuid`, `TypeSchemaRepo::find_current`
 - `TR/src/gear.rs` — wire the database-backed service when a database is bound
 - `TR/Cargo.toml` — `tower` dev-dependency
@@ -557,8 +569,9 @@ the last `~`, and the immutable schema-revision pair.
    repairs a Phase 1 defect: `admission_worker_test.rs::a_second_invocation_sees_the_first_ones_committed_revision`
    currently asserts that a derived Type Schema **fails**, and the comment blames T13's missing
    edges — half right, since `validate_schema` walks `chain_ids()` and would have found the base
-   with no edge table involved. T13 keeps what is genuinely edge-derived: `$ref` and `x-gts-ref`
-   targets, and T14's reverse walk.
+   with no edge table involved. T13 supplies the `$ref` targets needed by the forward closure and
+   the three direct edge kinds needed by T14's reverse walk. `x-gts-ref` is neither resolved nor
+   represented by an edge.
 2. **`instance` and `instance_revision` acquire their four edits** — entity, repository with its
    mapper, port trait and types, and the forwarding block in `store.rs`. T2's migration already
    created both tables, so no migration changes.
@@ -570,14 +583,14 @@ the last `~`, and the immutable schema-revision pair.
 
 **Acceptance criteria:**
 - [x] An Instance records the exact Type Schema revision that validated it — `(type_schema_entity_id, type_schema_revision_no)` on `instance_revision`, read in **the same snapshot** as the transient store so the recorded pair is the one that actually validated; a second read could see the schema revised in between
-- [x] An Instance whose conforming schema is absent fails retryably, not terminally — `WorkerError::ConformingTypeAbsent`, checked **before** validation so the failure names the real cause rather than reporting a missing schema as a content fault
+- [x] An Instance whose conforming schema is absent fails immediately with `dependency_not_found` and structured dependency ID/kind, before value validation. The refusal is recorded on the item and acknowledged by the outbox.
 - [x] A minor or major 0 in the Instance identifier's last segment is refused at acceptance — **already built and tested in T7**; `an_instance_identifier_must_name_a_stable_major_without_a_minor` covers both halves plus the Type Schema contrast, so this task adds nothing
 - [x] `instance` carries only the current-revision pointer — no derived artifact. The asymmetry with `type_schema` is documented on the entity so it is not "fixed" later: an Instance has no derived state, its value is authored and its schema revision is immutable and pinned by `ON DELETE RESTRICT`, so there is nothing that could change without a new revision and nothing to fingerprint
 - [x] `entity_kind` is derived from the identifier, not passed in. Stronger than removing the literal: `EvaluatedOutcome` is an **enum** whose variant carries the kind-specific payload (artifacts for a schema, the revision pair for an Instance), and `entity_kind()` reads it off the variant. Two `Option` fields beside a `kind` discriminant would have made a mismatch representable; here it is a compile error
 - [x] The transient store carries both kinds: both `UnsupportedKind` refusals are deleted and the dialect gate is keyed on the identifier's `~`. `type_id` is passed to `GtsEntity::new` **explicitly** from `GtsId::get_type_id()` with a `None` config — letting content name the conforming type would allow a value to claim conformance to a type it was not registered under, which is a validation bypass, not a convenience
 - [x] The closure reaches a candidate's derivation chain with **no `dependency` row present** — `closure` seeds its worklist with `GtsId::chain_ids()`, and `missing_roots` is still computed over the original roots so a chain member the seed added is not reported as one. The Phase 1 test is inverted, and its old comment was half wrong: it blamed T13's missing edges, but a derivation base is a pure function of the identifier
 - [x] A family holds one kind — `family_kind_conflict`, checked under the family lock and only for a family that already existed. Distinct from `already_exists` because the identifier *is* free; saying otherwise sends a caller looking for a conflicting entity that does not exist. Both orders are tested
-- [x] No `$ref`/`x-gts-ref` target is expected to resolve yet — `a_ref_outside_the_chain_still_fails` pins it, so T10's chain seed cannot be mistaken for T13 having landed early
+- [x] No `$ref` target is expected to resolve in T10; document-reference support belongs to T13 and is verified there by `a_ref_outside_the_chain_is_admitted`. An `x-gts-ref` target is never resolved or seeded because validating the keyword reads no target document.
 - [x] **An admitted Instance reads back with its value.** *Added after the task was marked done — see the correction below.* `GET /v2/entities/{entity_key}` returns either kind's authored document under the single public field `content`. The immutable `revision_no` remains an internal current-pointer and provenance detail; the public entity exposes `resource_version`, which is the token future writes accept. The three `effective_*` artifacts stay absent for an Instance, and that is the contract rather than the same omission: an Instance has no derived state, so there is nothing to materialize
 
 **The read path was missed, and the task's criteria are why.** Every criterion above is about
@@ -598,7 +611,7 @@ representable value rather than a mismatch a later edit could introduce. One sta
 uses that pairing internally and does not publish the revision number.
 
 **Consequence for later tasks, since it would have surfaced there as a regression.** T23's
-`get_instance` and T27's `batchGet` both sit on this method; the SDK helpers that hydrate a
+`get_instance` and T22a's `batchGet` both sit on this method; the SDK helpers that hydrate a
 content-free page through `batchGet` would have returned pages of null values.
 
 **Verification:**
@@ -626,7 +639,7 @@ every `WorkerError` today, not something this task introduces; T21 makes it a re
 Outcome and evidence: the criteria below.
 
 - [x] A fixture Type Schema registers over REST, the operation reaches `completed`, the entity and its resolved artifacts are readable — as a test (`api_rest_test.rs::a_registration_is_accepted_polled_and_read_back`, driving the real `register_routes`) **and now at runtime**: `POST /cf/types-registry/v1/entities` `202` → operation `completed` with one `succeeded` item → entity `active`, `rv=1`, all four artifacts materialized, readable by `gts_id` and by `gts_uuid`. **T9's boot blocker was the invocation, not the code, and is retracted:** `oagw` is a non-optional dependency of the example server while every tenant-resolver plugin sits behind a cargo feature, so a bare `cargo run` compiles the resolver with no plugin and `oagw` is the first to notice. With `--features "$(cat config/e2e-features.txt)"` — which is what `make example` passes — all 25 gears boot and `/cf/docs` renders the four routes
-- [x] Durable registration state survives closing and reopening the database pool byte-identically — `TR/tests/restart_persistence_test.rs`, two tests. One admits both a Type Schema and an Instance, drops the service/provider/pool, reopens the SQLite file, re-runs test migrations, and compares whole `Model` values in stable primary-key order across all eight affected tables; it then proves both entities are readable through a fresh service and that the persisted idempotency record replays without a write. The other pins the pre-T21 crash-window recovery of a committed non-terminal operation. This is deliberately not called a process-restart test: real `TypesRegistryGear::init`, startup seeding and a new process remain T30's e2e/manual obligation
+- [x] Durable registration state survives closing and reopening the database pool byte-identically — `TR/tests/restart_persistence_test.rs`, two tests. One admits both a Type Schema and an Instance, drops the service/provider/pool, reopens the SQLite file, re-runs test migrations, and compares whole `Model` values in stable primary-key order across all eight affected tables; it then proves both entities are readable through a fresh service and that the persisted idempotency record replays without a write. The other pins the crash window: a committed non-terminal operation survives the reopen and completes when admitted. This is deliberately not called a process-restart test: real `TypesRegistryGear::init`, startup seeding and a new process remain T30's e2e/manual obligation
 - [x] Consumers untouched: the old `TypesRegistryClient` is still served from its existing in-memory repository; full workspace tests pass — **10593 passed, 368 skipped, 0 failures** (`cargo nextest run --workspace` minus the two macro crates, as `make test-no-macros` does). Structurally, the branch touches four files outside the gear — `Cargo.lock`, `Cargo.toml` (gts 0.11.0 → 0.12.0) and the two configs — and **not one file in `types-registry-sdk`**; the gear still holds `service` and `local_client` beside the new `registry`
 - [x] The new path holds no entity state between admissions: the store is built per unit and dropped, and the entity read in the first item above comes from the database — `RegistryService` has no store field and `grep ArcSwap src/gear.rs` finds nothing; `build_store` / `load_unit_store` are free functions returning an owned `UnitStore`, so there is no `self` to retain it in. T5's `two_sequential_builds_each_observe_the_committed_revision` proves the consequence, and the `503`-without-a-database case shows the read really is a database read
 - [x] Gear tests green on SQLite, PostgreSQL and MySQL (see [Commands](#commands)) — 423 tests on SQLite, and the **first ever** container run of the two backend suites, Docker having been down for T1–T9. It found a real defect: `sqlx` binds `Uuid` as 16 raw bytes on both non-native backends, so every uuid write failed on MySQL's `CHAR(36)` and was silently stored as a blob in `SQLite`'s `TEXT`. Fixed to `BINARY(16)` / `BLOB` + `ck_tr_*_uuid_len`
@@ -652,10 +665,10 @@ Outcome and evidence: the criteria below.
   **The wire is unchanged.** AM stores and exposes the payload content, so `MetadataSchemaRegistry::validate_value` composes the envelope (`{"payload": value}`) at the one seam that validates a whole metadata document. `gts_validation::validate_property_value` checks individual properties and is unaffected. AM's REST contract, its domain models and the e2e suite keep their shapes
 - [x] `make dylint` **re-run** after T9a and T10 — workspace-wide, exit 0, zero findings. Unlike the first run at Checkpoint 1, nothing had accumulated: a phase is a short enough window that the two tasks since carried no layering debt (P13)
 - [x] **v1 is intact and the new surface is additive (T9a).** Both v1 routes are restored verbatim from `main` and the async surface sits under `/v2/`; three handlers take `TypesRegistryService`, three take `Option<Arc<RegistryService>>`, and neither falls back to the other. `make e2e-local` is green with **no e2e file edited for T9a** — the one e2e file this branch touches, `account_management/conftest.py`, belongs to the envelope fix above and would have been needed with or without T9a
-- [x] **Review follow-up: unsupported dry-run fails synchronously, and replays are explicit.** Until T20 supplies a rollback-only evaluation transaction, `dry_run: true` is rejected during admission with a canonical `400` field violation, before an operation can be created or stranded in `running`. Successful idempotency replays now include `Idempotency-Replayed: true`; first submissions omit it. Domain and REST regression tests pin both contracts
+- [x] **Review follow-up: unsupported dry-run fails synchronously, and replays are explicit.** Before T20, unsupported `dry_run: true` was rejected during admission with a canonical `400` field violation, before an operation can be created or stranded in `running`. Successful idempotency replays now include `Idempotency-Replayed: true`; first submissions omit it. Domain and REST regression tests pin both contracts
 - [ ] **Human review — everything after this widens the path rather than reshaping it.** Five open items, none of them a failing check:
-  - **Another gear owns part of `/types-registry/v1/*`.** `resource-group` registers five routes — `POST|GET /types`, `GET|PUT|DELETE /types/{code}` — inside this gear's service namespace, from `gears/system/resource-group/.../api/rest/routes/types.rs`. T27 and T28 widen that namespace, so a collision waits for whichever gear registers a conflicting path first. Decide: report to the resource-group owners now, or carry it as a known hazard into T27/T28
-  - ~~**`Idempotency-Key` cannot be declared in OpenAPI.**~~ **Retracted — the claim was false and is now fixed.** `ParamLocation::Header` exists and `openapi_registry.rs:200` already maps it onto utoipa's `ParameterIn::Header`; the generic `OperationBuilder::param(ParamSpec)` declares it. What misled us is that there is no `header_param` convenience beside `path_param` / `query_param`, so the capability is discoverable only by reading the enum. `POST /v2/entities` now declares the header as a required parameter, pinned by `the_idempotency_key_header_is_declared_as_a_required_parameter` and mutation-checked. The remaining toolkit gap is the missing convenience method — filed upstream as constructorfabric/gears-rust#4614
+  - **Another gear owns part of `/types-registry/v1/*`.** `resource-group` registers five routes — `POST|GET /types`, `GET|PUT|DELETE /types/{code}` — inside this gear's service namespace, from `gears/system/resource-group/.../api/rest/routes/types.rs`. T20a, T22a and T28 widen that namespace, so a collision waits for whichever gear registers a conflicting path first. Decide: report to the resource-group owners now, or carry it as a known hazard into T20a/T22a/T28. **T20a's widening did not collide** — it added two `/v2/entities*` routes, and `resource-group` owns only `/v1/types*`; see T20a's *Resolved hazard*. The decision for T22a and T28 is still open
+  - ~~**`Idempotency-Key` cannot be declared in OpenAPI.**~~ **Retracted — the claim was false and is now fixed.** `ParamLocation::Header` exists and `openapi_registry.rs:200` already maps it onto utoipa's `ParameterIn::Header`; the generic `OperationBuilder::param(ParamSpec)` declares it. What misled us is that there is no `header_param` convenience beside `path_param` / `query_param`, so the capability is discoverable only by reading the enum. `POST /v2/entities` now declares the header as a required parameter, pinned by `the_idempotency_key_header_is_declared_as_a_required_parameter` and mutation-checked. The remaining toolkit gap is the missing convenience method — filed upstream as constructorfabric/gears-rust#4614. Narrowed by the #4828 review follow-up: `ParamSpec` is now built through `ParamSpec::header` / `::query` / `::path` rather than a field literal, so the location no longer has to be found by reading `ParamLocation`, and the struct is `#[non_exhaustive]` so the next schema keyword added to it cannot repeat this PR's mechanical `format: None, minimum: None` across 12 declaration sites
   - **T2's three lowering decisions were flagged *worth review* and never signed off:** MySQL `DATETIME(6)` rather than `TIMESTAMP(6)`; three extra boolean-domain CHECKs on SQLite and MySQL; MySQL's four indexes declared inline as `KEY`
   - **The migration changed after T2 was marked done** (the uuid binding). Nothing to migrate forward — no deployment had run it — but the "done" marker moved
   - **T10's marker moved too, and the reason generalizes.** The public read returned `content: null` for an admitted Instance; fixed, with the correction written into T10. What is worth deciding rather than just noting: T10's criteria covered admission exhaustively and never named the read, and the same asymmetry stands wherever a task extends the write path — T11, T13 and T20 each add state that `RegistryService::entity()` must then be able to return. Consider a standing criterion for those three: *whatever this task makes storable is readable through the public surface, with a test on the route*. **T11 adopted it** — the criterion is written into T11's verification and discharged by `a_revision_is_readable_through_the_entity_route`; T13 and T20 still need the same, and the decision to make it standing rather than per-task is still yours
@@ -707,8 +720,8 @@ flat is how the root reaches 25 files.
 | Concept | Directory at | Contents then |
 |---|---|---|
 | `family/` | **T10 + T12** | `key.rs` (today's `family_key`), `rules.rs` (kind at T10, shape and contiguity at T12), tests |
-| `dependency/` | **T13 + T14** | `extraction.rs` (the four edge kinds), `worklist.rs` (reverse impact), tests |
-| `compat/` | **T17 + T18** | `baseline.rs` (selection + resolved comparison), `derivation.rs` (chain + major-0 quarantine), tests |
+| `dependency/` | ~~T13 + T14~~ | **Not taken.** The traversal turned out to be SQL, so there was no second file to put beside `extraction.rs`: `domain/dependency.rs` stays one pure file and T14's admission step went to `domain/admission/refresh.rs`. See T14's *Not `TR/src/domain/dependency/`* |
+| `compat/` | **T17 + T18** | `baseline.rs` (selection + resolved comparison), `derivation.rs` (major-0 quarantine + the ADR-0014 dialect pin), tests |
 
 Staying flat: `policy.rs`, `artifacts.rs`, `validator.rs`, `gts_store.rs`, `enums.rs`,
 `error.rs`, `ports.rs`, `registry_service.rs`, `seeding.rs` — one concept each, the way
@@ -742,8 +755,8 @@ the first row lands in that state.
 - [x] The compare-and-swap returns `Some(next_resource_version)` from the repository and `None` on a lost race. The repository computes `next` with `checked_add` and writes that exact value; the domain never reconstructs the database result or saturates at the numeric ceiling
 - [x] A positive precondition on a minor-bearing Type Schema is refused during acceptance: ADR-0004 makes that published contract content-immutable, so a change is registered as the next minor rather than appended as a revision
 - [x] Equal authored content yields `unchanged`, creating no revision and not advancing `resource_version`. Both kinds: the rule is shared, the tables are not
-- [x] `unchanged` is impossible for a create or a delete, enforced in code as well as by the CHECK. In code it is **structural**: `commit_creation` returns `CommittedUnit` and only `commit_revision` returns `RevisionCommit`, whose `Unchanged` variant is the sole way to reach `mark_item_unchanged`. A creation of existing content is `already_exists`, whatever the content
-- [x] Content hash is a prefilter only; effective artifacts are excluded from equality. `CurrentDocument` and `CurrentInstanceValue` gained `content_hash` so the digest and the bytes travel together, and the decision is `hash == hash && bytes == bytes` — the digest alone would let a collision swallow a real edit
+- [x] `unchanged` is impossible for a create or a delete, enforced in code as well as by the CHECK. In code it is **structural**: `commit_creation` returns `CommittedUnit` and both revision commit paths return `RevisionCommit`; the early `unchanged` proof is constructed only for `Precondition::Version`. A creation of existing content is `already_exists`, whatever the content
+- [x] Equality is exact comparison of canonical authored bytes; effective artifacts are excluded. `CurrentDocument` and `CurrentInstanceValue` carry the bytes, and the decision is `bytes == bytes`. (A stored FNV-1a `content_hash` prefilter was used here first; it was later removed with its column, see T22b.)
 
 **The concurrency shape, because it is not the obvious one.** The commit transaction runs at
 `READ COMMITTED` (`ports::commit_write`), so a concurrent admission can commit between reading
@@ -810,7 +823,7 @@ correction is the point: all three rules now read as one list, rather than one r
 - [x] A `DELETED` predecessor still counts; the predecessor test is re-asked inside the commit transaction. Both fall out of one primitive: `find_by_gts_id` returns tombstones and every rule runs inside `commit_creation`'s transaction, so there is no way for the two rules to disagree about what a tombstone means
 - [x] Family ownership is write-once; the entity's owner columns are a projection maintained under the lock. `NewEntity` now takes `family.ownership_scope` / `family.owner_tenant_id` instead of re-reading the request — a copy taken from the row it is verified against **cannot** disagree with it, which is stronger than verifying two independent readings. Write-once is structural: `create_or_get` has no update path, so this is the only writer of either column
 - [x] The predecessor is excluded from `dependency` and from the revision vector — a **negative** criterion, and the only discharge available now: T13 does not write edges yet and T15's vector does not exist. `a_predecessor_is_not_a_dependency_edge` asserts the table stays empty after `v1.0~` then `v1.1~`, so T13 inherits a failing test if it adds the edge
-- [x] Family locks use the configured 5s retry budget; timeout is a retryable `503` with `Retry-After`, and both successful commits and partial acquisition failures explicitly release every acquired guard
+- [x] ~~Family locks use the configured 5s retry budget; timeout is a retryable `503` with `Retry-After`~~ — **retired at T15 with the family locks.** `worker.write_lock_timeout` is gone, and so is the `503`: the write path serializes on the `entity_write_order` row, whose wait only the backend bounds (SPEC §8.1, and the `TxConfig` ask in §4)
 
 **Both rules are scoped to one MAJOR**, as the compatibility chain is, so a family may hold a
 major-only `v1~` beside a minor-bearing `v2.0~` (`database.sql`). Three of the twelve table rows
@@ -829,11 +842,11 @@ own family and that an Instance probes Instance spellings.
 - [x] Table-driven test over shape and contiguity combinations — twelve rows, each its own database, `shape_and_contiguity_over_the_combinations`. Genuine RED→GREEN
 - [x] Test: family key derivation maps `v1~`, `v1.4~`, `v2~` to one row, and a preceding-segment minor survives verbatim — the pure half in `key_tests.rs` (unchanged from T8), the *one row* half in `one_family_row_holds_every_version_and_owns_its_members`, which also pins the owner projection
 - [x] ~~Test: concurrent first registration under two owners yields one winner~~ — **already covered, and deliberately not duplicated on `SQLite`.** `repo_backends_test.rs::family_race_yields_one_row` (eight concurrent callers, exactly one `created`) and `family_race_inside_a_transaction_yields_one_row` (the loser keeps reading in the same transaction) are T4's, on both container backends. A `SQLite` version cannot exist: a second concurrent writer fails the whole transaction with `database is locked` rather than losing a unique-key race — measured, not assumed. `family_test.rs` carries a named placeholder test pointing at the two that do cover it. *"Two owners"* is P1 language; P0 fixes every row to `ownership_scope = 1` (ceiling C6)
-- [x] Tests: a creation holds the family lock across its transaction; configured contention returns `FamilyLockUnavailable`, then the same operation succeeds after the blocker releases. Lock tests use unique file-backed SQLite DSNs so their toolkit lock namespaces cannot collide under parallel test execution
+- [x] ~~Tests: a creation holds the family lock across its transaction; configured contention returns a refusal~~ — **retired at T15 with the family locks themselves.** The `entity_write_order` claim makes the whole commit transaction exclusive, so the family rules those locks serialized are already serialized; keeping them also inverted the lock order against ADR-0013's purge protocol
 
-**Family-lock gap closed.** `worker::lock_families` takes toolkit advisory locks in canonical
+**Family-lock gap closed, and later retired.** T12's `worker::lock_families` took toolkit advisory locks in canonical
 `family::lock_order` before opening the commit transaction and holds them through every family
-rule and entity insert. Acquisition uses the enforced `worker.family_lock_timeout`; contention
+rule and entity insert. Acquisition used the then-enforced `worker.write_lock_timeout`; contention
 returns retryable `503 Service Unavailable` with `Retry-After`, while any guards accumulated
 before either timeout or a fatal acquisition error are explicitly released through the same
 helper as the successful commit path. `SQLite` keeps its toolkit-defined DSN-keyed lock scope, so
@@ -848,25 +861,40 @@ under the same `Idempotency-Key`, which `submit`'s `!terminal` branch re-drives.
 ---
 
 ### Checkpoint 2
-- [ ] Revisions and CAS behave; family shape and contiguity hold under concurrency (the kind rule landed with T10)
-- [ ] Gear tests on three backends (see [Commands](#commands))
-- [ ] `make dylint` — full workspace, once for the phase (P13)
-- [ ] Human review
+- [x] Revisions and CAS behave; family shape and contiguity hold under concurrency (the kind rule landed with T10)
+- [x] Gear tests on three backends (see [Commands](#commands))
+- [x] `make dylint` — full workspace, once for the phase (P13)
+- [x] Human review
+
+**The one decision this checkpoint owed: the family lock is wired, not deferred.** T12 first
+raised it as an open gap and left the choice between T15 and a task of its own; the answer was
+neither — it landed straight away, in `5240378e4` and `6b836e247`, which is why T12's note above
+reads as closed. Family validation and creation are serialized under
+`Db::try_lock` with a retry on transient contention, so the two-different-new-members race T12
+described is closed for T10's kind rule at the same time. The same work stops a revision
+resurrecting a tombstoned entity and separates corruption from contention in the worker's error
+vocabulary. T15 therefore inherits bounded retry over the revision vector only — the lock and
+its ordering are already there.
 
 ---
 
 ## Phase 3 — Dependencies and materialization
 
-### - [ ] T13: Dependency edge extraction and writes
+### - [x] T13: Dependency edge extraction and writes
 
-**Description:** Extract the four edge kinds from authored content — `$ref`, `x-gts-ref`
-target, immediate derivation base, Instance conformance — and replace the admitted entity's
-outgoing rows on each admission.
+**Description:** Extract the edge kinds from authored content — `$ref`, immediate derivation
+base, Instance conformance — and replace the admitted entity's outgoing rows on each admission.
+
+`x-gts-ref` is not a dependency edge. Validation matches the value string against the pattern
+without consulting the registry, the target is not inlined into an effective artifact, and the
+keyword gives no deletion-safety guarantee. The managed–external boundary will classify candidate
+content when federation is introduced. The three stored edge kinds are `$ref`, immediate
+derivation base, and Instance conformance.
 
 **Unchanged by T10's move** (P13). T10 made the *forward* closure reach a candidate's
 derivation chain from the identifier, so derived schemas and Instances no longer wait on this
-task. What still needs rows here: `$ref` and `x-gts-ref` targets, which are not derivable from
-any identifier, and derivation/conformance, which stay materialized because T14's **reverse**
+task. What still needs rows here: `$ref` targets, which are not derivable from any identifier,
+and derivation/conformance, which stay materialized because T14's **reverse**
 walk has no identifier to walk backwards from — the criterion below already says so. Both endpoints are always managed entities. This is also
 the same extractor the worker uses for in-batch ordering.
 
@@ -882,116 +910,569 @@ extractor, called over the candidate document *before* the closure read, its tar
 closure roots beside the candidate's `chain_ids()`. Found at the PR #4641 review.
 
 **Acceptance criteria:**
-- [ ] `x-gts-ref` edge targets the exact identifier, or the pattern's longest valid identifier prefix; a pattern naming nothing valid (`gts.*`) and a GTS §9.6 relative pointer create no edge
-- [ ] Admission replaces only the admitted entity's outgoing rows, through the existing `DependencyRepo::replace_outgoing` — written and unit-tested at T4, with no caller until this task
-- [ ] Derivation and conformance are materialized even though derivable from the identifier
-- [ ] Extraction uses `gts-rust`'s extractor, never a local scan
-- [ ] Extraction is exposed as a pure function over authored content, callable without a database — required for unit testing without a fixture DB
-- [ ] `load_unit_store` seeds the closure with the direct reference targets extracted from each candidate **document**, alongside the candidate's `chain_ids()` — a first admission has no stored edges of its own, so the identifier-derived seed is the only thing the closure would otherwise see
-- [ ] For a revision the roots come from the candidate document's references, never from the previous revision's stored edge set: the overlay wins for edges as it already does for documents
-- [ ] A reference target that genuinely does not exist is distinguishable from a candidate that is not stored yet. `DependencyClosure::missing_roots` holds the candidate itself by construction on every first admission, so extracted targets need their own channel — a separate `UnitStore::missing_references` rather than more entries in `missing_candidates`, which T19 must be able to tell apart. `missing_candidates` has no production reader before this task, so the split costs nothing to make now
-- [ ] The `CLOSURE_BOUND` accounting covers the added roots: `ensure_within_bound` already charges the seeded roots before the first hop, and reference targets enlarge that seed
+- [x] `x-gts-ref` creates no edge and has no reader in the P0 dependency implementation
+- [x] Admission replaces only the admitted entity's outgoing rows, through the existing `DependencyRepo::replace_outgoing` — written and unit-tested at T4, with no caller until this task
+- [x] Derivation and conformance are materialized even though derivable from the identifier
+- [x] `$ref` extraction uses `gts-rust`'s extractor, never a local scan
+- [x] Extraction is exposed as a pure function over authored content, callable without a database — `domain::dependency::extract_edges(&GtsId, &Value)`, no clock and no ports in its signature, which is what lets the same call serve both sides of the admission
+- [x] `load_unit_store` seeds the closure with the `$ref` targets extracted from each candidate **document**, alongside the candidate's `chain_ids()` — a first admission has no stored edges of its own, so the identifier-derived seed is the only thing the closure would otherwise see. An `x-gts-ref` target is not seeded because validating the keyword never reads the target document
+- [x] For a revision the roots come from the candidate document's references, never from the previous revision's stored edge set: the overlay wins for edges as it already does for documents. **With one honest limit,** stated at `load_unit_store`: the candidate's *stale* rows are still walked, because `closure` cannot tell a candidate root from any other, so a reference a revision dropped may still be loaded. That is inert — resolution follows the document, and an extra registered schema answers no question — while the direction that is not inert holds: a reference the candidate **added** resolves
+- [x] A reference target that genuinely does not exist is distinguishable from a candidate that is not stored yet — `UnitStore::missing_references` beside `missing_candidates`. **No port change was needed.** `closure` already reports every root with no entity row; which of those roots is a candidate is `load_unit_store`'s own knowledge, so the split is one `partition` over the existing result rather than a second list crossing the seam. `missing_candidates` still has no production reader, so T19 inherits both lists and no ambiguity
+- [x] The `CLOSURE_BOUND` accounting covers the added roots: `ensure_within_bound` charges `roots.len()` before the first hop, and the seed *is* that vector — reference targets are pushed into it, not passed beside it, so no accounting change was possible to forget
+
+**The dependency reader is `gts-rust`.** `$ref` goes through `gts::extract_gts_refs`, the
+canonical definition shared with the resolution that validates the candidate. No local scan
+interprets either `$ref` or `x-gts-ref` as a dependency.
+
+**An Instance carries exactly one edge, and that is a rule rather than an omission.** `$ref`
+and `x-gts-ref` are schema keywords, so the same strings inside a *value* are data.
+Extracting them would invent an edge from a coincidence, and a malformed one would refuse a
+valid value — `an_instance_values_ref_shaped_data_is_data_and_not_an_edge` pins it.
+
+**Where the edges travel.** Extracted in `evaluate`, where the document is already parsed and
+no transaction is open, and carried on `EvaluatedUnit::edges` as target *identifiers*. The
+commit resolves them to rows, because that answer changes between evaluation and commit. Every
+edge target must resolve: an absent base, conforming schema or `$ref` target is a terminal
+`dependency_not_found` candidate refusal. If an entity identity disappears between evaluation
+and commit, `DependencyTargetAbsent` is a permanent system failure: P0 tombstones entities and
+does not physically remove them. No incomplete edge set is written. A malformed `$ref` still
+fails at extraction as `invalid_schema`.
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Table-driven test over edge-kind fixtures, including the no-edge cases
-- [ ] Test: re-admission removes an edge the new revision dropped
-- [ ] Test: a new schema whose `$ref` names an existing schema **outside its identifier chain** is admitted — the case that fails today with `invalid_schema`
-- [ ] Test: a revision that adds one reference and drops another resolves against the new set, not the stored one
-- [ ] Test: a reference to an identifier no entity carries is reported as a missing reference, distinct from the candidate's own absence
+- [x] Gear tests, all three backends (see [Commands](#commands)) — 531 on `SQLite`, six consecutive full-suite runs green; `make test-types-registry-db` green on `PostgreSQL` and `MySQL`. No new backend cases: the writes go through `replace_outgoing` and the resolution through `find_by_gts_ids`, both already exercised on both container backends by T4's `closure_walks_a_chain`. T13 adds no new SQL shape
+- [x] Table-driven test over edge-kind fixtures, including a derived schema carrying both schema edge kinds, a reference-free schema, and an Instance of a derived type; focused no-edge tests cover `x-gts-ref`
+- [x] Test: re-admission removes an edge the new revision dropped — `a_revision_removes_the_edge_it_dropped_and_adds_the_one_it_gained`, with `a_revision_that_keeps_its_reference_keeps_the_edge` for the other direction, because "replace" could otherwise be read as "clear and forget"
+- [x] Test: a new schema whose `$ref` names an existing schema **outside its identifier chain** is admitted — the case that failed with `invalid_schema`. It was already pinned, inverted, as `admission_worker_test::a_ref_outside_the_chain_still_fails`; that test is now `a_ref_outside_the_chain_is_admitted` and its flip is the RED→GREEN record. `dependency_test.rs` pins the rows the same admission writes
+- [x] Test: a revision that adds one reference and drops another resolves against the new set, not the stored one — `gts_store_test::a_revision_resolves_against_the_reference_it_now_carries`. All three new store tests were verified RED with the one seeding line disabled
+- [x] Test: a reference to an identifier no entity carries is reported as a missing reference, distinct from the candidate's own absence — `a_reference_no_entity_carries_is_a_missing_reference_not_a_missing_candidate`, and end to end `an_x_gts_ref_writes_no_row_whether_its_target_exists_or_not` against `a_ref_naming_no_entity_fails_the_candidate`: same absent identifier, two outcomes, because a pattern is satisfiable before anything matches it while a `$ref` is not
+
+**Two existing tests had to be inverted, and both were boundary markers rather than
+regressions.** `admission_worker_test::a_ref_outside_the_chain_still_fails` asserted the gap
+this task closes. `instance_test::an_instance_admits_against_a_type_from_an_earlier_operation`
+asserted an **empty** `dependency` table to prove conformance is identifier-derived; it now
+asserts exactly one row, from the Instance to its type, and reads the type's own empty
+outgoing set to keep making the original point — the resolution above needed no row.
+
+**SQLite family-lock tests use isolated family keys.** The `SQLite` lock backend is a marker
+**file** at `<cache_dir>/cf-gears/locks/{database_scope}/{hash(gear, key)}`
+(`toolkit-db/src/advisory_locks.rs`), and `database_scope` for `sqlite::memory:` is identical for
+every test in the workspace. So contention is per *lock key*, across processes, however isolated
+the databases are — and `nextest` runs each test in its own process. Sibling tests in
+`family_test` all admit some version of
+`cf.core.example.thing`, they all take that one family key, and the probe carries a 1 ms budget
+with no retries.
+
+The lock probe admits `cf.core.lockprobe.thing.v1~`, a family no other test touches. The Instance
+and dependency suites likewise own `cf.core.inst.*` and `cf.core.dep.*`. This isolates lock keys
+without bypassing the real marker-file lock mechanism. Eight consecutive full-suite runs are
+green.
 
 **Dependencies:** Checkpoint 2
-**Files likely touched:** `TR/src/domain/dependency.rs` (extraction; T14 adds the worklist and the pair takes `TR/src/domain/dependency/` — trigger table above), `TR/src/domain/gts_store.rs` (the read-side seed), `TR/src/infra/storage/repo/`, `TR/src/domain/ports.rs`, `TR/src/infra/storage/store.rs`, `TR/src/infra/storage/entity/dependency.rs`, `TR/tests/dependency_test.rs`, `TR/tests/gts_store_test.rs`
+**Files touched:** `TR/src/domain/{dependency,dependency_tests}.rs` (new), `TR/src/domain/{mod,enums}.rs`, `TR/src/domain/gts_store.rs`, `TR/src/domain/ports.rs`, `TR/src/domain/admission/{errors,unit}.rs`, `TR/src/api/rest/error.rs`, `TR/src/infra/storage/store.rs`, `TR/tests/dependency_test.rs` (new), `TR/tests/{gts_store_test,admission_worker_test,instance_test,family_test,revision_race_backends_test,common/mod}.rs`, `docs/{PRD,DESIGN}.md`, `docs/database.sql`, and `docs/p0/{SPEC,plan}.md`
 **Scope:** M
 
 ---
 
-### - [ ] T14: Reverse-impact worklist and artifact refresh
+### - [x] T14: Reverse-impact traversal and artifact refresh
 
-**Description:** The iterative worklist over direct reverse edges (D5 — a recursive CTE is
-not available, since raw SQL is forbidden outside migrations), with visited-set
-deduplication, fingerprint-stability early stop, the `activation_write_set` bound, and
-refresh of every affected dependent's effective artifacts in the same transaction.
+**Description:** The reverse-impact read over `dependency` and the refresh of every
+affected dependent's effective artifacts in the same transaction as the new revision, with
+the fingerprint-stability stop and the `activation_write_set` bound (D5).
+
+**The traversal is one scoped recursive CTE, and the refresh is a loop.** The task was
+planned as a worklist for both halves on the premise that a recursive CTE needs raw SQL,
+which `11_database_patterns.md` forbids outside migrations. That premise does not hold:
+`toolkit-db`'s ADR-0001 (`SecureCteSelect::recursive_cte`) builds a scoped `WITH RECURSIVE`
+entirely through `sea-query`, scope embedded in both the seed and the recursive member. So
+the traversal became one statement — it runs inside the commit transaction, where round
+trips are paid for in lock contention — and only the refresh stayed a loop, because the
+fingerprint stop decides the write set by *recomputation*, which no closure query can
+express. SPEC §D5 records the split.
 
 **Acceptance criteria:**
-- [ ] Traversal terminates on a cyclic graph
-- [ ] A dependent whose recomputed artifacts are identical stops the branch and does not move `resource_version`
-- [ ] Every affected dependent's artifacts become current in the same transaction as the new revision — no mixed current state
-- [ ] Exceeding `limits.activation_write_set` fails the candidate with a structured reason and commits nothing partial
-- [ ] `ponytail:` comment names the measured max fan-out (27), the bound (512) and the staging upgrade path
+- [x] A dependent whose recomputed artifacts are identical is not written and does not move `resource_version` — nor its `revision_no`, nor `updated_at`. Also verified as *examined*: the early-stop test asserts `examined == 2` beside an empty write set, so an empty impact set cannot make it pass
+- [x] Every affected dependent's artifacts become current in the same transaction as the new revision — the refresh takes the caller's `&DbTx`, and `commit_revision` calls it after `replace_edges`, so a dependent sees this revision's reference set
+- [x] Exceeding `limits.activation_write_set` fails the candidate with a structured reason (`activation_write_set_exceeded`) and commits nothing partial
+- [x] `ponytail:` comment names the measured max fan-out (27), the bound (512) and the staging upgrade path — on `DependencyRepo::reverse_impact`
+- [x] The traversal terminates on a row that contradicts acyclicity. **The criterion was "terminates on a cyclic graph", and an admitted graph cannot be cyclic** — admission is what keeps it acyclic (ADR-0012, rewritten here with PRD/DESIGN/`database.sql`): derivation strictly shortens the `~`-chain and nothing references an Instance, so those two cannot close a cycle at all, while `$ref` can — alone, or combined with derivation, where a base `$ref`s a schema derived from it. gts-rust refuses the first with `Circular $ref detected`, and T19 refuses both over the combined edge set. The termination property is kept as defence in depth, since a contradicting row would otherwise hang a commit transaction, and the invariant itself is now pinned where it is enforced
+
+**What made a depth-capped CTE safe.** `recursive_cte` requires a `max_depth` and truncates
+**silently** past it — a dependent left out keeps stale artifacts marked current, the one
+failure this read must not have. The cap is therefore the write-set bound itself, which
+makes truncation unreachable below the refusal: seed rows carry depth `0`, so a dependent at
+shortest distance `d` appears at depth `d - 1`; a hidden dependent would need a path of at
+least `bound + 2` edges, and every one of its `bound + 1` intermediate dependents is nearer
+and so already in the set — which puts the set over the bound, where the refusal has already
+fired. A returned set is complete; an incomplete walk is an error.
+
+**A refusal after the writes began needed its own channel.** `commit_revision` returns
+`Ok(Err(ItemFailure))` for every other candidate refusal, but those are all reached *before*
+a write. This one cannot be: the refresh must see the committed revision. Returning it in the
+`Ok` position would **commit** the revision it refuses, so it travels as
+`WorkerError::RefusedAfterWrite(ItemFailure)` — an error, which rolls the transaction back —
+and `process_item` unwraps it into the same `record_failure` path an evaluation-stage refusal
+takes. Invisible past the worker; `an_over_bound_write_set_commits_nothing` is what would
+have caught the mistake.
+
+**`limits` now reach the worker.** `run_operation` takes `&Limits` and carries it to
+`commit_revision`; `activation_write_set` moved off `inert_limit_keys` and gained a
+zero-refusal in `validate()`, alongside the other enforced limits. `resolved_document` and
+`resolution_closure` are also enforced, per document, during evaluation and refresh. A
+refresh refusal uses the same rollback channel as the activation-write-set refusal.
+
+**Two shapes came out of the rebase onto the family lock, not out of T14's design.** `Limits`
+and `WorkerSettings` both travel per item, which puts `process_item` one argument over
+Clippy's threshold, so T14 groups them as `ItemConfig` and `limits` rides on
+`CommitRequest` from there — T15 then replaces that grouping with its own borrowed
+`Tuning`, which does the same job for the same reason. And `commit_revision` crossed the
+200-line lint once the refresh call joined the tombstone and lock rechecks, so its
+`unchanged` branch became `commit_unchanged`: a re-read standing in for the
+compare-and-swap a real revision carries in its `WHERE`. T15 had planned that same
+extraction for its own clippy bound and inherits it verbatim.
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Test: revising a base with N dependents refreshes exactly N `type_schema` rows
-- [ ] Test: cyclic dependency graph terminates
-- [ ] Test: over-bound case commits nothing
+- [x] Gear tests, all three backends — `cargo nextest run -p cf-gears-types-registry`: **550 passed** (544 before the rebase; the six added are the family-lock suites this branch rebased onto); `--features integration` on `repo_backends_test`, `migration_backends_test` and `revision_race_backends_test`: **6 passed** (PostgreSQL + MySQL containers)
+- [x] Test: revising a base with N dependents refreshes exactly N `type_schema` rows — `refresh_test.rs::revising_a_base_refreshes_every_dependent_schema`, over a derived type and an out-of-chain `$ref`erer, asserting the new property reaches the refreshed artifacts
+- [x] Test: over-bound case commits nothing — the base's `resource_version`, its whole current row and both dependents' fingerprints are byte-identical after the refusal
+- [x] Test: the walk terminates on a cyclic row — `dependency_repo_test.rs` and `repo_test.rs`, both writing the cycle straight through the repository, plus the `PostgreSQL`/`MySQL` case, where a non-terminating backend would hang rather than fail
+- [x] Test: acyclicity is enforced, not assumed — `dependency_test.rs::a_revision_that_would_close_a_ref_cycle_is_refused` pins the `invalid_schema` refusal and that no edge is written. The in-batch half (two candidates referencing each other under one overlay) belongs to T19 and is listed there
+- [x] `make fmt`, `make clippy` (`--all-targets --features integration`) — clean
+
+**Added:** `TR/tests/dependency_repo_test.rs` (7 tests: transitive reach, root exclusion,
+every edge kind, empty set, the bound, no-truncation-past-the-cap, cyclic-row termination),
+`TR/tests/refresh_test.rs` (5 tests), `reverse_impact_walks_back_up_a_chain` in
+`repo_backends_test.rs`, `a_revision_that_would_close_a_ref_cycle_is_refused` in
+`dependency_test.rs`.
 
 **Dependencies:** T13
-**Files likely touched:** `TR/src/domain/dependency.rs` — **second file, so take `TR/src/domain/dependency/`**: `extraction.rs` from T13 plus `worklist.rs` here. Also `TR/src/infra/storage/repo/`, `TR/src/domain/ports.rs`, `TR/src/infra/storage/store.rs`, `TR/src/domain/admission/unit.rs`, `TR/tests/dependency_repo_test.rs`
-**Scope:** M
+**Files touched:** `TR/src/infra/storage/repo/{dependency_repo,mod}.rs`,
+`TR/src/domain/admission/refresh.rs` (new), `TR/src/domain/admission/{mod,unit,worker,errors}.rs`,
+`TR/src/domain/{ports,dependency}.rs`, `TR/src/infra/storage/store.rs`, `TR/src/config.rs`,
+`TR/src/api/rest/error.rs`, `TR/src/domain/registry_service.rs`, `TR/tests/*`, plus the
+document rewrite: `docs/{PRD,DESIGN,database.sql}`, `docs/ADR/0012-*`, `docs/p0/{SPEC,plan}.md`
+
+**Not `TR/src/domain/dependency/`.** The plan called for splitting that file into
+`extraction.rs` + `worklist.rs`. There is no worklist module: the traversal is SQL, and what
+remained is an admission step that speaks `ItemFailure` / `WorkerError` and builds a transient
+store — `unit.rs`'s neighbours, not extraction's. It went to
+`domain/admission/refresh.rs`, and `domain/dependency.rs` stays one pure file.
 
 ---
 
-### - [ ] T15: Revision-vector guard and bounded retry
+### - [x] T15: Revision-vector guard and bounded retry
 
 **Description:** The multi-pod correctness guard (D4): record a revision vector for every
 correctness-relevant dependency and dependent during evaluation, then under the target's
 entity lock re-derive the reverse-impact set from the database and compare both membership
 and the full vector, rolling back and revalidating within a bounded retry policy.
 
+**Membership is re-derived from the recorded *roots*, not re-read from the recorded rows.**
+Comparing versions of the entities evaluation happened to see catches a dependency that
+*moved* and misses one that *appeared* — a transitive dependency pulled in because some
+intermediate entity gained an edge, and the phantom dependent, which is one of the
+criteria. So `RevisionVector` carries the closure roots (the candidate identifier plus its
+document's `$ref` targets, a pure function of the authored document) and the commit re-runs
+`closure` and `reverse_impact` from them. One derivation function serves both sides, or the
+comparison would measure the difference between two readers instead of two states.
+
+**The vector is recorded inside the store-build transaction.** `evaluate` already opens one
+`snapshot_read` around `load_unit_store`; the vector's reads join it. Anywhere later and the
+comparison would be measuring a gap that opened *before* the evaluation rather than after
+it. `UnitStore` grew two accessors for this: `roots()`, because the roots are the closure's
+*question* and cannot be recovered from its answer, and `closure_entities()`, because the
+vector's dependency half **is** that answer — so evaluation calls `vector::derive_from` with
+the rows the store builder already walked, and only the commit side pays for the walk
+(`vector::derive`). One function builds the vector on both sides regardless, which is the
+property the comparison depends on.
+
+**Step 4.2's row locks over the revision vector are the wrong tool, and the documents now
+say so rather than deferring them** (`plan.md` P15; DESIGN §4 corrected, no ceiling). A lock
+guarantees only that nothing moves *after* it is taken, and the movement that matters
+happens between evaluation and the lock — the phantom dependent appears before any lock
+could be held. So the comparison is required either way and the lock is purely additive:
+it buys waiting instead of rolling back, which is liveness. It costs one round trip per
+vector member inside the commit transaction on a set the bound allows to reach 512, and it
+is the only reason step 4.2's canonical ordering had to extend past families at all. What
+serializes the rows instead was already there: the candidate's own row by the
+compare-and-swap that writes it, and a dependency by the write-write conflict its own
+refresh creates on the candidate's `type_schema` row precisely when the move affects it —
+and where it does not, the fingerprint-stability stop is the proof the staleness is inert.
+That conflict *orders* the two writes and nothing more: a refresh computes its artifacts
+before it writes, so the resumed `UPDATE` re-evaluates its predicate, not its payload. The
+refresh's write therefore carries the revision and fingerprint its own read saw, and the
+loser rolls back rather than overwriting the winner. **Found in review after this task**, and
+corrected here rather than left as a claim the code did not make good on. The missing
+`FOR UPDATE` is corroboration, not the reason.
+
+**One lock does survive the argument, and it orders commits.** The optimistic mechanism
+reaches everything that meets on a row. It does not reach an edge committed *after* a mover's
+reverse scan: adding an edge moves no `resource_version` and writes only `dependency`, so the
+two commits write no row in common, both pass their own guards, and the dependant keeps an
+artifact inlined from a revision that is no longer current with a fingerprint that matches it
+— no drift to report and nothing later to repair it. The requirement is a **serialized write path**:
+every commit claims the `entity_write_order` row of `types_registry__coordination_state` as its
+transaction's first statement.
+Either the edge is in `dependency` when the mover's scan runs after that claim, or the unit
+writing it has committed nothing and its own guard sees the mover's revision when it does —
+two cases, no third. A row rather than an advisory lock, because advisory keys live on a
+session separate from the transaction's connection: losing it releases the key while the
+transaction carries on, and the exclusion lapses silently.
+
+Consequences for this task: the family lock is no longer taken for a new member only, since
+the family advisory locks are gone entirely — the claim makes the transaction exclusive, so
+the rules they serialized already are, and keeping them inverted the lock order against
+ADR-0013's purge protocol. The vector guard stays load-bearing
+for the window the lock does not cover — evaluation runs outside it, so a commit landing
+between evaluation and lock acquisition is exactly what
+`a_dependency_mutated_between_evaluation_and_commit_costs_one_rollback_and_one_retry` holds a
+pass at its evaluation closure read to produce. Every other writer of entity state must take
+the lock too, or the order is not total: deletion at T20, the purge job under ADR-0013.
+**Found by review, not by a test** — which is the honest provenance;
+`a_new_dependant_cannot_commit_while_its_dependency_is_being_revised` is the test it should
+have had.
+
+**The `unchanged` branch is not guarded, and that is the decision, not an oversight.** It
+writes no revision, moves no version and refreshes no dependent, and the one thing it
+decides concerns the current authored document. Guarding it could only turn a
+genuine no-op re-submission into a revalidation because a *neighbour* moved, and after
+`max_revalidation_attempts` of those, into a failure.
+
+**The retry lives in `process_item`, not in `transaction_with_retry`.** A drift means the
+evaluation is void rather than wrong, so what has to be redone is the whole of step 3 — a
+fresh snapshot, a fresh transient store, fresh validation. Re-running the same transaction
+would compare the same stale vector and drift identically, which is why
+`RevalidationRequired` reads as `None` to `retryable_db_err`.
+
+**Early `unchanged` check.** Before evaluation, revision submissions compare the current
+canonical authored bytes in a short read-only snapshot. A match produces
+an internal proof carrying the entity ID and expected `resource_version`, without loading
+the dependency closure, deriving a vector, validating, or materializing artifacts. Its
+commit still claims `entity_write_order` as the first SQL statement, then checks that the
+same entity exists, is live, and has the recorded version before CAS-terminalizing the item.
+Every authored-content write advances that version; dependency refreshes do not change the
+bytes, so their fingerprints need no guard here. A concurrent edit fails the precondition;
+a concurrent deletion reports `entity_deleted`. The proof cannot be constructed for a
+creation. A probe miss releases its snapshot and runs the ordinary evaluation/commit path;
+this adds one small read-only transaction to genuine revisions.
+
+This fixes the case where an identical submission was refused during evaluation because
+its dependents exceeded `activation_write_set`. No-op submissions also bypass resolution
+and materialization budgets, since they perform neither operation. Real edits retain all
+those bounds. Tests cover bounded no-ops, a changed conforming type for an unchanged instance,
+and concurrent edits, deletion, and dependency refresh between the probe and commit.
+
+**`limits.activation_write_set` is asked twice for evaluated edits**, because the vector's reverse-impact
+read is the refresh's read. An over-bound candidate is refused at *evaluation* under the
+same `activation_write_set_exceeded` reason — earlier, cheaper, and invisible to a client;
+T14's refusal stays as the backstop for a set that grew in between.
+
 **Acceptance criteria:**
-- [ ] Vector carries `resource_version` and, where effective content was consumed, `resolution_fingerprint`
-- [ ] A new, removed or moved dependency/dependent rolls the transaction back
-- [ ] Retries are bounded by `worker.max_revalidation_attempts`; exhaustion terminalizes the item as `failed`
-- [ ] Lock order is family → entity/current rows, in canonical identifier order, everywhere
+- [x] Vector carries `resource_version` and, where effective content was consumed,
+  `resolution_fingerprint` — the latter for live Type Schema dependents, whose effective
+  artifacts the refresh consumes to decide whether to rewrite them. `None` for a
+  dependency (only its authored document is read, and that moves only with
+  `resource_version`), for an Instance dependent (`instance` carries no artifacts) and for
+  a tombstone — the two the refresh skips
+- [x] A new, removed or moved dependency/dependent rolls the transaction back —
+  `VectorDrift::{Appeared, Vanished, Moved, Refreshed}`, travelling as
+  `WorkerError::RevalidationRequired`, which is what rolls it back. `Refreshed` is the
+  fourth shape and not a redundant one: a refreshed dependent moves no version
+- [x] Every artifact write carries a compare-and-swap on `(revision_no,
+  resolution_fingerprint)` — `CurrentSchemaCas` — and a miss is
+  `VectorDrift::CurrentProjectionMoved`. The two paths differ in what the token is: for the
+  **refresh** it is the state its artifacts were computed against, carried out of the read
+  that selected the document (`CurrentDocument::projection`); for the **candidate's own
+  revision** the artifacts predate any transaction, so its token is read inside the commit and
+  is a post-guard sentinel — guard establishes the evaluation still holds, sentinel establishes
+  nothing wrote the row since. It is needed because the entity compare-and-swap does not cover
+  that row.
+  **Found in review, not by a test**: the row lock orders two writes and recomputes neither,
+  so the unconditional write let the loser put artifacts from before the winner over it,
+  paired with a `revision_no` read afterwards.
+  `a_refresh_write_is_a_compare_and_swap_on_the_fingerprint_it_read` pins the predicate.
+  **Two interleavings are owed on the container backends** and neither can run on `SQLite`:
+  a dependent revising itself under a refresh, and a candidate refreshed by the edge it
+  drops. Both were written and both passed unfixed — `SQLite` either refuses the concurrent
+  writer with `database is locked` or forces a transaction retry that re-reads the token, so
+  the stale-token window never opens. `PausingStores::new_at_occurrence` was added for them
+  and is what the container versions need
+- [x] Retries are bounded by `worker.max_revalidation_attempts`; exhaustion terminalizes
+  the item as `failed` — reason `revalidation_exhausted`, message naming the last drift.
+  The key moved off `inert_limit_keys` and gained a zero-refusal in `validate()`, as
+  `activation_write_set` did at T14
+- [x] ~~Lock order is family → entity/current rows, in canonical identifier order,
+  everywhere.~~ **Both halves are retired, for different reasons.** The row half was mistaken:
+  a lock over the revision vector cannot do the guard's job and costs a round trip per member
+  inside the commit transaction (`plan.md` P15, SPEC §8.1 step 4.2). The family half became
+  redundant and then harmful — see the lock paragraph above. What replaced both: the
+  `entity_write_order` claim orders commits, and no family lock is taken on either commit
+  path — the claim makes the whole transaction exclusive, so the family rules are already
+  serialized. Canonical order is kept where it is observable and where locks are actually many:
+  the currently uncalled `lock_order` helper sorts and dedups family keys for the next writer,
+  and the vector is `(gts_id, role)`-sorted on
+  both sides, which is what makes the comparison one merge walk and the reported drift
+  deterministic
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Test: a dependency mutated between evaluation and commit causes exactly one rollback and one successful retry
-- [ ] Test: a phantom dependent created after the initial scan is detected
-- [ ] Test: two pods against one database — a commit on one is visible to the other's first post-commit read
+- [x] Gear tests, all three backends — `cargo nextest run -p cf-gears-types-registry`:
+  **570 passed** (564 before the rebase onto the family lock); `--features integration` on `repo_backends_test`,
+  `migration_backends_test` and `revision_race_backends_test`: **6 passed**
+  (`PostgreSQL` + `MySQL` containers)
+- [x] Test: a dependency mutated between evaluation and commit causes exactly one rollback
+  and one successful retry —
+  `revalidation_test.rs::a_dependency_mutated_between_evaluation_and_commit_costs_one_\
+rollback_and_one_retry`. "One rollback" is read off the versions (revision 2, not 3);
+  "successful retry" off the artifacts, which inline the base's **new** property — only a
+  fresh evaluation could have produced that, and a committed stale one would still inline
+  the old
+- [x] Test: a phantom dependent created after the initial scan is detected — and detected on
+  *membership*, with no column of any recorded entry changed
+- [x] Test: two pods against one database — a commit on one is visible to the other's first
+  post-commit read. Two `DBProvider`s with their own pools over one database file; B's
+  miss is asserted first, so the hit is a read it actually performed
+- [x] Mutation-tested: with both `vector::guard` calls removed, the six guard tests fail and
+  the three controls (`a_commit_whose_vector_did_not_move_stands`, the `unchanged`
+  re-submission, the two-pod read) still pass — which is the shape that says the suite
+  measures the guard and not the fixtures
+- [x] `make fmt`, `make clippy` (`--all-targets --features integration`) — clean
+
+**Added:** `TR/src/domain/admission/vector.rs` + `vector_tests.rs` (10 tests over the pure
+comparison), `TR/tests/revalidation_test.rs` (9 tests),
+`current_projections_read_every_named_entity_that_has_one` in `repo_backends_test.rs`,
+`a_zero_revalidation_budget_fails_startup` in `config_test.rs`,
+`PausePoint::RevisionEntityRead` in `tests/common/mod.rs`.
+
+**Batched state checks use `current_schema_projections`.** The port returns only
+`entity_id`, `revision_no`, and `resolution_fingerprint`; vector derivation and refresh
+do not load the three materialized documents merely to compare state. Instance evaluation
+uses the same projection to record its conforming type's revision. `current_documents`
+uses this narrow SQL projection for its pointer read and selects only identity and authored
+text from the revision table. `find_current_schema` retains the full
+artifacts for entity reads. Transaction boundaries and CAS checks remain unchanged.
+`schema_projection_test.rs` checks the executed SQL excludes unused payload columns;
+the repository backend suite verifies projection values on PostgreSQL and MySQL.
+
+**Clippy-driven extractions, worth naming because they are also better shapes.**
+`process_item` passed the cognitive-complexity bound once the revalidation loop went in, so
+the success mapping became the pure `committed_outcome`, and `limits` + `worker` became one
+borrowed `Tuning` — which supersedes T14's `ItemConfig`, the same grouping under a name that
+also carries the worker tuning. `commit_unchanged` was T15's third such extraction until the
+rebase: T14 had already reached the 200-line bound on `commit_revision` and cut it the same
+way, so T15 keeps the docstring that states the re-read argument and adds nothing else.
 
 **Dependencies:** T14
-**Files likely touched:** `TR/src/domain/admission/unit.rs`, `TR/src/domain/admission/vector.rs`, `TR/src/infra/storage/repo/`, `TR/src/domain/ports.rs`, `TR/src/infra/storage/store.rs`, `TR/tests/concurrency_test.rs`
-**Scope:** M
+**Files touched:** `TR/src/domain/admission/{vector,vector_tests}.rs` (new),
+`TR/src/domain/admission/{mod,unit,worker,errors}.rs`, `TR/src/domain/gts_store.rs`,
+`TR/src/domain/ports.rs`, `TR/src/domain/registry_service.rs`,
+`TR/src/infra/storage/{store.rs,repo/type_schema_repo.rs}`, `TR/src/api/rest/error.rs`,
+`TR/src/config.rs`, `TR/tests/*`, `docs/p0/{SPEC,plan}.md`
 
----
-
-### - [ ] T16: Observability for the admission path
+### - [x] T16: Observability for the admission path
 
 **Description:** Instrument admission so production behaviour is diagnosable: structured
 spans per operation and per admission unit, and counters for the outcomes and bounds that
 matter.
 
 **Acceptance criteria:**
-- [ ] One span per operation and one per admission unit, carrying `operation_id`, `gts_id`, kind and dry-run mode
-- [ ] Counters: candidates by terminal status, refusals by reason, revalidation retries, activation-set size, worker duration
-- [ ] Every refusal reason in the acceptance path is countable and distinguishable — including `Unknown` compatibility once T17 lands
-- [ ] Structured fields only; no print macros (DE13xx)
+- [x] One span per operation and one per admission unit, carrying `operation_id`, `gts_id`,
+  kind and dry-run mode. `types_registry.admission.operation` opens **before** the first
+  read, so it covers the whole pass — which is why its `kind` and `dry_run` are
+  `field::Empty` and filled in by `record_operation_facts` once the operation row is
+  read. A pass that fails before that read therefore carries *no* `kind` label rather
+  than a blank one, which is its own test. `types_registry.admission.unit` restates
+  `operation_id`, `kind` and `dry_run` beside `gts_id` and `operation_item_id`:
+  deliberate duplication, because under a flat log format a field that lives only on the
+  parent span is not on the line an operator greps
+- [x] Counters: candidates by terminal status, refusals by reason, revalidation retries,
+  activation-set size, worker duration. Five instruments —
+  `types_registry_candidates_total{status}`, `types_registry_refusals_total{stage,reason}`,
+  `types_registry_revalidations_total{drift}`, `types_registry_activation_write_set` and
+  `types_registry_operation_duration_seconds`. **Every label value comes from a closed
+  vocabulary** and no identifier is ever a label: the `drift` label is the *shape* of the
+  drift (`appeared` / `vanished` / `moved` / `refreshed` / `current_projection_moved` — the
+  last one added with the refresh compare-and-swap, and the only shape raised by a write
+  rather than by the vector guard), not the `gts_id` that drifted, because that one is
+  unbounded and belongs on a span
+- [x] Every refusal reason in the acceptance path is countable and distinguishable —
+  `AcceptanceError::reason()`, one arm per variant over an exhaustive match, so a refusal
+  a later task adds cannot compile until it has a reason — demonstrated by the rebase onto
+  the family-lock work, whose `force_compatibility_unavailable` and
+  `minor_type_schema_revision` refusals broke the build here until both were named. Distinct from the RFC-9457
+  `reason` code `api/rest/error.rs` maps onto, which is deliberately coarse (six variants
+  share `VALIDATION_FAILED`): a client branches on the class, an operator needs the
+  variant. T17's `Unknown` compatibility verdict is refused in the **worker**, so it
+  earns an `ItemFailure` reason and is counted by the same `refusals_total` under
+  `stage="admission"` with no change here
+- [x] Structured fields only; no print macros (DE13xx) — nothing added uses one
 
 **Verification:**
-- [ ] `cargo test -p cf-gears-types-registry` using `tracing-test` to assert emitted fields
-- [ ] Manual: register over REST against `make example`, confirm spans and counters appear
+- [x] Gear tests (see [Commands](#commands)) — `cargo nextest run -p cf-gears-types-registry`:
+  **592 passed** (570 before, +22: 12 in-source, 10 integration; 586 before the rebase onto
+  the family lock, whose own six suites are the difference).
+  `--features integration` on the three container suites: 6 passed
+- [x] Test: the instrument contract — rendered names, label keys, label values and bucket
+  layouts — asserted against a local `InMemoryMetricExporter`, not reviewed. That is what
+  a dashboard depends on, and a dropped `_total` or a renamed label value is invisible in
+  a code review and silently empties a panel
+- [x] Test: the emission sites, end to end through the real `accept` / `run_operation`.
+  `tests/observability_test.rs` installs its own global meter provider and a
+  `types_registry=debug` subscriber for the binary, then drives a success, an `unchanged`
+  re-submission, an admission refusal, two acceptance refusals, a revision that refreshes
+  one dependent, and a real revalidation retry through `PausingStores`
+- [x] Mutation-tested: with all eight emission calls and both `.instrument()` layers
+  removed, **all 10** integration tests fail; restored, all 10 pass. The suite measures
+  the emission and not the fixtures
+- [x] `make fmt`, `make clippy` (`--workspace --all-targets --all-features`) — clean
+- [x] Manual, at runtime: booted the focused example server
+  (`--features static-tenants,static-authn,static-authz,otel`) with the metrics exporter
+  pointed at a local OTLP/HTTP sink, then `POST /cf/types-registry/v2/entities` three
+  times — an admitted schema (`202`), a revision naming version 1 of an absent identifier
+  (`202`, item `failed`), and an empty batch (`400`).
+  **Spans:** both appear on the real log lines, nested inside the gateway's own
+  `http_request` span —
+  `…:types_registry.admission.operation{operation_id=… kind="registration" dry_run=false}:types_registry.admission.unit{operation_id=… gts_id="gts.cf.core.t16.probe.v1~" kind="registration" dry_run=false operation_item_id=1}: … candidate admitted`.
+  **Counters:** the pushed OTLP payloads carry
+  `types_registry_candidates_total`, `types_registry_refusals_total` and
+  `types_registry_operation_duration_seconds`, with the label pairs
+  `status=succeeded`, `status=failed`, `stage=acceptance`, `stage=admission`,
+  `reason=empty_batch` and `reason=precondition_failed` all present as
+  protobuf key/value pairs. Metrics reach a collector only by OTLP push — this gear
+  declares no exporter and no `/metrics` endpoint — so the sink is what makes the
+  check observable at all
+- [x] **One pre-existing boot failure found and set aside, not caused by T16.** With
+  `config/quickstart.yaml` unchanged, the focused server dies at types-registry post-init:
+  the seeded `…am.tenant_type.v1~cf.core.am.platform.v1~` derives from
+  account-management's base schema, which this feature set does not link
+  (`Base schema 'gts.cf.core.am.tenant_type.v1~' not found for chain validation`).
+  The manual check therefore ran against a copy of the config with `entities: []`.
+  Attributed rather than assumed: the failing step is `switch_to_ready`'s chain
+  validation on the **legacy in-memory** path, which T16 does not touch — no line of this
+  task is on that path — and the missing base schema is a feature-selection fact about the
+  focused server, not a registry defect. Not run against `main`'s tree, so "pre-existing"
+  here means "independent of this task", which is what the call graph shows
+
+**Two design decisions worth stating, because both are trade-offs:**
+
+**The instruments are a domain port; only the spans are process-global.** *(Record
+corrected — `plan.md` P16. This entry and the commit message both argued the opposite, for a
+process-global instrument set reached the way `tracing` is. The code that shipped does not do
+that, and the port is the shape to extend.)* `domain::ports::metrics::AdmissionMetrics` is the
+trait, `infra::metrics` the OpenTelemetry adapter, and `TypesRegistryGear::init` injects the
+`Arc<dyn AdmissionMetrics>` into the service, which carries it down
+`run_operation` → `process_item` → `commit_evaluated` → the commit transaction's `'static`
+closure → `commit_creation` / `commit_revision` → the reverse-impact refresh. The `'static`
+closure is why the parameter is an `Arc` and not a reference: each retry attempt clones the
+handle. A caller with no meter passes `NoopMetrics`, which is the pre-T16 behaviour exactly, and
+that is what the several dozen existing worker test call sites pass. The deciding argument is the
+layer boundary: an OpenTelemetry type reached from `domain` through a crate-root module hides
+from `de0301_no_infra_in_domain`, and the emission sites are all on the admission call path.
+`observability.rs` keeps the two span constructors as free functions, because a `tracing` span
+*is* a global sink the emitting code neither carries nor injects, and its module header states
+the split. The instrument names carry a configurable prefix (`MetricsConfig`, default
+`types_registry`) and the rendered names are pinned by `infra::metrics_tests`.
+
+**The activation-write-set histogram counts revisions, not admissions.** A creation
+observes **nothing** rather than zero, because nothing can depend on an identifier the
+registry did not hold a moment ago and `commit_creation` runs no reverse-impact refresh at
+all. A zero *is* recorded for a revision whose dependents all recomputed to identical
+bytes. Both halves are tests, and the creation one carries a control assertion so its zero
+reads as scope rather than as silence.
+
+**Two smaller findings, both from the tests:**
+- `tests/revalidation_test.rs` needed `#![recursion_limit = "256"]`. Its spawned pass nests
+  the whole admission future, and one `tracing::Instrument` layer per level put it over the
+  default 128 — the same reason `lib.rs` already carries the attribute
+- The integration tests **all** hold one serial lock, including the two span tests. Letting
+  the span tests run alongside made `a_creation_observes_no_activation_write_set` see three
+  successes instead of one, intermittently: their admissions increment the very counters the
+  others measure a delta of. `Temporality::Delta` is what makes the per-test reset
+  meaningful — under the default cumulative temporality a flush re-exports every count
+  since process start and `reset()` clears the batches without clearing the sums
 
 **Dependencies:** T8 (may run parallel with T14, T15)
-**Files likely touched:** `TR/src/domain/admission/worker.rs`, `TR/src/domain/admission/acceptance.rs`, `TR/src/observability.rs`, `TR/tests/observability_test.rs`
+**Files touched:**
+- `TR/src/observability.rs` — NEW, the two span constructors and the `kind` label
+- `TR/src/domain/ports/metrics.rs` — NEW, the `AdmissionMetrics` port and the label vocabularies
+- `TR/src/infra/metrics.rs`, `TR/src/infra/metrics_tests.rs` — NEW, the OpenTelemetry adapter and
+  the rendered-name contract tests
+- `TR/src/observability_tests.rs` — NEW, 12 in-source contract tests
+- `TR/tests/observability_test.rs` — NEW, 10 emission tests
+- `TR/src/domain/admission/worker.rs` — the two spans, the duration histogram, the
+  candidate counters and the revalidation-retry counter; `run_operation` split into a
+  wrapper and `run_operation_inner` so the span covers the first read
+- `TR/src/domain/admission/acceptance.rs` — `AcceptanceError::reason()`; `accept` split
+  into a wrapper and `accept_inner` so every refusal of the path passes one counting point
+- `TR/src/domain/admission/unit.rs` — the activation-write-set observation
+- `TR/src/gear.rs` — `bind_instruments()` at a known point after `ToolKit` installs the
+  provider
+- `TR/src/lib.rs`, `TR/Cargo.toml`, `TR/tests/revalidation_test.rs`
 **Scope:** S
 
 ---
 
 ### Checkpoint 3
-- [ ] Dependent refresh is atomic with the new revision; identical recomputation is a no-op
-- [ ] Activation bound refuses rather than partially commits
-- [ ] Multi-pod read-after-commit holds
-- [ ] Admission emits spans and metrics
-- [ ] `make dylint` — full workspace, once for the phase (P13)
-- [ ] Human review
+- [x] Dependent refresh is atomic with the new revision; identical recomputation is a no-op —
+  `refresh_test.rs::revising_a_base_refreshes_every_dependent_schema` and
+  `a_dependent_whose_artifacts_are_identical_is_not_rewritten`
+- [x] Activation bound refuses rather than partially commits —
+  `refresh_test.rs::an_over_bound_write_set_commits_nothing`, with the earlier evaluation-side
+  refusal from T15 in front of it
+- [x] Multi-pod read-after-commit holds —
+  `revalidation_test.rs::a_commit_on_one_pod_is_visible_to_the_others_first_read`, two
+  `DBProvider`s with their own pools over one database file
+- [x] Admission emits spans and metrics — T16, verified at runtime as well as in tests
+- [x] `make dylint` — full workspace, once for the phase (P13). Exit 0. Two DE1201 warnings stand,
+  both on crates this branch does not touch (`cf-gears-simple-user-settings`,
+  `cf-gears-file-storage`): `git log main..HEAD` over their directories is empty, so they are
+  pre-existing and not this phase's to clear
+- [x] Gear tests at the checkpoint: **617 passed** on SQLite; **6 passed** on the PostgreSQL and
+  MySQL container suites, `revision_race_backends_test` included
+- [x] **Backend lock exclusion:** `a_second_commit_waits_for_the_first` observes
+  `types_registry__coordination_state` waits through Postgres `pg_blocking_pids` /
+  `pg_stat_activity` and MySQL `data_lock_waits` / `data_locks`. An isolated container
+  identifies the writer; `ClaimHooks` verifies pending-before-release and progress
+  afterwards. Both backends detect wrong-table and premature-return mutations.
+- [x] **`make test-types-registry-db` did not run `revision_race_backends_test`, and now does.**
+  The suite that proves the `entity_write_order` claim on a backend with real row locking was
+  reachable only by hand, so `make ci` never ran it — the container test the last commit added to
+  close a P0 blocker was outside the gate meant to protect it. One line in the `Makefile` target
+- [x] Human review — four items below; item 3's design decision is resolved
+
+**Handoff review (commit `319eb16a5`), item by item.**
+
+1. **The migration and its upgrade test — sound.** `Migrator::up(&db, Some(1))` applies exactly
+   one pending migration, so on a fresh database it stops where a deployment that only ran the
+   initial migration stops; the test then asserts the table is *absent* before applying the rest,
+   which is what makes it an upgrade test rather than a fresh-install one. Nothing else assumes
+   the table exists at initial-migration time: `m20260817_000001_initial_tests`'s `P0_TABLES` and
+   constraint counts exclude it, and `claim_entity_write_order` fails closed with a message naming
+   the migration when the row is missing (`claiming_a_missing_entity_write_order_row_fails_closed`).
+   **One gap worth naming:** `the_coordination_state_migration_absorbs_a_table_that_already_exists`
+   pins that a pre-created table is left alone — which means such a table keeps whatever shape it
+   was created with and never gains `ck_tr_coordination_state_seq`. Correct for the seed, silently
+   weaker for the constraint. No path in this repository pre-creates it, so this is a note, not a
+   defect.
+2. **The claim really is unpreceded, in the code and in the normative text.** `commit_creation`
+   (`unit.rs:375`) and `commit_revision` (`unit.rs:745`) both open with
+   `claim_entity_write_order`, and the transaction closure in `worker.rs` calls one or the other
+   as its only statement — there is no read between `transaction_with_retry` and the claim on
+   either branch. SPEC §8.1 step 4.1 says *"nothing may precede it, reads included"* and gives the
+   reason; the deletion protocol (§8.1, before Dry Run) repeats it as *"not optional and not
+   merely early"*. Both read as instructions T20 and the ADR-0013 purge can follow literally.
+   The mechanism is right too: an `UPDATE … SET state_seq = state_seq + 1` holds an exclusive row
+   lock to commit, and `#[secure(unrestricted)]` matches every other P0 table.
+3. **Store decorator duplication removed.** `TestStores<H>` forwards all seven port
+   traits once. `PauseHooks`, `ClaimHooks`, and `CasMissHooks` customize `StoreHooks`.
+   For T19/T20, add a `PausePoint` for timing or a hook for inspection/overrides.
+4. **Dependency ordering is explicit.** Missing input dependencies fail immediately.
+   Dependants submitted together follow batch ordering; separate submissions must await the
+   prerequisite operation. Redelivery recovers temporary system failures, not absent inputs.
 
 ---
 
 ## Phase 4 — Compatibility
 
-### - [ ] T17: Compatibility against one baseline
+### - [x] T17: Compatibility against one baseline
 
 **Description:** Baseline selection — the entity's current revision for a major-only
 candidate, or the `ACTIVE`/`DELETED` definition of `vM.(n-1)~` for a minor-bearing one —
@@ -999,29 +1480,60 @@ compared through `GtsStore::compare_documents`, which resolves both sides. `Unkn
 rejected with its own reason, never collapsed into `Incompatible`.
 
 **Acceptance criteria:**
-- [ ] `compare_documents` is the only comparison entry point; `is_minor_compatible` is not used
-- [ ] `CompatibilityVerdict::Unknown` fails the candidate with a reason distinct from `Incompatible` (`principle-fail-closed`)
-- [ ] Every admitted revision records `gts_spec_version`, `gts_impl_version` and `compat_forced`
-- [ ] `force` waives exactly one cross-minor check, only where the deployment enabled it and the candidate has such a check to waive; this removes `ForceCompatibilityUnavailable` and carries the accepted flag into `compat_forced`
-- [ ] Major-0 candidates get no baseline and no verdict
+- [x] `compare_documents` is the only comparison entry point; `is_minor_compatible` is not used
+- [x] `CompatibilityVerdict::Unknown` fails the candidate with a reason distinct from `Incompatible` (`principle-fail-closed`)
+- [x] Every admitted revision records `gts_spec_version`, `gts_impl_version` and `compat_forced`
+- [x] `force` waives one eligible cross-minor check when the deployment permits it. `ForceCompatibilityUnavailable` is removed; revision `compat_forced` records the effective waiver
+- [x] Major-0 candidates get no baseline and no verdict
+
+**Observability (`plan.md` P16 — this task instruments what it adds):**
+- [x] `types_registry_compat_verdicts_total{verdict,forced}` counts
+      `compatible | incompatible | unknown`; refusals also increment `refusals_total`
+- [x] `forced="true"` identifies waived cross-minor verdicts
+- [x] Unit spans record `baseline_gts_id`, `baseline_revision`, verdict,
+      `gts_spec_version`, and `gts_impl_version`. Identifiers never become metric labels
+- [x] **The admission reason vocabulary has one home, compile-enforced** (P16 rule 3):
+      `ItemFailure::new` takes `AdmissionFailureReason` from `domain::admission::reasons`.
+      Stored codes are unchanged; known codes restore typed variants and their metric labels,
+      while `Unknown(String)` preserves unfamiliar codes and maps them to `other` in metrics
+- [x] Add this task's compatibility refusal variants to `AdmissionFailureReason`
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Compatibility matrix: optional property added at a `Closed` level (compatible), at `Open` (incompatible), at `Partial` (`Unknown`)
-- [ ] Test: provenance columns match `GTS_SPECIFICATION_VERSION` and the crate version
-- [ ] Test: `force` refused when `allow_compatibility_force` is off, including on Dry Run
+- [~] Gear tests, all three backends (see [Commands](#commands)) — 739/739 SQLite tests pass.
+      `compat_backends_test` now runs the T17/T18 matrix on PostgreSQL and MySQL and is selected
+      by `make test-types-registry-db`; its Docker execution remains to be recorded
+- [x] Compatibility matrix: optional property added at a `Closed` level (compatible), at `Open` (incompatible), at `Partial` (`Unknown`)
+- [x] Test: provenance columns match `GTS_SPECIFICATION_VERSION` and the crate version
+- [x] Disabled `force` is refused (`force_is_refused_while_the_deployment_disallows_it`).
+      Before T20, Dry Run is synchronously rejected before the force gate; the ordering is asserted
+      by `a_forced_dry_run_is_refused_for_being_a_dry_run_before_force_is_considered`
+- [x] Test: the verdict instrument's rendered name, label keys and both label vocabularies
+      against an `InMemoryMetricExporter` — T16's bar, and the only thing that catches a dropped
+      `_total` or a renamed label value
+- [x] Test: emission end to end through `run_operation` — compatible, incompatible, `Unknown` and
+      forced each land under their own label pair — plus a mutation check that removing the
+      emission calls fails those tests
+- [x] Test: every `Reason` const is reachable and the vocabulary test enumerates the module, so
+      the set a dashboard depends on is asserted rather than greppable
 
 **Dependencies:** Checkpoint 3
-**Files likely touched:** `TR/src/domain/compat.rs` (baseline selection; T18's derivation chain joins it and the pair takes `TR/src/domain/compat/` — trigger table above), `TR/src/domain/admission/unit.rs`, `TR/src/domain/error.rs`, `TR/tests/compat_test.rs`
+**Files likely touched:** `TR/src/domain/compat.rs` (baseline selection; T18's derivation chain joins it and the pair takes `TR/src/domain/compat/` — trigger table above), `TR/src/domain/admission/unit.rs`, `TR/src/domain/error.rs`, `TR/src/domain/admission/reasons.rs` (NEW — the vocabulary), `TR/src/domain/ports/metrics.rs`, `TR/src/infra/metrics.rs`, `TR/src/observability.rs`, `TR/tests/compat_test.rs`
+
+**Storage:** `m20260908_000003_operation_item_compat_forced` persists the per-candidate
+waiver request for the worker; the fingerprint cannot recover it. The entity, port
+rows, and `database.sql` include the column. `compat_forced` avoids MySQL's reserved
+`FORCE`; `no_backend_names_the_column_with_a_reserved_word` guards the name.
+
 **Scope:** M
 
 ---
 
-### - [ ] T18: Derivation chain and major-0 quarantine
+### - [x] T18: Derivation chain and major-0 quarantine
 
 **Description:** Identifier-derived chain validation against every managed base, the
 Draft-07 dialect pin across a major, and the ADR-0015 quarantine: a stable candidate may not
-reference a major-0 identifier, and a major-0 schema may not carry a registered Instance.
+derive from or `$ref` a major-0 identifier, and a major-0 schema may not carry a registered
+Instance. `x-gts-ref` is an instance-value constraint and is outside the quarantine.
 
 **No preflight scan.** ADR-0015 and DESIGN were simplified to drop it (O4): the rule's base case
 comes from the release boundary — T2's migration creates the storage in the same release this task
@@ -1031,15 +1543,49 @@ but not the check. A dev database can be exactly that between T10 and T18; delet
 reasoning about it.
 
 **Acceptance criteria:**
-- [ ] Chain bases are reconstructed with `chain_ids()`, not stored or re-derived locally
-- [ ] A stable candidate whose immediate base, `$ref` or `x-gts-ref` targets include a major-0 identifier is refused
-- [ ] A registered Instance conforming to a major-0 schema is refused, even though the marker is in a preceding segment
-- [ ] Dialect is pinned at initial admission and cannot change across revisions of a major
+- [x] Reuse `dependency::extract_edges`, which calls `chain_ids()`, for chain bases and quarantine. `x-gts-ref` produces no edge
+- [x] A stable candidate whose immediate base or `$ref` targets include a major-0 identifier is refused. The base comes from `chain_ids()` and `$ref` targets come from `dependency::extract_edges`; no target document is needed to read its major
+- [x] Refuse Instances conforming to major 0 via the `instance_of` edge from `get_type_id()`
+- [x] Pin the dialect across intra-entity revisions and new minors, using the preceding minor's current definition
+
+**Observability (P16):**
+- [x] Each quarantine and dialect refusal carries **its own** `Reason` const from T17's
+      vocabulary — `stable_derives_from_major_zero`, `stable_refs_major_zero`,
+      `instance_of_major_zero`, `dialect_changed` — never collapsed into `invalid_schema`. An
+      ADR-0015 refusal and a malformed document are different operator actions, and a shared
+      reason makes them one number
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Tests: each quarantine path — a stable candidate deriving from a v0 base, one `$ref`-ing a v0 target, one whose `x-gts-ref` names a v0 entity exactly and one where it is the pattern's longest valid prefix; plus the two documented non-cases, `gts.*` and a relative JSON pointer, which name no entity and must be admitted
-- [ ] Test: dialect change across revisions is refused
+- [~] Gear tests, all three backends (see [Commands](#commands)) — 739/739 SQLite tests pass.
+      The target now selects 10 tests across four backend binaries, including the new T17/T18
+      PostgreSQL/MySQL scenarios; their Docker execution remains to be recorded
+- [x] Tests: each quarantine path — a stable candidate deriving from a v0 base and one `$ref`-ing a v0 target; plus stable candidates whose `x-gts-ref` names a v0 entity exactly or through a pattern, which must be admitted because the keyword is outside quarantine. Refusal tests register the v0 target first and assert that no entity row was written
+- [x] Test: dialect change across revisions is refused — both edges, the intra-entity one and the cross-minor one
+- [x] Test: the four refusals appear in `refusals_total{stage="admission"}` under those exact
+      label values — asserted as label values, not as counts:
+      `label_values_of("types_registry_refusals_total", "reason")` compared as a set
+
+**Implementation:** Quarantine runs in the worker over the dependency graph's
+extracted edges, before storage reads. The dialect pin runs before comparison
+because it needs the baseline. See SPEC §8.1 for placement and refusal semantics.
+Removing the pin makes both dialect tests fail with `compatibility_undecidable`.
+
+**Closed gap:** [gts-rust#120](https://github.com/GlobalTypeSystem/gts-rust/issues/120).
+`compare_documents` used to compare `$schema` verbatim and reject equivalent
+Draft-07 spellings (`…/schema#` vs `…/schema`) as `Unknown`, although the pin
+accepted them. Fixed upstream by gts-rust#121 and adopted here with gts 0.12.1, so
+admission now succeeds instead of refusing with `compatibility_undecidable`.
+`a_respelled_dialect_is_accepted_by_the_pin_and_the_library` covers the new behavior.
+Normalizing at acceptance was rejected as the alternative: it would rewrite retained
+content and its request fingerprint.
+
+**Added:** `compat/derivation.rs` and tests; four admission reasons;
+`DependencyKind::quarantine_verb`; dialect fixtures, quarantine integration tests,
+and refusal-label assertions. `baseline` moved into `compat/`; acceptance shares
+its Draft-07 spelling set with `derivation`. `compat_backends_test` executes the
+compatibility matrix, force provenance, quarantine paths, dialect pin, and revision
+provenance on PostgreSQL and MySQL. The operation-item migration now constrains
+MySQL's integer boolean, and the SQLite insert chunk accounts for all 15 columns.
 
 **Dependencies:** T17
 **Files likely touched:** `TR/src/domain/derivation.rs` — **second file for the concept, so take `TR/src/domain/compat/`**: `baseline.rs` from T17 plus `derivation.rs` here. Also `TR/src/domain/admission/acceptance.rs`, `TR/tests/quarantine_test.rs`
@@ -1048,143 +1594,764 @@ reasoning about it.
 ---
 
 ### Checkpoint 4
-- [ ] Compatibility matrix passes including the `Unknown` tier
-- [ ] Provenance persisted on every revision
-- [ ] Quarantine and dialect rules hold, including the two `x-gts-ref` non-cases (no preflight — O4)
-- [ ] `make dylint` — full workspace, once for the phase (P13)
+- [x] Compatibility matrix passes including the `Unknown` tier
+- [x] Provenance persisted on every revision
+- [x] Quarantine and dialect rules hold, including admission of stable schemas whose `x-gts-ref` names a major-0 entity (no preflight — O4)
+- [x] Every verdict is counted, with `Unknown` and a forced waiver each distinguishable in the
+      metrics and not only in a refusal reason (T17, P16)
+- [x] Quarantine and dialect refusals each carry their own counted reason, none collapsed into
+      `invalid_schema` (T18, P16) — four label values, asserted as a set
+- [x] Admission reasons live in one compile-enforced vocabulary: a new refusal cannot compile
+      without naming one (T17, P16)
+- [~] `make dylint` — the local run is blocked before project linting by stable/nightly artifacts
+      being mixed in Dylint's target directory (`E0514`); the gear's all-target/all-feature Clippy
+      run with `--no-deps -D warnings` is clean
 - [ ] Human review
 
 ---
 
-## Phase 5 — Batching, deletion, dry run
+## Phase 5 — Batching, deletion, dry run, and dispatch
 
-### - [ ] T19: Dependency-aware partial admission
+### - [x] T19: Dependency-aware partial admission
 
-**Description:** Batch admission: build the candidate graph from authored references between
-candidates plus the implicit `vM.(n-1)~ → vM.n~` edge, condense into SCCs, process in
-topological order, treat each acyclic candidate as one unit and each cyclic component as one
-atomic unit, and record an outcome for every candidate. The SCC condensation and topological
-order stay pure functions over a candidate set.
+**Description:** Order candidates by `$ref`, derivation, conformance and implicit minor
+predecessor edges. Detect cycles over `$ref` and derivation, refusing members with
+`invalid_schema`. Process one candidate per unit and return one outcome each.
+Ordering is pure; admitted state stays acyclic without atomic groups or condensation.
 
 **Acceptance criteria:**
-- [ ] Independent passing branches commit despite failures elsewhere
-- [ ] In-batch references resolve against the candidate overlay, never a previously committed revision
-- [ ] A failed selected dependency yields `blocked_by_dependency`; a failed lower minor yields `blocked_by_predecessor`
-- [ ] A cyclic component with one invalid member commits nothing
-- [ ] The implicit predecessor edge is not written to `dependency`
-- [ ] Condensation and ordering are exposed as pure functions over a candidate set, usable without a database — required for unit testing without a fixture DB
+
+- [x] Independent passing branches commit despite failures elsewhere
+- [x] In-batch references use candidate state, not older committed revisions (see notes below)
+- [x] Failed dependency/predecessor yields `blocked_by_dependency`/`blocked_by_predecessor`
+- [x] In-batch `$ref` cycles fail `invalid_schema`
+- [x] Mixed `$ref`/derivation cycles fail `invalid_schema`
+- [x] Self-referential GTS `$ref` fails `invalid_schema`. All cycle members fail without
+  entity, revision or edge writes; existing revisions remain unchanged
+- [x] Implicit predecessor edges are not stored:
+  `a_minor_pair_is_ordered_by_an_edge_that_is_never_stored`
+- [x] Pure `graph::order_batch(&[BatchCandidate]) -> BatchOrder`; 17 database-free tests
+
+**Observability (P16):**
+
+- [x] Both blocking reasons are `Reason` consts. Each blocked candidate increments
+  `candidates_total{status="failed"}` and `refusals_total{stage="admission",reason}`
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Tests: partial commit, blocked dependent, blocked predecessor, atomic cycle
-- [ ] Test: batch over `limits.batch_candidates` refused synchronously
+- [x] Gear tests, all three backends (see [Commands](#commands)) — recorded at completion:
+      SQLite 781/781; `make test-types-registry-db` 24/24 on PostgreSQL and MySQL
+- [x] Tests: partial commit, blocked dependent, blocked predecessor, refused in-batch `$ref` cycle
+- [x] Test: batch over `limits.batch_candidates` refused synchronously — covered by T7's
+      `a_batch_over_the_limit_is_refused_with_both_numbers`
+- [x] Test: each blocked candidate emits `candidates_total{status="failed"}` and the correct
+      refusal reason — `a_blocked_batch_counts_one_failed_candidate_per_blocked_reason`
+
+**Implementation notes:**
+- Committed batches realize the overlay through dependency-first commits; a failed candidate
+  blocks its dependents. The regression test
+  `an_in_batch_reference_never_resolves_against_the_committed_revision` uses a refused base
+  revision, so dependent refresh cannot mask incorrect ordering.
+- An ordering loop involving a predecessor edge is refused as `invalid_schema`
+  (`CycleKind::Unorderable`). When both blocking reasons apply, `blocked_by_predecessor` wins.
+  Execution follows dependency order; outcomes retain submission order, one per candidate.
+- Dry-run batches use one coherent snapshot plus prior successful candidates' virtual changes.
+  The T20 follow-up below replaces the original per-candidate rollback limitation.
 
 **Dependencies:** Checkpoint 4
-**Files likely touched:** `TR/src/domain/admission/graph.rs`, `TR/src/domain/admission/worker.rs`, `TR/tests/partial_admission_test.rs`
+**Main files:**
+- `TR/src/domain/admission/graph.rs`, `graph_tests.rs`, `worker.rs`, `reasons.rs`
+- `TR/tests/partial_admission_test.rs`, `partial_admission_backends_test.rs`
+- `TR/tests/observability_test.rs`
 **Scope:** M
 
 ---
 
-### - [ ] T20: Deletion and Dry Run
+### - [x] T20: Deletion and Dry Run
 
-**`EntityRepo::mark_deleted` already exists**, written and unit-tested at T4 with no caller; this is the task that gives it one.
+**Inherited from T15:** committed deletion claims `entity_write_order` as its transaction's first
+statement, before checking dependents. A revision-vector guard alone cannot serialize a new
+dependency edge against deletion. See `plan.md` P15, DESIGN §3.7 and SPEC §8.1 step 4.2.
 
 **Description:** The short deletion protocol — positive `expected_resource_version`, family
 and entity locks, recheck `ACTIVE` with no direct registered dependents, lifecycle to
 `DELETED`, version increment, outcome — and Dry Run as a mode of both registration and
-deletion, running every check in a rollback-only transaction.
+deletion, predicting the whole batch against one coherent snapshot without entity-state writes.
 
 **Acceptance criteria:**
-- [ ] Deletion with a live direct registered dependent is refused, reporting a count without identities
-- [ ] A transitive-only dependent does not block
-- [ ] A deleted entity is still exact-readable as deleted, and absent from lists
-- [ ] Dry Run commits nothing, moves no `resource_version`, and its mode is part of the fingerprint
-- [ ] Dry-run `succeeded` omits `resource_version`; dry-run `unchanged` reports the existing one
+
+- [x] Committed deletion claims `entity_write_order` as its first statement, covered by
+  claim-order tests matching creation/revision/`unchanged`
+- [x] Live direct registered dependants block deletion; report count only
+- [x] Transitive-only dependants do not block
+- [x] `x-gts-ref` creates no edge and does not block
+- [x] Paired service tests vary only `$ref`/`x-gts-ref` on a string property: the former
+  blocks deletion; the latter permits it and remains readable. Tenant availability is deferred
+- [x] Tombstones remain exact-readable and are excluded from lists
+- [x] Dry run issues no entity writes/claims; its mode enters the fingerprint and outcomes persist
+- [x] Predicted `succeeded` omits `resource_version`; `unchanged` reports the existing one
+
+**Observability — label sweep (P16 rule 2):**
+
+- [x] `dry_run` labels candidate, refusal and compatibility-verdict counters
+- [x] Dry runs do not observe the activation-write-set histogram; tested with rationale at the call
+- [x] `kind` distinguishes deletion/registration in candidate and refusal counters;
+  spans already carry both labels
+- [x] Both port labels are required, without defaults
+- [x] Deletion uses `has_registered_dependents`, `not_active` and `precondition_failed` reasons
+- [x] `blocked_dependents` is a span count, never a metric label or identity list.
+  Tests assert count presence and identity absence; dropping `record` fails the mutation check
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Tests: blocked deletion, transitive non-blocking, tombstone readability, dry run for both kinds
-- [ ] Test: reusing one key for dry run then commit is a fingerprint mismatch, not a replay
+- [x] Gear tests, all three backends (see [Commands](#commands))
+- [x] Tests: blocked deletion, transitive non-blocking, tombstone readability, dry run for both kinds
+- [x] Test: reusing one key for dry run then commit is a fingerprint mismatch, not a replay
+- [x] Test: instrument contract — the two new label keys and their vocabularies against an
+      `InMemoryMetricExporter` (T16's bar)
+- [x] Test: emission — a committed deletion, a refused deletion, a dry-run registration and a
+      dry-run deletion each land under the right label pair, asserted as a per-pass delta rather
+      than a total
+- [x] Test: no counter from a dry-run pass appears under `dry_run="false"`
+- [x] Mutation check: dropping either label, or the deletion emission, fails the suite
+
+**Implementation notes:**
+- Batch deletion orders dependents before their targets using stored edges within the batch
+  (`DependencyRepo::edges_within`, `graph::order_deletion_batch`). Each deletion rechecks live
+  dependents; failed deletions lead to `has_registered_dependents` on affected targets.
+  Unorderable stored rows are warned about and still processed for individual outcomes.
+- Dry run reuses admission checks over a snapshot and virtual candidate layers. Refused layers
+  are discarded; outcomes and operation completion publish atomically after the snapshot closes.
+  No entity-state write or write-order claim reaches storage.
+- Replay returns the same outcome fields in both modes, including the derived Registry Reference.
+- Dry runs do not observe the activation-write-set histogram. The compatibility verdict
+  counter carries `dry_run` only; candidate/refusal counters also carry `kind`.
+- POST registration already exposes dry run. REST deletion remains T20a's responsibility.
+
+**Recorded verification:** SQLite 837/837; PostgreSQL/MySQL 27/27 when run binary by binary.
+The combined backend selection hit Docker `PortNotExposed`; it was not green as one run.
+Workspace testing had 119 OAGW failures, also reproduced on clean HEAD in that environment.
+Mutation checks, formatting and clippy passed. These are implementation-time results.
+
+**Coverage gap:** the `more than {bound}` refusal-message branch (>512 live direct dependents)
+is untested; the deletion refusal itself is covered.
 
 **Dependencies:** T19
-**Files likely touched:** `TR/src/domain/admission/deletion.rs`, `TR/src/domain/admission/worker.rs`, `TR/src/api/rest/routes.rs`, `TR/tests/deletion_test.rs`
+**Main files:**
+- `TR/src/domain/admission/deletion.rs`, `worker.rs`, `graph.rs`, `acceptance.rs`
+- `TR/src/domain/admission/dry_run/` (`mod.rs`, `publish.rs`, `view/`)
+- `TR/src/domain/ports/metrics.rs`, `TR/src/infra/metrics.rs`, `TR/src/observability.rs`
+- `TR/src/infra/storage/repo/dependency_repo.rs`, `operation_repo.rs`
+- `TR/tests/deletion_test.rs`, `dry_run_test.rs`, `deletion_backends_test.rs`
+- `TR/tests/dry_run_batch_test.rs`, `dry_run_parity_test.rs`, `dry_run_batch_backends_test.rs`
+- `TR/tests/observability_test.rs`, `api_rest_test.rs`, `common/test_stores.rs`
 **Scope:** M
 
 ---
 
+### - [x] T20a: REST deletion and dry run
+
+**Description:** Expose single/batch deletion on `/v2/` with dry run on all mutations.
+Read completion belongs to T22a (P17).
+
+**Acceptance criteria:**
+
+- [x] Batch `items` use `key` parsed by `EntityKey::parse`; outcomes use `gts_id` in request
+  order, including UUID submissions
+- [x] `:batchDelete` requires positive `expected_resource_version` per item; absence is `400`
+- [x] `DELETE /entities/{entity_key}` uses the one-item batch domain path, GET's key resolution
+  and `Idempotency-Key`; no handler-local deletion/precondition model
+- [x] Single deletion requires a positive `expected_resource_version` query parameter and
+  refuses `If-Match`. Missing, non-numeric or zero yields `400`; mismatch yields `202`
+  then item `precondition_failed`, never `412` (DESIGN §3.3)
+- [x] Single and one-item batch deletion return identical version-mismatch outcomes
+- [x] `dry_run=false` by default; body field for registration/batch deletion, query for
+  single deletion. Preserve registration's router test and cover both deletion routes
+- [x] All mutations require `Idempotency-Key`: acceptance returns `202`, `Location` and
+  `Retry-After`; terminal replay returns `200` and `Idempotency-Replayed: true`.
+  Dry runs persist outcomes without entity/version changes; dry-run/commit key reuse conflicts
+- [x] OpenAPI includes deletion routes, RFC-9457 errors, preconditions, idempotency and dry run.
+  Quickstart covers registration, deletion, dry run and submit-then-poll on internal routes
+- [x] All mutations keep `exposed = false` until platform identity/PDP checks precede dispatch
+- [x] `QUICKSTART.md` meets the gear-layout guide: description, features, `/docs` link,
+  one or two working `curl` examples
+- [x] OpenAPI/quickstart identify the global platform-plane API and C8's internal-only
+  mutations pending `X-ToolKit-Internal-Token`/`PlatformIdentity` and a separate listener;
+  no usable gateway mutation example
+- [x] Handlers only map the domain service (SPEC §8.4)
+- [x] All routes use `routes::V2` for T24a's promotion
+- [x] Deletion routes reuse T20's `kind="deletion"` metrics
+- [x] No e2e edits; `make e2e-local` stays green. Preserve v1 and its in-memory store (P12/P17)
+- [x] Both breaking changelog entries belong to T24a's promotion
+
+**Verification:**
+- [x] Gear tests (see [Commands](#commands)), including `TR/tests/api_rest_test.rs` through
+      the real router: single/batch deletion parity for GTS Identifier and UUID, malformed
+      preconditions, version mismatch and idempotency replay/conflict
+- [x] Router tests: registration and both deletion spellings with `dry_run=true` reach a
+      terminal operation outcome while entity state, revisions and resource versions remain
+      unchanged; a committed control request demonstrates the corresponding mutation
+- [x] `make e2e-local` — unchanged and still green, no e2e file edited (P12)
+- [x] `make lychee`
+- [x] Manual: `/cf/docs` renders the mutation contracts; `curl` against `/v2/` for
+      register → poll → exact read → dry-run delete → exact read → delete → poll → tombstone
+
+**Implementation notes:**
+- Both routes map to `RegistryService::delete(DeleteRequest)` and submit `kind = Deletion`.
+- UUID keys resolve in one snapshot before acceptance, which reads no entity state.
+  Mappings are immutable; admission rechecks lifecycle and versions under locks.
+  Identifier-only batches need no lookup.
+- Unknown UUIDs return `404` because no identifier can be recovered for an outcome.
+  Absent identifiers reach admission and fail with `precondition_failed`.
+- Optional DTO versions let acceptance return `400 deletion_requires_version` on both
+  routes; OpenAPI still declares them required.
+- Shared idempotency/receipt helpers keep mutation responses consistent. `operation_location`
+  replaces the last `/entities` segment and suffix, preserving mount prefixes.
+
+**Route overlap checked:** `resource-group` owns `/v1/types*`; these `/v2/entities*`
+routes have no duplicate path/method pair in the served document.
+
+**Recorded verification:** SQLite 894/894 (44 router tests); PostgreSQL/MySQL 36/36 in one
+`make test-types-registry-db` run. Formatting, gear clippy and link checks passed.
+Manual `/cf/types-registry/v2/*` checks covered register/poll/read, dry-run and committed
+deletion, tombstones, `If-Match`, missing versions, unknown UUIDs and replay.
+`make e2e-local`: 324 passed, 19 skipped; no e2e edits.
+
+**Environment:** Focused quickstart needs `account-management` for v1 seeding; full
+`make run` failed on missing ONNX Runtime in `file-parser`. Manual checks used
+`--features account-management,static-authn,static-authz,single-tenant,static-idp`.
+
+**Corrected at Checkpoint 5:** Homebrew Rust 1.98 shadowed pinned 1.97.0 and caused a
+spurious `clippy::unused_async_trait_impl` failure in `libs/toolkit-security`.
+With `PATH="$HOME/.cargo/bin:$PATH"`, whole-workspace `make clippy`
+(`--all-targets --all-features` and `cargo hack --each-feature`) passed.
+
+**Dependencies:** T20 (deletion and dry run), T9a (interim v2 routes)
+**Files likely touched:**
+- `TR/src/api/rest/routes.rs`
+- `TR/src/api/rest/handlers.rs`
+- `TR/src/api/rest/dto.rs`
+- `TR/src/api/rest/error.rs`
+- `TR/src/domain/registry_service.rs`
+- `TR/tests/api_rest_test.rs`
+- `gears/system/types-registry/QUICKSTART.md`
+**Scope:** M
+
+### - [x] T21: Outbox dispatch wiring
+
+**Description:** Wire `toolkit-db`'s leased outbox (`types_registry__outbox`) through a
+`LeasedMessageHandler` mapping worker results to `Ok`/`Retry`/`Reject`. Payload: operation UUID only.
+
+**Acceptance criteria:**
+- [x] Every database-backed submission goes through the outbox; acceptance and enqueue
+      share a transaction, so no accepted operation lacks a driver (P3). Startup seeding
+      still writes the in-memory service; T24 moves it onto this path
+- [x] Signal the exact partition after the acceptance commit; transaction-time
+      signals can arrive before rows are visible.
+- [x] Handler contains no admission logic — it resolves the operation UUID and calls the worker
+- [x] Delivery is at-least-once and commits are idempotent; duplicate delivery is a no-op
+- [x] Retry failures that may clear; a permanent failure or an exhausted budget records
+      `system_failure` and ACKs. `Reject` is only for an envelope naming no operation
+- [x] Candidate content never enters an outbox or dead-letter payload
+- [x] Add `stateful`, deferred by T2: `[system, db, rest, stateful]` (SPEC §5)
+- [x] Start the worker at the end of `init()`, before stateful `start` (P3); retain `OutboxHandle` and call `stop()` after `ctx.cancellation_token()` fires (see lifecycle deviation)
+- [x] Started before anything can submit, so an acceptance always has somewhere to enqueue. T24's seed batch takes the same path and gates client publication on its item outcomes
+- [x] An operation submitted from any consumer's `init()` is admitted without that consumer waiting for the `start` phase
+
+**Verification:**
+- [x] Gear tests, all three backends (see [Commands](#commands))
+- [x] Real-router registration, batch/single deletion × committed/dry-run modes reach
+      terminal outcomes via outbox. Dry runs persist operations/outcomes while preserving
+      entity state, revisions and resource versions
+- [x] Test: duplicate delivery of one operation UUID changes nothing
+- [x] Test: an operation submitted immediately after `init()` returns reaches `completed` without the `start` phase running
+- [ ] Prove shutdown does not leak tasks. Reopened: the host's 35s hard stop can abort
+      `serve` while spawned outbox work continues. State is recoverable, task lifetime is not bounded
+- [x] Manual: submit over REST against `make example` and observe the operation reach `completed` without direct worker invocation
+
+**Testing exception (SPEC §§13–14):** Only real delivery uses
+`common::await_delivery` with bounded backoff and a 2s deadline. Domain tests call directly.
+
+**Implementation notes:**
+- `RegistryService::admit` is the one admission driver. Missing input
+  dependencies are terminal item refusals; retry classification covers only system failures.
+- `batch_size(1)` gives each message its own bounded attempt budget. After repeated lease
+  timeouts, delivery `N + 1` reads stored status without rerunning admission.
+- Admission reserves lease time for one guarded bulk system-failure write. Client and
+  dead-letter diagnostics contain stable codes and operation IDs, never raw errors.
+- Eight UUID-derived partitions run concurrently, while entity commits remain serialized.
+  There is no recovery scan: acceptance and enqueue share a transaction, so every committed
+  operation carries a message the outbox lease redelivers.
+- `OutboxDispatch` uses a weak reference to avoid an ownership cycle; runtime and tests
+  share the same pipeline settings.
+
+**Lifecycle deviation:** `serve` drains the retained handle after runtime cancellation, and
+worker startup remains in `init()`, before seeding.
+
+**Receipt behavior:** Production submissions return `pending`; terminal replays return
+`200` only after outbox admission completes.
+
+**Recorded verification:** SQLite 903/903; PostgreSQL/MySQL 39/39 in three runs;
+E2E 324 passed, 19 skipped; formatting and clippy passed. Live REST mutations completed,
+and `SIGTERM` drained the outbox.
+
+**Observed flakiness:** `migration_backends_test` failed once before three passing runs,
+likely from container startup contention.
+
+**Dependencies:** T20 (worker supports both mutation kinds and dry run); T20a precedes this
+task so the REST-to-outbox flow can be verified before Checkpoint 5
+**Files likely touched:** `TR/src/infra/outbox.rs`, `TR/src/gear.rs`, `TR/Cargo.toml`,
+`TR/src/domain/registry_service.rs`, `TR/src/domain/admission/errors.rs`,
+`TR/tests/outbox_test.rs`, `TR/tests/outbox_backends_test.rs`, `TR/tests/api_rest_test.rs`,
+`TR/tests/common/mod.rs`, `docs/p0/SPEC.md` (§§8.1, 13, 14)
+**Scope:** M
+---
+
 ### Checkpoint 5
-- [ ] Partial admission, atomic cycles, deletion safety and Dry Run all behave
+- [ ] Partial admission, the refused `$ref` cycle, deletion safety and Dry Run all behave
+- [ ] No series blends a dry run with a commit, or a deletion with a registration (T20, P16)
+- [ ] Blocked candidates are counted per reason (T19, P16)
+- [ ] Registration and both deletion routes support dry run on `/v2/`, with OpenAPI and
+      mutation quickstart examples in place (T20a, P17)
+- [ ] All three mutation routes, with and without dry run, complete through the outbox:
+      submit → poll → terminal outcome, no direct worker invocation (T21). Dry-run operation
+      and outcome records persist while entity state and resource versions remain unchanged
+- [ ] `make e2e-local` still green with no e2e file edited — P12's invariant holds through this
+      phase (T20a, T21, P17)
 - [ ] Gear tests (see [Commands](#commands))
 - [ ] `make dylint` — full workspace, once for the phase (P13)
 - [ ] Human review
 
 ---
 
-## Phase 6 — Dispatch and the new contract
+## Phase 6 — Read API and the new contract
 
-### - [ ] T21: Outbox dispatch wiring
+### T22: Deferred to P1 — inventory ownership metadata and per-gear push
 
-**Description:** Wire the `toolkit-db` leased outbox with prefix `types_registry_outbox` as
-a thin `LeasedMessageHandler` shell over the worker function, mapping its result to
-`Ok`/`Retry`/`Reject`. Messages carry only the operation UUID.
+**Moved, not completed.** The task is now [#4827](https://github.com/constructorfabric/gears-rust/issues/4827)
+under [P1 #4628](https://github.com/constructorfabric/gears-rust/issues/4628)
+and plan P18, which supersedes P4's P0 scope. The original T22 metadata/macros/filtering work
+and per-gear startup inventory integration now ship with the platform-plane client and authN.
+C3 remains open in P0. Task IDs are retained; this transfer note is not an open P0 task.
+
+T23 retains reconciliation of explicitly supplied documents. T24 retains process-wide
+inventory collection while moving admission to the database; T25/T26 migrate existing calls
+without adding inventory registration to every declaring gear.
+
+---
+
+### - [x] T22a: REST batchGet and discovery
+
+**Description:** Add `POST /entities:batchGet` and bounded, content-free `GET /entities`
+on `/v2/`; complete seven-route OpenAPI and quickstart coverage (former T27, P17).
+First in Phase 6 after Checkpoint 5; REST/SDK share SPEC §10.1/§10.2. T22 is deferred to P1 (P18).
 
 **Acceptance criteria:**
-- [ ] Handler contains no admission logic — it resolves the operation UUID and calls the worker
-- [ ] Delivery is at-least-once and commits are idempotent; duplicate delivery is a no-op
-- [ ] Transient database failure returns `Retry`; `Reject` only for a permanently invalid message
-- [ ] Candidate content never enters an outbox or dead-letter payload
-- [ ] The gear gains the `stateful` capability — SPEC §5 puts it at `[system, db, rest, stateful]` and T2 deferred the fourth to this task
-- [ ] **Worker is started at the end of types-registry's `init()`**, not in the stateful `start` (plan decision P3), wired to `ctx.cancellation_token()`; the `OutboxHandle` is retained and `stop()`ed on shutdown
-- [ ] Started **after** inline seeding, so seed operations — which are never enqueued — cannot be leased concurrently
-- [ ] An operation submitted from any consumer's `init()` is admitted without that consumer waiting for the `start` phase
+
+- [x] `batchGet` returns an explicit result per key, including absence; duplicate keys collapse
+- [x] All batch bodies use `items`; each item's `key` uses the path's `EntityKey::parse`
+  (DESIGN §3.3)
+- [x] Impossible identifiers return identical errors through batch and exact reads
+- [x] `batchGet` echoes requested keys
+- [x] Reject a batch `If-None-Match` header; validators belong in per-item `if_none_match`
+- [x] Discovery excludes tombstones and sorts by canonical identifier
+- [x] Return one bounded page (D12): default `limits.page_size_default` (50), reject above
+  `page_size_max` (100). Use `toolkit-odata` cursors and reject unknown versions
+- [x] Pages contain identity/metadata only: no `content`, `resolved_schema`, `effective_traits`,
+  `effective_traits_schema` or validator (§8.5)
+- [x] Exact/batch reads retain full representations and D3 artifacts
+- [x] Reject `$select` with an RFC-9457 problem naming the parameter (§10.2)
+- [x] Exercise sparse and exact pattern pages through the route
+- [x] Use T4's DB reads; decide the pattern in SQL over stored segments (SPEC D14)
+- [x] OpenAPI includes RFC-9457 errors for all seven routes: exact/list/batch/operation reads
+  and registration/batch deletion/single deletion
+- [x] All mutations keep `exposed = false` until platform identity/PDP checks precede dispatch
+- [x] Extend quickstart with batch reads, discovery, cursor traversal and full-document hydration
+- [x] OpenAPI/quickstart identify the global platform-plane API and C8's internal-only
+  mutations pending `X-ToolKit-Internal-Token`/`PlatformIdentity` and a separate listener;
+  no usable gateway mutation example
+- [x] Handlers only map the domain service (SPEC §8.4)
+- [x] All routes use `routes::V2` for T24a's promotion
+- [x] DTOs follow SPEC §10.1/§10.2: `items`, `key`, `EntityPage`; T23 follows the same contract
+- [x] No e2e edits; `make e2e-local` stays green. Preserve v1 and its in-memory store (P12/P17)
+- [x] Both breaking changelog entries belong to T24a's promotion
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Test: duplicate delivery of one operation UUID changes nothing
-- [ ] Test: an operation submitted immediately after `init()` returns reaches `completed` without the `start` phase running
-- [ ] Test: shutdown drains or cancels cleanly — no task leak after `stop()`
-- [ ] Manual: submit over REST against `make example` and observe the operation reach `completed` without direct worker invocation
+- [x] Gear tests (see [Commands](#commands)), including `TR/tests/api_rest_test.rs` driven
+      through the real router: per-key batch outcomes, exact/batch key-classification parity,
+      pagination, sparse and exact patterns, `$select` and cursor-version refusals
+- [x] `make e2e-local` — unchanged and still green, no e2e file edited (P12)
+- [ ] `make lychee` — **not run.** The target stops on `ensure-submodules` in this worktree
+      (`docs/web-docs` and friends are uninitialized), and its path list is
+      `docs examples guidelines gears/system/event-broker/docs`, which never covered this
+      gear's `QUICKSTART.md` anyway. `lychee` run directly over the two files this task
+      touched is clean: 22 OK, 0 errors
+- [x] Manual: `/cf/docs` renders all seven operations; `curl` against `/v2/` for
+      register → poll → page → batchGet → delete → poll → page, including a `limit` above
+      `page_size_max` and a `$select` refusal
 
-**Dependencies:** Checkpoint 5
-**Files likely touched:** `TR/src/infra/outbox.rs`, `TR/src/gear.rs`, `TR/Cargo.toml`, `TR/tests/outbox_test.rs`
+**Dependencies:** T4 (database reads), T9a (v2 routes and exact reads), T20a (mutation routes
+and quickstart, for the seven-route completeness check)
+**Files likely touched:**
+- `TR/src/api/rest/routes.rs`
+- `TR/src/api/rest/handlers.rs`
+- `TR/src/api/rest/dto.rs`
+- `TR/tests/api_rest_test.rs`
+- `gears/system/types-registry/QUICKSTART.md`
 **Scope:** M
 
+**Implementation notes:**
+- **Discovery became a port.** `EntityStore::list_page` and `TypeSchemaStore::current_schemas`
+  are new; `PageRequest` / `EntityPage` moved from `infra::storage::repo::entity_repo` into
+  `domain::ports` (re-exported from `repo/mod.rs`, so T4's tests are unchanged) because a
+  domain method now names them. `AdmissionView` refuses both: an overlay holds candidates
+  with no position in the stored keyset, and admission reaches entities by key, by id or
+  through the dependency relation, never by page.
+- **`current_schemas` keeps a batch read constant in round trips.** `find_current_schema` is
+  single-entity, so a 100-key batch would have cost 100 extra queries for the very artifacts
+  D3 materialized to avoid work. The batch read is two identity reads plus three
+  current-state reads under one snapshot, whatever the batch size.
+- **The exact read is now one key's `batch_get`**, as `delete_entity` is one target's
+  `delete`. That is what makes "impossible identifiers return identical errors through batch
+  and exact reads" structural rather than asserted: the key is classified once, an absence is
+  an absence on both, and a corrupt current-state row is `CorruptDocument` on both. An
+  impossible identifier is therefore an *absence* — no read surface validates the key and
+  refuses early while the other looks it up.
+- **The cursor is transport, not policy** (`TR/src/api/rest/cursor.rs`). The domain's position
+  is a stored `gts_id`; the base64url envelope is how one page hands that to the next over
+  HTTP. `toolkit-odata`'s `CursorV1` supplies the property the contract needs — an unknown
+  version is refused rather than read — and the pattern is bound in through `f` so replaying a
+  cursor under a different pattern is `FILTER_MISMATCH` rather than two spliced traversals.
+  `validate_cursor_against` compares filters only when both sides carry one, so the
+  unfiltered/filtered pair is checked explicitly; a unit test pins that.
+- **`limit` and the page ceiling live in the domain**, which is why `DiscoveryPage` carries the
+  size it was read at: a handler must not read `limits.page_size_default` to fill `page_info`,
+  or REST and a future gRPC adapter could report different defaults for the same read.
+- **The batch ceiling is 100, not DESIGN §3.3's 500** — SPEC §9 ceiling C10, declared rather
+  than taken silently. DESIGN's higher number bought a reconciliation the headroom to read
+  every identifier it might write before selecting its ≤100 candidates; P0 gives that up
+  because a `found` result is a full representation and §3.2 bounds a resolved document at
+  1 MB, so the key count is the only bound on one response. The upgrade path is T23's helper
+  paging its reads plus a bound on response bytes rather than on keys.
+  A constant rather than a config key because §10.3's configuration is fixed for P0. It equals
+  `limits.batch_candidates` today and is still not the same bound: raising the write ceiling
+  must not silently widen read fan-out. Two tests hold it — one pins the literal `100` so the
+  value cannot move unnoticed, one drives the boundary off the constant so exactly-at-ceiling
+  is served and one past it is refused.
+- **`if_none_match` is declared and not consulted.** No read emits a validator until T29, so
+  nothing a caller could hold can be compared against; the field exists now so the wire shape
+  does not change under the callers T23 migrates. `EntityLookupStatusDto` is `found` /
+  `not_found` only — declaring `unchanged` before T29 emits one would publish a vocabulary
+  value this gear never produces.
+- **Discovery filters by `pattern`, `limit` and `cursor` only.** DESIGN's `depth`, `origin`,
+  `availability`, `scope` and `tenant_id` are each out of P0 (SPEC §2). `kind` is *not* named
+  by this task's criteria and would change `EntityRepo::list_page`'s T4 signature, so it stays
+  out; v1's `kind` / `vendor` / `package` / `namespace` / `segment_scope` filters have no v2
+  equivalent, which T28 sees when it migrates the suites onto the promoted paths.
+- **`$select` is refused on the discovery route only**, where §10.2 legislates it as a query
+  parameter. `:batchGet` has no `$select` field to refuse: its one fixed field set is the full
+  representation, a superset of anything a projection could name.
+- **`PageInfoDto` is `{next_cursor, limit}`**, not `toolkit-odata`'s `PageInfo`: discovery pages
+  forward only, so a `prev_cursor` that is always `null` would publish a direction this route
+  does not travel. The envelope still names its array `items`, per SPEC §10.1's `EntityPage`.
+- **Standing bar.** `make fmt` green; gear tests green on all three backends (943 SQLite,
+  39 container-backed); `RUSTFLAGS="-D warnings" cargo check --workspace --all-targets
+  --all-features` clean, so no other gear regressed. `make clippy` is **red at HEAD for an
+  unrelated reason** — a newer `clippy::unused_async_trait_impl` fires in
+  `libs/toolkit-security` and `libs/toolkit-db`, neither of which this task touches. Clippy
+  over this gear with only that lint allowed is clean.
+- **Runtime evidence.** `make quickstart` (types-registry alone) and `make run` (all gears)
+  both fail to boot in this worktree for pre-existing reasons — v1 ready-mode seeding wants
+  account-management's base schemas in the first, and `file-parser` wants an ONNX Runtime that
+  is not installed in the second. The manual pass ran the example server with
+  `--no-default-features --features account-management,static-authn,static-authz,static-tenants,static-license`
+  and exercised the whole flow through api-gateway's `/cf` prefix, cursor traversal included.
+
 ---
 
-### - [ ] T22: `toolkit-gts` — `owning_gear` on inventory records
+### - [x] T22b: Field projection on all three read routes
 
-**Description:** Add `owning_gear` to `InventoryTypeSchema` and `InventoryInstance`, derived
-at macro-expansion time from the declaring crate's gear name, so the SDK can filter the
-process-wide inventory down to what each gear owns (plan decision P4). Without this field
-there is no way for a gear to know which inventory records are its own.
+**Description:** Implement DESIGN §3.3's `$select` on exact read, `:batchGet` and discovery
+before T23 publishes the SDK models and T29 computes validators (plan P19). An absent
+`$select` returns P0's document-free metadata set; callers explicitly request `content`,
+`resolved_schema`, `effective_traits`, `effective_traits_schema` or `provenance`. The
+default includes managed `origin`, as fixed in SPEC §10.2. P0 has no
+availability or tenant fields, so those unavailable DESIGN fields are not advertised or
+synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
 
 **Acceptance criteria:**
-- [ ] Both record structs carry `owning_gear: &'static str`
-- [ ] `#[gts_type_schema]` and `gts_instance!` populate it without the declaring crate passing anything explicitly
-- [ ] `toolkit-gts` exposes a filter — records for one `owning_gear` — beside the existing aggregators
-- [ ] Existing aggregators keep working; nothing that reads all records breaks
-- [ ] Generated schema documents are byte-identical to before (this change adds metadata, not schema content)
+- [x] Update SPEC §§2, 8.3, 8.5, 9, 10.1, 10.2 and 16 before coding: fix the exact P0
+  field allowlist and default, mandatory
+  `kind` and `lifecycle_status` and result-envelope metadata, and the intentional P0 omissions from
+  DESIGN. Remove the `$select` refusal and fixed-projection statements superseded by P19;
+  retain C7 only for absent tenant/visibility dimensions and revise C10's full-response
+  rationale without silently raising the 100-key ceiling. Done in the P19 contract revision;
+  implementation and verification criteria below remain open
+- [x] Define one transport-neutral normalized field set for all three routes and T23/T29:
+  field names follow ToolKit OData's case-insensitive, whitespace-trimming rules; order
+  does not change identity, and absent `$select` equals an explicit default selection.
+  Reject duplicates, empty, unknown, unavailable, malformed or excessive selections with
+  an RFC-9457 field violation naming `$select`, honoring ToolKit's parser limits. Check raw
+  empty comma segments too: ToolKit's parser currently drops them. A document
+  field selects the whole JSON document, not a nested path within it; inapplicable Type Schema
+  fields are absent on Instances
+- [x] Exact and batch reads accept the same selection and produce the same projected
+  entity for one key. Batch `"$select"` is a top-level body field applied to every key;
+  per-item `if_none_match` remains declared for T29. `key`, lookup status and future `etag`
+  stay outside projection; `kind` and `lifecycle_status` are mandatory even when omitted
+  from the selected set, so a projected entity says which documents apply and a projected
+  tombstone is distinguishable from `not_found`
+- [x] Discovery accepts `$select` in the query and returns one bounded page in the same
+  canonical order. Its cursor binds the normalized selection as well as `pattern` and
+  position: resuming under another selection is `400`; absent and explicit-default
+  selections are interchangeable. A page still carries no validator; the default page
+  remains content-free
+- [x] Selection controls **which stored documents are fetched and parsed**, not merely
+  which fields are removed after full `EntityDto` serialization. Read selected columns in
+  bounded batches under the same snapshot as identity/current state; no per-entity query,
+  no full artifact hydration for a metadata-only read. Keep all reads in SecureORM and
+  compare the same behavior on SQLite, PostgreSQL and MySQL
+- [x] REST DTOs distinguish an unselected field from JSON `null`, preserve the flat
+  document fields of DESIGN and declare optional fields accurately in OpenAPI. Specify
+  the matching transport-neutral SDK request/result shape for T23: its reconciliation
+  explicitly selects `content`, and its list helpers select the fields they hydrate.
+  T29 digests this exact normalized set, never the raw query text
+- [x] Unknown query parameters, including unsupported OData options and v1-only filters,
+  are refused rather than silently ignored. Use ToolKit's OData `$select` registration and
+  extraction for GET routes, with a gear-level allowlist for accepted options and fields;
+  batch reads reject query-string `$select`. Keep v1's in-memory routes unchanged until T24a
+
+**Implementation order:**
+1. Contract and normalized field-set parser, with pure tests and SPEC/OpenAPI examples.
+2. Exact and batch read projection through domain, repositories, DTOs and router tests.
+3. Discovery projection and cursor binding, then end-to-end tests and quickstart examples.
 
 **Verification:**
-- [ ] `cargo test -p cf-gears-toolkit-gts`
-- [ ] `cargo test --workspace` — every declaring crate still compiles
-- [ ] Test: the filter returns exactly one gear's records for a fixture with two declaring crates
-- [ ] Manual: diff generated schema documents against the T1 baseline — no change
+- [x] `make fmt`, gear tests on SQLite (1033) and both container backends (42, including
+  `projected_read_backends_test`), `git diff --check`. `make clippy` keeps T22a's unrelated
+  baseline failure (`clippy::unused_async_trait_impl` in `libs/toolkit-security`); clippy
+  over this gear with only that lint allowed is clean
+- [x] Router tests: default metadata-only response; each document alone; mixed batch;
+  managed `origin` shape, selected `provenance` and its
+  Instance null, Instance inapplicable fields; tombstone with `$select=content`; absent
+  key; invalid, unknown and unsupported selections; exact/batch parity
+- [x] Router tests: discovery with metadata and document selection, multiple pages,
+  cursor refusal after changing selection or pattern, and equivalent default spelling;
+  malformed/unsupported OData options are refused
+- [x] Instrumented repository test: metadata-only exact/batch/list reads do not fetch or
+  parse authored/effective documents; selected documents are fetched in bounded batches
+  inside one snapshot, including on PostgreSQL and MySQL
+- [x] Manual `/cf/docs` and `curl` check of all three routes, including a selective
+  `batchGet` and continuation under the same `$select`; update `QUICKSTART.md` to show
+  explicit hydration in batches of at most 100 keys
 
-**Dependencies:** T1 (may run parallel with T21)
-**Files likely touched:**
-- `libs/toolkit-gts/src/lib.rs`
-- `libs/toolkit-gts-macros/src/lib.rs`
-- `libs/toolkit-gts/tests/`
-**Scope:** M — a library and macro change; blast radius is every declaring crate
+**Implementation notes:**
+- **One `FieldSelection` bitset** (`TR/src/domain/selection.rs`) is the normalized identity:
+  order, case and duplicates cannot survive construction, `kind` and `lifecycle_status`
+  are always members, and `canonical()` is the sorted spelling the cursor binds and T29 will digest.
+  The REST parser runs ToolKit's `parse_select` for its limits, then refuses the empty
+  comma segments ToolKit drops. Every refusal is `400` naming `$select` with reason
+  `INVALID_SELECT`; *unavailable* is `availability` / `owned_by_context_tenant`.
+- **Projected reads are new ports beside the admission ones.** `read_current_schemas` /
+  `read_current_values` select only the named columns; `current_schemas`,
+  `current_documents` and `current_values` are unchanged for admission and dry run.
+  The revision row's identity is always read, so a missing current-state row is corruption
+  under every selection. An unselected column is absent from the result set and `SeaORM` reads it into
+  `Option` as `None`; the domain refuses a *selected* column that comes back `None`.
+  `projected_read_backends_test` records the SQL on all three backends: metadata-only
+  exact, batch and discovery reads never name a document column, selected ones name only
+  theirs, all in one snapshot transaction, at most six statements for a batch.
+- **Wire shape.** `EntityDto` omits unselected fields; only `kind` and `lifecycle_status`
+  were required in OpenAPI (T22c's amendment adds `gts_id`/`gts_uuid`), metadata is non-nullable, documents are any-JSON (so a selected `null`
+  stays). `origin` is `{"type":"managed",resource_version,created_at,updated_at}`;
+  `provenance` is exactly `gts_spec_version`, `gts_impl_version` and `compat_forced`;
+  `owning_gear` stays internal attribution that no read returns, and exposing it is P1
+  work (SPEC §10.2). Instance artifacts are absent even when selected.
+- **Strict query parameters.** A guard extractor refuses undeclared keys
+  (`UNSUPPORTED_QUERY_PARAM`, one violation per key) and repeated keys before ToolKit's
+  `OData` extraction. Exact read accepts `$select`; discovery `pattern`, `limit`/`$top`,
+  `cursor`/`$skiptoken`, `$select`; `:batchGet` no query parameter at all, its body now
+  `deny_unknown_fields` (a misspelled `select` is `422`, like the other v2 bodies).
+  `limit=0` is refused under the spelling used before ToolKit reports it as `$top`.
+- **Cursor binding.** The filter hash covers the pattern *and* `$select=canonical`, so it
+  is never empty and `validate_cursor_against` always compares. A T22a token (no selection
+  binding) is refused; absent and explicit-default selections resume one traversal
+  (asserted by comparing whole responses).
+- **Seeded discovery rows** in `api_rest_test.rs` now get a revision and current state,
+  because every page checks the current revision behind each row.
+- **`content_hash` removed.** The managed digest is no longer selectable, returned or
+  stored: `m20260924_000004_drop_revision_content_hash` drops it from both revision
+  tables, `$select=content_hash` is an unknown-field `400`, and `unchanged` compares
+  canonical authored bytes only. `resource_version` and `resolution_fingerprint` are
+  unchanged. The PRD, DESIGN and ADRs 0002/0004/0005/0006/0007/0011 drop the digest from
+  the external plugin contract too: a source returns only the opaque `external_revision`,
+  which changes with any source-owned response field (canonical content, effective
+  artifacts, lifecycle, ownership scope, tenant enablement) but not with platform-owned
+  availability or visibility, and conditional reads are delegated to the plugin.
+- **Runtime evidence.** Example server as in T22a; `/cf/openapi.json` shows `$select` on
+  both GET routes and the body field on `:batchGet`; `curl` exercised the default and
+  selective exact read, a selective `batchGet`, continuation under a respelled `$select`,
+  `400` after changing selection or pattern, `$top`/`$skiptoken`, and the corrected
+  QUICKSTART loop (216 ids, hydrated in 100-key batches). The T22a loop sent an empty
+  `cursor=` on its first page, which is a `400`; fixed here.
+
+**Dependencies:** T22a. Must complete before T23 fixes the SDK request/result models and
+before T29 fixes validator inputs; no dependency on deferred T22 inventory metadata.
+**Files likely touched:** `docs/p0/SPEC.md`, `TR/src/domain/registry_service.rs`,
+`TR/src/domain/ports/mod.rs`, `TR/src/infra/storage/repo/`, `TR/src/api/rest/{dto,handlers,routes,cursor}.rs`,
+`TR/tests/api_rest_test.rs`, `TR/tests/repo_backends_test.rs`, `QUICKSTART.md`.
+**Scope:** L across three read surfaces; land the three implementation slices above
+separately, each with its focused tests and a working gear.
 
 ---
 
-### - [ ] T23: New SDK trait and the reconciliation helper
+### - [x] T22c: Discovery filters by GTS chain depth and entity kind
+
+**Description:** Add DESIGN §3.3's `depth` and `kind` filters to `GET /entities` on the
+interim v2 route before T23 publishes `EntityQuery` (plan P20, SPEC D14/§10.2). These
+filters intersect with `pattern` and active-only discovery, before pagination and
+T22b's `$select`; they do not change exact read or `batchGet`. Every discovery filter is
+exact SQL before `LIMIT limit + 1` (SPEC D14). T22a's completed pattern-only filter record
+remains historical.
+
+**Acceptance criteria:**
+- [x] REST accepts optional `depth=1..255` and `kind=type_schema|instance` with typed
+  OpenAPI parameters. `depth` is an inclusive maximum `GtsId::segments().len()`;
+  one-segment roots have depth 1, and derived schemas and Instance tails add one
+  segment each. The SDK uses `EntityFilter::max_chain_depth: Option<u8>` and
+  `kind: Option<EntityKind>`. No `pattern` is required for either filter
+- [x] Filter by stored `entity.kind` and `entity.chain_depth` in SecureORM/SQL, and match
+  `pattern` exactly in SQL: `gts-rust` parses it, and the repository compiles the parsed
+  segments into joins on `entity_gts_segment`. Intersect all filters before counting a
+  page item or hydrating selected documents. No Rust post-filter; do not hand-count `~`,
+  walk dependency edges, materialize the full result set or add per-entity queries
+- [x] Migration `m20260925_000005_entity_gts_segment` adds `entity.chain_depth`
+  (`GtsId::segments().len()`), `entity_gts_segment` (0-based `segment_no`, binary
+  `segment_name`, `major`, nullable `minor`, `is_type`; FK cascade; lookup index) and
+  the entity indexes `idx_tr_entity_depth`, `idx_tr_entity_kind_lifecycle` and
+  `idx_tr_entity_lifecycle` on all
+  three backends, without backfill: `up` refuses a non-empty `entity`. Admission writes
+  the segments in its transaction and refuses a UUID-tail identifier
+- [x] Extend discovery's versioned cursor identity with canonical optional `depth`
+  and `kind`, alongside `pattern` and T22b's normalized selection. A continuation
+  changing any filter returns `400`; absence is distinct from an explicit value.
+  No release preceded T22c, so by decision the wire version stays `CursorV1`'s `1`: a
+  token without the new dimensions resumes only under the same absent `depth`/`kind`
+  and the same `pattern`/`$select`, and is refused as soon as either filter is named;
+  it is never read as an unfiltered traversal of a filtered query. Keep ordering by
+  canonical `gts_id`. The cursor is the last returned row and appears only when another
+  match exists, so a page with a cursor is full; no matching row is skipped or duplicated
+- [x] Reject zero, negative, fractional, non-numeric and overflow `depth`, unknown
+  `kind`, duplicate/unknown parameters and legacy v1 `is_schema` with RFC-9457 field
+  violations. `kind` is an enum rather than a free string; neither generic `$filter`
+  nor v1 `vendor`/`package`/`namespace`/`segment_scope` is accepted. Leave v1's
+  in-memory route untouched until T24a
+
+**Implementation order:**
+1. Add typed `kind` filtering through REST, domain and SQL with router/backend tests.
+2. Add GTS segment `depth`, cursor binding and sparse multi-page traversal tests;
+   update OpenAPI and quickstart.
+3. Materialize `chain_depth` and segments (migration 000005), compile `pattern` to SQL,
+   and pin it with the differential corpus. Each slice leaves the gear building and its
+   focused tests green.
+
+**Verification:**
+- [x] `make fmt`, gear tests on SQLite (1049) and both container backends (45, including
+  `discovery_filter_backends_test`), `git diff --check`. `make clippy` keeps T22a's
+  unrelated baseline (`clippy::unused_async_trait_impl` in `libs/toolkit-security`); this
+  gear is clean with only that lint allowed. `make lychee` stops on uninitialized
+  submodules in this worktree, as recorded under T22a; `QUICKSTART.md` adds no links
+- [x] Router tests: `depth=1` versus `depth=2` on roots, derived schemas and
+  Instances; each `kind`; all combinations with `pattern`, `$select`, absent
+  filters and tombstones; typed OpenAPI and RFC-9457 invalid-input responses
+- [x] Repository/backend tests: SQL kind and depth predicates, sparse filters returning
+  full pages, exactly-`limit` and empty results without a cursor, and
+  mixed-depth/mixed-kind traversal without omission or duplication on all three backends
+- [x] Differential test (`discovery_pattern_backends_test`): every generated pattern —
+  wildcard cuts, bare `~*`, early-segment minors, instance tails, UUID-tail patterns —
+  composed with `depth`, `kind` and `lifecycle`, returns exactly what
+  `GtsId::matches_pattern` accepts on SQLite, PostgreSQL and MySQL
+  (`make test-types-registry-db` 48/48; gear tests 1088/1088)
+- [x] `EXPLAIN` of each page's recorded statement over 18k rows, after `ANALYZE`, on all
+  three backends: a
+  broad pattern reads `gts_id` order with an early `LIMIT`; a sparse minor drives from
+  `idx_tr_entity_gts_segment_lookup`; `depth=1` uses `idx_tr_entity_depth`; `kind` uses
+  `idx_tr_entity_kind_lifecycle`; tombstone-only uses `idx_tr_entity_lifecycle`; no page
+  sorts more than its matches. MySQL: broad 0.80 ms, sparse kind 0.52 ms, tombstones
+  0.35 ms, `depth=1` under a broad pattern 2.10 ms (~3k rows read). A lifecycle-first
+  kind index was rejected: MySQL used it for every page and sorted (broad 23.5 ms)
+- [x] Cursor tests: changing each of `pattern`, `depth`, `kind` or `$select` returns
+  `400`, unchanged filters resume, and an old cursor version is refused
+- [x] Manual `/cf/docs` and `curl` traversal with `pattern`, `depth`, `kind`,
+  `$select` and a second page; `QUICKSTART.md` shows the inclusive depth rule
+
+**Implementation notes:**
+- **`EntityRepo::list_page` takes one `ListFilter`** and runs one statement through
+  `SecureSelect::project_all`: `kind`, `lifecycle` and `depth` on entity columns (`depth=1`
+  as equality, for `idx_tr_entity_depth`), and one inner join per constrained pattern
+  segment. `repo/segment_filter.rs` mirrors `matches_views`: a concrete segment pins name,
+  major and type marker, and minor only when given; a wildcard pins its given name prefix
+  (a byte range, not `LIKE`) and major; a bare `*` adds nothing; a UUID tail cannot match.
+  The first segment also bounds a `gts_id` range, an access path only. `LIMIT limit + 1`
+  decides the cursor.
+- **Depth range is the domain's.** REST accepts plain decimal digits only (`u8::from_str`
+  would take `+5`) and refuses overflow; `0` parses and `discover` refuses it as
+  `DepthOutOfRange`, so a future gRPC adapter gets the same rule. Every refusal names
+  `depth`.
+- **The cursor stays `toolkit-odata`'s `CursorV1`**, and `GET /entities` keeps ToolKit's
+  full `extract_odata_query`. `depth`/`kind` are extra terms `And`-ed onto T22b's exact
+  pattern/`$select` expression in the filter hash, added only when present: absent and
+  every explicit value differ, and a T22b token resumes under the same absent filters
+  (unit test built from T22b's formula). The base expression's operand order is part of
+  that compatibility.
+- **OpenAPI.** `depth` is `integer` with `minimum: 1`; `ParamSpec` has no `maximum` or
+  `enum`, so 255 and the `kind` vocabulary are in the descriptions. Closing that needs a
+  ToolKit `ParamSpec` change outside this gear.
+- **Runtime evidence.** Example server as in T22a: root, derived schema and Instance under
+  one pattern answered `depth=1` / `depth=2` / `kind` combinations as expected; a
+  `depth=2&limit=1&$select` walk resumed under a respelled `$select` and was refused after
+  changing `depth` or adding `kind`; the issued token decodes as `CursorV1` `"v": 1` and
+  resumes through `$skiptoken` under a respelled `$select` (ToolKit's extractor), while a
+  2100-character `$select` is refused by ToolKit; malformed `depth`,
+  unknown `kind` and `is_schema` were `400`.
+
+**Amendment (2026-09-23): lifecycle filter and mandatory identity.**
+- [x] Discovery accepts `lifecycle_status=active|deleted|all` (default `active`); unknown,
+  empty or repeated values are `400` naming it. It is an SQL predicate in
+  `ListFilter::lifecycle`, applied with the other filters before the page limit. Exact
+  read and `batchGet` are unchanged
+- [x] The cursor adds a `lifecycle_status` term only for `deleted`/`all`, so absent and
+  explicit `active` share one binding and changing the value on resume is `400`
+- [x] `gts_id` and `gts_uuid` join `kind` and `lifecycle_status` as members of every
+  `FieldSelection` and required, non-nullable `EntityDto` fields. Canonical selections other than the
+  default gained `gts_id,gts_uuid`, so a pre-amendment cursor under such a `$select` is
+  refused rather than resumed
+- [x] Tests: generated OpenAPI (`OpenApiRegistryImpl`) for the `EntityDto` required set,
+  its use by all three reads, and `lifecycle_status` as an optional string parameter
+  (`ParamSpec` has no `enum`/`default`; vocabulary is in the description); REST lifecycle
+  traversal, malformed values and cursor binding; repository tombstones among many active
+  rows on all three backends
+
+**Dependencies:** T22b (projection and cursor contract); T22a (bounded discovery).
+Must complete before T23 fixes the SDK `EntityQuery` shape. No dependency on deferred
+inventory T22 or on tenancy/federation.
+**Files likely touched:** `TR/src/domain/registry_service.rs`,
+`TR/src/infra/storage/repo/{entity_repo,segment_filter}.rs`,
+`TR/src/infra/storage/entity/{entity,entity_gts_segment}.rs`,
+`TR/src/infra/storage/migrations/m20260925_000005_entity_gts_segment.rs`,
+`TR/src/api/rest/{dto,handlers,routes,cursor}.rs`,
+`TR/tests/{api_rest_test,repo_backends_test,discovery_pattern_backends_test}.rs`,
+`docs/database.sql`, `QUICKSTART.md`.
+**Scope:** L across the discovery REST/domain/repository path; split into the two
+working implementation slices above.
+
+---
+
+### - [ ] T23: New SDK trait and explicit-document reconciliation helper
 
 **Description:** `TypesRegistryEntities` plus its models per SPEC §10.1, and the
-reconciliation workflow of DESIGN §3.3 as an SDK helper so no gear hand-rolls batching,
-idempotency or retry (plan decision P4). The old trait is **not** kept — it is deleted in
+reconciliation workflow of DESIGN §3.3 over explicitly supplied desired documents, as an SDK
+helper so existing callers need not hand-roll batching, idempotency or retry (P18). Inventory
+collection and per-gear filtering are deferred to P1; the helper does not discover declarations
+or delete entities absent from its input. The old trait is **not** kept — it is deleted in
 T26 once every consumer has moved.
 
 **Acceptance criteria:**
@@ -1195,13 +2362,22 @@ T26 once every consumer has moved.
 - [ ] No security-context parameter; a doc comment records that planes will add one as a deliberate breaking change, and that out-of-process use requires it
 - [ ] **Convenience read helpers as provided methods** over the two required primitives, so consumers keep familiar call shapes and the trait stays object-safe (DESIGN: *"single reads and the kind-narrowed `get_type_schema` / `get_instance` are provided methods over it"*): `get_type_schema`, `get_instance`, `get_type_schemas`, `get_instances`, the `_by_uuid` variants, `list_type_schemas`, `list_instances`. Kind narrowing costs no round trip — the kind is the trailing `~` of the identifier, so a kind-mismatched argument fails locally
 - [ ] `EntitySnapshot` exposes the materialized documents as **plain fields** (`content`, `resolved_schema`, `effective_traits`, `effective_traits_schema`) plus a `segments` accessor, so the ~40 call sites using the old models' computed methods become field reads rather than rewrites
-- [ ] Documents are selectable **individually**, not as an `effective` group: a caller wanting `effective_traits` must not be made to transfer the 1 MB-bounded `resolved_schema` with it (DESIGN §3.3, *Field selection*). `provenance` is the one group that survives
+- [ ] `origin` is the DESIGN managed variant in P0; it carries the read `resource_version`
+  and timestamps used by reconciliation. There is no content digest (SPEC §10.2), and
+  `provenance` is the sole selectable group
+- [ ] Documents are selectable **individually**, not as an `effective` group: a caller wanting `effective_traits` must not be made to transfer the 1 MB-bounded `resolved_schema` with it (DESIGN §3.3, *Field selection*). T22b supplies the server contract; the SDK models use the same normalized selection and represent omitted fields explicitly
 - [ ] **No `effective_*` recomputation exists in the SDK** — the old `GtsTypeSchema::effective_schema` / `effective_properties` / `effective_required` / `effective_traits` / `effective_traits_schema` are not reproduced. They resolved only the parent `$ref` and left non-parent references unresolved, and `effective_traits` was an admitted approximation (`TODO(#1723)`), so reproducing them would reintroduce both a wrong answer and a `constraint-gts-implementation` violation (SPEC §10.1)
 - [ ] `EntityQuery` carries `limit` and `cursor`, and `EntityPage` carries the next cursor — the trait already declared `EntityPage` in SPEC §10.1, and without these it is a page in name only (D12)
-- [ ] `list_instances` / `list_type_schemas` **hydrate a content-free page through `batchGet`**, so the ~87 existing call sites keep reading payloads from the result. The doc comment states the trade: complete with respect to the traversal, not to an instant, and one extra round trip per page which the client cache absorbs
+- [ ] `EntityQuery::filter` carries `pattern`, `max_chain_depth`, `kind` and `lifecycle`
+  from T22c as typed fields. `list_type_schemas` and `list_instances` request their respective
+  `kind` server-side while preserving caller-supplied pattern/depth and cursor;
+  they do not fetch the opposite kind and discard it client-side
+- [ ] `list_instances` / `list_type_schemas` **explicitly select the documents their callers read**, on the discovery page or through a following `batchGet`. The ~87 existing call sites keep reading payloads from the result. The doc comment states the trade: complete with respect to the traversal, not to an instant; `batchGet` is optional, for per-key validators and caching
 - [ ] **The validator field is in the models from this task**, and `BatchGet` accepts a validator per requested key in `BatchGetItem::if_none_match`, even though T29 computes them and T30 consumes them. Adding either later would break the SDK contract after ~50 call sites have moved onto it (SPEC §8.5, `plan.md` P9). A result variant for `unchanged` is part of the same shape
 - [ ] **Reconciliation helper** implements DESIGN §3.3's five steps: batch-read the desired identifiers, omit content equal to current, set `expected_resource_version` from the read for differing ones and leave it unset for missing ones, return `UpToDate` with no POST when nothing remains, otherwise submit once under one idempotency key and poll to terminality
-- [ ] The helper filters the process inventory by `owning_gear` (T22) and batches within `limits.batch_candidates`
+- [ ] The helper accepts an explicit desired-document set, requests `content` for its comparisons,
+  and batches within `limits.batch_candidates`. It does not collect or filter process inventory:
+  T22 moved that work to P1 (P18, SPEC D11)
 - [ ] **Retry lives here, not in gears:** a candidate failing because a dependency is not yet registered is retried a bounded number of times; failure names the gear and identifier
 - [ ] One generated idempotency key spans an invocation's retries and polling
 - [ ] Callable from a consumer's `init()` (P3). Its doc comment states the one requirement: declare `deps = [types_registry]`, or `init` ordering is not guaranteed
@@ -1210,10 +2386,13 @@ T26 once every consumer has moved.
 - [ ] `cargo test -p cf-gears-types-registry-sdk`
 - [ ] Test: a mock consumer round-trips submit → poll → read through the new trait
 - [ ] Test: helper returns `UpToDate` without submitting when everything already matches
+- [ ] Test: only supplied documents are reconciled; unrelated linked inventory and existing registry entities are neither submitted nor deleted
 - [ ] Test: helper converges when a base type is admitted only on the second attempt
 - [ ] Test: helper against an operation nothing will drain fails on its deadline with a diagnosable error, not a hang
 
-**Dependencies:** T22 (contract shape fixed by SPEC; may start at Checkpoint 4)
+**Dependencies:** T4 (reads), T21 (async dispatch), T22b (projection contract), T22c
+(discovery filter contract). Scheduled after T22c so the read surface is verified before SDK
+integration; its contract shape is fixed by SPEC, not by the REST DTOs
 **Files likely touched:**
 - `TR-SDK/src/entities.rs`
 - `TR-SDK/src/entity_models.rs`
@@ -1225,9 +2404,14 @@ T26 once every consumer has moved.
 ---
 
 ### Checkpoint 6
-- [ ] An operation submitted through the outbox reaches `completed` with no direct worker call
-- [ ] Inventory records carry `owning_gear`; generated schema documents unchanged
-- [ ] New trait and reconciliation helper pass against a mock consumer
+- [ ] The REST surface is complete on `/v2/`: all seven routes in OpenAPI; `batchGet` returns
+      explicit per-key results; all three read routes apply `$select`; the default is
+      document-free and discovery filters by `pattern`, inclusive `depth` and `kind`;
+      its cursor binds those filters and the normalized field set while traversing the
+      matching stable set exactly once; `QUICKSTART.md` covers reads and mutations
+      (T20a, T22a, T22b, T22c, P17/P19/P20)
+- [ ] `make e2e-local` remains green with no e2e file edited; gear tests and `make lychee` pass
+- [ ] New trait and explicit-document reconciliation helper pass against a mock consumer without inventory metadata/filtering; T22 is deferred to P1 (P18)
 - [ ] Nothing is cut over yet — consumers still on the old path
 - [ ] `make dylint` — full workspace, once for the phase (P13)
 - [ ] Human review
@@ -1236,10 +2420,10 @@ T26 once every consumer has moved.
 
 ## Phase 7 — Cutover and migration
 
-### - [ ] T24: Cutover — registry seeds only what it owns; ready mode and in-memory repository out
+### - [ ] T24: Cutover — linked inventory seeds into the database; ready mode and in-memory repository out
 
-**Description:** types-registry stops pulling the whole process inventory. It seeds only what
-it owns — `toolkit-gts` base types and its own control-plane types — inline at `init()` (P2),
+**Description:** types-registry keeps collecting the whole process-linked inventory and seeds
+its Type Schemas and Instances into the database inline at `init()` (P2/P18),
 then starts the outbox worker (P3). Delete `switch_to_ready`, the `temporary`/`persistent`
 split, `SystemCapability::post_init` and the in-memory repository. From here on reads are
 served from the database (SPEC D2, §8.2) — this is the task where the old in-memory read path
@@ -1251,34 +2435,40 @@ T30 lands its replacement. Between here and T30 reads are uncached.
 field carries operator-controlled identities that cannot be expressed as inventory items — their
 GTS identifiers are deployment-specific (e.g. the platform-root and customer tenant types in
 `e2e-local.yaml`). Currently these are seeded only into the in-memory `TypesRegistryService`;
-T24 must seed them into the database through the same inline admission path used for
-types-registry's own inventory. An invalid or oversized `cfg.entities` must fail boot loudly
+T24 must seed them into the database through the same outbox admission path used for
+the linked inventory. An invalid or oversized combined seed set must fail boot loudly
 (current in-memory behaviour preserved). The `cfg.entities` field itself is not removed — it
 remains the deployment-time escape hatch for identities that no gear can own.
 
 **Acceptance criteria:**
-- [ ] Seeding covers exactly the entities types-registry owns; no other gear's declarations are pulled
-- [ ] `cfg.entities` from the deployment configuration is seeded into the database at startup, through the same inline admission path; the field is validated and any failure fails boot
-- [ ] Seeding is idempotent — a second start admits nothing new and reports `unchanged` for both owned inventory and `cfg.entities`
-- [ ] Seeding runs **before** the outbox worker starts (P3) and enqueues nothing — it invokes the worker inline
-- [ ] `init()` never waits on a registrant and never blocks on the outbox (`constraint-boot-path`)
-- [ ] Owned inventory and `cfg.entities` together fit within `limits.batch_candidates`; if they exceed it, startup fails loudly rather than silently splitting
+- [ ] Seeding covers all linked Type Schema and Instance inventory, including other gears, through the database admission path; no per-gear filter is introduced (D11/P18)
+- [ ] `cfg.entities` from the deployment configuration is seeded into the database at startup, through the same outbox admission path; the field is validated and any failure fails boot
+- [ ] Seeding is idempotent — a second start admits nothing new and reports `unchanged` for both linked inventory and `cfg.entities`
+- [ ] Seeding runs **after** the outbox worker starts (P3) and enqueues like any other submission; startup awaits its items and fails boot on a `failed` one
+- [ ] `init()` never waits on a registrant; it blocks only on its own seed operations, before publishing the client (`constraint-boot-path`)
+- [ ] All linked inventory and `cfg.entities` together fit within `limits.batch_candidates` and other admission limits; if they exceed them, startup fails before publishing the client, with a diagnostic naming the exceeded limit. No truncation or silent split. Admission orders cross-crate dependencies inside this single batch
 - [ ] The v1 REST routes T9a restored are deleted **together with** the repository they read —
       `POST /v1/entities` (`types_registry.register`), `GET /v1/entities/{gts_id}`
       (`types_registry.get`) and the in-memory `GET /v1/entities` list. A route left pointing at a
       deleted repository is the failure mode; T24a then promotes v2 onto those paths
+- [ ] `TypesRegistryClient` survives this task over the database, not over the repository it
+      deletes: its `register` becomes a submit-then-poll shim for the T24–T26 window, so the
+      ~13 `register(...)` sites and every read site keep working while T25/T26 migrate them
+      (`plan.md` P12). The shim is one store and one write path — not a dual path — and T26
+      deletes it with the trait
 - [ ] Ready mode and the in-memory repository are gone; `ready_mode_tests.rs` deleted. The old model-typed cache goes with the old models, and the four `local_client.cache.{type_schemas,instances}.{capacity,ttl}` keys become accepted-and-ignored with a warning naming their T30 replacements
-- [ ] `owning_gear` comes from T22's inventory field, not a constant — ceiling C3 is struck from SPEC §9 in this task
+- [ ] `owning_gear = "types-registry"` remains a compatibility placeholder for P0 admissions. C3 stays open; its source comment describes incomplete attribution and the P1 upgrade, never claims that all declarations belong to the registry. Keep the column and global NOT NULL constraint; no read returns the placeholder, since exposing `owning_gear` is P1 work
 - [ ] No entity-derived state survives `init()` — no `ArcSwap`, no entity map, no `GtsOps` field on the gear or the service. Grep-checkable, and the ceilings C1/C4 struck by D2 depend on it
 
 **Verification:**
 - [ ] Gear tests, all three backends (see [Commands](#commands))
 - [ ] Test: second `init()` against a populated database seeds nothing
-- [ ] Test: the seed set contains no entity owned by another gear
+- [ ] Test: declarations from at least two linked crates seed successfully, including a cross-crate dependency; inventory selection does not require `owning_gear`
+- [ ] Test: the combined inventory + `cfg.entities` count exceeds a deliberately low `limits.batch_candidates`; startup fails explicitly before client publication, with no silent split/truncation
 - [ ] Test: `cfg.entities` entries are present and readable after boot, and a second boot reports `unchanged` for them
 - [ ] Test: an invalid entry in `cfg.entities` fails boot with a clear error
 - [ ] Test: a read issued after an entity is written directly to the database (not through the service) returns it — proving the read path holds no process-local copy. This is the single-process form of SPEC §13's two-pod criterion
-- [ ] `make quickstart` — server boots with only registry-owned types present
+- [ ] `make quickstart` — server boots with all linked inventory present in the database; the configured batch/admission limits cover the real seed set
 - [ ] `make e2e-local` — server boots with `cfg.entities` populated (the two AM tenant types); both are readable after boot
 - [ ] Manual: restart, confirm entities and artifacts byte-identical
 
@@ -1287,7 +2477,7 @@ remains the deployment-time escape hatch for identities that no gear can own.
 - `TR/src/gear.rs`
 - `TR/src/domain/seeding.rs`
 - `TR/src/domain/service.rs`
-- `TR/src/config.rs` (doc update: `entities` field comment names the inline seeding path)
+- `TR/src/config.rs` (doc update: `entities` field comment names the outbox seeding path)
 - `TR/src/infra/storage/in_memory_repo.rs` (deleted); `TR/src/infra/cache/` retyped in T30, not deleted
 - `TR/tests/seeding_test.rs`, `TR/tests/ready_mode_tests.rs` (deleted)
 **Scope:** M+
@@ -1301,26 +2491,28 @@ store they read from and go with it — v1 cannot outlive T24, and repointing it
 would be a compatibility shim with no consumer. This task is the other half: every v2 route moves
 onto the `/types-registry/v1/` paths, so P0 ends on **one** version rather than a permanent v2.
 
-**Placement.** After T27, not before it: T27 authors the remaining routes (`:batchGet`,
-`:batchDelete`, `DELETE /entities/{entity_key}`, the paged content-free `GET /entities`), and authoring them on v2 and then renaming is
-one move, while renaming first and authoring second means T27 lands on paths that changed under
-it. T28 then migrates e2e onto the final contract exactly once. Recommended Phase 7 order is
-therefore **T24 → T27 → T24a → T28**, with T25/T26 floating (they depend on T24 alone).
+**Placement.** Directly after T24 (`plan.md` P17). T20a authored the deletion routes in
+**Phase 5**, while T22a/T22b completed `:batchGet`, paged discovery and projection on
+**all three reads in Phase 6**, all on v2. This task promotes all seven routes at once. The Phase 7 order is
+**T24 → T24a → T28**, with T25 then T26 alongside it: T25 needs T24, T26 needs T25 — it
+deletes the shared trait, so it cannot run beside it.
 
 **The e2e window is a consequence of this ordering, not of a defect.** `make e2e-local` goes red
 at T24 — where the wire genuinely breaks and where it could not break earlier — and green again
-at T28. T25, T26 and T27 sit inside it and are gated by `cargo test --workspace`, `make quickstart`
-and `make example` instead. Before T24 the suite stays green, which is what T9a bought.
+at T28. T25 and T26 sit inside it and are gated by `cargo test --workspace`, `make quickstart`
+and `make example` instead. Before T24 the suite stays green, which is what T9a bought and what
+T20a and T22a preserve by not touching an e2e file.
 
 **Acceptance criteria:**
 - [ ] No `/v2/` path remains in the crate, in OpenAPI or in `QUICKSTART.md`
 - [ ] The promotion changes paths only: registration and deletion routes remain internal-only
       (`exposed = false`) until C8's platform listener and authorization gate exist
-- [ ] `operation_id`s are unchanged by the move — `types_registry.submit_entities`, `.get_operation`, `.get_entity` and T27's additions keep their names, so the promotion is a path change and nothing else. A client that already followed v2 sees only the prefix move
+- [ ] `operation_id`s are unchanged by the move — `types_registry.submit_entities`, `.get_operation`, `.get_entity` and T20a/T22a's additions keep their names, so the promotion is a path change and nothing else. It is still a *breaking* path change for anything on `/v2/`: every such route is removed here, so a caller must move its base path. What the unchanged `operation_id`s buy is that nothing but the path moves — bodies, statuses and semantics are the ones it already had, and the interim surface was never exposed beyond the platform listener
+- [ ] All **seven** routes promote together, because all seven exist by the end of Phase 6 (P17)
 - [ ] Old v1 handlers, DTOs and routes are **deleted**, not repointed — verified by T24's own criterion that the in-memory repository is gone; `grep -r 'types_registry\.register\|RegisterEntitiesRequest'` finds nothing outside history
 - [ ] Every surviving v1 route reads the database; none reads process memory
 - [ ] SPEC §10.2 records the final shape and closes the interim window, naming T9a as where it opened and this task as where it closed
-- [ ] Changelog: the v1 `POST` break (body shape, `202`, submit-then-poll) and the `GET /entities` shape change are **one release, two entries**, as T27 already requires
+- [ ] Changelog: the v1 `POST` break (body shape, `202`, submit-then-poll) and the read-shape break (`GET /entities` pagination plus document-free defaults on discovery and exact read) are **one release, two entries** — owned here outright, since this is where both breaks reach a v1 caller (P17/P19)
 - [ ] `api_rest_test.rs` needs only its per-version path constant changed — if it needs more, T9a's last criterion was not met and that is the finding, not this task's scope
 
 **Verification:**
@@ -1329,7 +2521,7 @@ and `make example` instead. Before T24 the suite stays green, which is what T9a 
 - [ ] Manual: `/cf/docs` renders every operation under v1 and no v2 path resolves
 - [ ] `make e2e-local` is **expected red** until T28 and green after it; the red set must be exactly the `/entities` call sites T28 owns, and any other failure is a regression this task introduced
 
-**Dependencies:** T27
+**Dependencies:** T24
 **Files likely touched:**
 - `TR/src/api/rest/routes.rs`, `TR/src/api/rest/handlers.rs`, `TR/src/api/rest/dto.rs`
 - `TR/tests/api_rest_test.rs`
@@ -1343,8 +2535,8 @@ and `make example` instead. Before T24 the suite stays green, which is what T9a 
 
 **Description:** Move every system gear and plugin off `TypesRegistryClient`: reads to the new
 trait, and the ~13 explicit `register(...)` sites to the reconciliation helper called from
-`init()`. Each gear gates its own readiness on its own registration — DESIGN's *"Each gear
-gates only its own readiness"*.
+`init()` with explicitly supplied documents. Existing registrants await their own terminal
+results. New per-gear inventory registration calls are deferred to P1 (P18).
 
 Covers `account-management` (+ static-idp-plugin), `authn-resolver` (+ static and oidc
 plugins), `authz-resolver` (+ static and tr plugins), `tenant-resolver` (+ static,
@@ -1354,9 +2546,9 @@ single-tenant and rg plugins), `resource-group`, `usage-collector` (+ plugins), 
 **Acceptance criteria:**
 - [ ] No system gear or plugin references `TypesRegistryClient`
 - [ ] Read sites move mechanically: T23's provided helpers keep the call shapes, so a read migration is a `use` change plus field reads where a computed method was used
-- [ ] Every gear declaring GTS types calls the reconciliation helper once, in `init()`, and declares `deps = [types_registry]`
+- [ ] Existing explicit registration sites call the helper with their desired documents and declare `deps = [types_registry]`; gears that only declare inventory gain no new registration call in P0
 - [ ] `RegisterResult::ensure_all_ok` sites are replaced by the helper's terminal result — no site treats `pending` as success
-- [ ] Registration failure fails that gear's startup naming the gear and identifier, and does not affect other gears
+- [ ] Explicit registration failure fails the calling gear's startup naming the gear and identifier; shared inventory bootstrap failures remain registry startup failures (P18)
 
 - [ ] Where a materialized `effective_*` field differs from what the deleted client-side method returned, the **materialized value is accepted** — the difference is the old approximation being wrong (unresolved non-parent `$ref`, trait-default order), and `gts-rust` is authoritative. A failing assertion is updated to the new value, never "fixed" back
 **Verification:**
@@ -1375,7 +2567,8 @@ single-tenant and rg plugins), `resource-group`, `usage-collector` (+ plugins), 
 **Description:** The remaining consumers — `bss/ledger`, `bss/rate-provider` (its shared
 `registration.rs` helper), `mini-chat` (+ static-audit and static-model-policy plugins),
 `llm-gateway`, `model-registry` — then delete `TypesRegistryClient`, its models and
-`testing::MockTypesRegistryClient`.
+`testing::MockTypesRegistryClient`. Existing explicit registration sites use T23 with their
+documents; automatic per-gear inventory registration remains in P1 (P18).
 
 **Acceptance criteria:**
 - [ ] No crate in the workspace references `TypesRegistryClient`, `RegisterResult`, `RegisterSummary`, `TypeSchemaQuery` or `InstanceQuery`
@@ -1395,60 +2588,15 @@ single-tenant and rg plugins), `resource-group`, `usage-collector` (+ plugins), 
 **Scope:** L — split per gear, same rule as T25
 
 ---
-### - [ ] T27: REST completion, OpenAPI, QUICKSTART
-
-**Description:** The remaining routes — `POST /entities:batchGet`, `POST /entities:batchDelete`,
-`DELETE /entities/{entity_key}`, `GET /entities` — plus OpenAPI completeness, the changelog entry for
-the `POST /entities` break, and `QUICKSTART.md`.
-
-**Acceptance criteria:**
-- [ ] `batchGet` returns one explicit result per requested key, including absence; duplicate keys collapse
-- [ ] Every batch item names its entity in one `key` field, classified by the same `EntityKey::parse` the path segment uses; the three batch bodies all name their array `items` (DESIGN §3.3, *Naming a single entity in a batch*)
-- [ ] Test: a syntactically impossible identifier answers **identically** through `:batchGet` and through `GET /entities/{entity_key}` — one classifier, so the two surfaces cannot disagree about one string
-- [ ] `:batchGet` results echo the `key` they were asked by; `:batchDelete` answers with an operation whose items are keyed by `gts_id`, so a caller that deleted by UUID matches by preserved request order
-- [ ] `:batchDelete` items carry a `key` plus a **required positive** `expected_resource_version`; absence is a `400`, not "delete if present"
-- [ ] `DELETE /entities/{entity_key}` is a one-item `:batchDelete` over the same domain path — no second deletion model, no handler-local precondition logic. It resolves `{entity_key}` as the `GET` does and requires `Idempotency-Key`
-- [ ] Its precondition is a required positive `expected_resource_version` **query parameter**; an `If-Match` header is refused, not ignored. Absent, non-numeric or `0` is a synchronous `400`; a mismatched version is `202` and then `precondition_failed` on the operation item, never `412` (DESIGN §3.3, `DELETE /entities/{entity_key}`)
-- [ ] Test: the same mismatched version through `DELETE /entities/{entity_key}` and through a one-item `:batchDelete` yields the identical item outcome — the assertion that keeps the two spellings one model
-- [ ] An `If-None-Match` **header** on `:batchGet` is refused, not ignored: validators are per item in `if_none_match`
-- [ ] `GET /entities` excludes deleted entities and sorts by canonical identifier
-- [ ] `GET /entities` returns **one bounded page and a cursor** (D12): `limit` defaults to `limits.page_size_default` (100) and a request above `limits.page_size_max` (1000) is **refused, not clamped**; cursors come from `toolkit-odata` and an unknown cursor version is rejected rather than reinterpreted
-- [ ] The page is **content-free**: the default field set is identity and metadata; all four documents (`content`, `resolved_schema`, `effective_traits`, `effective_traits_schema`) are absent, and a page carries no validator (§8.5)
-- [ ] One default set **per surface**: the page is content-free, while `GET /entities/{entity_key}` and `batchGet` return the full representation with D3's artifacts
-- [ ] A request carrying **`$select` is refused** with an RFC-9457 problem naming the parameter — never answered with the default representation (§10.2). Accept-and-ignore is wrong here: the caller would get up to 1MB it did not ask for and would build on behaviour P1 changes
-- [ ] Changelog records the `GET /entities` shape change beside the `POST /entities` one — two breaks, same release
-- [ ] `EntityRepo::list_page` gets its first real consumer here: its scan budget (`SCAN_BUDGET`, `SCAN_BATCH`) and prefix-range logic (`prefilter_prefix`, `range_upper_bound`) are the most intricate in the layer and have only ever been unit-tested — a test must exercise the budget boundary and a prefix range **through the route**
-- [ ] Both read routes go through T4's database read primitives; pattern filtering is `GtsId::matches_pattern` in Rust over prefiltered rows, never SQL that reimplements identifier matching
-- [ ] All **seven** routes appear in the OpenAPI document with RFC-9457 error responses registered — the four reads (`GET /entities/{entity_key}`, `GET /entities`, `:batchGet`, `GET /operations/{operation_id}`) and the three mutations (`POST /entities`, `:batchDelete`, `DELETE /entities/{entity_key}`)
-- [ ] The three mutation operations are not gateway-published: their operation specs keep
-      `exposed = false` until platform identity and a PDP decision are enforced before dispatch
-- [ ] `QUICKSTART.md` exists per `02_gear_layout_and_sdk_pattern.md` — description, features, link to `/docs`, one or two working `curl` examples
-- [ ] OpenAPI and `QUICKSTART.md` describe this as the platform-plane API for global entities,
-      state that mutation routes remain internal-only while platform identity
-      (`X-ToolKit-Internal-Token` / `PlatformIdentity`) and the separate listener are unavailable
-      (C8), and do not present a gateway mutation `curl` as usable
-- [ ] Changelog records the `POST /entities` break
-- [ ] No handler added in this task carries logic the domain service does not already expose — the REST surface stays a mapping layer, so a later gRPC surface cannot diverge from it (SPEC §8.4)
-
-**Verification:**
-- [ ] `make e2e-local` — register → poll → read → re-register unchanged → delete, plus replay and `409`
-- [ ] `make lychee`
-- [ ] Manual: `/cf/docs` renders every operation
-
-**Dependencies:** T21, T23
-**Files likely touched:**
-- `TR/src/api/rest/routes.rs`
-- `TR/src/api/rest/handlers.rs`
-- `TR/src/api/rest/dto.rs`
-- `gears/system/types-registry/QUICKSTART.md`
-- `testing/e2e/test_types_registry.py`
-**Scope:** M
-
----
-
----
 
 ### - [ ] T28: Update e2e suites for the `202` contract
+
+Four initial async-registration scenarios are described in
+[`registration.md`](../../../../../testing/e2e/suites/types_registry/scenarios/registration.md),
+with shared JSON fixtures and pytest scenario IDs. They exercise the interim v2
+surface alongside the existing v1 tests; this does **not** complete the cutover
+and migration work below. The local launcher uses SQLite, so these runs make no
+PostgreSQL/MySQL-specific claim.
 
 **Description:** The `POST /entities` break (D10) invalidates every e2e call site that
 registers and reads the result synchronously. Those sites move to submit-then-poll: `202`,
@@ -1469,7 +2617,12 @@ paged list. It was missed because the earlier survey counted `/entities` referen
 - [ ] The helper has a bounded deadline and fails with the operation's per-candidate errors, never on a bare timeout
 - [ ] `account_management`'s registration helper polls to terminality before returning, so that suite's setup stays synchronous from its own point of view
 - [ ] Assertions move from the POST body to the operation's per-`gts_id` outcomes
-- [ ] `GET /entities` call sites move to the paged, content-free shape (D12): the shared helper pages through the cursor, and any assertion that read `content` from a list result now reads it from `batchGet` or an exact read
+- [ ] `GET /entities` call sites move to the paged, document-free default (D12/D13): the shared helper pages through the cursor. Any assertion needing `content` explicitly selects it on discovery, `batchGet` or exact read; an unselected exact read no longer supplies documents
+- [ ] Legacy `is_schema` filters migrate to T22c's `kind=type_schema|instance`, and
+  callers needing a chain boundary use inclusive `depth`. A legacy
+  `vendor`/`package`/`namespace`/`segment_scope` predicate is translated only when
+  an equivalent GTS `pattern` is proved; otherwise the migration records a follow-up
+  rather than silently widening the result set
 - [ ] Tests that assert refusals still assert them **synchronously** — envelope, identifier, policy and idempotency failures stay pre-`202` (SPEC §8.1)
 
 **Verification:**
@@ -1490,19 +2643,19 @@ paged list. It was missed because the earlier survey counted `/entities` referen
 ### - [ ] T29: Freshness validators and conditional reads
 
 **Description:** The per-request validator of DESIGN §3.3 and the conditional reads it
-enables (SPEC §8.5, `plan.md` P9). For a P0 managed platform-plane read the validator is a
+enables (SPEC §8.5, `plan.md` P9/P19). For a P0 managed platform-plane read the validator is a
 versioned digest over `entity.resource_version`, `type_schema.resolution_fingerprint` (Type
-Schemas only) and a default-projection marker — every other input in DESIGN's table is
+Schemas only) and T22b's normalized selected-field set — every other input in DESIGN's table is
 `tenant plane only`, availability-conditional or external, so none of them applies here.
 Ships the `ETag` / `If-None-Match` → `304` path on exact reads and per-key validators on
 `batchGet`.
 
 **Acceptance criteria:**
 - [ ] Validator is **computed per request, never stored** (`cpt-cf-types-registry-principle-derive-not-store`) — no column, no cache entry holds one as authority
-- [ ] Inputs are exactly `resource_version` + `resolution_fingerprint` (Type Schemas; Instances have no derived form) + normalized-projection marker. A `TODO` names the P1 additions: subject visibility-chain version, Context Tenant availability-chain version, routing generation
+- [ ] Inputs are exactly `resource_version` + `resolution_fingerprint` (Type Schemas; Instances have no derived form) + T22b's normalized field set. A `TODO` names the P1 additions: subject visibility-chain version, Context Tenant availability-chain version, routing generation
 - [ ] Wire form per DESIGN: base64url of a **versioned** JSON object, identical bytes in `ETag` and in batch bodies; 128-bit digest for the managed case. The version field is what lets P1 add inputs without honouring a P0 token
 - [ ] Comparison decodes fields — never compares encoded strings, so serialization differences cannot read as a change
-- [ ] Projection is digested as the **normalized field set**, not the query string; absent `$select` equals the explicit default set (RFC 9110 §8.8.3), so a P1 narrow token cannot produce a false `unchanged` for a wider representation
+- [ ] Projection is digested as the **normalized field set**, not the query string; absent `$select` equals the explicit T22b default set (RFC 9110 §8.8.3). A narrow token never produces false `unchanged` for a wider representation, including two selections of the same key in P0
 - [ ] Exact read: response carries `ETag`; a matching `If-None-Match` returns a bodyless `304` **that still carries the `ETag`**, declared through `no_content_response(StatusCode::NOT_MODIFIED, ..)`
 - [ ] `batchGet`: validators travel **beside individual keys**, in each item's `if_none_match`, because one header cannot represent them; a result may be `unchanged`, and the response stays `200` even when all are. The two body fields are the two header names lowercased — request `if_none_match`, response `etag` — so the batch surface reads like the single one
 - [ ] An `unchanged` result **carries its `etag`**, and the exact read's `304` **carries its `ETag`** — RFC 9110 §15.4.5 has a `304` send the validator a `200` would have. Every result but `not_found` therefore has one, so a refresh loop has no special case
@@ -1510,7 +2663,7 @@ Ships the `ETag` / `If-None-Match` → `304` path on exact reads and per-key val
 - [ ] **Discovery pages carry no validator** and are never conditional (DESIGN: validators are for exact reads, *"never discovery pages"*) — `GET /entities` is unaffected
 - [ ] A deleted entity still has a validator, and deletion moves it (deletion increments `resource_version`)
 - [ ] Handlers stay mapping-only: the validator is computed in the domain service, so a future gRPC adapter gets it without new domain methods (SPEC §8.4)
-- [ ] `ponytail:`-style comment where the digest is built records ceiling C7 — the fixed projection marker and absent chain versions — and names the version field as the upgrade path
+- [ ] `ponytail:`-style comment where the digest is built records ceiling C7's absent tenant/visibility dimensions and names the version field as the upgrade path
 
 **Verification:**
 - [ ] Gear tests, all three backends (see [Commands](#commands))
@@ -1520,9 +2673,13 @@ Ships the `ETag` / `If-None-Match` → `304` path on exact reads and per-key val
 - [ ] Test: `batchGet` with a mix of current and stale validators returns `200`, `unchanged` for the current ones, full snapshots for the rest
 - [ ] Test: an Instance validator omits `resolution_fingerprint` and still changes on revision
 - [ ] Test: decoding rejects a validator whose version field is unknown rather than treating it as a match
+- [ ] Test: one key under two different selected-field sets has two different validators;
+  field order, case, an explicit default set and explicitly naming mandatory
+  `kind` or `lifecycle_status` do not change the normalized validator when the effective fields match
 - [ ] Test: deletion changes the validator
 
-**Dependencies:** T23 (validator field in the models), T27 (routes exist)
+**Dependencies:** T23 (validator field in the models), T22b (normalized projection and
+the three read routes, Phase 6 per P19)
 **Files likely touched:**
 - `TR/src/domain/validator.rs`
 - `TR/src/domain/service.rs`
@@ -1538,8 +2695,8 @@ Ships the `ETag` / `If-None-Match` → `304` path on exact reads and per-key val
 **Description:** Port the `local_client` cache onto `EntitySnapshot` and give it DESIGN §3.3's
 contract (SPEC §8.3, `plan.md` P7). Reads have been uncached since T24; this restores caching,
 and because T29 supplies validators the cache **revalidates** rather than merely expiring —
-which is what `cpt-cf-types-registry-fr-client-cache` asks for. Deferred to P1 with tenancy:
-only the projection / visibility / Context-Tenant key dimensions.
+which is what `cpt-cf-types-registry-fr-client-cache` asks for. T22b supplies the projection
+dimension in P0; visibility and Context-Tenant dimensions remain fixed until P1 tenancy.
 
 **Acceptance criteria:**
 - [ ] Cache is typed on `EntitySnapshot`; the `GtsTypeSchema` / `GtsInstance` implementation is gone with the old models
@@ -1551,7 +2708,9 @@ only the projection / visibility / Context-Tenant key dimensions.
 - [ ] A terminal successful registration or deletion outcome invalidates every local entry for each returned identifier/UUID pair, under **both** key forms. A `202` acceptance invalidates nothing — the client has not observed the mutation yet
 - [ ] Entries are indexed by identifier and by UUID, so either resolution direction hits one snapshot
 - [ ] Never cached, each asserted separately: `NotFound`, a failed read, a discovery page or its items, an operation resource
-- [ ] The key carries visibility context and projection as fixed P0 markers, so P1 adds dimensions without reshaping it
+- [ ] The key carries T22b's normalized selected-field set, with visibility context and
+  Context Tenant as fixed P0 markers. A narrow cached representation is never returned
+  for a wider selection; P1 adds real tenant dimensions without reshaping the key
 - [ ] The four old config keys are accepted-and-ignored with a warning naming `freshness_window` / `store_bound`; `ponytail:`-style comment records what is left of ceiling C7 (the key dimensions, not revalidation)
 
 **Verification:**
@@ -1561,6 +2720,8 @@ only the projection / visibility / Context-Tenant key dimensions.
 - [ ] Test: terminal outcome invalidates under identifier **and** UUID; a bare `202` invalidates nothing
 - [ ] Test: byte bound evicts on one 1MB document where a thousand small entries do not
 - [ ] Test: each of the four never-cached cases
+- [ ] Test: the same entity under two projections occupies distinct entries, while a
+  reordered, case-varied or explicit-default selection reuses its normalized entry
 - [ ] Test: a failed read leaves no entry and does not extend an existing window
 - [ ] Test: an expired entry whose content did not change is revalidated to `unchanged` and **kept**, not refetched — assert on the absence of a full-snapshot response, not only on the returned value
 - [ ] Test: two expired keys produce **one** conditional `batchGet`, not two
@@ -1578,12 +2739,12 @@ only the projection / visibility / Context-Tenant key dimensions.
 ---
 
 ### Checkpoint 7 — ready for review
-- [ ] The cutover holds: the real inventory seeds through the new path, every existing consumer works unchanged, the platform boots and stays healthy
-- [ ] All 15 success criteria of SPEC §16 met
+- [ ] The cutover holds: all linked inventory + `cfg.entities` seed into the database within configured limits; existing explicit callers reconcile their documents; repeat startup is idempotent and the platform stays healthy. C3 remains documented until P1
+- [ ] All 16 success criteria of SPEC §16 met
 - [ ] `make ci`, gear tests on three backends, `make e2e-local`, `make e2e-docker`, `make dylint`, `make lychee` green
 - [ ] Every ceiling in SPEC §9 has a comment at the point it binds
 - [ ] `TypesRegistryClient` is deleted and no crate references it (D6, T26)
 - [ ] Conditional reads work end to end: an exact read carries a validator and honours `If-None-Match` with `304`, `batchGet` reports `unchanged` per key (T29)
-- [ ] Discovery is bounded: no response is unbounded in items or bytes, and a cursor traverses the whole set exactly once (T27, D12)
+- [ ] Discovery is bounded: no response is unbounded in items or bytes, and a cursor traverses the whole set exactly once (T22a, D12) — proved at Checkpoint 6, re-checked here on the promoted v1 paths
 - [ ] The client cache is in place on the new models with its window, byte bound, `fresh` bypass and batched conditional revalidation (T30) — P0 does not ship an uncached read path
 - [ ] Human review

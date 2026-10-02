@@ -62,10 +62,12 @@ impl Sequencer {
     }
 
     /// Process a single partition with a bounded inner drain loop.
-    /// Each iteration runs in its own transaction.
+    /// Each iteration runs in its own transaction, and shutdown is checked
+    /// before starting the next one.
     async fn process_partition(
         &self,
         partition_id: i64,
+        cancel: &CancellationToken,
     ) -> Result<PartitionProcessResult, PartitionError> {
         let conn = self.db.sea_internal();
         debug_assert_eq!(
@@ -78,6 +80,12 @@ impl Sequencer {
         let mut total_claimed: u32 = 0;
 
         for _iteration in 0..self.config.max_inner_iterations {
+            // Committed iterations stand; what is left stays in incoming.
+            if cancel.is_cancelled() {
+                drained = false;
+                break;
+            }
+
             let txn = conn.begin().await?;
 
             // Try to acquire row lock
@@ -104,8 +112,7 @@ impl Sequencer {
                 break;
             }
 
-            #[allow(clippy::cast_possible_wrap)]
-            let item_count = claimed.len() as i64;
+            let item_count = i64::try_from(claimed.len()).unwrap_or(i64::MAX);
 
             #[allow(clippy::cast_possible_truncation)]
             let drained_this_iteration = (claimed.len() as u32) < self.config.batch_size;
@@ -186,7 +193,7 @@ impl WorkerAction for Sequencer {
 
     async fn execute(
         &mut self,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<Directive<SequencerReport>, OutboxError> {
         let Some(guard) = self.shared_prioritizer.take() else {
             return Ok(Directive::Idle(SequencerReport {
@@ -196,7 +203,7 @@ impl WorkerAction for Sequencer {
         };
 
         let pid = guard.partition_id();
-        match self.process_partition(pid).await {
+        match self.process_partition(pid, cancel).await {
             Ok(result) => {
                 let report = SequencerReport {
                     partition_id: pid,
@@ -313,6 +320,7 @@ impl Sequencer {
     }
 
     /// Atomically allocate sequence numbers for a partition.
+    ///
     /// Returns the `start_seq` (items get `start_seq` + 1, `start_seq` + 2, etc.).
     async fn allocate_sequences(
         &self,
@@ -323,12 +331,13 @@ impl Sequencer {
     ) -> Result<i64, OutboxError> {
         match store.allocate_sequences() {
             AllocSql::UpdateReturning(sql) => {
-                // Pg/SQLite: UPDATE ... RETURNING — $1 = partition_id, $2 = count
+                // Pg/SQLite: one UPDATE ... RETURNING.
                 let row = txn
                     .query_one_raw(Statement::from_sql_and_values(
                         store.backend(),
                         sql,
-                        [partition_id.into(), count.into()],
+                        // Statement order: the delta, then the row.
+                        [count.into(), partition_id.into()],
                     ))
                     .await?
                     .ok_or_else(|| {
@@ -342,8 +351,7 @@ impl Sequencer {
                 Ok(start_seq)
             }
             AllocSql::UpdateThenSelect { update, select } => {
-                // MySQL: UPDATE then SELECT
-                // ? order: (count, partition_id) matching SQL occurrence
+                // MySQL: UPDATE, then SELECT the start of the range.
                 txn.execute_raw(Statement::from_sql_and_values(
                     store.backend(),
                     update,

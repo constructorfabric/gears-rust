@@ -54,7 +54,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
 use serde::Deserialize;
 use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit::api::operation_builder::{ParamLocation, ParamSpec};
+use toolkit::api::operation_builder::ParamSpec;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::AccessScope;
 use toolkit_security::SecurityContext;
@@ -152,41 +152,19 @@ pub struct PreviewView {
 }
 
 fn currency_param() -> ParamSpec {
-    ParamSpec {
-        name: "currency".to_owned(),
-        location: ParamLocation::Query,
-        required: true,
-        description: Some(
-            "The ISO 4217 code of the market to preview. Required: the catalog performs no FX \
-             and has no base currency, so there is no answer to `what does this plan cost` \
-             without one."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
+    ParamSpec::query("currency").required(true).description(
+        "The ISO 4217 code of the market to preview. Required: the catalog performs no FX \
+         and has no base currency, so there is no answer to `what does this plan cost` \
+         without one.",
+    )
 }
 
 fn region_param() -> ParamSpec {
-    ParamSpec {
-        name: "region".to_owned(),
-        location: ParamLocation::Query,
-        required: true,
-        description: Some(
-            "The commercial region of the market to preview. Required for `currency`'s reason: a \
-             price row is keyed on the pair, and a region-less query names no row. This is the \
-             pricing region, not the IdP authorization-region claim."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
+    ParamSpec::query("region").required(true).description(
+        "The commercial region of the market to preview. Required for `currency`'s reason: a \
+         price row is keyed on the pair, and a region-less query names no row. This is the \
+         pricing region, not the IdP authorization-region claim.",
+    )
 }
 
 /// Build the Axum router for the preview and register it.
