@@ -1,12 +1,12 @@
 Created:  2026-08-24 by Virtuozzo International GmbH
-Updated:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-10-02 by Virtuozzo International GmbH
 
-<!-- CONFLUENCE_TITLE: [BSS]: Rating — Windowed Q Store & Attribution (Design) -->
-<!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: 12-usage-ingestion-normalization | Downstream: 14-unit-synthesis-period-tick, rating-core | Owners: BSS Rating team -->
+<!-- CONFLUENCE_TITLE: [BSS]: Rating — Windowed Counters, Attribution Projection & Scope Evidence (Design) -->
+<!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: 12-usage-ingestion-normalization, subscriptions, IRM | Downstream: 14-unit-synthesis-period-tick | Owners: BSS Rating team -->
 
-# DESIGN — Windowed Q Store & Attribution (Slice 13, pipeline)
+# DESIGN — Windowed Counters, Attribution Projection & Scope Evidence (Slice 13, pipeline)
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-design-q-store`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-design-q-store`
 
 <!-- toc -->
 
@@ -27,11 +27,13 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
   - [3.7 Database Schemas and Tables](#37-database-schemas-and-tables)
   - [3.8 Deployment Topology](#38-deployment-topology)
 - [4. Additional Context](#4-additional-context)
-  - [4.1 The Windowed Counter and Its Key (normative)](#41-the-windowed-counter-and-its-key-normative)
-  - [4.2 Single-Writer Serialization and Q Versioning (normative)](#42-single-writer-serialization-and-q-versioning-normative)
-  - [4.3 Per-Slice Attribution and bandOffsetQ (normative)](#43-per-slice-attribution-and-bandoffsetq-normative)
-  - [4.4 Re-Materialization and Reversal Decrement (normative)](#44-re-materialization-and-reversal-decrement-normative)
-  - [4.5 Composite Input-Q Assembly (normative)](#45-composite-input-q-assembly-normative)
+  - [4.1 Counter Key and Window Resolution (normative)](#41-counter-key-and-window-resolution-normative)
+  - [4.2 Row Serialization and q_version (normative)](#42-row-serialization-and-q_version-normative)
+  - [4.3 Slice Layout (normative)](#43-slice-layout-normative)
+  - [4.4 Re-Materialization (normative)](#44-re-materialization-normative)
+  - [4.5 Composite Inputs (normative)](#45-composite-inputs-normative)
+  - [4.6 Attribution Projection (normative)](#46-attribution-projection-normative)
+  - [4.7 Scope and Coverage Evidence (normative)](#47-scope-and-coverage-evidence-normative)
 - [5. Traceability](#5-traceability)
 
 <!-- /toc -->
@@ -40,115 +42,75 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 
 ### 1.1 Architectural Vision
 
-The **single writer** of the windowed tier counter `Q` per
-`(subscription, meter, dimensionKey, window)` (SEAMS **M7** — the counter key doubles as the
-partition key). It materializes `Q` from the normalized `UsageRecord`s of slice
-[`12`](./12-usage-ingestion-normalization.md); maintains the **per-slice attribution and
-`bandOffsetQ`** when a period split partitions an aggregation window (T-D-12); re-materializes `Q`
-on late/corrected usage before core replay; realizes the **reversal counter decrement** (the core
-never writes a counter); and assembles mutually consistent input-`Q` tuples for composite meters.
+This slice owns the state that sits between stored usage and evaluation:
 
-The store is the load-bearing reason the core can be a pure function: it converts an unbounded
-stream of raw usage into a small set of **frozen, versioned** aggregate values the core prices
-deterministically. Two invariants make that safe — **exactly one writer per counter key** (so no
-interleaving corrupts an aggregate) and **an explicit `qVersion`** on every counter (so the frozen
-determinism tuple binds a *specific* `Q`, and a re-materialization is a new version that triggers
-re-resolution rather than a silent mutation). The core aggregates nothing and mutates no counter
-([`../PRD.md`](../PRD.md) §9.2, §6.5; core slice [`01`](./01-foundation.md) §4.2).
+1. **Window counters** — versioned per-slice quantities `Q` of one child window and one aggregation
+   key. Every change increments `q_version`, so a result records exactly which quantity it priced.
+   Counters are derived: each can be rebuilt from `rating_usage_record`.
+2. **The attribution projection** — Rating's local copy of Subscriptions attribution segments,
+   which maps `(resource, interval)` to `(subscription, sub_line_key, payer, seller)` without a call
+   per record (Atlas C04, P3; T-D-52).
+3. **Scope and coverage evidence** — the sealed `UsageScope` proofs and emitter coverage
+   declarations the finalization gate needs (Atlas C05; T-D-47).
+
+Ingestion places a record into a window without reading pricing through the **meter spec** — a
+Rating-owned row per `(subscription, meter)` derived from the pinned plan document (the usage row's
+`tierAggregationWindow` and billing anchor).
+
+**CURRENT**: neither segments, nor scopes, nor coverage have a producer (SEAMS S-3, U-10, U-11);
+the projection and evidence tables stay empty and usage stays `awaiting_attribution`
+(`[DEPENDENCY GAP R-25, R-21]`).
 
 ### 1.2 Architecture Drivers
 
 #### Functional Drivers
 
-| Requirement | Design Response |
-|-------------|-----------------|
-| Windowed `Q` per `(subscription, meter, dimensionKey, window)` (SEAMS M7, T-D-04) | `QMaterializer` is the **single writer** per key; `Q` is the window-aggregated measure the core's windowed models price; the key **is** the partition key — window math stays partition-local (§4.1). |
-| Per-slice attribution + `bandOffsetQ` (T-D-12) | When a slice-[`09`](./09-period-plan-change.md) split partitions an open window, `SliceAttributor` attributes each sub-window's `Q_slice` by event time and derives the frozen `bandOffsetQ` (accumulated prior-slice `Q`) the core consumes (§4.3). |
-| Late/corrected usage re-materialization (PRD §6.10) | `QMaterializer` recomputes the affected window `Q` (and the per-slice attribution) from the current `UsageRecord` set, bumps `qVersion`, and signals slice [`14`](./14-unit-synthesis-period-tick.md) to route re-resolution; the decrement of a reversal is realized here, not by the core (§4.4). |
-| Composite input-`Q` assembly (core slice [`03`](./03-metering-models.md) §3.6) | `CompositeAssembler` reads the ≥ 2 input-meter `Q`s as a **version-consistent frozen tuple** across partitions (§4.5); the input-join rule for dimension-carrying inputs stays a tracked open. |
+| Requirement | Design response |
+|---|---|
+| `cpt-cf-bss-rating-fr-tier-aggregation-window` | Window boundaries from the spec; tiers reset per window (§4.1, T-D-48). |
+| `cpt-cf-bss-rating-fr-single-outcome-determinism` | `q_version` + `layout_version` recorded on every result (§4.2). |
+| `cpt-cf-bss-rating-fr-late-arriving-usage-reresolve` | A late record increments its slice counter and re-enqueues the child (§4.2). |
+| `cpt-cf-bss-rating-fr-composite-meter-eval` | Composite children read several counters at their current versions (§4.5). |
+| `cpt-cf-bss-rating-fr-level-aggregation` | Suspended (R-06); only `sum` counters are maintained. |
 
 #### NFR Allocation
 
-| NFR theme | Allocated To | Design Response | Verification / Status |
-|-----------|--------------|-----------------|-----------------------|
-| `cpt-cf-bss-rating-nfr-horizontal-scale` | Single-writer partition contract | One writer per `(subscription, meter, dimensionKey, window)`; **zero cross-partition locks**; unrelated counters materialize in parallel; a large tenant sub-shards by hash of `subscriptionId` (§3.8) | Design + load test (slice [`16`](./16-billing-handoff-operations.md)) |
-| `cpt-cf-bss-rating-nfr-throughput-latency` | Incremental materialization | The common path is an incremental counter increment keyed by the partition; full re-materialization is the off-hot-path correction case only | Load test |
-| `cpt-cf-bss-rating-nfr-resilience` | `qVersion` + idempotent increment | A re-delivered `UsageRecord` (already deduped in slice 12) never double-increments; a crashed materializer resumes deterministically from the `UsageRecord` set; the frozen `qVersion` makes replay detectable | Chaos/retry test |
-
-#### Key Decisions
-
-| Decision | Summary |
-|----------|---------|
-| `qVersion` per counter | Every counter carries a monotonic `qVersion`; slice [`14`](./14-unit-synthesis-period-tick.md) freezes a specific `qVersion` into the determinism tuple, so a re-materialization is a new version + a re-resolution trigger, never an in-place change to an already-rated aggregate (T-D-04 replay discipline). |
-| Window identity is derived, not authored | The `window` coordinate is computed from event time under the subscription's **frozen** `tierAggregationWindow` + `billingAnchorPolicy` (D-20 clamp) using the same `AnchorCalendar` math as core slice [`09`](./09-period-plan-change.md); the store applies the calendar, never invents boundaries. |
+| NFR | Design response |
+|---|---|
+| `cpt-cf-bss-rating-nfr-horizontal-scale` | Each counter row is its own lock; the projection is keyed per `resource_tenant_id`. |
+| `cpt-cf-bss-rating-nfr-throughput-latency` | Attribution is a local indexed lookup (10M records/day forbid a remote call per record). |
+| `cpt-cf-bss-rating-nfr-resilience` | Counters and projection are rebuildable; reconciliation recomputes samples daily. |
 
 ### 1.3 Architecture Layers
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-rating-tech-stack-qst`
 
-```text
-Normalized usage (slice 12)     UsageRecords (new + correcting), deduped, canonical
-        ▼
-Q store (this slice)            QMaterializer · WindowResolver · SliceAttributor ·
-        │  (single writer / key)  CompositeAssembler · ReversalDecrementer
-        ▼
-Frozen inputs to the core       versioned Q + bandOffsetQ (per unit), via slice 14 context assembly
-```
-
-| Layer | Responsibility | Technology |
-|-------|----------------|------------|
-| Application | Counter materialization, window resolution, per-slice attribution, composite assembly, reversal decrement | Rust modules in the `rating` gear (pipeline crate; **not** `rating-core`) |
-| Domain | Counter, per-slice attribution, `bandOffsetQ`, `qVersion`, composite input-tuple shapes | Rust; GTS + Rust domain structs |
-| Infrastructure | The **`Q` store** (windowed counters + per-slice attribution rows + `qVersion`) | PostgreSQL, SecureORM (`toolkit-db`) |
+`rating` crate: `domain/window.rs` (pure window arithmetic shared with `rating-core`),
+`infra/storage/counter_repo.rs`, `app/attribution_projector.rs`, `infra/storage/evidence_repo.rs`.
 
 ## 2. Principles and Constraints
 
 ### 2.1 Design Principles
 
-#### One writer per counter key
-
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-single-writer-qst`
-
-Exactly one writer materializes `Q` for a given `(subscription, meter, dimensionKey, window)` — the
-load-bearing invariant already normative in the core (slice [`01`](./01-foundation.md) §4.2; PRD
-§7.1). No interleaving of increments across writers is possible, so no lock and no cross-partition
-coordination is needed on the counter path.
-
-#### Frozen and versioned, never silently mutated
-
+  Counter updates are atomic row upserts; concurrent writers serialize on the row lock. No lease is
+  required for correctness.
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-versioned-q-qst`
-
-A counter the core rated was rated at a specific `qVersion`; a later change re-materializes to a
-**new** version and triggers re-resolution (slice [`08`](./08-retroactivity-corrections.md)) — the
-already-rated `Q` value is never edited under the core's feet. Determinism depends on the frozen
-tuple binding one `qVersion` (§4.2).
-
-#### Attribute by event time, price by slice
-
+  Every change to a counter increments `q_version`; a result binds one `q_version` per slice.
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-attribute-by-time-qst`
-
-When a window is split, `Q` is attributed to sub-window slices by **event time**, and each slice's
-`bandOffsetQ` is the accumulated prior-slice `Q`; the core prices each slice as its own unit over
-its own pin (T-D-12). Attribution is the store's; band math is the core's (§4.3).
+  A record belongs to the window and slice containing its whole interval; processing time never
+  decides; a record that crosses a boundary is not counted (T-D-48).
 
 ### 2.2 Constraints
 
-#### The core never writes Q
-
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-core-never-writes-qst`
-
-The evaluation core aggregates nothing and mutates no counter; the reversal decrement, the
-re-materialization, and the per-slice attribution are all this slice's (PRD §9.2; core slice
-[`03`](./03-metering-models.md) §4.3). The core reads `Q` frozen.
-
-#### Window identity from the frozen calendar
-
+  `rating-core` receives quantities in `EvaluationInput`; it never reads or writes counters.
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-window-from-calendar-qst`
-
-The `window` coordinate derives from event time under the subscription's frozen
-`tierAggregationWindow` + `billingAnchorPolicy` (D-20 clamp) via the core slice
-[`09`](./09-period-plan-change.md) `AnchorCalendar` math; the store never authors a boundary and
-never uses a live/mutable anchor.
+  Window and slice boundaries come from the spec and `rating_core::split_points` — never from
+  processing time.
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-no-fabricated-proof-qst`
+  A scope proof is stored only as received from Subscriptions; Rating never builds one from
+  current resources or from the usage it happened to see (Atlas C04).
 
 ## 3. Technical Architecture
 
@@ -156,139 +118,229 @@ never uses a live/mutable anchor.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-domain-model-qst`
 
-- **`WindowedCounter`** — `(subscription, meter, dimensionKey, window)` → aggregated `Q` + `qVersion` (monotonic) + the contributing `usageKey` set (for deterministic re-materialization).
-- **`WindowCoordinate`** — the resolved window identity: `tierAggregationWindow` kind + concrete half-open UTC `[from, to)` boundaries from the frozen anchor (D-20).
-- **`SliceAttribution`** — for a split window: per sub-window `[from, to)` → `Q_slice` + the frozen `bandOffsetQ` (accumulated prior-slice `Q`); the ordered slice list of the window.
-- **`CompositeInputTuple`** — for a composite meter: the ≥ 2 input-meter `Q`s read at a mutually consistent `qVersion` set, plus the assembly watermark (§4.5).
-- **`ReMaterializationSignal`** — emitted to slice [`14`](./14-unit-synthesis-period-tick.md) when a counter or attribution changes: the affected units + the new `qVersion` + the correction lineage.
+- **`MeterSpec`** — `(tenant, subscription_id, meter, valid_from) → { valid_to,
+  tier_aggregation_window, billing_anchor { policy, anchor_day, anchor_instant },
+  aggregation_function, defined_by_catalog_version }`.
+- **`AggregationKey`** — DESIGN §3.1; `agg_key_digest = SHA-256(canonical JSON)`.
+- **`WindowLayout`** — ordered split points of one window + `layout_version`.
+- **`SliceCounter`** — `(agg_key_digest, window_start, layout_version, slice_start) → { slice_end, q,
+  record_count, q_version }`.
+- **`AttributionSegment`** (Atlas C04) — `{segment_id, segment_version, resource_tenant_id,
+  resource_id, usage_type, subscription_id, sub_line_key, item?, seller_tenant_id, payer_tenant_id,
+  interval [from, to?), lifecycle_seq}`.
+- **`UsageScope`** (Atlas C04) — `{scope_id, scope_version, billing_group_id, rating_window,
+  irm_inventory_snapshot_id, irm_lifecycle_through_seq, segments_through_seq, reconciled_at, sealed,
+  expected: [{resource_id, usage_type, intervals}], digest}`.
+- **`CoverageDeclaration`** (Atlas C05) — `{coverage_id, version, resource_id, usage_type, period,
+  intervals, final, record_count, quantity_sum, active_record_set_digest, source_checkpoint,
+  supersedes_version?}`.
 
 ### 3.2 Component Model
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-component-q-store`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-component-q-store`
 
-- **`QMaterializer`** — the single-writer counter path: increments (new usage) or recomputes (correction) `Q` for a key from the `UsageRecord` set; bumps `qVersion` on any change.
-- **`WindowResolver`** — computes the `WindowCoordinate` for a `UsageRecord` from event time under the frozen anchor (`AnchorCalendar` math reused from core slice [`09`](./09-period-plan-change.md)).
-- **`SliceAttributor`** — maintains `SliceAttribution` + `bandOffsetQ` when a period split partitions the window (T-D-12); recomputes offsets when an earlier slice's `Q` changes (§4.3).
-- **`CompositeAssembler`** — reads the version-consistent input-`Q` tuple for a composite meter across partitions (§4.5).
-- **`ReversalDecrementer`** — realizes the counter decrement for a correcting/negative `UsageRecord` by recomputing the window `Q` (§4.4).
+| Component | Responsibility |
+|---|---|
+| `CounterMaterializer::apply(tx, record, delta)` | Called by ingestion: spec → window → layout → slice; upsert counter; bump the child's `input_generation`; enqueue the child. |
+| `SpecWriter` | Called by the rater after pinning: derive `MeterSpec` rows; apply records waiting for a spec. |
+| `LayoutWriter` | Called by the rater: if `split_points` differ from the stored layout, re-materialize (§4.4). |
+| `AttributionProjector` | Applies segment versions in `lifecycle_seq` order per `resource_tenant_id`; detects gaps; re-attributes waiting records. |
+| `EvidenceStore` | Stores scopes and coverage declarations; wakes the children they concern. |
 
 ### 3.3 API Contracts
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-interface-q-store-qst`
-
-**Inbound (from slice [`12`](./12-usage-ingestion-normalization.md))**: normalized `UsageRecord`s
-(new + correcting) to count. **Outbound (to slice [`14`](./14-unit-synthesis-period-tick.md))**: the
-frozen `(Q, qVersion)` and, for split windows, the per-slice `(Q_slice, bandOffsetQ)`; plus
-`ReMaterializationSignal`s that drive cascade routing. The core reads these only through the frozen
-`EvaluationContext` slice 14 assembles — never a direct counter read on the hot path.
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-interface-q-store-qst`
+  Internal: `apply`, `ensure_spec`, `ensure_layout`, `read_child_quantities(child) ->
+  ChildQuantities { per_slice, q_versions, layout_version }`, `attribute(resource, interval) ->
+  AttributionLookup`, `evidence_for(child) -> Evidence`.
+  Consumed (**PROPOSED — NOT YET IMPLEMENTED**, Atlas C04/C05): `AttributionSegmentChanged`,
+  `UsageScopeSealed`, `MeterCoverageDeclared` events;
+  `SubscriptionBillingReadV1::segments_since(ctx, resource_tenant_id, after_seq, limit)`,
+  `SubscriptionBillingReadV1::scope_for_window(ctx, fact_id, fact_version, window,
+  inventory_snapshot_id) -> Pending{required_seq} | Sealed{UsageScope}`,
+  `MeterCoverageReadV1::get(ctx, resource_id, usage_type, period, version?)`.
 
 ### 3.4 Internal Dependencies
 
-Upstream: slice [`12`](./12-usage-ingestion-normalization.md) (the `UsageRecord`s counted).
-Downstream: slice [`14`](./14-unit-synthesis-period-tick.md) (freezes `Q`/`qVersion`/`bandOffsetQ`
-into the context and routes cascades), core slice [`03`](./03-metering-models.md) (prices the
-windowed aggregate + reads `bandOffsetQ`), core slice [`08`](./08-retroactivity-corrections.md)
-(re-resolves on re-materialization). Reuses core slice [`09`](./09-period-plan-change.md)
-`AnchorCalendar` as pure window math.
+Ingestion (slice 12) calls `apply` and `attribute`; the rater (slice 14) calls `ensure_spec`,
+`ensure_layout`, `read_child_quantities`, `evidence_for`.
 
 ### 3.5 External Dependencies
 
-| Dependency | What arrives frozen | Contract |
-|------------|--------------------|----------|
-| Subscriptions (via slice 11 context) | `tierAggregationWindow` + `billingAnchorPolicy` per subscription (for window resolution); split boundaries (`changeEffectiveAt`, phase conversions) | slice [`11`](./11-consumer-contracts.md) §4.3; SEAMS P2 |
-
-_No direct external transport — this slice consumes slice 12's output in-process and serves slice 14._
+subscriptions (segments, scopes — SEAMS S-3, §L C04), the usage emitter (coverage — U-10; owner unassigned, overlay T6), IRM inventory
+via Subscriptions' scope proof (U-11).
 
 ### 3.6 Interactions and Sequences
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-flow-materialize-qst`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-materialize-qst`
+  **Apply a record** (inside the ingestion page transaction):
 
-**Materialize on new usage**:
-
-1. A `UsageRecord` arrives from slice [`12`](./12-usage-ingestion-normalization.md).
-2. `WindowResolver` computes its `WindowCoordinate` from event time under the frozen anchor.
-3. `QMaterializer` (single writer for the key) folds the record's measure into `Q`, appends the `usageKey` to the contributing set, and bumps `qVersion`.
-4. If the window is split, `SliceAttributor` attributes the measure to the owning sub-window slice and updates that slice's `Q_slice` (and, if it shifts a later slice's start offset, its `bandOffsetQ`).
-5. The updated `(Q, qVersion)` (and per-slice values) become available to slice [`14`](./14-unit-synthesis-period-tick.md) for context assembly.
+  ```text
+  spec = rating_meter_spec covering (subscription, meter, interval_start)
+    none → attribution_state = awaiting_spec; enqueue spec work; done
+  w = window_of(spec, interval)                 interval not inside one window → boundary_split_required
+  layout = SELECT … FROM rating_window_layout … FOR SHARE   (insert single-slice layout if absent)
+  slice  = the slice containing the interval    crosses a slice → boundary_split_required
+  INSERT INTO rating_window_counter … VALUES (…, q = delta, record_count = ±1, q_version = 1)
+    ON CONFLICT DO UPDATE SET q = q + excluded.q, record_count = record_count + excluded.record_count,
+                              q_version = q_version + 1
+  UPDATE rating_usage_record SET window_start = w.start, counted = true
+  fact = usage fact of (subscription, sub_line_key, period containing w)
+    known   → INSERT rating_child_window wk1|fact|w.start|agg_key (provisional) ON CONFLICT DO NOTHING
+              bump input_generation of the child and of its window group; enqueue
+    unknown → counters only (no child until the fact arrives, slice 14 §4.2)
+  ```
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-rating-flow-rematerialize-qst`
+  **Re-materialize a window** (layout change or repair), one transaction: `SELECT … FOR UPDATE` the
+  layout row; increment `layout_version`; insert the counters of the new layout version by summing
+  `rating_usage_record` (counted measurements minus invalidated targets) per slice, each with
+  `q_version = 1`; older layout rows stay as history; bump the child's `input_generation`; enqueue.
 
-**Re-materialize on correction**:
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-segment-apply-qst`
+  **Apply a segment version** (one transaction per inbox batch, per `resource_tenant_id`):
 
-1. A correcting/negative `UsageRecord` (slice [`12`](./12-usage-ingestion-normalization.md) §4.4) references the affected window.
-2. `ReversalDecrementer` / `QMaterializer` recompute `Q` (and per-slice `Q_slice`/`bandOffsetQ`) from the **current** `UsageRecord` set — the decrement is realized here — and bump `qVersion` **in the same transaction that enqueues the `ReMaterializationSignal` via the outbox** (§4.4).
-3. The `ReMaterializationSignal` (affected units + new `qVersion` + correction lineage) goes to slice [`14`](./14-unit-synthesis-period-tick.md), which routes `reresolve` through the core (slice [`08`](./08-retroactivity-corrections.md)); a `bandOffsetQ` shift cascades to later slices of the same window (§4.3).
+  ```text
+  cp = rating_source_checkpoint['segments:{resource_tenant}'] FOR UPDATE
+  for s in batch ordered by lifecycle_seq:
+    s.lifecycle_seq ≤ cp.applied_seq                      → duplicate, skip
+    s.lifecycle_seq > cp.applied_seq + 1                  → gap: buffer in inbox, stop; schedule
+                                                            segments_since(resource_tenant, applied_seq)
+    INSERT rating_attribution_segment (segment_id, segment_version, …) ON CONFLICT DO NOTHING
+    re-attribute: records of resource_id with attribution_state = awaiting_attribution in s.interval
+                  (and, for a changed owner, counted records under the old version — slice 08)
+    cp.applied_seq = s.lifecycle_seq
+  wake children whose scope requires segments_through_seq ≤ cp.applied_seq
+  COMMIT
+  ```
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-storage-q-qst`
-
-**Owned (partitioned by the pinned `orderingTenantId`, UTC):**
-
-- `windowed_counter` — PK `(subscription, meter, dimensionKey, window)`; columns: aggregated `Q`, `qVersion` (monotonic), contributing-`usageKey` set (or a digest + a link to slice 12's `usage_record`), last-materialized watermark. **Single-writer** per PK.
-- `slice_attribution` — for split windows: `(subscription, meter, dimensionKey, window, slice)` → `Q_slice`, `bandOffsetQ`, slice `[from, to)`; ordered per window.
-
-Concrete DDL is Design. The store is authoritative aggregate state (it survives supersession per M7);
-no monetary column (the gear computes no money — core slice [`01`](./01-foundation.md) §3.7).
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-storage-q-qst`
+  `rating_window_counter`, `rating_window_layout`, `rating_meter_spec`,
+  `rating_attribution_segment`, `rating_usage_scope`, `rating_coverage_declaration` — DESIGN §3.7.
 
 ### 3.8 Deployment Topology
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-rating-deployment-qst`
-
-Pipeline crate inside the one `rating` gear deployable. Single-writer ownership is realized by
-**partition ownership**: the counter key hashes to a shard, one materializer instance owns a shard
-at a time (coordination lease library), so "single writer per key" holds without a per-row lock;
-shards are `orderingTenantId`-scoped and sub-sharded by hash of `subscriptionId` for a large tenant.
-Unrelated shards materialize fully in parallel — zero cross-partition locks (PRD §7.1).
+  No dedicated process; counters run inside ingestion and rater transactions; segment application
+  runs in the inbox consumer / recovery sweep for its `resource_tenant_id`.
 
 ## 4. Additional Context
 
-### 4.1 The Windowed Counter and Its Key (normative)
+### 4.1 Counter Key and Window Resolution (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-counter-key-qst`
 
-- The counter key is **`(subscription, meter, dimensionKey, window)`** (SEAMS M7, the superset key — per-subscription reset scope + per-dimension counters; T-D-04); it doubles as the **partition key**, so single-meter window math is partition-local by construction.
-- The `window` coordinate is derived from event time under the subscription's frozen `tierAggregationWindow ∈ {calendar_month, invoice_period, subscription_lifetime, per_event}` and, for `invoice_period`, the frozen `billingAnchorPolicy` (D-20 no-drift clamp) — the same `AnchorCalendar` math as core slice [`09`](./09-period-plan-change.md); the store never authors a boundary.
-- For `per_event` there is no accumulation — the "counter" is the single event's measure; windowed models (`graduated`/`volume`/`package`) require a non-`per_event` window (core slice [`03`](./03-metering-models.md) §4.3).
-- **Non-`sum` folds (D-44 / T-D-17)**: for a meter with frozen `aggregationFunction ∈ {peak, time_weighted}`, `QMaterializer` maintains **per-granule partials** under the counter key (granule = the frozen `aggregationGranularity` cut of the window): `peak` keeps the granule max, `time_weighted` the granule step-integral (`hold_last` bounded by `maxHold`, beyond → 0 + operator signal). The window `Q` is the **sum of granule folds** — additive, so the single-writer key, `qVersion` discipline, and slice attribution apply unchanged. A late/corrected sample **re-folds its granule and, for `time_weighted`, the up-to-`maxHold` following granules whose `hold_last` carried its level** (`maxHold` is an integer count of **granules** — pricing design/03 §6; a step-function level legitimately crosses granule boundaries, so granule N+1's integral can depend on N's last sample — slice [`03`](./03-metering-models.md) §4.3, 2026-07-31 review #16) and bumps `qVersion` — the standard §4.4 re-materialization, scoped to the affected granules' contributions. A granule straddling a sub-window slice cut **belongs to the slice that opened it** (T-D-26 — slice [`03`](./03-metering-models.md) §4.3), so folds stay whole-granule and per-slice attribution never splits a fold.
-- Supersession does **not** reset an in-window counter (the new catalog row's bands apply to the continued `Q`, pricing `inst-tb-window-continuity`); the counter's scope is the window, not the catalog revision (§4.3).
+- Counter key `(tenant_id, agg_key_digest, window_start, layout_version, slice_start)`; the child key
+  is the same plus `fact_id`, without layout and slice (T-D-04, T-D-38, T-D-48). Counters do not
+  contain `fact_id`, so usage that arrives before its fact is retained and counted (F35).
+- Window by `tier_aggregation_window` (UTC, half-open):
 
-### 4.2 Single-Writer Serialization and Q Versioning (normative)
+| Value | Window containing instant `t` |
+|---|---|
+| `per_hour` | `[t truncated to UTC hour, +1 h)` (Atlas `CalendarHour{UTC}`) |
+| `calendar_month` | `[first day of t's UTC month 00:00, first day of next month)` |
+| `invoice_period` | the billing period containing `t` under the spec's anchor (D-20 clamp) |
+| `subscription_lifetime` | `[subscription activated_at, +∞)` — one window |
+| `per_event` | no counter — the record is its own `usage_event` child |
+
+- A `flat` usage row without `tierAggregationWindow` aggregates per `invoice_period`; for banded
+  models an absent window is `missing_model_param`.
+- Aggregation scope: `subscription_line` only (R-23); `resource` scope would add `resource_id` to the
+  key and is not expressible in the pricing catalog today.
+- `aggregation_function ≠ sum` ⇒ no counter; the child fails `unsupported_aggregation` (R-06).
+
+### 4.2 Row Serialization and q_version (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-single-writer-qst`
 
-- Exactly **one writer per counter key** (PRD §7.1; core slice [`01`](./01-foundation.md) §4.2): realized by partition ownership (§3.8), so concurrent increments for one key are serialized without a lock and unrelated keys never contend.
-- Every counter carries a monotonic **`qVersion`**, bumped on any materialization (increment or recompute). Slice [`14`](./14-unit-synthesis-period-tick.md) freezes a specific `(Q, qVersion)` into the determinism tuple; the core rates that version. A later change produces a **new** `qVersion` and a `ReMaterializationSignal` — never an in-place edit of the value a prior rating observed (the T-D-04 replay discipline realized on the write side).
-- Ingestion has already deduped the source events (slice [`12`](./12-usage-ingestion-normalization.md) §4.3), so a re-delivered `UsageRecord` never double-increments; a crashed materializer resumes by recomputing from the contributing `usageKey` set — deterministic, not offset-fragile.
+- `q_version` increases by exactly 1 per committed change to a counter row; it never decreases
+  within a `layout_version`.
+- A result stores, per slice, the `q_version` it read; the rater skips a child when its input digest
+  (which includes every slice `q_version`, the `layout_version`, the pin, the fact and subscription
+  versions, the evidence refs and the engine) is unchanged.
+- Records waiting for a spec are applied by `SpecWriter` in their own transaction once the spec
+  exists.
 
-### 4.3 Per-Slice Attribution and bandOffsetQ (normative)
+### 4.3 Slice Layout (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-slice-attribution-qst`
 
-- When a slice-[`09`](./09-period-plan-change.md) split point (window activation/supersession, phase conversion, plan change) falls **inside** an open aggregation window, the window stays the counter scope but each sub-window slice becomes its own evaluation unit (T-D-12; core slice [`01`](./01-foundation.md) §4.2). The store attributes each `UsageRecord`'s measure to the sub-window that contains its **event time** and maintains, per slice, `Q_slice` and the frozen **`bandOffsetQ`** = the accumulated `Q` of all prior slices of the same window — and, **for a reservation-carrying line, additionally `remainderOffsetQ`** = the accumulated prior-slice **post-reservation remainder**, the band axis of such lines (T-D-23; the raw `bandOffsetQ` includes reservation-matched quantity and stays the attribution/lineage figure, but band placement of the on-demand remainder uses the remainder axis — slice [`03`](./03-metering-models.md) §4.3).
-- Continuity is not configurable at window-activation/supersession and phase-conversion boundaries (they always carry — `bandOffsetQ` = accumulated prior-slice `Q`); only a **plan-change** boundary consults the snapshot-frozen carry-vs-reset flag (`reset` ⇒ `bandOffsetQ = 0`) routed by slice [`09`](./09-period-plan-change.md) (core slice [`03`](./03-metering-models.md) §4.3).
-- A change to an earlier slice's `Q` **shifts** every later slice's `bandOffsetQ`; the store recomputes the offsets in slice order and emits `ReMaterializationSignal`s for the affected later slices, which slice [`14`](./14-unit-synthesis-period-tick.md) routes as the T-D-12 cascade (each later slice re-resolves under its **own** pin — core slice [`08`](./08-retroactivity-corrections.md) §4.4). The cascade is finite and strictly ordered by slice index.
+- Split points of a child = `rating_core::split_points(window, pinned plan documents, fact version,
+  subscription version)`: price-window starts/ends of the rows that price the meter, phase
+  conversions and money-only term-slice boundaries inside the child's served range.
+- A slice is `[split_i, split_{i+1})`; a record goes to the slice containing its whole interval.
+- Band continuity across slices is computed inside `rating-core` from ordered slice quantities.
+- Example: `calendar_month` window `[2026-09-01, 2026-10-01)`, billing anchor day 15, price window
+  change at 2026-09-20 ⇒ two facts share the window: child A (fact of the period starting 08-15,
+  served `[09-01, 09-15)`, one slice) and child B (fact of the period starting 09-15, served
+  `[09-15, 10-01)`, slices `[09-15, 09-20)`, `[09-20, 10-01)`). A and B form a window group (DESIGN
+  §4.3): B's graduated offset is A's billable Q; volume uses the group total for both; a counter
+  change in A re-evaluates B and vice versa. Both finalize after `10-01 + delay`.
+- For `per_hour` windows a price change must be on an hour boundary for tariff-shape changes (Atlas
+  C10); a money-only change inside the hour is a slice with band continuity (graduated uses the
+  cumulative offset, volume the final window `Q`).
 
-### 4.4 Re-Materialization and Reversal Decrement (normative)
+### 4.4 Re-Materialization (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-rematerialize-qst`
 
-- Late or corrected usage recomputes the affected window `Q` (and per-slice attribution) from the **current** `UsageRecord` set — the reversal counter **decrement is realized here**, by recomputation, not by a core write (core slice [`03`](./03-metering-models.md) §4.3, slice [`08`](./08-retroactivity-corrections.md) §4.4). For an archived window the set is served from the cold tier (slice [`12`](./12-usage-ingestion-normalization.md) §3.7 tiering note) — identical recompute, correction-lane latency only.
-- Re-materialization bumps `qVersion` and emits a `ReMaterializationSignal` — **the bump and the signal commit in the same transaction, the signal via a transactional outbox** (the sibling discipline stated at slice [`15`](./15-rated-output-balance-effects.md) "same commit as the store write" and slice [`16`](./16-billing-handoff-operations.md) "in the same commit"; 2026-07-31 review, #9: without the coupling a crash between them left a bumped counter with no delivered signal — no reresolve fired and the rated output stayed frozen at a superseded `Q` until an unrelated correction self-healed it). The core's `reresolve` then diffs the new rating against the prior rated version and emits delta-only adjustments (slice [`15`](./15-rated-output-balance-effects.md)). The counter recompute is deterministic — same `UsageRecord` set ⇒ same `Q`.
-- Re-materialization is **off the hot path** (correction lane); the normal path is an incremental increment. A window whose `periodState = closed_posted` still re-materializes its `Q`, but the core routes the diff through posted-period protection (delta-only) — the counter recompute is identical either way (slice [`08`](./08-retroactivity-corrections.md) §4.3).
+- Triggers: the rater's `split_points` differ from the stored layout; reconciliation finds
+  `q ≠ Σ records`; an operator repair; a segment re-attribution.
+- One transaction holding `FOR UPDATE` on the layout row (ingestion holds `FOR SHARE`), recomputing
+  every slice from `rating_usage_record` (hot or cold tier). Same record set + layout ⇒ same counters.
 
-### 4.5 Composite Input-Q Assembly (normative)
+### 4.5 Composite Inputs (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-composite-assembly-qst`
 
-- A composite (derived) meter reads its ≥ 2 input-meter `Q`s from **different** partitions; the store assembles them as a **version-consistent frozen tuple** — each input `Q` pinned at a specific `qVersion`, captured at one assembly watermark — so the core reads frozen values, never live counters, and no cross-partition lock is taken (core slice [`03`](./03-metering-models.md) §3.6).
-- A later change to **any** input `Q` (new `qVersion`) re-assembles the tuple and re-resolves the composite line under the slice-[`08`](./08-retroactivity-corrections.md) correction keys; the composite line partitions on `(subscription, outputUnit, dimensionKey, window)`.
-- **Open**: the input-join rule when composite inputs carry dimension values (join on the matching `dimensionKey` tuple vs a formula-declared join) MUST be pinned jointly with the pricing gear before composite and dimensional pricing co-occur — tracked in core slice [`03`](./03-metering-models.md) §3.6 / [`../SEAMS.md`](../SEAMS.md); at launch they do not co-occur (`dimensionKey` empty until OSS emission).
+- A composite child is keyed on its output meter; its inputs are the counters of the input meters for
+  the same aggregation key except `meter`, the same window and slices, read with their `q_version`s.
+  A change to any input counter enqueues the composite child (ingestion looks up composites
+  referencing the meter in the spec rows).
+- Composite and dimensional pricing do not co-occur at launch (R-16).
+
+### 4.6 Attribution Projection (normative)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-attribution-projection-qst`
+
+- Source: `AttributionSegmentChanged{segment, segments_stream_seq}` (full-state replacement, explicit
+  version) and `segments_since` for gaps and bootstrap (Atlas C04, P11). Both enter the inbox
+  (T-D-51).
+- Order: gap-free `lifecycle_seq` per `resource_tenant_id`; a gap pauses application for that
+  tenant (buffered in the inbox) and blocks finalization of windows whose scope requires a later
+  sequence; Rating fills it with `segments_since` (and, when a broker exists, by seeking the topic to
+  the last applied offset first).
+- Lookup: the segment version whose interval contains the record's whole interval; open segments
+  have `valid_to = NULL`.
+- Payer transfer: one segment closes and the next opens at the same instant (Atlas F17). A record
+  crossing that instant is `boundary_split_required`.
+- Late `ResourceReady` for a historically valid line (Atlas F18): the segment opens at `ready_at`;
+  usage held as `awaiting_attribution` is counted then.
+- Orphans (no valid line at `ready_at`) produce no segment; their usage stays unattributed and goes
+  to the operator queue; Subscriptions owns the orphan decision (Atlas P2).
+
+### 4.7 Scope and Coverage Evidence (normative)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-scope-coverage-qst`
+
+- When a usage child becomes due, Rating asks `scope_for_window(fact_id, fact_version, window,
+  inventory_snapshot_id)` (batched per fact; the inventory snapshot id comes from IRM
+  `ResourceHistoryV1::open_scope` — **UNKNOWN / EXTERNAL CONTRACT REQUIRED** whether Rating or
+  Subscriptions opens it; the Atlas has Rating obtain it). `Pending{required_seq}` ⇒ child
+  `pending(scope_not_sealed)`; `Sealed{UsageScope}` ⇒ stored immutably and referenced by the result.
+- The expected children of the window are `expected_children(fact)` (DESIGN §3.1): one per priced
+  meter of the line for `subscription_line` scope (sealed empty scope ⇒ zero children), times the
+  scope's resources for `resource` scope.
+- Coverage declarations are stored per `(coverage_id, version)`; a higher version supersedes and
+  wakes the affected children (a correction).
+- The record-set digest is computed by Rating over its stored, non-invalidated records with the
+  Atlas canonical tuple and compared with the declaration; count + sum alone are never sufficient.
+- A monthly coverage declaration without hourly partitions cannot finalize an hourly child (F30).
 
 ## 5. Traceability
 
-- **PRD**: §9.2 (windowed `Q` duties), §6.5 (`tierAggregationWindow`), §6.10 (re-materialization on correction), §17.1 "Determinism and Rating compatibility", §7.1 (single-writer / horizontal-scale NFR).
-- **Seams**: M7 (writer side — the counter/partition key) — [`../SEAMS.md`](../SEAMS.md).
-- **Decisions**: T-D-04 (counter key + snapshot-replay), T-D-12 (per-slice attribution + `bandOffsetQ`), T-D-16 (consolidation) — [`../DECISIONS.md`](../DECISIONS.md).
-- **ADR**: [`../ADR/0002-cpt-cf-bss-rating-adr-rating-gear-consolidation.md`](../ADR/0002-cpt-cf-bss-rating-adr-rating-gear-consolidation.md).
-- **Related slices**: [`12-usage-ingestion-normalization.md`](./12-usage-ingestion-normalization.md) (feeds records), [`14-unit-synthesis-period-tick.md`](./14-unit-synthesis-period-tick.md) (freezes `Q`/routes cascades), [`03-metering-models.md`](./03-metering-models.md) §4.3 (band-offset math), [`08-retroactivity-corrections.md`](./08-retroactivity-corrections.md) (re-materialization + cascades), [`09-period-plan-change.md`](./09-period-plan-change.md) (`AnchorCalendar`, split boundaries).
+- **DESIGN**: §3.1, §3.7, §4.3, §4.5.
+- **SEAMS**: S-3, U-10, U-11, §L C04/C05, §M-3, §M-6.
+- **Decisions**: T-D-04, T-D-12, T-D-38, T-D-47, T-D-48, T-D-50, T-D-52, R-06, R-16, R-21, R-23, R-25.

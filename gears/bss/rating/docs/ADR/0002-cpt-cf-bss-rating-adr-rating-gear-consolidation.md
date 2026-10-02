@@ -5,7 +5,7 @@ decision-makers: "BSS Rating/Tariffs owner (single owner for both parts)"
 ---
 
 Created:  2026-08-24 by Virtuozzo International GmbH
-Updated:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-10-01 by Virtuozzo International GmbH
 
 # ADR-0002: One `rating` Gear — Consolidate Tariffs (Evaluation Core) and the Rating Pipeline
 
@@ -102,17 +102,22 @@ gears/bss/rating/
 │       ├── 01–11 …             ← evaluation-core slices (this design set, ~as-is)
 │       └── 12–16 …             ← pipeline slices (new; content = the duties today assigned
 │                                  to the "Rating" actor + T-D-10/11/15)
-├── rating-core/                ← (when code starts) pure crate: evaluate()/reresolve(),
+├── rating-core/                ← (when code starts) pure crate: evaluate()/split_points(),
 │                                  steps 1–9, guards; zero I/O dependencies
-└── …                           ← pipeline crates per ToolKit gear layout
+├── rating-sdk/                 ← RatingRunReadV1 / RatingRunControlV1 / OrderEvaluationV1 + types (ToolKit SDK pattern)
+└── rating/                     ← pipeline gear crate per ToolKit gear layout
 ```
 
-Pipeline slice set (initial): **12** usage ingestion & normalization; **13** windowed `Q` store
-(single-writer, per-slice attribution + `bandOffsetQ`) & usage/delta dedup (T-D-11);
-**14** evaluation-unit synthesis & the period tick (T-D-15) & context assembly / read-model pin;
-**15** rated-output persistence & the RatedCharge/BillableItem mapping (slice 11 §4.1 table) &
-`CommitmentBalanceEffect` publication + cascade orchestration (T-D-10);
-**16** Billing handoff & operations/scale.
+Pipeline slice set (initial, as decided 2026-07-11): **12** usage ingestion & normalization; **13**
+windowed `Q` store & usage/delta dedup (T-D-11); **14** evaluation-unit synthesis & the period tick
+(T-D-15) & context assembly / read-model pin; **15** rated-output persistence &
+`CommitmentBalanceEffect` publication (T-D-10); **16** Billing handoff & operations/scale.
+
+*Current slice content (2026-10-01, informative — this ADR's decision is unchanged)*: the "period
+tick" became Rating's child-window scheduler beneath Subscriptions' commercial facts (T-D-44);
+per-slice `bandOffsetQ` became band continuity inside one child evaluation (T-D-38); rated output
+became exact window results and absolute parent revisions delivered to Billing (T-D-45, T-D-46);
+`CommitmentBalanceEffect` publication is dormant (R-11). See [`../design/README.md`](../design/README.md).
 
 ### What lands where (scope split)
 

@@ -1,12 +1,12 @@
 Created:  2026-08-24 by Virtuozzo International GmbH
-Updated:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-10-02 by Virtuozzo International GmbH
 
-<!-- CONFLUENCE_TITLE: [BSS]: Rating — Unit Synthesis & Period Tick (Design) -->
-<!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: 12/13 (pipeline), Pricing, Subscriptions, Finance, Promotions, Billing, Contracts | Downstream: rating-core, 15-rated-output-balance-effects | Owners: BSS Rating team -->
+<!-- CONFLUENCE_TITLE: [BSS]: Rating — Facts, Child Windows, Scheduler & the Rater (Design) -->
+<!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: 12, 13, subscriptions, pricing | Downstream: 15-rated-output-balance-effects | Owners: BSS Rating team -->
 
-# DESIGN — Unit Synthesis & Period Tick (Slice 14, pipeline)
+# DESIGN — Facts, Child Windows, Scheduler & the Rater (Slice 14, pipeline)
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-design-unit-synthesis`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-design-unit-synthesis`
 
 <!-- toc -->
 
@@ -27,11 +27,13 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
   - [3.7 Database Schemas and Tables](#37-database-schemas-and-tables)
   - [3.8 Deployment Topology](#38-deployment-topology)
 - [4. Additional Context](#4-additional-context)
-  - [4.1 The Three Evaluation-Unit Kinds (normative)](#41-the-three-evaluation-unit-kinds-normative)
-  - [4.2 The Period Tick (normative)](#42-the-period-tick-normative)
-  - [4.3 Frozen-Context Assembly and Pin Discipline (normative)](#43-frozen-context-assembly-and-pin-discipline-normative)
-  - [4.4 Cascade Routing, Coalescing, and Bounding (normative)](#44-cascade-routing-coalescing-and-bounding-normative)
-  - [4.5 Commitment-Balance Freezing and the Hot Path (normative)](#45-commitment-balance-freezing-and-the-hot-path-normative)
+  - [4.1 Child Kinds (normative)](#41-child-kinds-normative)
+  - [4.2 Commercial Facts (normative)](#42-commercial-facts-normative)
+  - [4.3 Input Assembly (normative)](#43-input-assembly-normative)
+  - [4.4 Work Queue, Scheduler and Coalescing (normative)](#44-work-queue-scheduler-and-coalescing-normative)
+  - [4.5 Finalization Gate (normative)](#45-finalization-gate-normative)
+  - [4.6 Commitment Balances (normative)](#46-commitment-balances-normative)
+  - [4.7 Acceptance Vectors](#47-acceptance-vectors)
 - [5. Traceability](#5-traceability)
 
 <!-- /toc -->
@@ -40,122 +42,69 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 
 ### 1.1 Architectural Vision
 
-The **conductor** between the operational stores and the pure core: it synthesizes the **three
-evaluation-unit kinds** (`per_event`; windowed `Q` per sub-window slice; **period-driven** units for
-recurring lines, capacity-flavor charges, and true-up surfacing), assembles a fully **frozen**
-`EvaluationContext` for each, and invokes the core's `evaluate()` / `reresolve()`. It owns the
-**period tick** (T-D-15): at every `AnchorPeriod` boundary it emits the period-driven units — a
-zero-usage period still bills its capacity and recurring lines. And it owns **cascade routing**: a
-balance-affecting correction (T-D-10) or a `bandOffsetQ` shift (T-D-12) re-enters the core as
-delta-only `reresolve`, coalesced and bounded on a correction lane.
+This slice decides **what is rated, when, and with which inputs**. A **commercial parent fact**
+(Subscriptions) authorizes rating; Rating derives the **child windows** beneath it, schedules them
+durably, evaluates each child provisionally while its window is open, and finalizes it when its
+`FinalizationPolicy` delay has elapsed and its evidence is complete (T-D-44, T-D-47). The `Rater`
+assembles an `EvaluationInput` from stored rows only, calls `rating-core`, and persists the result in
+one transaction (DESIGN §3.6 Flow A′).
 
-This slice is the one place the whole gear's frozen-input discipline is *enforced*: nothing reaches
-`rating-core` except through a context this slice sealed — read-model pinned to one committed
-`CatalogVersion`, `Q` pinned to a `qVersion`, commitment balances pinned to a `balanceVersion`, FX
-to an `fxTableVersion`, coupons to a snapshot, `periodState` from Billing. A missing input fails
-closed **at this boundary**, never inside the core (core slice [`01`](./01-foundation.md) §2.1, slice
-[`11`](./11-consumer-contracts.md) §2.1). Because balances are **frozen into the context**, the core
-hot path is partition-local and never waits on a live cross-unit balance — the cross-unit ordering
-lives on the asynchronous write-back (slice [`15`](./15-rated-output-balance-effects.md)), off the
-hot path (§4.5).
+Subscriptions sends commercial facts and their changes, never a per-window timer; Rating never
+invents a commercial period (T-D-33). The Atlas example is the norm: a monthly cloudlet usage fact
+opens 744 hourly children in October; Rating schedules and computes each hour itself (F28, F33).
 
 ### 1.2 Architecture Drivers
 
 #### Functional Drivers
 
-| Requirement | Design Response |
-|-------------|-----------------|
-| Three unit kinds (core slice [`01`](./01-foundation.md) §4.2) | `UnitSynthesizer` produces `per_event` units (one `UsageRecord`), windowed-`Q` units (per sub-window slice, carrying frozen `bandOffsetQ`), and period-driven units keyed `(subscription, priceId, chargeKind, lineKey, AnchorPeriod)` (§4.1). |
-| Period tick (T-D-15, **fact-driven since T-D-33**) | `PeriodTick` fires on **consumption of the subscriptions period-fact set** for `(subscription, billing period)` — never its own calendar — and synthesizes the period-driven units; **idempotent per `(subscription, AnchorPeriod)`** with `AnchorPeriod` ≡ the fact's period identity; a zero-usage period still emits its capacity/recurring units, now by construction (§4.2). |
-| Frozen-context assembly + pin discipline (core slice [`11`](./11-consumer-contracts.md) §4.2) | `ContextAssembler` pins one committed `CatalogVersion` (published + warm-completion marker; pin lag ≤ 5s; no draft read) and freezes `Q`/`qVersion`, balances/`balanceVersion`, `fxTableVersion`, coupon snapshot, `periodState`; a missing required input fails closed here (§4.3). |
-| Cascade routing (T-D-10, T-D-12) | `CascadeRouter` turns Contracts balance-effect triggers and `bandOffsetQ` shifts into delta-only `reresolve` calls, **coalesced per unit per generation** and drained on a bounded correction lane (§4.4). |
+| Requirement | Design response |
+|---|---|
+| `cpt-cf-bss-rating-fr-hybrid-pricing` | Recurring and usage lines are children of distinct facts (§4.1). |
+| `cpt-cf-bss-rating-fr-capacity-charge` | Capacity lines are `period_line` children (fail closed until a reservation match source exists, R-11). |
+| `cpt-cf-bss-rating-fr-per-unit-pricing` | Seat quantities from the fact or the subscription version's `QuantityInterval`s, sliced at seat changes (slice 09). |
+| `cpt-cf-bss-rating-fr-single-outcome-determinism` | Inputs assembled only from version-keyed stored rows; input-generation CAS (§4.3). |
+| `cpt-cf-bss-rating-fr-tier-aggregation-window` | Expected child geometry from the row's `tierAggregationWindow` (§4.4). |
 
 #### NFR Allocation
 
-| NFR theme | Allocated To | Design Response | Verification / Status |
-|-----------|--------------|-----------------|-----------------------|
-| `cpt-cf-bss-rating-nfr-throughput-latency` | Context assembly | Assembly is frozen-input gathering + a pin; no evaluation cost lives here; the hot path is the core call over the sealed tuple | Load test (slice [`16`](./16-billing-handoff-operations.md)) |
-| `cpt-cf-bss-rating-nfr-horizontal-scale` | Frozen balances (§4.5) | Because balances are frozen into the context, the core stays partition-local with **zero cross-partition locks even for pooled/committed usage**; cross-unit `balanceVersion` ordering is asynchronous on the write-back (slice 15), not a hot-path lock | Design + load test |
-| `cpt-cf-bss-rating-nfr-resilience` | Period-tick idempotency + cascade coalescing | The tick is idempotent per `(subscription, AnchorPeriod)`; cascade re-resolutions coalesce per unit per generation so a fan-out is bounded and drains under backpressure without blocking first rating | Chaos/retry test |
-
-#### Key Decisions
-
-| Decision | Summary |
-|----------|---------|
-| Freeze balances, don't lock them | C1 resolution: commitment-pool balances enter the context **frozen** at a `balanceVersion`; the core never waits on a live balance; cross-unit sequencing is Contracts' serializer + the write-back (slice 15), off the hot path (§4.5). |
-| Coalesce + bound the cascade | C2 resolution: cascade triggers coalesce per `(unit, generation)` and drain on a dedicated bounded lane; fan-out is finite (structural termination — core slice [`08`](./08-retroactivity-corrections.md) §4.4) and never amplifies onto the hot path (§4.4). |
+| NFR | Design response |
+|---|---|
+| `cpt-cf-bss-rating-nfr-horizontal-scale` | Queue partitioned by `hash(subscription_id)`; child row lock only; scheduler sharded by `hash(fact_id)`. |
+| `cpt-cf-bss-rating-nfr-throughput-latency` | Coalescing: at most one pending work item per child (§4.4); provisional evaluations are estimates and may be skipped under load. |
+| `cpt-cf-bss-rating-nfr-resilience` | Leased at-least-once queue; durable schedule cursor; the rater is a no-op on unchanged inputs. |
 
 ### 1.3 Architecture Layers
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-rating-tech-stack-syn`
 
-```text
-Operational stores + upstream SoRs   Q store (slice 13) · pinned catalog (pricing) · Subscriptions ·
-        │                            Finance FX · Promotions coupons · Billing periodState · Contracts balances
-        ▼
-Unit synthesis (this slice)          UnitSynthesizer · PeriodTick · ContextAssembler · CascadeRouter
-        │  (freeze + invoke)
-        ▼
-rating-core                          evaluate() / reresolve() over the sealed EvaluationContext
-        ▼
-Rated output (slice 15)              outcomes + obligations + balance effects
-```
-
-| Layer | Responsibility | Technology |
-|-------|----------------|------------|
-| Application | Unit synthesis, the period tick, context assembly + pin, cascade routing | Rust modules in the `rating` gear (pipeline crate) |
-| Domain | Unit-kind shapes, `AnchorPeriod`, context-assembly + pin descriptors, cascade generation/coalescing keys | Rust; GTS + Rust domain structs |
-| Infrastructure | The period-tick coordination + idempotency ledger; the cascade lane (queue) | `toolkit-db`; coordination lease library; durable lane |
+`rating` crate: `app/fact_intake.rs`, `app/scheduler.rs`, `app/rater.rs`, `app/evidence_gate.rs`,
+`infra/queue.rs` (`toolkit_db::outbox` queues `rating.child_work`, `rating.rollup`).
 
 ## 2. Principles and Constraints
 
 ### 2.1 Design Principles
 
-#### Nothing reaches the core unfrozen
-
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-freeze-then-invoke-syn`
-
-Every core invocation is over a context this slice **sealed** — one `CatalogVersion`, one
-`qVersion`, one `balanceVersion`, one `fxTableVersion`, one coupon snapshot, one `periodState`. A
-missing input fails closed here; the core is never asked to guess or wait (core slice
-[`01`](./01-foundation.md) §2.1, slice [`11`](./11-consumer-contracts.md) §2.1).
-
-#### The tick is idempotent
-
+  All I/O to other gears happens before the rating transaction; inside it the rater reads only
+  Rating's rows and calls the pure core.
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-idempotent-tick-syn`
-
-A period tick for `(subscription, AnchorPeriod)` produces the same period-driven units however many
-times it fires; a re-run (restart, retry, replay) never double-emits a recurring or capacity line
-(§4.2). Idempotency is keyed, not timing-dependent.
-
-#### Cascades drain off the hot path
-
+  A fact creates its schedule and children idempotently (unique `child_id`); re-delivering a fact or
+  re-running the scheduler never duplicates a child or a result.
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-cascade-off-hotpath-syn`
-
-Re-resolution triggered by a correction re-enters through the core `reresolve` on a **bounded
-correction lane**, coalesced per unit; it never contends with or amplifies onto first rating
-(§4.4). First rating stays partition-local and cheap.
+  A child's evaluation never evaluates another child. Cross-child effects are explicit work items:
+  parent roll-up (slice 15), composite inputs (slice 13), commitment cascades (dormant, §4.6).
 
 ### 2.2 Constraints
 
-#### Read-model pin discipline
-
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-pin-discipline-syn`
-
-Exactly one committed `CatalogVersion` per resolution run, pin-eligible only after
-`CatalogVersionPublished`, the warm-completion marker, **and every earlier version being itself
-pin-eligible — the prefix-closed frontier (pricing D-114, adopted as T-D-31; this constraint is
-implemented gate-side here, so the stale two-condition rule mattered)** (pin lag ≤ 5s); no draft
-read, no default substitution (core slice [`11`](./11-consumer-contracts.md) §4.2; pricing design
-01 §4.4).
-
-#### Synthesis, not aggregation or evaluation
-
+  The rater pins only what `PricingCatalogClientV1::pin_frontier` returns (T-D-31) for provisional
+  and first-final evaluations and for administrative re-rates (which advance it), and the child's
+  `pin_of_record` for every other re-evaluation (T-D-37, T-D-24).
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-synthesis-only-syn`
-
-This slice aggregates no usage (slice [`13`](./13-q-store-attribution.md) owns `Q`) and prices
-nothing (the core does); it selects *what* to evaluate and freezes *the inputs*, then invokes the
-core.
+  This slice aggregates nothing (slice 13) and computes no money (`rating-core`).
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-constraint-no-commercial-clock-syn`
+  The scheduler only schedules windows inside a stored fact's served extent. It never creates a
+  fact, a billing period, a subscription or a billing group.
 
 ## 3. Technical Architecture
 
@@ -163,148 +112,252 @@ core.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-domain-model-syn`
 
-- **`EvaluationUnitSpec`** — the synthesized unit + its kind (`per_event` / windowed-slice / period-driven) + the identity that keys it (usage key, `(window, slice)`, or `(subscription, priceId, chargeKind, lineKey, AnchorPeriod)`).
-- **`AnchorPeriod`** — the `[periodStart, periodEnd)` UTC boundaries from the frozen `billingAnchorPolicy` (D-20 clamp); reused from core slice [`09`](./09-period-plan-change.md) `AnchorCalendar`. **Identity is consumed, not derived (T-D-33)**: for period-driven synthesis `AnchorPeriod` ≡ the consumed subscriptions fact's anchor-derived billing-period identity; the calendar supplies **geometry** (usage window slicing, the watchdog clock), and the joint K5 anchor fixture asserts calendar geometry ≡ fact identity.
-- **`FrozenContext`** — the sealed `EvaluationContext` (core slice [`01`](./01-foundation.md) §3.1) with every version/pin bound: `CatalogVersion`, `(Q, qVersion)`, `(balance, balanceVersion)`, `fxTableVersion`, coupon snapshot, `periodState`.
-- **`CascadeTrigger`** — a balance-effect trigger (T-D-10, from Contracts via slice [`15`](./15-rated-output-balance-effects.md)) or a `bandOffsetQ` shift (T-D-12, from slice [`13`](./13-q-store-attribution.md)); carries the affected units + the generation stamp.
-- **`TickLedgerEntry`** — the idempotency record for `(subscription, AnchorPeriod)`: the tick fired, which period-driven units it emitted (§4.2).
+- **`FactVersion`** — `rating_fact` row: `{fact_id, fact_version, kind, parent_origin, subscription_id,
+  sub_line_key, billing_group_id, tenant axes, currency, period, served extent, timing,
+  occurrence_id?, price_ids, payload_digest}`.
+- **`WindowSchedule`** — `{fact_id, fact_version, window_policy, finalization_policy (Rating-owned, T-D-54) {id, version,
+  delay}, next_due_window_start, expected_count, scheduler_version}`; Rating-internal (Atlas C10).
+- **`ChildSpec`** — `{child_id, child_kind, fact_id, window: RatingWindow {window_start, window_end,
+  served_from, served_to}, aggregation_key}`; `child_id = UUIDv5(WindowEvaluationKey)` (DESIGN §3.1).
+- **`WorkItem`** — `{child_id, reason}` on `rating.child_work`, partition `hash(subscription_id)`.
+- **`AssembledInputs`** — `{pin, plan documents, overlay documents, fact version, subscription
+  version, per-slice quantities with q_versions, layout_version, evidence refs, engine_version}` —
+  exactly the material of `EvaluationInput` and of the result's input manifest.
+- **`PendingReason`** — `not_due`, `pin_unavailable`, `scope_not_sealed`, `awaiting_attribution`,
+  `fx_rate_pending` (dormant, R-07),
+  `segments_behind`, `coverage_missing`, `coverage_mismatch`, `snapshot_unavailable`,
+  `boundary_split_required`, `period_open` (parent only).
 
 ### 3.2 Component Model
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-component-unit-synthesis`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-component-unit-synthesis`
 
-- **`UnitSynthesizer`** — builds `EvaluationUnitSpec`s from usage arrival (slice 12/13), window close, the period tick, and cascade triggers.
-- **`PeriodTick`** — the coordinated period-driven synthesizer, **fact-driven since T-D-33**: triggered by the subscriptions period-fact set, never a boundary clock; emits period-driven units idempotently per `(subscription, AnchorPeriod)` (§4.2).
-- **`ContextAssembler`** — pins the `CatalogVersion` and freezes every other input into a `FrozenContext`; fails closed on any absent required input (§4.3).
-- **`CascadeRouter`** — coalesces `CascadeTrigger`s per `(unit, generation)` and drains them as delta-only `reresolve` calls on the bounded correction lane (§4.4).
+| Component | Responsibility |
+|---|---|
+| `FactIntake` | Inbox fact → `rating_fact` (+ `rating_fact_head`), `rating_window_schedule`, `period_line` / `one_time` children; bumps `input_generation` of children affected by a new fact version. |
+| `WindowScheduler` | Due scan; inserts due `usage_window` children and enqueues them; advances `next_due_window_start` in the same transaction. |
+| `EvidenceGate` | Decides `final_eligible` or `pending(reason)` for a child (§4.5). |
+| `Rater` | Dequeue → ensure inputs → transaction (DESIGN Flow A′) → ack. |
+| `UsageParentDeriver` | **MIGRATION (R-20)**: derives a usage parent fact when Subscriptions publishes none. |
 
 ### 3.3 API Contracts
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-interface-synthesis-syn`
-
-**Inbound**: `UsageRecord`/`Q` availability (slices [`12`](./12-usage-ingestion-normalization.md)/[`13`](./13-q-store-attribution.md)); `ReMaterializationSignal` (slice 13); balance-effect cascade triggers (slice [`15`](./15-rated-output-balance-effects.md) / Contracts); the five upstream frozen inputs (slice [`11`](./11-consumer-contracts.md) §4.2–§4.6). **Outbound**: `evaluate(FrozenContext)` / `reresolve(...)` calls into `rating-core` (in-process); the resolved outcomes flow to slice [`15`](./15-rated-output-balance-effects.md). No external synchronous API.
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-interface-synthesis-syn`
+  Internal: `Scheduler::enqueue(tx, child_id, reason)` must run inside the caller's transaction so
+  the work item commits with its cause. External reads: `PricingCatalogClientV1` and the stored
+  subscription version (slice 11). Intake of facts is the inbox (slice 11 §4.11; fact shapes §4.3).
 
 ### 3.4 Internal Dependencies
 
-Upstream: slices [`12`](./12-usage-ingestion-normalization.md)/[`13`](./13-q-store-attribution.md)
-(usage/`Q`), slice [`11`](./11-consumer-contracts.md) (the five input contracts). Core: invokes
-[`01`](./01-foundation.md) `evaluate`/`reresolve`; reuses [`09`](./09-period-plan-change.md)
-`AnchorCalendar`; routes [`08`](./08-retroactivity-corrections.md) cascades. Downstream: slice
-[`15`](./15-rated-output-balance-effects.md) (persists outcomes, publishes balance effects that
-feed back as cascade triggers).
+Slice 13 (`ensure_spec`, `ensure_layout`, `read_child_quantities`), slice 11 stores, slice 15
+(`ResultStore::persist`, `ParentRollup`), `rating-core`.
 
 ### 3.5 External Dependencies
 
-| Dependency | What arrives frozen | Contract |
-|------------|--------------------|----------|
-| Pricing (Product Catalog) | pinned read model + `CatalogVersionPublished` + warm-completion marker | slice [`11`](./11-consumer-contracts.md) §4.2 |
-| Subscriptions | phase, eligibility, seat count, `(changeEffectiveAt, changeMode)`, `(currency, region)` binding | slice [`11`](./11-consumer-contracts.md) §4.3 |
-| Finance / Promotions / Billing | `fxTableVersion` / coupon snapshot / `periodState` | slice [`11`](./11-consumer-contracts.md) §4.4–§4.6 |
-| Contracts | commitment-pool `(balance, balanceVersion)` frozen into the context; balance-effect cascade triggers | slice [`05`](./05-commitments-reservations.md) §4.1 (T-D-10) |
+pricing (R-02), subscriptions (R-03, R-20), IRM/collector evidence (R-21) — SEAMS §B–§D.
 
 ### 3.6 Interactions and Sequences
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-flow-synthesize-syn`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-synthesize-syn`
+  **Evaluate a child** — DESIGN §3.6 Flow A′. If `split_points` computed from the assembled inputs
+  differ from the stored layout, the rater calls `ensure_layout` (re-materialization, its own
+  transaction), re-enqueues the child, and acks.
 
-**Synthesize and evaluate a usage unit**:
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-period-tick-syn`
+  **Fact intake** (one transaction per fact version):
 
-1. Usage/`Q` becomes available (slices [`12`](./12-usage-ingestion-normalization.md)/[`13`](./13-q-store-attribution.md)); `UnitSynthesizer` builds the `EvaluationUnitSpec` (per-event or windowed-slice, carrying `bandOffsetQ`).
-2. `ContextAssembler` pins the `CatalogVersion` and freezes `(Q, qVersion)`, `(balance, balanceVersion)`, `fxTableVersion`, coupon snapshot, `periodState`; a missing required input fails closed (§4.3).
-3. `rating-core` `evaluate(FrozenContext)` runs steps 1–9; the outcome flows to slice [`15`](./15-rated-output-balance-effects.md).
+  ```text
+  inbox entry source=fact business_id=fact_id version=fact_version digest=d
+  BEGIN
+    INSERT rating_inbox … ON CONFLICT DO NOTHING            same key, digest ≠ d → quarantine; COMMIT
+    INSERT rating_fact (fact_id, fact_version, …) ON CONFLICT DO NOTHING
+    UPSERT rating_fact_head SET current_version = max(current_version, fact_version)
+    kind = recurring → INSERT child period_line (wk1|fact|period_start|agg) ON CONFLICT DO NOTHING
+    kind = one_time  → R-19 accepted ? INSERT child one_time : store only
+    kind = usage     → INSERT rating_window_schedule (policy pinned now, next_due_window_start = first window)
+                       INSERT provisional children for windows that already have counters (F35)
+                         ON CONFLICT DO UPDATE only fact_version (policy never re-pinned)
+    newer version    → UPDATE rating_child_window SET input_generation += 1 WHERE fact_id = ?
+                       (children whose window intersects the changed term/served extent)
+    enqueue affected children; INSERT rating_inbox state = applied
+  COMMIT
+  ```
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-flow-period-tick-syn`
+  Example (recurring, MIGRATION mapping of the current Subscriptions fact): subscription S42, period
+  `[2026-09-15, 2026-10-15)`, `lineKey = plan#1`, `priceId = P-REC` → `fact_id = UUIDv5(…,
+  "S42|2026-09-15T00:00Z|plan#1|recurring")`, `fact_version = 1`, one `period_line` child.
 
-**Period tick**:
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-scheduler-syn`
+  **Due scan** (`WindowScheduler`, every ≤ 60 s per shard, batches of ≤ 500 schedules):
 
-1. The subscriptions **period-fact set** for `(subscription, billing period)` arrives — `BillableItemCreated(kind=recurring)`, one fact per component interval, on the shared ordering key — and the coordinated `PeriodTick` fires for that subscription-period (T-D-33; the calendar boundary itself triggers nothing — it only arms the missing-fact watchdog, §4.2).
-2. It checks the `TickLedgerEntry` for `(subscription, AnchorPeriod)` — `AnchorPeriod` ≡ the facts' period identity; if already emitted, it is a no-op (idempotent; late-arriving facts of the same period's set extend the entry per component key, never re-emit).
-3. Else the tick **records its pin first**: the run's `CatalogVersion` is written to the `TickLedgerEntry` as an **intent** before any unit evaluates — a crashed re-run reuses the recorded pin rather than re-pinning under a newer eligible version, so one period line never yields two rated rows under two pins (2026-07-31 review, #47; defence in depth — the slice-16 usage/period-key idempotency stays the primary absorber).
-4. `UnitSynthesizer` synthesizes the period-driven units — **each recurring unit from its fact, inheriting the fact's `(subscriptionId, billing period, lineKey)` key**; capacity-flavor charges and true-up surfacing ride the period's plan-line fact as their trigger (T-D-33) — even for a zero-usage period (by construction: the facts arrive regardless of usage); `ContextAssembler` freezes their contexts (under the recorded pin, absorbing the fact's suspended intervals + suspension-billing posture into the recurring proration inputs and passing the period-start `payerTenantId` + `collectionPaused` marker through to the priced line), and the core evaluates them; the ledger entry commits with the emitted-unit set.
+  ```text
+  BEGIN
+    SELECT … FROM rating_window_schedule
+     WHERE shard = ? AND next_due_window_start + window_length + delay <= now()
+     ORDER BY next_due_window_start LIMIT 500 FOR UPDATE SKIP LOCKED
+    for s: for each window w from s.next_due_window_start while w.end + s.delay <= now()
+                                                      and w.start < fact.served_to:
+             for each aggregation key k in expected_children(fact, w) (DESIGN §3.1):
+               INSERT rating_child_window (wk1|s.fact|w.start|k) ON CONFLICT DO NOTHING
+               enqueue child (reason = due)
+           UPDATE s SET next_due_window_start = <first window not yet due>
+  COMMIT
+  ```
+
+  After an outage the same loop catches up every due slot; the unique `child_id` absorbs re-runs
+  (F28). For `subscription_line` scope the expected keys are one per meter the line's plan prices at
+  the pin (empty `dimension_key` at launch), so an hour with no usage still gets its children — each
+  an explicit zero once its scope is sealed (F04).
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-rating-flow-cascade-route-syn`
-
-**Cascade routing**:
-
-1. A `CascadeTrigger` arrives — a Contracts balance effect (T-D-10) or a `bandOffsetQ` shift (T-D-12) — with the affected units + a generation stamp.
-2. `CascadeRouter` **coalesces** triggers for the same `(unit, generation)` into one pending re-resolution and enqueues on the bounded correction lane.
-3. The lane drains: each unit `reresolve`s over its **own** pin, delta-only (core slice [`08`](./08-retroactivity-corrections.md)); the resulting deltas flow to slice [`15`](./15-rated-output-balance-effects.md). Backpressure throttles the lane; first rating is untouched (§4.4).
+  **Wake-ups.** Children waiting on evidence are re-enqueued by the transaction that stores the
+  evidence: a counter change, a fact version, a segment that raises `applied_seq` past the scope's
+  `segments_through_seq`, a sealed scope, a coverage declaration. A durable timer is not needed:
+  the scheduler re-enqueues children still pending after `delay` on every scan (bounded by
+  `pending_rescan_interval`, default 5 min).
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-storage-synthesis-syn`
-
-**Owned (partitioned by the pinned `orderingTenantId`, UTC):**
-
-- `period_tick_ledger` — PK `(subscription, AnchorPeriod)`; the idempotency record + emitted period-driven-unit set (§4.2).
-- `cascade_lane` — the durable bounded queue of coalesced re-resolution work: `(unit, generation)` unique so a duplicate trigger folds in; status/backpressure columns (§4.4).
-
-`FrozenContext` itself is not persisted authoritatively — it is assembled per run from the upstream
-stores; the sealed `pricingSnapshotRef` persists with the outcome (slice
-[`15`](./15-rated-output-balance-effects.md)). No monetary column.
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-storage-synthesis-syn`
+  `rating_fact`, `rating_fact_head`, `rating_window_schedule`, `rating_child_window` — DESIGN §3.7;
+  queues `rating.child_work`, `rating.rollup` in `toolkit_db::outbox` tables.
 
 ### 3.8 Deployment Topology
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-rating-deployment-syn`
-
-Pipeline crate in the one `rating` gear deployable. The `PeriodTick` runs as a **coordinated
-singleton per `orderingTenantId` shard** (coordination lease library), sub-sharded by hash of
-`subscriptionId` for a large tenant — the same sharding rule as slices
-[`12`](./12-usage-ingestion-normalization.md)/[`13`](./13-q-store-attribution.md); the anchor-boundary
-sweep for a 100K+/tenant is not serialized through one worker. The `cascade_lane` is a bounded
-work queue drained by lane workers with backpressure, distinct from the first-rating path.
+  `Rater` workers: one processor per queue partition, N partitions (config, default 64).
+  `WindowScheduler`: S shards (default 16) under leases `rating:scheduler:{shard}`.
 
 ## 4. Additional Context
 
-### 4.1 The Three Evaluation-Unit Kinds (normative)
+### 4.1 Child Kinds (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-unit-kinds-syn`
 
-- **`per_event`** — one normalized `UsageRecord` (discrete meters); the unit is the event.
-- **Windowed-`Q` (per sub-window slice)** — the aggregated `Q` for `(subscription, meter, dimensionKey, window)`; when a period split partitions the window, **one unit per sub-window slice**, each carrying the frozen `bandOffsetQ` from slice [`13`](./13-q-store-attribution.md) (T-D-12) and binding exactly one pin (core slice [`01`](./01-foundation.md) §4.2).
-- **Period-driven** — recurring lines, capacity-flavor charges, and period-end true-up surfacing, keyed `(subscription, priceId, chargeKind, lineKey, AnchorPeriod)` (T-D-15; `lineKey` value rule per T-D-34, `AnchorPeriod` ≡ the consumed fact's period identity per T-D-33); synthesized by the **fact-driven** period tick, priced by the core. A **zero-usage period still emits** its period-driven units (§4.2; PRD §12 AC 20 capacity charge). This enumeration is **exhaustive**: `one_time` / `one_time_setup` rows synthesize **nothing** here — they are billed at their qualifying instant by Subscriptions/Billing from the frozen snapshot amount (T-D-18; the tick never emits, and can never re-emit, a one-time line).
-- **Serialization across kinds (fills core slice [`01`](./01-foundation.md) §4.2)**: a usage unit serializes on its counter partition key `(subscription, meter, dimensionKey, window)`; a period-driven unit serializes on `(subscription, AnchorPeriod)` (the tick-ledger key). The two key spaces are disjoint by construction — a usage unit prices metered `Q`, a period-driven unit prices a recurring/capacity/true-up line — so they never contend for the same row; where a period-driven true-up reads a window aggregate, it reads it **frozen** (the window's `qVersion` at tick time), not the live counter.
+| Kind | Parent kind | Created by | Lines | Final when |
+|---|---|---|---|---|
+| `usage_window` | usage | scheduler (due) or first counter write (provisional) | one per slice (slice 13 §4.3) | §4.5 |
+| `usage_event` | usage | ingestion of a record under a `per_event` row | one | §4.5 (window = the record interval) |
+| `period_line` | recurring | fact intake | one per slice (seat change, plan-change interval inside the period) | `advance`: at acceptance; `arrears`: when the period has ended |
+| `one_time` | one_time | fact intake — only if R-19 is accepted | one | at acceptance |
 
-### 4.2 The Period Tick (normative)
+The set is exhaustive. A plan change inside a period produces a new `sub_line_key` (`plan#n+1`) and
+therefore a separate fact and child (T-D-34, slice 09); a seat change is a slice of the same
+`period_line`.
+
+### 4.2 Commercial Facts (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-period-tick-syn`
 
-- **The trigger is the subscriptions period-fact set, never the calendar (T-D-33, 2026-08-01 — resolves SEAMS SB1):** the tick synthesizes the period-driven units for `(subscription, billing period)` **on consumption of `BillableItemCreated(kind=recurring)`** — one money-free fact per component interval, cut by subscriptions' `RecurringEmitter` (subscriptions SUB-D-07/19/21, all confirmed 2026-08-01). Each recurring unit **inherits its fact's `(subscriptionId, billing period, lineKey)` key**; capacity-flavor charges and true-up surfacing ride the period's **plan-line fact** as their trigger. Still **no `rating-core` scheduler**; the tick lives here in the pipeline.
-- **Absorbed fact fields (T-D-33):** the suspended interval(s) + `pause_recurring | continue` posture drive the recurring line's suspension proration (`pause_recurring` ⇒ prorate over the un-suspended stretch; `continue` ⇒ full period); the **period-start `payerTenantId`** and the `collectionPaused` marker pass through to the priced line as posting axes — no rating math reads them.
-- **Missing vs late facts:** a period whose fact set has not arrived by the calendar boundary + a grace horizon raises the §17.1 charge-coverage alarm — the tick **never self-synthesizes** a period; a **late** fact set (a subscriptions §4.3b revival cut, up to the 90-day dwell) synthesizes late — its composition/payer/eligibility as-of correctness is the producer's (subscriptions SUB-D-20), and this gear prices from the frozen snapshot the facts carry.
-- **Idempotent per `(subscription, AnchorPeriod)`**: the `period_tick_ledger` records that the tick fired and which units it emitted; a re-fire (restart, retry, coordinated-lease hand-off) is a no-op. A late usage arrival into an already-ticked period does **not** re-fire the tick — it re-resolves the affected usage unit (slice [`08`](./08-retroactivity-corrections.md)); a period-driven true-up whose input aggregate changed re-resolves under its own key, it is not re-synthesized.
-- **Zero-usage period**: capacity-flavor charges and recurring lines still emit — **by construction since T-D-33**: the fact set arrives per component per period regardless of usage (subscriptions AC 5/27; a reservation bills its allocation regardless of usage — core slice [`05`](./05-commitments-reservations.md) §4.2; PRD §12 AC 20).
-- The `AnchorCalendar` (frozen `billingAnchorPolicy`, D-20 clamp) survives as **geometry and watchdog**: the Q store keeps using it for window identity (slice [`13`](./13-q-store-attribution.md) §4.1), so period boundaries and tier-window boundaries never drift, and the **joint K5 anchor fixture asserts calendar geometry ≡ the consumed facts' period identity** — a plan change altering `billingAnchorPolicy` takes effect from the next period boundary (slice [`09`](./09-period-plan-change.md) §4.3).
-- **RESOLVED — recurring period-cut ownership (SEAMS SB1 → T-D-33, 2026-08-01):** subscriptions' `RecurringEmitter` owns the recurring WHEN via its money-free period fact per `(subscriptionId, billing period, lineKey)`; this slice's tick consumes it, `AnchorPeriod` ≡ the fact's period identity (the last differing coordinate closed), and the `lineKey` value rule is adopted verbatim (T-D-34). Double-emission and missed-pause/suspension risks are gone structurally: one WHEN owner, one key — see [`../SEAMS.md`](../SEAMS.md) §K.
+- The commercial WHEN is the fact (T-D-33). `fact_id` and `fact_version` are Subscriptions' (TARGET)
+  or derived by the MIGRATION mapping (DESIGN Flow C, Flow usage parent).
+- Fields absorbed from the fact: served extent, billing group, tenant axes, `currency`, `timing`,
+  frozen price ids, suspension ranges and posture (`pause_recurring` prorates over the un-suspended
+  part; `continue` bills the full period), `collection_paused` (carried to the delivery; no rating
+  math). **CURRENT** Subscriptions puts suspension intervals on a fact cut at the period it
+  describes; under TARGET a later suspension arrives as a new fact version.
+- A new fact version invalidates the children whose window intersects a changed term slice or
+  served extent; it never deletes a child: a removed obligation is a zero fact version and produces
+  a zero result (Atlas C04).
+- Missing fact (usage seen, no parent): the counters accumulate and **no child exists**
+  (`rating_usage_without_fact`); the recovery sweep asks `period_facts` (TARGET); when the fact
+  arrives, fact intake creates the children of the windows that have counters. Rating never invents
+  a subscription (F35).
+- `[DEPENDENCY GAP R-03, R-20]` — no fact has a wire schema or transport today.
 
-### 4.3 Frozen-Context Assembly and Pin Discipline (normative)
+### 4.3 Input Assembly (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-context-assembly-syn`
 
-- `ContextAssembler` seals one `FrozenContext` per unit: **one committed `CatalogVersion`** (pin-eligible per the prefix-closed frontier — §2.2, T-D-31; pin lag ≤ 5s; no draft read — core slice [`11`](./11-consumer-contracts.md) §4.2), plus the frozen `(Q, qVersion)` (slice [`13`](./13-q-store-attribution.md)), `(balance, balanceVersion)` (Contracts, §4.5), **the `per_unit` quantity as a sealed pair `(N, source ref)`** — the seat count / manual quantity with its Subscriptions-side provenance, so a T-D-21 administrative re-rate or a true-up recompute of a per-seat line has a defined replay source for the historical `N` (2026-07-31 review, #18: the sealed-input enumeration had omitted it while the docs already called the value frozen in context), **the payer's `customerGroup`** (resolved from the pinned read model's membership subject — core slice [`11`](./11-consumer-contracts.md) §4.2, review #40: a period-tick unit has no caller claims to read), `fxTableVersion` (Finance), coupon snapshot (Promotions), and `(periodState, sequence)` (Billing — the T-D-28 fence coordinate).
-- A missing or torn required input — no eligible pin, absent `periodState`, a torn snapshot pre-stamp/binding, an unresolvable coupon policy — **fails closed at this boundary** (core slice [`01`](./01-foundation.md) §3.3, slice [`11`](./11-consumer-contracts.md) §2.1); the core is never entered with a partial context.
-- The assembled versions are exactly the determinism tuple `(window-aggregated inputs incl. bandOffsetQ, pricingSnapshotRef, fxTableVersion)` (core slice [`01`](./01-foundation.md) §4.2); re-resolution re-assembles the **same** pins (open-period) or the superseding pin (administrative re-rate — core slice [`08`](./08-retroactivity-corrections.md) §4.1).
+In order, outside the transaction:
 
-### 4.4 Cascade Routing, Coalescing, and Bounding (normative)
+1. `pin` = `pin_frontier` if the work reason is `admin_rerate` or the child has no `pin_of_record`,
+   else `child.pin_of_record` (`pin_frontier = None` ⇒ requeue with backoff,
+   `pending(pin_unavailable)`).
+2. `SubscriptionVersionStore.ensure(latest)` → `subscription_version`.
+3. Plans needed = the subscription's plan links active in the child's window;
+   `PricingDocumentStore.ensure(catalog_version, plans + overlays)`.
+4. `SpecWriter.ensure_spec(subscription, meter)` for usage children.
+5. `split_points` → `ensure_layout` (usage children).
+
+Inside the transaction: re-read the child row (`FOR UPDATE`), the fact version, counters at the
+current `layout_version`, the stored documents, the subscription version, the evidence rows. The
+assembled set is the input manifest; `input_digest` = SHA-256 of the canonical `EvaluationInput`.
+The rater writes only if the child's `input_generation` still equals the value it read.
+
+### 4.4 Work Queue, Scheduler and Coalescing (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-cascade-routing-syn`
 
-- Two frozen inputs couple units, so correcting one re-resolves its dependents (core slice [`08`](./08-retroactivity-corrections.md) §4.4): **(a)** a balance-affecting correction (T-D-10) — Contracts, the `balanceVersion` serializer, emits triggers for every later-`balanceVersion` unit that drew or was rated overage against the pool; **(b)** a `bandOffsetQ` shift (T-D-12) — slice [`13`](./13-q-store-attribution.md) emits triggers for the later slices of the window.
-- **Coalescing**: `CascadeRouter` folds all triggers for the same `(unit, generation)` into **one** pending re-resolution (`cascade_lane` uniqueness) — a unit re-resolves **at most once per generation**, so a storm of triggers for the same unit does not multiply work. **The `generation` is defined (2026-07-31 review, #34 — it was load-bearing and minted nowhere)**: a **per-unit monotonic integer**, scoped to the unit key, incremented each time a *superseding* trigger source enqueues work for that unit — a newer `balanceVersion` (lane a), a newer `qVersion`/offset shift (lane b), or an administrative re-rate run (slice [`08`](./08-retroactivity-corrections.md) §4.1) — with coalescing keeping the **highest** generation (a superseded pending re-resolution is folded away, never run stale, and a correction is never dropped: the highest generation's inputs subsume its predecessors', both lanes being strictly ordered).
-- **Bounding + termination**: each chain is finite and strictly ordered (balance versions / slice index — core slice [`08`](./08-retroactivity-corrections.md) §4.4), so a cascade terminates; the lane is **bounded** with backpressure, so a large fan-out drains at a controlled rate and never amplifies onto the first-rating hot path. Fan-out magnitude is bounded by the number of distinct affected units, each processed once per generation.
-- Every cascade `reresolve` is delta-only under its own correction key `(unitKey[, slice], prior-rated-version, snapshot)` and its own pin; the deltas flow to slice [`15`](./15-rated-output-balance-effects.md), which dedups them (T-D-11).
+- `rating.child_work`: partition `hash(subscription_id) mod N`; at-least-once; dead-letter after 10
+  attempts (child `failed` + exception).
+- Coalescing: enqueue is skipped when `rating_child_window.queued_at` is set; the rater clears it
+  when it starts; work created during a run re-enqueues normally.
+- Provisional evaluations are optional: under backlog (`rating.child_work` depth > threshold) the
+  rater skips provisional work for windows not yet due; due and correction work is never skipped.
+- Retry: dependency `Unavailable` / no frontier — exponential backoff 1 s → 5 min; serialization
+  failure — immediate ×3; `EvaluationError` — none until an input changes or an operator retries.
+- Expected geometry: `window_geometry(window_policy, served extent)`; for `per_hour` the canonical
+  windows are UTC `[HH:00, HH+1:00)`; a fact opening at 10:30 has a first window 10:00–11:00 served
+  from 10:30 (F29).
 
-### 4.5 Commitment-Balance Freezing and the Hot Path (normative)
+### 4.5 Finalization Gate (normative)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-finalization-gate-syn`
+
+A `usage_window` / `usage_event` child is `final_eligible` when **all** hold (Atlas C05/C10,
+T-D-47):
+
+1. the parent fact is stored (a child cannot exist without it);
+2. `now ≥ window_end + finalization_policy.delay` (pinned in the schedule when the fact was
+   accepted; a later configuration change never moves an in-flight deadline);
+3. a sealed `UsageScope` for `(fact_id, window)` is stored (from `UsageScopeSealed` or
+   `scope_for_window`), and the attribution projection's `applied_seq` for every
+   `resource_tenant_id` in it is ≥ the scope's `segments_through_seq`;
+4. every expected `(resource, usage type, interval)` in the scope has a `final` coverage declaration
+   whose intervals cover the window;
+5. the stored usage records for those resources and the window match each declaration's
+   `record_count`, `quantity_sum` and `active_record_set_digest`
+   (SHA-256 over sorted `(usage_record_id, window_start, window_end, quantity, unit)` of active
+   records — the Atlas tuple with the collector's identity in place of the withdrawn `source_revision`);
+6. no record of the window is `boundary_split_required` or `awaiting_attribution`.
+
+A sealed empty scope (no resources) satisfies 3–5 with zero records (proven empty ⇒ zero result).
+Anything missing ⇒ `pending(reason)`; never zero.
+
+**MIGRATION (R-21)**: a finalization policy may carry `evidence_mode = delay_only`, accepted
+explicitly by Finance/Product for that profile: conditions 1, 2 and 6 only. Results and deliveries
+record `evidence_mode = delay_only`; late usage produces new revisions (slice 08). Without that
+acceptance, usage children cannot finalize until J-13 exists.
+
+The illustrative profiles of the Atlas are configuration, not SLAs: hourly cloudlets `delay =
+PT5M`; monthly VM hours `PT48H`.
+
+### 4.6 Commitment Balances (normative)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-balance-freeze-syn`
 
-- Commitment-pool balances enter the `FrozenContext` **frozen at a `balanceVersion`** (the `commitmentReservation` segment — core slice [`01`](./01-foundation.md) §4.3, T-D-09/T-D-10). The core evaluates the step-6 waterfall over the frozen balance and **never reads or waits on a live balance** — so the hot path stays partition-local with **zero cross-partition locks, even for pooled/committed usage** (this is the C1 resolution: the scale NFR holds because the only cross-unit dependency is on the *write-back*, not the *read*).
-- Cross-unit sequencing is asynchronous and off the hot path: slice [`15`](./15-rated-output-balance-effects.md) publishes each outcome's `CommitmentBalanceEffect` to Contracts (idempotent on the outcome key); **Contracts serializes** per-pool `balanceVersion` and freezes `(balance, balanceVersion)` for the next context assembly; concurrent units sharing a pool at one frozen version can jointly over-draw it — **the steady state under load, detected by Contracts at write-back and cascaded like any balance-affecting correction (T-D-27; core slice [`05`](./05-commitments-reservations.md) §4.1)**. A balance-affecting correction then cascades (§4.4) — bounded and coalesced.
-- Consequence: pooled/committed usage has a **higher correction-cascade cost** than pure usage (a late correction can re-resolve later drawing units) but the **same first-rating cost and scalability** (frozen balance, no lock). The trade — cheap deterministic first rating, bounded asynchronous cascade — is the intended posture.
+Commitment pools have no source (R-11). When Contracts supplies them, pool balances enter
+`EvaluationInput` as version-keyed copies and a pool change enqueues the children that observed an
+older `balanceVersion` (DESIGN Flow F). Until then no child reads a balance and no
+`CommitmentBalanceEffect` is published.
+
+### 4.7 Acceptance Vectors
+
+Copied from the Atlas (fixture ids kept) for Rating's scheduler and gate:
+
+| Fixture | Given | Required result |
+|---|---|---|
+| F28 | line active all October UTC; worker down 3 h; one hour without resources | 744 children, no duplicates; empty hour = zero child; parent cannot omit a lost hour |
+| F29 | activation 10:30, 8 cloudlets until 11:00 | window 10:00–11:00, served 10:30–11:00, Q = 4, 0.08 EUR |
+| F30 | window ends 11:00, delay 5 min; coverage absent at 11:05, arrives 11:08 | pending at 11:05; final at/after 11:08 |
+| F33 | one monthly fact, no further subscription events | every hour computed; restart resumes from checkpoints |
+| F34 | 10:00–11:00 final, month open | readable via `window_results`; no parent delivery |
+| F35 | usage before the fact / before attribution reaches the barrier | usage retained; fact recovered; child pending |
 
 ## 5. Traceability
 
-- **PRD**: §9.2 (context inputs, Rating handoff duties), §12 AC 20 (zero-usage capacity charge), §17.1 (determinism), §6.10 (re-resolution), §7.1 (scale NFR).
-- **Seams**: S1 (segments frozen into the context), M7 (`Q` frozen per `qVersion`) — [`../SEAMS.md`](../SEAMS.md).
-- **Decisions**: T-D-10 (balance cascade + `balanceVersion`), T-D-12 (`bandOffsetQ` cascade), T-D-15 (period tick), T-D-16 (consolidation) — [`../DECISIONS.md`](../DECISIONS.md).
-- **ADR**: [`../ADR/0002-cpt-cf-bss-rating-adr-rating-gear-consolidation.md`](../ADR/0002-cpt-cf-bss-rating-adr-rating-gear-consolidation.md).
-- **Related slices**: [`01-foundation.md`](./01-foundation.md) §4.2 (unit kinds, determinism tuple), [`11-consumer-contracts.md`](./11-consumer-contracts.md) (input contracts + pin discipline), [`08-retroactivity-corrections.md`](./08-retroactivity-corrections.md) (cascades, `reresolve`), [`09-period-plan-change.md`](./09-period-plan-change.md) (`AnchorCalendar`), [`13-q-store-attribution.md`](./13-q-store-attribution.md) (`Q`/`bandOffsetQ` + re-materialization signals), [`15-rated-output-balance-effects.md`](./15-rated-output-balance-effects.md) (balance-effect publication feeding cascades).
+- **DESIGN**: §3.1, §3.6 (Flows A′, C, usage parent), §4.1, §4.2, §4.5.
+- **Decisions**: T-D-15, T-D-18, T-D-31, T-D-33, T-D-37, T-D-38, T-D-44, T-D-47, R-02, R-03, R-11,
+  R-19, R-20, R-21.
+- **Atlas**: C07, C10, D13, D15, F28–F35.
