@@ -42,6 +42,15 @@ pub trait FilterField: Copy + Eq + std::hash::Hash + fmt::Debug + 'static {
 
     fn kind(&self) -> FieldKind;
 
+    /// Operators the served `$filter` text lists for this field.
+    ///
+    /// `None` publishes every operator [`FieldKind::allows`]. An endpoint that refuses some of
+    /// those after the parser names the ones it serves, so the contract does not advertise
+    /// the rest.
+    fn published_ops(&self) -> Option<&'static [FilterOp]> {
+        None
+    }
+
     /// Whether the field can be absent, so that `null` compares with it: `field eq null` asks for
     /// the rows where it is absent and `field ne null` for the rows where it is present.
     ///

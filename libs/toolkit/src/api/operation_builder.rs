@@ -590,25 +590,32 @@ where
             let name = field.name().to_owned();
             let kind = field.kind();
 
-            // Published straight from the parser's own table, so the contract
-            // cannot promise an operator the parser refuses, or hide one it
-            // accepts.
-            let ops: Vec<String> = [
-                FilterOp::Eq,
-                FilterOp::Ne,
-                FilterOp::Gt,
-                FilterOp::Ge,
-                FilterOp::Lt,
-                FilterOp::Le,
-                FilterOp::Contains,
-                FilterOp::StartsWith,
-                FilterOp::EndsWith,
-                FilterOp::In,
-            ]
-            .into_iter()
-            .filter(|op| kind.allows(*op))
-            .map(|op| op.to_string())
-            .collect();
+            // Published from the parser's own table, unless the field names the
+            // operators its endpoint actually serves.
+            let ops: Vec<String> = match field.published_ops() {
+                Some(ops) => ops
+                    .iter()
+                    .copied()
+                    .filter(|op| kind.allows(*op))
+                    .map(|op| op.to_string())
+                    .collect(),
+                None => [
+                    FilterOp::Eq,
+                    FilterOp::Ne,
+                    FilterOp::Gt,
+                    FilterOp::Ge,
+                    FilterOp::Lt,
+                    FilterOp::Le,
+                    FilterOp::Contains,
+                    FilterOp::StartsWith,
+                    FilterOp::EndsWith,
+                    FilterOp::In,
+                ]
+                .into_iter()
+                .filter(|op| kind.allows(*op))
+                .map(|op| op.to_string())
+                .collect(),
+            };
 
             _ = write!(description, "\n- {}: {}", name, ops.join("|"));
             filter.allowed_fields.insert(name.clone(), ops);

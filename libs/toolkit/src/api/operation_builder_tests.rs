@@ -827,3 +827,88 @@ fn response_content_types_must_not_contain_parameters() {
         );
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ServedOpsField {
+    Label,
+    Code,
+    Amount,
+}
+
+impl toolkit_odata::filter::FilterField for ServedOpsField {
+    const FIELDS: &'static [Self] = &[Self::Label, Self::Code, Self::Amount];
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Label => "label",
+            Self::Code => "code",
+            Self::Amount => "amount",
+        }
+    }
+
+    fn kind(&self) -> toolkit_odata::filter::FieldKind {
+        match self {
+            Self::Label | Self::Code => toolkit_odata::filter::FieldKind::String,
+            Self::Amount => toolkit_odata::filter::FieldKind::I64,
+        }
+    }
+
+    fn published_ops(&self) -> Option<&'static [toolkit_odata::filter::FilterOp]> {
+        use toolkit_odata::filter::FilterOp;
+
+        match self {
+            Self::Code => Some(&[FilterOp::Eq, FilterOp::In, FilterOp::Gt]),
+            Self::Label | Self::Amount => None,
+        }
+    }
+}
+
+fn split_ops(joined: &str) -> Vec<String> {
+    joined.split('|').map(ToOwned::to_owned).collect()
+}
+
+#[test]
+fn a_field_names_the_operators_its_endpoint_serves() {
+    let registry = MockRegistry::new();
+    let _router = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/items")
+        .with_odata_filter::<ServedOpsField>()
+        .anonymous()
+        .handler(test_handler)
+        .json_response(http::StatusCode::OK, "Success")
+        .register(Router::new(), &registry);
+
+    let ops = registry.operations.lock().unwrap();
+    let spec = &ops[0];
+    let description = spec
+        .params
+        .iter()
+        .find(|param| param.name == "$filter")
+        .unwrap()
+        .description
+        .as_deref()
+        .unwrap();
+
+    // A string with no override publishes the parser table. `code` names
+    // eq, in and gt; a string kind does not allow gt, and what remains keeps
+    // the override's order.
+    let plain = "eq|ne|contains|startswith|endswith|in";
+    let narrowed = "eq|in";
+    let description_expected = format!(
+        "OData v4 filter expression\n- label: {plain}\n- code: {narrowed}\n- amount: eq|ne|gt|ge|lt|le|in"
+    );
+    assert_eq!(description, description_expected);
+
+    let allowed = &spec
+        .vendor_extensions
+        .x_odata_filter
+        .as_ref()
+        .unwrap()
+        .allowed_fields;
+    assert_eq!(allowed.get("label").unwrap(), &split_ops(plain));
+    assert_eq!(allowed.get("code").unwrap(), &split_ops(narrowed));
+    // An integer with no override keeps the parser table for that kind.
+    assert_eq!(
+        allowed.get("amount").unwrap(),
+        &split_ops("eq|ne|gt|ge|lt|le|in")
+    );
+}
