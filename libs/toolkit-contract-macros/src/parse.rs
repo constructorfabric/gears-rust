@@ -14,8 +14,11 @@ fn is_secctx_attr(attr: &syn::Attribute) -> bool {
     SECCTX_ATTRS.iter().any(|n| attr.path().is_ident(n))
 }
 
+/// Parsed arguments of the `#[contract(...)]` attribute.
 pub struct ContractAttr {
+    /// Owning gear name the contract belongs to.
     pub gear: String,
+    /// Contract version string (the major version is also encoded in versioned trait names).
     pub version: String,
 }
 
@@ -65,6 +68,7 @@ impl syn::parse::Parse for ContractAttr {
     }
 }
 
+/// Builds a [`ContractModel`] from the attribute arguments and the annotated trait, validating the name suffix and methods.
 pub fn parse_trait(attr: ContractAttr, item: &ItemTrait) -> syn::Result<ContractModel> {
     let trait_name = item.ident.to_string();
     let kind = ContractKind::from_suffix(&trait_name).ok_or_else(|| {

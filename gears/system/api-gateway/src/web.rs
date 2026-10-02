@@ -13,7 +13,10 @@ use toolkit::RestHealthcheckRegistry;
 /// Per-check timeout (from `ApiGatewayConfig::healthcheck_timeout_ms`), injected as an
 /// `Extension`. A newtype avoids colliding with any other `Duration` extension.
 #[derive(Clone, Copy)]
-pub struct HealthcheckTimeout(pub Duration);
+pub struct HealthcheckTimeout(
+    /// Maximum time a readiness probe may take before it is reported as failed.
+    pub Duration,
+);
 
 /// Returns a 501 Not Implemented handler for operations without implementations
 #[allow(dead_code)]
@@ -64,6 +67,7 @@ fn status_for_report(report_ready: bool) -> StatusCode {
     }
 }
 
+/// Renders the API docs HTML page for the `OpenAPI` document served under `prefix_path`.
 #[cfg(not(feature = "embed_elements"))]
 pub fn serve_docs(prefix_path: &str) -> Html<String> {
     let openapi_url = if prefix_path.is_empty() {

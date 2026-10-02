@@ -391,6 +391,7 @@ fn project_rate(base: RateMinor, adjustment: &Adjustment) -> Option<RateMinor> {
 /// authored**: cheaper at the top than at the bottom, marked `applied`, and with
 /// the approval verdict taken over the same partial move because
 /// `run_materiality` runs the identical projection.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RateProjection {
     /// The rate under the adjustment.

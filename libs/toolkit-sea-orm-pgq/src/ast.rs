@@ -101,8 +101,11 @@ impl Element {
 /// shorter one. Unlike the types around it, `Hop` is not re-exported.
 #[derive(Clone, Debug)]
 pub struct Hop {
+    /// Edge element traversed by this hop.
     pub edge: Element,
+    /// Direction in which the edge is traversed.
     pub direction: Direction,
+    /// Vertex element reached by this hop.
     pub target: Element,
 }
 
@@ -113,7 +116,9 @@ pub struct Hop {
 /// a different tool (a recursive CTE or a closure table), not a longer pattern.
 #[derive(Clone, Debug)]
 pub struct GraphPattern {
+    /// First vertex element of the path.
     pub(crate) head: Element,
+    /// Hops following the head, in order.
     pub(crate) hops: Vec<Hop>,
 }
 
@@ -151,8 +156,11 @@ impl GraphPattern {
 /// One entry of the `COLUMNS` clause: a graph property projected as a column.
 #[derive(Clone, Debug)]
 pub struct ProjectedColumn {
+    /// Pattern variable the property is read from.
     pub(crate) variable: String,
+    /// Name of the graph property being projected.
     pub(crate) property: String,
+    /// Column alias the property is exposed under.
     pub(crate) alias: String,
 }
 
@@ -192,8 +200,11 @@ impl ProjectedColumn {
 /// A whole `GRAPH_TABLE` construct.
 #[derive(Clone, Debug)]
 pub struct GraphTable {
+    /// Name of the property graph being queried.
     pub(crate) graph: String,
+    /// Path pattern to match.
     pub(crate) pattern: GraphPattern,
+    /// Columns projected from the matched pattern.
     pub(crate) columns: Vec<ProjectedColumn>,
 }
 

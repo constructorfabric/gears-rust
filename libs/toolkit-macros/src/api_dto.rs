@@ -36,6 +36,7 @@ pub fn validate_flags(args: &Punctuated<Ident, Token![,]>) -> Result<(), TokenSt
     Ok(())
 }
 
+/// Expands `#[api_dto(...)]` by adding the serde/schema derives and attributes selected by the flags.
 pub fn expand_api_dto(args: &Punctuated<Ident, Token![,]>, input: &DeriveInput) -> TokenStream {
     if let Err(err) = validate_flags(args) {
         return err;

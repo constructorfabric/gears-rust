@@ -775,7 +775,8 @@ mod tests {
     use crate::infra::specification::TypesRegistrySpecificationManager;
     use crate::infra::storage::migrations::Migrator;
 
-    const TOPIC_ID: &str = "gts.cf.core.events.topic.v1~example.eb.storage.topic.v1";
+    const TOPIC_ID: &str =
+        toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.storage.topic.v1");
 
     /// A `LeasedMessageHandler` that always acknowledges - `Storage`'s own
     /// unit tests exercise `check_and_enqueue`'s transactional
@@ -1031,9 +1032,9 @@ mod tests {
         let err = storage
             .mark_subscription(
                 Uuid::now_v7(),
-                &GtsInstanceId::try_new(
-                    "gts.cf.core.events.consumer_group.v1~example.eb.storage.group.v1",
-                )
+                &GtsInstanceId::try_new(toolkit_gts::gts_id!(
+                    "cf.core.events.consumer_group.v1~example.eb.storage.group.v1"
+                ))
                 .unwrap(),
             )
             .await
@@ -1062,7 +1063,7 @@ mod tests {
         let storage = test_storage().await;
         let tenant_id = Uuid::new_v4();
         let group = test_consumer_group(
-            "gts.cf.core.events.consumer_group.v1~example.eb.storage.cg1.v1",
+            toolkit_gts::gts_id!("cf.core.events.consumer_group.v1~example.eb.storage.cg1.v1"),
             tenant_id,
         );
 
@@ -1105,9 +1106,9 @@ mod tests {
     async fn subscription_marker_round_trip() {
         let storage = test_storage().await;
         let id = Uuid::new_v4();
-        let group = GtsInstanceId::try_new(
-            "gts.cf.core.events.consumer_group.v1~example.eb.storage.cg2.v1",
-        )
+        let group = GtsInstanceId::try_new(toolkit_gts::gts_id!(
+            "cf.core.events.consumer_group.v1~example.eb.storage.cg2.v1"
+        ))
         .unwrap();
         let key = subscription_marker_key(id);
         assert!(
@@ -1153,7 +1154,7 @@ mod tests {
         let storage = test_storage().await;
         let tenant_id = Uuid::new_v4();
         let group = test_consumer_group(
-            "gts.cf.core.events.consumer_group.v1~example.eb.storage.cg3.v1",
+            toolkit_gts::gts_id!("cf.core.events.consumer_group.v1~example.eb.storage.cg3.v1"),
             tenant_id,
         );
         storage
@@ -1213,9 +1214,9 @@ mod tests {
     #[tokio::test]
     async fn group_marker_names_this_instance() {
         let storage = test_storage().await;
-        let group = GtsInstanceId::try_new(
-            "gts.cf.core.events.consumer_group.v1~example.eb.storage.cg4.v1",
-        )
+        let group = GtsInstanceId::try_new(toolkit_gts::gts_id!(
+            "cf.core.events.consumer_group.v1~example.eb.storage.cg4.v1"
+        ))
         .unwrap();
         let key = group_marker_key(&group).expect("a consumer group id is a GTS id");
 

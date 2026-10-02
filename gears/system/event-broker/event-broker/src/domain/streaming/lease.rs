@@ -13,6 +13,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use toolkit::domain_model;
 
 use uuid::Uuid;
 
@@ -29,6 +30,7 @@ pub trait StreamLeases: Send + Sync {
 }
 
 /// The set of subscriptions currently streaming.
+#[domain_model]
 #[derive(Debug, Default)]
 pub struct InProcessStreamLeases {
     open: Arc<Mutex<HashSet<Uuid>>>,
@@ -82,6 +84,7 @@ impl StreamLeases for InProcessStreamLeases {
 ///
 /// Holds its own handle on the set rather than a reference to the registry, so
 /// the lease can be owned by a session that outlives any borrow of it.
+#[domain_model]
 pub struct StreamLease {
     subscription_id: Uuid,
     open: Arc<Mutex<HashSet<Uuid>>>,

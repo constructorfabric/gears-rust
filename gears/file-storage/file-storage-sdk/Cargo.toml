@@ -9,6 +9,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["constructorfabric", "cf-gears", "file-storage"]
 categories = ["api-bindings"]
+metadata.docs.rs.all-features = true
 
 [lib]
 name = "file_storage_sdk"

@@ -25,6 +25,7 @@ pub trait AdvertiseAddressResolver {
 /// `tcp_directory_endpoint`), except erroring on a wildcard bind with no
 /// `advertise_addr` instead of silently skipping registration.
 pub struct ConfigAdvertiseAddress<'a> {
+    /// Registration config supplying the optional `advertise_addr`.
     pub(crate) config: &'a RegistrationConfig,
 }
 

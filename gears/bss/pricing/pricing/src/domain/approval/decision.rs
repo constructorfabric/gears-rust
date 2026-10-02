@@ -182,6 +182,7 @@ pub const WITHDRAW_FORBIDDEN: &str = "WITHDRAW_FORBIDDEN";
 /// the only principal who can reach `withdraw` at all is a `FinanceReviewer`, who
 /// is neither of the two the transition names. `api::rest::approvals`' module doc
 /// reports that contradiction; this type is where it bites.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WithdrawAuthority {
     /// The caller holds `plan × publish` in the tenant — the expressible proxy

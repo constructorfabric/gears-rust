@@ -1059,7 +1059,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-gears
-        run: cargo install --locked cargo-gears
+        run: cargo install --locked --git https://github.com/constructorfabric/cargo-gears
 
       - name: Run architecture lints
         run: cargo gears lint --dylint

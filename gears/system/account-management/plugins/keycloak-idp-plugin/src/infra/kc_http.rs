@@ -142,7 +142,9 @@ pub fn http_status_error(
 /// can attach test-only constructors without splitting tests across two
 /// files (DE1101).
 pub struct ReqwestKcTransport {
+    /// Underlying reqwest client used for all Admin REST calls.
     pub http: Client,
+    /// Retry / backoff policy applied to transient failures.
     pub retry_policy: crate::config::HttpRetryPolicy,
 }
 

@@ -6,6 +6,7 @@
 //! the counter and the outcome list are two views of that one record.
 
 use graph_storage_sdk::models::{IngestCounts, ItemOutcome};
+use toolkit_macros::domain_model;
 
 /// The counters and, when kept, the two per-item lists in batch order.
 pub type TallyParts = (
@@ -15,6 +16,7 @@ pub type TallyParts = (
 );
 
 /// The batch's counters, plus the per-item outcomes when the caller asked.
+#[domain_model]
 #[derive(Debug, Default)]
 pub struct IngestTally {
     pub counts: IngestCounts,

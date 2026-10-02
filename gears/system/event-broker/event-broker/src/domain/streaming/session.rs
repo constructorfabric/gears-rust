@@ -12,6 +12,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
+use toolkit::domain_model;
 
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
@@ -28,6 +29,7 @@ use crate::domain::streaming::read_set::{BatchOutcome, ReadSet};
 use crate::domain::streaming::time::NowFn;
 
 /// Where a session is in its life.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     /// Nothing has been emitted yet. The first frame is the topology baseline,
@@ -43,6 +45,7 @@ pub enum SessionState {
 }
 
 /// One consumption stream.
+#[domain_model]
 pub struct StreamSession {
     state: SessionState,
     read_set: ReadSet,
@@ -397,6 +400,7 @@ impl StreamSession {
 ///
 /// A struct rather than nine arguments: several are same-typed and a positional
 /// call would let them be transposed silently.
+#[domain_model]
 pub struct SessionOpening {
     pub read_set: ReadSet,
     pub filter: Arc<dyn EventFilter>,
@@ -436,6 +440,7 @@ pub struct SessionOpening {
 /// so there is nothing to notice a disconnect and nothing to clean up. If that
 /// allocation ever shows up in a profile, the fix is to rewrite the state
 /// machine as a poll loop, not to put a channel back.
+#[domain_model]
 pub struct FrameStream {
     /// The session, when it is not currently borrowed by a pending future.
     idle: Option<StreamSession>,

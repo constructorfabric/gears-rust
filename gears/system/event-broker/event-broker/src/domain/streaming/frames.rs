@@ -48,6 +48,7 @@ impl Position {
     }
 }
 
+#[domain_model]
 pub struct PositionBuilder {
     topic: GtsInstanceId,
     partition: i32,

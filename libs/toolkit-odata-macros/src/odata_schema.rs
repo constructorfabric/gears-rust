@@ -3,6 +3,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, Ident, Lit, Meta};
 
+/// Expands `#[derive(ODataSchema)]`, generating the schema description of the struct fields.
 pub fn expand_derive_odata_schema(input: &DeriveInput) -> syn::Result<TokenStream> {
     let struct_name = &input.ident;
 

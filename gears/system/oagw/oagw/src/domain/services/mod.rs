@@ -1,4 +1,6 @@
+/// Facade implementing the public SDK client on top of the internal services.
 pub(crate) mod client;
+/// Control-plane (configuration management) service implementation.
 pub(crate) mod management;
 
 pub(crate) use client::ServiceGatewayClientV1Facade;
@@ -128,6 +130,7 @@ pub(crate) enum SelectionError {
 #[domain_model]
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedEndpoint {
+    /// The selected endpoint.
     pub endpoint: Endpoint,
     /// When set, `upstream_peer` can skip DNS and connect directly.
     pub resolved_addr: Option<SocketAddr>,

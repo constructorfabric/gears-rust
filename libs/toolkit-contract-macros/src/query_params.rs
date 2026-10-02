@@ -22,6 +22,7 @@ use syn::{Data, DeriveInput, Fields, Type};
 
 use crate::support::contract_support_path;
 
+/// Expands `#[derive(QueryParams)]` into the type's query-string (de)serialisation impl.
 pub fn generate(input: &DeriveInput) -> syn::Result<TokenStream> {
     let support = contract_support_path();
     let ident = &input.ident;

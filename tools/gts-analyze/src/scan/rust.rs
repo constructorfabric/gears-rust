@@ -15,10 +15,14 @@ use crate::classify::classify_location;
 use crate::model::{InstanceDef, Reference, TypeDef};
 use crate::scan::looks_like_gts_id;
 
+/// GTS items collected from a single Rust source file.
 #[derive(Default)]
 pub struct ScanResult {
+    /// Type definitions found in the file.
     pub types: Vec<TypeDef>,
+    /// Instance declarations found in the file.
     pub instances: Vec<InstanceDef>,
+    /// Other GTS-shaped string references found in the file.
     pub references: Vec<Reference>,
 }
 

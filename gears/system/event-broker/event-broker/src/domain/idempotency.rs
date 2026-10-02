@@ -140,6 +140,7 @@ impl PublishEnqueue {
     }
 }
 
+#[domain_model]
 pub struct PublishEnqueueBuilder {
     chain: Option<ProducerChainCheck>,
     topic_partition: i32,

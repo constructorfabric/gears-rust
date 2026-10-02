@@ -53,9 +53,11 @@ use crate::domain::metrics::{AM_CROSS_TENANT_DENIAL, MetricKind, emit_metric};
 // ---------------------------------------------------------------------------
 
 #[resource_error(gts_id!("cf.core.am.tenant.v1~"))]
+/// Resource marker for tenant errors.
 pub(crate) struct TenantResource;
 
 #[resource_error(gts_id!("cf.core.am.user.v1~"))]
+/// Resource marker for user errors.
 pub(crate) struct UserResource;
 
 // `TenantMetadataResource` carries the unified 404 for the metadata
@@ -65,9 +67,11 @@ pub(crate) struct UserResource;
 // so consumers still see *which* schema was involved without a separate
 // type-level discriminator.
 #[resource_error(gts_id!("cf.core.am.tenant_metadata.v1~"))]
+/// Resource marker for tenant-metadata errors (unified 404).
 pub(crate) struct TenantMetadataResource;
 
 #[resource_error(gts_id!("cf.core.am.conversion_request.v1~"))]
+/// Resource marker for conversion-request errors.
 pub(crate) struct ConversionRequestResource;
 
 // Machine identities carry their own resource type rather than riding
@@ -76,6 +80,7 @@ pub(crate) struct ConversionRequestResource;
 // client keys that distinction off. Pinned against the SDK constant by
 // `sdk_error_mapping_tests`.
 #[resource_error(gts_id!("cf.core.am.service_account.v1~"))]
+/// Resource marker for service-account errors (`resource_type` in the canonical envelope).
 pub(crate) struct ServiceAccountResource;
 
 /// Curated public `field_violations[].description` for one

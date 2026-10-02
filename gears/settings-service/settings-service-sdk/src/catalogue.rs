@@ -33,12 +33,13 @@ use serde_json::{Value, json};
 use toolkit_gts::InventoryTypeSchema;
 
 /// The prefix every catalogue value type shares.
-// A prefix, not an identifier: DE0901 parses any `gts.`-prefixed literal as a
-// whole GTS id and counts four tokens where a complete one has five. The
-// catalogue's own ids below are complete and pass; this is the string they
-// start with.
-#[allow(unknown_lints, de0901_gts_string_pattern)]
-pub const VALUE_TYPE_PREFIX: &str = "gts.cf.core.settings.type_";
+///
+/// A prefix, not an identifier, so it cannot go through `gts_id!` (which
+/// validates a complete id); it is built from [`toolkit_gts::GTS_ID_PREFIX`].
+#[must_use]
+pub fn value_type_prefix() -> String {
+    format!("{}cf.core.settings.type_", toolkit_gts::GTS_ID_PREFIX)
+}
 
 /// One catalogue entry: the type id and the schema it registers.
 #[derive(Debug, Clone, Copy)]

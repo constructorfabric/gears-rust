@@ -73,6 +73,7 @@ pub struct ChainSealer {
 
 impl ChainSealer {
     #[must_use]
+    /// Creates a sealer backed by a fresh chain-state repository.
     pub fn new() -> Self {
         Self {
             chain_state: ChainStateRepo::new(),

@@ -9,6 +9,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["constructorfabric", "cf-gears"]
 categories = ["web-programming"]
+metadata.docs.rs.all-features = true
 
 [lib]
 name = "simple_user_settings_sdk"

@@ -44,6 +44,7 @@ pub type WiredCluster = (ClusterHandle, Vec<Arc<BoundProfile>>);
 /// own backend (`cpt-cf-clst-fr-routing-per-primitive`) or left `None`, in which
 /// case [`ClusterWiringBuilder::build_and_start`] auto-fills it with the SDK
 /// default backend over `cache` (`cpt-cf-clst-fr-routing-omit-default`).
+#[toolkit::domain_model]
 pub struct ProfileBackends {
     cache: Arc<dyn ClusterCacheBackend>,
     leader_election: Option<Arc<dyn LeaderElectionBackend>>,
@@ -174,6 +175,7 @@ impl ProfileBackends {
 }
 
 /// Entry point for wiring the cluster gear.
+#[toolkit::domain_model]
 pub struct ClusterWiring;
 
 impl ClusterWiring {
@@ -515,6 +517,7 @@ async fn build_cache_for_profile(
 
 /// A fluent builder collecting per-profile backend bindings and plugin shutdown
 /// hooks. Finish with [`build_and_start`](Self::build_and_start).
+#[toolkit::domain_model]
 #[must_use = "a wiring builder registers nothing until `.build_and_start()` is called"]
 pub struct ClusterWiringBuilder {
     hub: Arc<ClientHub>,
@@ -869,6 +872,7 @@ fn register_profile_or_rollback(
 /// The running cluster wiring. Backends are registered in the hub; consumers
 /// resolve them with the SDK resolvers (e.g.
 /// `ClusterCacheV1::resolver(handle.hub())`). Owns the wired plugins' shutdown.
+#[toolkit::domain_model]
 pub struct ClusterHandle {
     hub: Arc<ClientHub>,
     registered: Vec<String>,

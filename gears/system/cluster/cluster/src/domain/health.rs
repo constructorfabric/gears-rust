@@ -82,6 +82,7 @@ pub const READINESS_PROBE_BUDGET: Duration = Duration::from_millis(250);
 /// collected before `start` runs any wiring (§4.2's lifecycle constraint), so
 /// there is no backend to capture yet. The registry it holds is the empty one
 /// created in `init`, and it becomes populated under this check's feet.
+#[toolkit::domain_model]
 pub struct ClusterReadiness {
     /// The index this check reads on every probe round.
     profiles: Arc<ProfileRegistry>,

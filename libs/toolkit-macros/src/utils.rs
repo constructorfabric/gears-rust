@@ -4,9 +4,13 @@ use syn::{ImplItem, Path, Type};
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct TraitMethodInfo {
+    /// Name of the trait method.
     pub name: syn::Ident,
+    /// Type of the single request argument.
     pub input_type: Type,
+    /// Success type of the returned `Result`.
     pub output_type: Type,
+    /// Error type of the returned `Result`.
     pub error_type: Type,
 }
 

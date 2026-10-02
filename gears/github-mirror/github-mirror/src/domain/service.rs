@@ -54,144 +54,176 @@ async fn release_sync_lock(lock: toolkit_db::DbLockGuard, lock_key: &str) {
 /// advisory lock indefinitely.
 const SYNC_FETCH_BUDGET: std::time::Duration = std::time::Duration::from_mins(30);
 
+/// Database provider handle the service uses for transactions and queries.
 pub(crate) type DbProvider = toolkit_db::DBProvider<toolkit_db::DbError>;
 
+/// Authorization resource type `github_mirror.repo` (the mirrored repo).
 pub(crate) const REPO_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.repo",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.issue` (the mirrored issue).
 pub(crate) const ISSUE_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.issue",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.pull_request` (the mirrored pull request).
 pub(crate) const PULL_REQUEST_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.pull_request",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.commit` (the mirrored commit).
 pub(crate) const COMMIT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.commit",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.comment` (the mirrored comment).
 pub(crate) const COMMENT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.comment",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.review_comment` (the mirrored review comment).
 pub(crate) const REVIEW_COMMENT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.review_comment",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.review` (the mirrored review).
 pub(crate) const REVIEW_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.review",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.label` (the mirrored label).
 pub(crate) const LABEL_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.label",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.milestone` (the mirrored milestone).
 pub(crate) const MILESTONE_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.milestone",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.release` (the mirrored release).
 pub(crate) const RELEASE_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.release",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.branch` (the mirrored branch).
 pub(crate) const BRANCH_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.branch",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.contributor` (the mirrored contributor).
 pub(crate) const CONTRIBUTOR_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.contributor",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.workflow_run` (the mirrored workflow run).
 pub(crate) const WORKFLOW_RUN_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.workflow_run",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.pull_request_file` (the mirrored pull request file).
 pub(crate) const PULL_REQUEST_FILE_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.pull_request_file",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.tag` (the mirrored tag).
 pub(crate) const TAG_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.tag",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.commit_file` (the mirrored commit file).
 pub(crate) const COMMIT_FILE_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.commit_file",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.review_thread` (the mirrored review thread).
 pub(crate) const REVIEW_THREAD_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.review_thread",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.commit_comment` (the mirrored commit comment).
 pub(crate) const COMMIT_COMMENT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.commit_comment",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.issue_event` (the mirrored issue event).
 pub(crate) const ISSUE_EVENT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.issue_event",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.deployment` (the mirrored deployment).
 pub(crate) const DEPLOYMENT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.deployment",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.pull_request_commit` (the mirrored pull request commit).
 pub(crate) const PULL_REQUEST_COMMIT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.pull_request_commit",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.commit_status` (the mirrored commit status).
 pub(crate) const COMMIT_STATUS_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.commit_status",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.workflow_job` (the mirrored workflow job).
 pub(crate) const WORKFLOW_JOB_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.workflow_job",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.issue_reaction` (the mirrored issue reaction).
 pub(crate) const ISSUE_REACTION_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.issue_reaction",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.check_run` (the mirrored check run).
 pub(crate) const CHECK_RUN_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.check_run",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.issue_timeline` (the mirrored issue timeline).
 pub(crate) const ISSUE_TIMELINE_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.issue_timeline",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.sync` (the mirrored sync).
 pub(crate) const SYNC_RESOURCE: ResourceType =
     ResourceType::from_static("github_mirror.sync", &[pep_properties::OWNER_TENANT_ID]);
 
+/// Action names used when authorizing operations against the mirror's resource types.
 pub(crate) mod actions {
+    /// Action for listing mirrored resources.
     pub const LIST: &str = "list";
+    /// Action for upserting mirrored resources (used by the sync path).
     pub const UPSERT: &str = "upsert";
+    /// Action for triggering a repository sync.
     pub const SYNC: &str = "sync";
 }
 

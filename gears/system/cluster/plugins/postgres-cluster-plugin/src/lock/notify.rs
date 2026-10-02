@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::pg_error::map_sqlx_error;
 
+/// Postgres `NOTIFY` channel on which lock releases are announced to waiters.
 pub const RELEASE_CHANNEL: &str = "cluster_lock_released";
 
 /// `NOTIFY cluster_lock_released, '<name>'` for a batch of names in **one**
@@ -71,6 +72,7 @@ pub struct ReleaseWaiters {
 }
 
 impl ReleaseWaiters {
+    /// Creates an empty waiter registry.
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {

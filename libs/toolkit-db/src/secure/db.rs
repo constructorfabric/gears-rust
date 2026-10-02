@@ -1081,6 +1081,7 @@ impl Db {
 ///     .await?;
 /// ```
 pub struct DbConn<'a> {
+    /// Underlying connection borrowed for the lifetime of this handle.
     pub(crate) conn: &'a DatabaseConnection,
 }
 
@@ -1116,6 +1117,7 @@ impl std::fmt::Debug for DbConn<'_> {
 /// }).await;
 /// ```
 pub struct DbTx<'a> {
+    /// Underlying transaction borrowed for the lifetime of this handle.
     pub(crate) tx: &'a DatabaseTransaction,
 }
 

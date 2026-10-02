@@ -105,6 +105,7 @@ pub struct QueueBuilder {
 }
 
 impl QueueBuilder {
+    /// Creates a queue builder for the named queue with the given partition layout.
     pub(crate) fn new(builder: OutboxBuilder, name: String, partitions: Partitions) -> Self {
         Self {
             builder,

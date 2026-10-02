@@ -18,11 +18,13 @@
 //! Collapsing the two would tell a broken client to retry forever.
 
 use super::error::DomainError;
+use toolkit_macros::domain_model;
 
 /// An entity tag over a resource's persisted representation.
 ///
 /// Compared verbatim as an opaque token: this type never parses or orders tags,
 /// so how one is derived can change without any caller noticing.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ETag(String);
 
@@ -51,6 +53,7 @@ impl std::fmt::Display for ETag {
 /// Carries the current tag forward on success so the handler can echo a
 /// refreshed `ETag` without recomputing it — and, more importantly, so the
 /// value the check passed against is the same one the response reports.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proceed {
     /// The current tag, verified to match what the caller supplied.
