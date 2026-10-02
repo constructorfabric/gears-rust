@@ -60,7 +60,9 @@ impl OidcConfig {
 /// A cached OIDC Discovery entry.
 #[derive(Debug, Clone)]
 pub(crate) struct CachedDiscovery {
+    /// The discovered OIDC provider configuration.
     pub config: OidcConfig,
+    /// When the entry was fetched; used for TTL expiry.
     pub fetched_at: Instant,
 }
 
@@ -108,6 +110,7 @@ impl OidcDiscovery {
         )
     }
 
+    /// Creates a discovery client with an explicit `url_policy` (used by tests to relax URL security checks); `ttl_secs` and `max_entries` size the cache.
     pub(crate) fn new_with_url_policy(
         ttl_secs: u64,
         max_entries: usize,

@@ -127,6 +127,7 @@ pub struct OAuth2ClientCredAuthPlugin {
 }
 
 impl OAuth2ClientCredAuthPlugin {
+    /// Create the plugin with a token cache of the given TTL and capacity.
     #[must_use]
     pub fn new(
         credstore: Arc<dyn CredStoreClientV1>,

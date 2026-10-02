@@ -13,6 +13,7 @@
 //! declared retention survive a deployment that mentions none.
 
 use std::time::Duration;
+use toolkit::domain_model;
 
 use toolkit_gts::GtsInstanceId;
 
@@ -27,6 +28,7 @@ use crate::config::{
 /// number bounding their data came from their own configuration, from the
 /// topic's author, or from a default nobody chose - without reproducing the
 /// resolution by hand.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
@@ -45,6 +47,7 @@ pub enum Source {
 /// Constructed only through the named constructors below: a positional pair
 /// would let a caller attach the wrong source to a value silently, and the
 /// source is the whole reason this type exists.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Sourced<T> {
     value: T,
@@ -106,6 +109,7 @@ impl<T> Sourced<T> {
 /// A struct rather than the bare value it currently carries: the specification
 /// tier sits in the middle of the ladder, and a second declared field would
 /// otherwise change every signature that passes this one through.
+#[domain_model]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Declaration {
     /// The retention the topic declares, if it declares one. Advisory: an
@@ -115,6 +119,7 @@ pub struct Declaration {
 }
 
 /// One topic's settings, resolved, with the provenance of each.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EffectiveSettings {
     partitions: Sourced<i32>,
@@ -150,6 +155,7 @@ impl EffectiveSettings {
     }
 }
 
+#[domain_model]
 pub struct EffectiveSettingsBuilder {
     partitions: Sourced<i32>,
     retention: Option<Sourced<RetentionSettings>>,

@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn omitted_idp_provisioning_defaults_to_false() {
         let cfg: RootTypeConfig = serde_json::from_value(serde_json::json!({
-            "gts_id": "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+            "gts_id": gts_id!("cf.core.am.tenant_type.v1~cf.core.am.platform.v1~")
         }))
         .expect("root-type config");
         assert!(!cfg.idp_provisioning);

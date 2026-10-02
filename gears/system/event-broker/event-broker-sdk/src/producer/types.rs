@@ -37,6 +37,7 @@ impl ProducerIdentity {
         self
     }
 
+    /// Rejects an identity whose `source` is blank.
     pub(crate) fn validate(&self) -> Result<(), crate::error::EventBrokerError> {
         if self.source.trim().is_empty() {
             return Err(crate::error::EventBrokerError::InvalidProducerOptions {
@@ -89,6 +90,7 @@ impl DirectDeduplication {
         Self::Reuse { mode, producer_id }
     }
 
+    /// Rejects option combinations the broker does not support (for example a stateless mode that registers a producer).
     pub(crate) fn validate(&self) -> Result<(), crate::error::EventBrokerError> {
         match *self {
             Self::Stateless => Ok(()),

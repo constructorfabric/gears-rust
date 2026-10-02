@@ -638,6 +638,7 @@ pub struct ThresholdVersion {
 /// `approval::content_pin::put_threshold_version`, which destructures this
 /// exhaustively. Widening the version therefore costs two compile errors and a
 /// decision at the pin, which is the point.
+#[domain_model]
 pub(crate) struct ThresholdVersionParts<'a> {
     /// The version number — the `version` half of the store's primary key.
     pub version: u64,

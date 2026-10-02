@@ -26,7 +26,9 @@ use syn::{Ident, ItemTrait, ReturnType, TraitItem, TraitItemFn, Type};
 
 use crate::model::{MethodShape, StreamFraming, StreamOpen};
 
+/// Parsed arguments of the `#[rest_contract(...)]` attribute.
 pub struct RestContractAttr {
+    /// Base URL path prepended to every method's path template.
     pub base_path: String,
     /// `#[toolkit::rest_contract(base_path = "...", require_full_coverage)]`
     /// (ADR-0003): opt into a generated coverage assertion that every base-trait
@@ -39,24 +41,37 @@ pub struct RestContractAttr {
     pub default_exposed: bool,
 }
 
+/// Parsed REST projection of a contract trait, ready for codegen.
 pub struct RestContractModel {
+    /// The original projection trait item as written by the user.
     pub item: ItemTrait,
+    /// Identifier of the projection trait.
     pub trait_ident: Ident,
+    /// Path of the base contract trait this projection mirrors.
     pub base_trait: syn::Path,
+    /// Base URL path prepended to every method's path template.
     pub base_path: String,
+    /// Whether a coverage assertion between base-trait methods and REST bindings is generated.
     pub require_full_coverage: bool,
+    /// Trait-level default edge visibility; `true` means exposed, `false` internal.
     pub default_exposed: bool,
+    /// Projected methods in declaration order.
     pub methods: Vec<RestMethodModel>,
 }
 
+/// A single method of the REST projection.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "these are independent per-method projection flags (retryable / streaming / optional / server_manual / anonymous) parsed from distinct attributes; a bitflags enum would obscure rather than clarify the 1:1 attribute mapping"
 )]
 pub struct RestMethodModel {
+    /// Rust method identifier.
     pub ident: Ident,
+    /// HTTP verb the method is bound to.
     pub http_method: HttpVerb,
+    /// Path template relative to the base path, with `{placeholder}` segments.
     pub path_template: String,
+    /// Whether the client may retry the call on transient failures.
     pub retryable: bool,
     /// Unary, or server-streaming with how its stream is opened
     /// (`#[streaming] fn` → `Stream(Immediate)`, `#[streaming] async fn` →
@@ -68,6 +83,7 @@ pub struct RestMethodModel {
     /// `#[streaming]` means SSE, which is what it has always meant. Meaningless
     /// for a `MethodShape::Unary` method, where it stays at its default.
     pub stream_framing: StreamFraming,
+    /// Parameters of the method (path, query and body), excluding the receiver.
     pub params: Vec<RestParam>,
     /// `Some((ok_ty, err_ty))` extracted from the method's `Result<T, E>`
     /// return type. Populated for **both** unary and streaming methods (a
@@ -94,17 +110,26 @@ pub struct RestMethodModel {
     pub anonymous: bool,
 }
 
+/// A parameter of a REST projection method.
 pub struct RestParam {
+    /// Parameter name.
     pub ident: Ident,
+    /// Parameter type.
     pub ty: Type,
 }
 
+/// HTTP verb a REST method is bound to.
 #[derive(Clone, Copy)]
 pub enum HttpVerb {
+    /// HTTP `GET`.
     Get,
+    /// HTTP `POST`.
     Post,
+    /// HTTP `PUT`.
     Put,
+    /// HTTP `PATCH`.
     Patch,
+    /// HTTP `DELETE`.
     Delete,
 }
 
@@ -179,6 +204,7 @@ impl syn::parse::Parse for RestContractAttr {
     }
 }
 
+/// Builds a [`RestContractModel`] from the attribute arguments and the annotated projection trait.
 pub fn parse(attr: RestContractAttr, item: ItemTrait) -> syn::Result<RestContractModel> {
     let trait_ident = item.ident.clone();
     let trait_name = trait_ident.to_string();
@@ -562,6 +588,7 @@ fn extract_result_types(ty: &Type) -> syn::Result<(Type, Type)> {
 }
 
 impl HttpVerb {
+    /// Variant name in the runtime IR's HTTP verb enum.
     pub fn ir_variant(self) -> &'static str {
         match self {
             HttpVerb::Get => "Get",
@@ -572,6 +599,7 @@ impl HttpVerb {
         }
     }
 
+    /// Whether this verb conventionally carries a request body.
     pub fn allows_body(self) -> bool {
         matches!(self, HttpVerb::Post | HttpVerb::Put | HttpVerb::Patch)
     }

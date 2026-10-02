@@ -595,7 +595,9 @@ pub struct SecureInsertOne<A, S>
 where
     A: ActiveModelTrait,
 {
+    /// The wrapped `SeaORM` insert statement.
     pub(crate) inner: sea_orm::Insert<A>,
+    /// Typestate marker tracking whether the scope has been applied.
     pub(crate) _state: PhantomData<S>,
 }
 
@@ -791,7 +793,9 @@ pub struct SecureInsertMany<A, S>
 where
     A: ActiveModelTrait,
 {
+    /// The wrapped `SeaORM` insert-many statement.
     pub(crate) inner: sea_orm::InsertMany<A>,
+    /// Typestate marker tracking whether the scope has been applied.
     pub(crate) _state: PhantomData<S>,
 }
 
@@ -1095,8 +1099,11 @@ where
 /// ```
 #[derive(Clone, Debug)]
 pub struct SecureUpdateMany<E: EntityTrait, S> {
+    /// The wrapped `SeaORM` update-many statement.
     pub(crate) inner: sea_orm::UpdateMany<E>,
+    /// Typestate marker tracking whether the scope has been applied.
     pub(crate) _state: PhantomData<S>,
+    /// Whether the caller attempted to update the tenant column, which is rejected on execution.
     pub(crate) tenant_update_attempted: bool,
 }
 
@@ -1242,7 +1249,9 @@ where
 /// ```
 #[derive(Clone, Debug)]
 pub struct SecureDeleteMany<E: EntityTrait, S> {
+    /// The wrapped `SeaORM` delete-many statement.
     pub(crate) inner: sea_orm::DeleteMany<E>,
+    /// Typestate marker tracking whether the scope has been applied.
     pub(crate) _state: PhantomData<S>,
 }
 

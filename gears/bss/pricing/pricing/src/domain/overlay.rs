@@ -236,6 +236,7 @@ pub enum ScopeSelector {
 /// [`ScopeSelector::parts`], whose match binds every field with no rest pattern,
 /// and destructured in turn by `approval::content_pin::put_overlay_revision` — so
 /// widening the selector costs two compile errors and a decision at the pin.
+#[domain_model]
 pub struct ScopeSelectorParts<'a> {
     /// The class, [`ScopeClass::Global`] for the classless scope.
     pub class: ScopeClass,
@@ -494,6 +495,7 @@ pub struct LineKey {
 /// [`LineKey::cohort`] — three accessor calls, which are three things a fourth
 /// field is silently absent from. Produced by [`LineKey::parts`], which
 /// destructures `Self` exhaustively, and destructured in turn at the pin.
+#[domain_model]
 pub struct LineKeyParts<'a> {
     /// The line's target plan.
     pub plan_id: Option<PlanId>,

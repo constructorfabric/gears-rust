@@ -2,6 +2,7 @@
 //! Query options this gear declines across every listing, and the fields a
 //! listing orders by.
 
+use toolkit_macros::domain_model;
 use toolkit_odata::filter::{FieldKind, FilterField};
 
 use crate::domain::error::DomainError;
@@ -44,6 +45,7 @@ pub fn reject_unsupported_options(
 /// pagination library has no spelling for an empty one: a listing ordered on a
 /// column that may be empty fails as soon as a page has a row after it. Such a
 /// column still filters; it does not order.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeclarationOrderField {
     Key,
@@ -74,6 +76,7 @@ impl FilterField for DeclarationOrderField {
 
 /// The fields `GET /categories` orders by: its filter fields less the optional
 /// `domain_affinity`, for the reason [`DeclarationOrderField`] gives.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CategoryOrderField {
     Key,
@@ -100,6 +103,7 @@ impl FilterField for CategoryOrderField {
 /// belongs to value rows and orders nothing here, and the columns that may be
 /// empty would break the page's cursor for the reason [`DeclarationOrderField`]
 /// gives. What remains is what the browse also filters on.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingOrderField {
     Key,

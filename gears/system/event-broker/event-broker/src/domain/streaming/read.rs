@@ -13,17 +13,21 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use toolkit::domain_model;
 
 use crate::domain::model::{Event, Sequence};
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaxEvents(pub usize);
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaxBytes(pub usize);
 
 /// How much one read may return. Distinct argument types rather than two bare
 /// counts, so the two bounds cannot be transposed silently.
+#[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct ReadLimit {
     max_events: usize,
@@ -81,6 +85,7 @@ impl ReadLimit {
 /// A run of events within one resident span, keeping that span's storage alive
 /// for as long as the run is held. Sharing rather than copying is the point:
 /// many readers of one partition must not multiply its resident memory.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct EventSlice {
     events: Arc<[Event]>,
@@ -159,6 +164,7 @@ impl EventSlice {
     }
 }
 
+#[domain_model]
 pub struct EventSliceBuilder {
     events: Arc<[Event]>,
     range: Range<usize>,
@@ -203,6 +209,7 @@ impl EventSliceBuilder {
 /// physically merged: adjacency is derived, so a read spanning four fetches
 /// borrows four storages instead of concatenating them. Callers see one flat
 /// iterator and never learn how many runs it took.
+#[domain_model]
 #[derive(Debug, Clone, Default)]
 pub struct EventBatch {
     runs: Vec<EventSlice>,
@@ -278,6 +285,7 @@ impl EventBatch {
 }
 
 /// What a read of one partition found.
+#[domain_model]
 #[derive(Debug)]
 pub enum PartitionRead {
     /// Served from one or more exactly-adjacent spans accounting for the

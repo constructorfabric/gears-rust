@@ -758,6 +758,7 @@ pub struct ScopeKey {
 /// stops **that file** compiling. A refactor was rejected on `scope_key_columns`'
 /// own stated ground — a comparison that had to parse first would answer
 /// "corrupt" where the honest answer is "these two rows are not on one key".
+#[domain_model]
 pub(crate) struct ScopeKeyParts<'a> {
     pub plan_id: PlanId,
     pub currency: &'a CurrencyCode,

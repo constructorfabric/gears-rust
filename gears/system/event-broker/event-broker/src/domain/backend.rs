@@ -12,6 +12,7 @@
 //! domain" invariant despite talking about the backend boundary.
 
 use std::sync::Arc;
+use toolkit::domain_model;
 
 use event_broker_sdk::EventBrokerBackend;
 use event_broker_sdk::models::{Event as SdkEvent, ProducerMeta as SdkProducerMeta};
@@ -35,6 +36,7 @@ pub trait BackendResolver: Send + Sync {
 
 /// The trivial resolver for this change: always the one backend it was
 /// constructed with, regardless of `topic`.
+#[domain_model]
 pub struct SingleBackendResolver {
     backend: Arc<dyn EventBrokerBackend>,
 }

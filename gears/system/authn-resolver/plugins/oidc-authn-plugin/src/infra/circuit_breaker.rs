@@ -54,8 +54,11 @@ pub(crate) fn host_key(endpoint: &reqwest::Url) -> String {
 /// In-memory, per-process circuit breaker for IdP-facing operations.
 pub struct CircuitBreaker {
     host: String,
+    /// Lock-free state register holding one of the `STATE_*` codes.
     pub(crate) state: CircuitBreakerState,
+    /// Consecutive failures observed in the current state; reset on success and when the breaker opens.
     pub(crate) failure_count: AtomicU32,
+    /// When the breaker last opened; used to decide when `reset_timeout` has elapsed and a half-open probe is allowed.
     pub(crate) opened_at: Mutex<Option<Instant>>,
     failure_threshold: u32,
     reset_timeout: Duration,

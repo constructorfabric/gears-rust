@@ -197,6 +197,7 @@ fn event_type_matches(pattern: &GtsIdPattern, event_type: &GtsTypeId) -> bool {
 }
 
 impl ConsumerHandle {
+    /// Wraps a started `Consumer` in its public handle.
     pub(crate) fn from_consumer(consumer: Consumer) -> Self {
         Self { consumer }
     }
@@ -223,6 +224,7 @@ impl Consumer {
         Self { slots: Vec::new() }
     }
 
+    /// Starts one subscription slot per parallel worker, each dispatching events one at a time to `handler`.
     pub(crate) async fn new_with_slots<M, H>(
         builder: ConsumerBuilder<crate::consumer::builder::BrokerOnly<M>>,
         handler: H,
@@ -235,6 +237,7 @@ impl Consumer {
         Self::new_with_batch_slots(builder, handler).await
     }
 
+    /// Starts one subscription slot per parallel worker, each dispatching event batches to `handler`.
     pub(crate) async fn new_with_batch_slots<M, H>(
         builder: ConsumerBuilder<crate::consumer::builder::BrokerOnly<M>>,
         handler: H,
@@ -329,6 +332,7 @@ impl Consumer {
         Ok(Self { slots })
     }
 
+    /// Starts one subscription slot per parallel worker, dispatching events to the route handler matching topic and type, else the default handler.
     pub(crate) async fn new_with_routed_slots<M>(
         builder: ConsumerBuilder<crate::consumer::builder::BrokerOnly<M>>,
         default_handler: Option<Arc<dyn ConsumerHandler>>,

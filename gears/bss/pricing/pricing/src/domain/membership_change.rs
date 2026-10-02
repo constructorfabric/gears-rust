@@ -18,6 +18,7 @@
 //! text, so it cannot have moved between submit and decide the way a plan's
 //! rows can.
 
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -36,6 +37,7 @@ use time::OffsetDateTime;
 /// intervals **as they stand when the commit runs**). Naming the predecessor
 /// here would pin a fact the proposal does not need and the commit does not
 /// use.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MembershipMoveProposal {
     /// AMS's identity for the payer — [`crate::infra::storage::repo::group_membership_repo`]'s
@@ -59,6 +61,7 @@ pub struct MembershipMoveProposal {
 /// pin identically, which is the same "collections hashed in canonical order,
 /// not the order they arrive in" discipline `content_pin`'s module doc states
 /// for `PlanShape`.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MembershipMoveSet {
     proposals: Vec<MembershipMoveProposal>,

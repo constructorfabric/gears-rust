@@ -49,6 +49,7 @@
 use proc_macro::TokenStream;
 use syn::{DeriveInput, parse_macro_input};
 
+/// Implementation of the `Scopable` derive macro.
 mod scopable;
 
 /// Derive macro for implementing `ScopableEntity`.

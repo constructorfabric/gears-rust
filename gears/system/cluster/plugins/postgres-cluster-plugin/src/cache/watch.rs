@@ -95,8 +95,11 @@ pub fn validate_key_len(key: &str) -> Result<(), ClusterError> {
 /// The `<event_type>` byte of the NOTIFY payload format (DESIGN.md §2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifyEvent {
+    /// The key's value was written (created or overwritten).
     Changed,
+    /// The key was explicitly deleted.
     Deleted,
+    /// The key's TTL elapsed and the entry was reaped.
     Expired,
 }
 
@@ -177,9 +180,22 @@ where
 /// LISTEN task's reconnect-then-`Reset` path.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedNotification {
-    Changed { key: String },
-    Deleted { key: String },
-    Expired { key: String },
+    /// A `C` payload: the value at `key` was written.
+    Changed {
+        /// The cache key named in the payload.
+        key: String,
+    },
+    /// A `D` payload: `key` was explicitly deleted.
+    Deleted {
+        /// The cache key named in the payload.
+        key: String,
+    },
+    /// An `E` payload: `key` expired by TTL.
+    Expired {
+        /// The cache key named in the payload.
+        key: String,
+    },
+    /// Empty or unrecognized payload: consumers must resynchronize rather than trust incremental events.
     Reset,
 }
 
@@ -313,6 +329,7 @@ pub struct WatchRegistry {
 }
 
 impl WatchRegistry {
+    /// Creates an empty, open registry with no watchers.
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {

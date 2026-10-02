@@ -8,7 +8,9 @@
 
 mod classify;
 mod model;
+/// Rendering of the scan report as Markdown or JSON.
 mod render;
+/// Per-file scanners that extract GTS types, instances and references.
 mod scan;
 mod walk;
 

@@ -9,6 +9,7 @@ use crate::domain::error::DomainError;
 // ---------------------------------------------------------------------------
 
 #[resource_error(gts_id!("cf.core.credstore.secret.v1~"))]
+/// Resource marker that scopes canonical errors to the credstore secret resource.
 pub(crate) struct SecretResource;
 
 // ---------------------------------------------------------------------------

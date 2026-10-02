@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn a_well_formed_topic_parses() {
-        let raw = "gts.cf.core.events.topic.v1~example.eb.orders.acme.v1";
+        let raw = toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.orders.acme.v1");
         assert_eq!(parse_topic_id(raw).unwrap().as_ref(), raw);
     }
 

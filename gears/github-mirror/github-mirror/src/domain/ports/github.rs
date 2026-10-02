@@ -21,6 +21,7 @@ use crate::domain::repo::{
 /// exhaustive, so a family added here has to be given a delete before the
 /// crate compiles again. `EnumIter` supplies the iteration, so there is no
 /// hand-written list to keep in step with the variants either.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
 pub enum Listing {
     Issues,
