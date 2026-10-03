@@ -1,5 +1,5 @@
 Created:  2026-09-15 by Constructor Tech
-Updated:  2026-10-02 by Constructor Tech
+Updated:  2026-10-03 by Constructor Tech
 
 # Moving existing values into the immutable-versions store
 
@@ -35,11 +35,14 @@ reshapes the schema and leaves every surviving row `declared`:
 - narrows the `status` check to `(2, 4)`; codes `1` and `3` are retired;
 - rows in `status IN (1, 3)` (unfinished writes and deletes) are deleted;
 - every `active` row becomes `declared`;
-- drops `value_fp`, `fp_key_id` and the index that swept unfinished rows.
+- drops `value_fp`, `fp_key_id` and the index that swept unfinished rows;
+- creates the empty write-intent table `credstore_write_intents` (internal
+  bookkeeping of in-flight secret writes).
 
 `m0002` moves no store bytes and mints no `value_version`. There is **no gc
-table, no maintenance job and no fingerprint fence** after it. Moving the values
-is a separate, one-off job: the **value-migration tool**
+table, no maintenance job and no fingerprint fence** after it. The tool runs
+stop-the-world with no concurrent writer, so it records no write intents.
+Moving the values is a separate, one-off job: the **value-migration tool**
 (`gears/credstore/credstore-value-migration`, package
 `cf-gears-credstore-value-migration`), run by the operator, outside the gear,
 against the database and the stores. The gear does not contain or run it.

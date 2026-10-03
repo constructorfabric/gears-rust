@@ -4,7 +4,7 @@ date: 2026-07-04
 ---
 
 Created:  2026-07-07 by Constructor Tech
-Updated:  2026-10-01 by Constructor Tech
+Updated:  2026-10-03 by Constructor Tech
 
 # ADR-0001: Stateful Gear with Gear-Owned Secret Metadata
 
@@ -27,7 +27,7 @@ Updated:  2026-10-01 by Constructor Tech
 
 **ID**: `cpt-cf-credstore-adr-stateful-gear`
 
-**Amended by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md)**: the write saga with `provisioning`/`deprovisioning` statuses below is replaced by provider-assigned, immutable value versions with a pointer (`value_version`, distinct from the row's own `version` counter) in the row, inline destroy of older versions after a successful write (where the backend supports it), and record deletion through the platform transactional outbox. The backend plugin is no longer a one-value-per-key store: it is a **versioned kv store** keyed by `(tenant_id, record_id)` with three required operations and one optional, each taking the key explicitly — `put(key, value) -> version` (a durable write of a new immutable version; the provider chooses the version), `get(key, version)` (exactly the bytes of the `put` that returned `version`, or not found), `delete_key(key)` (idempotent), and the optional idempotent `destroy(key, Below(version) | Exactly(version))`, which requires versions ordered per key. It still has no list, no CAS and no transactions, so any versioned kv store qualifies. The stateful-gear decision itself — metadata (identity, sharing, ownership, version, the `value_version` pointer) in the gear's table, values in a plugin — is unchanged; it is what makes the pointer possible. The metadata database is the system of record for metadata and is backed up together with the store.
+**Amended by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md)**: the write saga with `provisioning`/`deprovisioning` statuses below is replaced by provider-assigned, immutable value versions with a pointer (`value_version`, distinct from the row's own `version` counter) in the row, a write intent announcing every `put`, destroy of older versions by outbox tasks enqueued in the write's commit transaction (where the backend supports it), and record deletion through the platform transactional outbox. The backend plugin is no longer a one-value-per-key store: it is a **versioned kv store** keyed by `(tenant_id, record_id)` with three required operations and one optional, each taking the key explicitly — `put(key, value) -> version` (a durable write of a new immutable version; the provider chooses the version), `get(key, version)` (exactly the bytes of the `put` that returned `version`, or not found), `delete_key(key)` (idempotent), and the optional idempotent `destroy(key, Below(version) | Exactly(version))`, which requires versions ordered per key. It still has no list, no CAS and no transactions, so any versioned kv store qualifies. The stateful-gear decision itself — metadata (identity, sharing, ownership, version, the `value_version` pointer) in the gear's table, values in a plugin — is unchanged; it is what makes the pointer possible. The metadata database is the system of record for metadata and is backed up together with the store.
 
 ## Context and Problem Statement
 

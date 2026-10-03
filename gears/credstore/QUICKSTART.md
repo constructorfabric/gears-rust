@@ -22,10 +22,12 @@ in `$select` — there is no separate address for the secret alone.
   locally without touching the ancestor's credential
 - List credential records (`$filter`/`$orderby`/`limit`/`cursor`), or bulk-read
   several secrets at once by selecting `secret`
-- Immutable value versions: every write stores a new version in the backend
-  and switches the record's pointer to it; no in-place overwrite, no reaper
-  and no maintenance job. Deleting a record frees the reference at once and
-  purges its backend key through the outbox
+- Immutable value versions: every write announces itself in PostgreSQL (a
+  write intent), stores a new version in the backend and switches the record's
+  pointer to it; no in-place overwrite, no reaper and no maintenance job. The
+  cleanup of superseded and removed versions, and the purge of a deleted
+  record's key, are outbox tasks enqueued in the same transaction that made
+  them necessary. Deleting a record frees the reference at once
 - Best-effort audit of secret reads and writes through `event-broker`
   (`audit_publish_failed` metric on failure)
 - Access denial returned as `404` (not an error) to prevent credential
@@ -57,6 +59,9 @@ gears:
       vendor: "constructorfabric"  # selects backend plugin by vendor name (default: "constructorfabric"; "constructorfabric" -> static-credstore-plugin, "openbao" -> vault-credstore-plugin)
       hierarchy:
         ancestor_cache_ttl_secs: 300 # ancestor-chain cache TTL (default: 300)
+      write:
+        intent_lease_secs: 300      # lease of a write intent, database clock (default: 300; minimum: 60; must be far above the plugin's put timeout)
+        reclaim_batch: 16           # expired intents one reclaim pass handles (default: 16)
       list:
         max_limit: 200              # cap for a metadata-mode page's `limit` (default: 200)
         secret_mode_cap: 25         # cap on how many references a secret-mode ($select=…,secret) request may match (default: 25)
@@ -64,13 +69,16 @@ gears:
 
 There is no `reaper:` or `gc:` block: the gear runs no resident loop and no
 maintenance job, and unknown config keys (including those two) are rejected
-at startup.
+at startup. Expired write intents (left by a writer that crashed or stalled
+between announcing a store write and committing it) are reclaimed at startup,
+before the gear reports ready, and by a pass after every secret write.
 
 **Secrets are provisioned only through this API.** A backend plugin (e.g.
 `static-credstore-plugin` for development) (`CredStorePluginClientV2`) is a versioned
 byte store keyed by `(tenant_id, record_id)`: `put` returns the version, `get`
 reads one, `delete_key` drops the key (called by the outbox after a record
-delete), and `destroy` is optional (`supports_destroy`). There is no way to
+delete, or for a key no record will ever use), and `destroy` is optional
+(`supports_destroy`; called only by the outbox, never inline in a write). There is no way to
 seed a value directly in the plugin's own configuration: the static plugin's
 config carries only `vendor` and `priority`, and any other key (including the
 withdrawn `secrets` block) fails validation at boot. It is a non-durable
