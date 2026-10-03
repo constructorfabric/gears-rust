@@ -1092,7 +1092,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-usage-collector-timescaledb e2e-usage-collector-clickhouse e2e-event-broker
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-usage-collector-timescaledb e2e-usage-collector-clickhouse e2e-event-broker e2e-oop
 
 E2E_TARGET ?=
 # E2E selectors for `make e2e-local`:
@@ -1201,6 +1201,23 @@ e2e-event-broker: py-env
 	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
 	E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv
+
+# Out-of-process (loopback) E2E: boots flight-control + OoP gears as local
+# processes (no Kubernetes) and asserts the cross-process seams. Self-managed:
+# its conftest builds the binaries and owns the process lifecycle, so it runs
+# pytest directly (not via run_e2e.py). `timeout_func_only` keeps the per-test
+# timeout from counting the heavy fixture setup (build + boot + route sync), and
+# the 30s per-test cap (vs pytest.ini's default) leaves headroom for the
+# lifecycle tests' process stop/start + polling while still failing fast.
+## Run the out-of-process (loopback, no-k8s) E2E suite
+e2e-oop: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-flight-control --bin flight-control
+	cargo build -p hello --features oop_module --bin hello-oop
+	cargo build -p cf-api-contracts --features oop_module --bin api-contracts-oop
+	cargo build -p cf-api-contracts-consumer --features oop_module --bin api-contracts-consumer-oop
+	OOP_E2E=1 $(PYTHON) -m pytest testing/e2e/suites/oop \
+		-o timeout_func_only=true --timeout=30 -vv
 
 # -------- Code coverage --------
 
