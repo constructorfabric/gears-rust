@@ -15,7 +15,9 @@
 //! branch regardless, but merging it to `main` is gated on that review.
 //! GCS/etc. remain deferred beyond that.
 
+pub mod hashing_length_guard;
 mod in_memory;
+pub mod length_guard;
 mod local_fs;
 mod s3;
 

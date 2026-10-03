@@ -187,7 +187,7 @@ impl MultipartService {
     }
 
     fn backend_path(file_id: Uuid, version_id: Uuid) -> String {
-        format!("/{file_id}/{version_id}")
+        crate::domain::storage_layout::backend_path(file_id, version_id)
     }
 
     fn actor_kind(ctx: &SecurityContext) -> &'static str {

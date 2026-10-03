@@ -89,10 +89,12 @@ liability that would couple intermediaries to a layout we want free to change.
     (clean logs / no `Referer` leak) and the **URL stable** across re-issue (clean CDN cache). (The token is **never**
     carried in `Authorization` — that header always carries the standard platform JWT.)
   * the query parameter is named **`fs-token`** and the header **`X-FS-Token`**.
-  * **If both are present, the query parameter wins** and the header is ignored — the sidecar reads the query first
-    and falls back to the header only when it is absent (`extract_token`, `bin/sidecar.rs`). The two values are
-    never compared, so a proxy that injects its own `X-FS-Token` cannot override a caller-supplied `?fs-token=`.
-    Callers should send exactly one envelope.
+  * **Either envelope alone is accepted.** When both are present and agree, that shared value is used. When both are
+    present and *disagree*, the sidecar rejects the request outright with **`400 Bad Request`** ("conflicting
+    fs-token in query and header") rather than picking one silently — a caller or intermediary that attached two
+    different credentials to the same request has a bug worth surfacing, not a query-wins/header-wins ambiguity to
+    resolve quietly. When neither is present, the sidecar rejects with `401 Unauthorized`. Callers should send
+    exactly one envelope.
 * **Why a token, not discrete fields:** because we are not S3-compatible, the discrete-field benefits (external
   readability, edge/CDN/WAF/tooling interop, S3-shape familiarity) are moot — and they would lock intermediaries to our
   field layout. The token is **atomic** (signed/verified/rotated as one unit) and **opaque**, which is what makes the
@@ -157,8 +159,8 @@ the dual-envelope (query + header) and the asymmetric, sidecar-cannot-mint prope
 
 ### Implementation note (P2, 2026-07)
 
-**Implemented as** a bespoke, codec-equivalent format rather than literal PASETO `v4.public`
-(`src/infra/signed_url/mod.rs:9-12`): `base64url(json(claims)).base64url(ed25519_signature)` — the JSON claim-set and
+**Implemented as** a bespoke, codec-equivalent format rather than literal PASETO `v4.public`:
+`base64url(json(claims)).base64url(ed25519_signature)` — the JSON claim-set and
 an Ed25519 signature over its serialized bytes, each base64url-encoded and joined with a `.`. There is **no `kid`
 field** anywhere in the token (no footer, no key-id claim); instead, the sidecar's `Verifier` checks a token's
 signature against a small **ordered** set of public keys — the primary (`FS_SIDECAR_PUBLIC_KEY`) plus, optionally,
@@ -186,7 +188,7 @@ correctness gap) remain deferred — tracked as a "Deferred item" in `DECOMPOSIT
 
 ### Claim-set evolution (P2 1.11, 2026-07)
 
-The `Claims` struct (`src/infra/signed_url/mod.rs`) gained two fields since the implementation note above: `content_type`
+The `Claims` struct gained two fields since the implementation note above: `content_type`
 and `etag`, both `String`, `#[serde(default, skip_serializing_if = "String::is_empty")]`. They are populated only on a
 download (`op = get`) token — the control plane stamps the version's stored MIME type and its content ETag
 (`domain::etag::content_etag`) into the claims at `download-url` issuance time — so that the sidecar, which has no DB

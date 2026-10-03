@@ -1,10 +1,406 @@
 //! Database error conversion helpers.
+//!
+//! Three tiers of error handling live here, from least to most specific:
+//!
+//! 1. [`db_err`] -- the untyped fallback: any `Display` error becomes
+//!    `DomainError::Database`, which the REST layer maps to HTTP 500
+//!    (`api/rest/error.rs`). Correct for genuine infrastructure failures
+//!    (connection lost, pool exhausted); wrong for the recoverable ones
+//!    (racing unique-key insert, lock-order deadlock) that (2) and (3) exist
+//!    to catch.
+//! 2. [`conflict_on_unique_violation`] -- classifies a *typed* database
+//!    error (`sea_orm::DbErr` or `toolkit_db::secure::ScopeError`, the two
+//!    shapes this gear's repositories ever see) as a unique-constraint
+//!    violation and maps it to `DomainError::Conflict` (HTTP 409) instead,
+//!    falling back to the same shape `db_err` would have produced otherwise.
+//!    Used where a repository still holds the original typed error, i.e.
+//!    right at the `.map_err(..)` call site of the failing query.
+//!    [`file_not_found_on_foreign_key_violation`] is the same idea for a
+//!    foreign-key violation, mapped to `DomainError::FileNotFound` (HTTP
+//!    404) instead of `Conflict` -- see its own doc comment for why that is
+//!    the correct reading for this gear's one foreign key that can fail
+//!    under a race (`file_versions.file_id`/`multipart_uploads.file_id` ->
+//!    `files.file_id`).
+//! 3. [`transaction_with_bounded_retry`] -- retries a transaction body a
+//!    bounded number of times when it fails with a lock-contention error
+//!    (`PostgreSQL` serialization failure / deadlock, `MySQL` deadlock,
+//!    `SQLite` `BUSY`). Unlike (2), this operates on an already-mapped
+//!    [`DomainError`] (see that function's doc comment for why), because the
+//!    transactions that need it call through repository methods several
+//!    layers away from the raw driver error.
 
 use std::fmt::Display;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
+
+use sea_orm::{DbBackend, DbErr};
+use toolkit_db::contention::is_retryable_contention;
+use toolkit_db::secure::{
+    DEFAULT_TX_RETRY_ATTEMPTS, Db, DbTx, ScopeError,
+    is_foreign_key_violation as toolkit_is_foreign_key_violation,
+    is_unique_violation as toolkit_is_unique_violation,
+};
+use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 
+/// Extract the raw SQLSTATE/vendor error code from a `sea_orm::DbErr`, when
+/// the underlying driver error carries one. Follows the exact descent
+/// `sea_orm::DbErr::sql_err`'s own doc comment demonstrates for reaching
+/// "anything else" beyond its two portable constraint-violation
+/// classifications: unwrap `Exec`/`Query(RuntimeErr::SqlxError(_))` to the
+/// driver's `sqlx::Error::Database`, whose `code()` is the code itself —
+/// unlike the error's `Display` text, never translated by the server's
+/// `lc_messages` setting.
+fn sqlstate(err: &DbErr) -> Option<String> {
+    let (DbErr::Exec(sea_orm::RuntimeErr::SqlxError(e))
+    | DbErr::Query(sea_orm::RuntimeErr::SqlxError(e))) = err
+    else {
+        return None;
+    };
+    let sea_orm::sqlx::Error::Database(driver_err) = e.as_ref() else {
+        return None;
+    };
+    driver_err.code().map(std::borrow::Cow::into_owned)
+}
+
+/// Reach the SQLSTATE behind whichever of the two concrete error shapes this
+/// gear ever hands to [`db_err`] the caller actually passed (see
+/// [`ClassifiableDbError`]'s own doc comment for why only these two occur),
+/// via a plain runtime downcast — never changing the classification
+/// [`Display`] already produced for the message text, only supplementing it.
+fn sqlstate_of_any(e: &dyn std::any::Any) -> Option<String> {
+    if let Some(db_err) = e.downcast_ref::<DbErr>() {
+        return sqlstate(db_err);
+    }
+    if let Some(ScopeError::Db(db_err)) = e.downcast_ref::<ScopeError>() {
+        return sqlstate(db_err);
+    }
+    None
+}
+
 /// Convert any displayable error into a [`DomainError::Database`].
-pub fn db_err(e: impl Display) -> DomainError {
-    DomainError::database(e.to_string())
+///
+/// The untyped fallback from the module doc comment: stringifies the error,
+/// discarding its original shape. Every classifier in this module falls back
+/// to exactly this shape when it does not recognize the error, so switching
+/// one call site to a more specific classifier never changes behaviour
+/// anywhere else.
+///
+/// When the error is (or wraps) a `sea_orm::DbErr` whose driver error carries
+/// a SQLSTATE code, that code is appended to the message as `(SQLSTATE
+/// <code>)` — the exact shape `toolkit_db::contention::is_retryable_contention`
+/// already recognizes via `contains_sqlstate`. This is what lets
+/// [`is_retryable_domain_error`] classify a contention error correctly even
+/// against a non-English `lc_messages` server, where the driver's own
+/// message text no longer contains a recognizable phrase: the code itself is
+/// never translated, so it survives flattening into this string-only
+/// `DomainError::Database` regardless of locale.
+pub fn db_err(e: impl Display + 'static) -> DomainError {
+    let message = e.to_string();
+    let message = match sqlstate_of_any(&e) {
+        Some(code) => format!("{message} (SQLSTATE {code})"),
+        None => message,
+    };
+    DomainError::database(message)
+}
+
+/// A database error shape that can report whether it wraps a
+/// unique-constraint violation.
+///
+/// Implemented for the two error types that actually reach a `db.rs` call
+/// site in this gear:
+/// - `sea_orm::DbErr` -- produced by a raw query that does not go through
+///   `SecureORM` (e.g. a plain `Entity::delete_many()...exec(conn)`);
+/// - `toolkit_db::secure::ScopeError` -- produced by anything routed through
+///   `.secure()`/`secure_insert` (tenant-scoped inserts, scoped
+///   deletes/updates).
+///
+/// [`conflict_on_unique_violation`] is generic over this trait instead of
+/// hard-coding one of the two, because which shape a given repository call
+/// produces depends only on whether that call goes through `.secure()`.
+pub trait ClassifiableDbError: Display {
+    /// Returns `true` if `self` represents a unique-constraint violation
+    /// (`PostgreSQL` `23505`, `SQLite` "UNIQUE constraint failed", `MySQL`
+    /// `1062`, ...). See `toolkit_db::secure::error::is_unique_violation`
+    /// for the exact detection rules (SQLSTATE fast path + message
+    /// fallback).
+    fn is_unique_violation(&self) -> bool;
+
+    /// Returns `true` if `self` represents a foreign-key-constraint
+    /// violation. See `toolkit_db::secure::error::is_foreign_key_violation`
+    /// for the exact detection rules.
+    fn is_foreign_key_violation(&self) -> bool;
+}
+
+impl ClassifiableDbError for DbErr {
+    fn is_unique_violation(&self) -> bool {
+        toolkit_is_unique_violation(self)
+    }
+
+    fn is_foreign_key_violation(&self) -> bool {
+        toolkit_is_foreign_key_violation(self)
+    }
+}
+
+impl ClassifiableDbError for ScopeError {
+    fn is_unique_violation(&self) -> bool {
+        // Only the `Db` variant can be a unique-constraint violation; every
+        // other variant is a scope/validation error the database never saw.
+        match self {
+            Self::Db(db_err) => toolkit_is_unique_violation(db_err),
+            _ => false,
+        }
+    }
+
+    fn is_foreign_key_violation(&self) -> bool {
+        // Only the `Db` variant can be a foreign-key violation; every other
+        // variant is a scope/validation error the database never saw.
+        match self {
+            Self::Db(db_err) => toolkit_is_foreign_key_violation(db_err),
+            _ => false,
+        }
+    }
+}
+
+/// Classify a database error: a unique-constraint violation becomes
+/// `DomainError::Conflict` (HTTP 409, `api/rest/error.rs`) with
+/// `conflict_message`; anything else falls back to exactly the
+/// `DomainError::Database` shape [`db_err`] would have produced (HTTP 500).
+///
+/// `conflict_message` must be safe to return to the client verbatim --
+/// `DomainError::Conflict`'s payload is sent as-is
+/// (`FileResourceError::aborted(message)` in `api/rest/error.rs`). The
+/// original error's text is never included in it; it is logged at `DEBUG`
+/// instead, only on the conflict path, so a client-facing conflict always
+/// leaves a matching log line with the underlying constraint. The argument
+/// is lazily converted (`impl Into<String>`) so the common fallback path
+/// never pays for a `String` it discards.
+///
+/// Only call sites backed by a unique index that holds an application-level
+/// invariant use this instead of plain [`db_err`]
+/// (`repo/idempotency_repo.rs::insert`, `repo/policy_repo.rs::upsert`); reads,
+/// unconditional deletes, and inserts with no such invariant have nothing
+/// more specific to say than "a database error occurred".
+pub fn conflict_on_unique_violation<E: ClassifiableDbError + 'static>(
+    e: E,
+    conflict_message: impl Into<String>,
+) -> DomainError {
+    if e.is_unique_violation() {
+        let message = conflict_message.into();
+        tracing::debug!(
+            error = %e,
+            conflict_message = %message,
+            "database unique-constraint violation classified as a conflict"
+        );
+        DomainError::conflict(message)
+    } else {
+        db_err(e)
+    }
+}
+
+/// Classify a database error: a foreign-key-constraint violation becomes
+/// `DomainError::FileNotFound` (HTTP 404); anything else falls back to
+/// exactly the `DomainError::Database` shape [`db_err`] would have produced
+/// (HTTP 500).
+///
+/// This gear has exactly one foreign key that can fail under a race rather
+/// than a programming error: `file_versions.file_id` / `multipart_uploads.file_id`
+/// both `REFERENCES files (file_id)`, and the only rows ever inserted into
+/// either child table are written by `VersionRepo::insert`/`MultipartRepo::
+/// create` on a `file_id` the caller already read moments earlier
+/// (`require_file`/`get_file`). A violation there means the parent row was
+/// deleted concurrently between that read and this insert (see
+/// `FileRepo::lock_for_update`'s callers for the delete side of this race) --
+/// i.e. exactly the caller-facing meaning of `FileNotFound`, not an
+/// application bug and not a generic 500.
+///
+/// `file_id` is logged (`DEBUG`, only on the classified path) alongside the
+/// original error text for diagnosis; the returned `DomainError::FileNotFound`
+/// carries only `file_id`, same as every other `FileNotFound` call site.
+pub fn file_not_found_on_foreign_key_violation<E: ClassifiableDbError + 'static>(
+    e: E,
+    file_id: Uuid,
+) -> DomainError {
+    if e.is_foreign_key_violation() {
+        tracing::debug!(
+            error = %e,
+            %file_id,
+            "foreign-key violation against a deleted file classified as file-not-found"
+        );
+        DomainError::file_not_found(file_id)
+    } else {
+        db_err(e)
+    }
+}
+
+/// Attempt budget for [`transaction_with_bounded_retry`].
+///
+/// Reuses [`toolkit_db::secure::DEFAULT_TX_RETRY_ATTEMPTS`] (3: the first try
+/// plus two retries) -- the same bounded-retry budget the rest of the
+/// workspace standardizes on, rather than a gear-local number.
+const TX_RETRY_ATTEMPTS: u32 = DEFAULT_TX_RETRY_ATTEMPTS;
+
+/// Base delay, growth factor, and cap for [`retry_backoff_delay`].
+///
+/// Deliberately small: every transaction this wrapper is applied to is a
+/// handful of point writes against indexed rows, not a batch job -- even
+/// three failed attempts in a row add at most a few hundred milliseconds of
+/// backoff before giving up and returning the last error.
+const RETRY_BACKOFF_BASE_MS: u64 = 10;
+const RETRY_BACKOFF_FACTOR: u64 = 2;
+const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(200);
+
+/// Small jittered backoff before retry attempt `next_attempt` (which must be
+/// `>= 2`; the first attempt is never delayed).
+///
+/// A from-scratch reimplementation of `toolkit_db::secure::db`'s private
+/// exponential-with-jitter helper (see [`transaction_with_bounded_retry`] for
+/// why this gear cannot reuse that one directly). The jitter matters: without
+/// it, two transactions that just deadlocked against each other would both
+/// wake and retry at the same instant and could collide again.
+fn retry_backoff_delay(next_attempt: u32) -> Duration {
+    use tokio_retry::strategy::{ExponentialBackoff, jitter};
+
+    debug_assert!(
+        next_attempt >= 2,
+        "attempt 1 (the first try) is never delayed"
+    );
+    // 0-based index into the backoff sequence: the delay before attempt 2 is
+    // the sequence's first element, attempt 3's delay is the second, ...
+    let index = next_attempt.saturating_sub(2) as usize;
+
+    let base = ExponentialBackoff::from_millis(RETRY_BACKOFF_BASE_MS)
+        .factor(RETRY_BACKOFF_FACTOR)
+        .max_delay(RETRY_BACKOFF_MAX)
+        .nth(index)
+        .unwrap_or(RETRY_BACKOFF_MAX);
+
+    jitter(base)
+}
+
+/// Re-derive retryable-contention classification for an already-mapped
+/// [`DomainError`].
+///
+/// # Why this works on a string, not the original `DbErr`
+///
+/// By the time an error reaches [`transaction_with_bounded_retry`], the
+/// repository methods it calls through have already flattened their
+/// `DbErr`/`ScopeError` into a `DomainError::Database` string via [`db_err`];
+/// the typed error is gone. `is_retryable_contention` classifies by matching
+/// the error's message text against backend-specific signatures (SQLSTATE
+/// codes and message fragments), and already accepts a `DbErr::Custom(msg)`
+/// for exactly this case -- a documented path in `toolkit_db::contention` --
+/// so re-wrapping the stored string in a synthetic `DbErr::Custom` reuses
+/// that matching logic unchanged. This no longer depends on the driver's
+/// message text being in English: [`db_err`] appends the original error's raw
+/// SQLSTATE code (when the driver supplied one) to the stored message in the
+/// exact `(SQLSTATE <code>)` shape `is_retryable_contention` recognizes, and
+/// that code is never translated by the server's `lc_messages` setting the
+/// way the surrounding message text is. A driver error that carries no code
+/// at all (rare, but not impossible depending on how a proxy/pooler reports
+/// it) still falls back to matching the message text alone, which remains
+/// locale-dependent in that narrower case.
+///
+/// A `DomainError` variant other than `Database` (e.g. `Conflict`,
+/// `PreconditionFailed`) is never retried: those are domain decisions made
+/// by the transaction body itself, not database errors, and retrying them
+/// would just reproduce the same decision.
+fn is_retryable_domain_error(e: &DomainError, backend: DbBackend) -> bool {
+    match e {
+        DomainError::Database { message } => {
+            is_retryable_contention(backend, &DbErr::Custom(message.clone()))
+        }
+        _ => false,
+    }
+}
+
+/// Run a transaction with a bounded number of retries on transient
+/// lock-contention failures (`PostgreSQL` serialization failure `40001` /
+/// deadlock `40P01`, `MySQL`/`InnoDB` deadlock, `SQLite` `BUSY` /
+/// `BUSY_SNAPSHOT` -- see `toolkit_db::contention`).
+///
+/// # Why a bespoke wrapper instead of `Db::transaction_with_retry`
+///
+/// `toolkit_db::secure::Db` already provides
+/// [`Db::transaction_with_retry`](toolkit_db::secure::Db::transaction_with_retry),
+/// but it requires an `extract_db_err: Fn(&E) -> Option<&sea_orm::DbErr>`
+/// accessor to reach the original `DbErr` back out of the returned error.
+/// `DomainError::Database` holds only a `String`, so no such accessor can
+/// exist. This wrapper reimplements the same retry/backoff shape against
+/// `Db::transaction_ref_mapped`, using [`is_retryable_domain_error`]'s
+/// string-based reclassification instead.
+///
+/// # `FnMut`, not `FnOnce`: cloning per attempt
+///
+/// `Db::transaction_ref_mapped` takes an `FnOnce` closure, but a retry loop
+/// must run the same logical attempt again after a failure. `body` is
+/// therefore `FnMut`, and every retryable call site in `store/*.rs` clones
+/// its captured state (audit rows, events, byte buffers, ...) *inside*
+/// `body`, once per invocation, before moving the clones into the
+/// `async move` block -- the outer `move` closure keeps the originals for
+/// the next attempt; only the per-attempt clones are consumed. Every such
+/// value is a small, owned, `#[derive(Clone)]` type (domain rows, scalar
+/// hashes/strings) with no connection or transaction state to re-use.
+///
+/// # Safety precondition: no side effects outside the DB before commit
+///
+/// Retrying re-runs `body` from a fresh `BEGIN`, so `body` must not perform
+/// any effect that persists outside the (rolled-back) transaction -- an
+/// outbound network call, a spawned task, anything the rollback would not
+/// undo. This holds at every call site this wrapper is applied to
+/// (`store/versions.rs`, `store/files.rs`, `store/metadata.rs`): each `body`
+/// only calls repository methods against `tx`, including
+/// `EventsOutboxRepo::enqueue`, which inserts an outbox row as part of the
+/// same transaction rather than sending anything directly. It is not applied
+/// to every transaction in the gear -- see those modules' call sites for
+/// which ones were left un-retried and why.
+///
+/// # Errors
+///
+/// Returns the last `DomainError` once [`TX_RETRY_ATTEMPTS`] is exhausted, or
+/// immediately for any error [`is_retryable_domain_error`] does not
+/// recognize as retryable -- in both cases the same error a non-retrying
+/// caller of `transaction_ref_mapped` would have received.
+pub async fn transaction_with_bounded_retry<T, F>(db: &Db, mut body: F) -> Result<T, DomainError>
+where
+    T: Send + 'static,
+    F: for<'a> FnMut(
+            &'a DbTx<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<T, DomainError>> + Send + 'a>>
+        + Send,
+{
+    let backend = db.backend();
+    let mut attempt: u32 = 1;
+
+    loop {
+        // `|tx| body(tx)` is a fresh `FnOnce` per iteration (it uniquely
+        // borrows `body` for one call), which is all `transaction_ref_mapped`
+        // requires -- `body` stays `FnMut` and available for the next
+        // attempt.
+        let result = db.transaction_ref_mapped(|tx| body(tx)).await;
+
+        match result {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if attempt < TX_RETRY_ATTEMPTS && is_retryable_domain_error(&e, backend) {
+                    let next_attempt = attempt + 1;
+                    let delay = retry_backoff_delay(next_attempt);
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = TX_RETRY_ATTEMPTS,
+                        delay = ?delay,
+                        error = %e,
+                        "retrying transaction after a likely lock-contention failure"
+                    );
+                    // Jittered -- see `retry_backoff_delay`.
+                    tokio::time::sleep(delay).await;
+                    attempt = next_attempt;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
 }

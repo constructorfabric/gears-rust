@@ -79,10 +79,13 @@ planes:
 * **Data plane** — the **sidecar**. It has its own domain and URL and is the only component that
   moves user bytes. It is connected to N storage backends and validates the signed-URL signature
   (and a platform token only when the signed URL carries a token-claim predicate — see DESIGN §3.2).
-  **Shipped path (P2):** the sidecar reaches the control plane over a **plain, token-authenticated
-  HTTP callback** — `POST .../versions/{version_id}/finalize` after a successful `PUT`, and
+  **Shipped path (P2):** the sidecar reaches the control plane over a
+  **token-authenticated HTTP callback** — `POST .../versions/{version_id}/finalize` after a successful `PUT`, and
   `POST .../multipart/{upload_id}/parts/{n}/report` after a successful part write — both authorized
-  solely by the **same signed `fs-token`** that authorized the original operation. There is no FS SDK
+  solely by the **same signed `fs-token`** that authorized the original operation. These callbacks are
+  token-authenticated HTTP inside the deployment's trusted network boundary; when the callback path
+  crosses an untrusted or shared network it **MUST** use TLS (or equivalent authenticated encryption),
+  otherwise the internal token and the callback payload travel in cleartext. There is no FS SDK
   s2s call, no app-token, and no on-behalf-of delegation: the control plane treats a verified token as
   full authorization for that one `(file_id, version_id)` operation. The sidecar holds **no** direct
   database connection and is a thin, stateless byte-mover. It never binds a version as the file's
@@ -117,10 +120,14 @@ retained — they simply move into the sidecar, which is platform-controlled inf
 * a single client protocol independent of backend.
 
 A **read** is therefore two HTTP requests: a control request (obtain a signed GET URL) plus a data
-request against the sidecar. A **write** is more: **presign (control) → `PUT` (data) → finalize
-(data→control, a token-authenticated callback) → `bind` (control)** — three control-plane touches and
-one data-plane touch, not the two-request model this ADR originally described (see the Implementation
-note above).
+request against the sidecar. A **write** using the staged, manual-bind flow is more: **presign (control) →
+`PUT` (data) → finalize (data→control, a token-authenticated callback) → `bind` (control)** — three
+control-plane touches and one data-plane touch, not the two-request model this ADR originally described
+(see the Implementation note above). *Amendment:* the default `bind: "auto"` path (same Implementation
+note) folds the client-issued `bind` into the same finalize transaction the sidecar's callback already
+triggers, so the client itself only ever makes **two** requests — create (presign) and `PUT` — for a
+brand-new file's first content; the three-control-plane-touch count above still describes the manual-bind
+staged flow and a version bound after the fact.
 
 Signed URLs are **Ed25519, stateless** (S3-presigned-style): the control plane signs with a private
 key and is the **sole minter**; the sidecar verifies with the public key and can never forge a URL.
@@ -128,8 +135,10 @@ Constraints are AND-combined into the signed payload — `exp` (required, capped
 `max_url_ttl`, recommended 7 days, enforced by the control plane at signing), optional
 `ip`/CIDR, optional predicates over token claims (`tok.typ`, `tok.sub`, `tok.tenant_id`, …), and — on
 upload URLs — an optional size bound (`max_size` or `exact_size`, mutually exclusive) and
-`expected_hash`. Bandwidth (`max_rate`) and connection (`max_conns`) caps are declared but enforced in
-P2. The control plane signs with one active keypair at a time (private in control config, public in
+`expected_hash`. `ip`/CIDR, token-claim predicates, and bandwidth (`max_rate`)/connection (`max_conns`)
+caps are declared here as part of the constraint model's design but are **not implemented**: the token
+carries none of these fields, and the sidecar enforces none of them — a documented extension point, not
+a shipped capability. The control plane signs with one active keypair at a time (private in control config, public in
 sidecar config); the sidecar verifies against a small ordered **set** of public keys — the active one
 plus, during a rotation window, previously-active ones (`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`) — which is
 what lets `signing_key_seed` be rotated without an outage or invalidating already-issued signed URLs
@@ -170,9 +179,8 @@ emergency revocation is the platform auth module's token revocation, not the URL
   `sign_url`), so a client could always call `finalize`/`report-part` itself at a time of its
   choosing, replay reports, or otherwise occupy the trust position the callback was designed for the
   sidecar alone. The data-integrity half of this was already closed independently (the control plane
-  re-derives `size`/`hash`/`mime_type` from a real streaming read-back — see
-  `domain/service/write.rs::read_back_and_hash_streaming` — so a forged claim cannot corrupt stored
-  metadata). What remained was *who* is allowed to call these two routes at all. The chosen
+  re-derives `size`/`hash`/`mime_type` from a real streaming read-back of the backend bytes, so a
+  forged claim cannot corrupt stored metadata). What remained was *who* is allowed to call these two routes at all. The chosen
   mechanism is an **interim gear-local shared secret** (not the platform's
   `toolkit-security::internal_auth` profiles, which are not yet deployable in this gear — Profile 1
   is in-process-only trust, useless across the sidecar/control-plane process boundary; Profile 2
@@ -182,7 +190,10 @@ emergency revocation is the platform auth module's token revocation, not the URL
   When configured, `finalize`/`report-part` additionally require a `x-fs-internal-token` header
   matching the configured secret (constant-time comparison via `ring::constant_time`,
   `handlers::FinalizeAuth`), checked *after* `fs-token` verification; a missing/mismatched header is
-  a `403`. The sidecar sends this header (from `FS_SIDECAR_INTERNAL_TOKEN`) on both callbacks when
+  a `403`. Like the `fs-token` callback authorization above, this header is token-authenticated HTTP
+  within the deployment's trusted network boundary; it too **MUST** travel over TLS (or equivalent
+  authenticated encryption) when the callback path crosses an untrusted or shared network, since the
+  shared secret alone gives the header no confidentiality in transit. The sidecar sends this header (from `FS_SIDECAR_INTERNAL_TOKEN`) on both callbacks when
   configured; an unset secret on the control plane preserves pre-0.1 behavior (token-only trust),
   while a control plane that has the secret set answers `403` to any sidecar not yet sending the
   header, so **the rollout order matters**: (1) redeploy every sidecar talking to the control plane with the matching
@@ -211,14 +222,14 @@ emergency revocation is the platform auth module's token revocation, not the URL
   read-back. Mitigations available today: enable `finalize_internal_secret` +
   `require_finalize_internal_secret` so only the sidecar (not an arbitrary
   token holder) can reach `report_part`/`finalize` at all — this gate already
-  covers `report_part`, not just `finalize` (`handlers::report_multipart_part`
-  calls the same `FinalizeAuth::verify`). A durable fix (deriving the part
+  covers `report_part`, not just `finalize`, both checked the same way. A durable fix (deriving the part
   hash from a sidecar-side value the control plane can independently trust,
   or re-hashing the assembled object) is future work, out of scope for this
   remediation. A related gap in the same release gate is now closed in code for every shipping
-  backend, though the closure differs by backend: `StorageBackend::publish_exclusive`'s **default**
-  implementation (`infra/backend/mod.rs`) is a non-atomic (TOCTOU) `exists`-then-`put`, but no
-  shipping backend relies on that default. `LocalFsBackend` (`std::fs::hard_link`, which atomically
+  backend: `StorageBackend::publish_exclusive` has **no default trait implementation** at all (a
+  backend-agnostic `exists`-then-write fallback would necessarily be the same non-atomic TOCTOU this
+  paragraph closes, so the trait does not offer one) — every backend implements its own atomic write.
+  `LocalFsBackend` (`std::fs::hard_link`, which atomically
   fails `AlreadyExists` if the target already exists) and `InMemoryBackend` (a single mutex guarding
   both the check and the insert) each override it with a fully atomic, provider-independent
   implementation; `S3Backend` **overrides** it with an atomic conditional write (`If-None-Match: *`
