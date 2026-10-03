@@ -107,6 +107,12 @@ use timescaledb_usage_collector_plugin as _;
 
 #[cfg(feature = "clickhouse-usage-collector")]
 use clickhouse_usage_collector_plugin as _;
+#[cfg(feature = "quota-enforcement")]
+use cluster as _;
+#[cfg(feature = "quota-enforcement")]
+use quota_enforcement as _;
+#[cfg(feature = "quota-enforcement")]
+use quota_enforcement_storage_plugin as _;
 
 #[cfg(feature = "bss-products")]
 use bss_products as _;
