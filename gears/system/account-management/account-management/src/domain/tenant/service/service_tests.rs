@@ -946,6 +946,154 @@ async fn update_tenant_accepts_oversized_name_when_gts_schema_unregistered() {
     assert_eq!(info.name.chars().count(), 256);
 }
 
+// ---- Tenant name whitespace policy -----------------------------
+//
+// An all-whitespace name passes the schema's `minLength: 1` and the
+// DB `CHECK (length(name) BETWEEN 1 AND 255)`, so the AM-side
+// trim + empty check in `normalize_tenant_name` is the only gate.
+// `ConstantTypesRegistry` reports the tenant schema as unregistered,
+// which pins that the rule holds without the GTS schema.
+
+#[tokio::test]
+async fn create_tenant_rejects_all_whitespace_name_before_any_side_effect() {
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x7A1);
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let idp = Arc::new(FakeIdpProvisioner::new(FakeOutcome::Ok));
+    let svc = TenantService::new(
+        repo.clone(),
+        idp.clone(),
+        Arc::new(InertResourceOwnershipChecker),
+        crate::domain::tenant_type::inert_tenant_type_checker(),
+        mock_enforcer(),
+        AccountManagementConfig::default(),
+    )
+    .with_types_registry(Arc::new(ConstantTypesRegistry));
+
+    for name in ["", "   ", "\t\n "] {
+        let mut input = child_input(child, root);
+        input.name = name.to_owned();
+        let err = svc
+            .create_tenant(&ctx_for(root), input)
+            .await
+            .expect_err("empty / all-whitespace name MUST reject");
+        match err {
+            DomainError::Validation { detail } => assert!(
+                detail.contains("create_tenant") && detail.contains("all-whitespace"),
+                "Validation must name the rule; got: {detail}"
+            ),
+            other => panic!("expected Validation for {name:?}, got {other:?}"),
+        }
+    }
+    assert!(
+        repo.find_by_id(&AccessScope::allow_all(), child)
+            .await
+            .expect("repo")
+            .is_none(),
+        "rejected name MUST NOT leave a provisioning row"
+    );
+    assert_eq!(
+        idp.calls.lock().expect("lock").len(),
+        0,
+        "rejected name MUST short-circuit BEFORE the IdP round-trip"
+    );
+}
+
+#[tokio::test]
+async fn create_tenant_persists_trimmed_name() {
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x7A2);
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let svc = make_service(repo.clone(), FakeOutcome::Ok);
+    let mut input = child_input(child, root);
+    input.name = "  acme\t".to_owned();
+
+    let created = svc
+        .create_tenant(&ctx_for(root), input)
+        .await
+        .expect("padded name is accepted");
+
+    assert_eq!(created.name, "acme");
+    let row = repo
+        .find_by_id(&AccessScope::allow_all(), child)
+        .await
+        .expect("repo")
+        .expect("child row present");
+    assert_eq!(row.name, "acme", "stored name MUST be the trimmed value");
+}
+
+#[tokio::test]
+async fn update_tenant_rejects_all_whitespace_name_and_keeps_row() {
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x7A3);
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let svc = make_service(repo.clone(), FakeOutcome::Ok);
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
+        .await
+        .expect("create");
+
+    let err = svc
+        .update_tenant(
+            &ctx_for(root),
+            child,
+            UpdateTenantRequest::new().with_name("   "),
+        )
+        .await
+        .expect_err("all-whitespace rename MUST reject");
+    match err {
+        DomainError::Validation { detail } => assert!(
+            detail.contains("update_tenant") && detail.contains("all-whitespace"),
+            "Validation must name the rule; got: {detail}"
+        ),
+        other => panic!("expected Validation, got {other:?}"),
+    }
+
+    let row = repo
+        .find_by_id(&AccessScope::allow_all(), child)
+        .await
+        .expect("repo")
+        .expect("child row present");
+    assert_eq!(row.name, "child", "rejected rename MUST NOT touch the row");
+}
+
+#[tokio::test]
+async fn update_tenant_padded_current_name_is_idempotent_no_op() {
+    let root = Uuid::from_u128(0x100);
+    let child = Uuid::from_u128(0x7A4);
+    let repo = Arc::new(FakeTenantRepo::with_root(root));
+    let svc = make_service(repo.clone(), FakeOutcome::Ok);
+    svc.create_tenant(&ctx_for(root), child_input(child, root))
+        .await
+        .expect("create");
+    let before = repo
+        .find_by_id(&AccessScope::allow_all(), child)
+        .await
+        .expect("repo")
+        .expect("child row present");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+    let info = svc
+        .update_tenant(
+            &ctx_for(root),
+            child,
+            UpdateTenantRequest::new().with_name(" child "),
+        )
+        .await
+        .expect("padded current name is accepted");
+
+    assert_eq!(info.name, "child");
+    let after = repo
+        .find_by_id(&AccessScope::allow_all(), child)
+        .await
+        .expect("repo")
+        .expect("child row present");
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "padded current name MUST trim to a no-op: no DB write, no `updated_at` bump"
+    );
+}
+
 // ---- Closure invariant end-to-end ------------------------------
 
 #[tokio::test]

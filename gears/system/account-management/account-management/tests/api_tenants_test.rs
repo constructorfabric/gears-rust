@@ -145,6 +145,55 @@ async fn create_tenant_with_unknown_field_returns_validation_error() {
     );
 }
 
+#[tokio::test]
+async fn create_tenant_all_whitespace_name_returns_400_and_persists_nothing() {
+    // `"   "` passes the schema's `minLength: 1` and the DB length
+    // CHECK; the service-layer trim + empty rule is what rejects it.
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+
+    let services = build_services(&h);
+    let router = build_test_router(&services);
+
+    let body = serde_json::json!({
+        "name": "   ",
+        "parent_id": root.to_string(),
+        "tenant_type": SAMPLE_TENANT_TYPE,
+    });
+    let req = json_request(
+        "POST",
+        "/account-management/v1/tenants",
+        Some(body),
+        ctx_for(root),
+    );
+    let resp = router.clone().oneshot(req).await.expect("router");
+    let (status, body) = response_problem(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["status"], 400);
+    assert!(
+        body["context"]["field_violations"][0]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("all-whitespace")),
+        "field violation must name the whitespace rule: {body}"
+    );
+
+    let req = json_request(
+        "GET",
+        &format!("/account-management/v1/tenants/{root}/children"),
+        None,
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    assert_eq!(
+        body["items"].as_array().map(Vec::len),
+        Some(0),
+        "rejected create MUST NOT persist a child: {body}"
+    );
+}
+
 // ─── GET /tenants/{id} ───────────────────────────────────────────────
 
 #[tokio::test]
@@ -275,6 +324,48 @@ async fn update_tenant_empty_body_returns_400() {
     );
     let resp = router.oneshot(req).await.expect("router");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn update_tenant_all_whitespace_name_returns_400() {
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let child = Uuid::new_v4();
+    seed_active_child(&h, child, root, "child", 1).await;
+
+    let services = build_services(&h);
+    let router = build_test_router(&services);
+
+    let req = json_request(
+        "PATCH",
+        &format!("/account-management/v1/tenants/{child}"),
+        Some(serde_json::json!({ "name": "   " })),
+        ctx_for(root),
+    );
+    let resp = router.clone().oneshot(req).await.expect("router");
+    let (status, body) = response_problem(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["context"]["field_violations"][0]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("all-whitespace")),
+        "field violation must name the whitespace rule: {body}"
+    );
+
+    let req = json_request(
+        "GET",
+        &format!("/account-management/v1/tenants/{child}"),
+        None,
+        ctx_for(root),
+    );
+    let resp = router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    assert_eq!(
+        body["name"], "child",
+        "rejected rename MUST NOT touch the row"
+    );
 }
 
 #[tokio::test]
