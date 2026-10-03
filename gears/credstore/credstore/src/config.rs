@@ -1,7 +1,7 @@
 //! Validated credential-store configuration.
 //!
-//! Controls backend plugin selection, hierarchy-cache lifetime and the
-//! collection-read caps. ADR-0006 withdraws the `reaper` block (`tick_secs`,
+//! Controls backend plugin selection, hierarchy-cache lifetime, the
+//! collection-read caps and the secret-write intent lease. ADR-0006 withdraws the `reaper` block (`tick_secs`,
 //! `provisioning_timeout_secs`, `deprovisioning_timeout_secs`) and there is
 //! no `gc` block either: the gear has no resident loop and no maintenance
 //! job. `deny_unknown_fields` makes an old `reaper:` or `gc:` key a hard
@@ -15,6 +15,7 @@ pub struct CredStoreConfig {
     pub vendor: String,
     pub hierarchy: HierarchyCfg,
     pub list: ListCfg,
+    pub write: WriteCfg,
 }
 
 impl Default for CredStoreConfig {
@@ -23,6 +24,7 @@ impl Default for CredStoreConfig {
             vendor: "constructorfabric".to_owned(),
             hierarchy: HierarchyCfg::default(),
             list: ListCfg::default(),
+            write: WriteCfg::default(),
         }
     }
 }
@@ -68,6 +70,38 @@ impl Default for ListCfg {
     }
 }
 
+/// Smallest accepted `write.intent_lease_secs`. The lease must comfortably
+/// exceed a plugin `put`: the writer refuses to start a put after half the
+/// lease, and the gear cannot see the plugin's own per-call timeout.
+pub const MIN_INTENT_LEASE_SECS: u64 = 60;
+
+/// Settings for the secret-write protocol's write intents (ADR-0006): a
+/// write announces itself in `credstore_write_intents` before `plugin.put`,
+/// and an intent no writer retired within its lease is reclaimed.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WriteCfg {
+    /// How long, on the database clock, an intent is protected from
+    /// reclaim. A writer that finds more than half of it spent before its
+    /// `put` abandons the write (`503`), which bounds how long a stalled
+    /// writer can still land a version after its intent was reclaimed.
+    /// Seconds, `>= MIN_INTENT_LEASE_SECS` (60).
+    pub intent_lease_secs: u64,
+    /// Maximum expired intents one reclaim pass handles (startup passes
+    /// repeat until a pass returns fewer; every secret write runs one pass
+    /// after it finishes). `> 0`.
+    pub reclaim_batch: u64,
+}
+
+impl Default for WriteCfg {
+    fn default() -> Self {
+        Self {
+            intent_lease_secs: 300,
+            reclaim_batch: 16,
+        }
+    }
+}
+
 impl CredStoreConfig {
     /// # Errors
     /// Returns `Err` with a description if any field is invalid.
@@ -84,13 +118,23 @@ impl CredStoreConfig {
         if self.list.secret_mode_cap == 0 {
             return Err("list.secret_mode_cap must be > 0".to_owned());
         }
+        if self.write.intent_lease_secs < MIN_INTENT_LEASE_SECS {
+            return Err(format!(
+                "write.intent_lease_secs must be >= {MIN_INTENT_LEASE_SECS}: the lease must \
+                 comfortably exceed a plugin put (the writer refuses to start a put after \
+                 half the lease, and the gear cannot see the plugin's own per-call timeout)"
+            ));
+        }
+        if self.write.reclaim_batch == 0 {
+            return Err("write.reclaim_batch must be > 0".to_owned());
+        }
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CredStoreConfig;
+    use super::{CredStoreConfig, MIN_INTENT_LEASE_SECS, WriteCfg};
 
     #[test]
     fn default_config_is_valid() {
@@ -102,6 +146,8 @@ mod tests {
         assert_eq!(cfg.hierarchy.ancestor_cache_ttl_secs, 300);
         assert_eq!(cfg.list.max_limit, 200);
         assert_eq!(cfg.list.secret_mode_cap, 25);
+        assert_eq!(cfg.write.intent_lease_secs, 300);
+        assert_eq!(cfg.write.reclaim_batch, 16);
         assert!(cfg.validate().is_ok());
     }
 
@@ -124,6 +170,45 @@ mod tests {
         assert_eq!(cfg.list.max_limit, 50);
         // Unspecified fields fall back to defaults.
         assert_eq!(cfg.list.secret_mode_cap, 25);
+    }
+
+    #[test]
+    fn deserializes_partial_write_config_with_defaults() {
+        let cfg: CredStoreConfig =
+            serde_json::from_str(r#"{"write":{"intent_lease_secs":60}}"#).expect("deserialize");
+        assert_eq!(cfg.write.intent_lease_secs, 60);
+        // Unspecified fields fall back to defaults.
+        assert_eq!(cfg.write.reclaim_batch, 16);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_enforces_the_intent_lease_floor() {
+        let with_lease = |intent_lease_secs: u64| CredStoreConfig {
+            write: WriteCfg {
+                intent_lease_secs,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(MIN_INTENT_LEASE_SECS, 60);
+        let err = with_lease(MIN_INTENT_LEASE_SECS - 1)
+            .validate()
+            .expect_err("a lease below the floor must be rejected");
+        assert!(
+            err.contains("write.intent_lease_secs must be >= 60"),
+            "{err}"
+        );
+        assert!(with_lease(MIN_INTENT_LEASE_SECS).validate().is_ok());
+        assert!(CredStoreConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_an_unknown_write_key() {
+        let err = serde_json::from_str::<CredStoreConfig>(r#"{"write":{"lease":60}}"#)
+            .expect_err("unknown write key must be rejected");
+        assert!(err.to_string().contains("lease"));
     }
 
     #[test]
@@ -161,6 +246,24 @@ mod tests {
             ..Default::default()
         };
         assert!(zero_secret_mode_cap.validate().is_err());
+
+        let zero_intent_lease = CredStoreConfig {
+            write: WriteCfg {
+                intent_lease_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(zero_intent_lease.validate().is_err());
+
+        let zero_reclaim_batch = CredStoreConfig {
+            write: WriteCfg {
+                reclaim_batch: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(zero_reclaim_batch.validate().is_err());
     }
 
     #[test]

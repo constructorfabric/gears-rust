@@ -7,8 +7,12 @@
 //!   types shipped together, so the gear starts from one consolidated schema.
 //! * `m0002_value_versions` - ADR-0006 immutable value versions: the
 //!   `value_version` pointer and `fallback` column on `credstore_secrets`,
-//!   the narrowed two-status `CHECK`, the pointer/status `CHECK`, and the
-//!   removal of the fence columns and the reaper index. No gc table.
+//!   the narrowed two-status `CHECK`, the pointer/status `CHECK`, the
+//!   removal of the fence columns and the reaper index, and the write-intent
+//!   journal `credstore_write_intents`. No gc table. Irreversible: its `down`
+//!   always returns an error (it deletes saga rows, drops the value
+//!   fingerprints and demotes rows to `declared`); roll back by restoring the
+//!   pre-migration database and store snapshots (credstore DESIGN section 8).
 
 use sea_orm_migration::prelude::*;
 

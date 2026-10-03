@@ -5,10 +5,14 @@
 //! policy, the value-version pointer and optimistic preconditions, all
 //! persisted separately from secret values.
 
-use credstore_sdk::{OwnerId, SecretRef, SharingMode, StoreKey, TenantId, ValueVersion};
+use credstore_sdk::{
+    DestroySelector, OwnerId, SecretRef, SharingMode, StoreKey, TenantId, ValueVersion,
+};
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
+
+use crate::domain::ports::metrics::CleanupOp;
 
 /// A row's lifecycle status. `CHECK (status IN (2, 4))` at the storage layer
 /// admits only these two; codes `1` (`provisioning`) and `3`
@@ -242,6 +246,94 @@ pub struct NewDeclaredSecret {
     pub expires_at: Option<OffsetDateTime>,
     /// Suppression policy carried into the row at create time (ADR-0004).
     pub fallback: Fallback,
+}
+
+/// One secret-write attempt, as the repository needs to know it: the
+/// identity of its write intent (`credstore_write_intents` row; inserted by
+/// tx0 before `plugin.put`, deleted by tx1 in the transaction that commits
+/// or definitively loses the write), the store key the attempt `put`s under,
+/// and whether the selected plugin supports `destroy` (destroy tasks are
+/// enqueued only then; purges always).
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct WriteAttempt {
+    /// Minted per write attempt (v4), never reused: a retried write gets a
+    /// new one.
+    pub attempt_id: Uuid,
+    /// The store key the attempt `put`s under.
+    pub key: StoreKey,
+    pub destroy_supported: bool,
+}
+
+/// A store-cleanup task a repository transaction enqueued in the platform
+/// transactional outbox, next to the row change or intent deletion that
+/// learned it was needed. Executed by the outbox handler, never inline.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupTask {
+    /// `plugin.delete_key(key)`: the key will never hold a live value
+    /// (record deleted, or the attempt's fresh key lost its row).
+    Purge(StoreKey),
+    /// `plugin.destroy(key, selector)`; enqueued only for destroy-capable
+    /// plugins.
+    Destroy {
+        key: StoreKey,
+        selector: DestroySelector,
+    },
+}
+
+impl CleanupTask {
+    /// The metric label of this task.
+    #[must_use]
+    pub fn op(&self) -> CleanupOp {
+        match self {
+            Self::Purge(_) => CleanupOp::Purge,
+            Self::Destroy { .. } => CleanupOp::Destroy,
+        }
+    }
+
+    /// The store key the task acts on.
+    #[must_use]
+    pub fn key(&self) -> &StoreKey {
+        match self {
+            Self::Purge(key) | Self::Destroy { key, .. } => key,
+        }
+    }
+}
+
+/// How a secret write's commit transaction (tx1) ended. Everything but an
+/// error is a definite outcome: the intent is retired in the same
+/// transaction as the row change, and every cleanup task listed was enqueued
+/// in that same transaction.
+#[domain_model]
+#[derive(Debug)]
+pub enum IntentCommit<T> {
+    /// The row change committed (`value`: the post-write row, if the method
+    /// returns one); the intent is gone.
+    Committed {
+        value: T,
+        enqueued: Vec<CleanupTask>,
+    },
+    /// The row change lost definitively (the create hit the reference's
+    /// unique index, or the compare-and-set matched no row). The intent
+    /// deletion committed anyway, together with the cleanup of this
+    /// attempt's version.
+    Lost { enqueued: Vec<CleanupTask> },
+    /// The intent had already been reclaimed: the transaction changed
+    /// nothing. The writer is alive and knows its version, so it settles it
+    /// itself ([`crate::domain::secret::repo::SecretRepo::settle_lost_intent`]).
+    IntentLost,
+}
+
+/// Result of one [`crate::domain::secret::repo::SecretRepo::reclaim_expired`]
+/// pass.
+#[domain_model]
+#[derive(Debug, Default)]
+pub struct Reclaimed {
+    /// Expired intents deleted.
+    pub intents: u64,
+    /// The purges enqueued for those whose record has no row.
+    pub enqueued: Vec<CleanupTask>,
 }
 
 impl SecretRow {

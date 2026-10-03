@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::{Constraint, EqPredicate, InPredicate, Predicate};
@@ -20,13 +21,17 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::ports::audit::{AuditEvent, AuditSink};
+use crate::domain::ports::clock::MonotonicClock;
 pub use crate::domain::ports::metrics::NoopMetrics;
 use crate::domain::ports::metrics::{
-    CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome,
+    CleanupOp, CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome,
 };
 use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
-use crate::domain::secret::model::{NewDeclaredSecret, NewSecret, SecretRow, SecretStatus};
+use crate::domain::secret::model::{
+    CleanupTask, IntentCommit, NewDeclaredSecret, NewSecret, Reclaimed, SecretRow, SecretStatus,
+    WriteAttempt,
+};
 use crate::domain::secret::repo::SecretRepo;
 use crate::domain::secret::type_resolver::{ResolvedSecretType, SecretTypeResolver};
 use crate::domain::secret::typing::reasons;
@@ -1092,14 +1097,80 @@ impl PluginSelector for NoPluginSelector {
 /// `(row_id, new_value_version)` - see `pending_switch`'s field docs.
 type PendingSwitch = (Uuid, ValueVersion);
 
+/// One held write intent. `expired` stands for `lease_until < now()`.
+#[derive(Debug, Clone)]
+struct FakeIntent {
+    attempt_id: Uuid,
+    key: StoreKey,
+    expired: bool,
+}
+
+/// Manually advanced [`MonotonicClock`]: time moves only when a test says so,
+/// so the lease guard is tested without sleeping.
+pub struct ManualClock {
+    base: Instant,
+    offset: Mutex<Duration>,
+}
+
+impl ManualClock {
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: Instant::now(),
+            offset: Mutex::new(Duration::ZERO),
+        })
+    }
+
+    /// Moves the clock forward by `by`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn advance(&self, by: Duration) {
+        *self.offset.lock().expect("lock") += by;
+    }
+}
+
+impl MonotonicClock for ManualClock {
+    fn now(&self) -> Instant {
+        self.base + *self.offset.lock().expect("lock")
+    }
+}
+
 /// In-memory [`SecretRepo`] replicating the real (transactional) semantics of
 /// each method, for domain-service unit tests.
 ///
 /// `scope_allows` controls the result of [`SecretRepo::scope_includes_tenant`].
 pub struct FakeSecretRepo {
     rows: Mutex<Vec<SecretRow>>,
-    /// Every key purge a delete enqueued in the platform outbox, in order.
-    purged: Mutex<Vec<StoreKey>>,
+    /// Every cleanup task a repo "transaction" enqueued in the platform
+    /// outbox, in order. A task is appended in the same step that applies the
+    /// row change (or intent deletion) that caused it, and never otherwise -
+    /// the fake's model of "enqueued in the same transaction".
+    enqueued: Mutex<Vec<CleanupTask>>,
+    /// How many of `enqueued` [`run_cleanup`] already executed.
+    cleanup_cursor: Mutex<usize>,
+    /// The write intents currently held (`credstore_write_intents`).
+    intents: Mutex<Vec<FakeIntent>>,
+    /// Every attempt id `begin_write_intent` ever accepted, in order.
+    begun: Mutex<Vec<Uuid>>,
+    /// When `> 0`, the next `begin_write_intent` fails (tx0 unavailable).
+    begin_intent_failures: Mutex<usize>,
+    /// When `> 0`, the next `reclaim_expired` fails.
+    reclaim_failures: Mutex<usize>,
+    /// When `> 0`, the next `settle_lost_intent` fails.
+    settle_failures: Mutex<usize>,
+    /// When `> 0`, a reclaimer "runs just before" each of the next commits
+    /// (`insert_active`/`switch_value`): every held intent expires and is
+    /// reclaimed by the same rules as `reclaim_expired`, so the commit finds
+    /// its own intent gone.
+    reclaim_before_commit: Mutex<usize>,
+    /// One-shot: a concurrent delete (that enqueues nothing itself) removes
+    /// this row just before the next commit.
+    vanish_before_commit: Mutex<Option<Uuid>>,
+    /// Advance this clock by this much whenever `begin_write_intent`
+    /// succeeds (a slow tx0, or a stall right after it).
+    advance_on_begin: Mutex<Option<(Arc<ManualClock>, Duration)>>,
     pub scope_allows: bool,
     /// When `> 0`, the next `insert_active` call fails with a simulated
     /// internal error (before touching rows) and decrements; consumed
@@ -1151,7 +1222,16 @@ impl FakeSecretRepo {
     pub fn new() -> Self {
         Self {
             rows: Mutex::new(Vec::new()),
-            purged: Mutex::new(Vec::new()),
+            enqueued: Mutex::new(Vec::new()),
+            cleanup_cursor: Mutex::new(0),
+            intents: Mutex::new(Vec::new()),
+            begun: Mutex::new(Vec::new()),
+            begin_intent_failures: Mutex::new(0),
+            reclaim_failures: Mutex::new(0),
+            settle_failures: Mutex::new(0),
+            reclaim_before_commit: Mutex::new(0),
+            vanish_before_commit: Mutex::new(None),
+            advance_on_begin: Mutex::new(None),
             scope_allows: true,
             insert_active_failures: Mutex::new(0),
             insert_active_conflicts: Mutex::new(0),
@@ -1294,14 +1374,245 @@ impl FakeSecretRepo {
         self.rows.lock().expect("lock").clone()
     }
 
-    /// Every key purge enqueued so far (a delete), in order.
+    /// Every key purge enqueued so far (by a delete, a lost write or a
+    /// reclaim), in order.
     ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn purged_keys(&self) -> Vec<StoreKey> {
-        self.purged.lock().expect("lock").clone()
+        self.enqueued
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|t| match t {
+                CleanupTask::Purge(key) => Some(key.clone()),
+                CleanupTask::Destroy { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Every cleanup task (purge or destroy) enqueued so far, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn enqueued_tasks(&self) -> Vec<CleanupTask> {
+        self.enqueued.lock().expect("lock").clone()
+    }
+
+    /// The tasks enqueued but not yet handed out by a previous call: what the
+    /// outbox would deliver next. See [`run_cleanup`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn take_pending_cleanup(&self) -> Vec<CleanupTask> {
+        let enqueued = self.enqueued.lock().expect("lock");
+        let mut cursor = self.cleanup_cursor.lock().expect("lock");
+        let pending = enqueued[*cursor..].to_vec();
+        *cursor = enqueued.len();
+        pending
+    }
+
+    /// The write intents currently held, as `(attempt_id, key)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn intents(&self) -> Vec<(Uuid, StoreKey)> {
+        self.intents
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|i| (i.attempt_id, i.key.clone()))
+            .collect()
+    }
+
+    /// Every attempt id `begin_write_intent` ever accepted, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn begun_attempts(&self) -> Vec<Uuid> {
+        self.begun.lock().expect("lock").clone()
+    }
+
+    /// Every held intent's lease is over (`lease_until < now()`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn expire_intents(&self) {
+        for intent in &mut *self.intents.lock().expect("lock") {
+            intent.expired = true;
+        }
+    }
+
+    /// Arrange for the next `n` `begin_write_intent` calls to fail (tx0
+    /// cannot reach the database).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn fail_next_begin_write_intent(&self, n: usize) {
+        *self.begin_intent_failures.lock().expect("lock") += n;
+    }
+
+    /// Arrange for the next `n` `reclaim_expired` calls to fail.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn fail_next_reclaim(&self, n: usize) {
+        *self.reclaim_failures.lock().expect("lock") += n;
+    }
+
+    /// Arrange for the next `n` `settle_lost_intent` calls to fail.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn fail_next_settle(&self, n: usize) {
+        *self.settle_failures.lock().expect("lock") += n;
+    }
+
+    /// Models a reclaimer running just before each of the next `n` commits
+    /// (`insert_active`/`switch_value`): the writer's intent is expired and
+    /// reclaimed (by the real reclaim rules) before its commit transaction
+    /// runs, so the commit finds it gone.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn reclaim_intents_before_next_commits(&self, n: usize) {
+        *self.reclaim_before_commit.lock().expect("lock") += n;
+    }
+
+    /// One-shot: a concurrent delete (which enqueues nothing itself, so the
+    /// writer's own enqueues stay distinguishable) removes `row_id` just
+    /// before the next commit - the late-writer scenario.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn delete_row_before_next_commit(&self, row_id: Uuid) {
+        *self.vanish_before_commit.lock().expect("lock") = Some(row_id);
+    }
+
+    /// Advance `clock` by `by` every time a write intent is recorded (a
+    /// stall between tx0 and the `put`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn advance_clock_on_begin_write_intent(&self, clock: &Arc<ManualClock>, by: Duration) {
+        *self.advance_on_begin.lock().expect("lock") = Some((Arc::clone(clock), by));
+    }
+
+    fn enqueue(&self, tasks: &[CleanupTask]) {
+        self.enqueued.lock().expect("lock").extend_from_slice(tasks);
+    }
+
+    fn row_exists(&self, record_id: Uuid) -> bool {
+        self.rows
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|r| r.id == record_id)
+    }
+
+    /// What a write that lost (or lost its intent) leaves for the outbox,
+    /// by the same rule as the SQL repo.
+    fn lost_write_tasks(
+        &self,
+        key: &StoreKey,
+        version: &ValueVersion,
+        destroy_supported: bool,
+    ) -> Vec<CleanupTask> {
+        if !self.row_exists(key.record_id) {
+            return vec![CleanupTask::Purge(key.clone())];
+        }
+        if destroy_supported {
+            return vec![CleanupTask::Destroy {
+                key: key.clone(),
+                selector: DestroySelector::Exactly(version.clone()),
+            }];
+        }
+        Vec::new()
+    }
+
+    /// Deletes the attempt's intent; `true` iff it existed.
+    fn retire_intent(&self, attempt_id: Uuid) -> bool {
+        let mut intents = self.intents.lock().expect("lock");
+        let before = intents.len();
+        intents.retain(|i| i.attempt_id != attempt_id);
+        intents.len() < before
+    }
+
+    /// The reclaim rules: delete up to `limit` expired intents; purge each
+    /// whose record has no row.
+    fn reclaim_inner(&self, limit: usize) -> Reclaimed {
+        let reclaimed: Vec<FakeIntent> = {
+            let mut intents = self.intents.lock().expect("lock");
+            let mut taken = Vec::new();
+            let mut kept = Vec::new();
+            for intent in intents.drain(..) {
+                if intent.expired && taken.len() < limit {
+                    taken.push(intent);
+                } else {
+                    kept.push(intent);
+                }
+            }
+            *intents = kept;
+            taken
+        };
+        let tasks: Vec<CleanupTask> = reclaimed
+            .iter()
+            .filter(|i| !self.row_exists(i.key.record_id))
+            .map(|i| CleanupTask::Purge(i.key.clone()))
+            .collect();
+        self.enqueue(&tasks);
+        Reclaimed {
+            intents: reclaimed.len() as u64,
+            enqueued: tasks,
+        }
+    }
+
+    /// Concurrent activity scheduled to land just before a commit.
+    fn before_commit(&self) {
+        let vanish = self.vanish_before_commit.lock().expect("lock").take();
+        if let Some(row_id) = vanish {
+            self.rows.lock().expect("lock").retain(|r| r.id != row_id);
+        }
+        let reclaim = {
+            let mut remaining = self.reclaim_before_commit.lock().expect("lock");
+            if *remaining > 0 {
+                *remaining -= 1;
+                true
+            } else {
+                false
+            }
+        };
+        if reclaim {
+            self.expire_intents();
+            self.reclaim_inner(usize::MAX);
+        }
+    }
+
+    fn take_failure(counter: &Mutex<usize>) -> bool {
+        let mut remaining = counter.lock().expect("lock");
+        if *remaining > 0 {
+            *remaining -= 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Every `type_uuid_in` clamp `list_candidate_references` (step 1) was
@@ -1615,40 +1926,70 @@ impl SecretRepo for FakeSecretRepo {
             .collect())
     }
 
+    async fn begin_write_intent(
+        &self,
+        attempt: &WriteAttempt,
+        _lease: Duration,
+    ) -> Result<(), DomainError> {
+        if Self::take_failure(&self.begin_intent_failures) {
+            return Err(DomainError::internal(
+                "simulated begin_write_intent failure",
+            ));
+        }
+        self.intents.lock().expect("lock").push(FakeIntent {
+            attempt_id: attempt.attempt_id,
+            key: attempt.key.clone(),
+            expired: false,
+        });
+        self.begun.lock().expect("lock").push(attempt.attempt_id);
+        let advance = self.advance_on_begin.lock().expect("lock").clone();
+        if let Some((clock, by)) = advance {
+            clock.advance(by);
+        }
+        Ok(())
+    }
+
+    async fn drop_write_intent(&self, attempt_id: Uuid) -> Result<(), DomainError> {
+        self.retire_intent(attempt_id);
+        Ok(())
+    }
+
     async fn insert_active(
         &self,
         _scope: &AccessScope,
         new: &NewSecret,
-    ) -> Result<(), DomainError> {
-        {
-            let mut remaining = self.insert_active_failures.lock().expect("lock");
-            if *remaining > 0 {
-                *remaining -= 1;
-                return Err(DomainError::internal("simulated insert_active failure"));
-            }
+        attempt: &WriteAttempt,
+    ) -> Result<IntentCommit<()>, DomainError> {
+        // A failure models an ambiguous tx1: nothing is applied here, the
+        // intent stays.
+        if Self::take_failure(&self.insert_active_failures) {
+            return Err(DomainError::internal("simulated insert_active failure"));
         }
-        {
-            let mut remaining = self.insert_active_conflicts.lock().expect("lock");
-            if *remaining > 0 {
-                *remaining -= 1;
-                return Err(DomainError::Conflict);
-            }
+        self.before_commit();
+        if !self.retire_intent(attempt.attempt_id) {
+            return Ok(IntentCommit::IntentLost);
         }
-        let mut rows = self.rows.lock().expect("lock");
-        let conflict = rows.iter().any(|r| {
-            r.tenant_id == new.tenant_id
-                && r.reference == new.reference.as_ref()
-                && match new.sharing {
-                    SharingMode::Private => {
-                        r.sharing == SharingMode::Private && r.owner_id == new.owner_id
+        // The create lost: the intent deletion committed, with the purge of
+        // the attempt's fresh key in the same transaction.
+        let conflict = Self::take_failure(&self.insert_active_conflicts) || {
+            let rows = self.rows.lock().expect("lock");
+            rows.iter().any(|r| {
+                r.tenant_id == new.tenant_id
+                    && r.reference == new.reference.as_ref()
+                    && match new.sharing {
+                        SharingMode::Private => {
+                            r.sharing == SharingMode::Private && r.owner_id == new.owner_id
+                        }
+                        _ => r.sharing != SharingMode::Private,
                     }
-                    _ => r.sharing != SharingMode::Private,
-                }
-        });
+            })
+        };
         if conflict {
-            return Err(DomainError::Conflict);
+            let tasks = vec![CleanupTask::Purge(attempt.key.clone())];
+            self.enqueue(&tasks);
+            return Ok(IntentCommit::Lost { enqueued: tasks });
         }
-        rows.push(SecretRow {
+        self.rows.lock().expect("lock").push(SecretRow {
             id: new.id,
             tenant_id: new.tenant_id,
             reference: new.reference.as_ref().to_owned(),
@@ -1662,7 +2003,10 @@ impl SecretRepo for FakeSecretRepo {
             value_version: Some(new.value_version.clone()),
             fallback: new.fallback,
         });
-        Ok(())
+        Ok(IntentCommit::Committed {
+            value: (),
+            enqueued: Vec::new(),
+        })
     }
 
     async fn insert_declared(
@@ -1714,38 +2058,83 @@ impl SecretRepo for FakeSecretRepo {
         fallback: crate::domain::secret::model::Fallback,
         expires_at: Option<OffsetDateTime>,
         new_value_version: ValueVersion,
-    ) -> Result<Option<SecretRow>, DomainError> {
-        {
-            let mut remaining = self.switch_value_failures.lock().expect("lock");
-            if *remaining > 0 {
-                *remaining -= 1;
-                return Err(DomainError::internal("simulated switch_value failure"));
-            }
+        attempt: &WriteAttempt,
+    ) -> Result<IntentCommit<SecretRow>, DomainError> {
+        // A failure models an ambiguous tx1: nothing is applied here, the
+        // intent stays.
+        if Self::take_failure(&self.switch_value_failures) {
+            return Err(DomainError::internal("simulated switch_value failure"));
         }
-        {
-            let mut remaining = self.force_switch_value_none.lock().expect("lock");
-            if *remaining > 0 {
-                *remaining -= 1;
-                return Ok(None);
-            }
+        self.before_commit();
+        if !self.retire_intent(attempt.attempt_id) {
+            return Ok(IntentCommit::IntentLost);
         }
-        let mut rows = self.rows.lock().expect("lock");
-        let row = rows.iter_mut().find(|r| {
-            r.id == id
-                && matches!(r.status, SecretStatus::Active | SecretStatus::Declared)
-                && r.version == expected_version
-        });
-        let Some(row) = row else {
-            return Ok(None);
+        let forced_loss = Self::take_failure(&self.force_switch_value_none);
+        let switched = if forced_loss {
+            None
+        } else {
+            let mut rows = self.rows.lock().expect("lock");
+            rows.iter_mut()
+                .find(|r| {
+                    r.id == id
+                        && matches!(r.status, SecretStatus::Active | SecretStatus::Declared)
+                        && r.version == expected_version
+                })
+                .map(|row| {
+                    row.value_version = Some(new_value_version.clone());
+                    row.sharing = sharing;
+                    row.fallback = fallback;
+                    row.expires_at = expires_at;
+                    row.status = SecretStatus::Active;
+                    row.version += 1;
+                    row.updated_at = OffsetDateTime::now_utc();
+                    row.clone()
+                })
         };
-        row.value_version = Some(new_value_version);
-        row.sharing = sharing;
-        row.fallback = fallback;
-        row.expires_at = expires_at;
-        row.status = SecretStatus::Active;
-        row.version += 1;
-        row.updated_at = OffsetDateTime::now_utc();
-        Ok(Some(row.clone()))
+        let Some(row) = switched else {
+            // A definite loss: the intent deletion committed, with the
+            // cleanup of this attempt's version in the same transaction.
+            let tasks =
+                self.lost_write_tasks(&attempt.key, &new_value_version, attempt.destroy_supported);
+            self.enqueue(&tasks);
+            return Ok(IntentCommit::Lost { enqueued: tasks });
+        };
+        let tasks = if attempt.destroy_supported {
+            vec![CleanupTask::Destroy {
+                key: attempt.key.clone(),
+                selector: DestroySelector::Below(new_value_version),
+            }]
+        } else {
+            Vec::new()
+        };
+        self.enqueue(&tasks);
+        Ok(IntentCommit::Committed {
+            value: row,
+            enqueued: tasks,
+        })
+    }
+
+    async fn settle_lost_intent(
+        &self,
+        key: &StoreKey,
+        version: &ValueVersion,
+        destroy_supported: bool,
+    ) -> Result<Vec<CleanupTask>, DomainError> {
+        if Self::take_failure(&self.settle_failures) {
+            return Err(DomainError::internal(
+                "simulated settle_lost_intent failure",
+            ));
+        }
+        let tasks = self.lost_write_tasks(key, version, destroy_supported);
+        self.enqueue(&tasks);
+        Ok(tasks)
+    }
+
+    async fn reclaim_expired(&self, limit: u64) -> Result<Reclaimed, DomainError> {
+        if Self::take_failure(&self.reclaim_failures) {
+            return Err(DomainError::internal("simulated reclaim_expired failure"));
+        }
+        Ok(self.reclaim_inner(usize::try_from(limit).unwrap_or(usize::MAX)))
     }
 
     async fn update_metadata(
@@ -1772,6 +2161,10 @@ impl SecretRepo for FakeSecretRepo {
         Ok(Some(row.clone()))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors SecretRepo::remove_value's one-CAS-with-every-field-it-may-update shape"
+    )]
     async fn remove_value(
         &self,
         _scope: &AccessScope,
@@ -1780,7 +2173,8 @@ impl SecretRepo for FakeSecretRepo {
         sharing: SharingMode,
         fallback: crate::domain::secret::model::Fallback,
         expires_at: Option<OffsetDateTime>,
-    ) -> Result<Option<(SecretRow, Option<ValueVersion>)>, DomainError> {
+        destroy_supported: bool,
+    ) -> Result<Option<(SecretRow, Vec<CleanupTask>)>, DomainError> {
         let mut rows = self.rows.lock().expect("lock");
         let row = rows
             .iter_mut()
@@ -1795,7 +2189,25 @@ impl SecretRepo for FakeSecretRepo {
         row.expires_at = expires_at;
         row.version += 1;
         row.updated_at = OffsetDateTime::now_utc();
-        Ok(Some((row.clone(), old_value_version)))
+        let row = row.clone();
+        drop(rows);
+        // The destroys are enqueued by the same transaction as the CAS.
+        let key = row.store_key();
+        let tasks = match old_value_version {
+            Some(old) if destroy_supported => vec![
+                CleanupTask::Destroy {
+                    key: key.clone(),
+                    selector: DestroySelector::Below(old.clone()),
+                },
+                CleanupTask::Destroy {
+                    key,
+                    selector: DestroySelector::Exactly(old),
+                },
+            ],
+            _ => Vec::new(),
+        };
+        self.enqueue(&tasks);
+        Ok(Some((row, tasks)))
     }
 
     async fn delete_by_id(
@@ -1824,8 +2236,38 @@ impl SecretRepo for FakeSecretRepo {
         rows.remove(idx);
         drop(rows);
         // The row delete and the purge enqueue are one transaction.
-        self.purged.lock().expect("lock").push(key.clone());
+        self.enqueue(&[CleanupTask::Purge(key.clone())]);
         Ok(())
+    }
+}
+
+/// Runs every cleanup task `repo` has enqueued and not yet handed out
+/// against `plugin`, in order: what the outbox handler does after the
+/// enqueuing transactions commit (`purge` -> `delete_key`; `destroy` ->
+/// `destroy`, skipped for a plugin that does not support it). Lets a service
+/// test assert the end state of the value store, while the enqueue itself is
+/// asserted through [`FakeSecretRepo::enqueued_tasks`].
+///
+/// # Panics
+///
+/// Panics if the plugin reports an error.
+pub async fn run_cleanup(repo: &FakeSecretRepo, plugin: &FakePlugin) {
+    let ctx = make_ctx(Uuid::nil(), Uuid::nil());
+    for task in repo.take_pending_cleanup() {
+        match task {
+            CleanupTask::Purge(key) => plugin
+                .delete_key(&ctx, &key)
+                .await
+                .expect("delete_key must succeed"),
+            CleanupTask::Destroy { key, selector } => {
+                if plugin.supports_destroy() {
+                    plugin
+                        .destroy(&ctx, &key, selector)
+                        .await
+                        .expect("destroy must succeed");
+                }
+            }
+        }
     }
 }
 
@@ -1836,8 +2278,11 @@ pub struct FakeMetrics {
     pub cross_tenant_denied_count: Mutex<u64>,
     pub read_outcomes: Mutex<Vec<ReadOutcome>>,
     pub deps: Mutex<Vec<(Dep, DepOp, Outcome)>>,
-    pub destroy_failed_total: Mutex<u64>,
-    pub outbox_purge_failed_total: Mutex<u64>,
+    pub write_intents_reclaimed_total: Mutex<u64>,
+    pub write_intent_lost_total: Mutex<u64>,
+    pub write_intent_reclaim_failed_total: Mutex<u64>,
+    pub store_cleanup_enqueued: Mutex<Vec<CleanupOp>>,
+    pub store_cleanup_failed: Mutex<Vec<CleanupOp>>,
     pub read_retries: Mutex<Vec<ReadRetryOutcome>>,
     pub list_type_invariant_violation_total: Mutex<u64>,
     pub audit_publish_failed_total: Mutex<u64>,
@@ -1877,20 +2322,45 @@ impl FakeMetrics {
         self.read_outcomes.lock().expect("lock").last().copied()
     }
 
-    /// Number of failed best-effort `destroy` calls recorded.
+    /// Total expired write intents reported reclaimed.
     ///
     /// # Panics
     /// Panics if the internal mutex is poisoned.
-    pub fn destroy_failed_total(&self) -> u64 {
-        *self.destroy_failed_total.lock().expect("lock")
+    pub fn write_intents_reclaimed_total(&self) -> u64 {
+        *self.write_intents_reclaimed_total.lock().expect("lock")
     }
 
-    /// Number of failed outbox purge deliveries recorded.
+    /// Number of commits that found their own intent reclaimed.
     ///
     /// # Panics
     /// Panics if the internal mutex is poisoned.
-    pub fn outbox_purge_failed_total(&self) -> u64 {
-        *self.outbox_purge_failed_total.lock().expect("lock")
+    pub fn write_intent_lost_total(&self) -> u64 {
+        *self.write_intent_lost_total.lock().expect("lock")
+    }
+
+    /// Number of failed reclaim passes (and failed settlements of a
+    /// reclaimed intent) recorded.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn write_intent_reclaim_failed_total(&self) -> u64 {
+        *self.write_intent_reclaim_failed_total.lock().expect("lock")
+    }
+
+    /// Every enqueued store-cleanup task's op, in order.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn store_cleanup_enqueued(&self) -> Vec<CleanupOp> {
+        self.store_cleanup_enqueued.lock().expect("lock").clone()
+    }
+
+    /// Every failed store-cleanup delivery's op, in order.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn store_cleanup_failed(&self) -> Vec<CleanupOp> {
+        self.store_cleanup_failed.lock().expect("lock").clone()
     }
 
     /// Every recorded read-retry outcome, in order.
@@ -1935,8 +2405,11 @@ impl Default for FakeMetrics {
             cross_tenant_denied_count: Mutex::new(0),
             read_outcomes: Mutex::new(Vec::new()),
             deps: Mutex::new(Vec::new()),
-            destroy_failed_total: Mutex::new(0),
-            outbox_purge_failed_total: Mutex::new(0),
+            write_intents_reclaimed_total: Mutex::new(0),
+            write_intent_lost_total: Mutex::new(0),
+            write_intent_reclaim_failed_total: Mutex::new(0),
+            store_cleanup_enqueued: Mutex::new(Vec::new()),
+            store_cleanup_failed: Mutex::new(Vec::new()),
             read_retries: Mutex::new(Vec::new()),
             list_type_invariant_violation_total: Mutex::new(0),
             audit_publish_failed_total: Mutex::new(0),
@@ -1956,11 +2429,20 @@ impl CredStoreMetricsPort for FakeMetrics {
     fn cross_tenant_denied(&self) {
         *self.cross_tenant_denied_count.lock().expect("lock") += 1;
     }
-    fn destroy_failed(&self) {
-        *self.destroy_failed_total.lock().expect("lock") += 1;
+    fn write_intents_reclaimed(&self, n: u64) {
+        *self.write_intents_reclaimed_total.lock().expect("lock") += n;
     }
-    fn outbox_purge_failed(&self) {
-        *self.outbox_purge_failed_total.lock().expect("lock") += 1;
+    fn write_intent_lost(&self) {
+        *self.write_intent_lost_total.lock().expect("lock") += 1;
+    }
+    fn write_intent_reclaim_failed(&self) {
+        *self.write_intent_reclaim_failed_total.lock().expect("lock") += 1;
+    }
+    fn store_cleanup_enqueued(&self, op: CleanupOp) {
+        self.store_cleanup_enqueued.lock().expect("lock").push(op);
+    }
+    fn store_cleanup_failed(&self, op: CleanupOp) {
+        self.store_cleanup_failed.lock().expect("lock").push(op);
     }
     fn read_retry(&self, outcome: ReadRetryOutcome) {
         self.read_retries.lock().expect("lock").push(outcome);

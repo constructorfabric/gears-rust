@@ -15,43 +15,48 @@
 )]
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use credstore_sdk::{
-    OwnerId, SecretRef, SecretType, SharingMode, StoreKey, TenantId, ValueVersion,
+    DestroySelector, OwnerId, SecretRef, SecretType, SharingMode, StoreKey, TenantId, ValueVersion,
 };
 use sea_orm::{ActiveValue, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::outbox::Wake;
-use toolkit_db::secure::{DBRunner, ScopeError, SecureInsertExt};
+use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt, SecureInsertExt};
 use toolkit_db::{ConnectOpts, DBProvider, connect_db};
 use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{Fallback, NewDeclaredSecret, NewSecret, SecretStatus};
+use crate::domain::secret::model::{
+    CleanupTask, Fallback, IntentCommit, NewDeclaredSecret, NewSecret, SecretRow, SecretStatus,
+    WriteAttempt,
+};
 use crate::domain::secret::repo::SecretRepo;
-use crate::infra::outbox::PurgeEnqueuer;
+use crate::infra::outbox::CleanupEnqueuer;
 use crate::infra::storage::entity;
 use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::repo_impl::SecretRepoImpl;
 
-/// Records every purge a repo transaction enqueues. The enqueue itself does
-/// not write a row (the real outbox is exercised in `infra::outbox_tests`).
+/// Records every cleanup task a repo transaction enqueues. The enqueue itself
+/// does not write a row (the real outbox is exercised in
+/// `infra::outbox_tests`).
 #[derive(Default)]
 struct RecordingEnqueuer {
-    keys: Mutex<Vec<StoreKey>>,
+    tasks: Mutex<Vec<CleanupTask>>,
 }
 
 #[async_trait]
-impl PurgeEnqueuer for RecordingEnqueuer {
-    async fn enqueue_purge(
+impl CleanupEnqueuer for RecordingEnqueuer {
+    async fn enqueue(
         &self,
         _runner: &(dyn DBRunner + Sync),
-        key: &StoreKey,
+        task: &CleanupTask,
     ) -> Result<Wake, DomainError> {
-        self.keys.lock().expect("lock").push(key.clone());
+        self.tasks.lock().expect("lock").push(task.clone());
         Ok(Wake::empty())
     }
 }
@@ -79,7 +84,7 @@ async fn setup_with_purges() -> (SecretRepoImpl, Arc<RecordingEnqueuer>) {
     let purges = Arc::new(RecordingEnqueuer::default());
     let repo = SecretRepoImpl::new(
         Arc::new(DBProvider::<DomainError>::new(db)),
-        Arc::clone(&purges) as Arc<dyn PurgeEnqueuer>,
+        Arc::clone(&purges) as Arc<dyn CleanupEnqueuer>,
     );
     (repo, purges)
 }
@@ -90,7 +95,104 @@ async fn setup() -> SecretRepoImpl {
 }
 
 fn purged(purges: &RecordingEnqueuer) -> Vec<StoreKey> {
-    purges.keys.lock().expect("lock").clone()
+    purges
+        .tasks
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter_map(|t| match t {
+            CleanupTask::Purge(key) => Some(key.clone()),
+            CleanupTask::Destroy { .. } => None,
+        })
+        .collect()
+}
+
+/// Every task enqueued so far, purges and destroys, in order.
+fn enqueued(purges: &RecordingEnqueuer) -> Vec<CleanupTask> {
+    purges.tasks.lock().expect("lock").clone()
+}
+
+const LEASE: Duration = Duration::from_mins(5);
+
+/// The attempt ids of every write intent currently held.
+async fn intent_ids(repo: &SecretRepoImpl) -> Vec<Uuid> {
+    let conn = repo.db.conn().expect("conn");
+    entity::write_intents::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .all(&conn)
+        .await
+        .expect("read intents")
+        .into_iter()
+        .map(|i| i.attempt_id)
+        .collect()
+}
+
+fn enqueued_of(purges: &RecordingEnqueuer) -> Vec<CleanupTask> {
+    enqueued(purges)
+}
+
+/// An attempt that `put`s under the store key of record `id` in `tenant`,
+/// for a plugin that supports `destroy`.
+fn attempt_for(tenant: Uuid, id: Uuid) -> WriteAttempt {
+    WriteAttempt {
+        attempt_id: Uuid::new_v4(),
+        key: StoreKey::new(TenantId(tenant), id),
+        destroy_supported: true,
+    }
+}
+
+/// tx0: announce a write attempt on record `id`.
+async fn begin(repo: &SecretRepoImpl, tenant: Uuid, id: Uuid) -> WriteAttempt {
+    let attempt = attempt_for(tenant, id);
+    repo.begin_write_intent(&attempt, LEASE)
+        .await
+        .expect("begin_write_intent");
+    attempt
+}
+
+/// tx0 + tx1 of a create: announces the attempt, then commits the insert.
+async fn insert_with_intent(
+    repo: &SecretRepoImpl,
+    scope: &AccessScope,
+    new: &NewSecret,
+) -> IntentCommit<()> {
+    let attempt = begin(repo, new.tenant_id.0, new.id).await;
+    repo.insert_active(scope, new, &attempt)
+        .await
+        .expect("insert_active")
+}
+
+/// [`insert_with_intent`], asserting the insert committed.
+async fn insert_ok(repo: &SecretRepoImpl, scope: &AccessScope, new: &NewSecret) {
+    assert!(matches!(
+        insert_with_intent(repo, scope, new).await,
+        IntentCommit::Committed { .. }
+    ));
+}
+
+/// tx0 + tx1 of an overwrite of record `id` (version `expected_version`) by
+/// `value`, on a `Tenant`-shared, `Inherit` record without expiry.
+async fn switch_with_intent(
+    repo: &SecretRepoImpl,
+    tenant: Uuid,
+    id: Uuid,
+    expected_version: i64,
+    value: &str,
+) -> IntentCommit<SecretRow> {
+    let attempt = begin(repo, tenant, id).await;
+    repo.switch_value(
+        &AccessScope::for_tenant(tenant),
+        id,
+        expected_version,
+        SharingMode::Tenant,
+        Fallback::Inherit,
+        None,
+        vv(value),
+        &attempt,
+    )
+    .await
+    .expect("switch_value")
 }
 
 fn vv(s: &str) -> ValueVersion {
@@ -155,9 +257,7 @@ async fn seed_active(
     let value_version = vv("1");
     let new = new_secret(tenant, owner, key, sharing, value_version.clone());
     let id = new.id;
-    repo.insert_active(&AccessScope::for_tenant(tenant), &new)
-        .await
-        .expect("insert_active");
+    insert_ok(repo, &AccessScope::for_tenant(tenant), &new).await;
     (id, value_version)
 }
 
@@ -181,9 +281,7 @@ async fn seed_active_typed(
         secret_type_uuid,
     );
     let id = new.id;
-    repo.insert_active(&AccessScope::for_tenant(tenant), &new)
-        .await
-        .expect("insert_active");
+    insert_ok(repo, &AccessScope::for_tenant(tenant), &new).await;
     (id, value_version)
 }
 
@@ -275,9 +373,7 @@ async fn insert_active_stores_the_value_version_pointer() {
     let owner = Uuid::new_v4();
 
     let new = new_secret(tenant, owner, "k", SharingMode::Tenant, vv("5"));
-    repo.insert_active(&AccessScope::for_tenant(tenant), &new)
-        .await
-        .expect("insert_active");
+    insert_ok(&repo, &AccessScope::for_tenant(tenant), &new).await;
 
     let row = repo
         .resolve_for_get(TenantId(tenant), OwnerId(owner), &sref("k"), &[tenant])
@@ -291,18 +387,26 @@ async fn insert_active_stores_the_value_version_pointer() {
 }
 
 #[tokio::test]
-async fn duplicate_nonprivate_insert_conflicts() {
-    let repo = setup().await;
+async fn duplicate_nonprivate_insert_is_a_definite_loss_that_purges_the_fresh_key() {
+    let (repo, purges) = setup_with_purges().await;
     let tenant = Uuid::new_v4();
     let owner = Uuid::new_v4();
     seed_active(&repo, tenant, owner, "dup", SharingMode::Tenant).await;
 
     let new = new_secret(tenant, owner, "dup", SharingMode::Tenant, vv("2"));
-    let err = repo
-        .insert_active(&AccessScope::for_tenant(tenant), &new)
+    let attempt = begin(&repo, tenant, new.id).await;
+    let outcome = repo
+        .insert_active(&AccessScope::for_tenant(tenant), &new, &attempt)
         .await
-        .expect_err("duplicate non-private insert violates unique index");
-    assert!(matches!(err, DomainError::Conflict));
+        .expect("a unique violation is a definite outcome, not an error");
+    let key = StoreKey::new(TenantId(tenant), new.id);
+    let IntentCommit::Lost { enqueued } = outcome else {
+        panic!("duplicate non-private insert violates the unique index: {outcome:?}");
+    };
+    assert_eq!(enqueued, vec![CleanupTask::Purge(key.clone())]);
+    // The intent deletion committed in the same transaction as the purge.
+    assert_eq!(intent_ids(&repo).await, Vec::<Uuid>::new());
+    assert_eq!(enqueued_of(&purges), vec![CleanupTask::Purge(key)]);
 }
 
 #[tokio::test]
@@ -315,16 +419,16 @@ async fn insert_over_an_expired_row_conflicts_and_changes_nothing() {
 
     let mut old = new_secret(tenant, owner, "exp", SharingMode::Tenant, vv("1"));
     old.expires_at = Some(time::OffsetDateTime::now_utc() - TimeDuration::seconds(5));
-    repo.insert_active(&scope, &old).await.expect("seed");
+    insert_ok(&repo, &scope, &old).await;
 
     // An expired record still holds the reference: expiry applies to the
     // secret, not to the record, so a plain create over it is a conflict.
     let new = new_secret(tenant, owner, "exp", SharingMode::Tenant, vv("1"));
-    let err = repo
-        .insert_active(&scope, &new)
-        .await
-        .expect_err("the expired row still holds the reference");
-    assert!(matches!(err, DomainError::Conflict));
+    let outcome = insert_with_intent(&repo, &scope, &new).await;
+    assert!(
+        matches!(outcome, IntentCommit::Lost { .. }),
+        "the expired row still holds the reference: {outcome:?}"
+    );
 
     let row = repo
         .resolve_for_get(TenantId(tenant), OwnerId(owner), &sref("exp"), &[tenant])
@@ -333,7 +437,369 @@ async fn insert_over_an_expired_row_conflicts_and_changes_nothing() {
         .expect("the expired row is still the decisive record");
     assert_eq!(row.id, old.id);
     assert!(row.is_expired(time::OffsetDateTime::now_utc()));
-    assert!(purged(&purges).is_empty(), "no purge enqueued");
+    assert_eq!(
+        purged(&purges),
+        vec![StoreKey::new(TenantId(tenant), new.id)],
+        "only the loser's own fresh key is purged"
+    );
+}
+
+// ── write-intent journal: begin / drop / settle / reclaim ───────────────────
+
+/// Inserts an intent row directly, with an explicit `lease_until`.
+async fn insert_raw_intent(
+    repo: &SecretRepoImpl,
+    attempt_id: Uuid,
+    key: &StoreKey,
+    lease_until: time::OffsetDateTime,
+) -> Result<(), ScopeError> {
+    let conn = repo.db.conn().expect("conn");
+    entity::write_intents::Entity::insert(entity::write_intents::ActiveModel {
+        attempt_id: ActiveValue::Set(attempt_id),
+        tenant_id: ActiveValue::Set(key.tenant_id.0),
+        record_id: ActiveValue::Set(key.record_id),
+        lease_until: ActiveValue::Set(lease_until),
+    })
+    .secure()
+    .scope_unchecked(&AccessScope::allow_all())?
+    .exec(&conn)
+    .await
+    .map(|_| ())
+}
+
+fn hours_ago(h: i64) -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc() - time::Duration::hours(h)
+}
+
+fn some_key(tenant: Uuid) -> StoreKey {
+    StoreKey::new(TenantId(tenant), Uuid::new_v4())
+}
+
+#[tokio::test]
+async fn migration_creates_the_write_intents_table_keyed_by_attempt_id() {
+    let repo = setup().await;
+    let key = some_key(Uuid::new_v4());
+    let attempt = Uuid::new_v4();
+    insert_raw_intent(&repo, attempt, &key, hours_ago(-1))
+        .await
+        .expect("the table exists");
+
+    let err = insert_raw_intent(&repo, attempt, &some_key(Uuid::new_v4()), hours_ago(-1))
+        .await
+        .expect_err("attempt_id is the primary key");
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected a uniqueness violation, got: {err}"
+    );
+    assert_eq!(intent_ids(&repo).await, vec![attempt]);
+}
+
+#[tokio::test]
+async fn begin_write_intent_stores_the_key_and_a_database_clock_lease() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let attempt = attempt_for(tenant, Uuid::new_v4());
+    let before = time::OffsetDateTime::now_utc();
+
+    repo.begin_write_intent(&attempt, Duration::from_mins(5))
+        .await
+        .expect("begin");
+
+    let conn = repo.db.conn().expect("conn");
+    let rows = entity::write_intents::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .all(&conn)
+        .await
+        .expect("read");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.attempt_id, attempt.attempt_id);
+    assert_eq!(row.tenant_id, attempt.key.tenant_id.0);
+    assert_eq!(row.record_id, attempt.key.record_id);
+    let lease = row.lease_until - before;
+    assert!(
+        lease > time::Duration::seconds(290) && lease < time::Duration::seconds(310),
+        "lease_until is now + 300s on the database clock, got +{lease}"
+    );
+
+    // A second `begin` with the same attempt id is refused: ids are never
+    // reused.
+    repo.begin_write_intent(&attempt, Duration::from_mins(5))
+        .await
+        .expect_err("attempt_id is unique");
+}
+
+#[tokio::test]
+async fn drop_write_intent_deletes_the_intent_and_is_idempotent() {
+    let repo = setup().await;
+    let attempt = begin(&repo, Uuid::new_v4(), Uuid::new_v4()).await;
+    assert_eq!(intent_ids(&repo).await, vec![attempt.attempt_id]);
+
+    repo.drop_write_intent(attempt.attempt_id)
+        .await
+        .expect("drop");
+    assert!(intent_ids(&repo).await.is_empty());
+    repo.drop_write_intent(attempt.attempt_id)
+        .await
+        .expect("dropping an absent intent is not an error");
+}
+
+#[tokio::test]
+async fn reclaim_skips_unexpired_intents_and_takes_expired_ones() {
+    let (repo, purges) = setup_with_purges().await;
+    let tenant = Uuid::new_v4();
+    // Live: lease 300s on the database clock.
+    let live = begin(&repo, tenant, Uuid::new_v4()).await;
+    // Expired: a writer that crashed an hour ago.
+    let dead_key = some_key(tenant);
+    let dead = Uuid::new_v4();
+    insert_raw_intent(&repo, dead, &dead_key, hours_ago(1))
+        .await
+        .expect("seed");
+
+    let reclaimed = repo.reclaim_expired(16).await.expect("reclaim");
+    assert_eq!(reclaimed.intents, 1);
+    assert_eq!(intent_ids(&repo).await, vec![live.attempt_id]);
+    assert_eq!(
+        reclaimed.enqueued,
+        vec![CleanupTask::Purge(dead_key.clone())]
+    );
+    assert_eq!(enqueued_of(&purges), vec![CleanupTask::Purge(dead_key)]);
+
+    // Nothing else is due.
+    let again = repo.reclaim_expired(16).await.expect("reclaim");
+    assert_eq!(again.intents, 0);
+    assert!(again.enqueued.is_empty());
+}
+
+#[tokio::test]
+async fn reclaim_purges_only_the_records_without_a_row() {
+    let (repo, purges) = setup_with_purges().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    // A live record whose rotation crashed: its row exists.
+    let (live_id, _) = seed_active(&repo, tenant, owner, "live", SharingMode::Tenant).await;
+    let live_key = StoreKey::new(TenantId(tenant), live_id);
+    // A create that crashed before its insert: no row.
+    let dead_key = some_key(tenant);
+    insert_raw_intent(&repo, Uuid::new_v4(), &live_key, hours_ago(2))
+        .await
+        .expect("seed");
+    insert_raw_intent(&repo, Uuid::new_v4(), &dead_key, hours_ago(1))
+        .await
+        .expect("seed");
+
+    let reclaimed = repo.reclaim_expired(16).await.expect("reclaim");
+
+    assert_eq!(reclaimed.intents, 2, "both intents are deleted");
+    assert!(intent_ids(&repo).await.is_empty());
+    assert_eq!(
+        enqueued_of(&purges),
+        vec![CleanupTask::Purge(dead_key)],
+        "the live record's orphan is not purged: it is above a live pointer"
+    );
+}
+
+#[tokio::test]
+async fn reclaim_takes_at_most_limit_intents_oldest_first() {
+    let (repo, _purges) = setup_with_purges().await;
+    let tenant = Uuid::new_v4();
+    let oldest = Uuid::new_v4();
+    let middle = Uuid::new_v4();
+    let newest = Uuid::new_v4();
+    insert_raw_intent(&repo, newest, &some_key(tenant), hours_ago(1))
+        .await
+        .expect("seed");
+    insert_raw_intent(&repo, oldest, &some_key(tenant), hours_ago(3))
+        .await
+        .expect("seed");
+    insert_raw_intent(&repo, middle, &some_key(tenant), hours_ago(2))
+        .await
+        .expect("seed");
+
+    let first = repo.reclaim_expired(2).await.expect("reclaim");
+    assert_eq!(first.intents, 2);
+    assert_eq!(intent_ids(&repo).await, vec![newest], "oldest leases first");
+
+    let second = repo.reclaim_expired(2).await.expect("reclaim");
+    assert_eq!(
+        second.intents, 1,
+        "fewer than the limit: the backlog is done"
+    );
+    assert!(intent_ids(&repo).await.is_empty());
+}
+
+#[tokio::test]
+async fn settle_lost_intent_destroys_exactly_when_the_row_exists_else_purges() {
+    let (repo, purges) = setup_with_purges().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let (id, _) = seed_active(&repo, tenant, owner, "live", SharingMode::Tenant).await;
+    let live_key = StoreKey::new(TenantId(tenant), id);
+
+    let tasks = repo
+        .settle_lost_intent(&live_key, &vv("2"), true)
+        .await
+        .expect("settle");
+    assert_eq!(
+        tasks,
+        vec![CleanupTask::Destroy {
+            key: live_key.clone(),
+            selector: DestroySelector::Exactly(vv("2")),
+        }]
+    );
+
+    // The row exists but the plugin has no destroy: nothing to enqueue.
+    let tasks = repo
+        .settle_lost_intent(&live_key, &vv("2"), false)
+        .await
+        .expect("settle");
+    assert!(tasks.is_empty());
+
+    // No row: the whole key is dead, whatever the plugin supports.
+    let dead_key = some_key(tenant);
+    for destroy_supported in [true, false] {
+        let tasks = repo
+            .settle_lost_intent(&dead_key, &vv("1"), destroy_supported)
+            .await
+            .expect("settle");
+        assert_eq!(tasks, vec![CleanupTask::Purge(dead_key.clone())]);
+    }
+    assert_eq!(enqueued_of(&purges).len(), 3, "exactly the tasks returned");
+}
+
+#[tokio::test]
+async fn commit_with_its_intent_deleted_by_a_concurrent_reclaim_is_intent_lost() {
+    // The sequence of ADR-0006 step 5c, end to end on SQL: the writer
+    // announces, a reclaim (lease over) deletes the intent, the writer's
+    // commit finds it gone.
+    let (repo, purges) = setup_with_purges().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let (id, old_value) = seed_active(&repo, tenant, owner, "k", SharingMode::Tenant).await;
+
+    let attempt = attempt_for(tenant, id);
+    // Expired lease for this very attempt.
+    insert_raw_intent(&repo, attempt.attempt_id, &attempt.key, hours_ago(1))
+        .await
+        .expect("seed");
+    let reclaimed = repo.reclaim_expired(16).await.expect("reclaim");
+    assert_eq!(reclaimed.intents, 1);
+    assert!(
+        reclaimed.enqueued.is_empty(),
+        "the record has a row: nothing to purge"
+    );
+
+    let outcome = repo
+        .switch_value(
+            &AccessScope::for_tenant(tenant),
+            id,
+            1,
+            SharingMode::Tenant,
+            Fallback::Inherit,
+            None,
+            vv("2"),
+            &attempt,
+        )
+        .await
+        .expect("switch_value");
+    assert!(matches!(outcome, IntentCommit::IntentLost), "{outcome:?}");
+    let row = repo
+        .resolve_for_get(TenantId(tenant), OwnerId(owner), &sref("k"), &[tenant])
+        .await
+        .expect("resolve")
+        .expect("row");
+    assert_eq!(row.value_version, Some(old_value));
+    assert!(enqueued_of(&purges).is_empty());
+}
+
+// ── generated SQL of the PostgreSQL-specific statements ──────────────────────
+//
+// The SQLite tests above run the same builders, but the PostgreSQL text
+// (database-clock lease, `FOR UPDATE SKIP LOCKED`, a target-less `ON
+// CONFLICT DO NOTHING`) is pinned here without a server.
+
+#[test]
+fn postgres_begin_intent_uses_the_database_clock() {
+    use sea_orm::sea_query::{PostgresQueryBuilder, Query};
+
+    let attempt = attempt_for(Uuid::nil(), Uuid::nil());
+    let mut insert = Query::insert();
+    insert
+        .into_table(entity::write_intents::Entity)
+        .columns([
+            entity::write_intents::Column::AttemptId,
+            entity::write_intents::Column::TenantId,
+            entity::write_intents::Column::RecordId,
+            entity::write_intents::Column::LeaseUntil,
+        ])
+        .select_from(super::intents::begin_intent_source(
+            sea_orm::DbBackend::Postgres,
+            &attempt,
+            Duration::from_mins(5),
+        ))
+        .expect("column count matches");
+    let sql = insert.to_string(PostgresQueryBuilder);
+    assert!(
+        sql.starts_with(
+            r#"INSERT INTO "credstore_write_intents" ("attempt_id", "tenant_id", "record_id", "lease_until") SELECT "#
+        ),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("now() + make_interval(0, 0, 0, 0, 0, 0, 300"),
+        "lease_until must be the database clock plus the lease: {sql}"
+    );
+
+    // The prepared form binds the lease as the fourth parameter: the
+    // placeholder syntax is the backend's own (`$n`).
+    let (prepared, values) = insert.build(PostgresQueryBuilder);
+    assert!(
+        prepared.ends_with("now() + make_interval(0, 0, 0, 0, 0, 0, $4)"),
+        "{prepared}"
+    );
+    assert_eq!(values.0.len(), 4);
+}
+
+#[test]
+fn postgres_reclaim_batch_locks_with_skip_locked_oldest_first() {
+    use sea_orm::QueryTrait;
+
+    let sql = super::intents::expired_intents_select(sea_orm::DbBackend::Postgres, 16)
+        .build(sea_orm::DbBackend::Postgres)
+        .to_string();
+    assert!(sql.contains(r#""lease_until" < (now())"#), "{sql}");
+    assert!(
+        sql.contains(
+            r#"ORDER BY "credstore_write_intents"."lease_until" ASC LIMIT 16 FOR UPDATE SKIP LOCKED"#
+        ),
+        "{sql}"
+    );
+}
+
+#[test]
+fn the_create_insert_does_nothing_on_any_unique_conflict() {
+    use sea_orm::QueryTrait;
+
+    let tenant = Uuid::new_v4();
+    let new = new_secret(tenant, Uuid::new_v4(), "k", SharingMode::Tenant, vv("1"));
+    let am = entity::secrets::ActiveModel {
+        id: ActiveValue::Set(new.id),
+        ..Default::default()
+    };
+    for backend in [sea_orm::DbBackend::Postgres, sea_orm::DbBackend::Sqlite] {
+        let sql = super::writes::insert_unless_taken(am.clone())
+            .build(backend)
+            .to_string();
+        // No conflict target (the builder leaves a double space): whichever
+        // unique index the reference hits is skipped.
+        let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains("ON CONFLICT DO NOTHING"),
+            "no conflict target, so any unique index conflict is skipped: {sql}"
+        );
+    }
 }
 
 // ── write protocol: insert_declared (ADR-0004 Amendment B) ──────────────────
@@ -448,45 +914,40 @@ async fn switch_value_is_a_cas_that_bumps_the_row_version_and_moves_the_pointer(
     let scope = AccessScope::for_tenant(tenant);
     let (id, _old) = seed_active(&repo, tenant, owner, "k", SharingMode::Tenant).await;
 
-    let row = repo
-        .switch_value(
-            &scope,
-            id,
-            1,
-            SharingMode::Tenant,
-            Fallback::Inherit,
-            None,
-            vv("2"),
-        )
-        .await
-        .expect("switch_value")
-        .expect("row updated");
+    let IntentCommit::Committed { value: row, .. } =
+        switch_with_intent(&repo, tenant, id, 1, "2").await
+    else {
+        panic!("the CAS on the version read first must commit");
+    };
     assert_eq!(row.version, 2);
     assert_eq!(row.value_version, Some(vv("2")));
     assert_eq!(row.status, SecretStatus::Active);
+    let _ = scope;
 }
 
 #[tokio::test]
-async fn switch_value_version_mismatch_returns_none_and_changes_nothing() {
-    let repo = setup().await;
+async fn switch_value_version_mismatch_is_a_definite_loss_that_destroys_its_own_version() {
+    let (repo, purges) = setup_with_purges().await;
     let tenant = Uuid::new_v4();
     let owner = Uuid::new_v4();
-    let scope = AccessScope::for_tenant(tenant);
     let (id, old_value) = seed_active(&repo, tenant, owner, "k", SharingMode::Tenant).await;
 
-    let result = repo
-        .switch_value(
-            &scope,
-            id,
-            99, // stale
-            SharingMode::Tenant,
-            Fallback::Inherit,
-            None,
-            vv("2"),
-        )
-        .await
-        .expect("switch_value");
-    assert!(result.is_none());
+    let outcome = switch_with_intent(&repo, tenant, id, 99 /* stale */, "2").await;
+    let IntentCommit::Lost { enqueued } = outcome else {
+        panic!("a stale CAS is a definite loss: {outcome:?}");
+    };
+    // The row still exists, so only the loser's own version is dead.
+    let key = StoreKey::new(TenantId(tenant), id);
+    let expected = vec![CleanupTask::Destroy {
+        key,
+        selector: DestroySelector::Exactly(vv("2")),
+    }];
+    assert_eq!(enqueued, expected);
+    assert_eq!(enqueued_of(&purges), expected);
+    assert!(
+        intent_ids(&repo).await.is_empty(),
+        "the intent deletion commits with the loss"
+    );
 
     let row = repo
         .resolve_for_get(TenantId(tenant), OwnerId(owner), &sref("k"), &[tenant])
@@ -498,23 +959,135 @@ async fn switch_value_version_mismatch_returns_none_and_changes_nothing() {
 }
 
 #[tokio::test]
-async fn switch_value_missing_row_returns_none() {
-    let repo = setup().await;
+async fn switch_value_loss_without_destroy_support_enqueues_nothing_for_a_live_row() {
+    let (repo, purges) = setup_with_purges().await;
     let tenant = Uuid::new_v4();
-    let scope = AccessScope::for_tenant(tenant);
-    let result = repo
+    let owner = Uuid::new_v4();
+    let (id, _) = seed_active(&repo, tenant, owner, "k", SharingMode::Tenant).await;
+
+    let attempt = WriteAttempt {
+        destroy_supported: false,
+        ..begin(&repo, tenant, id).await
+    };
+    let outcome = repo
         .switch_value(
-            &scope,
-            Uuid::new_v4(),
+            &AccessScope::for_tenant(tenant),
+            id,
+            99,
+            SharingMode::Tenant,
+            Fallback::Inherit,
+            None,
+            vv("2"),
+            &attempt,
+        )
+        .await
+        .expect("switch_value");
+    let IntentCommit::Lost { enqueued } = outcome else {
+        panic!("a stale CAS is a definite loss: {outcome:?}");
+    };
+    assert!(enqueued.is_empty());
+    assert!(enqueued_of(&purges).is_empty());
+    assert!(intent_ids(&repo).await.is_empty());
+}
+
+#[tokio::test]
+async fn switch_value_missing_row_is_a_definite_loss_that_purges_the_key() {
+    let (repo, purges) = setup_with_purges().await;
+    let tenant = Uuid::new_v4();
+    let id = Uuid::new_v4();
+
+    let outcome = switch_with_intent(&repo, tenant, id, 1, "2").await;
+    let IntentCommit::Lost { enqueued } = outcome else {
+        panic!("a missing row loses the CAS: {outcome:?}");
+    };
+    let expected = vec![CleanupTask::Purge(StoreKey::new(TenantId(tenant), id))];
+    assert_eq!(enqueued, expected);
+    assert_eq!(enqueued_of(&purges), expected);
+    assert!(intent_ids(&repo).await.is_empty());
+}
+
+#[tokio::test]
+async fn switch_value_commit_enqueues_destroy_below_the_new_version_with_the_intent_deletion() {
+    let (repo, purges) = setup_with_purges().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let (id, _) = seed_active(&repo, tenant, owner, "k", SharingMode::Tenant).await;
+
+    let outcome = switch_with_intent(&repo, tenant, id, 1, "2").await;
+    let IntentCommit::Committed { enqueued, .. } = outcome else {
+        panic!("{outcome:?}");
+    };
+    let expected = vec![CleanupTask::Destroy {
+        key: StoreKey::new(TenantId(tenant), id),
+        selector: DestroySelector::Below(vv("2")),
+    }];
+    assert_eq!(enqueued, expected);
+    assert_eq!(enqueued_of(&purges), expected);
+    assert!(intent_ids(&repo).await.is_empty());
+}
+
+#[tokio::test]
+async fn switch_value_with_a_reclaimed_intent_changes_nothing() {
+    let (repo, purges) = setup_with_purges().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let (id, old_value) = seed_active(&repo, tenant, owner, "k", SharingMode::Tenant).await;
+
+    // The attempt's intent is gone before its commit (reclaimed).
+    let attempt = begin(&repo, tenant, id).await;
+    repo.drop_write_intent(attempt.attempt_id)
+        .await
+        .expect("drop");
+    let outcome = repo
+        .switch_value(
+            &AccessScope::for_tenant(tenant),
+            id,
             1,
             SharingMode::Tenant,
             Fallback::Inherit,
             None,
             vv("2"),
+            &attempt,
         )
         .await
         .expect("switch_value");
-    assert!(result.is_none());
+    assert!(matches!(outcome, IntentCommit::IntentLost), "{outcome:?}");
+
+    let row = repo
+        .resolve_for_get(TenantId(tenant), OwnerId(owner), &sref("k"), &[tenant])
+        .await
+        .expect("resolve")
+        .expect("row");
+    assert_eq!(row.value_version, Some(old_value), "the row is unchanged");
+    assert_eq!(row.version, 1);
+    assert!(enqueued_of(&purges).is_empty(), "nothing enqueued");
+}
+
+#[tokio::test]
+async fn insert_active_with_a_reclaimed_intent_changes_nothing() {
+    let (repo, purges) = setup_with_purges().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let new = new_secret(tenant, owner, "k", SharingMode::Tenant, vv("1"));
+
+    let attempt = begin(&repo, tenant, new.id).await;
+    repo.drop_write_intent(attempt.attempt_id)
+        .await
+        .expect("drop");
+    let outcome = repo
+        .insert_active(&scope, &new, &attempt)
+        .await
+        .expect("insert_active");
+    assert!(matches!(outcome, IntentCommit::IntentLost), "{outcome:?}");
+    assert!(
+        repo.find_own(&scope, TenantId(tenant), OwnerId(owner), &sref("k"))
+            .await
+            .expect("find_own")
+            .is_none(),
+        "no row was inserted"
+    );
+    assert!(enqueued_of(&purges).is_empty());
 }
 
 // ── write protocol: delete_by_id ─────────────────────────────────────────────
@@ -580,9 +1153,7 @@ async fn delete_then_create_only_put_under_the_same_reference_succeeds() {
         .expect("delete");
 
     let new = new_secret(tenant, owner, "reused", SharingMode::Tenant, vv("1"));
-    repo.insert_active(&scope, &new)
-        .await
-        .expect("recreate under the same reference immediately succeeds");
+    insert_ok(&repo, &scope, &new).await;
 
     let row = repo
         .resolve_for_get(TenantId(tenant), OwnerId(owner), &sref("reused"), &[tenant])
@@ -817,7 +1388,7 @@ async fn secret_type_round_trips_through_storage() {
     new.secret_type_uuid = SecretType::from_name("personal-token")
         .expect("known")
         .uuid();
-    repo.insert_active(&scope, &new).await.expect("insert");
+    insert_ok(&repo, &scope, &new).await;
 
     let row = repo
         .resolve_for_get(TenantId(tenant), OwnerId(owner), &sref("typed"), &[tenant])
@@ -993,14 +1564,14 @@ async fn update_metadata_version_mismatch_returns_none() {
 }
 
 #[tokio::test]
-async fn remove_value_declares_row_and_returns_the_old_value_version() {
-    let repo = setup().await;
+async fn remove_value_declares_row_and_enqueues_destroy_below_and_exactly_the_old_version() {
+    let (repo, purges) = setup_with_purges().await;
     let tenant = Uuid::new_v4();
     let owner = Uuid::new_v4();
     let scope = AccessScope::for_tenant(tenant);
     let (id, value_version) = seed_active(&repo, tenant, owner, "rm", SharingMode::Tenant).await;
 
-    let (row, old) = repo
+    let (row, tasks) = repo
         .remove_value(
             &scope,
             id,
@@ -1008,6 +1579,7 @@ async fn remove_value_declares_row_and_returns_the_old_value_version() {
             SharingMode::Tenant,
             Fallback::None,
             None,
+            true,
         )
         .await
         .expect("remove_value")
@@ -1016,18 +1588,34 @@ async fn remove_value_declares_row_and_returns_the_old_value_version() {
     assert_eq!(row.value_version, None);
     assert_eq!(row.fallback, Fallback::None);
     assert_eq!(row.version, 2);
-    assert_eq!(old, Some(value_version));
+    let key = StoreKey::new(TenantId(tenant), id);
+    let expected = vec![
+        CleanupTask::Destroy {
+            key: key.clone(),
+            selector: DestroySelector::Below(value_version.clone()),
+        },
+        CleanupTask::Destroy {
+            key,
+            selector: DestroySelector::Exactly(value_version),
+        },
+    ];
+    assert_eq!(tasks, expected);
+    assert_eq!(
+        enqueued_of(&purges),
+        expected,
+        "enqueued by the same transaction as the CAS"
+    );
 }
 
 #[tokio::test]
-async fn remove_value_on_already_declared_row_returns_no_old_value() {
-    let repo = setup().await;
+async fn remove_value_without_destroy_support_enqueues_nothing() {
+    let (repo, purges) = setup_with_purges().await;
     let tenant = Uuid::new_v4();
     let owner = Uuid::new_v4();
     let scope = AccessScope::for_tenant(tenant);
-    let (id, _) = seed_active(&repo, tenant, owner, "rm-twice", SharingMode::Tenant).await;
+    let (id, _) = seed_active(&repo, tenant, owner, "rm-nd", SharingMode::Tenant).await;
 
-    let (declared, _) = repo
+    let (row, tasks) = repo
         .remove_value(
             &scope,
             id,
@@ -1035,14 +1623,42 @@ async fn remove_value_on_already_declared_row_returns_no_old_value() {
             SharingMode::Tenant,
             Fallback::None,
             None,
+            false,
+        )
+        .await
+        .expect("remove_value")
+        .expect("row updated");
+    assert_eq!(row.status, SecretStatus::Declared);
+    assert!(tasks.is_empty());
+    assert!(enqueued_of(&purges).is_empty());
+}
+
+#[tokio::test]
+async fn remove_value_on_already_declared_row_enqueues_nothing() {
+    let (repo, purges) = setup_with_purges().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, _) = seed_active(&repo, tenant, owner, "rm-twice", SharingMode::Tenant).await;
+
+    let (declared, first) = repo
+        .remove_value(
+            &scope,
+            id,
+            Some(1),
+            SharingMode::Tenant,
+            Fallback::None,
+            None,
+            true,
         )
         .await
         .expect("remove_value")
         .expect("row updated");
     assert_eq!(declared.status, SecretStatus::Declared);
+    assert_eq!(first.len(), 2);
 
-    // Idempotent re-send: metadata equal, no value version to hand back this time.
-    let (row, old) = repo
+    // Idempotent re-send: metadata equal, no value version to destroy this time.
+    let (row, tasks) = repo
         .remove_value(
             &scope,
             id,
@@ -1050,12 +1666,18 @@ async fn remove_value_on_already_declared_row_returns_no_old_value() {
             SharingMode::Tenant,
             Fallback::None,
             None,
+            true,
         )
         .await
         .expect("remove_value")
         .expect("row still updated (version bumps)");
     assert_eq!(row.status, SecretStatus::Declared);
-    assert_eq!(old, None);
+    assert!(tasks.is_empty());
+    assert_eq!(
+        enqueued_of(&purges).len(),
+        2,
+        "only the first removal enqueued"
+    );
 }
 
 #[tokio::test]
@@ -1074,6 +1696,7 @@ async fn remove_value_version_mismatch_returns_none() {
             SharingMode::Tenant,
             Fallback::None,
             None,
+            true,
         )
         .await
         .expect("remove_value");
@@ -1094,24 +1717,17 @@ async fn switch_value_accepts_a_declared_row_and_reactivates_it() {
         SharingMode::Tenant,
         Fallback::None,
         None,
+        true,
     )
     .await
     .expect("remove_value")
     .expect("declared");
 
-    let row = repo
-        .switch_value(
-            &scope,
-            id,
-            2,
-            SharingMode::Tenant,
-            Fallback::Inherit,
-            None,
-            vv("2"),
-        )
-        .await
-        .expect("switch_value")
-        .expect("declared row reactivated");
+    let IntentCommit::Committed { value: row, .. } =
+        switch_with_intent(&repo, tenant, id, 2, "2").await
+    else {
+        panic!("declared row reactivated");
+    };
     assert_eq!(row.status, SecretStatus::Active);
     assert_eq!(row.value_version, Some(vv("2")));
     assert_eq!(row.fallback, Fallback::Inherit);
@@ -1131,6 +1747,7 @@ async fn find_own_and_find_for_write_see_a_declared_row() {
         SharingMode::Tenant,
         Fallback::Inherit,
         None,
+        true,
     )
     .await
     .expect("remove_value")
@@ -1179,6 +1796,7 @@ async fn resolve_for_get_suppressed_row_blocks_the_walk() {
         SharingMode::Tenant,
         Fallback::None,
         None,
+        true,
     )
     .await
     .expect("remove_value")
@@ -1217,6 +1835,7 @@ async fn resolve_for_get_declared_inherit_row_never_competes() {
         SharingMode::Tenant,
         Fallback::Inherit,
         None,
+        true,
     )
     .await
     .expect("remove_value")
@@ -1253,6 +1872,7 @@ async fn resolve_candidates_includes_own_declared_row_and_ancestor_shared_row() 
         SharingMode::Tenant,
         Fallback::Inherit,
         None,
+        true,
     )
     .await
     .expect("remove_value")
@@ -1303,6 +1923,7 @@ async fn resolve_candidates_excludes_ancestor_declared_inherit_row() {
         SharingMode::Shared,
         Fallback::Inherit,
         None,
+        true,
     )
     .await
     .expect("remove_value")
@@ -1548,6 +2169,7 @@ async fn list_candidate_references_type_scope_matches_the_collection_reads_visib
         SharingMode::Tenant,
         Fallback::Inherit,
         None,
+        true,
     )
     .await
     .expect("remove_value")
@@ -1615,6 +2237,7 @@ async fn list_candidate_references_type_scope_matches_the_collection_reads_visib
         SharingMode::Shared,
         Fallback::Inherit,
         None,
+        true,
     )
     .await
     .expect("remove_value")

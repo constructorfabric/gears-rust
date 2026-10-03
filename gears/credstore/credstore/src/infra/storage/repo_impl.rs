@@ -1,11 +1,14 @@
 //! `SeaORM`-backed implementation of [`SecretRepo`] (ADR-0006).
 
 pub mod helpers;
+mod intents;
 mod reads;
 mod writes;
 
 #[cfg(test)]
 mod repo_tests;
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use credstore_sdk::{OwnerId, SecretRef, SharingMode, StoreKey, TenantId, ValueVersion};
@@ -16,7 +19,10 @@ use uuid::Uuid;
 pub use helpers::{CredstoreDbProvider, SecretRepoImpl};
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{Fallback, NewDeclaredSecret, NewSecret, SecretRow};
+use crate::domain::secret::model::{
+    CleanupTask, Fallback, IntentCommit, NewDeclaredSecret, NewSecret, Reclaimed, SecretRow,
+    WriteAttempt,
+};
 use crate::domain::secret::repo::SecretRepo;
 
 #[async_trait]
@@ -105,8 +111,25 @@ impl SecretRepo for SecretRepoImpl {
         reads::list_candidates_for_references(self, req_tenant, subject, chain, references).await
     }
 
-    async fn insert_active(&self, scope: &AccessScope, new: &NewSecret) -> Result<(), DomainError> {
-        writes::insert_active(self, scope, new).await
+    async fn begin_write_intent(
+        &self,
+        attempt: &WriteAttempt,
+        lease: Duration,
+    ) -> Result<(), DomainError> {
+        intents::begin_write_intent(self, attempt, lease).await
+    }
+
+    async fn drop_write_intent(&self, attempt_id: Uuid) -> Result<(), DomainError> {
+        intents::drop_write_intent(self, attempt_id).await
+    }
+
+    async fn insert_active(
+        &self,
+        scope: &AccessScope,
+        new: &NewSecret,
+        attempt: &WriteAttempt,
+    ) -> Result<IntentCommit<()>, DomainError> {
+        writes::insert_active(self, scope, new, attempt).await
     }
 
     async fn insert_declared(
@@ -126,7 +149,8 @@ impl SecretRepo for SecretRepoImpl {
         fallback: Fallback,
         expires_at: Option<OffsetDateTime>,
         new_value_version: ValueVersion,
-    ) -> Result<Option<SecretRow>, DomainError> {
+        attempt: &WriteAttempt,
+    ) -> Result<IntentCommit<SecretRow>, DomainError> {
         writes::switch_value(
             self,
             scope,
@@ -136,8 +160,22 @@ impl SecretRepo for SecretRepoImpl {
             fallback,
             expires_at,
             new_value_version,
+            attempt,
         )
         .await
+    }
+
+    async fn settle_lost_intent(
+        &self,
+        key: &StoreKey,
+        version: &ValueVersion,
+        destroy_supported: bool,
+    ) -> Result<Vec<CleanupTask>, DomainError> {
+        intents::settle_lost_intent(self, key, version, destroy_supported).await
+    }
+
+    async fn reclaim_expired(&self, limit: u64) -> Result<Reclaimed, DomainError> {
+        intents::reclaim_expired(self, limit).await
     }
 
     async fn update_metadata(
@@ -169,7 +207,8 @@ impl SecretRepo for SecretRepoImpl {
         sharing: SharingMode,
         fallback: Fallback,
         expires_at: Option<OffsetDateTime>,
-    ) -> Result<Option<(SecretRow, Option<ValueVersion>)>, DomainError> {
+        destroy_supported: bool,
+    ) -> Result<Option<(SecretRow, Vec<CleanupTask>)>, DomainError> {
         writes::remove_value(
             self,
             scope,
@@ -178,6 +217,7 @@ impl SecretRepo for SecretRepoImpl {
             sharing,
             fallback,
             expires_at,
+            destroy_supported,
         )
         .await
     }

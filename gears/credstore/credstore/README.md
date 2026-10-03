@@ -38,25 +38,46 @@ The `cf-gears-credstore` module provides:
 - **Versioning** — strong generation-bound `ETag` (`"<id>.<version>"`) on `GET`,
   mandatory `If-Match` on `PUT`/`DELETE` (a validator, or `*` for explicit
   last-writer-wins; no ABA across recreation)
-- **Crash-safe writes** — each value is written with `put(key, value)`, which
-  returns an immutable version; the row's `value_version` pointer switches to
-  it in one transaction after the bytes are durable, and older versions are
-  destroyed best effort afterwards (only if the plugin declares
-  `supports_destroy`; a failure is counted in `destroy_failed` and retried
-  implicitly by the next write). No resident reaper, no maintenance job
+- **Crash-safe writes** — a secret write first announces itself in the
+  gear's `credstore_write_intents` table (one row per attempt, with a lease on
+  the database clock), then calls the plugin's `put(key, value)`, which
+  returns an immutable version; one transaction then deletes the intent and
+  switches the row's `value_version` pointer to the new version. Every store
+  side effect is either announced before it happens or executed by an outbox
+  task enqueued in the transaction that learned it was needed — no best-effort
+  store call is ever relied on for cleanup, and the write path never calls
+  `destroy` or `delete_key` inline. A writer that finds more than half the
+  lease spent before its `put` abandons the write (`503`); an intent whose
+  lease expired is reclaimed — in one bounded transaction run once at startup
+  and best effort after every secret write — which enqueues the purge of its
+  key when the record has no row. No resident reaper, no maintenance job
+- **Store cleanup on the outbox** — one queue, `credstore.store_cleanup`
+  (partitioned by store key, so the tasks of a key run in order), carries
+  `purge(key)` (`delete_key`) and `destroy(key, below|exactly, version)`
+  (`destroy`, only where the plugin declares `supports_destroy`; acknowledged
+  without a call otherwise). Rotating a secret enqueues `destroy(below new)`
+  in the commit transaction; removing it enqueues `destroy(below old)` and
+  `destroy(exactly old)` with the compare-and-set; a write that lost its
+  compare-and-set or its create enqueues the cleanup of its own version (or
+  `purge` when the record has no row) with the intent deletion. A transient
+  plugin error is retried by the outbox (`store_cleanup_failed` counts failed
+  attempts); a malformed payload is rejected
 - **Delete and purge** — deleting a record is one row transaction that also
-  enqueues a key purge on the platform transactional outbox; the outbox
-  handler calls the plugin's `delete_key(key)` (retried until it succeeds,
-  `outbox_purge_failed` counts failed attempts). The reference is free at
+  enqueues a key purge on the same outbox queue; the handler calls the plugin's
+  `delete_key(key)` (retried until it succeeds). The reference is free at
   once, so delete-then-recreate works immediately
 - **Audit** — every secret read and write is published to the credstore audit
   topic through the `event-broker` gear, best effort: a failure logs an error
   (never the secret) and counts `audit_publish_failed`, and the operation is
   unaffected
 - **Metrics** — `read_outcome`, `walkup_depth`, dependency latency/health,
-  `cross_tenant_denied`, `destroy_failed`, `outbox_purge_failed`, `read_retry`,
-  `list_type_invariant_violation`, `audit_publish_failed`, `secret_unreadable` (`credstore_*`
-  OpenTelemetry instruments); no inventory gauge
+  `cross_tenant_denied`, `read_retry`, `list_type_invariant_violation`,
+  `audit_publish_failed`, `secret_unreadable`, and for the write protocol
+  `write_intents_reclaimed`, `write_intent_lost` (a commit found its own
+  intent reclaimed), `write_intent_reclaim_failed`,
+  `store_cleanup_enqueued{op}` and `store_cleanup_failed{op}` with `op` =
+  `purge` | `destroy` (`credstore_*_total` OpenTelemetry instruments); no
+  inventory gauge, never a `COUNT` query
 - **Backend plugin** — a versioned value store (`CredStorePluginClientV2`: `put`, `get`, `delete_key`, optional `destroy`) keyed by `(tenant_id, record_id)`, discovered via the types registry (vendor)
 - **`ClientHub` + REST** — registers `CredStoreClientV1`; exposes `/credstore/v1/credentials`
 
@@ -75,8 +96,9 @@ rotates/removes the secret without touching the rest of the record; and the
 secret is read by naming it in `$select` on that same address or on the
 collection — there is no dedicated secret address. Every value write stores a new immutable version in the backend under the
 record key `(tenant_id, record_id)`, switches the row's `value_version`
-pointer to it in one transaction, and destroys the replaced versions best
-effort afterwards — the model of Vault KV v2 and the cloud secret managers.
+pointer to it in one transaction, and the replaced versions are destroyed by
+an outbox task enqueued in that same transaction — the model of Vault KV v2
+and the cloud secret managers.
 Expiry applies to the secret, not to the record. Nothing sweeps expired rows:
 an expired record stays visible (status `expired`, normal validator) but its
 secret is never served — a read of it fails `409 SECRET_EXPIRED`, without
@@ -136,10 +158,23 @@ credstore:
     list:
       max_limit: 200             # metadata-mode page-size cap
       secret_mode_cap: 25        # secret-mode ($select=…,secret) match-set cap
+    write:
+      intent_lease_secs: 300     # how long a write intent is protected from reclaim (>= 60)
+      reclaim_batch: 16          # expired intents one reclaim pass handles (> 0)
 ```
 
 The config is `deny_unknown_fields`: the withdrawn `reaper:` and `gc:` blocks
 are rejected at startup.
+
+Residuals of the write protocol, by design: an orphan version above the
+highest committed pointer of a live record (a crash or an ambiguous commit
+after `put` on a replace or patch) is never served and is removed by the
+record's next secret write or its delete; a writer paused for longer than the
+remaining lease between its lease guard and the end of `put` may land a
+version after reclaim purged the key (hygiene only — the pointer is never
+dangling and reads return exact bytes whatever the lease does); backends
+without `destroy` keep rotated and removed versions until the record is
+deleted.
 
 ## License
 

@@ -23,7 +23,9 @@ use crate::domain::ports::metrics::{
 };
 use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
-use crate::domain::secret::model::{Fallback, PutPrecondition, SecretStatus, WritePrecondition};
+use crate::domain::secret::model::{
+    CleanupTask, Fallback, PutPrecondition, SecretStatus, WritePrecondition,
+};
 use crate::domain::secret::repo::SecretRepo;
 use crate::domain::secret::service::{ListSettings, Service};
 use crate::domain::secret::test_support::*;
@@ -503,10 +505,15 @@ async fn create_starts_at_version_one_then_overwrite_bumps() {
         Some(ValueVersion::new("2")),
         "each write gets the next value version under the same key"
     );
+    assert!(
+        plugin.destroy_calls().is_empty(),
+        "the write path never calls destroy inline"
+    );
+    run_cleanup(&repo, &plugin).await;
     assert_eq!(
         plugin.versions(&row2.store_key()),
         vec!["2"],
-        "the rotated version was destroyed inline"
+        "the rotated version is destroyed by the outbox task"
     );
 
     let got = svc
@@ -733,8 +740,16 @@ async fn ambiguous_cas_failure_keeps_the_new_version_and_the_old_value_serves() 
             put_matches(row.id, row.version),
         )
         .await
-        .expect_err("ambiguous CAS failure propagates");
-    assert!(matches!(err, DomainError::Internal { .. }));
+        .expect_err("ambiguous CAS failure is a 503");
+    assert!(
+        matches!(err, DomainError::ServiceUnavailable { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        repo.intents().len(),
+        1,
+        "the intent stays: the commit may or may not have happened"
+    );
 
     // Old value still serves; row untouched.
     let got = svc
@@ -745,9 +760,11 @@ async fn ambiguous_cas_failure_keeps_the_new_version_and_the_old_value_serves() 
     assert_eq!(got.secret.as_bytes(), b"old");
     assert_eq!(repo.rows()[0].value_version, Some(ValueVersion::new("1")));
 
-    // The version is NOT destroyed: the row may point at it.
+    // The version is NOT destroyed: the row may point at it. Nothing was
+    // enqueued either.
     assert_eq!(plugin.versions(&key_k), vec!["1", "2"]);
     assert_eq!(plugin.destroy_calls().len(), destroys, "no destroy at all");
+    assert!(repo.enqueued_tasks().is_empty());
 
     // The next successful write's destroy(Below) reclaims the orphan.
     svc.put(
@@ -759,6 +776,7 @@ async fn ambiguous_cas_failure_keeps_the_new_version_and_the_old_value_serves() 
     .await
     .expect("next write");
     assert_eq!(repo.rows()[0].value_version, Some(ValueVersion::new("3")));
+    run_cleanup(&repo, &plugin).await;
     assert_eq!(plugin.versions(&key_k), vec!["3"]);
 }
 
@@ -826,6 +844,7 @@ async fn put_whose_ack_is_lost_is_503_and_the_orphan_is_destroyed_by_the_next_wr
     )
     .await
     .expect("next write");
+    run_cleanup(&repo, &plugin).await;
     assert_eq!(plugin.versions(&key_k), vec!["3"]);
 }
 
@@ -856,13 +875,19 @@ async fn lost_cas_destroys_its_own_version_and_the_winner_serves() {
     assert!(matches!(err, DomainError::VersionConflict));
 
     assert_eq!(
-        plugin.destroy_calls()[destroys..],
-        [(
-            key_k.clone(),
-            DestroySelector::Exactly(ValueVersion::new("2"))
-        )],
-        "the loser destroys exactly its own version"
+        plugin.destroy_calls().len(),
+        destroys,
+        "the write path never calls destroy inline"
     );
+    assert_eq!(
+        repo.enqueued_tasks(),
+        [CleanupTask::Destroy {
+            key: key_k.clone(),
+            selector: DestroySelector::Exactly(ValueVersion::new("2"))
+        }],
+        "the loser's commit enqueues the destroy of exactly its own version"
+    );
+    run_cleanup(&repo, &plugin).await;
     assert_eq!(plugin.versions(&key_k), vec!["1"]);
 
     let got = svc
@@ -937,10 +962,11 @@ async fn exists_writer_re_reads_and_retries_once_after_a_lost_cas() {
         .expect("some");
     assert_eq!(got.secret.as_bytes(), b"new");
     assert_eq!(repo.rows()[0].value_version, Some(ValueVersion::new("3")));
+    run_cleanup(&repo, &plugin).await;
     assert_eq!(
         plugin.versions(&key_k),
         vec!["3"],
-        "the lost put and the old version are destroyed"
+        "the lost put and the old version are destroyed by the outbox"
     );
 }
 
@@ -966,10 +992,11 @@ async fn exists_writer_that_loses_twice_returns_a_conflict() {
         .await
         .expect_err("second loss");
     assert!(matches!(err, DomainError::VersionConflict));
+    run_cleanup(&repo, &plugin).await;
     assert_eq!(
         plugin.versions(&key_k),
         vec!["1"],
-        "both lost versions destroyed"
+        "both lost versions are destroyed by the outbox"
     );
 }
 
@@ -1024,60 +1051,17 @@ async fn two_exists_writers_sequentially_last_pointer_wins_older_versions_destro
         .expect("some");
     assert_eq!(got.secret.as_bytes(), b"v3", "last writer wins");
     assert_eq!(repo.rows()[0].value_version, Some(ValueVersion::new("3")));
-    assert_eq!(plugin.versions(&key_k), vec!["3"]);
     assert!(
-        plugin
-            .destroy_calls()
-            .iter()
-            .all(|(_, sel)| matches!(sel, DestroySelector::Below(_))),
+        repo.enqueued_tasks().iter().all(|t| matches!(
+            t,
+            CleanupTask::Destroy {
+                selector: DestroySelector::Below(_),
+                ..
+            }
+        )),
         "committed writes destroy by position only"
     );
-}
-
-#[tokio::test]
-async fn failed_destroy_is_ignored_counted_and_the_next_write_cleans_up() {
-    let tenant = Uuid::new_v4();
-    let repo = Arc::new(FakeSecretRepo::new());
-    let plugin = FakePlugin::new();
-    let dir = Arc::new(FakeDir::single(tenant));
-    let metrics = FakeMetrics::new();
-    let svc = make_service(
-        repo.clone(),
-        plugin.clone(),
-        dir,
-        mock_enforcer(),
-        metrics.clone(),
-    );
-    let ctx = make_ctx(Uuid::new_v4(), tenant);
-    let row = create_k(&svc, &repo, &ctx, "v1").await;
-    let key_k = row.store_key();
-    // The create's own destroy(Below) already ran; fail the next one.
-    let before = metrics.destroy_failed_total();
-    plugin.fail_next_destroys(1);
-
-    svc.put(
-        &ctx,
-        &key("k"),
-        write_replace(SharingMode::Tenant, "v2"),
-        put_exists(),
-    )
-    .await
-    .expect("overwrite succeeds despite the destroy failure");
-    assert_eq!(metrics.destroy_failed_total(), before + 1);
-    assert_eq!(
-        plugin.versions(&key_k),
-        vec!["1", "2"],
-        "old version stays below the pointer"
-    );
-
-    svc.put(
-        &ctx,
-        &key("k"),
-        write_replace(SharingMode::Tenant, "v3"),
-        put_exists(),
-    )
-    .await
-    .expect("next write");
+    run_cleanup(&repo, &plugin).await;
     assert_eq!(plugin.versions(&key_k), vec!["3"]);
 }
 
@@ -1142,20 +1126,22 @@ async fn removing_the_secret_destroys_below_and_exactly_old_and_never_delete_key
         .await
         .expect("remove the secret");
 
-    let calls = plugin.destroy_calls();
+    assert_eq!(plugin.destroy_calls().len(), before, "never inline");
     assert_eq!(
-        calls[before..],
+        repo.enqueued_tasks(),
         [
-            (
-                key_k.clone(),
-                DestroySelector::Below(ValueVersion::new("1"))
-            ),
-            (
-                key_k.clone(),
-                DestroySelector::Exactly(ValueVersion::new("1"))
-            ),
-        ]
+            CleanupTask::Destroy {
+                key: key_k.clone(),
+                selector: DestroySelector::Below(ValueVersion::new("1"))
+            },
+            CleanupTask::Destroy {
+                key: key_k.clone(),
+                selector: DestroySelector::Exactly(ValueVersion::new("1"))
+            },
+        ],
+        "enqueued with the CAS that nulls the pointer"
     );
+    run_cleanup(&repo, &plugin).await;
     assert!(
         plugin.delete_key_calls().is_empty(),
         "never delete_key here"
@@ -1742,7 +1728,7 @@ async fn create_over_a_live_own_row_is_still_a_conflict() {
 }
 
 #[tokio::test]
-async fn lost_create_race_destroys_the_loser_version_and_returns_conflict() {
+async fn lost_create_race_purges_the_loser_key_and_returns_conflict() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
@@ -1763,10 +1749,18 @@ async fn lost_create_race_destroys_the_loser_version_and_returns_conflict() {
         .expect_err("unique violation is a conflict");
     assert!(matches!(err, DomainError::Conflict));
 
-    let calls = plugin.destroy_calls();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].1, DestroySelector::Exactly(ValueVersion::new("1")));
-    assert!(!plugin.holds_key(&calls[0].0));
+    assert!(
+        plugin.destroy_calls().is_empty(),
+        "the write path never calls destroy inline"
+    );
+    // The fresh key can never get a row: the whole key is purged, by an
+    // outbox task enqueued with the intent deletion.
+    let purged = repo.purged_keys();
+    assert_eq!(purged.len(), 1);
+    assert!(repo.intents().is_empty(), "the intent was retired");
+    assert!(plugin.holds_key(&purged[0]), "nothing is purged inline");
+    run_cleanup(&repo, &plugin).await;
+    assert!(!plugin.holds_key(&purged[0]));
 }
 
 #[tokio::test]
@@ -1788,11 +1782,16 @@ async fn ambiguous_create_failure_keeps_the_version() {
         )
         .await
         .expect_err("ambiguous failure");
-    assert!(matches!(err, DomainError::Internal { .. }));
+    assert!(
+        matches!(err, DomainError::ServiceUnavailable { .. }),
+        "{err:?}"
+    );
     assert!(
         plugin.destroy_calls().is_empty(),
         "the commit may have happened: the version is not destroyed"
     );
+    assert!(repo.enqueued_tasks().is_empty(), "nothing is enqueued");
+    assert_eq!(repo.intents().len(), 1, "the intent stays for the reclaim");
 }
 
 // ── delete ────────────────────────────────────────────────────────────────────
@@ -3822,8 +3821,13 @@ async fn put_null_on_active_row_removes_the_value_in_one_transaction_and_cleans_
     assert_eq!(after.status, SecretStatus::Declared);
     assert!(after.value_version.is_none());
     assert!(
+        plugin.contains(&row.store_key(), &old_version),
+        "nothing is destroyed inline"
+    );
+    run_cleanup(&repo, &plugin).await;
+    assert!(
         !plugin.contains(&row.store_key(), &old_version),
-        "the removed version must be destroyed"
+        "the removed version is destroyed by the outbox task"
     );
     assert!(
         plugin.delete_key_calls().is_empty(),

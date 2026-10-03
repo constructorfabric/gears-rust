@@ -1,19 +1,22 @@
 //! Credential-store domain service (ADR-0006: immutable value versions).
 //!
 //! Orchestrates authorization, typed-secret validation, hierarchy resolution
-//! and the immutable-value write/read/delete protocols: put the bytes under
-//! the record's key, switch the row's pointer in one compare-and-set, then
-//! (where the plugin supports it) destroy older versions best effort.
+//! and the immutable-value write/read/delete protocols. Every side effect on
+//! the value store is either announced in the database before it happens
+//! (a write intent, inserted before `plugin.put`) or executed by an outbox
+//! task enqueued in the same transaction that learned it is needed (older
+//! versions after a rotation, an unreferenced version after a lost write, a
+//! whole key after a delete). No best-effort store call is ever relied on for
+//! cleanup: this service never calls `destroy` or `delete_key` itself.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use authz_resolver_sdk::PolicyEnforcer;
 use credstore_sdk::{
     CredStoreError, CredStorePluginClientV2, Credential, CredentialPatch, CredentialStatus,
-    CredentialWrite, DestroySelector, Fallback as SdkFallback, InheritanceStatus, OwnerId,
-    PatchField, PutOutcome, Secret, SecretRef, SecretValue, SharingMode, StoreKey, TenantId,
-    Validator, ValueVersion,
+    CredentialWrite, Fallback as SdkFallback, InheritanceStatus, OwnerId, PatchField, PutOutcome,
+    Secret, SecretRef, SecretValue, SharingMode, StoreKey, TenantId, Validator, ValueVersion,
 };
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
@@ -24,8 +27,9 @@ use authz_resolver_sdk::pep::ResourceType;
 use crate::domain::authz::{self, actions, scope_for};
 use crate::domain::error::DomainError;
 use crate::domain::ports::audit::{AuditEvent, AuditOperation, AuditOutcome, AuditSink, NoopAudit};
+use crate::domain::ports::clock::{MonotonicClock, SystemClock};
 use crate::domain::ports::metrics::{
-    CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome,
+    CleanupOp, CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome,
 };
 use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
@@ -33,8 +37,8 @@ use time::OffsetDateTime;
 
 use crate::domain::secret::list_filter;
 use crate::domain::secret::model::{
-    Fallback, NewDeclaredSecret, NewSecret, PutPrecondition, SecretRow, SecretStatus,
-    WritePrecondition,
+    CleanupTask, Fallback, IntentCommit, NewDeclaredSecret, NewSecret, PutPrecondition, SecretRow,
+    SecretStatus, WriteAttempt, WritePrecondition,
 };
 use crate::domain::secret::repo::SecretRepo;
 use crate::domain::secret::type_resolver::{ResolvedSecretType, SecretTypeResolver};
@@ -142,6 +146,29 @@ pub struct ListSettings {
     pub secret_mode_cap: u64,
 }
 
+/// Secret-write settings (`WriteCfg`): how long a write intent is protected
+/// from reclaim, and how many expired intents one reclaim pass handles.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub struct WriteSettings {
+    pub intent_lease: Duration,
+    pub reclaim_batch: u64,
+}
+
+impl Default for WriteSettings {
+    fn default() -> Self {
+        Self {
+            intent_lease: Duration::from_mins(5),
+            reclaim_batch: 16,
+        }
+    }
+}
+
+/// Upper bound on the reclaim passes of one startup run (each handles up to
+/// `reclaim_batch` intents): a larger backlog drains through the piggyback
+/// reclaim of later writes.
+const MAX_STARTUP_RECLAIM_PASSES: u32 = 64;
+
 /// `CredStore` domain service — get / put / delete with walk-up, the
 /// immutable-value write protocol, and `AuthZ`.
 #[domain_model]
@@ -154,6 +181,8 @@ pub struct Service {
     metrics: Arc<dyn CredStoreMetricsPort>,
     audit: Arc<dyn AuditSink>,
     list: ListSettings,
+    write: WriteSettings,
+    clock: Arc<dyn MonotonicClock>,
 }
 
 /// What a write is about to do to a secret, known once the write is
@@ -209,6 +238,8 @@ impl Service {
             metrics,
             audit: Arc::new(NoopAudit),
             list,
+            write: WriteSettings::default(),
+            clock: Arc::new(SystemClock),
         }
     }
 
@@ -216,6 +247,21 @@ impl Service {
     #[must_use]
     pub fn with_audit(mut self, audit: Arc<dyn AuditSink>) -> Self {
         self.audit = audit;
+        self
+    }
+
+    /// Use `write` for the write-intent lease and the reclaim batch (default:
+    /// [`WriteSettings::default`]).
+    #[must_use]
+    pub fn with_write_settings(mut self, write: WriteSettings) -> Self {
+        self.write = write;
+        self
+    }
+
+    /// Use `clock` for the lease guard (default: the system monotonic clock).
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn MonotonicClock>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -942,23 +988,29 @@ impl Service {
     /// a write of one class never affects the other.
     ///
     /// `value: Some(_)` follows ADR-0006's single protocol regardless of
-    /// precondition: `plugin.put` the bytes under the record's key, then one
-    /// compare-and-set switches the row's pointer (`insert_active` on create,
-    /// `switch_value` on overwrite), then — where the plugin supports it —
-    /// older versions are destroyed best effort. The plugin is resolved
-    /// (fail-fast) only on this path. A lost compare-and-set under an
+    /// precondition: announce the attempt (a write intent, inserted before any
+    /// store call; failure answers 503 with nothing written), `plugin.put` the
+    /// bytes under the record's key, then ONE transaction retires the intent
+    /// and switches the row (`insert_active` on create, `switch_value` on
+    /// overwrite, a compare-and-set on the version read first). Every store
+    /// cleanup the outcome implies (older versions after a rotation, this
+    /// attempt's version after a lost write) is enqueued in that same
+    /// transaction and executed by the outbox, never inline. The plugin is
+    /// resolved (fail-fast) only on this path. A lost compare-and-set under an
     /// `If-Match: *` precondition re-reads the row and retries once from the
-    /// start before returning `VersionConflict`. A create-only `PUT` over an
-    /// expired own row is a conflict like any other existing row (the expired
-    /// record is visible: renew or delete it). `value: None` never
-    /// touches the plugin at all on create (`insert_declared`, a plain
-    /// `INSERT`) or on replace of an already-`declared` row (metadata-only,
-    /// `update_metadata`, itself skipped when nothing would change — ADR-0004
-    /// "A metadata-only write that changes nothing bumps nothing"); on
-    /// replace of an `active` row it removes the value in the same one
-    /// compare-and-set `PATCH {"secret": null}` uses (`remove_value`), and
-    /// the plugin is then resolved for the old version's best-effort
-    /// `destroy`.
+    /// start, as a new attempt, before returning `VersionConflict`. After
+    /// every attempt a bounded reclaim of expired intents runs best effort.
+    /// A create-only `PUT` over an expired own row is a conflict like any
+    /// other existing row (the expired record is visible: renew or delete it).
+    /// `value: None` never touches the plugin at all on create
+    /// (`insert_declared`, a plain `INSERT`) or on replace of an
+    /// already-`declared` row (metadata-only, `update_metadata`, itself
+    /// skipped when nothing would change — ADR-0004 "A metadata-only write
+    /// that changes nothing bumps nothing"); on replace of an `active` row it
+    /// removes the value in the same one compare-and-set `PATCH {"secret":
+    /// null}` uses (`remove_value`), which enqueues the destroy of the old
+    /// version in the same transaction (the plugin is resolved only to learn
+    /// whether it supports `destroy`).
     ///
     /// `write` is always required; `write_secret` is additionally required
     /// when `value` is `Some(_)`, or when a `None` removes an existing value
@@ -1030,7 +1082,7 @@ impl Service {
     #[allow(
         clippy::cognitive_complexity,
         clippy::too_many_lines,
-        reason = "write orchestration (validate -> scope -> resolve -> put -> commit -> destroy) \
+        reason = "write orchestration (validate -> scope -> resolve -> announce -> put -> commit) \
                   is inherently branchy; kept as one function for readability of the flow"
     )]
     async fn put_once(
@@ -1217,10 +1269,11 @@ impl Service {
                 None if existing.status == SecretStatus::Active => {
                     // Replace of an active row with an explicit `null`:
                     // remove the value in the same one compare-and-set
-                    // `PATCH {"secret": null}` uses, then best-effort destroy
-                    // the version it left behind.
+                    // `PATCH {"secret": null}` uses; the destroy of the
+                    // version it left behind is enqueued in that same
+                    // transaction.
                     let plugin = self.plugins.resolve().await?;
-                    let (row, old_version) = self
+                    let (row, enqueued) = self
                         .repo
                         .remove_value(
                             &scope,
@@ -1229,11 +1282,11 @@ impl Service {
                             sharing,
                             fallback,
                             expires_at,
+                            plugin.supports_destroy(),
                         )
                         .await?
                         .ok_or(DomainError::VersionConflict)?;
-                    self.destroy_removed(ctx, &plugin, &row.store_key(), old_version.as_ref())
-                        .await;
+                    self.count_enqueued(&enqueued);
                     Validator {
                         id: row.id,
                         version: row.version,
@@ -1581,7 +1634,7 @@ impl Service {
             }
             PatchField::Null => {
                 let plugin = self.plugins.resolve().await?;
-                let (row, old_version) = self
+                let (row, enqueued) = self
                     .repo
                     .remove_value(
                         &scope,
@@ -1590,11 +1643,11 @@ impl Service {
                         merged_sharing,
                         merged_fallback,
                         merged_expires_at,
+                        plugin.supports_destroy(),
                     )
                     .await?
                     .ok_or(DomainError::VersionConflict)?;
-                self.destroy_removed(ctx, &plugin, &row.store_key(), old_version.as_ref())
-                    .await;
+                self.count_enqueued(&enqueued);
                 Ok(Some(Validator {
                     id: row.id,
                     version: row.version,
@@ -1709,13 +1762,17 @@ impl Service {
         }
     }
 
-    /// Create-path write protocol (ADR-0006 section 6.2 steps 2-4,
-    /// `insert_active` variant): `plugin.put` the value under the key of a
-    /// freshly minted record id, then insert the row `active` pointing at the
-    /// returned value version, then best-effort `destroy(Below)`. A create-only uniqueness conflict is a
-    /// definite loss: the just-put version is destroyed (best effort, where
-    /// supported) and `Conflict` returned. Any other repo failure is
-    /// ambiguous (the commit may have happened): the version is kept.
+    /// Create-path write protocol (ADR-0006 section 6.2, `insert_active`
+    /// variant): mint the record id, announce the attempt (write intent),
+    /// `plugin.put` the value under the new key, then ONE transaction retires
+    /// the intent and inserts the row `active` pointing at the returned
+    /// version. A create-only uniqueness conflict is a definite loss: the
+    /// transaction commits the intent deletion together with the purge of the
+    /// fresh key (nothing can ever reference it) and the caller answers
+    /// `Conflict`. An ambiguous failure (the commit may have happened) is a
+    /// 503 and leaves the intent for the reclaim; an intent found already
+    /// reclaimed is settled by the writer itself (503). A bounded reclaim of
+    /// expired intents runs after every attempt.
     async fn create_new(
         &self,
         ctx: &SecurityContext,
@@ -1726,6 +1783,12 @@ impl Service {
     ) -> Result<Validator, DomainError> {
         let id = Uuid::new_v4();
         let store_key = StoreKey::new(params.tenant, id);
+        let attempt = WriteAttempt {
+            attempt_id: Uuid::new_v4(),
+            key: store_key.clone(),
+            destroy_supported: plugin.supports_destroy(),
+        };
+        self.announce_write(&attempt).await?;
         let value_version = self
             .plugin_put_timed(plugin, ctx, &store_key, value)
             .await?;
@@ -1740,33 +1803,38 @@ impl Service {
             value_version: value_version.clone(),
             fallback: params.fallback,
         };
-        match self.repo.insert_active(scope, &new).await {
-            Ok(()) => {
-                self.destroy_below(ctx, plugin, &store_key, &value_version)
-                    .await;
+        let result = match self.repo.insert_active(scope, &new, &attempt).await {
+            Ok(IntentCommit::Committed { enqueued, .. }) => {
+                self.count_enqueued(&enqueued);
                 Ok(Validator { id, version: 1 })
             }
-            Err(DomainError::Conflict) => {
-                self.destroy_exactly(ctx, plugin, &store_key, &value_version)
-                    .await;
+            Ok(IntentCommit::Lost { enqueued }) => {
+                self.count_enqueued(&enqueued);
                 Err(DomainError::Conflict)
             }
-            // Ambiguous (PG unavailable or timed out): the row may point at
-            // this version, so it is NOT destroyed.
-            Err(e) => Err(e),
-        }
+            Ok(IntentCommit::IntentLost) => {
+                Err(self.settle_lost_intent(&attempt, &value_version).await)
+            }
+            Err(e) => Err(Self::write_unconfirmed(e)),
+        };
+        self.piggyback_reclaim().await;
+        result
     }
 
-    /// Overwrite-path write protocol (ADR-0006 section 6.2 steps 2-4,
-    /// `switch_value` variant): `plugin.put` the value under the record's
-    /// key, then one compare-and-set on the row version read in step 1
-    /// switches the pointer. Returns `Ok(None)` on a definite loss (0 rows:
-    /// the row changed or vanished concurrently) after a best-effort
-    /// `destroy(Exactly(own))`; on a win, best-effort `destroy(Below(new))`.
-    /// Any other repo failure is ambiguous: the version is kept and the error
-    /// returned. Shared by `put`'s replace leg and `patch {"secret": ...}`
-    /// (ADR-0004); accepts a `declared` row too, switching it back to
-    /// `active`.
+    /// Overwrite-path write protocol (ADR-0006 section 6.2, `switch_value`
+    /// variant): announce the attempt (write intent), `plugin.put` the value
+    /// under the record's key, then ONE transaction retires the intent and
+    /// runs one compare-and-set on the row version read in step 1, switching
+    /// the pointer. Returns `Ok(None)` on a definite loss (0 rows: the row
+    /// changed or vanished concurrently): the intent deletion commits
+    /// together with `destroy(Exactly(own))` (row still exists) or
+    /// `purge(key)` (row gone). On a win the same transaction enqueues
+    /// `destroy(Below(new))`. Any other repo failure is ambiguous: 503, the
+    /// intent stays for the reclaim. An intent found already reclaimed is
+    /// settled by the writer itself (503). A bounded reclaim of expired
+    /// intents runs after every attempt. Shared by `put`'s replace leg and
+    /// `patch {"secret": ...}` (ADR-0004); accepts a `declared` row too,
+    /// switching it back to `active`.
     #[allow(
         clippy::too_many_arguments,
         reason = "carries every field an overwrite's CAS needs: the row read in step 1, sharing, \
@@ -1784,6 +1852,12 @@ impl Service {
         value: &SecretValue,
     ) -> Result<Option<Validator>, DomainError> {
         let store_key = existing.store_key();
+        let attempt = WriteAttempt {
+            attempt_id: Uuid::new_v4(),
+            key: store_key.clone(),
+            destroy_supported: plugin.supports_destroy(),
+        };
+        self.announce_write(&attempt).await?;
         let value_version = self
             .plugin_put_timed(plugin, ctx, &store_key, value)
             .await?;
@@ -1791,7 +1865,7 @@ impl Service {
         // The compare-and-set is always on the version read in step 1,
         // whatever the client precondition: `destroy(Below)` is safe only for
         // a writer whose base is the row it read before its `put`.
-        let switched = self
+        let result = match self
             .repo
             .switch_value(
                 scope,
@@ -1801,23 +1875,194 @@ impl Service {
                 fallback,
                 expires_at,
                 value_version.clone(),
+                &attempt,
             )
-            .await?;
-
-        let Some(row) = switched else {
-            // Definite loss: another writer's committed row stands; this
-            // version is unreferenced.
-            self.destroy_exactly(ctx, plugin, &store_key, &value_version)
-                .await;
-            return Ok(None);
+            .await
+        {
+            Ok(IntentCommit::Committed {
+                value: row,
+                enqueued,
+            }) => {
+                self.count_enqueued(&enqueued);
+                Ok(Some(Validator {
+                    id: row.id,
+                    version: row.version,
+                }))
+            }
+            // Definite loss: another writer's committed row stands (or the
+            // row is gone); this version's cleanup was enqueued with the
+            // intent deletion.
+            Ok(IntentCommit::Lost { enqueued }) => {
+                self.count_enqueued(&enqueued);
+                Ok(None)
+            }
+            Ok(IntentCommit::IntentLost) => {
+                Err(self.settle_lost_intent(&attempt, &value_version).await)
+            }
+            Err(e) => Err(Self::write_unconfirmed(e)),
         };
+        self.piggyback_reclaim().await;
+        result
+    }
 
-        self.destroy_below(ctx, plugin, &store_key, &value_version)
-            .await;
-        Ok(Some(Validator {
-            id: row.id,
-            version: row.version,
-        }))
+    /// Steps 2-3 of a secret write: announce the attempt (tx0), then the
+    /// lease guard. `Err` means the caller must not `put`, and nothing is
+    /// left behind: either the intent could not be inserted, or it was
+    /// abandoned.
+    ///
+    /// The lease guard bounds the one residual the intent protocol has:
+    /// reclaim never claims an intent before `lease_until`, so a writer that
+    /// finds more than half the lease spent between announcing and its `put`
+    /// (a stalled instance, a slow database) would risk landing a version
+    /// after its intent was reclaimed, and abandons the write instead. The
+    /// monotonic start instant is taken BEFORE tx0 is issued, so the
+    /// database-clock lease can never start earlier than the writer thinks.
+    async fn announce_write(&self, attempt: &WriteAttempt) -> Result<(), DomainError> {
+        let started = self.clock.now();
+        if let Err(e) = self
+            .repo
+            .begin_write_intent(attempt, self.write.intent_lease)
+            .await
+        {
+            tracing::warn!(
+                record = %attempt.key.record_id,
+                "credstore: could not record the write intent; nothing was written to the store"
+            );
+            return Err(Self::write_unavailable(
+                "the credential store could not record the write",
+                e,
+            ));
+        }
+        if self.clock.now().saturating_duration_since(started) > self.write.intent_lease / 2 {
+            if let Err(e) = self.repo.drop_write_intent(attempt.attempt_id).await {
+                // Best effort: the intent expires and is reclaimed anyway.
+                tracing::warn!(
+                    record = %attempt.key.record_id,
+                    err = %e,
+                    "credstore: could not delete the abandoned write intent; it will be reclaimed"
+                );
+            }
+            return Err(DomainError::ServiceUnavailable {
+                detail: "the write took too long to start; retry".to_owned(),
+                retry_after: None,
+                cause: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// Step 5c: the commit found the writer's own intent reclaimed. The
+    /// writer is alive and knows its version, so it enqueues the cleanup
+    /// nobody else will (`destroy(Exactly(version))` if the record has a row,
+    /// else `purge(key)`) and answers 503. If that transaction fails too, the
+    /// version stays until the record's next secret write or delete (the
+    /// documented lease-window residual): logged and counted.
+    async fn settle_lost_intent(
+        &self,
+        attempt: &WriteAttempt,
+        version: &ValueVersion,
+    ) -> DomainError {
+        self.metrics.write_intent_lost();
+        match self
+            .repo
+            .settle_lost_intent(&attempt.key, version, attempt.destroy_supported)
+            .await
+        {
+            Ok(tasks) => self.count_enqueued(&tasks),
+            Err(e) => {
+                self.metrics.write_intent_reclaim_failed();
+                tracing::error!(
+                    record = %attempt.key.record_id,
+                    err = %e,
+                    "credstore: write intent was reclaimed and its version could not be settled; \
+                     it stays until the record's next secret write or delete"
+                );
+            }
+        }
+        DomainError::ServiceUnavailable {
+            detail: "the write outlived its lease and was not applied; retry".to_owned(),
+            retry_after: None,
+            cause: None,
+        }
+    }
+
+    /// A failure of the commit transaction other than a definite outcome: the
+    /// commit may or may not have happened, so the answer is 503 and the
+    /// intent (if it still exists) is left for the reclaim.
+    fn write_unconfirmed(e: DomainError) -> DomainError {
+        Self::write_unavailable("the credential store could not confirm the write", e)
+    }
+
+    /// `e` as a retryable 503 (kept as the cause, never shown on the wire).
+    fn write_unavailable(detail: &str, e: DomainError) -> DomainError {
+        match e {
+            DomainError::ServiceUnavailable { .. } => e,
+            other => DomainError::ServiceUnavailable {
+                detail: detail.to_owned(),
+                retry_after: None,
+                cause: Some(Box::new(other)),
+            },
+        }
+    }
+
+    /// Counts the cleanup tasks a committed transaction enqueued.
+    fn count_enqueued(&self, tasks: &[CleanupTask]) {
+        for task in tasks {
+            self.metrics.store_cleanup_enqueued(task.op());
+        }
+    }
+
+    /// Step 6: reclaim expired write intents after a write, best effort in
+    /// its own transaction. A failure is logged and counted by
+    /// [`Self::reclaim_expired`] and never changes the write's reply.
+    async fn piggyback_reclaim(&self) {
+        drop(self.reclaim_expired().await);
+    }
+
+    /// One reclaim pass: deletes up to `reclaim_batch` intents whose lease
+    /// expired and enqueues the purge of every key whose record has no row.
+    /// Returns how many intents it reclaimed. A failure is logged and counted
+    /// (`write_intent_reclaim_failed`); the intents stay for the next pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns the repository error of a failed pass.
+    pub async fn reclaim_expired(&self) -> Result<u64, DomainError> {
+        match self.repo.reclaim_expired(self.write.reclaim_batch).await {
+            Ok(reclaimed) => {
+                if reclaimed.intents > 0 {
+                    self.metrics.write_intents_reclaimed(reclaimed.intents);
+                }
+                self.count_enqueued(&reclaimed.enqueued);
+                Ok(reclaimed.intents)
+            }
+            Err(e) => {
+                self.metrics.write_intent_reclaim_failed();
+                tracing::warn!(err = %e, "credstore: reclaiming expired write intents failed");
+                Err(e)
+            }
+        }
+    }
+
+    /// Startup reclaim, run by `serve` before the gear reports ready: passes
+    /// repeat until one reclaims fewer intents than `reclaim_batch` (at most
+    /// [`MAX_STARTUP_RECLAIM_PASSES`]; a larger backlog drains through the
+    /// piggyback reclaim of later writes). Returns the total reclaimed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the first failed pass (already logged and
+    /// counted); the caller starts regardless.
+    pub async fn reclaim_at_startup(&self) -> Result<u64, DomainError> {
+        let mut total = 0;
+        for _ in 0..MAX_STARTUP_RECLAIM_PASSES {
+            let reclaimed = self.reclaim_expired().await?;
+            total += reclaimed;
+            if reclaimed < self.write.reclaim_batch {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     /// Timed `plugin.put`, mapping the error and recording the dependency
@@ -1849,89 +2094,6 @@ impl Service {
         result
     }
 
-    /// Best-effort `destroy`, only when the plugin declares support. A
-    /// failure is ignored (counted and logged): older versions stay until the
-    /// next successful write to the record destroys them.
-    async fn destroy_best_effort(
-        &self,
-        ctx: &SecurityContext,
-        plugin: &Arc<dyn CredStorePluginClientV2>,
-        key: &StoreKey,
-        selector: DestroySelector,
-    ) {
-        if !plugin.supports_destroy() {
-            return;
-        }
-        let t0 = Instant::now();
-        let result = plugin.destroy(ctx, key, selector).await;
-        let secs = t0.elapsed().as_secs_f64();
-        self.metrics.dependency(
-            Dep::Plugin,
-            DepOp::PluginDestroy,
-            if result.is_ok() {
-                Outcome::Success
-            } else {
-                Outcome::Error
-            },
-            secs,
-        );
-        if let Err(e) = result {
-            self.metrics.destroy_failed();
-            // The plugin's error text is not logged: it is not curated for
-            // the credstore boundary.
-            tracing::warn!(
-                record = %key.record_id,
-                unavailable = e.is_unavailable(),
-                "credstore: best-effort destroy failed; the next successful write retries it"
-            );
-        }
-    }
-
-    /// Step 4: after a committed write, destroy every version older than the
-    /// one just committed.
-    async fn destroy_below(
-        &self,
-        ctx: &SecurityContext,
-        plugin: &Arc<dyn CredStorePluginClientV2>,
-        key: &StoreKey,
-        committed: &ValueVersion,
-    ) {
-        self.destroy_best_effort(ctx, plugin, key, DestroySelector::Below(committed.clone()))
-            .await;
-    }
-
-    /// After a definite CAS loss: destroy this writer's own, unreferenced
-    /// version.
-    async fn destroy_exactly(
-        &self,
-        ctx: &SecurityContext,
-        plugin: &Arc<dyn CredStorePluginClientV2>,
-        key: &StoreKey,
-        own: &ValueVersion,
-    ) {
-        self.destroy_best_effort(ctx, plugin, key, DestroySelector::Exactly(own.clone()))
-            .await;
-    }
-
-    /// After a secret removal committed: `destroy(Below(old))` then
-    /// `destroy(Exactly(old))`, never `delete_key` (a concurrent writer may
-    /// already have put a newer version under the same key).
-    async fn destroy_removed(
-        &self,
-        ctx: &SecurityContext,
-        plugin: &Arc<dyn CredStorePluginClientV2>,
-        key: &StoreKey,
-        old: Option<&ValueVersion>,
-    ) {
-        let Some(old) = old else {
-            return;
-        };
-        self.destroy_best_effort(ctx, plugin, key, DestroySelector::Below(old.clone()))
-            .await;
-        self.destroy_best_effort(ctx, plugin, key, DestroySelector::Exactly(old.clone()))
-            .await;
-    }
-
     /// Delete an owned secret (section 6.3).
     ///
     /// One database transaction ([`SecretRepo::delete_by_id`]) deletes the row
@@ -1940,7 +2102,9 @@ impl Service {
     /// commits (ADR-0006: no name retention - a successor mints its own record
     /// id and key, so it can never collide with this delete's lagging purge).
     /// The outbox handler calls `plugin.delete_key` and retries until it
-    /// succeeds. No plugin call happens on this path.
+    /// succeeds. No plugin call happens on this path. The purge also removes
+    /// any orphan version a crashed or ambiguous write left above the
+    /// record's pointer.
     ///
     /// # Errors
     ///
@@ -1993,7 +2157,10 @@ impl Service {
             .delete_by_id(&scope, &row.store_key(), expected_version)
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.metrics.store_cleanup_enqueued(CleanupOp::Purge);
+                Ok(())
+            }
             Err(DomainError::NotFound) if expected_version.is_some() => {
                 Err(DomainError::VersionConflict)
             }
@@ -2038,3 +2205,7 @@ mod service_tests;
 #[cfg(test)]
 #[path = "audit_tests.rs"]
 mod audit_tests;
+
+#[cfg(test)]
+#[path = "write_intent_tests.rs"]
+mod write_intent_tests;

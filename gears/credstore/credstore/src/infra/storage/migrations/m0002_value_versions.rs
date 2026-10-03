@@ -5,7 +5,13 @@
 //! `CHECK` `credstore_secrets_value_version_check` is added, the
 //! value-fingerprint fence columns (`value_fp`, `fp_key_id`) and their
 //! `CHECK` are dropped, and the reaper's `idx_credstore_pending` is dropped.
-//! There is no gc table: nothing in the schema tracks garbage.
+//! The write-intent journal `credstore_write_intents` is added: a secret write
+//! inserts `(attempt_id, tenant_id, record_id, lease_until)` before it
+//! `put`s under the store key `(tenant_id, record_id)` and deletes it in the
+//! transaction that commits (or definitively loses) the write; an intent
+//! whose lease expired is reclaimed. It is a before-the-fact log, not a task
+//! queue: store cleanup tasks live in the platform transactional outbox, and
+//! nothing in the schema tracks garbage.
 //!
 //! Per-backend raw SQL, like `m0001_initial_schema`. `PostgreSQL` rewrites the
 //! shipped anonymous status `CHECK` in place - its auto-generated name is
@@ -19,6 +25,13 @@
 //! written under it, so every carried row becomes `declared` (`status = 4`,
 //! `value_version` `NULL`). `MySQL` is not supported; this migration fails
 //! fast with the same error text as `m0001`.
+//!
+//! **Irreversible.** The migration is data-destructive by design (saga rows
+//! deleted, fingerprints dropped, rows demoted to `declared`), so `down`
+//! returns [`DbErr::Migration`] on every backend and changes nothing. There
+//! is no schema `down` against live data: rolling back means restoring the
+//! pre-migration database snapshot together with the store snapshot (credstore
+//! DESIGN section 8).
 
 use credstore_sdk::types::GENERIC_TYPE_UUID_STR;
 use sea_orm_migration::prelude::*;
@@ -26,6 +39,11 @@ use sea_orm_migration::sea_orm::ConnectionTrait;
 
 const MYSQL_NOT_SUPPORTED: &str = "credstore migrations: MySQL is not supported \
     (this migration set targets PostgreSQL/SQLite)";
+
+/// The `down` error text; see the module docs.
+const IRREVERSIBLE: &str = "m0002_value_versions is irreversible: it deletes saga rows, \
+    drops the value fingerprints and demotes rows to declared; roll back by restoring the \
+    pre-migration database and store snapshots (credstore DESIGN section 8)";
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -43,15 +61,12 @@ impl MigrationTrait for Migration {
         }
     }
 
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let backend = manager.get_database_backend();
-        let conn = manager.get_connection();
-
-        match backend {
-            sea_orm::DatabaseBackend::Postgres => Self::down_postgres(conn).await,
-            sea_orm::DatabaseBackend::Sqlite => Self::down_sqlite(conn).await,
-            _ => Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned())),
-        }
+    /// Always fails, on every backend and before touching the database: after
+    /// `up` the saga rows are gone, the value fingerprints are dropped and
+    /// the carried rows are `declared`, so there is nothing a schema `down`
+    /// could restore. Rollback is a restore of the pre-migration snapshots.
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Err(DbErr::Migration(IRREVERSIBLE.to_owned()))
     }
 }
 
@@ -133,28 +148,16 @@ $do$;
             "ALTER TABLE credstore_secrets DROP COLUMN IF EXISTS fp_key_id;",
             // The reaper's sweep index has nothing left to sweep.
             "DROP INDEX IF EXISTS idx_credstore_pending;",
-        ];
-        for sql in statements {
-            conn.execute_unprepared(sql).await?;
-        }
-        Ok(())
-    }
-
-    async fn down_postgres(conn: &impl ConnectionTrait) -> Result<(), DbErr> {
-        let statements = [
-            "CREATE INDEX IF NOT EXISTS idx_credstore_pending \
-                ON credstore_secrets (updated_at) WHERE status <> 2;",
-            "DROP INDEX IF EXISTS idx_credstore_type;",
-            "ALTER TABLE credstore_secrets ADD COLUMN IF NOT EXISTS value_fp BYTEA NULL;",
-            "ALTER TABLE credstore_secrets ADD COLUMN IF NOT EXISTS fp_key_id SMALLINT NULL;",
-            "ALTER TABLE credstore_secrets DROP CONSTRAINT IF EXISTS credstore_secrets_value_version_check;",
-            "ALTER TABLE credstore_secrets DROP CONSTRAINT IF EXISTS credstore_secrets_status_check;",
-            "ALTER TABLE credstore_secrets \
-                ADD CONSTRAINT credstore_secrets_status_check CHECK (status IN (1, 2, 3));",
-            "ALTER TABLE credstore_secrets \
-                ADD CONSTRAINT credstore_secrets_fp_check CHECK ((value_fp IS NULL) = (fp_key_id IS NULL));",
-            "ALTER TABLE credstore_secrets DROP COLUMN IF EXISTS fallback;",
-            "ALTER TABLE credstore_secrets DROP COLUMN IF EXISTS value_version;",
+            // The write-intent journal: one row per in-flight secret write
+            // attempt; `lease_until` is on the database clock.
+            "CREATE TABLE IF NOT EXISTS credstore_write_intents (
+                attempt_id UUID PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                record_id UUID NOT NULL,
+                lease_until TIMESTAMPTZ NOT NULL
+            );",
+            "CREATE INDEX IF NOT EXISTS idx_credstore_write_intents_lease \
+                ON credstore_write_intents (lease_until);",
         ];
         for sql in statements {
             conn.execute_unprepared(sql).await?;
@@ -222,66 +225,18 @@ WHERE status = 2;
             "CREATE INDEX IF NOT EXISTS idx_credstore_type \
                 ON credstore_secrets (tenant_id, secret_type_uuid);"
                 .to_owned(),
-        ];
-        for sql in &statements {
-            conn.execute_unprepared(sql).await?;
-        }
-        Ok(())
-    }
-
-    async fn down_sqlite(conn: &impl ConnectionTrait) -> Result<(), DbErr> {
-        let generic_uuid_hex = GENERIC_TYPE_UUID_STR.replace('-', "");
-        let statements = [
-            format!(
-                r"
-CREATE TABLE credstore_secrets_old (
-    id BLOB PRIMARY KEY NOT NULL,
-    tenant_id BLOB NOT NULL,
-    reference TEXT NOT NULL CHECK (length(reference) BETWEEN 1 AND 255),
-    sharing SMALLINT NOT NULL CHECK (sharing IN (1, 2, 3)),
-    owner_id BLOB NOT NULL,
-    status SMALLINT NOT NULL CHECK (status IN (1, 2, 3)),
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    version BIGINT NOT NULL DEFAULT 1,
-    secret_type_uuid BLOB NOT NULL DEFAULT (x'{generic_uuid_hex}'),
-    expires_at TEXT NULL,
-    value_fp BLOB NULL,
-    fp_key_id SMALLINT NULL,
-    CHECK ((value_fp IS NULL) = (fp_key_id IS NULL))
-);
-                "
-            ),
-            // Only rows that already fit the old (status IN (1,2,3)) shape
-            // carry back; a `declared` (4) row has no pre-ADR-0006
-            // equivalent and is dropped.
-            r"
-INSERT INTO credstore_secrets_old
-    (id, tenant_id, reference, sharing, owner_id, status, created_at, updated_at,
-     version, secret_type_uuid, expires_at, value_fp, fp_key_id)
-SELECT
-    id, tenant_id, reference, sharing, owner_id, status, created_at, updated_at,
-    version, secret_type_uuid, expires_at, value_fp, fp_key_id
-FROM credstore_secrets
-WHERE status IN (1, 2, 3);
-            "
+            // The write-intent journal (see the module docs). SQLite keeps
+            // UUIDs as 16-byte blobs and timestamps as TEXT, like the rest of
+            // the schema.
+            "CREATE TABLE IF NOT EXISTS credstore_write_intents (
+                attempt_id BLOB PRIMARY KEY NOT NULL,
+                tenant_id BLOB NOT NULL,
+                record_id BLOB NOT NULL,
+                lease_until TEXT NOT NULL
+            );"
             .to_owned(),
-            "DROP TABLE credstore_secrets;".to_owned(),
-            "ALTER TABLE credstore_secrets_old RENAME TO credstore_secrets;".to_owned(),
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_credstore_nonprivate \
-                ON credstore_secrets (tenant_id, reference) WHERE sharing <> 1;"
-                .to_owned(),
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_credstore_private \
-                ON credstore_secrets (tenant_id, reference, owner_id) WHERE sharing = 1;"
-                .to_owned(),
-            "CREATE INDEX IF NOT EXISTS idx_credstore_lookup \
-                ON credstore_secrets (reference, tenant_id, status);"
-                .to_owned(),
-            "CREATE INDEX IF NOT EXISTS idx_credstore_pending \
-                ON credstore_secrets (updated_at) WHERE status <> 2;"
-                .to_owned(),
-            "CREATE INDEX IF NOT EXISTS idx_credstore_expiry \
-                ON credstore_secrets (expires_at) WHERE expires_at IS NOT NULL AND status = 2;"
+            "CREATE INDEX IF NOT EXISTS idx_credstore_write_intents_lease \
+                ON credstore_write_intents (lease_until);"
                 .to_owned(),
         ];
         for sql in &statements {
@@ -290,3 +245,7 @@ WHERE status IN (1, 2, 3);
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "m0002_value_versions_tests.rs"]
+mod m0002_value_versions_tests;

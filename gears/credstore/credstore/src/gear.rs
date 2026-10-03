@@ -3,7 +3,9 @@
 //! Initialization builds the domain service and registers its SDK client and
 //! REST routes. The lifecycle entry runs no resident background loop and no
 //! maintenance job (ADR-0006 D7); its only asynchronous work is the platform
-//! transactional outbox that purges a deleted record's store key.
+//! transactional outbox that executes store cleanup (purging a dead record's
+//! store key, destroying superseded versions). Before reporting ready it
+//! reclaims expired write intents once.
 
 use std::sync::{Arc, OnceLock};
 
@@ -25,10 +27,10 @@ use crate::config::CredStoreConfig;
 use crate::domain::ports::audit::AuditSink;
 use crate::domain::ports::metrics::CredStoreMetricsPort;
 use crate::domain::ports::plugin::PluginSelector;
-use crate::domain::secret::service::{ListSettings, Service};
+use crate::domain::secret::service::{ListSettings, Service, WriteSettings};
 use crate::infra::audit::{self, BrokerResolver, DEFAULT_PUBLISH_TIMEOUT, EventBrokerAuditSink};
 use crate::infra::metrics::CredStoreMetricsMeter;
-use crate::infra::outbox::{self, OutboxPurgeEnqueuer, PurgeHandler};
+use crate::infra::outbox::{self, CleanupEnqueuer, CleanupHandler, OutboxCleanupEnqueuer};
 use crate::infra::plugin_select::GtsCredStorePluginSelector;
 use crate::infra::storage::repo_impl::SecretRepoImpl;
 use crate::infra::tenant_resolver::TenantResolverDir;
@@ -51,12 +53,12 @@ pub struct CredStoreGear {
     outbox_deferred: OnceLock<OutboxDeferred>,
 }
 
-/// State built in `init` and consumed by `serve` to start the key-purge
+/// State built in `init` and consumed by `serve` to start the store-cleanup
 /// outbox: the enqueuer must exist at `init` (the repository holds it), the
 /// pipeline itself starts when the gear serves.
 struct OutboxDeferred {
     db: toolkit_db::Db,
-    enqueuer: Arc<OutboxPurgeEnqueuer>,
+    enqueuer: Arc<OutboxCleanupEnqueuer>,
     plugins: Arc<GtsCredStorePluginSelector>,
     metrics: Arc<dyn CredStoreMetricsPort>,
 }
@@ -80,30 +82,37 @@ impl CredStoreGear {
         cancel: CancellationToken,
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
-        if self.service.get().is_none() {
+        let Some(service) = self.service.get() else {
             anyhow::bail!("credstore: serve invoked before init");
-        }
+        };
         let od = self
             .outbox_deferred
             .get()
             .ok_or_else(|| anyhow::anyhow!("credstore: outbox not initialized"))?;
 
-        // Start the key-purge outbox before reporting ready: a delete
-        // enqueues into it inside its transaction.
+        // Start the store-cleanup outbox before reporting ready: every
+        // secret write, delete and reclaim enqueues into it inside its
+        // transaction.
         let handle = outbox::start(
             od.db.clone(),
             &od.enqueuer,
-            PurgeHandler::new(
+            CleanupHandler::new(
                 Arc::clone(&od.plugins) as Arc<dyn PluginSelector>,
                 Arc::clone(&od.metrics),
             ),
         )
         .await?;
 
+        // Reclaim the write intents a previous run left behind (a writer that
+        // crashed between announcing a store write and committing it), before
+        // traffic arrives. The reclaim enqueues into the outbox started
+        // above.
+        Self::reclaim_at_startup(service).await;
+
         ready.notify();
         info!(
             target: "credstore.lifecycle",
-            "credstore gear serving; the only background work is the outbox key purge"
+            "credstore gear serving; the only background work is the outbox store cleanup"
         );
 
         cancel.cancelled().await;
@@ -111,6 +120,27 @@ impl CredStoreGear {
         info!(target: "credstore.lifecycle", "credstore lifecycle cancelled; stopping outbox");
         handle.stop().await;
         Ok(())
+    }
+}
+
+impl CredStoreGear {
+    /// Startup reclaim of expired write intents. A failure is logged and
+    /// counted by the service; the gear starts regardless, and later writes
+    /// reclaim as they go.
+    async fn reclaim_at_startup(service: &Service) {
+        match service.reclaim_at_startup().await {
+            Ok(0) => {}
+            Ok(n) => info!(
+                target: "credstore.lifecycle",
+                reclaimed = n,
+                "reclaimed expired write intents at startup"
+            ),
+            Err(e) => tracing::warn!(
+                target: "credstore.lifecycle",
+                err = %e,
+                "startup reclaim of expired write intents failed; starting anyway"
+            ),
+        }
     }
 }
 
@@ -127,10 +157,10 @@ impl Gear for CredStoreGear {
         let db: Arc<DBProvider<crate::domain::error::DomainError>> =
             Arc::new(DBProvider::new(db_raw.db()));
 
-        let enqueuer = Arc::new(OutboxPurgeEnqueuer::new());
+        let enqueuer = Arc::new(OutboxCleanupEnqueuer::new());
         let repo = Arc::new(SecretRepoImpl::new(
             Arc::clone(&db),
-            Arc::clone(&enqueuer) as Arc<dyn crate::infra::outbox::PurgeEnqueuer>,
+            Arc::clone(&enqueuer) as Arc<dyn CleanupEnqueuer>,
         ));
 
         let authz_client = ctx
@@ -219,7 +249,11 @@ impl Gear for CredStoreGear {
                     secret_mode_cap: cfg.list.secret_mode_cap,
                 },
             )
-            .with_audit(audit_sink),
+            .with_audit(audit_sink)
+            .with_write_settings(WriteSettings {
+                intent_lease: std::time::Duration::from_secs(cfg.write.intent_lease_secs),
+                reclaim_batch: cfg.write.reclaim_batch,
+            }),
         );
 
         self.service

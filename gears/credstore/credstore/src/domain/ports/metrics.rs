@@ -1,8 +1,11 @@
 //! Metrics vocabulary and recording port for credential-store operations.
 //!
-//! Defines bounded labels for outcomes and dependencies, plus the three
-//! lifecycle counters of ADR-0006 (`destroy_failed`, `outbox_purge_failed`,
-//! `read_retry`). No inventory gauges: the shipped reaper's per-status
+//! Defines bounded labels for outcomes and dependencies, plus the lifecycle
+//! counters of ADR-0006: the write-intent counters
+//! (`write_intents_reclaimed`, `write_intent_lost`,
+//! `write_intent_reclaim_failed`), the store-cleanup counters
+//! (`store_cleanup_enqueued`, `store_cleanup_failed`, by task op) and
+//! `read_retry`. No inventory gauges: the shipped reaper's per-status
 //! row-count gauges were `COUNT … GROUP BY` queries, forbidden by the
 //! platform's no-`COUNT` rule, and are withdrawn rather than reimplemented.
 
@@ -75,6 +78,24 @@ impl DepOp {
     }
 }
 
+/// The kind of store-cleanup task (the `op` label of the `store_cleanup_*`
+/// counters): a key purge (`delete_key`) or a version destroy.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupOp {
+    Purge,
+    Destroy,
+}
+impl CleanupOp {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Purge => "purge",
+            Self::Destroy => "destroy",
+        }
+    }
+}
+
 /// Outcome of a secret read that found its version gone and re-read the row
 /// once (ADR-0006, DESIGN section 4.6). `SecondMiss` is the 503 case.
 #[domain_model]
@@ -116,13 +137,23 @@ pub trait CredStoreMetricsPort: Send + Sync + 'static {
     fn walkup_depth(&self, depth: u64);
     fn dependency(&self, dep: Dep, op: DepOp, outcome: Outcome, secs: f64);
     fn cross_tenant_denied(&self);
-    /// A best-effort `destroy` (after a write, a lost CAS or a secret
-    /// removal) failed; the next successful write to the record retries it
-    /// implicitly.
-    fn destroy_failed(&self);
-    /// An outbox `delete_key` delivery attempt failed and will be retried; a
-    /// persistently rising value means a key purge is stuck.
-    fn outbox_purge_failed(&self);
+    /// `n` expired write intents were reclaimed (deleted by
+    /// `reclaim_expired`).
+    fn write_intents_reclaimed(&self, n: u64);
+    /// A secret write's commit transaction found its own intent already
+    /// reclaimed (the writer outlived its lease); the writer settled its
+    /// version itself.
+    fn write_intent_lost(&self);
+    /// A reclaim pass (startup or piggyback after a write) failed; the
+    /// intents stay for the next pass. A persistently rising value means
+    /// expired intents are not being reclaimed.
+    fn write_intent_reclaim_failed(&self);
+    /// A store-cleanup task (`purge` or `destroy`) was enqueued in the
+    /// transactional outbox.
+    fn store_cleanup_enqueued(&self, op: CleanupOp);
+    /// A store-cleanup delivery attempt failed and will be retried; a
+    /// persistently rising value means a purge or destroy is stuck.
+    fn store_cleanup_failed(&self, op: CleanupOp);
     /// A secret read found its version gone and re-read the row once.
     fn read_retry(&self, outcome: ReadRetryOutcome);
     /// Collection read (ADR-0005): a reference's reduced winner named a
@@ -155,8 +186,11 @@ impl CredStoreMetricsPort for NoopMetrics {
     fn walkup_depth(&self, _: u64) {}
     fn dependency(&self, _: Dep, _: DepOp, _: Outcome, _: f64) {}
     fn cross_tenant_denied(&self) {}
-    fn destroy_failed(&self) {}
-    fn outbox_purge_failed(&self) {}
+    fn write_intents_reclaimed(&self, _: u64) {}
+    fn write_intent_lost(&self) {}
+    fn write_intent_reclaim_failed(&self) {}
+    fn store_cleanup_enqueued(&self, _: CleanupOp) {}
+    fn store_cleanup_failed(&self, _: CleanupOp) {}
     fn read_retry(&self, _: ReadRetryOutcome) {}
     fn list_type_invariant_violation(&self) {}
     fn audit_publish_failed(&self) {}
@@ -194,6 +228,8 @@ mod tests {
         assert_eq!(Outcome::Error.as_str(), "error");
         assert_eq!(ReadRetryOutcome::Recovered.as_str(), "recovered");
         assert_eq!(ReadRetryOutcome::SecondMiss.as_str(), "second_miss");
+        assert_eq!(CleanupOp::Purge.as_str(), "purge");
+        assert_eq!(CleanupOp::Destroy.as_str(), "destroy");
     }
 
     #[test]
@@ -203,8 +239,11 @@ mod tests {
         noop.walkup_depth(3);
         noop.dependency(Dep::Pdp, DepOp::Evaluate, Outcome::Success, 0.1);
         noop.cross_tenant_denied();
-        noop.destroy_failed();
-        noop.outbox_purge_failed();
+        noop.write_intents_reclaimed(2);
+        noop.write_intent_lost();
+        noop.write_intent_reclaim_failed();
+        noop.store_cleanup_enqueued(CleanupOp::Purge);
+        noop.store_cleanup_failed(CleanupOp::Destroy);
         noop.read_retry(ReadRetryOutcome::Recovered);
         noop.list_type_invariant_violation();
         noop.audit_publish_failed();

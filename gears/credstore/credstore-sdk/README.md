@@ -65,7 +65,10 @@ returns the provider's `ValueVersion`; `get` reads exactly that version
 (`Ok(None)` when it is gone, `ServiceUnavailable` for a transient failure,
 `SecretUnreadable` for a version held but permanently unreadable);
 `delete_key` removes the key with all versions (idempotent); `destroy` is
-optional and declared through `supports_destroy`.
+optional and declared through `supports_destroy`. The gear issues both only
+from its transactional-outbox handler (after a record delete, a rotation, a
+secret removal, or a write that lost its compare-and-set), at least once and
+in order per key, never on the request path.
 
 ## Usage
 

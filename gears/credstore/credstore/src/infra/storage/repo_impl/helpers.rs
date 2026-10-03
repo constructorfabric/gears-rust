@@ -2,6 +2,8 @@
 //! entity/domain converters, and error mapping. Kept in one leaf module so
 //! `reads`/`writes` and the parent depend on it one-way (no module cycle).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use credstore_sdk::{OwnerId, SharingMode, TenantId, ValueVersion};
@@ -11,24 +13,28 @@ use toolkit_db::secure::ScopeError;
 use crate::domain::error::DomainError;
 use crate::domain::secret::model::{Fallback, SecretRow, SecretStatus};
 use crate::infra::canonical_mapping::classify_db_err_to_domain;
-use crate::infra::outbox::PurgeEnqueuer;
+use crate::infra::outbox::CleanupEnqueuer;
 use crate::infra::storage::entity;
 
 pub type CredstoreDbProvider = DBProvider<DomainError>;
+
+/// The boxed future a [`DBProvider::transaction`] closure returns.
+pub(super) type TxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DomainError>> + Send + 'a>>;
 
 /// `SeaORM` repository adapter for
 /// [`SecretRepo`](crate::domain::secret::repo::SecretRepo).
 pub struct SecretRepoImpl {
     pub(crate) db: Arc<CredstoreDbProvider>,
-    /// Enqueues the key purge of a deleted record in the platform
-    /// transactional outbox, inside the delete transaction (section 6.3).
-    pub(crate) purge: Arc<dyn PurgeEnqueuer>,
+    /// Enqueues store-cleanup tasks (key purges, version destroys) in the
+    /// platform transactional outbox, inside the transaction that learned
+    /// they are needed (section 6.3).
+    pub(crate) cleanup: Arc<dyn CleanupEnqueuer>,
 }
 
 impl SecretRepoImpl {
     #[must_use]
-    pub fn new(db: Arc<CredstoreDbProvider>, purge: Arc<dyn PurgeEnqueuer>) -> Self {
-        Self { db, purge }
+    pub fn new(db: Arc<CredstoreDbProvider>, cleanup: Arc<dyn CleanupEnqueuer>) -> Self {
+        Self { db, cleanup }
     }
 }
 

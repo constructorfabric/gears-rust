@@ -12,7 +12,9 @@
 //! Three operations are required of every backend (`put`, `get`,
 //! `delete_key`); `destroy` is optional and declared through
 //! [`CredStorePluginClientV2::supports_destroy`]. The gear never calls
-//! `destroy` on a plugin that does not declare it.
+//! `destroy` on a plugin that does not declare it. It issues `delete_key` and
+//! `destroy` only from its transactional-outbox handler, at least once and in
+//! order per key (hence the idempotency below), never inline on a request.
 //!
 //! Guarantees required of a backend: **durability** (`put` returns only after
 //! the bytes are durable), **exact bytes** (`get` returns exactly the bytes of
@@ -66,8 +68,8 @@ pub trait CredStorePluginClientV2: Send + Sync {
     ) -> Result<Option<SecretValue>, CredStoreError>;
 
     /// Deletes the key with all its versions. Idempotent: a key the plugin
-    /// does not hold is success. Issued only by the outbox handler after a
-    /// record delete.
+    /// does not hold is success. Issued only by the outbox handler: after a
+    /// record delete, or when a write's fresh key can never hold a live value.
     async fn delete_key(&self, ctx: &SecurityContext, key: &StoreKey)
     -> Result<(), CredStoreError>;
 

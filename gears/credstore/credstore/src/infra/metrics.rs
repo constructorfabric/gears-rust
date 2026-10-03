@@ -10,7 +10,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 
 use crate::domain::ports::metrics::{
-    CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome,
+    CleanupOp, CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome,
 };
 
 /// Meter / instrumentation scope name.
@@ -22,8 +22,11 @@ const CREDSTORE_WALKUP_DEPTH: &str = "credstore_walkup_depth";
 const CREDSTORE_DEPENDENCY_QUERY_DURATION: &str = "credstore_dependency_query_duration_seconds";
 const CREDSTORE_DEPENDENCY_HEALTH: &str = "credstore_dependency_health_total";
 const CREDSTORE_CROSS_TENANT_DENIED: &str = "credstore_cross_tenant_denied_total";
-const CREDSTORE_DESTROY_FAILED: &str = "credstore_destroy_failed_total";
-const CREDSTORE_OUTBOX_PURGE_FAILED: &str = "credstore_outbox_purge_failed_total";
+const CREDSTORE_WRITE_INTENTS_RECLAIMED: &str = "credstore_write_intents_reclaimed_total";
+const CREDSTORE_WRITE_INTENT_LOST: &str = "credstore_write_intent_lost_total";
+const CREDSTORE_WRITE_INTENT_RECLAIM_FAILED: &str = "credstore_write_intent_reclaim_failed_total";
+const CREDSTORE_STORE_CLEANUP_ENQUEUED: &str = "credstore_store_cleanup_enqueued_total";
+const CREDSTORE_STORE_CLEANUP_FAILED: &str = "credstore_store_cleanup_failed_total";
 const CREDSTORE_READ_RETRY: &str = "credstore_read_retry_total";
 const CREDSTORE_LIST_TYPE_INVARIANT_VIOLATION: &str =
     "credstore_list_type_invariant_violation_total";
@@ -37,8 +40,11 @@ pub struct CredStoreMetricsMeter {
     dependency_query_duration: Histogram<f64>,
     dependency_health: Counter<u64>,
     cross_tenant_denied: Counter<u64>,
-    destroy_failed: Counter<u64>,
-    outbox_purge_failed: Counter<u64>,
+    write_intents_reclaimed: Counter<u64>,
+    write_intent_lost: Counter<u64>,
+    write_intent_reclaim_failed: Counter<u64>,
+    store_cleanup_enqueued: Counter<u64>,
+    store_cleanup_failed: Counter<u64>,
     read_retry: Counter<u64>,
     list_type_invariant_violation: Counter<u64>,
     audit_publish_failed: Counter<u64>,
@@ -80,18 +86,40 @@ impl CredStoreMetricsMeter {
                 .u64_counter(CREDSTORE_CROSS_TENANT_DENIED)
                 .with_description("Cross-tenant secret access attempts that were denied")
                 .build(),
-            destroy_failed: meter
-                .u64_counter(CREDSTORE_DESTROY_FAILED)
+            write_intents_reclaimed: meter
+                .u64_counter(CREDSTORE_WRITE_INTENTS_RECLAIMED)
                 .with_description(
-                    "Best-effort destroy of store versions (after a write, a lost CAS or a \
-                     secret removal) that failed; the next successful write retries implicitly",
+                    "Expired write intents (a writer that crashed or stalled between announcing \
+                     a store write and committing it) deleted by a reclaim pass",
                 )
                 .build(),
-            outbox_purge_failed: meter
-                .u64_counter(CREDSTORE_OUTBOX_PURGE_FAILED)
+            write_intent_lost: meter
+                .u64_counter(CREDSTORE_WRITE_INTENT_LOST)
                 .with_description(
-                    "Outbox delete_key delivery attempts that failed and will be retried (a \
-                     persistently rising value means a key purge is stuck)",
+                    "Secret writes whose commit found their own intent already reclaimed (the \
+                     writer outlived its lease); the writer cleaned up its version itself",
+                )
+                .build(),
+            write_intent_reclaim_failed: meter
+                .u64_counter(CREDSTORE_WRITE_INTENT_RECLAIM_FAILED)
+                .with_description(
+                    "Reclaim passes (startup or after a write) that failed; the intents stay \
+                     for the next pass (a persistently rising value means expired intents are \
+                     not being reclaimed)",
+                )
+                .build(),
+            store_cleanup_enqueued: meter
+                .u64_counter(CREDSTORE_STORE_CLEANUP_ENQUEUED)
+                .with_description(
+                    "Store-cleanup tasks (purge of a key, destroy of versions) enqueued in the \
+                     transactional outbox, by op",
+                )
+                .build(),
+            store_cleanup_failed: meter
+                .u64_counter(CREDSTORE_STORE_CLEANUP_FAILED)
+                .with_description(
+                    "Store-cleanup delivery attempts that failed and will be retried, by op (a \
+                     persistently rising value means a purge or destroy is stuck)",
                 )
                 .build(),
             read_retry: meter
@@ -167,12 +195,26 @@ impl CredStoreMetricsPort for CredStoreMetricsMeter {
         self.cross_tenant_denied.add(1, &[]);
     }
 
-    fn destroy_failed(&self) {
-        self.destroy_failed.add(1, &[]);
+    fn write_intents_reclaimed(&self, n: u64) {
+        self.write_intents_reclaimed.add(n, &[]);
     }
 
-    fn outbox_purge_failed(&self) {
-        self.outbox_purge_failed.add(1, &[]);
+    fn write_intent_lost(&self) {
+        self.write_intent_lost.add(1, &[]);
+    }
+
+    fn write_intent_reclaim_failed(&self) {
+        self.write_intent_reclaim_failed.add(1, &[]);
+    }
+
+    fn store_cleanup_enqueued(&self, op: CleanupOp) {
+        self.store_cleanup_enqueued
+            .add(1, &[KeyValue::new("op", op.as_str())]);
+    }
+
+    fn store_cleanup_failed(&self, op: CleanupOp) {
+        self.store_cleanup_failed
+            .add(1, &[KeyValue::new("op", op.as_str())]);
     }
 
     fn read_retry(&self, outcome: ReadRetryOutcome) {
