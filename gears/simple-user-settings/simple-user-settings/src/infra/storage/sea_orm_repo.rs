@@ -57,6 +57,17 @@ impl Default for SeaOrmSettingsRepository {
     }
 }
 
+/// The one row keyed `(tenant_id, user_id)`.
+///
+/// The PDP scope says what the caller may touch; it may name neither the user
+/// nor a single tenant. Which row is the caller's is pinned here, on the full
+/// primary key.
+fn own_row(tenant_id: Uuid, user_id: Uuid) -> Condition {
+    Condition::all()
+        .add(entity::Column::TenantId.eq(tenant_id))
+        .add(entity::Column::UserId.eq(user_id))
+}
+
 /// Map scope errors to domain errors.
 fn map_scope_error(e: ScopeError) -> DomainError {
     match e {
@@ -81,10 +92,13 @@ impl SettingsRepository for SeaOrmSettingsRepository {
         &self,
         conn: &C,
         scope: &AccessScope,
+        tenant_id: Uuid,
+        user_id: Uuid,
     ) -> Result<Option<SimpleUserSettings>, DomainError> {
         let result = SettingsEntity::find()
             .secure()
             .scope_with(scope)
+            .filter(own_row(tenant_id, user_id))
             .one(conn)
             .await
             .map_err(map_scope_error)?;
@@ -154,6 +168,7 @@ impl SettingsRepository for SeaOrmSettingsRepository {
         let existing = SettingsEntity::find()
             .secure()
             .scope_with(scope)
+            .filter(own_row(tenant_id, user_id))
             .one(conn)
             .await
             .map_err(map_scope_error)?;
