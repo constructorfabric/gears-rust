@@ -16,6 +16,10 @@ const ALL_SPANS: &[&str] = &[
     spans::LOCK_LOCK,
     spans::LOCK_RENEW,
     spans::LOCK_RELEASE,
+    spans::LOCK_ACQUIRE,
+    spans::LOCK_ACQUIRE_WAITING,
+    spans::LOCK_TOKEN_RENEW,
+    spans::LOCK_TOKEN_RELEASE,
 ];
 
 const ALL_METRICS: &[&str] = &[

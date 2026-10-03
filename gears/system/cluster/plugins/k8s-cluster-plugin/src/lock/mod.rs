@@ -843,14 +843,17 @@ impl DistributedLockBackend for K8sLock {
     /// [`acquire_guarded`](K8sLock::acquire_guarded) seam: this hands the token to a
     /// caller, so a dropped future leaves the lease to lapse on its TTL like any
     /// unheld lease (§5.8.2), never the orphan-and-release the guard path guards
-    /// against. Instrumented as `try_lock`, the operation it shares a lease with.
+    /// against. Instrumented under its own `acquire` span and `op` label, not
+    /// `try_lock`'s. Every Profile-3 lock RPC takes this path, so an operator needs it
+    /// apart from the in-process guard path, and the CAS default, Postgres and Redis
+    /// locks draw the same split.
     async fn acquire(
         &self,
         name: &str,
         owner: &str,
         ttl: Duration,
     ) -> Result<LeaseToken, ClusterError> {
-        let span = tracing::info_span!(spans::LOCK_TRY_LOCK, provider = %self.runtime.provider, lock = %name);
+        let span = tracing::info_span!(spans::LOCK_ACQUIRE, provider = %self.runtime.provider, lock = %name);
         let started = std::time::Instant::now();
         let out = async {
             if self.shutdown.is_cancelled() {
@@ -871,7 +874,7 @@ impl DistributedLockBackend for K8sLock {
         }
         .instrument(span)
         .await;
-        self.runtime.record_lock("try_lock", name, started, &out);
+        self.runtime.record_lock("acquire", name, started, &out);
         out
     }
 
@@ -879,7 +882,8 @@ impl DistributedLockBackend for K8sLock {
     /// handing the token back rather than a guard. Shares the wait loop with `lock`
     /// (so budget, watch-driven wake, and shutdown behave identically) and,
     /// like [`acquire`](Self::acquire), runs each attempt inline — a dropped
-    /// `acquire_waiting` leaves the lease to lapse. Instrumented as `lock`.
+    /// `acquire_waiting` leaves the lease to lapse. Instrumented under its own
+    /// `acquire_waiting` span and `op` label, for the reason `acquire` gives.
     async fn acquire_waiting(
         &self,
         name: &str,
@@ -887,14 +891,18 @@ impl DistributedLockBackend for K8sLock {
         ttl: Duration,
         timeout: Duration,
     ) -> Result<LeaseToken, ClusterError> {
-        let span =
-            tracing::info_span!(spans::LOCK_LOCK, provider = %self.runtime.provider, lock = %name);
+        let span = tracing::info_span!(
+            spans::LOCK_ACQUIRE_WAITING,
+            provider = %self.runtime.provider,
+            lock = %name
+        );
         let started = std::time::Instant::now();
         let out = self
             .wait_acquire_token(name, owner, ttl, timeout)
             .instrument(span)
             .await;
-        self.runtime.record_lock("lock", name, started, &out);
+        self.runtime
+            .record_lock("acquire_waiting", name, started, &out);
         out
     }
 
@@ -903,10 +911,12 @@ impl DistributedLockBackend for K8sLock {
     /// Reuses [`renew_holder`] — the exact path the guard task's `Renew` takes — so a
     /// lease acquired through `acquire` and one acquired through `try_lock` renew
     /// identically. Cross-checking that the transport caller is `token.owner` is the
-    /// serving gear's authorization decision, not this predicate's.
+    /// serving gear's authorization decision, not this predicate's. Instrumented
+    /// under its own `token_renew` span and `op` label, distinct from the guard
+    /// task's `renew`, for the reason `acquire` gives.
     async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
         let span = tracing::info_span!(
-            spans::LOCK_RENEW, provider = %self.runtime.provider, lock = %token.name
+            spans::LOCK_TOKEN_RENEW, provider = %self.runtime.provider, lock = %token.name
         );
         let started = std::time::Instant::now();
         let holder = HolderToken::from_token(token);
@@ -921,16 +931,17 @@ impl DistributedLockBackend for K8sLock {
         .instrument(span)
         .await;
         self.runtime
-            .record_lock("renew", &token.name, started, &out);
+            .record_lock("token_renew", &token.name, started, &out);
         out
     }
 
     /// Token-fenced release (§5.4): reconstruct the `holderIdentity` and clear it if
     /// this holder still holds it, idempotent by absence. Reuses [`release_holder`],
-    /// the guard task's own `Release` path.
+    /// the guard task's own `Release` path. Instrumented as `token_release`, for the
+    /// reason `renew` gives.
     async fn release(&self, token: &LeaseToken) -> Result<(), ClusterError> {
         let span = tracing::info_span!(
-            spans::LOCK_RELEASE, provider = %self.runtime.provider, lock = %token.name
+            spans::LOCK_TOKEN_RELEASE, provider = %self.runtime.provider, lock = %token.name
         );
         let started = std::time::Instant::now();
         let holder = HolderToken::from_token(token);
@@ -939,7 +950,7 @@ impl DistributedLockBackend for K8sLock {
             .instrument(span)
             .await;
         self.runtime
-            .record_lock("release", &token.name, started, &out);
+            .record_lock("token_release", &token.name, started, &out);
         out
     }
 }

@@ -451,10 +451,10 @@ impl DistributedLockBackend for UnboundLockBackend {
         Err(not_bound(self.profile))
     }
 
-    /// The two acquisition methods a facade does not reach but a wrapper might.
-    /// The token-predicated methods (`renew`, `release`) are deliberately left at
-    /// their trait defaults: a token can only come from an acquisition against
-    /// *this* backend, and no acquisition here ever succeeds.
+    /// The store-owned-leases half, now required rather than defaulted. Every one
+    /// answers `not_bound`: a token can only come from an acquisition against
+    /// *this* backend, and no acquisition here ever succeeds, so `renew` / `release`
+    /// can only ever be reached with a token this backend never minted.
     async fn acquire(
         &self,
         _name: &str,
@@ -471,6 +471,18 @@ impl DistributedLockBackend for UnboundLockBackend {
         _ttl: Duration,
         _timeout: Duration,
     ) -> Result<crate::lease::LeaseToken, ClusterError> {
+        Err(not_bound(self.profile))
+    }
+
+    async fn renew(
+        &self,
+        _token: &crate::lease::LeaseToken,
+        _ttl: Duration,
+    ) -> Result<(), ClusterError> {
+        Err(not_bound(self.profile))
+    }
+
+    async fn release(&self, _token: &crate::lease::LeaseToken) -> Result<(), ClusterError> {
         Err(not_bound(self.profile))
     }
 
@@ -516,14 +528,27 @@ impl LeaderElectionBackend for UnboundLeaderElectionBackend {
         Err(not_bound(self.profile))
     }
 
-    /// As on the lock: `renew` and `resign` are token-predicated and stay
-    /// defaulted, because no `join` here ever hands one out.
+    /// The store-owned-leases half, now required rather than defaulted. Every one
+    /// answers `not_bound`: no `join` here ever hands out a token, so `renew` and
+    /// `resign` can only be reached with a token this backend never minted.
     async fn join(
         &self,
         _name: &str,
         _owner: &str,
         _config: crate::leader::ElectionConfig,
     ) -> Result<Option<crate::lease::LeaseToken>, ClusterError> {
+        Err(not_bound(self.profile))
+    }
+
+    async fn renew(
+        &self,
+        _token: &crate::lease::LeaseToken,
+        _ttl: Duration,
+    ) -> Result<(), ClusterError> {
+        Err(not_bound(self.profile))
+    }
+
+    async fn resign(&self, _token: &crate::lease::LeaseToken) -> Result<(), ClusterError> {
         Err(not_bound(self.profile))
     }
 

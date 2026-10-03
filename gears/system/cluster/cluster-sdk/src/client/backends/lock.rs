@@ -54,6 +54,19 @@ use crate::lock::{DistributedLockBackend, LockFeatures, LockGuard, LockRequest};
 /// that cannot be concurrent anyway.
 const COMMAND_BUFFER: usize = 1;
 
+/// A blocking wait as the wire's whole milliseconds, rounded **up**.
+///
+/// Rounding down, as [`duration_ms`] does, would turn the sub-millisecond
+/// remainder at the end of [`acquire_waiting`](DistributedLockBackend::acquire_waiting)'s
+/// budget into a `timeout_ms: 0` re-issue that the server answers with an
+/// immediate `LockTimeout`, so the loop would spin RPCs until the remainder closed.
+/// Rounding up asks for at least the remaining budget, so the wait that comes back
+/// lands past the caller's deadline and ends the loop. Only a caller's own zero
+/// timeout goes out as zero.
+fn wait_ms(value: Duration) -> u64 {
+    u64::try_from(value.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
+}
+
 /// [`DistributedLockBackend`] over the wire (§12.11).
 #[derive(Debug, Clone)]
 pub struct RemoteLockBackend {
@@ -77,6 +90,32 @@ impl RemoteLockBackend {
 
     fn stub(&self) -> LockStub {
         self.stub.clone()
+    }
+
+    /// One blocking `Lock` RPC waiting up to `timeout`. The server may clamp the
+    /// wait; [`acquire_waiting`](DistributedLockBackend::acquire_waiting) owns the
+    /// re-issue loop that makes a clamp invisible to the caller.
+    async fn lock_once(
+        &self,
+        name: &str,
+        ttl: Duration,
+        timeout: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        let request = stubs::LockRequest::from(dto::LockRequest {
+            profile: self.profile.name(),
+            name: name.to_owned(),
+            ttl_ms: duration_ms(ttl),
+            timeout_ms: wait_ms(timeout),
+            client_request_id: None,
+        });
+        let response = self
+            .stub()
+            .lock(request)
+            .await
+            .map_err(|status| from_status(&status))?;
+        Ok(decode::<dto::LockAcquired, _>(response.into_inner())?
+            .token
+            .into())
     }
 
     /// The lease reference every token-keyed operation carries.
@@ -185,6 +224,21 @@ impl DistributedLockBackend for RemoteLockBackend {
     ///
     /// This is also why the client sets no RPC deadline: one shorter than
     /// `timeout` would sever an acquisition the server was about to grant.
+    ///
+    /// It waits up to the caller's **whole** `timeout`, re-issuing `Lock` as needed.
+    /// The server clamps any single blocking wait (the gear's `MAX_LOCK_WAIT`) so
+    /// that no wire caller can park a polling task for an unbounded time. A clamped
+    /// wait comes back as `LockTimeout` while the caller still has budget. This loop
+    /// re-issues with whatever budget remains, so a Profile-3 `lock(name, ttl, 10min)`
+    /// waits the full ten minutes, as it does in-process (invariant I1). A
+    /// `LockTimeout` that arrives once the caller's own deadline has passed is the
+    /// genuine timeout. Its `waited` is the **sum of the server-measured waits**, so
+    /// it stays populated server-side (§6.9) and covers the whole wait, not just the
+    /// last RPC. Every other outcome ends the wait, the backpressure refusal
+    /// included.
+    ///
+    /// `owner` is advisory — the server mints the real one. See the [module
+    /// docs](self).
     async fn acquire_waiting(
         &self,
         name: &str,
@@ -193,21 +247,23 @@ impl DistributedLockBackend for RemoteLockBackend {
         timeout: Duration,
     ) -> Result<LeaseToken, ClusterError> {
         let _server_mints_the_owner = owner;
-        let request = stubs::LockRequest::from(dto::LockRequest {
-            profile: self.profile.name(),
-            name: name.to_owned(),
-            ttl_ms: duration_ms(ttl),
-            timeout_ms: duration_ms(timeout),
-            client_request_id: None,
-        });
-        let response = self
-            .stub()
-            .lock(request)
-            .await
-            .map_err(|status| from_status(&status))?;
-        Ok(decode::<dto::LockAcquired, _>(response.into_inner())?
-            .token
-            .into())
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut waited_total = Duration::ZERO;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match self.lock_once(name, ttl, remaining).await {
+                Err(ClusterError::LockTimeout { name, waited }) => {
+                    waited_total = waited_total.saturating_add(waited);
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ClusterError::LockTimeout {
+                            name,
+                            waited: waited_total,
+                        });
+                    }
+                }
+                outcome => return outcome,
+            }
+        }
     }
 
     /// # Errors
@@ -250,5 +306,31 @@ impl DistributedLockBackend for RemoteLockBackend {
     /// is asking about.
     async fn probe(&self) -> Result<(), ClusterError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::wait_ms;
+
+    #[test]
+    fn a_blocking_wait_rounds_up_to_the_next_whole_millisecond() {
+        assert_eq!(
+            wait_ms(Duration::ZERO),
+            0,
+            "only a zero budget asks for zero"
+        );
+        assert_eq!(
+            wait_ms(Duration::from_micros(1)),
+            1,
+            "a sub-ms remainder must not go out as a zero-length wait"
+        );
+        assert_eq!(wait_ms(Duration::from_micros(999)), 1);
+        assert_eq!(wait_ms(Duration::from_millis(1)), 1, "whole ms are exact");
+        assert_eq!(wait_ms(Duration::from_micros(1_001)), 2);
+        assert_eq!(wait_ms(Duration::from_millis(350)), 350);
+        assert_eq!(wait_ms(Duration::MAX), u64::MAX, "saturates, never wraps");
     }
 }

@@ -615,6 +615,7 @@ The plugin contract — the interface a plugin author implements to adapt a back
 
 **Threshold**: A plugin compiled against the initial released version of the cluster contract MUST work against every minor and patch release of the same major version without modification.
 **Rationale**: Plugin authors are typically not the same teams as cluster maintainers (think: NATS plugin maintained by an external team). Forcing plugin authors to recompile and re-release on every cluster minor version creates an ecosystem coordination problem.
+**Note (2026-09-18, PR #4863)**: One deliberate, scoped exception is now on record. The store-owned-lease methods (`acquire`/`acquire_waiting`/`renew`/`release` on `DistributedLockBackend`; `join`/`renew`/`resign` on `LeaderElectionBackend`) are **required** rather than defaulted, so a backend omitting them fails to compile. Because Profile 3 serves every lock/election RPC through these methods, a missing implementation is a whole-profile failure best surfaced at build time rather than as a silent per-call `Unsupported`. This is a SemVer-breaking plugin-contract change for these methods only; see ADR-012's amendment and invariant I11 in DESIGN.md.
 **Architecture Allocation**: See DESIGN.md.
 <!-- cpt-cf-id-content -->
 

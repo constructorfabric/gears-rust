@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use toolkit::client_hub::ClientHub;
@@ -11,6 +12,7 @@ use crate::leader::types::{
     ElectionConfig, LeaderElectionCapability, LeaderElectionFeatures, LeaderStatus,
 };
 use crate::leader::watch::LeaderWatch;
+use crate::lease::LeaseToken;
 use crate::profile::ClusterProfile;
 use crate::test_support::StubClusterClient;
 use crate::test_support::with_nothing_derivable;
@@ -35,6 +37,23 @@ impl LeaderElectionBackend for StubBackend {
     ) -> Result<LeaderWatch, ClusterError> {
         let (_tx, _resign, watch) = LeaderWatch::channel(1, LeaderStatus::Follower);
         Ok(watch)
+    }
+
+    async fn join(
+        &self,
+        name: &str,
+        owner: &str,
+        _config: ElectionConfig,
+    ) -> Result<Option<LeaseToken>, ClusterError> {
+        Ok(Some(LeaseToken::new(name, owner, 1)))
+    }
+
+    async fn renew(&self, _token: &LeaseToken, _ttl: Duration) -> Result<(), ClusterError> {
+        Ok(())
+    }
+
+    async fn resign(&self, _token: &LeaseToken) -> Result<(), ClusterError> {
+        Ok(())
     }
 }
 
