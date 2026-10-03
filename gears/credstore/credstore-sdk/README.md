@@ -34,7 +34,7 @@ Transport-agnostic interface for the `CredStore` gear:
     (ADR-0007): present fields replace, absent fields untouched; covers
     metadata edits, secret rotation and secret removal (`null`); never
     creates
-  - `list` — OData query (`filter`, `select`, `orderby`, `limit`, `cursor`)
+  - `list` — `OData` query (`filter`, `select`, `orderby`, `limit`, `cursor`)
     over records; `secret` appears only when selected. Selecting it switches
     to **secret mode** (ADR-0005): `limit`/`cursor` rejected, results capped
     and non-paginated, filterable only by `reference in (...)` or
