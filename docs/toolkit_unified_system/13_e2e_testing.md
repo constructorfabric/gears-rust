@@ -589,3 +589,5 @@ A test that can be removed without reducing integration confidence should not ex
 - No test duplicates unit test domain logic — if removing the test doesn't reduce integration confidence, the test shouldn't exist
 
 > Design guided by [Google SMURF (2024)](https://testing.googleblog.com/2024/10/smurf-beyond-test-pyramid.html): each test justified by high **Fidelity** (real PG + real AuthZ) that compensates for lower **Speed** vs unit tests.
+
+See also: [`14_db_behavior_testing.md`](14_db_behavior_testing.md) — concurrency correctness under the `Service ↔ PostgreSQL` seam (transaction boundaries, retry firing, invariant survival under concurrent writers) is deliberately out of E2E's stability-first scope and lives there instead.
