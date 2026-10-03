@@ -30,15 +30,11 @@ fn default_true() -> bool {
     true
 }
 
-fn default_port() -> u16 {
-    443
-}
-
 fn default_cost() -> u32 {
     1
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 enum Scheme {
     Http,
@@ -54,8 +50,9 @@ struct Endpoint {
     #[serde(default)]
     scheme: Scheme,
     host: String,
-    #[serde(default = "default_port")]
-    port: u16,
+    /// Absent means "resolve from the scheme" (see `domain::Scheme::default_port`).
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -363,10 +360,11 @@ impl From<Scheme> for domain::Scheme {
 
 impl From<Endpoint> for domain::Endpoint {
     fn from(v: Endpoint) -> Self {
+        let scheme: domain::Scheme = v.scheme.into();
         Self {
-            scheme: v.scheme.into(),
+            scheme,
             host: v.host,
-            port: v.port,
+            port: v.port.unwrap_or_else(|| scheme.default_port()),
         }
     }
 }
@@ -1057,6 +1055,28 @@ mod tests {
         let rr = headers.request.as_ref().unwrap();
         assert_eq!(rr.set.get("x-custom").unwrap(), "value");
         assert_eq!(rr.passthrough, domain::PassthroughMode::All);
+    }
+
+    #[test]
+    fn portless_endpoint_defaults_by_scheme() {
+        // http without a port must resolve to 80, not 443.
+        let http_ep: Endpoint =
+            serde_json::from_value(serde_json::json!({"scheme": "http", "host": "svc.internal"}))
+                .unwrap();
+        assert_eq!(domain::Endpoint::from(http_ep).port, 80);
+
+        // https without a port stays 443.
+        let https_ep: Endpoint =
+            serde_json::from_value(serde_json::json!({"scheme": "https", "host": "svc.internal"}))
+                .unwrap();
+        assert_eq!(domain::Endpoint::from(https_ep).port, 443);
+
+        // An explicit port round-trips unchanged.
+        let explicit: Endpoint = serde_json::from_value(
+            serde_json::json!({"scheme": "http", "host": "svc.internal", "port": 8080}),
+        )
+        .unwrap();
+        assert_eq!(domain::Endpoint::from(explicit).port, 8080);
     }
 
     #[test]

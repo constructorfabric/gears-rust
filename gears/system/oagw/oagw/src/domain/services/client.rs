@@ -83,11 +83,18 @@ impl ServiceGatewayClientV1 for ServiceGatewayClientV1Facade {
     }
 
     async fn delete_upstream(&self, ctx: SecurityContext, id: Uuid) -> Result<(), CanonicalError> {
-        self.cp
+        // Unlike the REST path, this facade holds no backend-selector handle and
+        // cannot invalidate it: after delete `resolve_proxy_target` fails and a
+        // re-created upstream gets a fresh selector under a new id, so only a
+        // same-id re-create would observe stale backend health.
+        let deleted_route_ids = self
+            .cp
             .delete_upstream(&ctx, id)
             .await
-            .map(|_| ())
-            .map_err(CanonicalError::from)
+            .map_err(CanonicalError::from)?;
+        self.dp
+            .remove_rate_limit_keys_for_upstream_cascade(id, &deleted_route_ids);
+        Ok(())
     }
 
     async fn create_route(
@@ -150,7 +157,9 @@ impl ServiceGatewayClientV1 for ServiceGatewayClientV1Facade {
         self.cp
             .delete_route(&ctx, id)
             .await
-            .map_err(CanonicalError::from)
+            .map_err(CanonicalError::from)?;
+        self.dp.remove_rate_limit_keys_for_route(id);
+        Ok(())
     }
 
     async fn resolve_proxy_target(
@@ -662,6 +671,224 @@ mod tests {
     use super::*;
     use crate::domain::error::DomainError;
     use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    // -- Facade rate-limit cleanup (#4) -------------------------------------
+
+    fn test_ctx() -> SecurityContext {
+        SecurityContext::builder()
+            .subject_tenant_id(Uuid::new_v4())
+            .subject_id(Uuid::new_v4())
+            .build()
+            .expect("test security context")
+    }
+
+    /// CP stub: `delete_upstream` reports the cascade-deleted route ids and
+    /// `delete_route` succeeds — unless `fail` is set, in which case both return
+    /// an error. All other methods are unused.
+    struct StubCp {
+        cascade_route_ids: Vec<Uuid>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl ControlPlaneService for StubCp {
+        async fn create_upstream(
+            &self,
+            _: &SecurityContext,
+            _: model::CreateUpstreamRequest,
+        ) -> Result<model::Upstream, DomainError> {
+            unimplemented!()
+        }
+        async fn get_upstream(
+            &self,
+            _: &SecurityContext,
+            _: Uuid,
+        ) -> Result<model::Upstream, DomainError> {
+            unimplemented!()
+        }
+        async fn list_upstreams(
+            &self,
+            _: &SecurityContext,
+            _: &model::ListQuery,
+        ) -> Result<Vec<model::Upstream>, DomainError> {
+            unimplemented!()
+        }
+        async fn update_upstream(
+            &self,
+            _: &SecurityContext,
+            _: Uuid,
+            _: model::UpdateUpstreamRequest,
+        ) -> Result<model::Upstream, DomainError> {
+            unimplemented!()
+        }
+        async fn delete_upstream(
+            &self,
+            _: &SecurityContext,
+            id: Uuid,
+        ) -> Result<Vec<Uuid>, DomainError> {
+            if self.fail {
+                return Err(DomainError::NotFound {
+                    entity: "upstream",
+                    id,
+                });
+            }
+            Ok(self.cascade_route_ids.clone())
+        }
+        async fn create_route(
+            &self,
+            _: &SecurityContext,
+            _: model::CreateRouteRequest,
+        ) -> Result<model::Route, DomainError> {
+            unimplemented!()
+        }
+        async fn get_route(
+            &self,
+            _: &SecurityContext,
+            _: Uuid,
+        ) -> Result<model::Route, DomainError> {
+            unimplemented!()
+        }
+        async fn list_routes(
+            &self,
+            _: &SecurityContext,
+            _: Option<Uuid>,
+            _: &model::ListQuery,
+        ) -> Result<Vec<model::Route>, DomainError> {
+            unimplemented!()
+        }
+        async fn update_route(
+            &self,
+            _: &SecurityContext,
+            _: Uuid,
+            _: model::UpdateRouteRequest,
+        ) -> Result<model::Route, DomainError> {
+            unimplemented!()
+        }
+        async fn delete_route(&self, _: &SecurityContext, id: Uuid) -> Result<(), DomainError> {
+            if self.fail {
+                return Err(DomainError::NotFound {
+                    entity: "route",
+                    id,
+                });
+            }
+            Ok(())
+        }
+        async fn resolve_proxy_target(
+            &self,
+            _: &SecurityContext,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(model::Upstream, model::Route), DomainError> {
+            unimplemented!()
+        }
+    }
+
+    /// DP stub that records rate-limit key cleanup calls.
+    #[derive(Default)]
+    struct RecordingDp {
+        route_purges: Mutex<Vec<Uuid>>,
+        /// (upstream_id, cascaded route ids) per cascade cleanup call.
+        cascade_calls: Mutex<Vec<(Uuid, Vec<Uuid>)>>,
+    }
+
+    #[async_trait]
+    impl DataPlaneService for RecordingDp {
+        async fn proxy_request(
+            &self,
+            _: SecurityContext,
+            _: http::Request<Body>,
+        ) -> Result<http::Response<Body>, DomainError> {
+            unimplemented!()
+        }
+        fn remove_rate_limit_keys_for_upstream(&self, _upstream_id: Uuid) {}
+        fn remove_rate_limit_keys_for_route(&self, route_id: Uuid) {
+            self.route_purges.lock().unwrap().push(route_id);
+        }
+        fn remove_rate_limit_keys_for_upstream_cascade(
+            &self,
+            upstream_id: Uuid,
+            route_ids: &[Uuid],
+        ) {
+            self.cascade_calls
+                .lock()
+                .unwrap()
+                .push((upstream_id, route_ids.to_vec()));
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_upstream_purges_upstream_and_cascaded_route_keys() {
+        let route_a = Uuid::new_v4();
+        let route_b = Uuid::new_v4();
+        let cp = Arc::new(StubCp {
+            cascade_route_ids: vec![route_a, route_b],
+            fail: false,
+        });
+        let dp = Arc::new(RecordingDp::default());
+        let facade = ServiceGatewayClientV1Facade::new(cp, dp.clone());
+
+        let upstream_id = Uuid::new_v4();
+        facade
+            .delete_upstream(test_ctx(), upstream_id)
+            .await
+            .unwrap();
+
+        // One single-pass cascade cleanup covering the upstream + both routes.
+        assert_eq!(
+            *dp.cascade_calls.lock().unwrap(),
+            vec![(upstream_id, vec![route_a, route_b])]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_route_purges_route_keys() {
+        let cp = Arc::new(StubCp {
+            cascade_route_ids: vec![],
+            fail: false,
+        });
+        let dp = Arc::new(RecordingDp::default());
+        let facade = ServiceGatewayClientV1Facade::new(cp, dp.clone());
+
+        let route_id = Uuid::new_v4();
+        facade.delete_route(test_ctx(), route_id).await.unwrap();
+
+        assert_eq!(*dp.route_purges.lock().unwrap(), vec![route_id]);
+        assert!(dp.cascade_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_upstream_failure_propagates_and_skips_cleanup() {
+        let cp = Arc::new(StubCp {
+            cascade_route_ids: vec![Uuid::new_v4()],
+            fail: true,
+        });
+        let dp = Arc::new(RecordingDp::default());
+        let facade = ServiceGatewayClientV1Facade::new(cp, dp.clone());
+
+        let result = facade.delete_upstream(test_ctx(), Uuid::new_v4()).await;
+
+        assert!(result.is_err(), "CP delete failure must propagate");
+        // Cleanup runs only after a successful delete.
+        assert!(dp.cascade_calls.lock().unwrap().is_empty());
+        assert!(dp.route_purges.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_route_failure_propagates_and_skips_cleanup() {
+        let cp = Arc::new(StubCp {
+            cascade_route_ids: vec![],
+            fail: true,
+        });
+        let dp = Arc::new(RecordingDp::default());
+        let facade = ServiceGatewayClientV1Facade::new(cp, dp.clone());
+
+        let result = facade.delete_route(test_ctx(), Uuid::new_v4()).await;
+
+        assert!(result.is_err(), "CP delete failure must propagate");
+        assert!(dp.route_purges.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn auth_config_hashmap_round_trips() {

@@ -8,6 +8,14 @@ use crate::body::BodyStream;
 use crate::error::StreamingError;
 use crate::sse::ServerEvent;
 
+/// Maximum bytes buffered for a single not-yet-dispatched SSE event block.
+///
+/// Defense-in-depth: an upstream that streams bytes without ever emitting a
+/// `\n\n` event boundary would otherwise make the parse buffer grow without
+/// bound (memory-exhaustion DoS). Once an in-progress block exceeds this, the
+/// stream fails with a [`StreamingError::ServerEventsParse`].
+const MAX_EVENT_BUFFER_BYTES: usize = 1024 * 1024; // 1 MiB
+
 struct ParseState {
     body: BodyStream,
     buf: String,
@@ -18,16 +26,23 @@ struct ParseState {
     utf8_tail: Vec<u8>,
     /// Whether this is the first chunk (for BOM stripping).
     first_chunk: bool,
+    /// A trailing bare `\r` held from the previous chunk (see `append_normalized`).
+    carry_cr: bool,
     done: bool,
 }
 
 /// Parse a field line within an SSE event block.
 ///
+/// Follows the W3C EventSource algorithm: each `data` field appends its value
+/// followed by a `\n` (the single trailing `\n` is stripped once at dispatch by
+/// [`finalize_block`]). Returns `true` iff this line was a `data` field, so the
+/// caller can distinguish "one empty data field" from "no data field at all".
+///
 /// Malformed lines are silently skipped (per W3C spec).
-fn parse_line(line: &str, event: &mut ServerEvent) {
+fn parse_line(line: &str, event: &mut ServerEvent) -> bool {
     // Comment lines start with ':'
     if line.starts_with(':') {
-        return;
+        return false;
     }
 
     let (field, value) = match line.find(':') {
@@ -44,10 +59,10 @@ fn parse_line(line: &str, event: &mut ServerEvent) {
 
     match field {
         "data" => {
-            if !event.data.is_empty() {
-                event.data.push('\n');
-            }
+            // W3C: append the value then a newline for *every* data field.
             event.data.push_str(value);
+            event.data.push('\n');
+            return true;
         }
         "event" => {
             event.event = Some(value.to_owned());
@@ -68,6 +83,27 @@ fn parse_line(line: &str, event: &mut ServerEvent) {
             tracing::trace!("ignoring unknown SSE field: {field}");
         }
     }
+    false
+}
+
+/// Build a dispatchable event from one event block, applying the W3C
+/// trailing-LF rule (strip exactly one `\n` accumulated by the data fields).
+///
+/// Dispatches when a `data` field appeared (even an empty one, per spec) or
+/// when metadata is present (the SDK deliberately yields metadata-only events);
+/// comment-only and empty blocks yield `None`.
+fn finalize_block(block: &str) -> Option<ServerEvent> {
+    let mut event = ServerEvent::default();
+    let mut had_data = false;
+    for line in block.lines() {
+        had_data |= parse_line(line, &mut event);
+    }
+    if had_data {
+        // A trailing '\n' is always present when had_data, and no later field
+        // touches `data`, so this removes exactly the W3C dispatch newline.
+        event.data.pop();
+    }
+    (had_data || !event.is_empty()).then_some(event)
 }
 
 /// Normalize CRLF (`\r\n`) and bare CR (`\r`) to LF (`\n`).
@@ -78,6 +114,30 @@ fn parse_line(line: &str, event: &mut ServerEvent) {
 fn normalize_line_endings(s: &str) -> String {
     // Replace CRLF first, then any remaining bare CR.
     s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Append `text` to `buf`, normalizing line endings while correctly resolving a
+/// CR that may be split from its following LF across a chunk boundary.
+///
+/// A trailing bare `\r` is held (`carry_cr`) rather than normalized immediately,
+/// so that a `\r\n` delivered as `"...\r"` + `"\n..."` is treated as one line
+/// ending instead of a spurious blank line (false event boundary).
+fn append_normalized(buf: &mut String, carry_cr: &mut bool, text: &str) {
+    let mut s = text;
+    if *carry_cr {
+        buf.push('\n'); // the held CR is a line ending...
+        if let Some(rest) = s.strip_prefix('\n') {
+            // ...and if this chunk starts with LF, they were one CRLF.
+            s = rest;
+        }
+        *carry_cr = false;
+    }
+    if let Some(stripped) = s.strip_suffix('\r') {
+        // Hold a trailing bare CR for the next chunk to disambiguate.
+        *carry_cr = true;
+        s = stripped;
+    }
+    buf.push_str(&normalize_line_endings(s));
 }
 
 /// Split buffered text on event boundaries (`\n\n`), returning completed
@@ -95,14 +155,8 @@ fn extract_events(buf: &mut String) -> VecDeque<ServerEvent> {
         };
 
         let block = &buf[..pos];
-        if !block.is_empty() {
-            let mut event = ServerEvent::default();
-            for line in block.lines() {
-                parse_line(line, &mut event);
-            }
-            if !event.is_empty() {
-                events.push_back(event);
-            }
+        if let Some(event) = finalize_block(block) {
+            events.push_back(event);
         }
 
         // Remove the consumed block + the two newlines.
@@ -132,6 +186,7 @@ pub fn parse_server_events_stream(
         pending: VecDeque::new(),
         utf8_tail: Vec::new(),
         first_chunk: true,
+        carry_cr: false,
         done: false,
     };
 
@@ -144,15 +199,29 @@ pub fn parse_server_events_stream(
                     return Some((Ok(event), state));
                 }
 
+                // Guard against unbounded buffering: an in-progress block past
+                // the cap means the upstream never emitted an event boundary.
+                // Fail instead of growing `buf` without bound.
+                if !state.done && state.buf.len() > MAX_EVENT_BUFFER_BYTES {
+                    state.done = true;
+                    state.buf.clear();
+                    return Some((
+                        Err(StreamingError::ServerEventsParse {
+                            detail: format!(
+                                "SSE event exceeded {MAX_EVENT_BUFFER_BYTES}-byte buffer \
+                                 limit without an event boundary"
+                            ),
+                        }),
+                        state,
+                    ));
+                }
+
                 if state.done {
                     // Stream is finished. Flush any remaining data in the buffer.
-                    if !state.buf.trim().is_empty() {
-                        let mut event = ServerEvent::default();
-                        for line in state.buf.lines() {
-                            parse_line(line, &mut event);
-                        }
+                    if !state.buf.is_empty() {
+                        let event = finalize_block(&state.buf);
                         state.buf.clear();
-                        if !event.is_empty() {
+                        if let Some(event) = event {
                             return Some((Ok(event), state));
                         }
                     }
@@ -200,7 +269,7 @@ pub fn parse_server_events_stream(
                             } else {
                                 text
                             };
-                            state.buf.push_str(&normalize_line_endings(&text));
+                            append_normalized(&mut state.buf, &mut state.carry_cr, &text);
                             state.pending = extract_events(&mut state.buf);
                         }
                         // Loop back to yield pending events.
@@ -210,6 +279,11 @@ pub fn parse_server_events_stream(
                         return Some((Err(StreamingError::Stream(e)), state));
                     }
                     None => {
+                        // Flush a dangling bare CR held from the last chunk.
+                        if state.carry_cr {
+                            state.buf.push('\n');
+                            state.carry_cr = false;
+                        }
                         state.done = true;
                         // Loop back to flush remaining buffer.
                     }
@@ -483,7 +557,8 @@ mod tests {
     #[tokio::test]
     async fn field_name_without_colon() {
         // Bare "data" line (no colon) — field name is "data", value is "".
-        // Empty pushes are no-ops; only the non-empty "real" contributes.
+        // Per W3C, each (even empty) data field appends "value\n"; the two leading
+        // empty data fields therefore contribute two leading newlines.
         let body = body_from_chunks(vec!["data\ndata\ndata: real\n\n"]);
         let events: Vec<_> = parse_server_events_stream(body)
             .collect::<Vec<_>>()
@@ -493,13 +568,13 @@ mod tests {
             .collect();
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data, "real");
+        assert_eq!(events[0].data, "\n\nreal");
     }
 
     #[tokio::test]
     async fn empty_data_value() {
-        // "data:" with no value after colon — empty string appended to data buffer.
-        // First empty push is a no-op; second line appends "hello".
+        // "data:" with no value, then "data: hello". Per W3C the leading empty
+        // data field contributes a newline, so the result is "\nhello".
         let body = body_from_chunks(vec!["data:\ndata: hello\n\n"]);
         let events: Vec<_> = parse_server_events_stream(body)
             .collect::<Vec<_>>()
@@ -509,7 +584,22 @@ mod tests {
             .collect();
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].data, "hello");
+        assert_eq!(events[0].data, "\nhello");
+    }
+
+    #[tokio::test]
+    async fn single_empty_data_line_dispatches_empty_event() {
+        // A lone empty data field must dispatch an event with empty data (#2).
+        let body = body_from_chunks(vec!["data:\n\n"]);
+        let events: Vec<_> = parse_server_events_stream(body)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "");
     }
 
     // -- W3C spec: id field with null byte ---------------------------------
@@ -668,6 +758,60 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].data, "hello");
         assert_eq!(events[1].data, "world");
+    }
+
+    #[tokio::test]
+    async fn crlf_split_across_chunks_is_one_boundary() {
+        // Logical "data: aaa\r\ndata: bbb\n\n" delivered with the CRLF split
+        // \r | \n must be one event ("aaa\nbbb"), not two (#3).
+        let body = body_from_chunks(vec!["data: aaa\r", "\ndata: bbb\n\n"]);
+        let events: Vec<_> = parse_server_events_stream(body)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "aaa\nbbb");
+    }
+
+    #[tokio::test]
+    async fn split_bare_cr_not_followed_by_lf_is_a_line_boundary() {
+        // A chunk ending in a bare `\r`, then a chunk NOT starting with `\n`:
+        // the held CR must resolve to a standalone line ending, so the two data
+        // lines stay separate within one event ("a\nb"), not merged.
+        let body = body_from_chunks(vec!["data: a\r", "data: b\n\n"]);
+        let events: Vec<_> = parse_server_events_stream(body)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "a\nb");
+    }
+
+    #[tokio::test]
+    async fn oversized_block_without_boundary_errors() {
+        // An upstream that streams past the buffer cap without ever sending a
+        // `\n\n` boundary must fail, not buffer without bound.
+        let big = format!("data: {}", "a".repeat(MAX_EVENT_BUFFER_BYTES + 16));
+        let owned: Vec<Result<Bytes, BoxError>> = vec![Ok(Bytes::from(big))];
+        let body: BodyStream = Box::pin(futures_util::stream::iter(owned));
+
+        let results: Vec<_> = parse_server_events_stream(body).collect::<Vec<_>>().await;
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            Err(StreamingError::ServerEventsParse { detail }) => {
+                assert!(
+                    detail.contains("buffer limit"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected a ServerEventsParse error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

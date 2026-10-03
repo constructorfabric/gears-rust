@@ -109,6 +109,10 @@ pub(crate) trait DataPlaneService: Send + Sync {
 
     /// Remove all rate-limit buckets associated with a route.
     fn remove_rate_limit_keys_for_route(&self, route_id: Uuid);
+
+    /// Remove all rate-limit buckets for an upstream and its cascade-deleted
+    /// routes in a single pass (avoids a per-route full-map scan).
+    fn remove_rate_limit_keys_for_upstream_cascade(&self, upstream_id: Uuid, route_ids: &[Uuid]);
 }
 
 /// Why endpoint selection failed (multi-endpoint LB path).

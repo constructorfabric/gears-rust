@@ -522,6 +522,13 @@ pub(crate) fn streaming_body_with_lifecycle(
         },
         |mut state| async move {
             loop {
+                // `watch::changed()` only fires on a *new* edge, so a stream
+                // started after shutdown was already signalled must check the
+                // current value up front. Mirrors websocket.rs::shutdown_signalled.
+                if *state.shutdown_rx.borrow() {
+                    tracing::debug!("SSE stream terminated by shutdown (pre-armed)");
+                    return None;
+                }
                 return tokio::select! {
                     biased;
                     result = state.shutdown_rx.changed() => {
@@ -1202,6 +1209,24 @@ mod tests {
         // Stream should end.
         let next = stream.next().await;
         assert!(next.is_none(), "stream should end after shutdown");
+    }
+
+    #[tokio::test]
+    async fn sse_lifecycle_pre_armed_shutdown_ends_immediately() {
+        let (tx, rx) = watch::channel(false);
+        tx.send(true).unwrap(); // shutdown BEFORE the stream is ever polled
+        let stream = streaming_body_with_lifecycle(
+            bytes_stream(vec!["data: never\n\n"]),
+            Duration::from_secs(300),
+            rx,
+        );
+        let out = tokio::time::timeout(Duration::from_secs(1), stream.collect::<Vec<_>>())
+            .await
+            .expect("must not wait for the idle timeout");
+        assert!(
+            out.is_empty(),
+            "pre-armed shutdown must terminate immediately"
+        );
     }
 
     #[tokio::test]
