@@ -41,7 +41,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # HTTP client for the Vault / OpenBao KV v2 REST API
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true }
 
 # Value encoding for the KV v2 "value" field
 base64 = { workspace = true }

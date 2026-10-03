@@ -1,6 +1,8 @@
 //! Confirms `CredStorePluginClientV2` delegates to `Service`'s HTTP methods
 //! (the pure-logic and network-mapping behavior is covered in
 //! `service_tests.rs` / `wire_tests.rs`).
+use std::sync::Arc;
+
 use credstore_sdk::{
     CredStorePluginClientV2, DestroySelector, SecretValue, StoreKey, TenantId, ValueVersion,
 };
@@ -10,6 +12,7 @@ use uuid::Uuid;
 
 use crate::config::{VaultCredStorePluginConfig, VaultToken};
 use crate::domain::service::Service;
+use crate::infra::http::ReqwestTransport;
 
 fn ctx() -> SecurityContext {
     SecurityContext::builder()
@@ -29,7 +32,8 @@ fn service_for(server: &MockServer) -> Service {
         token: VaultToken::from("test-token"),
         ..VaultCredStorePluginConfig::default()
     };
-    Service::from_config(&cfg).expect("builds")
+    let transport = ReqwestTransport::from_config(&cfg).expect("builds");
+    Service::new(Arc::new(transport), &cfg)
 }
 
 #[tokio::test]

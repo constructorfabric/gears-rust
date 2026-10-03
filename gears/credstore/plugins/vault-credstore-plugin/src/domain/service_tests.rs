@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use credstore_sdk::{
     CredStoreError, DestroySelector, SecretValue, StoreKey, TenantId, ValueVersion,
 };
@@ -6,6 +8,15 @@ use uuid::Uuid;
 
 use super::*;
 use crate::config::VaultCredStorePluginConfig;
+use crate::infra::http::ReqwestTransport;
+
+/// Builds a service over the real `reqwest` transport, so these tests drive
+/// the whole stack (request building, headers, classification) against the
+/// mock server.
+fn service_from(cfg: &VaultCredStorePluginConfig) -> Service {
+    let transport = ReqwestTransport::from_config(cfg).expect("builds");
+    Service::new(Arc::new(transport), cfg)
+}
 
 fn config_for(server: &MockServer) -> VaultCredStorePluginConfig {
     VaultCredStorePluginConfig {
@@ -60,7 +71,7 @@ async fn get_missing_version_returns_none_on_404() {
         );
     });
 
-    let svc = Service::from_config(&config_for(&server)).expect("builds");
+    let svc = service_from(&config_for(&server));
     assert!(svc.get_value(&k, &vv("3")).await.expect("ok").is_none());
     mock.assert();
 }
@@ -78,7 +89,7 @@ async fn get_200_decodes_value() {
         }));
     });
 
-    let svc = Service::from_config(&config_for(&server)).expect("builds");
+    let svc = service_from(&config_for(&server));
     let got = svc
         .get_value(&k, &vv("2"))
         .await
@@ -91,7 +102,7 @@ async fn get_200_decodes_value() {
 #[tokio::test]
 async fn get_non_numeric_version_is_internal_error() {
     let server = MockServer::start();
-    let svc = Service::from_config(&config_for(&server)).expect("builds");
+    let svc = service_from(&config_for(&server));
     let err = svc.get_value(&key(), &vv("x")).await.unwrap_err();
     assert!(matches!(err, CredStoreError::Internal(_)));
 }
@@ -109,7 +120,7 @@ async fn put_sends_no_cas_and_returns_assigned_version() {
             .json_body(serde_json::json!({"data": {"version": 5}}));
     });
 
-    let svc = Service::from_config(&config_for(&server)).expect("builds");
+    let svc = service_from(&config_for(&server));
     let v = svc
         .put_value(&k, SecretValue::from("s3cret"))
         .await
@@ -126,7 +137,7 @@ async fn put_5xx_is_unavailable() {
             .path_includes("/v1/secret/data/credstore/");
         then.status(503);
     });
-    let svc = Service::from_config(&config_for(&server)).expect("builds");
+    let svc = service_from(&config_for(&server));
     let err = svc
         .put_value(&key(), SecretValue::from("x"))
         .await
@@ -145,7 +156,7 @@ async fn delete_key_sends_to_metadata_path_and_204_is_ok() {
         then.status(204);
     });
 
-    let svc = Service::from_config(&config_for(&server)).expect("builds");
+    let svc = service_from(&config_for(&server));
     svc.delete_key_value(&k).await.expect("ok");
     mock.assert();
 }
@@ -158,7 +169,7 @@ async fn delete_key_404_is_idempotent_success() {
             .path_includes("/v1/secret/metadata/credstore/");
         then.status(404);
     });
-    let svc = Service::from_config(&config_for(&server)).expect("builds");
+    let svc = service_from(&config_for(&server));
     svc.delete_key_value(&key()).await.expect("ok, idempotent");
 }
 
@@ -172,7 +183,7 @@ async fn destroy_exactly_posts_the_one_version_without_listing() {
             .json_body(serde_json::json!({"versions": [4]}));
         then.status(204);
     });
-    let svc = Service::from_config(&config_for(&server)).expect("builds");
+    let svc = service_from(&config_for(&server));
     svc.destroy_value(&k, &DestroySelector::Exactly(vv("4")))
         .await
         .expect("ok");
@@ -199,7 +210,7 @@ async fn destroy_below_lists_metadata_and_destroys_live_older_versions() {
             .json_body(serde_json::json!({"versions": [2, 3]}));
         then.status(204);
     });
-    let svc = Service::from_config(&config_for(&server)).expect("builds");
+    let svc = service_from(&config_for(&server));
     svc.destroy_value(&k, &DestroySelector::Below(vv("4")))
         .await
         .expect("ok");
@@ -222,7 +233,7 @@ async fn destroy_below_with_nothing_older_makes_no_destroy_call() {
         when.method(POST).path(destroy_path(&k));
         then.status(204);
     });
-    let svc = Service::from_config(&config_for(&server)).expect("builds");
+    let svc = service_from(&config_for(&server));
     svc.destroy_value(&k, &DestroySelector::Below(vv("5")))
         .await
         .expect("ok");
@@ -237,7 +248,7 @@ async fn destroy_below_on_missing_key_is_success() {
             .path_includes("/v1/secret/metadata/credstore/");
         then.status(404);
     });
-    let svc = Service::from_config(&config_for(&server)).expect("builds");
+    let svc = service_from(&config_for(&server));
     svc.destroy_value(&key(), &DestroySelector::Below(vv("9")))
         .await
         .expect("ok");
@@ -250,7 +261,7 @@ async fn get_5xx_maps_to_service_unavailable() {
         when.method(GET).path_includes("/v1/secret/data/credstore/");
         then.status(500);
     });
-    let svc = Service::from_config(&config_for(&server)).expect("builds");
+    let svc = service_from(&config_for(&server));
     let err = svc.get_value(&key(), &vv("1")).await.unwrap_err();
     assert!(err.is_unavailable());
 }
@@ -267,7 +278,7 @@ async fn namespace_header_sent_when_configured() {
 
     let mut cfg = config_for(&server);
     cfg.namespace = Some("team-a".to_owned());
-    let svc = Service::from_config(&cfg).expect("builds");
+    let svc = service_from(&cfg);
     svc.get_value(&key(), &vv("1")).await.expect("ok");
     mock.assert();
 }
@@ -281,7 +292,7 @@ async fn connection_failure_maps_to_service_unavailable() {
         timeout_secs: 2,
         ..VaultCredStorePluginConfig::default()
     };
-    let svc = Service::from_config(&cfg).expect("builds");
+    let svc = service_from(&cfg);
     let err = svc.get_value(&key(), &vv("1")).await.unwrap_err();
     assert!(err.is_unavailable());
 }

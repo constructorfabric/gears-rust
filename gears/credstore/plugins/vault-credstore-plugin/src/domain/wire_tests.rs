@@ -1,5 +1,3 @@
-use reqwest::StatusCode;
-
 use super::*;
 
 #[test]
@@ -121,80 +119,109 @@ fn parse_version_accepts_numbers_only() {
 
 #[test]
 fn classify_get_response_404_is_none() {
-    let got = classify_get_response(StatusCode::NOT_FOUND, "").expect("ok");
+    let got = classify_get_response(404, "").expect("ok");
     assert!(got.is_none());
 }
 
 #[test]
 fn classify_get_response_200_decodes_value() {
     let body = r#"{"data":{"data":{"value":"aGVsbG8="}}}"#;
-    let got = classify_get_response(StatusCode::OK, body).expect("ok");
+    let got = classify_get_response(200, body).expect("ok");
     assert_eq!(got, Some(b"hello".to_vec()));
 }
 
 #[test]
 fn classify_get_response_5xx_is_unavailable() {
-    let err = classify_get_response(StatusCode::INTERNAL_SERVER_ERROR, "").unwrap_err();
+    let err = classify_get_response(500, "").unwrap_err();
     assert!(err.is_unavailable());
 }
 
 #[test]
 fn classify_get_response_403_is_internal_not_unavailable() {
-    let err = classify_get_response(StatusCode::FORBIDDEN, "").unwrap_err();
+    let err = classify_get_response(403, "").unwrap_err();
     assert!(matches!(err, CredStoreError::Internal(_)));
     assert!(!err.is_unavailable());
 }
 
 #[test]
 fn classify_put_response_2xx_returns_version() {
-    let got = classify_put_response(StatusCode::OK, r#"{"data":{"version":3}}"#).expect("ok");
+    let got = classify_put_response(200, r#"{"data":{"version":3}}"#).expect("ok");
     assert_eq!(got, "3");
 }
 
 #[test]
 fn classify_put_response_5xx_is_unavailable() {
-    let err = classify_put_response(StatusCode::SERVICE_UNAVAILABLE, "").unwrap_err();
+    let err = classify_put_response(503, "").unwrap_err();
     assert!(err.is_unavailable());
 }
 
 #[test]
 fn classify_put_response_400_is_internal() {
-    let err = classify_put_response(StatusCode::BAD_REQUEST, "{}").unwrap_err();
+    let err = classify_put_response(400, "{}").unwrap_err();
     assert!(matches!(err, CredStoreError::Internal(_)));
 }
 
 #[test]
 fn classify_metadata_response_404_is_empty() {
-    assert!(
-        classify_metadata_response(StatusCode::NOT_FOUND, "")
-            .expect("ok")
-            .is_empty()
-    );
+    assert!(classify_metadata_response(404, "").expect("ok").is_empty());
 }
 
 #[test]
 fn classify_destroy_response_404_and_204_are_ok() {
-    classify_destroy_response(StatusCode::NO_CONTENT).expect("ok");
-    classify_destroy_response(StatusCode::NOT_FOUND).expect("ok");
-    assert!(
-        classify_destroy_response(StatusCode::BAD_GATEWAY)
-            .unwrap_err()
-            .is_unavailable()
-    );
+    classify_destroy_response(204).expect("ok");
+    classify_destroy_response(404).expect("ok");
+    assert!(classify_destroy_response(502).unwrap_err().is_unavailable());
 }
 
 #[test]
 fn classify_delete_response_204_is_ok() {
-    classify_delete_response(StatusCode::NO_CONTENT).expect("ok");
+    classify_delete_response(204).expect("ok");
 }
 
 #[test]
 fn classify_delete_response_404_is_ok_idempotent() {
-    classify_delete_response(StatusCode::NOT_FOUND).expect("ok, idempotent delete");
+    classify_delete_response(404).expect("ok, idempotent delete");
 }
 
 #[test]
 fn classify_delete_response_5xx_is_unavailable() {
-    let err = classify_delete_response(StatusCode::BAD_GATEWAY).unwrap_err();
+    let err = classify_delete_response(502).unwrap_err();
     assert!(err.is_unavailable());
+}
+
+#[test]
+fn classify_get_response_408_is_unavailable() {
+    let err = classify_get_response(408, "").unwrap_err();
+    assert!(err.is_unavailable());
+}
+
+#[test]
+fn classify_get_response_status_boundaries() {
+    // 2xx range ends at 299, 5xx range starts at 500.
+    assert!(classify_get_response(299, r#"{"data":{"data":null}}"#).is_ok());
+    assert!(matches!(
+        classify_get_response(300, "").unwrap_err(),
+        CredStoreError::Internal(_)
+    ));
+    assert!(matches!(
+        classify_get_response(499, "").unwrap_err(),
+        CredStoreError::Internal(_)
+    ));
+    assert!(classify_get_response(500, "").unwrap_err().is_unavailable());
+    assert!(classify_get_response(599, "").unwrap_err().is_unavailable());
+    assert!(matches!(
+        classify_get_response(600, "").unwrap_err(),
+        CredStoreError::Internal(_)
+    ));
+}
+
+#[test]
+fn to_json_body_serializes_the_request_shapes() {
+    let put = to_json_body(&PutRequestBody::new("aGk=".to_owned())).expect("ok");
+    assert_eq!(put, r#"{"data":{"value":"aGk="}}"#);
+    let destroy = to_json_body(&DestroyRequestBody {
+        versions: vec![2, 3],
+    })
+    .expect("ok");
+    assert_eq!(destroy, r#"{"versions":[2,3]}"#);
 }

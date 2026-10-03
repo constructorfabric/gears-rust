@@ -1,57 +1,59 @@
-//! HTTP-backed value store: talks to a Vault / `OpenBao` KV v2 secrets engine
-//! over its REST API. See the module docs on [`super::wire`] for the pure
+//! Vault / `OpenBao` KV v2 value store: turns the plugin operations into KV v2
+//! REST calls and classifies the answers. The HTTP exchange itself goes
+//! through the [`VaultTransport`] port (the `reqwest` adapter lives in
+//! `crate::infra::http`). See the module docs on [`super::wire`] for the pure
 //! path/status logic and [`crate`]'s README for the backend key shape.
-use std::time::Duration;
+use std::sync::Arc;
 
 use credstore_sdk::{CredStoreError, DestroySelector, SecretValue, StoreKey, ValueVersion};
-use reqwest::Client;
 
+use super::transport::{HttpMethod, TransportError, VaultRequest, VaultResponse, VaultTransport};
 use super::wire;
 use crate::config::VaultCredStorePluginConfig;
 
 /// Vault / `OpenBao` KV v2 backend client.
 ///
-/// Holds a configured `reqwest::Client` and the resolved connection
-/// settings (address, mount, path prefix, token, optional namespace). The
-/// token is kept as a plain `String` here (never `Debug`/logged — see
-/// [`crate::config::VaultToken`] for the config-side redaction) and is
-/// attached to every outbound request as `X-Vault-Token`.
+/// Holds the injected [`VaultTransport`] and the resolved addressing settings
+/// (address, mount, path prefix). Authentication (`X-Vault-Token`, optional
+/// `X-Vault-Namespace`) is the transport's concern: the token never reaches
+/// this layer (see [`crate::config::VaultToken`] for the config-side
+/// redaction).
 pub struct Service {
-    http: Client,
+    transport: Arc<dyn VaultTransport>,
     address: String,
     mount: String,
     path_prefix: String,
-    token: String,
-    namespace: Option<String>,
 }
 
 impl Service {
-    /// Builds a service from plugin configuration.
-    ///
-    /// # Errors
-    /// Returns an error if the underlying HTTP client fails to build (e.g.
-    /// an invalid TLS configuration) — this constructor performs no network
-    /// I/O itself.
-    pub fn from_config(cfg: &VaultCredStorePluginConfig) -> anyhow::Result<Self> {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(cfg.timeout_secs.max(1)))
-            .build()?;
-        Ok(Self {
-            http,
+    /// Builds a service that talks to the backend through `transport`, using
+    /// the addressing settings of `cfg`.
+    #[must_use]
+    pub fn new(transport: Arc<dyn VaultTransport>, cfg: &VaultCredStorePluginConfig) -> Self {
+        Self {
+            transport,
             address: cfg.address.clone(),
             mount: cfg.mount.clone(),
             path_prefix: cfg.path_prefix.clone(),
-            token: cfg.token.expose().to_owned(),
-            namespace: cfg.namespace.clone(),
-        })
+        }
     }
 
-    fn apply_headers(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let builder = builder.header("X-Vault-Token", &self.token);
-        match &self.namespace {
-            Some(ns) => builder.header("X-Vault-Namespace", ns),
-            None => builder,
-        }
+    /// Sends `method url` (with an optional serialized JSON body) through the
+    /// transport; a failure to get any response is a "backend unavailable".
+    async fn call(
+        &self,
+        method: HttpMethod,
+        url: String,
+        json_body: Option<String>,
+    ) -> Result<VaultResponse, CredStoreError> {
+        self.transport
+            .send(VaultRequest {
+                method,
+                url,
+                json_body,
+            })
+            .await
+            .map_err(TransportError::into_sdk_error)
     }
 
     fn paths(&self, key: &StoreKey) -> (String, String) {
@@ -78,15 +80,9 @@ impl Service {
         let (data_path, _) = self.paths(key);
         let url = format!("{}?version={n}", wire::full_url(&self.address, &data_path));
 
-        let response = self
-            .apply_headers(self.http.get(&url))
-            .send()
-            .await
-            .map_err(|e| map_reqwest_err(&e))?;
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let response = self.call(HttpMethod::Get, url, None).await?;
 
-        wire::classify_get_response(status, &body)
+        wire::classify_get_response(response.status, &response.body)
             .map(|maybe_bytes| maybe_bytes.map(SecretValue::new))
     }
 
@@ -103,18 +99,13 @@ impl Service {
     ) -> Result<ValueVersion, CredStoreError> {
         let (data_path, _) = self.paths(key);
         let url = wire::full_url(&self.address, &data_path);
-        let body = wire::PutRequestBody::new(wire::encode_value(value.as_bytes()));
+        let body = wire::to_json_body(&wire::PutRequestBody::new(wire::encode_value(
+            value.as_bytes(),
+        )))?;
 
-        let response = self
-            .apply_headers(self.http.post(&url))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| map_reqwest_err(&e))?;
-        let status = response.status();
-        let response_body = response.text().await.unwrap_or_default();
+        let response = self.call(HttpMethod::Post, url, Some(body)).await?;
 
-        wire::classify_put_response(status, &response_body).map(ValueVersion::new)
+        wire::classify_put_response(response.status, &response.body).map(ValueVersion::new)
     }
 
     /// Deletes the key with all versions by removing the KV v2 metadata
@@ -127,13 +118,9 @@ impl Service {
         let (_, metadata_path) = self.paths(key);
         let url = wire::full_url(&self.address, &metadata_path);
 
-        let response = self
-            .apply_headers(self.http.delete(&url))
-            .send()
-            .await
-            .map_err(|e| map_reqwest_err(&e))?;
+        let response = self.call(HttpMethod::Delete, url, None).await?;
 
-        wire::classify_delete_response(response.status())
+        wire::classify_delete_response(response.status)
     }
 
     /// Destroys versions of `key`: `Below(N)` lists the live versions from
@@ -154,14 +141,8 @@ impl Service {
                 let n = wire::parse_version(v.as_str())?;
                 let (_, metadata_path) = self.paths(key);
                 let url = wire::full_url(&self.address, &metadata_path);
-                let response = self
-                    .apply_headers(self.http.get(&url))
-                    .send()
-                    .await
-                    .map_err(|e| map_reqwest_err(&e))?;
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                wire::classify_metadata_response(status, &body)?
+                let response = self.call(HttpMethod::Get, url, None).await?;
+                wire::classify_metadata_response(response.status, &response.body)?
                     .into_iter()
                     .filter(|x| *x < n)
                     .collect()
@@ -173,31 +154,11 @@ impl Service {
         let (t, r) = (key.tenant_id.0.to_string(), key.record_id.to_string());
         let path = wire::destroy_path(&self.mount, &self.path_prefix, &t, &r);
         let url = wire::full_url(&self.address, &path);
-        let response = self
-            .apply_headers(self.http.post(&url))
-            .json(&wire::DestroyRequestBody { versions })
-            .send()
-            .await
-            .map_err(|e| map_reqwest_err(&e))?;
+        let body = wire::to_json_body(&wire::DestroyRequestBody { versions })?;
+        let response = self.call(HttpMethod::Post, url, Some(body)).await?;
 
-        wire::classify_destroy_response(response.status())
+        wire::classify_destroy_response(response.status)
     }
-}
-
-/// Maps a `reqwest` transport-level failure (connect refused, timeout, DNS,
-/// TLS) to the SDK's "backend unavailable" variant. Deliberately coarse —
-/// never includes `reqwest::Error`'s `Display` text, which can embed the
-/// request URL; the vendor/priority/address are not secret, but there is no
-/// value in taking on that leak surface for a diagnostic string.
-fn map_reqwest_err(err: &reqwest::Error) -> CredStoreError {
-    let kind = if err.is_timeout() {
-        "timeout"
-    } else if err.is_connect() {
-        "connection failed"
-    } else {
-        "request failed"
-    };
-    CredStoreError::service_unavailable(format!("vault credstore plugin: {kind}"))
 }
 
 #[cfg(test)]

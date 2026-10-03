@@ -2,14 +2,29 @@
 //! construction, request/response JSON shapes, value encoding, and
 //! status-code / error-body classification.
 //!
-//! Kept separate from [`super::service`] (which owns the `reqwest::Client`
-//! and actually makes the calls) so this module's logic is unit-testable
-//! without a network or a mock server.
+//! Kept separate from [`super::service`] (which orchestrates the calls through
+//! the [`super::transport::VaultTransport`] port) so this module's logic is
+//! unit-testable without a network or a mock server. HTTP status codes are
+//! plain `u16`s here: the transport adapter owns the HTTP client types.
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use credstore_sdk::CredStoreError;
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+
+/// `404 Not Found`.
+const NOT_FOUND: u16 = 404;
+/// `408 Request Timeout`.
+const REQUEST_TIMEOUT: u16 = 408;
+
+/// Whether `status` is a `2xx` success.
+fn is_success(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
+/// Whether `status` is a `5xx` server error.
+fn is_server_error(status: u16) -> bool {
+    (500..600).contains(&status)
+}
 
 /// Builds the KV v2 **data** path (read/write a version) for the record key
 /// `(tenant_id, record_id)`, relative to `{address}/v1/`.
@@ -83,6 +98,17 @@ impl PutRequestBody {
 #[derive(Serialize)]
 pub struct DestroyRequestBody {
     pub versions: Vec<u64>,
+}
+
+/// Serializes a request body for the transport.
+///
+/// # Errors
+/// [`CredStoreError::Internal`] if serialization fails (not reachable for the
+/// plain body types above; mapped rather than unwrapped).
+pub fn to_json_body<T: Serialize>(body: &T) -> Result<String, CredStoreError> {
+    serde_json::to_string(body).map_err(|_| {
+        CredStoreError::internal("vault credstore plugin: failed to encode request body")
+    })
 }
 
 /// Shape of a KV v2 read response: `{"data": {"data": {"value": "..."}}}`.
@@ -191,8 +217,8 @@ pub fn parse_version(v: &str) -> Result<u64, CredStoreError> {
 /// Classifies a non-2xx status into the SDK's stable error taxonomy,
 /// without ever including the response body (which may carry request
 /// echoes) or any header in the resulting message.
-fn map_error_status(status: StatusCode) -> CredStoreError {
-    if status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT {
+fn map_error_status(status: u16) -> CredStoreError {
+    if is_server_error(status) || status == REQUEST_TIMEOUT {
         CredStoreError::service_unavailable(format!(
             "vault credstore plugin: backend responded with {status}"
         ))
@@ -206,14 +232,11 @@ fn map_error_status(status: StatusCode) -> CredStoreError {
 /// Classifies a `GET ?version=N` response: `200` carries a value; `404` means
 /// the version is missing, deleted or destroyed (`Ok(None)`, never an error);
 /// anything else is a backend failure.
-pub fn classify_get_response(
-    status: StatusCode,
-    body: &str,
-) -> Result<Option<Vec<u8>>, CredStoreError> {
-    if status == StatusCode::NOT_FOUND {
+pub fn classify_get_response(status: u16, body: &str) -> Result<Option<Vec<u8>>, CredStoreError> {
+    if status == NOT_FOUND {
         return Ok(None);
     }
-    if status.is_success() {
+    if is_success(status) {
         return parse_get_body(body);
     }
     Err(map_error_status(status))
@@ -221,8 +244,8 @@ pub fn classify_get_response(
 
 /// Classifies a `POST` (write) response: 2xx yields the assigned version,
 /// anything else is a backend failure.
-pub fn classify_put_response(status: StatusCode, body: &str) -> Result<String, CredStoreError> {
-    if status.is_success() {
+pub fn classify_put_response(status: u16, body: &str) -> Result<String, CredStoreError> {
+    if is_success(status) {
         return parse_put_body(body);
     }
     Err(map_error_status(status))
@@ -230,8 +253,8 @@ pub fn classify_put_response(status: StatusCode, body: &str) -> Result<String, C
 
 /// Classifies a `DELETE` metadata response: `2xx` or `404` (already gone)
 /// both succeed (idempotent).
-pub fn classify_delete_response(status: StatusCode) -> Result<(), CredStoreError> {
-    if status.is_success() || status == StatusCode::NOT_FOUND {
+pub fn classify_delete_response(status: u16) -> Result<(), CredStoreError> {
+    if is_success(status) || status == NOT_FOUND {
         Ok(())
     } else {
         Err(map_error_status(status))
@@ -240,21 +263,18 @@ pub fn classify_delete_response(status: StatusCode) -> Result<(), CredStoreError
 
 /// Classifies a metadata `GET` response used to list versions: `404` (no such
 /// key) is an empty list, 2xx parses the live versions.
-pub fn classify_metadata_response(
-    status: StatusCode,
-    body: &str,
-) -> Result<Vec<u64>, CredStoreError> {
-    if status == StatusCode::NOT_FOUND {
+pub fn classify_metadata_response(status: u16, body: &str) -> Result<Vec<u64>, CredStoreError> {
+    if status == NOT_FOUND {
         return Ok(Vec::new());
     }
-    if status.is_success() {
+    if is_success(status) {
         return parse_live_versions(body);
     }
     Err(map_error_status(status))
 }
 
 /// Classifies a `POST destroy` response: `2xx` or `404` succeed (idempotent).
-pub fn classify_destroy_response(status: StatusCode) -> Result<(), CredStoreError> {
+pub fn classify_destroy_response(status: u16) -> Result<(), CredStoreError> {
     classify_delete_response(status)
 }
 

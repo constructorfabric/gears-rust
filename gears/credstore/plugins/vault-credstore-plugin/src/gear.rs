@@ -16,6 +16,7 @@ use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 use crate::config::VaultCredStorePluginConfig;
 use crate::domain::Service;
+use crate::infra::http::ReqwestTransport;
 
 /// Vault / `OpenBao` credstore plugin gear.
 ///
@@ -53,8 +54,10 @@ impl Gear for VaultCredStorePlugin {
             "Loaded plugin configuration"
         );
 
-        // Create service from config (validate early, before registration).
-        let service = Arc::new(Service::from_config(&cfg)?);
+        // Create the HTTP transport and the service from config (validate
+        // early, before registration).
+        let transport = Arc::new(ReqwestTransport::from_config(&cfg)?);
+        let service = Arc::new(Service::new(transport, &cfg));
 
         // Build registration payload and instance id for this plugin.
         let (instance_id, instance_json) = PluginV1::<CredStorePluginSpecV1>::build_registration(
