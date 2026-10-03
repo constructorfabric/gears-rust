@@ -1,4 +1,9 @@
 [[ignore]]
+reason = ""
+patterns = ["gears/task-engine/docs/DESIGN.md"]
+
+
+[[ignore]]
 reason = "Ignore graph-storage research companions for ADR-0001 (graph-engine evaluation, PG19 SQL/PGQ spike report) — evidence documents, not Constructor Studio SDLC artifacts."
 patterns = [
   "gears/graph-storage/docs/graph-engine-alternatives.md",
