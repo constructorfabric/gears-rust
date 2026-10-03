@@ -37,6 +37,16 @@
 //! finishes first can resolve the other's waiter. Uniqueness is the caller's to
 //! guarantee, not the library's.
 //!
+//! # Limits
+//!
+//! A queue may be given a **bound** in entities and bytes, past which an
+//! enqueue is refused with [`OutboxError::QueueFull`], without the enqueuing
+//! transaction issuing any statement for the decision - see [`QueueLimits`]
+//! and [`Outbox::depth`]. Each of the two channels is counted with its own in
+//! and out, so a channel's depth is its own difference and can be proved zero
+//! on its own evidence. It is opt-in: a queue with no bound behaves exactly as
+//! before.
+//!
 //! # Why so many tasks
 //!
 //! Each task does **one simple thing** and then conditionally tells another
@@ -56,9 +66,11 @@
 //! |---|---|---|
 //! | sequencer | claims incoming rows, assigns sequence numbers, writes outgoing | the partition's processor |
 //! | processor | reads a batch, runs the handler, acks | - |
-//! | vacuum | deletes processed outgoing and body rows | the trace sweeper, when it deleted any |
+//! | vacuum | deletes processed outgoing and body rows | the trace sweeper, when it deleted any; the counter audit, when a dirty partition had nothing to collect |
 //! | trace sweeper | collects finished trace rows | - |
+//! | counter audit | corrects whichever channel of a partition is provably empty | - |
 //! | cold reconciler | rediscovers pending partitions from the incoming table | the sequencer |
+//! | counter flush | publishes this instance's journal, then re-reads | - |
 //! | notifier | collects this instance's completion mail | the caller waiting on it |
 //! | retry reporter | reports this instance's retrying batches | the caller watching one |
 //!
@@ -66,16 +78,20 @@
 //! "the receiver could not otherwise find out, and has a reason to act". The
 //! vacuum tells the sweeper only when it actually deleted bodies - the one
 //! thing that can make a trace collectable ahead of its own clock - rather
-//! than after every sweep. A task that was not signalled falls back to a slow
-//! poll or does not run at all. That is what makes many small tasks cheaper
-//! than a few large ones rather than dearer - the notifier issues no query
-//! while nothing is outstanding.
+//! than after every sweep, and tells the audit only when a partition it was
+//! told was dirty turned out to have nothing to collect - the one shape that
+//! suggests the counters and the rows disagree. A task that was not signalled
+//! falls back to a slow poll or does not run at all. That is what makes many
+//! small tasks cheaper than a few large ones rather than dearer - the notifier
+//! issues no query while nothing is outstanding.
 //!
-//! Channels are [`taskward::poker`] for a timer, a `Notify` per partition
-//! where the listener's identity *is* the subject, and a bare `Notify` where
-//! the wakeup says nothing. Adding another is the expected move. The
-//! prioritizer is not one of these: it decides *which partition next* for the
-//! sequencers, which is work distribution rather than delivery.
+//! Channels are [`taskward::poker`] for a timer, a [`taskward::Signal`] of
+//! partition ids where the wakeup must say *which* partition and one worker is
+//! listening, a `Notify` per partition where the listener's identity *is* the
+//! subject, and a bare `Notify` where the wakeup says nothing. Adding another
+//! is the expected move. The prioritizer is not one of these: it decides
+//! *which partition next* for the sequencers, which is work distribution
+//! rather than delivery.
 //!
 //! One task is honestly not this shape: the **processor** reads, hands the
 //! batch to the handler, and acks, because the lease it holds spans all three
@@ -100,6 +116,7 @@
 //! | processor | the cursor and the lease | the ack alone |
 //! | vacuum counter | telling the vacuum there is something to collect | the ack bumps it, the vacuum decrements it |
 //! | trace | one traced batch's lifetime | the enqueue inserts, the ack counts down, the owner claims, the sweep deletes |
+//! | partition counter | admission accounting | the counter flusher and the audit - never a hot path |
 //! | dead letters | entities that failed for good | the ack inserts, the dead-letter API resolves and deletes |
 //!
 //! An ack writes four of those in one transaction, and that is not a violation
@@ -108,8 +125,17 @@
 //! trace it belonged to counts down, and a rejected entity becomes a dead
 //! letter. Four tables, one commit, one fact.
 //!
+//! **No hot path writes an admission counter.** The enqueue, the sequencer and
+//! the ack report what they did into an in-memory journal; the counter flusher
+//! is the only thing that turns those reports into rows, and the audit the
+//! only other writer. That is why the accounting has a table of its own rather
+//! than sharing the vacuum's: the vacuum's marker is bumped by the ack while it
+//! is committing, and the accounting must never wait behind it.
+//!
 //! Reading another stage's table is unremarkable and several tasks do it - the
-//! notifier and the retry reporter read the trace table that the ack writes.
+//! notifier and the retry reporter read the trace table that the ack writes,
+//! the audit needs the processor's cursor to know what is past it, and the
+//! flusher joins the counters to the partitions to filter by queue.
 //!
 //! # Processing modes
 //!
@@ -206,12 +232,15 @@
 //! }
 //! ```
 
+mod admission;
+mod audit;
 mod batch;
 mod builder;
 mod core;
 mod dead_letter;
 mod dialect;
 mod handler;
+mod limits;
 mod manager;
 mod migrations;
 pub(crate) mod prioritizer;
@@ -244,6 +273,7 @@ pub use handler::{
     HandlerResult, LeasedHandler, LeasedMessageHandler, MessageResult, OutboxMessage,
     PerMessageAdapter, TransactionalHandler, TransactionalMessageHandler,
 };
+pub use limits::{Bound, Bounds, FullScope, QueueLimits, QueueLimitsBuilder, Volume};
 pub use manager::{OutboxBuilder, OutboxHandle};
 pub use migrations::{outbox_migrations, outbox_migrations_with_prefix};
 pub use record::{Record, RecordBuilder, RecordTarget, Records, RecordsBuilder, RecordsTarget};

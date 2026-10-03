@@ -160,6 +160,9 @@ pub struct PartitionProcessor<S: ProcessingStrategy> {
     partition_id: i64,
     tuning: super::super::types::WorkerTuning,
     db: Db,
+    /// Both the statements and the channel reporter hang off this, so it is
+    /// one constructor argument in place of two.
+    outbox: Arc<Outbox>,
     statements: Arc<OutboxStatements>,
     trace_mailbox: Arc<TraceMailbox>,
     partition_mode: PartitionMode,
@@ -182,6 +185,7 @@ impl<S: ProcessingStrategy> PartitionProcessor<S> {
             partition_id,
             tuning,
             db,
+            outbox: Arc::clone(outbox),
             statements,
             trace_mailbox,
             partition_mode: PartitionMode::new(),
@@ -218,6 +222,16 @@ impl<S: ProcessingStrategy> WorkerAction for PartitionProcessor<S> {
         };
 
         let result = self.strategy.process(&ctx, effective_size).await?;
+
+        // Post-commit: the strategy commits before returning, and a rolled
+        // back ack yields no result at all, so anything reported here really
+        // left the outgoing channel.
+        if let Some(processed) = result.as_ref()
+            && !processed.released.is_zero()
+        {
+            self.outbox
+                .record_acked(self.partition_id, processed.released);
+        }
 
         if let Some(pr) = result {
             let has_more = pr.count >= effective_size;

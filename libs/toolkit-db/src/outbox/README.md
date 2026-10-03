@@ -330,6 +330,113 @@ exist, and `trace_status` then answers `None` for it. The window is seven days
 by default, so this means a handler that has made no progress for a week. The
 messages themselves are untouched - only the notification aid is.
 
+## Limits: bounding what a queue will hold
+
+A queue accepts work without bound unless you say otherwise. With a bound, an
+enqueue past it is refused and **your transaction issues no extra statement for
+the privilege** - the decision is taken against state the process already
+holds, so nothing is read and no counter row is locked.
+
+```rust
+use toolkit_utils::byte_size::MIB;   // also KIB and GIB
+
+Outbox::builder(db)
+    .queue("orders", Partitions::of(8))
+        .limits(QueueLimits::builder()
+            .max_entities(100_000)
+            .max_bytes(64 * MIB)
+            .build())
+        .leased(OrderHandler { client })
+    .start().await?;
+```
+
+```rust
+match outbox.enqueue(txn, record).await {
+    Ok(pending) => wake += pending,
+    Err(OutboxError::QueueFull { queue, scope, bounds }) => {
+        // Shed load, or apply back pressure to whoever is producing.
+    }
+    Err(other) => return Err(other.into()),
+}
+```
+
+The bound is enforced queue-wide, with a derived per-partition share as a
+secondary guard so one skewed key cannot consume the whole allowance.
+
+### What "bounded" means precisely
+
+The backlog is everything the queue is holding and has not carried to a
+terminal state - work enqueued but not yet sequenced, *and* work sequenced but
+not yet acked. A retry does not change it; a dead letter does, because a
+dead-lettered entity has left the queue as surely as a delivered one. Rows
+awaiting garbage collection do not count: refusing a producer because the
+vacuum is behind would punish it for a lag it cannot influence.
+
+Read it with `outbox.depth(&conn, "orders").await?`. A bounded queue answers
+from its counters; an unbounded queue has none, because nothing maintains
+counters for a reading that gates nothing, so `depth` counts the rows instead.
+Truthful either way, and the cost follows what you asked about.
+
+**It is a bound, not a hard ceiling.** No statement is issued in your
+transaction, so the backlog can exceed the bound transiently - by what other
+instances have done since your last refresh, plus what this instance has not
+yet published. Both are bounded by `QueueLimits::refresh_interval`; shorten it
+if the overshoot matters.
+
+A submission counts against the bound from the moment it is written, so this
+instance's own uncommitted work is never admitted twice. If its transaction
+rolls back, `Wake::discard` gives the allowance back at once. A `Wake` dropped
+without being fired or discarded keeps counting, because whether its rows
+committed is unknown; the counter audit below clears it once the partition is
+proved empty.
+
+### How it is counted
+
+Nothing on a hot path writes a counter. The enqueue, the sequencer and the ack
+report what they did into in-memory state; one background task publishes those
+reports and re-reads the result. Your transaction is untouched - the same
+statements it issued before the queue had a bound.
+
+There are two channels, and each is counted with its own in and out:
+
+| channel | in | out | depth |
+|---|---|---|---|
+| incoming | the enqueue put a row there | the sequencer took it out | enqueued, not yet sequenced |
+| outgoing | the sequencer put it there | the ack took it out | sequenced, not yet acked |
+
+The backlog is the two depths added. Counting each channel separately is what
+makes the next part work.
+
+### The counters correct themselves
+
+A channel's depth is a difference, so anything that removes rows by a route the
+pipeline does not know about - an operator with a SQL prompt, a botched
+migration, a crash that lost an unpublished report - would otherwise leave it
+permanently high, and a bounded queue refusing work forever.
+
+Each channel is checked where the answer is free: **a channel holding no rows
+has a depth of provably zero.** That is one index probe per channel, no
+counting, and because the channels are counted separately a correction names
+the side that drifted and leaves the other alone. The check is its own task,
+for bounded queues only, woken when the vacuum finds a partition it was told
+was dirty with nothing to collect - the shape a stray `DELETE` leaves behind.
+
+Every correction is applied as a difference, never as an assignment. A counter
+with more than one writer is always racing somebody: writing the value you
+decided on discards whatever committed in the meantime, whereas adding the
+difference composes with it and the next pass finds a smaller one.
+
+A partition that never goes quiet is never checked that way, and there is
+deliberately no exhaustive recount for it. Comparing the counters against a row
+count is unsound while any instance holds unpublished reports: the rows already
+reflect work whose counter delta has not been written yet, so a row-derived
+correction cancels a delta that is still coming and the channel ends up off by
+twice it. Another instance's reports can be neither read nor flushed from here,
+so no amount of locking fixes it. A channel with no rows is the one state where
+the two sides cannot disagree, which is why that is the only evidence acted on -
+and the cost is that a partition which never empties keeps its drift until it
+does.
+
 ## Use-Case Scenarios
 
 ### Handler makes a remote HTTP call

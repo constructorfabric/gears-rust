@@ -36,7 +36,7 @@ use super::taskward::{Directive, WorkerAction};
 use super::trace::TraceState;
 use super::types::{LeaseConfig, OutboxConfig, SequencerConfig, WorkerTuning};
 use super::workers::sequencer::Sequencer;
-use super::{Outbox, OutboxError, Partitions};
+use super::{Outbox, OutboxError, Partitions, Volume};
 use crate::migration_runner::run_migrations_for_testing;
 use crate::outbox::{OutboxMessageId, Wake};
 use crate::{ConnectOpts, Db, connect_db};
@@ -152,6 +152,11 @@ fn test_collectable_traces() -> super::workers::vacuum::CollectableTraces {
     super::workers::vacuum::CollectableTraces::new()
 }
 
+/// The vacuum's downstream channel: the partitions it found unaudited.
+fn test_unaudited() -> Arc<super::taskward::Signal<i64>> {
+    Arc::new(super::taskward::Signal::new())
+}
+
 fn make_shared_prioritizer() -> Arc<SharedPrioritizer> {
     Arc::new(SharedPrioritizer::new())
 }
@@ -208,6 +213,9 @@ async fn run_sequencer_until_idle(seq: &mut Sequencer) {
 async fn run_sequencer_once(t: &TestOutbox, db: &Db) {
     let mut seq = make_sequencer(t, SequencerConfig::default(), db);
     run_sequencer_until_idle(&mut seq).await;
+    // Nothing on a hot path writes a counter, so a test that wants to see the
+    // durable numbers has to publish the journal the way the worker does.
+    flush_counters(t, db).await;
 }
 
 async fn enqueue_and_sequence(
@@ -4896,7 +4904,13 @@ async fn custom_prefix_vacuum_cleans_custom_tables() {
         &tables,
     ));
     let collectable = test_collectable_traces();
-    let mut vacuum = VacuumTask::new(db.clone(), statements, 10_000, collectable.clone());
+    let mut vacuum = VacuumTask::new(
+        db.clone(),
+        statements,
+        10_000,
+        collectable.clone(),
+        test_unaudited(),
+    );
     vacuum.execute(&cancel).await.unwrap();
 
     assert_eq!(count_rows(&db, tables.outgoing()).await, 0);
@@ -5656,10 +5670,10 @@ async fn insert_raw_incoming_for_tables(
         conn.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             format!(
-                "INSERT INTO {} (partition_id, body_id) VALUES ($1, $2)",
+                "INSERT INTO {} (partition_id, body_id, bytes) VALUES ($1, $2, $3)",
                 tables.incoming()
             ),
-            [partition_id.into(), body_id.into()],
+            [partition_id.into(), body_id.into(), 0_i64.into()],
         ))
         .await
         .expect("insert incoming");
@@ -6141,8 +6155,15 @@ async fn vacuum_concurrent_workers_safe() {
         Arc::clone(&statements),
         10_000,
         collectable.clone(),
+        test_unaudited(),
     );
-    let mut vac2 = VacuumTask::new(db.clone(), statements, 10_000, collectable);
+    let mut vac2 = VacuumTask::new(
+        db.clone(),
+        statements,
+        10_000,
+        collectable,
+        test_unaudited(),
+    );
 
     vac1.execute(&cancel).await.unwrap();
     vac2.execute(&cancel).await.unwrap();
@@ -6663,4 +6684,1255 @@ async fn batch_transactional_respects_configured_batch_size() {
 
     drop(db);
     handle.stop().await;
+}
+
+// -- Queue limits --
+
+/// Read one partition's `admitted - released`, straight from the columns,
+/// bypassing every in-memory reading so a test cannot pass on a stale snapshot.
+async fn read_partition_channels(db: &Db, partition_id: i64) -> super::admission::Channels {
+    #[derive(Debug, FromQueryResult)]
+    struct Row {
+        incoming_in_entities: i64,
+        incoming_in_bytes: i64,
+        incoming_out_entities: i64,
+        incoming_out_bytes: i64,
+        outgoing_in_entities: i64,
+        outgoing_in_bytes: i64,
+        outgoing_out_entities: i64,
+        outgoing_out_bytes: i64,
+    }
+    let tables = OutboxTables::default();
+    let conn = db.sea_internal();
+    let row = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        format!(
+            "SELECT incoming_in_entities, incoming_in_bytes, \
+                    incoming_out_entities, incoming_out_bytes, \
+                    outgoing_in_entities, outgoing_in_bytes, \
+                    outgoing_out_entities, outgoing_out_bytes \
+             FROM {} WHERE partition_id = $1",
+            tables.partition_counter()
+        ),
+        [partition_id.into()],
+    ))
+    .one(&conn)
+    .await
+    .expect("counter query")
+    .expect("counter row");
+    super::admission::Channels {
+        incoming_in: Volume {
+            entities: row.incoming_in_entities,
+            bytes: row.incoming_in_bytes,
+        },
+        incoming_out: Volume {
+            entities: row.incoming_out_entities,
+            bytes: row.incoming_out_bytes,
+        },
+        outgoing_in: Volume {
+            entities: row.outgoing_in_entities,
+            bytes: row.outgoing_in_bytes,
+        },
+        outgoing_out: Volume {
+            entities: row.outgoing_out_entities,
+            bytes: row.outgoing_out_bytes,
+        },
+    }
+}
+
+/// Publish this instance's journal and take a fresh snapshot, the way the
+/// background worker does, so a test can assert on the durable counters.
+async fn flush_counters(t: &TestOutbox, db: &Db) {
+    let mut flush = super::workers::counter_flush::CounterFlush {
+        outbox: Arc::clone(&t.outbox),
+        db: db.clone(),
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    flush.execute(&cancel).await.unwrap();
+}
+
+#[tokio::test]
+async fn enqueue_alone_moves_no_counter() {
+    // Admission is the sequencer's to record: enqueue writes rows and nothing
+    // else, which is what keeps it out of the caller's transaction.
+    let db = setup_db("ch2b_enqueue_no_counter").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    // Only a bounded queue keeps counters at all.
+    bound_queue(&t, "q", 100, 1);
+
+    let conn = db.conn().unwrap();
+    t.outbox
+        .enqueue(
+            &conn,
+            Record::to("q", 0)
+                .payload(b"hello".to_vec(), "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .fire();
+
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 1);
+    assert_eq!(
+        read_partition_channels(&db, pid).await,
+        super::admission::Channels::ZERO,
+        "enqueue must not touch the counters: it reports in memory instead"
+    );
+
+    // The arrival is in the journal, though, so admission can already see it.
+    flush_counters(&t, &db).await;
+    let channels = read_partition_channels(&db, pid).await;
+    assert_eq!(
+        channels.incoming_in,
+        Volume {
+            entities: 1,
+            bytes: 5
+        },
+        "and the flusher is what turns the report into a row"
+    );
+    assert_eq!(channels.pending(), channels.incoming_in);
+}
+
+#[tokio::test]
+async fn the_counters_net_to_zero_once_a_queue_drains() {
+    let db = setup_db("ch2b_counters_net_zero").await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let handler = CountingHandler {
+        counter: Arc::clone(&counter),
+        notify: Arc::clone(&notify),
+    };
+
+    let handle = Outbox::builder(db.clone())
+        .processor_tuning(WorkerTuning::processor_default().idle_interval(Duration::from_mins(1)))
+        .sequencer_tuning(WorkerTuning::sequencer_default().idle_interval(Duration::from_mins(1)))
+        .processors(1)
+        .maintenance(1, 1)
+        .queue("test-q", Partitions::of(1))
+        .limits(
+            super::limits::QueueLimits::builder()
+                .max_entities(1000)
+                .refresh_interval(Duration::from_millis(20))
+                .build(),
+        )
+        .leased(handler)
+        .start()
+        .await
+        .unwrap();
+
+    let outbox = handle.outbox();
+    let pid = outbox.all_partition_ids()[0];
+
+    let conn = db.conn().unwrap();
+    for i in 0..3u8 {
+        outbox
+            .enqueue(
+                &conn,
+                Record::to("test-q", 0)
+                    .payload(vec![i; 10], "test/msg")
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .fire();
+    }
+
+    // Wait for all three to be handled.
+    for _ in 0..3 {
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("handler ran");
+    }
+
+    // Nothing writes a counter on a hot path, so the numbers appear only once
+    // the flush worker has published them. Poll the durable columns.
+    let mut channels = read_partition_channels(&db, pid).await;
+    for _ in 0..100 {
+        if channels.incoming_in.entities == 3 && channels.outgoing_out.entities == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        channels = read_partition_channels(&db, pid).await;
+    }
+
+    assert_eq!(
+        channels.incoming_in,
+        Volume {
+            entities: 3,
+            bytes: 30
+        },
+        "three arrivals of ten bytes entered the incoming channel"
+    );
+    assert_eq!(
+        channels.incoming_out, channels.outgoing_in,
+        "the sequencer's move is one transaction, so the two counters agree"
+    );
+    assert_eq!(
+        channels.outgoing_out, channels.incoming_in,
+        "and the ack took out exactly what arrived"
+    );
+    assert_eq!(
+        channels.pending(),
+        Volume::ZERO,
+        "so both channels are empty"
+    );
+
+    // And the same conclusion through the public reading.
+    let depth = outbox.depth(&conn, "test-q").await.unwrap();
+    assert_eq!(depth, super::limits::Volume::ZERO);
+
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn a_crash_mid_batch_leaves_the_backlog_matching_the_rows() {
+    // The property a bounded queue depends on across a restart: every counter
+    // move rides in the same statement as the row move it describes, so no
+    // crash can land between them and leave the reading and the rows
+    // disagreeing. A restarted process has no journal of its own, so what it
+    // reports is whatever the columns say.
+    let db = setup_db("ch2b_crash_backlog").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "crash-q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    bound_queue(&t, "crash-q", 100, 1);
+
+    let handled = Arc::new(AtomicU32::new(0));
+    enqueue_and_sequence(
+        &t,
+        &db,
+        "crash-q",
+        0,
+        &["aaaa", "bbbb", "cccc", "dddd", "eeee", "ffff"],
+    )
+    .await;
+
+    // Two are delivered and acked, so four rows remain. `run_leased` drives
+    // the strategy directly, bypassing the processor - which is where the
+    // ack's report into the journal lives - so the test does that part.
+    let acked = run_leased(
+        &db,
+        pid,
+        CountingSuccessHandler {
+            count: Arc::clone(&handled),
+        },
+        Duration::from_secs(30),
+        2,
+    )
+    .await;
+    assert_eq!(handled.load(Ordering::Relaxed), 2);
+    if let Some(result) = acked.as_ref() {
+        t.outbox.record_acked(pid, result.released);
+    }
+    flush_counters(&t, &db).await;
+
+    // Then a process takes the lease for the rest and is killed mid-batch:
+    // the lease is held, nothing is acked, and no counter moved.
+    simulate_crash(&db, pid, 300).await;
+
+    // Restart. A new process, with no memory of any of this.
+    let restarted = make_default_test_outbox().await;
+    restarted
+        .outbox
+        .register_queue(&db, "crash-q", 1)
+        .await
+        .unwrap();
+    bound_queue(&restarted, "crash-q", 100, 1);
+    let conn = db.conn().unwrap();
+
+    let reported = restarted.outbox.depth(&conn, "crash-q").await.unwrap();
+    assert_eq!(
+        reported,
+        Volume {
+            entities: 4,
+            bytes: 16
+        },
+        "the four rows the crash left behind, and their bytes"
+    );
+
+    // And it agrees with the rows themselves: the audit finds nothing to
+    // correct, which is the assertion that would fail if a crash could
+    // separate a counter from its rows.
+    assert!(
+        !restarted.outbox.audit_partition(&db, pid).await.unwrap(),
+        "the reading is already right, so there is nothing to correct"
+    );
+
+    // The abandoned lease expires, the rest is delivered, and the queue nets
+    // back to nothing.
+    expire_lease(&db, pid).await;
+    let acked = run_leased(
+        &db,
+        pid,
+        CountingSuccessHandler {
+            count: Arc::clone(&handled),
+        },
+        Duration::from_secs(30),
+        10,
+    )
+    .await;
+    assert_eq!(handled.load(Ordering::Relaxed), 6, "all six, exactly once");
+    if let Some(result) = acked.as_ref() {
+        restarted.outbox.record_acked(pid, result.released);
+    }
+    flush_counters(&restarted, &db).await;
+    assert_eq!(
+        restarted.outbox.depth(&conn, "crash-q").await.unwrap(),
+        Volume::ZERO,
+        "a drained queue reports nothing outstanding"
+    );
+}
+
+/// Remove ready rows the way nothing in the pipeline ever would - an operator
+/// with a SQL prompt, a botched migration - so the derived counters drift.
+async fn delete_outgoing_behind_the_pipelines_back(db: &Db, partition_id: i64) {
+    let conn = db.sea_internal();
+    conn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM toolkit_outbox_outgoing WHERE partition_id = $1",
+        [partition_id.into()],
+    ))
+    .await
+    .expect("delete outgoing");
+}
+
+/// Remove unsequenced rows the way nothing in the pipeline ever would, so the
+/// incoming channel drifts on its own.
+async fn delete_incoming_behind_the_pipelines_back(db: &Db, partition_id: i64) {
+    let conn = db.sea_internal();
+    conn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM toolkit_outbox_incoming WHERE partition_id = $1",
+        [partition_id.into()],
+    ))
+    .await
+    .expect("delete incoming");
+}
+
+#[tokio::test]
+async fn the_audit_sweeps_the_incoming_channel_with_no_signal_at_all() {
+    // The vacuum never looks at the incoming channel, and rows deleted from it
+    // are never acked, so nothing bumps the marker that would bring the vacuum
+    // round to signal. Without a timer of its own the audit would never learn
+    // of that drift. The sweep filters on the in-memory snapshot, so it finds
+    // this partition because the snapshot claims a backlog.
+    let db = setup_db("ch2c_audit_sweep_incoming").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 2).await.unwrap();
+    bound_queue(&t, "q", 100, 2);
+    let pids = t.outbox.all_partition_ids();
+
+    let conn = db.conn().unwrap();
+    t.outbox
+        .enqueue(
+            &conn,
+            Record::to("q", 0)
+                .payload(b"gone".to_vec(), "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .fire();
+    flush_counters(&t, &db).await;
+    delete_incoming_behind_the_pipelines_back(&db, pids[0]).await;
+
+    let mut audit = super::workers::counter_audit::CounterAudit {
+        outbox: Arc::clone(&t.outbox),
+        db: db.clone(),
+        // Deliberately empty: no vacuum, no signal, nothing to take.
+        unaudited: Arc::new(super::taskward::Signal::new()),
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    audit.execute(&cancel).await.unwrap();
+
+    assert_eq!(
+        t.outbox.depth(&conn, "q").await.unwrap(),
+        Volume::ZERO,
+        "the timer's own sweep found and corrected it, unsignalled"
+    );
+    let channels = read_partition_channels(&db, pids[0]).await;
+    assert_eq!(channels.incoming_depth(), Volume::ZERO);
+    assert_eq!(
+        channels.incoming_in,
+        Volume {
+            entities: 1,
+            bytes: 4
+        },
+        "corrected by raising the out side, never by lowering what arrived"
+    );
+
+    // The partition that never claimed anything was never probed, which is
+    // what keeps the sweep cheap.
+    assert_eq!(
+        read_partition_channels(&db, pids[1]).await,
+        super::admission::Channels::ZERO
+    );
+}
+
+#[tokio::test]
+async fn a_rolled_back_transaction_hands_its_reservation_back() {
+    // An enqueue counts its arrival at the write, before the caller commits,
+    // so this instance's own uncommitted work already occupies the allowance.
+    // Discarding the wake on the rollback path takes that count back at once
+    // instead of leaving the reading high until the audit.
+    let db = setup_db("ch2b_rollback_reservation").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    bound_queue(&t, "q", 100, 1);
+    let pid = t.outbox.all_partition_ids()[0];
+
+    // Commit one, so there is a real arrival to distinguish from the rolled
+    // back ones.
+    let outbox = Arc::clone(&t.outbox);
+    let committed: Result<(), anyhow::Error> = crate::outbox::in_transaction(&db, |tx| {
+        Box::pin(async move {
+            let wake = outbox
+                .enqueue(
+                    tx,
+                    Record::to("q", 0)
+                        .payload(b"kept".to_vec(), "text/plain")
+                        .build()
+                        .unwrap(),
+                )
+                .await?;
+            Ok(((), wake))
+        })
+    })
+    .await;
+    committed.unwrap();
+
+    // Now enqueue three and roll back.
+    let outbox = Arc::clone(&t.outbox);
+    let rolled_back: Result<(), anyhow::Error> = crate::outbox::in_transaction(&db, |tx| {
+        Box::pin(async move {
+            let mut wake = Wake::empty();
+            for i in 0..3u8 {
+                wake += outbox
+                    .enqueue(
+                        tx,
+                        Record::to("q", 0)
+                            .payload(vec![i; 8], "text/plain")
+                            .build()
+                            .unwrap(),
+                    )
+                    .await?;
+            }
+            wake.discard();
+            Err(anyhow::anyhow!("business rule said no"))
+        })
+    })
+    .await;
+    assert!(rolled_back.is_err());
+
+    // One row on disk, and the reading agrees: the three that never committed
+    // were handed back rather than left to the audit.
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 1);
+    flush_counters(&t, &db).await;
+    assert_eq!(
+        read_partition_channels(&db, pid).await.incoming_in,
+        Volume {
+            entities: 1,
+            bytes: 4
+        },
+        "only the committed arrival is counted"
+    );
+    assert_eq!(
+        t.outbox.depth(&db.conn().unwrap(), "q").await.unwrap(),
+        Volume {
+            entities: 1,
+            bytes: 4
+        }
+    );
+}
+
+#[tokio::test]
+async fn unsequenced_work_counts_against_the_bound() {
+    // The incoming channel has its own in and out, so work enqueued and not
+    // yet sequenced is real backlog the bound can see. Under the earlier
+    // design it was invisible until the sequencer caught up.
+    let db = setup_db("ch2c_unsequenced_counts").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    bound_queue(&t, "q", 100, 1);
+    let pid = t.outbox.all_partition_ids()[0];
+
+    let conn = db.conn().unwrap();
+    for i in 0..4u8 {
+        t.outbox
+            .enqueue(
+                &conn,
+                Record::to("q", 0)
+                    .payload(vec![i; 10], "text/plain")
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .fire();
+    }
+    // Deliberately not sequenced: four rows sit in the incoming channel.
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 4);
+
+    flush_counters(&t, &db).await;
+    let channels = read_partition_channels(&db, pid).await;
+    assert_eq!(
+        channels.incoming_depth(),
+        Volume {
+            entities: 4,
+            bytes: 40
+        },
+        "the incoming channel is four deep"
+    );
+    assert_eq!(
+        channels.outgoing_depth(),
+        Volume::ZERO,
+        "and the outgoing channel has seen nothing"
+    );
+    assert_eq!(
+        t.outbox.depth(&conn, "q").await.unwrap(),
+        Volume {
+            entities: 4,
+            bytes: 40
+        },
+        "so the bound sees unsequenced work, which is the whole point"
+    );
+
+    // Once sequenced, the work moves channels without changing the total.
+    run_sequencer_once(&t, &db).await;
+    let channels = read_partition_channels(&db, pid).await;
+    assert_eq!(channels.incoming_depth(), Volume::ZERO);
+    assert_eq!(
+        channels.outgoing_depth(),
+        Volume {
+            entities: 4,
+            bytes: 40
+        },
+        "the incoming channel's exit and the outgoing channel's entry are one move"
+    );
+    assert_eq!(
+        t.outbox.depth(&conn, "q").await.unwrap(),
+        Volume {
+            entities: 4,
+            bytes: 40
+        },
+        "and the queue still holds the same four"
+    );
+}
+
+#[tokio::test]
+async fn each_channel_is_audited_on_its_own_evidence() {
+    // The reason the two channels are counted separately: each has its own
+    // provable zero, so a correction names the side that drifted and leaves
+    // the other alone.
+    let db = setup_db("ch2c_audit_per_channel").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    bound_queue(&t, "q", 100, 1);
+
+    let conn = db.conn().unwrap();
+    for i in 0..3u8 {
+        t.outbox
+            .enqueue(
+                &conn,
+                Record::to("q", 0)
+                    .payload(vec![i; 10], "text/plain")
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .fire();
+    }
+
+    // An operator empties the incoming channel before it is ever sequenced.
+    // Only that channel drifted, and it is provably empty, so the correction
+    // lands there.
+    flush_counters(&t, &db).await;
+    delete_incoming_behind_the_pipelines_back(&db, pid).await;
+    assert!(
+        t.outbox.audit_partition(&db, pid).await.unwrap(),
+        "an empty incoming channel with a non-zero depth must be corrected"
+    );
+    let channels = read_partition_channels(&db, pid).await;
+    assert_eq!(
+        channels.incoming_depth(),
+        Volume::ZERO,
+        "the incoming channel was corrected"
+    );
+    assert_eq!(
+        channels.incoming_in,
+        Volume {
+            entities: 3,
+            bytes: 30
+        },
+        "by raising its out side, never by lowering what arrived"
+    );
+    assert_eq!(
+        channels.outgoing_in,
+        Volume::ZERO,
+        "and the outgoing channel was not touched: nothing was ever sequenced"
+    );
+    assert_eq!(t.outbox.depth(&conn, "q").await.unwrap(), Volume::ZERO);
+
+    // Now the other side. Three more, sequenced this time, then deleted from
+    // the outgoing channel.
+    for i in 0..3u8 {
+        t.outbox
+            .enqueue(
+                &conn,
+                Record::to("q", 0)
+                    .payload(vec![i; 10], "text/plain")
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .fire();
+    }
+    run_sequencer_once(&t, &db).await;
+    let before = read_partition_channels(&db, pid).await;
+    assert_eq!(
+        before.outgoing_depth(),
+        Volume {
+            entities: 3,
+            bytes: 30
+        },
+        "sequenced work is in the outgoing channel"
+    );
+
+    delete_outgoing_behind_the_pipelines_back(&db, pid).await;
+    assert!(t.outbox.audit_partition(&db, pid).await.unwrap());
+    let after = read_partition_channels(&db, pid).await;
+    assert_eq!(
+        after.outgoing_depth(),
+        Volume::ZERO,
+        "the outgoing channel was corrected"
+    );
+    assert_eq!(
+        after.incoming_in, before.incoming_in,
+        "and the incoming channel's arrivals were left exactly as they were"
+    );
+    assert_eq!(t.outbox.depth(&conn, "q").await.unwrap(), Volume::ZERO);
+
+    // Idempotent: nothing left to correct.
+    assert!(
+        !t.outbox.audit_partition(&db, pid).await.unwrap(),
+        "a second pass finds both channels already agreeing"
+    );
+}
+
+fn bound_queue(t: &TestOutbox, queue: &str, max_entities: i64, partitions: usize) {
+    t.outbox.set_bounded(
+        queue,
+        Arc::new(super::admission::Admission::new(
+            super::limits::QueueLimits::builder()
+                .max_entities(max_entities)
+                .build(),
+            partitions,
+        )),
+    );
+}
+
+#[tokio::test]
+async fn an_empty_channel_is_where_drifted_counters_are_corrected() {
+    let db = setup_db("ch2c_audit_quiescent").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    bound_queue(&t, "q", 3, 1);
+
+    // Three entities, sequenced, so the admitted side has counted them.
+    let conn = db.conn().unwrap();
+    for i in 0..3u8 {
+        t.outbox
+            .enqueue(
+                &conn,
+                Record::to("q", 0)
+                    .payload(vec![i; 10], "text/plain")
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .fire();
+    }
+    run_sequencer_once(&t, &db).await;
+    assert_eq!(
+        t.outbox.depth(&conn, "q").await.unwrap(),
+        super::limits::Volume {
+            entities: 3,
+            bytes: 30
+        },
+    );
+
+    // The queue is now full by its own reading, and refuses work.
+    let err = t
+        .outbox
+        .enqueue(
+            &conn,
+            Record::to("q", 0)
+                .payload(vec![9], "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, OutboxError::QueueFull { .. }));
+
+    // Now the rows disappear without ever being acked. Nothing releases them,
+    // so the difference is stuck high and would stay that way forever.
+    delete_outgoing_behind_the_pipelines_back(&db, pid).await;
+    assert_eq!(
+        t.outbox.depth(&conn, "q").await.unwrap(),
+        super::limits::Volume {
+            entities: 3,
+            bytes: 30
+        },
+        "the reading is now wrong: nothing is pending, but it still claims three"
+    );
+
+    // The partition is empty, so the truth costs nothing to establish.
+    let corrected = t.outbox.audit_partition(&db, pid).await.unwrap();
+    assert!(
+        corrected,
+        "an empty partition with a non-zero reading audits"
+    );
+
+    assert_eq!(
+        t.outbox.depth(&conn, "q").await.unwrap(),
+        super::limits::Volume::ZERO,
+        "the counters agree with the empty partition again"
+    );
+
+    // And the queue takes work again, which it would not have done before.
+    t.outbox
+        .enqueue(
+            &conn,
+            Record::to("q", 0)
+                .payload(vec![9], "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .expect("an audited queue accepts work again")
+        .fire();
+}
+
+#[tokio::test]
+async fn a_healthy_partition_is_left_alone() {
+    let db = setup_db("ch2c_audit_noop").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    bound_queue(&t, "q", 100, 1);
+
+    // Nothing has ever been enqueued, so the counters are already right.
+    assert!(
+        !t.outbox.audit_partition(&db, pid).await.unwrap(),
+        "a correct reading is not rewritten"
+    );
+    assert_eq!(
+        t.outbox.depth(&db.conn().unwrap(), "q").await.unwrap(),
+        super::limits::Volume::ZERO
+    );
+}
+
+#[tokio::test]
+async fn an_unbounded_queue_is_never_probed() {
+    let db = setup_db("ch2c_audit_unbounded").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+
+    // No limit configured, so the reading gates nothing and drift is harmless.
+    let conn = db.conn().unwrap();
+    t.outbox
+        .enqueue(
+            &conn,
+            Record::to("q", 0)
+                .payload(b"x".to_vec(), "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .fire();
+    run_sequencer_once(&t, &db).await;
+    delete_outgoing_behind_the_pipelines_back(&db, pid).await;
+
+    assert!(
+        !t.outbox.audit_partition(&db, pid).await.unwrap(),
+        "an unbounded queue is not worth correcting, so it is not even probed"
+    );
+    assert_eq!(
+        t.outbox.depth(&conn, "q").await.unwrap(),
+        Volume::ZERO,
+        "an unbounded queue is never counted at all, so there is nothing to drift"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn hundreds_of_parallel_enqueues_are_counted_exactly_once() {
+    // The counters are the reason this matters: enqueue takes no counter lock,
+    // so nothing serialises these transactions on the outbox's account, and
+    // whatever commits must be counted exactly - no double counts, no losses.
+    const TASKS: usize = 300;
+    /// A floor that guards against the test passing vacuously if contention
+    /// ever starts eating most of the transactions. All 300 commit in practice.
+    const MIN_COMMITTED: i64 = 150;
+    const PAYLOAD: usize = 16;
+
+    let db = setup_empty_db_with_pool("ch2b_parallel_enqueue", 8).await;
+    run_migrations_for_testing(&db, super::outbox_migrations())
+        .await
+        .expect("migrations");
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    // Only a bounded queue keeps counters, and the bound is set well clear of
+    // the workload so nothing is refused.
+    bound_queue(&t, "q", i64::from(u32::MAX), 1);
+
+    let mut handles = Vec::with_capacity(TASKS);
+    for i in 0..TASKS {
+        let outbox = Arc::clone(&t.outbox);
+        let db = db.clone();
+        handles.push(tokio::spawn(async move {
+            let result: Result<(), anyhow::Error> = crate::outbox::in_transaction(&db, |tx| {
+                Box::pin(async move {
+                    let record = Record::to("q", 0)
+                        .payload(
+                            vec![u8::try_from(i % 256).unwrap_or(0); PAYLOAD],
+                            "text/plain",
+                        )
+                        .build()?;
+                    let wake = outbox.enqueue(tx, record).await?;
+                    Ok(((), wake))
+                })
+            })
+            .await;
+            result.is_ok()
+        }));
+    }
+
+    let mut committed = 0i64;
+    for handle in handles {
+        if handle.await.expect("task did not panic") {
+            committed += 1;
+        }
+    }
+
+    // SQLite serialises writers, so some transactions may lose a contention
+    // race. What must hold is that the counters agree with what committed -
+    // that is the invariant, not that all 300 win.
+    assert!(
+        committed >= MIN_COMMITTED,
+        "only {committed} of {TASKS} committed - too few to prove anything about counting"
+    );
+    assert_eq!(
+        count_rows(&db, "toolkit_outbox_incoming").await,
+        committed,
+        "every committed enqueue wrote exactly one row"
+    );
+
+    // The enqueue reports arrivals in memory; the flusher is what writes them.
+    flush_counters(&t, &db).await;
+
+    let channels = read_partition_channels(&db, pid).await;
+    assert_eq!(
+        channels.incoming_in.entities, committed,
+        "each committed enqueue counted exactly once - no double counts, no losses"
+    );
+    assert_eq!(
+        channels.incoming_in.bytes,
+        committed * i64::try_from(PAYLOAD).unwrap(),
+        "and its bytes counted exactly once too"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_limit_adds_no_statement_to_the_enqueuing_transaction() {
+    // The claim this proves: configuring a bound costs the caller's
+    // transaction nothing. Asserted against what the driver actually issued,
+    // not against a reading of the code.
+    let (db, recorder) = crate::test_support::connect_with_recorder(
+        "sqlite:file:ch2b_recorder?mode=memory&cache=shared",
+        ConnectOpts {
+            max_conns: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect");
+    run_migrations_for_testing(&db, super::outbox_migrations())
+        .await
+        .expect("migrations");
+
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "plain", 1).await.unwrap();
+    t.outbox.register_queue(&db, "bounded", 1).await.unwrap();
+    t.outbox.set_bounded(
+        "bounded",
+        Arc::new(super::admission::Admission::new(
+            super::limits::QueueLimits::builder()
+                .max_entities(1_000)
+                .max_bytes(1_000_000)
+                .build(),
+            1,
+        )),
+    );
+
+    let conn = db.conn().unwrap();
+
+    // Baseline: the unbounded queue.
+    recorder.clear();
+    t.outbox
+        .enqueue(
+            &conn,
+            Record::to("plain", 0)
+                .payload(b"payload".to_vec(), "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .fire();
+    let unbounded: Vec<String> = recorder.events().into_iter().map(|q| q.sql).collect();
+
+    // The same submission into a queue that has a bound.
+    recorder.clear();
+    t.outbox
+        .enqueue(
+            &conn,
+            Record::to("bounded", 0)
+                .payload(b"payload".to_vec(), "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .fire();
+    let bounded: Vec<String> = recorder.events().into_iter().map(|q| q.sql).collect();
+
+    assert!(
+        !unbounded.is_empty(),
+        "the recorder saw nothing, so the comparison would be vacuous"
+    );
+    assert_eq!(
+        bounded, unbounded,
+        "a bound must add no statement, and change none:\n  bounded: {bounded:#?}\nunbounded: {unbounded:#?}"
+    );
+}
+
+#[tokio::test]
+async fn the_audit_is_told_only_when_the_rows_disagree_with_the_counters() {
+    use super::workers::vacuum::VacuumTask;
+
+    // The conditional half of the design: a drain that collected rows is the
+    // healthy case and says nothing, so the audit is not woken once per
+    // partition per sweep to confirm all is well.
+    let db = setup_db("ch2c_signal_is_conditional").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    let statements = t.outbox.statements_arc();
+
+    // A partition with processed rows to collect: the drain does its job.
+    let conn = db.conn().unwrap();
+    t.outbox
+        .enqueue(
+            &conn,
+            Record::to("q", 0)
+                .payload(b"x".to_vec(), "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .fire();
+    run_sequencer_once(&t, &db).await;
+    let sea = db.sea_internal();
+    sea.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE toolkit_outbox_processor SET processed_seq = 1 WHERE partition_id = $1",
+        [pid.into()],
+    ))
+    .await
+    .unwrap();
+    set_vacuum_counter(&db, pid, 1).await;
+
+    let unaudited = test_unaudited();
+    let mut vacuum = VacuumTask::new(
+        db.clone(),
+        Arc::clone(&statements),
+        10_000,
+        test_collectable_traces(),
+        Arc::clone(&unaudited),
+    );
+    vacuum.execute(&CancellationToken::new()).await.unwrap();
+
+    assert_eq!(
+        count_rows(&db, "toolkit_outbox_outgoing").await,
+        0,
+        "it collected"
+    );
+    assert!(
+        unaudited.take().is_empty(),
+        "a sweep that collected rows must not wake the audit"
+    );
+
+    // Now the anomaly: dirty again, but there is nothing left to collect.
+    set_vacuum_counter(&db, pid, 1).await;
+    vacuum.execute(&CancellationToken::new()).await.unwrap();
+
+    assert_eq!(
+        unaudited.take(),
+        vec![pid],
+        "a partition that was dirty yet had nothing to collect is the audit's business"
+    );
+}
+
+#[tokio::test]
+async fn a_correction_is_refused_the_moment_the_partition_is_not_empty() {
+    // The guarantee a flag cannot give: emptiness is established by the same
+    // statement that acts on it, so a partition that filled up after being
+    // reported empty is left alone rather than zeroed.
+    let db = setup_db("ch2c_guard_refuses").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    bound_queue(&t, "q", 100, 1);
+
+    let conn = db.conn().unwrap();
+    for i in 0..2u8 {
+        t.outbox
+            .enqueue(
+                &conn,
+                Record::to("q", 0)
+                    .payload(vec![i; 10], "text/plain")
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .fire();
+    }
+    run_sequencer_once(&t, &db).await;
+
+    // Two entities are sequenced and unprocessed, so the reading is correct
+    // and the partition is not empty. An audit must decline on both counts.
+    assert_eq!(
+        t.outbox.depth(&conn, "q").await.unwrap(),
+        super::limits::Volume {
+            entities: 2,
+            bytes: 20
+        },
+    );
+    assert!(
+        !t.outbox.audit_partition(&db, pid).await.unwrap(),
+        "work is waiting past the cursor, so there is nothing provable to correct"
+    );
+    assert_eq!(
+        t.outbox.depth(&conn, "q").await.unwrap(),
+        super::limits::Volume {
+            entities: 2,
+            bytes: 20
+        },
+        "and the reading is untouched"
+    );
+
+    // Now empty it behind the pipeline's back, leaving the counters drifted.
+    delete_outgoing_behind_the_pipelines_back(&db, pid).await;
+    assert!(
+        t.outbox.audit_partition(&db, pid).await.unwrap(),
+        "an empty partition with a non-zero reading is corrected"
+    );
+    assert_eq!(
+        t.outbox.depth(&conn, "q").await.unwrap(),
+        super::limits::Volume::ZERO
+    );
+
+    // And a second call finds nothing left to do, so the correction is
+    // idempotent - which is what makes two instances running it concurrently
+    // safe rather than additive.
+    assert!(!t.outbox.audit_partition(&db, pid).await.unwrap());
+    assert_eq!(
+        t.outbox.depth(&conn, "q").await.unwrap(),
+        super::limits::Volume::ZERO
+    );
+}
+
+#[tokio::test]
+async fn a_batch_aimed_at_one_partition_cannot_overshoot_that_partitions_budget() {
+    // The per-partition guard exists so a skewed key cannot consume the whole
+    // queue's allowance. It has to weigh what the submission adds to *that*
+    // partition, which means folding the batch per partition first: judged an
+    // entity at a time, every entity of a 40-entity batch would be measured
+    // against the same unchanged reading and the batch would sail through.
+    let db = setup_db("ch2b_limit_partition_budget").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 4).await.unwrap();
+    // 40 entities and 1 MiB over 4 partitions is a budget of 10 and 256 KiB.
+    // Both bounds are set so the message carries two real numbers rather than
+    // a per-partition share of the unbounded sentinel, and the byte bound is
+    // large enough that its share clears the one-payload floor.
+    t.outbox.set_bounded(
+        "q",
+        Arc::new(super::admission::Admission::new(
+            super::limits::QueueLimits::builder()
+                .max_entities(40)
+                .max_bytes(1024 * 1024)
+                .build(),
+            4,
+        )),
+    );
+
+    let conn = db.conn().unwrap();
+    let mut lopsided = Records::to("q").payload_type("text/plain");
+    for i in 0..11u8 {
+        lopsided = lopsided.push(0, vec![i]);
+    }
+    let err = t
+        .outbox
+        .enqueue_batch(&conn, lopsided.build().unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "queue 'q' is full: partition 0 holds 0/10 entities, 0/262144 bytes",
+        "the whole batch is weighed against one partition's budget, not one entity at a time"
+    );
+    assert_eq!(
+        count_rows(&db, "toolkit_outbox_incoming").await,
+        0,
+        "a refused batch writes nothing"
+    );
+
+    // Spread over the four partitions, the same 11 entities are comfortably
+    // inside every budget and are admitted.
+    let mut spread = Records::to("q").payload_type("text/plain");
+    for i in 0..11u8 {
+        spread = spread.push(u32::from(i % 4), vec![i]);
+    }
+    t.outbox
+        .enqueue_batch(&conn, spread.build().unwrap())
+        .await
+        .expect("11 entities across 4 partitions fit")
+        .fire();
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 11);
+}
+
+#[tokio::test]
+async fn a_bounded_queue_refuses_work_past_its_entity_limit() {
+    let db = setup_db("ch2b_limit_entities").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    t.outbox.set_bounded(
+        "q",
+        Arc::new(super::admission::Admission::new(
+            super::limits::QueueLimits::builder()
+                .max_entities(2)
+                .build(),
+            1,
+        )),
+    );
+
+    let conn = db.conn().unwrap();
+    for i in 0..2u8 {
+        t.outbox
+            .enqueue(
+                &conn,
+                Record::to("q", 0)
+                    .payload(vec![i], "text/plain")
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .fire();
+    }
+
+    let err = t
+        .outbox
+        .enqueue(
+            &conn,
+            Record::to("q", 0)
+                .payload(vec![9], "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "queue 'q' is full: the queue holds 2/2 entities",
+        "an unset byte bound is absent from the message, not reported as i64::MAX"
+    );
+    assert_eq!(
+        count_rows(&db, "toolkit_outbox_incoming").await,
+        2,
+        "a refused enqueue must write nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_bounded_queue_refuses_a_batch_whole() {
+    let db = setup_db("ch2b_limit_batch").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    t.outbox.set_bounded(
+        "q",
+        Arc::new(super::admission::Admission::new(
+            super::limits::QueueLimits::builder().max_bytes(100).build(),
+            1,
+        )),
+    );
+
+    let conn = db.conn().unwrap();
+    let batch = Records::to("q")
+        .payload_type("text/plain")
+        .push(0, vec![0u8; 60])
+        .push(0, vec![0u8; 60])
+        .build()
+        .unwrap();
+
+    let err = t.outbox.enqueue_batch(&conn, batch).await.unwrap_err();
+    assert!(matches!(err, OutboxError::QueueFull { .. }));
+    assert_eq!(
+        count_rows(&db, "toolkit_outbox_incoming").await,
+        0,
+        "a refused batch is all-or-nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_unbounded_queue_is_never_refused() {
+    let db = setup_db("ch2b_unbounded").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+
+    let conn = db.conn().unwrap();
+    for i in 0..50u8 {
+        t.outbox
+            .enqueue(
+                &conn,
+                Record::to("q", 0)
+                    .payload(vec![i; 1024], "text/plain")
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .fire();
+    }
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 50);
 }
