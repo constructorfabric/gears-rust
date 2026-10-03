@@ -40,6 +40,9 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 
 [dev-dependencies]
-credstore = { workspace = true }
+# Path-only on purpose (no `version`, no `workspace = true`): `cf-gears-credstore` is not a
+# normal dependency of this crate, so a versioned dev-dependency would demand a release of it
+# that need not be on crates.io yet when this crate is published (see `release-plz.toml`).
+credstore = { package = "cf-gears-credstore", path = "../credstore" }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }

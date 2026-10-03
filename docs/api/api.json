@@ -3329,7 +3329,7 @@
         "description": "The response to a create: the declaration, and whether a retired one was\nrevived or the active one evolved rather than a new setting declared."
       },
       "CredentialDto": {
-        "description": "Response body for both `GET /credstore/v1/credentials/{ref}` and each item\nof `GET /credstore/v1/credentials` (ADR-0004 Amendment A, \"Why one item\nshape, and why writes do not follow `$select`\"): one shape for both\naddresses. `secret` is populated only when `$select` names it (point\nread) or in secret mode (collection) and only for an item the caller may\nread; absent from the wire entirely otherwise — including when the item's\nvalue could not be served (refused, missing, fingerprint mismatch —\nomitted by the domain layer already, never reported as an error for one\nitem).\n\n`Debug` is hand-written to redact `secret`.",
+        "description": "Response body for both `GET /credstore/v1/credentials/{ref}` and each item\nof `GET /credstore/v1/credentials` (ADR-0004 Amendment A, \"Why one item\nshape, and why writes do not follow `$select`\"): one shape for both\naddresses. `secret` is populated only when `$select` names it (point\nread) or in secret mode (collection) and only for an item the caller may\nread; absent from the wire entirely otherwise — including when the item's\nvalue could not be served (refused or missing — omitted by the\ndomain layer already — or permanently unreadable, in which case the item\nstays with its metadata; never reported as an error for one item).\n\n`Debug` is hand-written to redact `secret`.",
         "properties": {
           "expires_at": {
             "format": "date-time",
@@ -3454,7 +3454,8 @@
         "enum": [
           "none",
           "declared",
-          "active"
+          "active",
+          "expired"
         ],
         "type": "string"
       },
@@ -48808,7 +48809,7 @@
     },
     "/credstore/v1/credentials": {
       "get": {
-        "description": "Upward-rooted collection read (ADR-0005): one reduced item per reference, from the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only `reference`. Selecting `secret` in `$select` switches to secret mode (ADR-0004): no `limit`/`cursor`/`$orderby`, a `reference` or `type` selector only, capped and unpaginated.",
+        "description": "Upward-rooted collection read (ADR-0005): one reduced item per reference, from the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only `reference`. Selecting `secret` in `$select` switches to secret mode (ADR-0004): no `limit`/`cursor`/`$orderby`, a `reference` (`eq`/`in`) or `type` (`eq`/`in`) selector only, capped and unpaginated; an expired or unreadable item is returned without its secret.",
         "operationId": "credstore.list_credentials",
         "parameters": [
           {
@@ -49129,7 +49130,7 @@
         ]
       },
       "get": {
-        "description": "Retrieve the credential for the authenticated tenant, with walk-up resolution: the same item shape the collection returns. Without `$select`, the record fields only (never `secret`); selecting `secret` includes it, for a caller the projection's action(s) admit -- `read` when `$select` is absent or names any of `sharing`/ `status`/`fallback`/`inheritance`/`version`/`updated_at`/`owner_id`, `read_secret` when `secret` is named, both when both. Supersedes the withdrawn `GET .../secret`: `GET .../{ref}?$select=reference,type,expires_at,secret` is its equivalent, and a secret-only projection resolving to a value-less winner is the same canonical 404 that address gave.",
+        "description": "Retrieve the credential for the authenticated tenant, with walk-up resolution: the same item shape the collection returns. Without `$select`, the record fields only (never `secret`); selecting `secret` includes it, for a caller the projection's action(s) admit -- `read` when `$select` is absent or names any of `sharing`/ `status`/`fallback`/`inheritance`/`version`/`updated_at`/`owner_id`, `read_secret` when `secret` is named, both when both. Supersedes the withdrawn `GET .../secret`: `GET .../{ref}?$select=reference,type,expires_at,secret` is its equivalent, and a secret-only projection resolving to a value-less winner is the same canonical 404 that address gave. Selecting `secret` of a record whose expiry has passed fails 409 `SECRET_EXPIRED` (only for a caller who may read the secret); without `secret` the record is returned with `status` `expired`. Selecting `secret` of a record whose stored version the backend cannot return (gone although the pointer did not move, or reported permanently unreadable) fails 409 `SECRET_UNREADABLE`, same disclosure rule; retrying does not help, rewrite the secret or delete the record.",
         "operationId": "credstore.get_credential",
         "parameters": [
           {
@@ -49201,6 +49202,16 @@
               }
             },
             "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
           },
           "500": {
             "content": {
