@@ -1,10 +1,10 @@
 ---
-status: accepted
+status: superseded
 date: 2026-07-04
 ---
 
-Created:  2026-07-07 by Virtuozzo International GmbH
-Updated:  2026-07-07 by Virtuozzo International GmbH
+Created:  2026-07-07 by Constructor Tech
+Updated:  2026-10-03 by Constructor Tech
 
 # ADR-0002: Status-Driven Deprovisioning Saga with Name Retention
 
@@ -26,6 +26,8 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
 <!-- /toc -->
 
 **ID**: `cpt-cf-credstore-adr-deprovisioning-saga`
+
+**Superseded by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md).** The saga and its name retention existed because a successor's value shared the deleted value's backend key. With immutable per-version keys that race cannot occur; deletion becomes one row transaction plus an outbox purge of the record's key.
 
 ## Context and Problem Statement
 
