@@ -7,47 +7,48 @@
 //! platform's `add_metric_suffixes: false` collector posture.
 
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
+use opentelemetry::metrics::{Counter, Histogram, Meter};
 
 use crate::domain::ports::metrics::{
-    CredStoreMetricsPort, Dep, DepOp, FenceVerify, Outcome, ReadOutcome, SecretCounts,
+    CleanupOp, CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, ReadRetryOutcome,
 };
 
 /// Meter / instrumentation scope name.
 pub(crate) const METER_NAME: &str = "credstore";
 
 // ─── Metric names (literal Prometheus form; `add_metric_suffixes: false`) ─────
-const CREDSTORE_SECRETS: &str = "credstore_secrets";
-const CREDSTORE_SECRETS_PROVISIONING: &str = "credstore_secrets_provisioning";
-const CREDSTORE_SECRETS_DEPROVISIONING: &str = "credstore_secrets_deprovisioning";
-const CREDSTORE_TENANTS_WITH_SECRETS: &str = "credstore_tenants_with_secrets";
 const CREDSTORE_READ_OUTCOME: &str = "credstore_read_outcome_total";
 const CREDSTORE_WALKUP_DEPTH: &str = "credstore_walkup_depth";
 const CREDSTORE_DEPENDENCY_QUERY_DURATION: &str = "credstore_dependency_query_duration_seconds";
 const CREDSTORE_DEPENDENCY_HEALTH: &str = "credstore_dependency_health_total";
-const CREDSTORE_PROVISIONING_REAPED: &str = "credstore_provisioning_reaped_total";
-const CREDSTORE_DEPROVISIONING_REAPED: &str = "credstore_deprovisioning_reaped_total";
-const CREDSTORE_PROVISIONING_ROLLBACK: &str = "credstore_provisioning_rollback_total";
 const CREDSTORE_CROSS_TENANT_DENIED: &str = "credstore_cross_tenant_denied_total";
-const CREDSTORE_FENCE_VERIFY: &str = "credstore_fence_verify_total";
-const CREDSTORE_FENCE_BACKFILL: &str = "credstore_fence_backfill_total";
+const CREDSTORE_WRITE_INTENTS_RECLAIMED: &str = "credstore_write_intents_reclaimed_total";
+const CREDSTORE_WRITE_INTENT_LOST: &str = "credstore_write_intent_lost_total";
+const CREDSTORE_WRITE_INTENT_RECLAIM_FAILED: &str = "credstore_write_intent_reclaim_failed_total";
+const CREDSTORE_STORE_CLEANUP_ENQUEUED: &str = "credstore_store_cleanup_enqueued_total";
+const CREDSTORE_STORE_CLEANUP_FAILED: &str = "credstore_store_cleanup_failed_total";
+const CREDSTORE_READ_RETRY: &str = "credstore_read_retry_total";
+const CREDSTORE_LIST_TYPE_INVARIANT_VIOLATION: &str =
+    "credstore_list_type_invariant_violation_total";
+const CREDSTORE_AUDIT_PUBLISH_FAILED: &str = "credstore_audit_publish_failed_total";
+const CREDSTORE_SECRET_UNREADABLE: &str = "credstore_secret_unreadable_total";
 
 /// OpenTelemetry-backed metrics handle for the credstore module.
 pub struct CredStoreMetricsMeter {
-    secrets: Gauge<i64>,
-    secrets_provisioning: Gauge<i64>,
-    secrets_deprovisioning: Gauge<i64>,
-    tenants_with_secrets: Gauge<i64>,
     read_outcome: Counter<u64>,
     walkup_depth: Histogram<u64>,
     dependency_query_duration: Histogram<f64>,
     dependency_health: Counter<u64>,
-    provisioning_reaped: Counter<u64>,
-    deprovisioning_reaped: Counter<u64>,
-    provisioning_rollback: Counter<u64>,
     cross_tenant_denied: Counter<u64>,
-    fence_verify: Counter<u64>,
-    fence_backfill: Counter<u64>,
+    write_intents_reclaimed: Counter<u64>,
+    write_intent_lost: Counter<u64>,
+    write_intent_reclaim_failed: Counter<u64>,
+    store_cleanup_enqueued: Counter<u64>,
+    store_cleanup_failed: Counter<u64>,
+    read_retry: Counter<u64>,
+    list_type_invariant_violation: Counter<u64>,
+    audit_publish_failed: Counter<u64>,
+    secret_unreadable: Counter<u64>,
 }
 
 impl std::fmt::Debug for CredStoreMetricsMeter {
@@ -62,22 +63,6 @@ impl CredStoreMetricsMeter {
     #[must_use]
     pub fn new(meter: &Meter) -> Self {
         Self {
-            secrets: meter
-                .i64_gauge(CREDSTORE_SECRETS)
-                .with_description("Live count of secrets by sharing scope")
-                .build(),
-            secrets_provisioning: meter
-                .i64_gauge(CREDSTORE_SECRETS_PROVISIONING)
-                .with_description("Live count of secrets in provisioning state")
-                .build(),
-            secrets_deprovisioning: meter
-                .i64_gauge(CREDSTORE_SECRETS_DEPROVISIONING)
-                .with_description("Live count of secrets in deprovisioning state")
-                .build(),
-            tenants_with_secrets: meter
-                .i64_gauge(CREDSTORE_TENANTS_WITH_SECRETS)
-                .with_description("Live count of tenants that own at least one secret")
-                .build(),
             read_outcome: meter
                 .u64_counter(CREDSTORE_READ_OUTCOME)
                 .with_description("Secret read results by outcome")
@@ -97,37 +82,75 @@ impl CredStoreMetricsMeter {
                     "Upstream dependency call outcomes, by dependency + operation + outcome",
                 )
                 .build(),
-            provisioning_reaped: meter
-                .u64_counter(CREDSTORE_PROVISIONING_REAPED)
-                .with_description("Provisioning secrets reaped by the background sweeper")
-                .build(),
-            deprovisioning_reaped: meter
-                .u64_counter(CREDSTORE_DEPROVISIONING_REAPED)
-                .with_description(
-                    "Stuck deprovisioning secrets completed by the background sweeper",
-                )
-                .build(),
-            provisioning_rollback: meter
-                .u64_counter(CREDSTORE_PROVISIONING_ROLLBACK)
-                .with_description(
-                    "Create-saga provisioning-row rollbacks after a backend write failure, by outcome",
-                )
-                .build(),
             cross_tenant_denied: meter
                 .u64_counter(CREDSTORE_CROSS_TENANT_DENIED)
                 .with_description("Cross-tenant secret access attempts that were denied")
                 .build(),
-            fence_verify: meter
-                .u64_counter(CREDSTORE_FENCE_VERIFY)
+            write_intents_reclaimed: meter
+                .u64_counter(CREDSTORE_WRITE_INTENTS_RECLAIMED)
                 .with_description(
-                    "Value-fingerprint fence verdicts on reads, by outcome \
-                     (mismatch = fail-closed 404, the alertable signal)",
+                    "Expired write intents (a writer that crashed or stalled between announcing \
+                     a store write and committing it) deleted by a reclaim pass",
                 )
                 .build(),
-            fence_backfill: meter
-                .u64_counter(CREDSTORE_FENCE_BACKFILL)
+            write_intent_lost: meter
+                .u64_counter(CREDSTORE_WRITE_INTENT_LOST)
                 .with_description(
-                    "Lazy fingerprint backfills of out-of-band seeded rows, by outcome",
+                    "Secret writes whose commit found their own intent already reclaimed (the \
+                     writer outlived its lease); the writer cleaned up its version itself",
+                )
+                .build(),
+            write_intent_reclaim_failed: meter
+                .u64_counter(CREDSTORE_WRITE_INTENT_RECLAIM_FAILED)
+                .with_description(
+                    "Reclaim passes (startup or after a write) that failed; the intents stay \
+                     for the next pass (a persistently rising value means expired intents are \
+                     not being reclaimed)",
+                )
+                .build(),
+            store_cleanup_enqueued: meter
+                .u64_counter(CREDSTORE_STORE_CLEANUP_ENQUEUED)
+                .with_description(
+                    "Store-cleanup tasks (purge of a key, destroy of versions) enqueued in the \
+                     transactional outbox, by op",
+                )
+                .build(),
+            store_cleanup_failed: meter
+                .u64_counter(CREDSTORE_STORE_CLEANUP_FAILED)
+                .with_description(
+                    "Store-cleanup delivery attempts that failed and will be retried, by op (a \
+                     persistently rising value means a purge or destroy is stuck)",
+                )
+                .build(),
+            read_retry: meter
+                .u64_counter(CREDSTORE_READ_RETRY)
+                .with_description(
+                    "Secret reads that found their version gone and re-read the row once, by \
+                     outcome (second_miss = 503)",
+                )
+                .build(),
+            list_type_invariant_violation: meter
+                .u64_counter(CREDSTORE_LIST_TYPE_INVARIANT_VIOLATION)
+                .with_description(
+                    "Collection read: a reduced reference's winner named a type outside the \
+                     authorized set (override-type-consistency violated); the reference was \
+                     dropped from the page",
+                )
+                .build(),
+            audit_publish_failed: meter
+                .u64_counter(CREDSTORE_AUDIT_PUBLISH_FAILED)
+                .with_description(
+                    "Audit events for secret reads and writes that the event broker could not \
+                     accept (absent, unavailable, slow or rejecting); the operation itself was \
+                     unaffected",
+                )
+                .build(),
+            secret_unreadable: meter
+                .u64_counter(CREDSTORE_SECRET_UNREADABLE)
+                .with_description(
+                    "Secret reads whose stored version can never be read (the plugin reported \
+                     it unreadable, or it was gone although the record's pointer did not \
+                     move); a rising value means records need a rewrite or delete",
                 )
                 .build(),
         }
@@ -141,19 +164,6 @@ impl CredStoreMetricsMeter {
 }
 
 impl CredStoreMetricsPort for CredStoreMetricsMeter {
-    fn record_inventory(&self, counts: SecretCounts) {
-        self.secrets
-            .record(counts.private, &[KeyValue::new("sharing", "private")]);
-        self.secrets
-            .record(counts.tenant, &[KeyValue::new("sharing", "tenant")]);
-        self.secrets
-            .record(counts.shared, &[KeyValue::new("sharing", "shared")]);
-        self.secrets_provisioning.record(counts.provisioning, &[]);
-        self.secrets_deprovisioning
-            .record(counts.deprovisioning, &[]);
-        self.tenants_with_secrets.record(counts.tenants, &[]);
-    }
-
     fn read_outcome(&self, outcome: ReadOutcome) {
         self.read_outcome
             .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
@@ -181,31 +191,47 @@ impl CredStoreMetricsPort for CredStoreMetricsMeter {
         );
     }
 
-    fn provisioning_reaped(&self, n: u64) {
-        self.provisioning_reaped.add(n, &[]);
-    }
-
-    fn deprovisioning_reaped(&self, n: u64) {
-        self.deprovisioning_reaped.add(n, &[]);
-    }
-
-    fn provisioning_rollback(&self, outcome: Outcome) {
-        self.provisioning_rollback
-            .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
-    }
-
     fn cross_tenant_denied(&self) {
         self.cross_tenant_denied.add(1, &[]);
     }
 
-    fn fence_verify(&self, outcome: FenceVerify) {
-        self.fence_verify
+    fn write_intents_reclaimed(&self, n: u64) {
+        self.write_intents_reclaimed.add(n, &[]);
+    }
+
+    fn write_intent_lost(&self) {
+        self.write_intent_lost.add(1, &[]);
+    }
+
+    fn write_intent_reclaim_failed(&self) {
+        self.write_intent_reclaim_failed.add(1, &[]);
+    }
+
+    fn store_cleanup_enqueued(&self, op: CleanupOp) {
+        self.store_cleanup_enqueued
+            .add(1, &[KeyValue::new("op", op.as_str())]);
+    }
+
+    fn store_cleanup_failed(&self, op: CleanupOp) {
+        self.store_cleanup_failed
+            .add(1, &[KeyValue::new("op", op.as_str())]);
+    }
+
+    fn read_retry(&self, outcome: ReadRetryOutcome) {
+        self.read_retry
             .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
     }
 
-    fn fence_backfill(&self, outcome: Outcome) {
-        self.fence_backfill
-            .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
+    fn list_type_invariant_violation(&self) {
+        self.list_type_invariant_violation.add(1, &[]);
+    }
+
+    fn audit_publish_failed(&self) {
+        self.audit_publish_failed.add(1, &[]);
+    }
+
+    fn secret_unreadable(&self) {
+        self.secret_unreadable.add(1, &[]);
     }
 }
 

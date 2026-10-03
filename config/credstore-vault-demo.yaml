@@ -1,0 +1,115 @@
+# Minimal demo config for the vault-credstore-plugin prototype: credstore
+# backed by a local OpenBao dev server instead of static-credstore-plugin.
+# Based on config/quickstart.yaml, trimmed to only what credstore + its
+# dependency chain need (api-gateway, types-registry, tenant-resolver,
+# authn/authz static plugins, credstore, vault-credstore-plugin).
+#
+# All state (sqlite, logs) lives under server.home_dir, outside the repo tree.
+#
+# Run: start OpenBao dev server, then the example server against this config:
+#   docker run -d --name credstore-openbao -p 8200:8200 -e BAO_DEV_ROOT_TOKEN_ID=root -e BAO_DEV_LISTEN_ADDRESS=0.0.0.0:8200 --cap-add=IPC_LOCK openbao/openbao:latest server -dev
+#   cargo run -p cf-gears-example-server --features vault-credstore,static-tenants,static-authn,static-authz -- --config config/credstore-vault-demo.yaml run
+
+server:
+  home_dir: "~/.cf-gears-credstore-vault-demo"
+
+database:
+  servers:
+    sqlite_users:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        synchronous: "NORMAL"
+        busy_timeout: "5000"
+      pool:
+        max_conns: 5
+        acquire_timeout: "30s"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/cf-gears.log"
+    file_level: info
+    max_age_days: 1
+    max_backups: 1
+    max_size_mb: 10
+
+gears:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8087"
+      enable_docs: true
+      cors_enabled: false
+      prefix_path: "/cf"
+      openapi:
+        title: "CF/Gears Vault CredStore Demo"
+        version: "0.1.0"
+        description: "Local hello-world demo of credstore over OpenBao"
+      defaults:
+        body_limit_bytes: 64000000
+      # Local dev only: uses the default root SecurityContext, no bearer token.
+      auth_disabled: true
+
+  gear-orchestrator:
+    config: {}
+
+  tenant-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-tr-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 20
+      tenants:
+        # Structural root — must match DEFAULT_TENANT_ID in toolkit-security
+        # (used by auth_disabled mode).
+        - id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          name: "default"
+          parent_id: null
+          status: active
+
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: accept_all
+
+  authz-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  types-registry:
+    database:
+      server: "sqlite_users"
+      file: "types_registry.db"
+    config: {}
+
+  credstore:
+    database:
+      server: "sqlite_users"
+      file: "credstore.db"
+    config:
+      # Selects vault-credstore-plugin as the backend by GTS vendor.
+      vendor: "openbao"
+
+  vault-credstore-plugin:
+    config:
+      vendor: "openbao"
+      priority: 100
+      address: "http://127.0.0.1:8200"
+      # Local OpenBao dev-mode root token. Real deployments would set
+      # VAULT_TOKEN and use token: "${VAULT_TOKEN}" instead.
+      token: "root"
+      mount: "secret"
+      path_prefix: "credstore"
+      timeout_secs: 5

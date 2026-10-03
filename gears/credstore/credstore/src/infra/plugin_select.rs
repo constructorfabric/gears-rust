@@ -1,13 +1,13 @@
 //! Types-registry-backed selection of the active value-store plugin.
 //!
 //! Resolves the configured vendor lazily and retrieves its scoped
-//! [`CredStorePluginClientV1`] from
+//! [`CredStorePluginClientV2`] from
 //! `ClientHub`.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use credstore_sdk::{CredStorePluginClientV1, CredStorePluginSpecV1};
+use credstore_sdk::{CredStorePluginClientV2, CredStorePluginSpecV1};
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
@@ -84,7 +84,7 @@ impl GtsCredStorePluginSelector {
 
 #[async_trait]
 impl PluginSelector for GtsCredStorePluginSelector {
-    async fn resolve(&self) -> Result<Arc<dyn CredStorePluginClientV1>, DomainError> {
+    async fn resolve(&self) -> Result<Arc<dyn CredStorePluginClientV2>, DomainError> {
         let instance_id = self
             .selector
             .get_or_init(|| self.resolve_instance())
@@ -93,7 +93,7 @@ impl PluginSelector for GtsCredStorePluginSelector {
         let scope = ClientScope::gts_id(instance_id.as_ref());
 
         self.hub
-            .try_get_scoped::<dyn CredStorePluginClientV1>(&scope)
+            .try_get_scoped::<dyn CredStorePluginClientV2>(&scope)
             .ok_or_else(|| DomainError::ServiceUnavailable {
                 detail: format!("credstore plugin client not registered yet for '{instance_id}'"),
                 retry_after: None,

@@ -1,17 +1,17 @@
 //! `ToolKit` gear registration for the static credential backend.
 //!
 //! Loads and validates configuration, registers its GTS plugin instance, and
-//! publishes a scoped `CredStorePluginClientV1` through `ClientHub`.
+//! publishes a scoped `CredStorePluginClientV2` through `ClientHub`.
 
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use credstore_sdk::{CredStorePluginClientV1, CredStorePluginSpecV1};
+use credstore_sdk::{CredStorePluginClientV2, CredStorePluginSpecV1};
 use toolkit::Gear;
 use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
-use tracing::info;
+use tracing::{info, warn};
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 use crate::config::StaticCredStorePluginConfig;
@@ -45,8 +45,12 @@ impl Gear for StaticCredStorePlugin {
         info!(
             vendor = %cfg.vendor,
             priority = cfg.priority,
-            secret_count = cfg.secrets.len(),
             "Loaded plugin configuration"
+        );
+
+        warn!(
+            "static credstore plugin is a non-durable in-memory value store for development \
+             and tests only: stored values do not survive a restart; do not use it in production"
         );
 
         // Create service from config (validate early, before registration).
@@ -70,9 +74,9 @@ impl Gear for StaticCredStorePlugin {
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
         // Register scoped client in ClientHub
-        let api: Arc<dyn CredStorePluginClientV1> = service;
+        let api: Arc<dyn CredStorePluginClientV2> = service;
         ctx.client_hub()
-            .register_scoped::<dyn CredStorePluginClientV1>(ClientScope::gts_id(&instance_id), api);
+            .register_scoped::<dyn CredStorePluginClientV2>(ClientScope::gts_id(&instance_id), api);
 
         info!(instance_id = %instance_id);
         Ok(())

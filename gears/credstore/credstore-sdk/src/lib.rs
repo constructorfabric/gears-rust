@@ -11,10 +11,11 @@ pub mod types;
 pub use ::gts::GtsId;
 pub use api::CredStoreClientV1;
 pub use error::CredStoreError;
-pub use gts::{CredStorePluginSpecV1, SECRET_RESOURCE_TYPE, SecretTypeTraits, SecretV1};
+pub use gts::{CREDENTIAL_RESOURCE_TYPE, CredStorePluginSpecV1, CredentialV1, SecretTypeTraits};
 pub use models::{
-    ExpiryWrite, GetSecretResponse, OwnerId, SecretRef, SecretValue, SharingMode, TenantId,
-    WriteOptions, WritePrecondition,
+    Credential, CredentialListItem, CredentialPatch, CredentialStatus, CredentialWrite, Fallback,
+    InheritanceStatus, OwnerId, PatchField, PutOutcome, PutPrecondition, Secret, SecretRef,
+    SecretValue, SharingMode, StoreKey, TenantId, Validator, ValueVersion, WritePrecondition,
 };
-pub use plugin_api::CredStorePluginClientV1;
+pub use plugin_api::{CredStorePluginClientV2, DestroySelector};
 pub use types::{SECRET_TYPE_CATALOG, SecretType, SecretTypeDescriptor};

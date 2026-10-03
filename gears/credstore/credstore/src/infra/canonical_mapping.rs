@@ -26,7 +26,7 @@ pub(crate) fn classify_db_err_to_domain(db_err: DbErr) -> DomainError {
         };
     }
     // Every CHECK in the schema (reference length, sharing/status domains, the
-    // fingerprint fence pairing) guards data the code validates or produces
+    // value-version/status pairing) guards data the code validates or produces
     // before the write — `reference` is rejected at both the SDK and REST
     // boundaries, the rest never comes from user input. A firing CHECK is
     // therefore a broken server-side invariant, not a bad secret reference:

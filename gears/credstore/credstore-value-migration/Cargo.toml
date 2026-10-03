@@ -1,0 +1,48 @@
+[package]
+name = "cf-gears-credstore-value-migration"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "One-off operator tool moving CredStore values into the immutable-versions store (ADR-0006)"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "credstore_value_migration"
+
+[lints]
+workspace = true
+
+[dependencies]
+credstore-sdk = { workspace = true }
+toolkit-security = { workspace = true }
+# Postgres and SQLite drivers (with the workspace TLS stack) for `sea-orm`;
+# the tool talks to `credstore_secrets` with raw statements.
+toolkit-db = { workspace = true, features = ["pg", "sqlite"] }
+sea-orm = { workspace = true }
+
+# Fence-key HMAC (AWS-LC; the workspace bans the pure-Rust `sha2`/`hmac`).
+aws-lc-rs = { workspace = true }
+
+async-trait = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+
+[dev-dependencies]
+# Path-only on purpose (no `version`, no `workspace = true`): `cf-gears-credstore` is not a
+# normal dependency of this crate, so a versioned dev-dependency would demand a release of it
+# that need not be on crates.io yet when this crate is published (see `release-plz.toml`).
+credstore = { package = "cf-gears-credstore", path = "../credstore" }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }

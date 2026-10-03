@@ -8,18 +8,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, GetSecretResponse, SecretRef, SecretValue, SharingMode,
-    WriteOptions,
+    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
+    CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef, Validator,
 };
+use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{WritePrecondition, WriteSpec};
+use crate::domain::secret::model::{PutPrecondition as DomainPutPrecondition, WritePrecondition};
 use crate::domain::secret::service::Service;
 
-/// Map the SDK's optimistic-concurrency precondition onto the domain one. The
-/// typed `ClientHub` precondition only expresses the single-generation cases
-/// (`Exists` / `Matches`); the multi-validator `AnyVersion` is REST-only.
+/// Map the SDK's `patch`/`delete` optimistic-concurrency precondition onto
+/// the domain one. The typed `ClientHub` precondition only expresses the
+/// single-generation cases (`Exists` / `Matches`); the multi-validator
+/// `AnyVersion` is REST-only.
 fn to_domain_precondition(p: credstore_sdk::WritePrecondition) -> WritePrecondition {
     match p {
         credstore_sdk::WritePrecondition::Exists => WritePrecondition::Exists,
@@ -29,10 +31,23 @@ fn to_domain_precondition(p: credstore_sdk::WritePrecondition) -> WritePrecondit
     }
 }
 
+/// Map the SDK's `put` precondition onto the domain one.
+fn to_domain_put_precondition(p: PutPrecondition) -> DomainPutPrecondition {
+    match p {
+        PutPrecondition::CreateOnly => DomainPutPrecondition::CreateOnly,
+        PutPrecondition::Exists => DomainPutPrecondition::Exists,
+        PutPrecondition::Matches(Validator { id, version }) => {
+            DomainPutPrecondition::Version { id, version }
+        }
+    }
+}
+
 impl From<DomainError> for CredStoreError {
     fn from(err: DomainError) -> Self {
         match err {
             DomainError::NotFound => CredStoreError::NotFound,
+            DomainError::SecretExpired => CredStoreError::SecretExpired,
+            DomainError::SecretUnreadable => CredStoreError::SecretUnreadable,
             // Both are 409-class; the SDK has no distinct optimistic-lock variant.
             DomainError::Conflict | DomainError::VersionConflict => CredStoreError::Conflict,
             DomainError::InvalidSecretRef { detail } => CredStoreError::invalid_ref(detail),
@@ -40,6 +55,10 @@ impl From<DomainError> for CredStoreError {
                 CredStoreError::unsupported_transition(detail)
             }
             DomainError::TypeViolation { reason, detail, .. } => CredStoreError::TypeViolation {
+                reason: reason.to_owned(),
+                detail,
+            },
+            DomainError::InvalidRequest { reason, detail, .. } => CredStoreError::InvalidRequest {
                 reason: reason.to_owned(),
                 detail,
             },
@@ -86,53 +105,54 @@ impl CredStoreLocalClient {
 
 #[async_trait]
 impl CredStoreClientV1 for CredStoreLocalClient {
-    async fn get(
+    async fn get_record(
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
-    ) -> Result<Option<GetSecretResponse>, CredStoreError> {
-        match self.svc.get(ctx, key).await {
-            // The SDK `get` contract is a single 404 surface: `Ok(None)`
-            // covers "does not exist" and "inaccessible" alike. The service's
-            // `NotFound` (a resolved row whose value is absent, e.g. mid-saga)
-            // is the same surface, so fold it rather than leak an error the
+    ) -> Result<Option<Credential>, CredStoreError> {
+        self.svc.get_record(ctx, key).await.map_err(Into::into)
+    }
+
+    async fn get_secret(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+    ) -> Result<Option<Secret>, CredStoreError> {
+        match self.svc.get_secret(ctx, key).await {
+            // The SDK `get_secret` contract is a single 404 surface:
+            // `Ok(None)` covers "does not exist", "inaccessible", and
+            // "suppressed" alike. The service's `NotFound` (a resolved row
+            // whose backend value is missing even after the read protocol's
+            // one re-read of its current `value_version` — ADR-0006) is the
+            // same surface, so fold it rather than leak an error the
             // contract does not admit.
             Err(DomainError::NotFound) => Ok(None),
             other => other.map_err(Into::into),
         }
     }
 
-    async fn put_opts(
+    async fn put(
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-        precondition: credstore_sdk::WritePrecondition,
-        opts: WriteOptions,
-    ) -> Result<(), CredStoreError> {
+        write: CredentialWrite,
+        precondition: PutPrecondition,
+    ) -> Result<PutOutcome, CredStoreError> {
         self.svc
-            .put(
-                ctx,
-                key,
-                value,
-                WriteSpec::update(sharing, to_domain_precondition(precondition)).with_opts(opts),
-            )
+            .put(ctx, key, write, to_domain_put_precondition(precondition))
             .await
             .map_err(Into::into)
     }
 
-    async fn create_opts(
+    async fn patch(
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-        opts: WriteOptions,
-    ) -> Result<(), CredStoreError> {
-        // create-only: Conflict if a secret of this sharing class exists.
+        patch: CredentialPatch,
+        precondition: credstore_sdk::WritePrecondition,
+    ) -> Result<Validator, CredStoreError> {
         self.svc
-            .put(ctx, key, value, WriteSpec::create(sharing).with_opts(opts))
+            .patch(ctx, key, patch, to_domain_precondition(precondition))
             .await
             .map_err(Into::into)
     }
@@ -147,6 +167,14 @@ impl CredStoreClientV1 for CredStoreLocalClient {
             .delete(ctx, key, to_domain_precondition(precondition))
             .await
             .map_err(Into::into)
+    }
+
+    async fn list(
+        &self,
+        ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        self.svc.list(ctx, query).await.map_err(Into::into)
     }
 }
 

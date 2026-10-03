@@ -1,10 +1,14 @@
 // Updated: 2026-04-14 by Constructor Tech
 //! Service implementation for the static `AuthZ` resolver plugin.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use authz_resolver_sdk::pep::IntoPropertyValue;
 use authz_resolver_sdk::{
     Capability, Constraint, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
     InPredicate, InTenantSubtreePredicate, Predicate,
 };
+use toolkit_gts::GtsId;
 use toolkit_macros::domain_model;
 use toolkit_security::pep_properties;
 use uuid::Uuid;
@@ -33,19 +37,172 @@ use uuid::Uuid;
 ///   means "no row filter", never "the caller owns this row".
 /// - Denies access (`decision: false`) when no valid tenant can be resolved, before any
 ///   constraint is built.
+/// - With configured [`PropertyGrant`]s, narrows every emitted constraint with
+///   `In(property, values)` for the matching rules (see [`Service::evaluate`]).
 #[domain_model]
 #[derive(Default)]
-pub struct Service;
+pub struct Service {
+    grants: Vec<PropertyGrant>,
+}
+
+/// One granted property value: a UUID or a plain string.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GrantValue {
+    Uuid(Uuid),
+    String(String),
+}
+
+impl GrantValue {
+    /// Parse a configured value: a `Uuid` is used as is; a string starting
+    /// with `gts.` must be a valid GTS id and becomes its v5 UUID; anything
+    /// else is a plain string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a `gts.`-prefixed string that is not a valid GTS id.
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        if let Ok(uuid) = Uuid::parse_str(raw) {
+            return Ok(Self::Uuid(uuid));
+        }
+        if raw.starts_with("gts.") {
+            let id = GtsId::try_new(raw)
+                .map_err(|e| anyhow::anyhow!("invalid GTS id '{raw}' in property grant: {e}"))?;
+            return Ok(Self::Uuid(id.to_uuid()));
+        }
+        Ok(Self::String(raw.to_owned()))
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Uuid(u) => u.into_filter_value(),
+            Self::String(s) => s.as_str().into_filter_value(),
+        }
+    }
+}
+
+/// A parsed property-grant rule held by [`Service`].
+#[derive(Debug, Clone)]
+pub struct PropertyGrant {
+    pub resource_type: String,
+    pub property: String,
+    /// Empty = every action.
+    pub actions: Vec<String>,
+    /// Empty = every subject.
+    pub subjects: Vec<Uuid>,
+    pub values: Vec<GrantValue>,
+}
+
+impl PropertyGrant {
+    /// Convert a configuration rule, parsing its values once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty `resource_type` or `property`, or an
+    /// unparsable value.
+    pub fn try_from_config(cfg: &crate::config::PropertyGrantConfig) -> anyhow::Result<Self> {
+        if cfg.resource_type.trim().is_empty() {
+            anyhow::bail!("property grant: resource_type must not be empty");
+        }
+        if cfg.property.trim().is_empty() {
+            anyhow::bail!(
+                "property grant for '{}': property must not be empty",
+                cfg.resource_type
+            );
+        }
+        let values = cfg
+            .values
+            .iter()
+            .map(|v| GrantValue::parse(v))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self {
+            resource_type: cfg.resource_type.clone(),
+            property: cfg.property.clone(),
+            actions: cfg.actions.clone(),
+            subjects: cfg.subjects.clone(),
+            values,
+        })
+    }
+
+    fn matches(&self, request: &EvaluationRequest) -> bool {
+        self.resource_type == request.resource.resource_type
+            && (self.actions.is_empty() || self.actions.contains(&request.action.name))
+            && (self.subjects.is_empty() || self.subjects.contains(&request.subject.id))
+    }
+}
 
 impl Service {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// A service that narrows decisions with the given property grants.
+    #[must_use]
+    pub fn with_grants(grants: Vec<PropertyGrant>) -> Self {
+        Self { grants }
+    }
+
+    /// Union of granted values per property over the rules matching `request`.
+    fn matching_grants(
+        &self,
+        request: &EvaluationRequest,
+    ) -> BTreeMap<&str, BTreeSet<&GrantValue>> {
+        let mut by_property: BTreeMap<&str, BTreeSet<&GrantValue>> = BTreeMap::new();
+        for grant in self.grants.iter().filter(|g| g.matches(request)) {
+            by_property
+                .entry(grant.property.as_str())
+                .or_default()
+                .extend(grant.values.iter());
+        }
+        by_property
+    }
+
+    /// Narrow every alternative in `constraints` with `In(property, values)`
+    /// for the matching property grants (a constraint of only the grant
+    /// predicates when there is none yet). Returns `false` (deny) when a grant
+    /// names a property the PEP did not declare: dropping it would widen the
+    /// configured restriction to every value, so that fails closed.
+    fn apply_property_grants(
+        &self,
+        request: &EvaluationRequest,
+        constraints: &mut Vec<Constraint>,
+    ) -> bool {
+        let grants = self.matching_grants(request);
+        if grants.is_empty() {
+            return true;
+        }
+        let mut grant_predicates = Vec::with_capacity(grants.len());
+        for (property, values) in &grants {
+            if !supports_property(request, property) {
+                tracing::warn!(
+                    resource_type = %request.resource.resource_type,
+                    property = %property,
+                    "static-authz: property grant configured but the PEP does not declare \
+                     the property -- denying (fail closed)",
+                );
+                return false;
+            }
+            grant_predicates.push(Predicate::In(InPredicate::new(
+                *property,
+                values.iter().map(|v| v.to_json()),
+            )));
+        }
+        if constraints.is_empty() {
+            constraints.push(Constraint {
+                predicates: grant_predicates,
+            });
+        } else {
+            for constraint in constraints.iter_mut() {
+                constraint
+                    .predicates
+                    .extend(grant_predicates.iter().cloned());
+            }
+        }
+        true
     }
 
     /// Evaluate an authorization request.
     #[must_use]
-    #[allow(clippy::unused_self)] // &self reserved for future config/state
     pub fn evaluate(&self, request: &EvaluationRequest) -> EvaluationResponse {
         // Always scope to context tenant (all CRUD operations get constraints)
         let tenant_id = request
@@ -143,6 +300,13 @@ impl Service {
                     });
                 }
             }
+        }
+
+        if !self.apply_property_grants(request, &mut constraints) {
+            return EvaluationResponse {
+                decision: false,
+                context: EvaluationResponseContext::default(),
+            };
         }
 
         // No constraint means the PEP declared none of the properties above. The compiler

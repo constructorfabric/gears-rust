@@ -162,7 +162,7 @@ pub(in crate::domain::services) async fn validate_secret_ref_accessible(
     let key = credstore_sdk::SecretRef::new(bare)
         .map_err(|e| DomainError::validation(format!("invalid secret_ref '{raw_ref}': {e}")))?;
 
-    match credstore.get(ctx, &key).await {
+    match credstore.get_record(ctx, &key).await {
         Ok(Some(_)) => Ok(()),
         // Not a malformed argument: the ref parses, the secret just isn't
         // there (yet) or isn't shared. Distinguished from `Validation` so

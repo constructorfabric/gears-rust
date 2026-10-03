@@ -15,6 +15,25 @@ pub enum CredStoreError {
     NotFound,
     #[error("secret already exists")]
     Conflict,
+    /// The record resolved and the caller may read its secret, but the
+    /// decisive `active` record's `expires_at` has passed: the secret is never
+    /// served and resolution does not continue to an ancestor's value. The
+    /// record's metadata stays readable (lifecycle status `expired`); renewing
+    /// it (`patch` of `expires_at` or a new `secret`) restores the secret.
+    /// Surfaced only to a caller authorized to read the secret of that type;
+    /// everyone else gets [`Self::NotFound`].
+    #[error("secret expired")]
+    SecretExpired,
+    /// The record points at a stored version the backend holds but can never
+    /// return (a lost or rotated decryption key, a corrupt entry), or that is
+    /// gone although the pointer did not move. Permanent: retrying does not
+    /// help; the record must be rewritten or deleted. Storage plugins return
+    /// it from `get` for a permanently unreadable version; the gear surfaces
+    /// it (409 `SECRET_UNREADABLE`) only to a caller authorized to read the
+    /// secret, everyone else gets [`Self::NotFound`] or the record's
+    /// metadata.
+    #[error("secret unreadable")]
+    SecretUnreadable,
     #[error("no plugin available")]
     NoPluginAvailable,
     #[error("service unavailable: {detail}")]
@@ -26,9 +45,23 @@ pub enum CredStoreError {
     UnsupportedTransition { detail: String },
     /// A write violated the secret type's traits (unknown type, disallowed
     /// sharing mode, schema/size/format violation, expiry on a
-    /// non-expirable type). `reason` is a stable machine-readable code.
+    /// non-expirable type), or named a type that conflicts with the one
+    /// already in play: a differing type on replace (`TYPE_IMMUTABLE`) or a
+    /// create over a reference that currently resolves, for the creating
+    /// caller (its tenant, owner and ancestor chain), to a record of a
+    /// different type (`TYPE_MISMATCH_WITH_INHERITED`): an ancestor's `shared`
+    /// record or, when creating a private record, the tenant's own
+    /// non-private one.
+    /// `reason` is a stable machine-readable code.
     #[error("secret type violation ({reason}): {detail}")]
     TypeViolation { reason: String, detail: String },
+    /// A request is malformed independently of any secret type — an empty
+    /// merge patch (`EMPTY_PATCH`), a required `secret` missing from a `PUT`
+    /// (`SECRET_REQUIRED`), a merge-patch `null` on a non-nullable field
+    /// (`NULL_NOT_ALLOWED`), or a missing/conflicting write precondition
+    /// (`PRECONDITION_REQUIRED`). `reason` is a stable machine-readable code.
+    #[error("invalid request ({reason}): {detail}")]
+    InvalidRequest { reason: String, detail: String },
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -76,6 +109,12 @@ impl CredStoreError {
         matches!(self, Self::NotFound)
     }
 
+    /// `true` when the decisive record's secret has expired.
+    #[must_use]
+    pub fn is_secret_expired(&self) -> bool {
+        matches!(self, Self::SecretExpired)
+    }
+
     /// `true` for any transient infrastructure outage where retry is appropriate.
     #[must_use]
     pub fn is_unavailable(&self) -> bool {
@@ -97,12 +136,14 @@ impl CredStoreError {
     }
 
     /// `true` for request-shape rejections (invalid secret reference,
-    /// secret-type trait violations).
+    /// secret-type trait violations, malformed request shape).
     #[must_use]
     pub fn is_validation_error(&self) -> bool {
         matches!(
             self,
-            Self::InvalidSecretRef { .. } | Self::TypeViolation { .. }
+            Self::InvalidSecretRef { .. }
+                | Self::TypeViolation { .. }
+                | Self::InvalidRequest { .. }
         )
     }
 
@@ -171,6 +212,11 @@ mod error_tests {
     fn display_redacts_nothing_but_is_stable() {
         assert_eq!(CredStoreError::NotFound.to_string(), "secret not found");
         assert_eq!(CredStoreError::AccessDenied.to_string(), "access denied");
+        assert_eq!(CredStoreError::SecretExpired.to_string(), "secret expired");
+        assert_eq!(
+            CredStoreError::SecretUnreadable.to_string(),
+            "secret unreadable"
+        );
         assert_eq!(
             CredStoreError::Conflict.to_string(),
             "secret already exists"
@@ -182,6 +228,10 @@ mod error_tests {
         assert!(CredStoreError::NotFound.is_not_found());
         assert!(CredStoreError::Conflict.is_already_exists());
         assert!(CredStoreError::AccessDenied.is_permission_denied());
+        assert!(CredStoreError::SecretExpired.is_secret_expired());
+        assert!(!CredStoreError::NotFound.is_secret_expired());
+        assert!(!CredStoreError::SecretExpired.is_not_found());
+        assert!(!CredStoreError::SecretExpired.is_retryable());
         assert!(CredStoreError::invalid_ref("x").is_validation_error());
         assert!(
             CredStoreError::TypeViolation {
@@ -191,6 +241,13 @@ mod error_tests {
             .is_validation_error()
         );
         assert!(CredStoreError::unsupported_transition("x").is_precondition_failed());
+        assert!(
+            CredStoreError::InvalidRequest {
+                reason: "EMPTY_PATCH".to_owned(),
+                detail: "x".to_owned(),
+            }
+            .is_validation_error()
+        );
         assert!(CredStoreError::NoPluginAvailable.is_unavailable());
         assert!(CredStoreError::service_unavailable("down").is_unavailable());
         assert!(CredStoreError::service_unavailable("down").is_retryable());

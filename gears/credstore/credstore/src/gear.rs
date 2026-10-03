@@ -1,10 +1,13 @@
 //! `ToolKit` gear declaration, dependency wiring, and managed lifecycle.
 //!
-//! Initialization builds the domain service, registers its SDK client and REST
-//! routes, and the stateful lifecycle runs recovery and fence-backfill sweeps.
+//! Initialization builds the domain service and registers its SDK client and
+//! REST routes. The lifecycle entry runs no resident background loop and no
+//! maintenance job (ADR-0006 D7); its only asynchronous work is the platform
+//! transactional outbox that executes store cleanup (purging a dead record's
+//! store key, destroying superseded versions). Before reporting ready it
+//! reclaims expired write intents once.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
@@ -21,9 +24,13 @@ use types_registry_sdk::TypesRegistryClient;
 
 use crate::client::CredStoreLocalClient;
 use crate::config::CredStoreConfig;
+use crate::domain::ports::audit::AuditSink;
 use crate::domain::ports::metrics::CredStoreMetricsPort;
-use crate::domain::secret::service::{ReaperSettings, Service};
+use crate::domain::ports::plugin::PluginSelector;
+use crate::domain::secret::service::{ListSettings, Service, WriteSettings};
+use crate::infra::audit::{self, BrokerResolver, DEFAULT_PUBLISH_TIMEOUT, EventBrokerAuditSink};
 use crate::infra::metrics::CredStoreMetricsMeter;
+use crate::infra::outbox::{self, CleanupEnqueuer, CleanupHandler, OutboxCleanupEnqueuer};
 use crate::infra::plugin_select::GtsCredStorePluginSelector;
 use crate::infra::storage::repo_impl::SecretRepoImpl;
 use crate::infra::tenant_resolver::TenantResolverDir;
@@ -42,12 +49,25 @@ use crate::infra::types_registry::GtsSecretTypeResolver;
 )]
 pub struct CredStoreGear {
     service: OnceLock<Arc<Service>>,
+    /// Everything `serve` needs to start the outbox pipeline.
+    outbox_deferred: OnceLock<OutboxDeferred>,
+}
+
+/// State built in `init` and consumed by `serve` to start the store-cleanup
+/// outbox: the enqueuer must exist at `init` (the repository holds it), the
+/// pipeline itself starts when the gear serves.
+struct OutboxDeferred {
+    db: toolkit_db::Db,
+    enqueuer: Arc<OutboxCleanupEnqueuer>,
+    plugins: Arc<GtsCredStorePluginSelector>,
+    metrics: Arc<dyn CredStoreMetricsPort>,
 }
 
 impl Default for CredStoreGear {
     fn default() -> Self {
         Self {
             service: OnceLock::new(),
+            outbox_deferred: OnceLock::new(),
         }
     }
 }
@@ -62,33 +82,65 @@ impl CredStoreGear {
         cancel: CancellationToken,
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
-        let Some(svc) = self.service.get().cloned() else {
+        let Some(service) = self.service.get() else {
             anyhow::bail!("credstore: serve invoked before init");
         };
+        let od = self
+            .outbox_deferred
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("credstore: outbox not initialized"))?;
 
-        let tick = Duration::from_secs(svc.reaper_tick_secs());
-        let mut interval = tokio::time::interval(tick);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Start the store-cleanup outbox before reporting ready: every
+        // secret write, delete and reclaim enqueues into it inside its
+        // transaction.
+        let handle = outbox::start(
+            od.db.clone(),
+            &od.enqueuer,
+            CleanupHandler::new(
+                Arc::clone(&od.plugins) as Arc<dyn PluginSelector>,
+                Arc::clone(&od.metrics),
+            ),
+        )
+        .await?;
+
+        // Reclaim the write intents a previous run left behind (a writer that
+        // crashed between announcing a store write and committing it), before
+        // traffic arrives. The reclaim enqueues into the outbox started
+        // above.
+        Self::reclaim_at_startup(service).await;
 
         ready.notify();
         info!(
             target: "credstore.lifecycle",
-            reaper_tick_secs = tick.as_secs(),
-            "credstore reaper tick started"
+            "credstore gear serving; the only background work is the outbox store cleanup"
         );
 
-        loop {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => break,
-                _ = interval.tick() => {
-                    svc.reap_and_refresh().await;
-                }
-            }
-        }
+        cancel.cancelled().await;
 
-        info!(target: "credstore.lifecycle", "credstore reaper tick cancelled");
+        info!(target: "credstore.lifecycle", "credstore lifecycle cancelled; stopping outbox");
+        handle.stop().await;
         Ok(())
+    }
+}
+
+impl CredStoreGear {
+    /// Startup reclaim of expired write intents. A failure is logged and
+    /// counted by the service; the gear starts regardless, and later writes
+    /// reclaim as they go.
+    async fn reclaim_at_startup(service: &Service) {
+        match service.reclaim_at_startup().await {
+            Ok(0) => {}
+            Ok(n) => info!(
+                target: "credstore.lifecycle",
+                reclaimed = n,
+                "reclaimed expired write intents at startup"
+            ),
+            Err(e) => tracing::warn!(
+                target: "credstore.lifecycle",
+                err = %e,
+                "startup reclaim of expired write intents failed; starting anyway"
+            ),
+        }
     }
 }
 
@@ -105,7 +157,11 @@ impl Gear for CredStoreGear {
         let db: Arc<DBProvider<crate::domain::error::DomainError>> =
             Arc::new(DBProvider::new(db_raw.db()));
 
-        let repo = Arc::new(SecretRepoImpl::new(Arc::clone(&db)));
+        let enqueuer = Arc::new(OutboxCleanupEnqueuer::new());
+        let repo = Arc::new(SecretRepoImpl::new(
+            Arc::clone(&db),
+            Arc::clone(&enqueuer) as Arc<dyn CleanupEnqueuer>,
+        ));
 
         let authz_client = ctx
             .client_hub()
@@ -142,26 +198,76 @@ impl Gear for CredStoreGear {
             .client_hub()
             .get::<dyn TypesRegistryClient>()
             .map_err(|e| anyhow::anyhow!("failed to get TypesRegistryClient: {e}"))?;
-        let types = Arc::new(GtsSecretTypeResolver::new(registry, Arc::clone(&metrics)));
+        let types = Arc::new(GtsSecretTypeResolver::new(
+            Arc::clone(&registry),
+            Arc::clone(&metrics),
+        ));
         info!("types-registry client resolved from client hub; secret-type resolver wired");
 
-        let svc = Arc::new(Service::new(
-            repo,
-            dir,
-            enforcer,
-            plugins,
-            types,
-            metrics,
-            ReaperSettings {
-                tick_secs: cfg.reaper.tick_secs,
-                provisioning_timeout_secs: cfg.reaper.provisioning_timeout_secs,
-                deprovisioning_timeout_secs: cfg.reaper.deprovisioning_timeout_secs,
-            },
+        // Audit (`cpt-cf-credstore-nfr-audit`): the event broker is a
+        // non-blocking dependency. It is deliberately NOT in `deps` and its
+        // client is resolved per event, so credstore starts and works with
+        // the broker absent; every dropped event is counted instead.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            audit::register_audit_types(registry.as_ref()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                target: "credstore.audit",
+                error = %e,
+                "credstore audit topic/event type not registered; publishing will fail and be \
+                 counted until they are"
+            ),
+            Err(_) => tracing::warn!(
+                target: "credstore.audit",
+                "registering the credstore audit topic/event type timed out; publishing will \
+                 fail and be counted until they are registered"
+            ),
+        }
+        let hub = ctx.client_hub();
+        let resolve: BrokerResolver =
+            Arc::new(move || hub.try_get::<dyn event_broker_sdk::EventBrokerApi>());
+        let audit_sink: Arc<dyn AuditSink> = Arc::new(EventBrokerAuditSink::new(
+            resolve,
+            Arc::clone(&metrics),
+            DEFAULT_PUBLISH_TIMEOUT,
         ));
+
+        let svc = Arc::new(
+            Service::new(
+                repo,
+                dir,
+                enforcer,
+                Arc::clone(&plugins) as Arc<dyn PluginSelector>,
+                types,
+                Arc::clone(&metrics),
+                ListSettings {
+                    max_limit: cfg.list.max_limit,
+                    secret_mode_cap: cfg.list.secret_mode_cap,
+                },
+            )
+            .with_audit(audit_sink)
+            .with_write_settings(WriteSettings {
+                intent_lease: std::time::Duration::from_secs(cfg.write.intent_lease_secs),
+                reclaim_batch: cfg.write.reclaim_batch,
+            }),
+        );
 
         self.service
             .set(Arc::clone(&svc))
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
+
+        self.outbox_deferred
+            .set(OutboxDeferred {
+                db: db_raw.db(),
+                enqueuer,
+                plugins,
+                metrics,
+            })
+            .map_err(|_| anyhow::anyhow!("{} outbox already initialized", Self::MODULE_NAME))?;
 
         let client: Arc<dyn credstore_sdk::CredStoreClientV1> =
             Arc::new(CredStoreLocalClient::new(svc));
@@ -181,7 +287,12 @@ impl DatabaseCapability for CredStoreGear {
     fn migrations(&self) -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
         use sea_orm_migration::MigratorTrait;
         info!("providing credstore database migrations");
-        crate::infra::storage::migrations::Migrator::migrations()
+        let mut m = crate::infra::storage::migrations::Migrator::migrations();
+        match crate::infra::outbox::migrations() {
+            Ok(outbox) => m.extend(outbox),
+            Err(e) => tracing::error!(err = %e, "credstore outbox migrations unavailable"),
+        }
+        m
     }
 }
 

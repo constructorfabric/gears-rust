@@ -1,9 +1,10 @@
-// Created: 2026-06-06 — tests for the `CredStorePluginClientV1` trait impl.
-use credstore_sdk::{CredStorePluginClientV1, OwnerId, SecretRef, SecretValue, TenantId};
+use credstore_sdk::{
+    CredStorePluginClientV2, DestroySelector, SecretValue, StoreKey, TenantId, ValueVersion,
+};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::config::{SecretConfig, StaticCredStorePluginConfig};
+use crate::config::StaticCredStorePluginConfig;
 use crate::domain::service::Service;
 
 fn ctx() -> SecurityContext {
@@ -18,40 +19,15 @@ fn empty_service() -> Service {
     Service::from_config(&StaticCredStorePluginConfig::default()).expect("config builds")
 }
 
-fn seeded_service() -> Service {
-    let cfg = StaticCredStorePluginConfig {
-        secrets: vec![SecretConfig {
-            tenant_id: Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()),
-            owner_id: None,
-            key: "openai-key".to_owned(),
-            value: "seeded".to_owned(),
-            sharing: None,
-        }],
-        ..Default::default()
-    };
-    Service::from_config(&cfg).expect("config builds")
-}
-
-fn tid() -> TenantId {
-    TenantId(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap())
-}
-
-#[tokio::test]
-async fn get_seeded_tenant_secret() {
-    let svc = seeded_service();
-    let got = svc
-        .get(&ctx(), &tid(), &SecretRef::new("openai-key").unwrap(), None)
-        .await
-        .unwrap()
-        .expect("secret present");
-    assert_eq!(got.as_bytes(), b"seeded");
+fn key() -> StoreKey {
+    StoreKey::new(TenantId(Uuid::new_v4()), Uuid::new_v4())
 }
 
 #[tokio::test]
 async fn get_missing_returns_none() {
     let svc = empty_service();
     let got = svc
-        .get(&ctx(), &tid(), &SecretRef::new("absent").unwrap(), None)
+        .get(&ctx(), &key(), &ValueVersion::new("1"))
         .await
         .unwrap();
     assert!(got.is_none());
@@ -60,47 +36,57 @@ async fn get_missing_returns_none() {
 #[tokio::test]
 async fn put_then_get_roundtrip() {
     let svc = empty_service();
-    let key = SecretRef::new("written").unwrap();
-
-    svc.put(&ctx(), &tid(), &key, SecretValue::from("v1"), None)
-        .await
-        .unwrap();
-
-    let got = svc.get(&ctx(), &tid(), &key, None).await.unwrap();
+    let k = key();
+    let v = svc.put(&ctx(), &k, SecretValue::from("v1")).await.unwrap();
+    let got = svc.get(&ctx(), &k, &v).await.unwrap();
     assert_eq!(got.unwrap().as_bytes(), b"v1");
 }
 
 #[tokio::test]
-async fn private_put_is_owner_scoped() {
+async fn each_put_is_a_new_immutable_version() {
     let svc = empty_service();
-    let key = SecretRef::new("owned").unwrap();
-    let owner = OwnerId(Uuid::new_v4());
-
-    svc.put(
-        &ctx(),
-        &tid(),
-        &key,
-        SecretValue::from("secret"),
-        Some(&owner),
-    )
-    .await
-    .unwrap();
-
-    // Visible to the owner, not to the tenant class.
-    assert!(
-        svc.get(&ctx(), &tid(), &key, Some(&owner))
-            .await
-            .unwrap()
-            .is_some()
+    let k = key();
+    let v1 = svc.put(&ctx(), &k, SecretValue::from("v1")).await.unwrap();
+    let v2 = svc.put(&ctx(), &k, SecretValue::from("v2")).await.unwrap();
+    assert_ne!(v1, v2);
+    assert_eq!(
+        svc.get(&ctx(), &k, &v1).await.unwrap().unwrap().as_bytes(),
+        b"v1"
     );
-    assert!(svc.get(&ctx(), &tid(), &key, None).await.unwrap().is_none());
+    assert_eq!(
+        svc.get(&ctx(), &k, &v2).await.unwrap().unwrap().as_bytes(),
+        b"v2"
+    );
 }
 
 #[tokio::test]
-async fn delete_removes_value() {
-    let svc = seeded_service();
-    let key = SecretRef::new("openai-key").unwrap();
+async fn declares_and_implements_destroy() {
+    let svc = empty_service();
+    assert!(svc.supports_destroy());
+    let k = key();
+    let v1 = svc.put(&ctx(), &k, SecretValue::from("v1")).await.unwrap();
+    let v2 = svc.put(&ctx(), &k, SecretValue::from("v2")).await.unwrap();
+    svc.destroy(&ctx(), &k, DestroySelector::Below(v2.clone()))
+        .await
+        .unwrap();
+    assert!(svc.get(&ctx(), &k, &v1).await.unwrap().is_none());
+    assert!(svc.get(&ctx(), &k, &v2).await.unwrap().is_some());
+    svc.destroy(&ctx(), &k, DestroySelector::Exactly(v2.clone()))
+        .await
+        .unwrap();
+    assert!(svc.get(&ctx(), &k, &v2).await.unwrap().is_none());
+}
 
-    svc.delete(&ctx(), &tid(), &key, None).await.unwrap();
-    assert!(svc.get(&ctx(), &tid(), &key, None).await.unwrap().is_none());
+#[tokio::test]
+async fn delete_key_removes_all_versions() {
+    let svc = empty_service();
+    let k = key();
+    let v = svc.put(&ctx(), &k, SecretValue::from("v1")).await.unwrap();
+    svc.delete_key(&ctx(), &k).await.unwrap();
+    assert!(svc.get(&ctx(), &k, &v).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delete_key_missing_is_success() {
+    empty_service().delete_key(&ctx(), &key()).await.unwrap();
 }

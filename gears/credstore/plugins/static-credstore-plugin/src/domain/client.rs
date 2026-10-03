@@ -1,51 +1,57 @@
-// Updated: 2026-06-06 — implements the per-tenant value-store `CredStorePluginClientV1`.
 //! SDK adapter for the static value store.
 //!
 //! Requests are already authorized and resolved by the host gear, so this
-//! adapter keys values only by tenant, reference, and optional owner.
+//! adapter keys values purely by `StoreKey` - see `credstore_sdk::plugin_api`.
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreError, CredStorePluginClientV1, OwnerId, SecretRef, SecretValue, TenantId,
+    CredStoreError, CredStorePluginClientV2, DestroySelector, SecretValue, StoreKey, ValueVersion,
 };
 use toolkit_security::SecurityContext;
 
 use super::service::Service;
 
-/// The static plugin is a pure per-tenant value store: it ignores the
-/// security context (the gear has already authorized the request and
-/// resolved tenant/owner) and keys purely on `(tenant_id, key, owner_id)`.
+/// The static plugin ignores the security context (the gear has already
+/// authorized the request) and keys purely on `(tenant_id, record_id)`.
 #[async_trait]
-impl CredStorePluginClientV1 for Service {
-    async fn get(
-        &self,
-        _ctx: &SecurityContext,
-        tenant_id: &TenantId,
-        key: &SecretRef,
-        owner_id: Option<&OwnerId>,
-    ) -> Result<Option<SecretValue>, CredStoreError> {
-        Ok(self.get_value(tenant_id, key, owner_id))
-    }
-
+impl CredStorePluginClientV2 for Service {
     async fn put(
         &self,
         _ctx: &SecurityContext,
-        tenant_id: &TenantId,
-        key: &SecretRef,
+        key: &StoreKey,
         value: SecretValue,
-        owner_id: Option<&OwnerId>,
+    ) -> Result<ValueVersion, CredStoreError> {
+        Ok(self.put_value(key, value))
+    }
+
+    async fn get(
+        &self,
+        _ctx: &SecurityContext,
+        key: &StoreKey,
+        version: &ValueVersion,
+    ) -> Result<Option<SecretValue>, CredStoreError> {
+        Ok(self.get_value(key, version))
+    }
+
+    async fn delete_key(
+        &self,
+        _ctx: &SecurityContext,
+        key: &StoreKey,
     ) -> Result<(), CredStoreError> {
-        self.put_value(tenant_id, key, value, owner_id);
+        self.delete_key_value(key);
         Ok(())
     }
 
-    async fn delete(
+    fn supports_destroy(&self) -> bool {
+        true
+    }
+
+    async fn destroy(
         &self,
         _ctx: &SecurityContext,
-        tenant_id: &TenantId,
-        key: &SecretRef,
-        owner_id: Option<&OwnerId>,
+        key: &StoreKey,
+        selector: DestroySelector,
     ) -> Result<(), CredStoreError> {
-        self.delete_value(tenant_id, key, owner_id);
+        self.destroy_value(key, &selector);
         Ok(())
     }
 }

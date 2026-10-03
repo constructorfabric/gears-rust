@@ -19,9 +19,9 @@ fn catalog_names_and_ids_are_unique_and_well_formed() {
     for d in SECRET_TYPE_CATALOG {
         assert!(
             d.gts_id.starts_with(&format!(
-                "{GTS_ID_PREFIX}cf.core.credstore.secret.v1~cf.core.credstore."
+                "{GTS_ID_PREFIX}cf.core.credstore.credential.v1~cf.core.credstore."
             )),
-            "{} not derived from the secret base type",
+            "{} not derived from the credential base type",
             d.name
         );
         assert!(d.gts_id.ends_with(".v1~"));
@@ -114,4 +114,11 @@ fn serde_round_trip_uses_short_name() {
     let back: SecretType = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back, t);
     assert!(serde_json::from_str::<SecretType>("\"bogus\"").is_err());
+}
+
+#[test]
+fn secret_type_debug_and_display_name_the_catalog_entry() {
+    let t = SecretType::from_name("api-key").expect("known");
+    assert_eq!(t.to_string(), "api-key");
+    assert_eq!(format!("{t:?}"), "SecretType(\"api-key\")");
 }
