@@ -66,11 +66,26 @@ mod scopable;
 /// - `unrestricted` - Mark as global entity (forbids all other attributes)
 /// - `pep_prop(property_name = "column_name")` - Custom PEP property mapping (repeatable)
 ///
-/// The macro auto-generates `resolve_property()` from dimension columns and `pep_prop` entries:
-/// - `tenant_col` → `"owner_tenant_id"`
-/// - `resource_col` → `"id"`
-/// - `owner_col` → `"owner_id"`
+/// The macro generates the `SCOPE_PROPERTIES` table from those attributes,
+/// under the well-known property names:
+/// - `tenant_col` → `"owner_tenant_id"` (`pep_properties::OWNER_TENANT_ID`)
+/// - `resource_col` → `"id"` (`pep_properties::RESOURCE_ID`)
+/// - `owner_col` → `"owner_id"` (`pep_properties::OWNER_ID`)
 /// - Each `pep_prop(name = "col")` → `"name"`
+///
+/// `type_col` gets no entry: no property name addresses it, so no scope can.
+/// It is the one dimension the macro still emits as a method.
+///
+/// The `no_*` answers are emitted too, as `UNSCOPED_DIMENSIONS`. Nothing there
+/// names a column -- the list records which dimensions were decided against, so
+/// that a table missing a row can be told from an entity that genuinely has no
+/// such column. `unrestricted` emits an empty list and is exempt from the
+/// check, because it scopes on nothing by construction.
+///
+/// `resolve_property()`, `scope_columns()`, `tenant_col()`, `resource_col()`
+/// and `owner_col()` are **not** generated. They are provided by the
+/// `ScopeProperties` trait, which reads them all back out of that one table --
+/// see its documentation for what a manual implementation writes.
 ///
 /// # Example
 ///

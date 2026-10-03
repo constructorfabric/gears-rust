@@ -62,78 +62,83 @@ pub fn expand_derive_scopable(input: DeriveInput) -> syn::Result<TokenStream> {
 
     let entity_ident = syn::Ident::new("Entity", input.ident.span());
 
-    // If unrestricted, generate simple implementation with all None
+    // If unrestricted, generate the empty table: nothing is scopable, so
+    // every accessor the trait derives from it answers None.
     if config.unrestricted.is_some() {
         return Ok(quote! {
             impl ::toolkit_db::secure::ScopableEntity for #entity_ident {
                 const IS_UNRESTRICTED: bool = true;
 
-                fn tenant_col() -> ::core::option::Option<Self::Column> {
-                    ::core::option::Option::None
-                }
-
-                fn resource_col() -> ::core::option::Option<Self::Column> {
-                    ::core::option::Option::None
-                }
-
-                fn owner_col() -> ::core::option::Option<Self::Column> {
-                    ::core::option::Option::None
-                }
-
                 fn type_col() -> ::core::option::Option<Self::Column> {
                     ::core::option::Option::None
                 }
 
-                fn scope_columns() -> ::std::vec::Vec<Self::Column> {
-                    ::std::vec::Vec::new()
-                }
+                // Nothing to scope by, so nothing resolves, the column list is
+                // empty, and the three dimension accessors `ScopeProperties`
+                // derives from this table all answer `None`.
+                const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
 
-                fn resolve_property(_property: &str) -> ::core::option::Option<Self::Column> {
-                    ::core::option::Option::None
-                }
+                // An unrestricted entity scopes on nothing by construction, so
+                // there is no dimension left to decide about. The check in
+                // `ScopeProperties` exempts it; the const is still required.
+                const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[];
             }
         });
     }
 
-    // Generate tenant_col implementation
-    let tenant_col_impl =
-        generate_col_impl("tenant_col", config.tenant_col.as_ref(), input.ident.span());
-
-    // Generate resource_col implementation
-    let resource_col_impl = generate_col_impl(
-        "resource_col",
-        config.resource_col.as_ref(),
-        input.ident.span(),
-    );
-
-    // Generate owner_col implementation
-    let owner_col_impl =
-        generate_col_impl("owner_col", config.owner_col.as_ref(), input.ident.span());
-
-    // Generate type_col implementation
+    // Only type_col is generated as a method. The tenant, resource and owner
+    // dimensions are the well-known properties of SCOPE_PROPERTIES, and
+    // `ScopeProperties` reads them back out of it, so emitting them here would
+    // put the same column in two places again (issue #4726). type_col has no
+    // property name, so it has nowhere else to come from.
     let type_col_impl = generate_col_impl("type_col", config.type_col.as_ref(), input.ident.span());
 
-    // Generate resolve_property implementation
-    let resolve_property_impl = generate_resolve_property(&config, input.ident.span());
-    let scope_columns_impl = generate_scope_columns(&config, input.ident.span());
+    // One table; the trait derives the lookup, the column list and the three
+    // dimension accessors from it, so none of them can describe a different set.
+    let scope_properties_impl = generate_scope_properties(&config, input.ident.span());
+
+    // The other half of the same decision: the dimensions `#[secure(...)]`
+    // answered `no_*` to. `validate_config` has already required an answer for
+    // each one, so this cannot be partial.
+    let unscoped_dimensions_impl = generate_unscoped_dimensions(&config);
 
     // Generate the implementation
     Ok(quote! {
         impl ::toolkit_db::secure::ScopableEntity for #entity_ident {
             const IS_UNRESTRICTED: bool = false;
 
-            #tenant_col_impl
-
-            #resource_col_impl
-
-            #owner_col_impl
-
             #type_col_impl
 
-            #resolve_property_impl
-            #scope_columns_impl
+            #scope_properties_impl
+
+            #unscoped_dimensions_impl
         }
     })
+}
+
+/// Build `UNSCOPED_DIMENSIONS`: the well-known dimensions this entity was asked
+/// about and answered `no_tenant` / `no_resource` / `no_owner` to.
+///
+/// The complement of the dimension entries in [`generate_scope_properties`],
+/// from the same configuration, so the two cannot disagree. It exists because
+/// the trait cannot tell a dimension an entity has no column for from one whose
+/// row was forgotten, and the write-side guards skip themselves on both.
+fn generate_unscoped_dimensions(config: &SecureConfig) -> TokenStream {
+    let mut entries = Vec::new();
+
+    for (property, dimension) in [
+        (PEP_PROP_OWNER_TENANT_ID, config.tenant_col.as_ref()),
+        (PEP_PROP_RESOURCE_ID, config.resource_col.as_ref()),
+        (PEP_PROP_OWNER_ID, config.owner_col.as_ref()),
+    ] {
+        if dimension.is_none() {
+            entries.push(quote! { #property });
+        }
+    }
+
+    quote! {
+        const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[#(#entries),*];
+    }
 }
 
 /// Generate a column method implementation
@@ -161,114 +166,104 @@ fn generate_col_impl(
     }
 }
 
-/// Enumerate every column a scope predicate can address.
+/// Build the `SCOPE_PROPERTIES` table: every property this entity understands,
+/// paired with the column it means.
 ///
-/// Built from the same configuration as `resolve_property`, so the two cannot
-/// disagree about what counts as a scope column — which matters because a
-/// property-graph declaration derives its `PROPERTIES` list from this, and a
-/// scope column left out of that list is silently unfilterable.
+/// One table rather than a `resolve_property` match plus a `scope_columns`
+/// list. The trait derives both from it, so a property the lookup answers and a
+/// column the list omits can no longer disagree — which was possible before,
+/// and mattered because a property-graph declaration builds its `PROPERTIES`
+/// list from the columns, and a scope column missing from that list is silently
+/// unfilterable inside `MATCH` (issue #4726).
 ///
-/// `type_col` is deliberately absent: `resolve_property` emits no arm for it
-/// (there is no well-known property name), so no scope constraint can address
-/// it — listing it here would let an entity whose only dimension is `type_col`
-/// pass the Policy 2 gates while resolving nothing, which is the silent
-/// deny-all those gates exist to refuse.
-fn generate_scope_columns(config: &SecureConfig, span: Span) -> TokenStream {
-    let mut columns = Vec::new();
+/// The dimension columns take their well-known property names;
+/// `pep_prop(name = "column")` entries take theirs verbatim. `type_col` gets no
+/// entry: there is no property name for it, so no scope can address it, and a
+/// column with no property would let an entity whose only dimension is
+/// `type_col` pass the Policy 2 gates while resolving nothing.
+fn generate_scope_properties(config: &SecureConfig, span: Span) -> TokenStream {
+    let mut entries = Vec::new();
 
-    for col_name in [
-        config.tenant_col.as_ref().map(|(name, _)| name),
-        config.resource_col.as_ref().map(|(name, _)| name),
-        config.owner_col.as_ref().map(|(name, _)| name),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let col_ident = syn::Ident::new(&snake_to_upper_camel(col_name), span);
-        columns.push(quote! { Self::Column::#col_ident });
+    for (property, dimension) in [
+        (PEP_PROP_OWNER_TENANT_ID, config.tenant_col.as_ref()),
+        (PEP_PROP_RESOURCE_ID, config.resource_col.as_ref()),
+        (PEP_PROP_OWNER_ID, config.owner_col.as_ref()),
+    ] {
+        if let Some((col_name, _)) = dimension {
+            let col_ident = syn::Ident::new(&snake_to_upper_camel(col_name), span);
+            entries.push(quote! { (#property, Self::Column::#col_ident) });
+        }
     }
 
-    // `pep_prop` columns are scope columns too: `resolve_property` maps them,
-    // so a scope can address them, so a pattern must be able to filter on them.
-    for (_, column, _) in &config.pep_props {
+    for (property, column, _) in &config.pep_props {
         let col_ident = syn::Ident::new(&snake_to_upper_camel(column), span);
-        columns.push(quote! { Self::Column::#col_ident });
+        entries.push(quote! { (#property, Self::Column::#col_ident) });
     }
 
     quote! {
-        fn scope_columns() -> ::std::vec::Vec<Self::Column> {
-            ::std::vec![#(#columns),*]
-        }
+        const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+            #(#entries),*
+        ];
     }
 }
 
-/// Generate the `resolve_property` match arms from dimension columns and `pep_prop` entries.
-fn generate_resolve_property(config: &SecureConfig, span: Span) -> TokenStream {
-    let mut arms = Vec::new();
+/// The first attribute `unrestricted` forbids, if the entity wrote one.
+///
+/// `unrestricted` means the entity scopes on nothing, so every other
+/// `#[secure(...)]` attribute contradicts it. The rule lives here alone: it
+/// used to be checked a second time while parsing, which read
+/// `config.unrestricted` and therefore only fired for an attribute written
+/// *after* `unrestricted`. Which of the two diagnostics a user saw depended on
+/// writing order, and one of them named the attribute while the other named
+/// `unrestricted`.
+///
+/// The order below is fixed rather than source order, so the same
+/// configuration always reports the same attribute.
+fn first_other_attribute(config: &SecureConfig) -> Option<(&'static str, Span)> {
+    let dimensions: [(&'static str, Option<Span>); 8] = [
+        ("tenant_col", config.tenant_col.as_ref().map(|(_, s)| *s)),
+        ("no_tenant", config.no_tenant),
+        (
+            "resource_col",
+            config.resource_col.as_ref().map(|(_, s)| *s),
+        ),
+        ("no_resource", config.no_resource),
+        ("owner_col", config.owner_col.as_ref().map(|(_, s)| *s)),
+        ("no_owner", config.no_owner),
+        ("type_col", config.type_col.as_ref().map(|(_, s)| *s)),
+        ("no_type", config.no_type),
+    ];
 
-    // Auto-map dimension columns to their well-known property names
-    if let Some((col_name, _)) = &config.tenant_col {
-        let col_variant = snake_to_upper_camel(col_name);
-        let col_ident = syn::Ident::new(&col_variant, span);
-        arms.push(quote! {
-            #PEP_PROP_OWNER_TENANT_ID => ::core::option::Option::Some(Self::Column::#col_ident),
-        });
-    }
-
-    if let Some((col_name, _)) = &config.resource_col {
-        let col_variant = snake_to_upper_camel(col_name);
-        let col_ident = syn::Ident::new(&col_variant, span);
-        arms.push(quote! {
-            #PEP_PROP_RESOURCE_ID => ::core::option::Option::Some(Self::Column::#col_ident),
-        });
-    }
-
-    if let Some((col_name, _)) = &config.owner_col {
-        let col_variant = snake_to_upper_camel(col_name);
-        let col_ident = syn::Ident::new(&col_variant, span);
-        arms.push(quote! {
-            #PEP_PROP_OWNER_ID => ::core::option::Option::Some(Self::Column::#col_ident),
-        });
-    }
-
-    // Custom pep_prop entries
-    for (property, column, _) in &config.pep_props {
-        let col_variant = snake_to_upper_camel(column);
-        let col_ident = syn::Ident::new(&col_variant, span);
-        arms.push(quote! {
-            #property => ::core::option::Option::Some(Self::Column::#col_ident),
-        });
-    }
-
-    quote! {
-        fn resolve_property(property: &str) -> ::core::option::Option<Self::Column> {
-            match property {
-                #(#arms)*
-                _ => ::core::option::Option::None,
-            }
+    for (attribute, span) in dimensions {
+        if let Some(span) = span {
+            return Some((attribute, span));
         }
     }
+
+    config
+        .pep_props
+        .first()
+        .map(|(_, _, span)| ("pep_prop", *span))
 }
 
 /// Validate the configuration for strict compile-time checks
 fn validate_config(config: &SecureConfig, input: &DeriveInput) -> syn::Result<()> {
     let struct_span = input.span();
 
-    // If unrestricted is set, no other attributes should be present
-    if let Some(unrestricted_span) = config.unrestricted {
-        let has_other = config.tenant_col.is_some()
-            || config.no_tenant.is_some()
-            || config.resource_col.is_some()
-            || config.no_resource.is_some()
-            || config.owner_col.is_some()
-            || config.no_owner.is_some()
-            || config.type_col.is_some()
-            || config.no_type.is_some();
-
-        if has_other {
+    // If unrestricted is set, no other attributes should be present.
+    //
+    // `pep_props` belongs in this list, not only in the parse-time guard in
+    // `parse_secure_attrs`: that guard reads `config.unrestricted`, so it only
+    // fires when `unrestricted` was written *before* the `pep_prop`. Written
+    // after, the declared property reached the `unrestricted` branch of
+    // `expand_derive_scopable`, which emits an empty `SCOPE_PROPERTIES` -- so
+    // the property was dropped in silence and the entity came out fully
+    // unscoped. Attribute order decided whether that was a hard error.
+    if config.unrestricted.is_some() {
+        if let Some((attribute, span)) = first_other_attribute(config) {
             return Err(syn::Error::new(
-                unrestricted_span,
-                "When using 'unrestricted', no other column attributes are allowed",
+                span,
+                format!("secure: '{attribute}' cannot be used with 'unrestricted'"),
             ));
         }
         return Ok(()); // Valid unrestricted config
@@ -336,6 +331,8 @@ fn validate_pep_props(config: &SecureConfig) -> syn::Result<()> {
             ));
         }
 
+        validate_column_name("pep_prop", column, *span)?;
+
         // Check for duplicate property names
         if !seen.insert(property.clone()) {
             return Err(syn::Error::new(
@@ -346,6 +343,43 @@ fn validate_pep_props(config: &SecureConfig) -> syn::Result<()> {
     }
 
     Ok(())
+}
+
+/// Check that `column` forms a usable `Self::Column` variant.
+///
+/// `syn::Ident::new` panics on anything that is not a valid Rust identifier,
+/// which aborts expansion with a bare `proc macro panicked` and no span at all.
+/// Every other bad input to `#[secure(...)]` gets a spanned error, and every
+/// column name reaches `Ident::new`: the four dimensions through
+/// `generate_col_impl` and `generate_scope_properties`, the `pep_prop` entries
+/// through the latter. So the check belongs to all of them, not to one.
+///
+/// `what` names the attribute for the message -- `tenant_col`, `pep_prop`.
+fn validate_column_name(what: &str, column: &str, span: Span) -> syn::Result<()> {
+    let variant = snake_to_upper_camel(column);
+    if is_ident(&variant) {
+        return Ok(());
+    }
+    Err(syn::Error::new(
+        span,
+        format!(
+            "{what}: column name '{column}' does not form a valid column variant \
+             ('{variant}'); use a snake_case identifier"
+        ),
+    ))
+}
+
+/// Whether `s` is a valid Rust identifier.
+///
+/// ASCII only: the workspace sets `non_ascii_idents = "forbid"`, so an
+/// identifier this crate generates could not use anything else anyway.
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Validate a single dimension has exactly one specification
@@ -369,10 +403,12 @@ fn validate_dimension(
             let msg = format!("secure: specify either `{name}_col` or `no_{name}`, not both");
             Err(syn::Error::new(*col_span, msg))
         }
-        _ => {
-            // Valid: exactly one is specified
-            Ok(())
+        (Some((column, col_span)), None) => {
+            // Exactly one is specified, and it names a column. The name still
+            // has to survive `Ident::new`.
+            validate_column_name(&format!("{name}_col"), column, *col_span)
         }
+        (None, Some(_)) => Ok(()),
     }
 }
 
@@ -398,12 +434,6 @@ fn parse_secure_attrs(input: &DeriveInput) -> syn::Result<SecureConfig> {
             }
 
             if meta.path.is_ident("no_tenant") {
-                if config.unrestricted.is_some() {
-                    return Err(syn::Error::new(
-                        span,
-                        "Cannot use 'no_tenant' with 'unrestricted'",
-                    ));
-                }
                 if config.no_tenant.is_some() {
                     return Err(syn::Error::new(span, "duplicate attribute 'no_tenant'"));
                 }
@@ -418,12 +448,6 @@ fn parse_secure_attrs(input: &DeriveInput) -> syn::Result<SecureConfig> {
             }
 
             if meta.path.is_ident("no_resource") {
-                if config.unrestricted.is_some() {
-                    return Err(syn::Error::new(
-                        span,
-                        "Cannot use 'no_resource' with 'unrestricted'",
-                    ));
-                }
                 if config.no_resource.is_some() {
                     return Err(syn::Error::new(span, "duplicate attribute 'no_resource'"));
                 }
@@ -438,12 +462,6 @@ fn parse_secure_attrs(input: &DeriveInput) -> syn::Result<SecureConfig> {
             }
 
             if meta.path.is_ident("no_owner") {
-                if config.unrestricted.is_some() {
-                    return Err(syn::Error::new(
-                        span,
-                        "Cannot use 'no_owner' with 'unrestricted'",
-                    ));
-                }
                 if config.no_owner.is_some() {
                     return Err(syn::Error::new(span, "duplicate attribute 'no_owner'"));
                 }
@@ -458,12 +476,6 @@ fn parse_secure_attrs(input: &DeriveInput) -> syn::Result<SecureConfig> {
             }
 
             if meta.path.is_ident("no_type") {
-                if config.unrestricted.is_some() {
-                    return Err(syn::Error::new(
-                        span,
-                        "Cannot use 'no_type' with 'unrestricted'",
-                    ));
-                }
                 if config.no_type.is_some() {
                     return Err(syn::Error::new(span, "duplicate attribute 'no_type'"));
                 }
@@ -479,12 +491,6 @@ fn parse_secure_attrs(input: &DeriveInput) -> syn::Result<SecureConfig> {
 
             // Check for pep_prop(name = "column") — nested meta with parentheses
             if meta.path.is_ident("pep_prop") {
-                if config.unrestricted.is_some() {
-                    return Err(syn::Error::new(
-                        span,
-                        "Cannot use 'pep_prop' with 'unrestricted'",
-                    ));
-                }
                 meta.parse_nested_meta(|pep_meta| {
                     let property = pep_meta
                         .path
@@ -539,12 +545,6 @@ fn parse_key_value_attr(
 
     match key.as_str() {
         "tenant_col" => {
-            if config.unrestricted.is_some() {
-                return Err(syn::Error::new(
-                    span,
-                    "Cannot use 'tenant_col' with 'unrestricted'",
-                ));
-            }
             if config.tenant_col.is_some() {
                 return Err(syn::Error::new(span, "duplicate attribute 'tenant_col'"));
             }
@@ -557,12 +557,6 @@ fn parse_key_value_attr(
             config.tenant_col = Some((value, span));
         }
         "resource_col" => {
-            if config.unrestricted.is_some() {
-                return Err(syn::Error::new(
-                    span,
-                    "Cannot use 'resource_col' with 'unrestricted'",
-                ));
-            }
             if config.resource_col.is_some() {
                 return Err(syn::Error::new(span, "duplicate attribute 'resource_col'"));
             }
@@ -575,12 +569,6 @@ fn parse_key_value_attr(
             config.resource_col = Some((value, span));
         }
         "owner_col" => {
-            if config.unrestricted.is_some() {
-                return Err(syn::Error::new(
-                    span,
-                    "Cannot use 'owner_col' with 'unrestricted'",
-                ));
-            }
             if config.owner_col.is_some() {
                 return Err(syn::Error::new(span, "duplicate attribute 'owner_col'"));
             }
@@ -593,12 +581,6 @@ fn parse_key_value_attr(
             config.owner_col = Some((value, span));
         }
         "type_col" => {
-            if config.unrestricted.is_some() {
-                return Err(syn::Error::new(
-                    span,
-                    "Cannot use 'type_col' with 'unrestricted'",
-                ));
-            }
             if config.type_col.is_some() {
                 return Err(syn::Error::new(span, "duplicate attribute 'type_col'"));
             }
@@ -641,5 +623,97 @@ mod tests {
         assert_eq!(snake_to_upper_camel("id"), "Id");
         assert_eq!(snake_to_upper_camel("owner_user_id"), "OwnerUserId");
         assert_eq!(snake_to_upper_camel("custom_col"), "CustomCol");
+    }
+
+    /// Every attribute `unrestricted` forbids, and the one setter that turns it
+    /// on in a config.
+    ///
+    /// The list is the test's own, written out rather than derived from
+    /// `first_other_attribute`: a table that builds itself from the code it
+    /// checks agrees with that code by construction.
+    #[expect(
+        clippy::type_complexity,
+        reason = "a table of (name, setter) pairs reads better inline than behind an alias"
+    )]
+    const EVERY_FORBIDDEN_ATTRIBUTE: [(&str, fn(&mut SecureConfig)); 9] = [
+        ("tenant_col", |c| {
+            c.tenant_col = Some(("tenant_id".to_owned(), Span::call_site()));
+        }),
+        ("no_tenant", |c| c.no_tenant = Some(Span::call_site())),
+        ("resource_col", |c| {
+            c.resource_col = Some(("id".to_owned(), Span::call_site()));
+        }),
+        ("no_resource", |c| c.no_resource = Some(Span::call_site())),
+        ("owner_col", |c| {
+            c.owner_col = Some(("owner_id".to_owned(), Span::call_site()));
+        }),
+        ("no_owner", |c| c.no_owner = Some(Span::call_site())),
+        ("type_col", |c| {
+            c.type_col = Some(("kind".to_owned(), Span::call_site()));
+        }),
+        ("no_type", |c| c.no_type = Some(Span::call_site())),
+        ("pep_prop", |c| {
+            c.pep_props.push((
+                "department_id".to_owned(),
+                "department_id".to_owned(),
+                Span::call_site(),
+            ));
+        }),
+    ];
+
+    fn unrestricted_config() -> SecureConfig {
+        SecureConfig {
+            unrestricted: Some(Span::call_site()),
+            ..SecureConfig::default()
+        }
+    }
+
+    /// Each attribute is reported under its own name.
+    ///
+    /// `first_other_attribute` pairs a name with the field it reads, nine
+    /// times, and a pair written the wrong way round type-checks: every field
+    /// carries a `Span`, so `("owner_col", config.no_owner)` compiles and sends
+    /// the user looking for an attribute they did not write. The UI fixtures
+    /// pin the span on real source, but only for the few attributes it is worth
+    /// compiling a crate for; this covers all nine.
+    #[test]
+    fn every_forbidden_attribute_is_reported_under_its_own_name() {
+        for (name, set_it) in EVERY_FORBIDDEN_ATTRIBUTE {
+            let mut config = unrestricted_config();
+            set_it(&mut config);
+            assert_eq!(
+                first_other_attribute(&config).map(|(attribute, _)| attribute),
+                Some(name),
+                "an entity whose only other attribute is `{name}` must be told so"
+            );
+        }
+    }
+
+    /// Nothing else present, nothing to report -- the negative control, without
+    /// which the test above would pass for a function that always returned the
+    /// name it was handed.
+    #[test]
+    fn unrestricted_on_its_own_forbids_nothing() {
+        assert!(first_other_attribute(&unrestricted_config()).is_none());
+    }
+
+    /// With several present, the answer is the first in the fixed order, not
+    /// the first in the source.
+    ///
+    /// The order is the reason the diagnostic no longer depends on how the
+    /// attributes were written, so reordering the table changes behaviour and
+    /// should fail a test rather than only a fixture.
+    #[test]
+    fn several_attributes_report_the_first_in_the_fixed_order() {
+        let mut config = unrestricted_config();
+        // Set them back to front: the last entry first, the first entry last.
+        for (_, set_it) in EVERY_FORBIDDEN_ATTRIBUTE.iter().rev() {
+            set_it(&mut config);
+        }
+        assert_eq!(
+            first_other_attribute(&config).map(|(attribute, _)| attribute),
+            Some("tenant_col"),
+            "the fixed order decides, and `tenant_col` heads it"
+        );
     }
 }

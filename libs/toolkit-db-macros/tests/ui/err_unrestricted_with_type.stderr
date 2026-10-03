@@ -1,18 +1,5 @@
-error: Cannot use 'unrestricted' with 'type_col'
- --> tests/ui/err_unrestricted_with_type.rs:6:9
-  |
-6 | #[secure(unrestricted, type_col = "type_id")]
-  |         ^^^^^^^^^^^^
-  |
-note: type_col defined here
+error: secure: 'type_col' cannot be used with 'unrestricted'
  --> tests/ui/err_unrestricted_with_type.rs:6:24
   |
 6 | #[secure(unrestricted, type_col = "type_id")]
   |                        ^^^^^^^^
-
-error: When using 'unrestricted', no other column attributes are allowed
- --> tests/ui/err_unrestricted_with_type.rs:6:9
-  |
-6 | #[secure(unrestricted, type_col = "type_id")]
-  |         ^^^^^^^^^^^^
-
