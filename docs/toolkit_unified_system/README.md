@@ -63,7 +63,7 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 - `11_database_patterns.md` – DBRunner/SecureTx executors, transactions, repository pattern, database migrations.
 - `12_unit_testing.md` – Philosophy, reliability principles, infrastructure, assert patterns, naming, priority matrix for unit/integration tests.
 - `13_e2e_testing.md` – Philosophy, integration seams concept, pytest infrastructure, test patterns, anti-patterns for E2E tests.
-- `14_db_behavior_testing.md` – DB-behavior testing as a third test layer: a defect catalog (check-then-act races, N+1, retry wiring, migration hazards, ...), the audit method (transaction map, query recorder, scale-invariance, PostgreSQL barrier tests), and a report template.
+- `14_db_behavior_testing.md` – DB-behavior testing as a third test layer: defect catalog, audit method, report template.
 - `16_defect_class_to_control_map.md` – The inverse lookup: given a class of defect (tenant bypass, missing gate, global tables, wire/storage type mismatch, error classification, disclosure, in-process bypass, N+1, write-skew, API completeness, coverage that proves nothing), which control is supposed to catch it. Use it to find the class a defect belongs to, and to check that an applicable class has a control rather than an intention.
 
 ### Related ADRs
