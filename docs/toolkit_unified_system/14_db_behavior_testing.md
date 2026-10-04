@@ -22,7 +22,6 @@
 - [How to run an audit](#how-to-run-an-audit)
   - [Barrier-test template](#barrier-test-template)
 - [Where to keep which test](#where-to-keep-which-test)
-- [Audit report template](#audit-report-template)
 - [Related documents](#related-documents)
 
 <!-- /toc -->
@@ -59,13 +58,13 @@ Each class: what it is, how to find it, how to catch it with a test, the typical
   ```rust
   // BAD: a kitten inserted after the check is cascaded away, or the FK fails the delete unmapped
   let has_kitten = KittenEntity::find().filter(kitten::Column::CatId.eq(id))
-      .secure().scope_with(&scope).one(&conn).await?.is_some();
+      .secure().scope_with(&scope).one(runner).await?.is_some();
   if !has_kitten {
-      CatEntity::delete_many().filter(cat::Column::Id.eq(id)).secure().scope_with(&scope).exec(&conn).await?;
+      CatEntity::delete_many().filter(cat::Column::Id.eq(id)).secure().scope_with(&scope).exec(runner).await?;
   }
 
   // GOOD: the FK (kitten.cat_id REFERENCES cat ON DELETE RESTRICT) decides; no pre-check, no extra isolation
-  let res = CatEntity::delete_many().filter(cat::Column::Id.eq(id)).secure().scope_with(&scope).exec(&conn).await;
+  let res = CatEntity::delete_many().filter(cat::Column::Id.eq(id)).secure().scope_with(&scope).exec(runner).await;
   match res {
       Ok(r) if r.rows_affected == 0 => Err(DomainError::not_found()),
       Ok(_) => Ok(()),
@@ -129,21 +128,20 @@ Each class: what it is, how to find it, how to catch it with a test, the typical
   process crashes in between.
   ```rust
   // BAD: external call inside the open transaction (holds locks for the whole call; repeated if the
-  // closure is ever retried); event enqueued after COMMIT
-  // (in_transaction_mapped returns (SecureConn, Result); see 11)
-  let (_conn, res) = conn.in_transaction_mapped(DomainError::database_infra, move |tx| Box::pin(async move {
+  // closure is ever retried); event published after COMMIT, so a crash in between loses it
+  db.transaction_ref_mapped(|tx| Box::pin(async move {
       vet.approve(&cat).await?;
       repo.insert(tx, &scope, &cat).await
-  })).await;
-  res?;
-  events.enqueue(CatCreated { id }).await?;           // a crash before this line loses the event
+  })).await?;
+  producer.publish(CatCreated { id }).await?;          // a crash before this line loses the event
 
-  // GOOD: call out first; state change and outbox row in one transaction
+  // GOOD: call out first; state change and outbox row in one transaction; the wake fires only on commit
   vet.approve(&cat).await?;
-  let (_conn, res) = conn.in_transaction_mapped(DomainError::database_infra, move |tx| Box::pin(async move {
-      repo.insert(tx, &scope, &cat).await?; outbox.insert(tx, &scope, &CatCreated { id }).await
-  })).await;
-  res?;
+  toolkit_db::outbox::in_transaction(&db, |tx| Box::pin(async move {
+      repo.insert(tx, &scope, &cat).await?;
+      let wake = producer.enqueue(tx, CatCreated { id }).await?;
+      Ok(((), wake))
+  })).await?;
   ```
 - **How to find it.** Search the closure and its callees for an injected client (`Arc<dyn Client>`); check the event
   write is in the same transaction.
@@ -151,8 +149,9 @@ Each class: what it is, how to find it, how to catch it with a test, the typical
   a negative control. Dynamic: on the write-plus-event trace assert `rec.all_in_one_transaction()` and
   `rec.writes_outside_tx().is_empty()` (the former ignores statements outside a transaction), and that
   `rec.stats()` contains the outbox `INSERT`.
-- **Typical fix.** Call out before `BEGIN` (or after `COMMIT` if tolerant); write events to an outbox table in
-  the same transaction and deliver them separately, at least once and idempotently.
+- **Typical fix.** Call out before `BEGIN` (or after `COMMIT` if tolerant); enqueue the event through
+  `outbox::in_transaction` so the outbox row commits with the state change and the wake fires only after `COMMIT`;
+  delivery is separate, at least once and idempotent.
 
 ### Retry wiring and non-idempotent retries
 - **What it is.** `transaction_with_retry` re-runs the whole closure on PostgreSQL `40001`/`40P01`, MySQL
@@ -161,18 +160,19 @@ Each class: what it is, how to find it, how to catch it with a test, the typical
   `SERIALIZABLE`) has no retry wrapper; the `DbErr` is unreachable when the classifier runs.
   ```rust
   // BAD: this path locks two cats, so it can deadlock (40P01); the abort reaches the caller as a failed request
-  db.transaction_ref_mapped_with_config(TxConfig::default(), |tx| Box::pin(async move {
+  db.transaction_ref_mapped(|tx| Box::pin(async move {
       repo.swap_kittens(tx, &scope, cat_a, cat_b).await
   })).await
 
-  // GOOD: retry wrapper. 2nd arg is your fn(&DomainError) -> Option<&DbErr>;
-  // it must still find the DbErr after every map_err in the chain
-  db.transaction_with_retry(TxConfig::default(), |e: &DomainError| e.db_err(), |tx| Box::pin(async move {
-      repo.swap_kittens(tx, &scope, cat_a, cat_b).await   // idempotent: safe to run again
-  })).await
+  // GOOD: retry wrapper; the body is FnMut and runs again on retry, so clone captures per attempt.
+  // as_db_err: fn(&DomainError) -> Option<&DbErr>; it must still find the DbErr after every map_err
+  db.transaction_with_retry(TxConfig::default(), as_db_err, |tx| {
+      let (repo, scope) = (repo.clone(), scope.clone());
+      Box::pin(async move { repo.swap_kittens(tx, &scope, cat_a, cat_b).await })   // idempotent
+  }).await
   ```
-- **How to find it.** Grep both calls per file; a bare `transaction_ref_mapped_with_config` on a path that locks
-  rows or runs `SERIALIZABLE`, beside retried siblings, is the tell.
+- **How to find it.** Grep per file: a `transaction_ref_mapped`/`transaction_with_config` on a path that locks
+  rows or runs `SERIALIZABLE`, beside `transaction_with_retry` siblings, is the tell.
 - **How to catch it with a test.** Static scan of retried vs unretried calls, with a negative control; a round-trip
   test that passes the real contention error through the actual `map_err` chain into the classifier. The `DbErr`
   must stay reachable by `extract_db_err` through every `map_err`; a `.to_string()` anywhere in the chain turns
@@ -279,23 +279,25 @@ Each class: what it is, how to find it, how to catch it with a test, the typical
   - a new `NOT NULL`/`CHECK`/FK that existing rows violate, which passes on an empty test database.
   ```rust
   // BAD: no-op down() that reads as a working rollback
-  async fn down(&self, _m: &SchemaManager) -> Result<(), DbErr> { Ok(()) }
+  async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> { Ok(()) }
 
-  // GOOD: the no-op is documented, with what a real rollback would need
-  /// No-op: `nickname` is `UNIQUE`, so SQLite cannot `DROP COLUMN` it; a real rollback rebuilds `cat`
-  /// (create, copy, drop, rename) with child FKs in mind.
-  async fn down(&self, _m: &SchemaManager) -> Result<(), DbErr> { Ok(()) }
+  // GOOD: an irreversible migration says so; a documented Ok(()) is only for a down() with nothing to undo
+  async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+      Err(DbErr::Migration("irreversible: `nickname` is UNIQUE, SQLite cannot DROP COLUMN it; \
+                            rebuild `cat` (create, copy, drop, rename) by hand".into()))
+  }
   ```
 - **How to find it.** The diff adds a migration, not edits one; trace child tables when a rebuilt table drops;
   each `down()` undoes `up()` or documents why not; ask what violating rows do.
 - **How to catch it with a test.** Run `up()`, `down()`, `up()` on both backends, calling `down()` directly (the
-  toolkit runner applies only `up()`), asserting data survives with correct types; a documented no-op `down()`
-  is exempt. Check SQLite rebuilds in a real `sqlite3` session with the pragma set explicitly. Seed a violating
-  row and confirm the staged path (add nullable, backfill, validate, tighten; *expand/contract*) succeeds or
-  fails loudly.
-- **Typical fix.** A new migration; a documented reason for any no-op `down()`; expand/contract on populated
-  tables. For a SQLite rebuild, copy child rows out and back or rebuild the children too: `up()` runs inside a
-  transaction, where `PRAGMA foreign_keys = OFF` is a no-op.
+  toolkit runner applies only `up()`), asserting data survives with correct types; an irreversible `down()`
+  returns `Err(DbErr::Migration(..))` and is exempt. Check SQLite rebuilds in a real `sqlite3` session with the
+  pragma set explicitly. Seed a violating row and confirm the staged path (add nullable, backfill, validate,
+  tighten; *expand/contract*) succeeds or fails loudly.
+- **Typical fix.** A new migration; `Err(DbErr::Migration(..))` for an irreversible `down()`, a documented
+  `Ok(())` only when nothing needs undoing; expand/contract on populated tables. For a SQLite rebuild, copy
+  child rows out and back or rebuild the children too: `up()` runs inside a transaction, where
+  `PRAGMA foreign_keys = OFF` is a no-op.
 
 ### Deadlocks and lock ordering
 - **What it is.** Two operations lock the same two rows (or row sets) in opposite order and wait on each other;
@@ -350,20 +352,23 @@ Each class: what it is, how to find it, how to catch it with a test, the typical
   let t1 = tokio::spawn(async move { b1.wait().await; svc1.create(a).await });
   let t2 = tokio::spawn(async move { b2.wait().await; svc2.create(b).await });
   let _ = (t1.await?, t2.await?);
-  assert_eq!(CatEntity::find().filter(cat::Column::Name.eq("tom")).all(&db).await?.len(), 1);
+  let conn = db.conn()?;
+  assert_eq!(CatEntity::find().filter(cat::Column::Name.eq("tom"))
+      .secure().scope_with(&scope).all(&conn).await?.len(), 1);
   ```
 - **How to find it.** Confirm CI sets a flag (your gear's choice, e.g. `<GEAR>_PG_REQUIRE_DOCKER=1`) that makes the
   PostgreSQL suite fail instead of silently skip without Docker; the barrier template shows the check. For each
   assertion ask whether it fails when the targeted bug is present; revert a fix to confirm.
 - **How to catch it with a test.** Not mechanizable; the backstop is
   [`16_defect_class_to_control_map.md`](16_defect_class_to_control_map.md#coverage-that-proves-nothing):
-  every known defect has a named assertion; `#[ignore]`d ones are listed in the report's open findings.
+  every known defect has a named assertion; an `#[ignore]`d one names the defect in its reason string.
 - **Typical fix.** Fail closed in CI; assert table state and specific error variants; use barriers.
 
 ## How to run an audit
 
-Tooling: `toolkit_db::test_support` behind the `test-support` cargo feature (enable it in the gear's
-`[dev-dependencies]`). `rec` below is its `QueryRecorder`.
+Run the audit as an LLM pass over the gear, with the catalog above as the checklist. The output is fixes and
+pinned tests in the gear, not a stored report. Tooling: `toolkit_db::test_support` behind the `test-support`
+cargo feature (enable it in the gear's `[dev-dependencies]`). `rec` below is its `QueryRecorder`.
 
 1. **Inventory.** List every table, every repository method issuing a statement, every place a transaction
    opens. Grep is enough.
@@ -377,7 +382,7 @@ Tooling: `toolkit_db::test_support` behind the `test-support` cargo feature (ena
 
    ```rust
    let (db, rec) = connect_with_recorder(&dsn, ConnectOpts { max_conns: Some(1), ..Default::default() }).await?;
-   run_migrations(&db).await?;              // your gear's migrator
+   run_migrations_for_testing(&db, Migrator::migrations()).await?;   // the gear's migrator
    rec.clear();                             // migrations were recorded too
    svc.create_cat(&ctx, input).await?;
    snapshot_trace("create_cat", &rec);      // writes <DB_AUDIT_TRACE_DIR>/create_cat.txt when the var is set
@@ -404,19 +409,20 @@ Tooling: `toolkit_db::test_support` behind the `test-support` cargo feature (ena
    *negative control* running the same check on a deliberately bad string and expecting it to fail.
 9. **Barrier tests** (PostgreSQL): for each TOCTOU/CAS/deadlock finding start two callers at once with the
    template below and assert the table state afterwards.
-10. **Pin every known defect** as a named assertion for the *correct* behaviour, `#[ignore = "known defect: <ID>"]`;
+10. **Pin every known defect** as a named assertion for the *correct* behaviour,
+    `#[ignore = "known defect: <what is wrong>"]`;
     the fix removes the `#[ignore]`. If it cannot be asserted directly, assert today's behaviour and say in a
     comment which assertion to flip.
 
 ### Barrier-test template
 
-`shared_pg()` (one `testcontainers` PostgreSQL per test file via `OnceCell`, `None` without Docker), `svc1`/`svc2`
+`pg_fixture()` (one `testcontainers` PostgreSQL per test file via `OnceCell`, `None` without Docker), `svc1`/`svc2`
 (two services over the same `pg.db`) and `assert_invariant_holds` are the gear's own helpers, not toolkit APIs.
 
 ```rust
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_callers_leave_the_invariant_intact() {
-    let Some(pg) = shared_pg().await else {   // None when Docker is unavailable
+    let Some(pg) = pg_fixture().await else {   // None when Docker is unavailable
         assert!(std::env::var("<GEAR>_PG_REQUIRE_DOCKER").is_err(), "Docker required in CI"); // gear's own flag
         return;                               // best-effort local skip only
     };
@@ -458,29 +464,6 @@ the hook to reproduce one deterministically.
 Needs HTTP and a real database: E2E (13). Needs real PostgreSQL/MySQL but no HTTP: a feature-gated Rust suite
 inside the gear, outside the 12/13 split; name it in the gear's own testing doc. Anything else: SQLite unit
 test (12).
-
-## Audit report template
-
-Keep the catalog and method here and record only gear-specific findings in the gear's report. Mirror this
-skeleton:
-
-```markdown
-# DB behavior audit — <gear name>
-## Scope
-Code, branch or PR covered, and what is deliberately excluded.
-## What was found
-Table: ID | class | severity | where (repository/service, no line numbers) | status and reason.
-## Open findings
-Each finding not fixed in this change: ID, why, and the condition for revisiting.
-## Transaction-behaviour findings
-Narrative on isolation and retry choices only; the rows stay in the table above.
-## How it was found
-Mechanisms used (recorder, scale-invariance, static scans, barrier suite) and how they were validated.
-## Deviation from the unit/E2E testing guide
-Suites outside the 12/13 split, and why.
-## What this does not cover
-Statement cost, transaction duration, `EXPLAIN` plans, whatever was not tested: named, not implied.
-```
 
 ## Related documents
 
