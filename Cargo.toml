@@ -131,6 +131,8 @@ members = [
     "gears/system/types-registry/types-registry",
     "gears/simple-user-settings/simple-user-settings-sdk",
     "gears/simple-user-settings/simple-user-settings",
+    "gears/construct/construct-sdk",
+    "gears/construct/construct",
     "gears/settings-service/settings-service-sdk",
     "gears/settings-service/settings-service",
     "gears/system/tenant-resolver/tenant-resolver-sdk",
