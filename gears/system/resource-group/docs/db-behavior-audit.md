@@ -1,8 +1,8 @@
 # DB behavior audit — resource-group
 
-The general method and defect catalog this audit applies have since been factored out into
+The general method and defect catalog are in
 [`docs/toolkit_unified_system/14_db_behavior_testing.md`](../../../../docs/toolkit_unified_system/14_db_behavior_testing.md);
-this document is the report of the specific audit run against resource-group.
+this document is the report of the audit run against resource-group.
 
 <!-- toc -->
 

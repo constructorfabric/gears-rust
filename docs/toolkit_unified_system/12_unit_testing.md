@@ -420,4 +420,4 @@ Tests that add confidence without blocking delivery:
 - Every domain invariant from gear acceptance criteria is covered by at least one test
 - `make all` (or `make fmt && make lint && make test`) passes with zero errors
 
-See also: [`14_db_behavior_testing.md`](14_db_behavior_testing.md) for transaction boundaries, N+1/scale-invariance, and concurrency correctness — deliberately out of scope for this layer (see "What Does NOT Belong Here" above), covered there instead.
+See also: [`14_db_behavior_testing.md`](14_db_behavior_testing.md) for transaction-boundary and N+1 checks (SQLite tests with a query recorder, reusing this guide's setup) and for concurrency correctness, which is out of scope here.
