@@ -122,3 +122,47 @@ fn runtime_short_circuits_unreachable_boolean_operands() -> Result<(), EngineErr
     assert_eq!(eval("true || missing")?, json!(true));
     Ok(())
 }
+
+#[test]
+fn runtime_evaluates_collections_maps_and_the_remaining_operators() -> Result<(), EngineError> {
+    let cases = [
+        ("[1] + [2]", json!([1, 2])),
+        ("1 + 2", json!(3)),
+        ("1 <= 1", json!(true)),
+        ("2 >= 3", json!(false)),
+        ("null == null", json!(true)),
+        ("1 != 2", json!(true)),
+        ("!false", json!(true)),
+        ("true && true", json!(true)),
+        ("false || true", json!(true)),
+        (r#"has({"a": 1}.a)"#, json!(true)),
+        (r#"has({"a": 1}.b)"#, json!(false)),
+        (r#"{"a": 1}["a"]"#, json!(1)),
+        (r#"{"a": 1, "b": 2}.all(k, k != "c")"#, json!(true)),
+    ];
+
+    for (source, expected) in cases {
+        assert_eq!(eval(source)?, expected, "expression: {source}");
+    }
+    Ok(())
+}
+
+#[test]
+fn runtime_reports_map_call_and_node_errors() {
+    let cases = [
+        (r#"{"a": 1, "a": 2}"#, "duplicate map key"),
+        ("{1: 2}", "map keys must be strings"),
+        (r#"{"a": 1}[1]"#, "map index must be a string"),
+        (r#"{"a": 1}.b"#, "missing CEL field"),
+        ("1.all(x, true)", "comprehension requires collection"),
+        ("size(1)", "size requires collection or string"),
+        ("9223372036854775807 + 1", "integer overflow"),
+        (r#""a".missing()"#, "unsupported function or argument types"),
+        ("1.5", "unsupported compiled CEL node"),
+    ];
+
+    for (source, message) in cases {
+        let error = eval(source).expect_err("invalid runtime operation must fail");
+        assert!(error.to_string().contains(message), "{source}: {error}");
+    }
+}

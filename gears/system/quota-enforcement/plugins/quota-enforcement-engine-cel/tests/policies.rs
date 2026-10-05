@@ -606,3 +606,85 @@ fn a_contract_read_through_brackets_is_reported_and_the_pruned_closure_still_reb
     }
     Ok(())
 }
+
+/// One misuse per type rule: each is refused at save time, and the message
+/// names the rule it broke rather than a generic failure.
+#[test]
+fn each_type_rule_refuses_its_own_misuse() {
+    const PLAN: &str = r#"{ "debit_plan": [] }"#;
+    let gated = |cond: &str| format!("{cond} ? {PLAN} : {PLAN}");
+    let cases = [
+        (
+            gated(r#"amount < "x""#),
+            "comparison requires matching scalar types",
+        ),
+        (
+            gated(r#"amount + "x" > 1"#),
+            "arithmetic requires integer operands",
+        ),
+        (
+            gated("1 in amount"),
+            "membership requires a compatible collection",
+        ),
+        (gated("size(amount) > 1"), "outside the bounded CEL profile"),
+        (gated(r#"-"x" > 1"#), "unary operator type mismatch"),
+        (gated("amount && true"), "logical operands must be boolean"),
+        (gated("amount"), "condition must be boolean"),
+        (
+            gated("amount.x > 1"),
+            "property access requires a typed object",
+        ),
+        (gated("amount[0] > 1"), "index type mismatch"),
+        (
+            gated("request[request.region] > 1"),
+            "dynamic object indexing",
+        ),
+        (
+            gated("size([1, \"a\"]) > 1"),
+            "list elements have incompatible types",
+        ),
+        (gated("size({1: 2}) > 1"), "map key must be a string"),
+        (gated(r#"size({"a": 1, "a": 2}) > 1"#), "duplicate map key"),
+        (
+            gated("amount.all(x, true)"),
+            "comprehension requires collection",
+        ),
+        (gated("1.5 > 1"), "outside the bounded integer CEL profile"),
+        (
+            r#"{ "debit_plan": amount > 1 ? [] : 1 }"#.to_owned(),
+            "conditional branches must have compatible types",
+        ),
+        (
+            r#"{ "debit_plan": [], "deny": { "reason": "x" } }"#.to_owned(),
+            "carries both",
+        ),
+        (
+            r#"{ "debit_plan": [1] }"#.to_owned(),
+            "list of `{id, amount}` records",
+        ),
+    ];
+    for (expr, expected) in cases {
+        let err = compile(&expr).map(|_| ()).expect_err(&expr);
+        assert!(err.message.contains(expected), "{expr}: {err:?}");
+    }
+}
+
+/// The bounded functions and collection forms the profile does admit.
+#[test]
+fn the_bounded_profile_admits_its_own_functions_and_collections() {
+    const PLAN: &str = r#"{ "debit_plan": [] }"#;
+    for cond in [
+        r#""region" in request"#,
+        r#"request.region.contains("e")"#,
+        r#"request.region.startsWith("e") || request.region.endsWith("u")"#,
+        r#"int("1") > 0"#,
+        r#"string(1) == "1""#,
+        "size(quotas) > 0",
+        "size([null]) > 0",
+        "!(amount > 1)",
+        "-amount < 0",
+    ] {
+        let expr = format!("{cond} ? {PLAN} : {PLAN}");
+        assert!(compile(&expr).is_ok(), "refused: {expr}");
+    }
+}

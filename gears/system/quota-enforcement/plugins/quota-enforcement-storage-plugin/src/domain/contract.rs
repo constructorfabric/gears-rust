@@ -321,3 +321,8 @@ impl QuotaEnforcementStoragePluginV1 for StoragePlugin {
         StoragePlugin::reclaim_operation_log(self, batch_size, before).await
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "contract_tests.rs"]
+mod contract_tests;
