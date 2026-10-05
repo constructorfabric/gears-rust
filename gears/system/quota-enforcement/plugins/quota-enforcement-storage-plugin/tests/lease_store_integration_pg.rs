@@ -668,7 +668,10 @@ async fn commit_record_out_of_band(
     use sea_orm::ActiveValue::Set;
     let now = OffsetDateTime::now_utc();
     let conn = h.db.conn().expect("conn");
-    toolkit_db::secure::secure_insert::<idempotency_record::Entity>(
+    // Bounded: an insert that waits on the holder would otherwise deadlock
+    // the test, which only releases the holder after this returns.
+    let all = AccessScope::allow_all();
+    let insert = toolkit_db::secure::secure_insert::<idempotency_record::Entity>(
         idempotency_record::ActiveModel {
             tenant_id: Set(tenant().as_uuid()),
             subject_key: Set(IdempotencySubjectKey::of(&subjects(holders))
@@ -687,11 +690,13 @@ async fn commit_record_out_of_band(
             created_at: Set(now),
             expires_at: Set(now + Duration::from_hours(1)),
         },
-        &AccessScope::allow_all(),
+        &all,
         &conn,
-    )
-    .await
-    .expect("commit the competing record");
+    );
+    tokio::time::timeout(NO_DEADLOCK, insert)
+        .await
+        .expect("the competing insert waited on the holder")
+        .expect("commit the competing record");
 }
 
 fn winners_lease() -> EvaluatedLease {
@@ -713,7 +718,9 @@ fn hold_an_acquisition(
     let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
     let holder = h.acquire_with(&["u1"], 5, key, held_evaluator(locked_tx, release_rx));
-    locked_rx.recv().expect("the acquisition is evaluating");
+    locked_rx
+        .recv_timeout(NO_DEADLOCK)
+        .expect("the acquisition is evaluating");
     (holder, release_tx)
 }
 

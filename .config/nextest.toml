@@ -5,3 +5,11 @@
 [[profile.default.overrides]]
 filter = 'package(cf-gears-clickhouse-usage-collector-plugin)'
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# Quota Enforcement storage plugin: per-test kill. Its PostgreSQL suites hold
+# transactions open on purpose and connect with no lock or statement timeout,
+# so a locking regression would otherwise wait for the CI job's own limit. The
+# longest test takes about 5s; three minutes turns any hang into a TIMEOUT.
+[[profile.default.overrides]]
+filter = 'package(cf-gears-quota-enforcement-storage-plugin)'
+slow-timeout = { period = "60s", terminate-after = 3 }

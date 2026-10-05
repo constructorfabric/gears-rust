@@ -708,7 +708,10 @@ async fn commit_envelope_out_of_band(
     use sea_orm::ActiveValue::Set;
     let now = OffsetDateTime::now_utc();
     let conn = h.db.conn().expect("conn");
-    toolkit_db::secure::secure_insert::<idempotency_record::Entity>(
+    // Bounded: an insert that waits on the holder would otherwise deadlock
+    // the test, which only releases the holder after this returns.
+    let all = AccessScope::allow_all();
+    let insert = toolkit_db::secure::secure_insert::<idempotency_record::Entity>(
         idempotency_record::ActiveModel {
             tenant_id: Set(tenant().as_uuid()),
             subject_key: Set(IdempotencySubjectKey::of(&subjects(holders))
@@ -727,11 +730,13 @@ async fn commit_envelope_out_of_band(
             created_at: Set(now),
             expires_at: Set(now + Duration::from_hours(1)),
         },
-        &AccessScope::allow_all(),
+        &all,
         &conn,
-    )
-    .await
-    .expect("commit the competing envelope");
+    );
+    tokio::time::timeout(NO_DEADLOCK, insert)
+        .await
+        .expect("the competing insert waited on the holder")
+        .expect("commit the competing envelope");
 }
 
 fn winners_batch() -> quota_enforcement_sdk::BatchRecord {
@@ -762,7 +767,9 @@ fn hold_a_batch(
         held_evaluator(locked_tx, release_rx),
         Duration::from_secs(30),
     );
-    locked_rx.recv().expect("the batch is evaluating");
+    locked_rx
+        .recv_timeout(NO_DEADLOCK)
+        .expect("the batch is evaluating");
     (batch, release_tx)
 }
 

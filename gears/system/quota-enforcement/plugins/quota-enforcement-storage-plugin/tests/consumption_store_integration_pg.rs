@@ -56,6 +56,9 @@ const METRIC_OTHER: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.a
 
 /// A Tuesday, and the day after it: one calendar period boundary apart.
 const DAY_ONE: OffsetDateTime = time::macros::datetime!(2026-03-17 10:00:00 UTC);
+/// A blocking wait in a test must end in this time; a deadlock would not.
+const NO_DEADLOCK: Duration = Duration::from_mins(1);
+
 const DAY_TWO: OffsetDateTime = time::macros::datetime!(2026-03-18 10:00:00 UTC);
 
 fn tenant() -> TenantId {
@@ -683,7 +686,9 @@ fn hold_the_row(h: &PgHarness, key: &str) -> HeldDebit {
     let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
     let holder = h.debit_held("u1", METRIC_TOKENS, 1, write(key, 1), locked_tx, release_rx);
-    locked_rx.recv().expect("the holder locks the row");
+    locked_rx
+        .recv_timeout(NO_DEADLOCK)
+        .expect("the holder locks the row");
     (holder, release_tx)
 }
 
@@ -949,7 +954,10 @@ async fn commit_record_out_of_band(h: &PgHarness, write: &IdempotencyWrite, deci
     use sea_orm::ActiveValue::Set;
     let now = OffsetDateTime::now_utc();
     let conn = h.db.conn().expect("conn");
-    toolkit_db::secure::secure_insert::<idempotency_record::Entity>(
+    // Bounded: an insert that waits on the holder would otherwise deadlock
+    // the test, which only releases the holder after this returns.
+    let all = AccessScope::allow_all();
+    let insert = toolkit_db::secure::secure_insert::<idempotency_record::Entity>(
         idempotency_record::ActiveModel {
             tenant_id: Set(write.scope.tenant_id.as_uuid()),
             subject_key: Set(write.scope.subject_key.as_bytes().to_vec()),
@@ -966,11 +974,13 @@ async fn commit_record_out_of_band(h: &PgHarness, write: &IdempotencyWrite, deci
             created_at: Set(now),
             expires_at: Set(now + Duration::from_hours(1)),
         },
-        &AccessScope::allow_all(),
+        &all,
         &conn,
-    )
-    .await
-    .expect("commit the competing record");
+    );
+    tokio::time::timeout(NO_DEADLOCK, insert)
+        .await
+        .expect("the competing insert waited on the holder")
+        .expect("commit the competing record");
 }
 
 fn winners_decision() -> Decision {
