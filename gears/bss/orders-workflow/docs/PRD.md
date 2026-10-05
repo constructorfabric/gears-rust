@@ -113,7 +113,7 @@ Orders Workflow fills this process gap additively, coordinating between Orders L
 
 > **Alignment note**: `OrderApprovalRequest` / `OrderApprovalDecision` semantics are deliberately aligned with the manifest §4.3 TransitionRequest/Approval pattern (the same pattern used for approval in Subscriptions and Contracts). However, these are Orders Workflow–owned entities; Orders Workflow does NOT write into the Subscriptions or Contracts data models.
 
-> **Cross-reference**: For definitions of Order, Order Line Item and the accepted `OrderPin` (PriceBook plan revision, selected items and price bindings; D-193), see the Orders Lifecycle PRD (`PRD-orders-lifecycle-202608101404`).
+> **Cross-reference**: For definitions of Order and Order Line Item, see the Orders Lifecycle PRD (`PRD-orders-lifecycle-202608101404`). That PRD names the line's frozen pricing reference the **catalog price pin**; this PRD and both designs use the pricing-model-aligned name **`OrderPin`** — the accepted plan revision, its selected items and their price bindings (D-193) — for the same artifact. The names converge when the Lifecycle PRD is aligned to the PriceBook model (§13, §15).
 
 ## 2. Architecture Alignment
 
@@ -166,7 +166,7 @@ Orders Workflow fills this process gap additively, coordinating between Orders L
 
 **ID**: `cpt-cf-bss-orders-workflow-actor-owf-generic-approval`
 
-**Role**: The owner of approval **policy** — routing, multi-party gate evaluation, and approval-requirement/threshold evaluation over the submitted request context. Since D-197 (Lifecycle D-166) it is reached only through this gear's **approval policy adapter**, a port whose contract is §9.2: Orders Workflow submits `OrderApprovalRequest` instances (carrying order context, including the stored TCV figure) and receives `OrderApprovalDecision` responses, and queries the approval-requirement verdict keyed on order + version. The routing and threshold configuration (who approves, under what conditions) lives behind the adapter — not in the orchestration. Escalation timers are scheduled, persisted, and fired by Orders Workflow (§6.2); the adapter provides the escalation path and receives/routes the escalation command. The phase-1 implementation is a stand-in behind the §9.2 contract that returns `approval not required` (audited); the intended implementation embeds the shared `cf-gears-bss-approval` library as Pricing and Products do (`DECISIONS.md` Q-14). No separate approval service is expected.
+**Role**: The owner of approval **policy** — routing, multi-party gate evaluation, and approval-requirement/threshold evaluation over the submitted request context. Since D-197 (Lifecycle D-166) it **MUST** be reached only through this gear's **approval policy adapter**, a port whose contract is §9.2: Orders Workflow submits `OrderApprovalRequest` instances (carrying order context, including the stored TCV figure) and receives `OrderApprovalDecision` responses, and queries the approval-requirement verdict keyed on order + version. The routing and threshold configuration (who approves, under what conditions) lives behind the adapter — not in the orchestration. Escalation timers are scheduled, persisted, and fired by Orders Workflow (§6.2); the adapter provides the escalation path and receives/routes the escalation command. The phase-1 implementation is a stand-in behind the §9.2 contract that returns `approval not required` (audited); the intended implementation embeds the shared `cf-gears-bss-approval` library as Pricing and Products do (`DECISIONS.md` Q-14). No separate approval service is expected.
 **Integration direction**: In-process port called from inside step operations (verdict query, request submission, read by key, decision read); inbound decision event on this gear's own topic.
 
 #### Subscriptions
@@ -237,7 +237,7 @@ No module-specific deviations — project defaults apply.
 
 ### 5.3 Customization and Extensibility (Phase 1)
 
-Orders Workflow is a **canonical, platform-operated process** protecting a `p1` order-taking saga, with a deliberately small set of per-seller policy settings. It is not a tenant-configurable order-orchestration product in this phase. Customization lives in the gears that own the meaning: order data in Orders Lifecycle, decomposition in the catalog (PriceBook), approval routing in the approval policy adapter (`DECISIONS.md` D-207). Every change reaches only process instances started after it (§5.2).
+Orders Workflow is a **canonical, platform-operated process** protecting a `p1` order-taking saga, with a deliberately small set of per-seller policy settings. It is not a tenant-configurable order-orchestration product in this phase. §8 states the principle — the orchestration layer accommodates varying commercial complexity *without bespoke workflow configurations* — and this section makes its consequences explicit, so each limit below is a declared position rather than an omission. Customization lives in the gears that own the meaning: order data in Orders Lifecycle, decomposition in the catalog (PriceBook), approval routing in the approval policy adapter (`DECISIONS.md` D-207). Every change reaches only process instances started after it (§5.2).
 
 | **Kind of change** | **Phase 1** | **Vehicle and owner** | **Why the rest is excluded** | **Reopens when** |
 |---|---|---|---|---|
@@ -248,12 +248,14 @@ Orders Workflow is a **canonical, platform-operated process** protecting a `p1` 
 | Per-seller runtime policy | Yes: approval escalation window, overdue window, manual-task SLA class, partial-failure policy | A seller-policy write, bounds-checked, recorded and pinned onto new process records only (D-134, D-140) | Any other runtime setting is a definition or release change | A PRD change |
 | What a step does: guards, seam calls, schemas, new operations, the protected list, manual-task actions, tables | Not without a release | An Orders release of the owning slice, then a definition version that uses it (DESIGN §4.7) | Keeps the protected invariants in reviewed code | — |
 | Lifecycle triggers, process events, reasons, process phases | Not without a PRD change | A PRD change and an Orders release | Closed sets by design (§6.1, §6.6) | — |
-| Custom order properties or characteristics | Not in this gear | Orders Lifecycle or the catalog; they reach Workflow only as references (ADR-0013) | Workflow carries references, never a local extension bag | The owning gear's PRD |
+| Custom order properties or characteristics | Not in this gear; deferred | Adopter data rides on the **opaque caller-owned reference** this gear transports on every intent and never interprets (§6.3); order characteristics belong to Orders Lifecycle or the catalog and reach Workflow only as references (ADR-0013) | Workflow carries references, never a local extension bag; a typed characteristic model is a platform-wide decision, not one this gear takes alone | §15 *Typed custom properties* |
 | Customer-derived GTS payload types | No | — | Step, event, reason and authorization catalogues are fixed contracts | — |
 | Fulfillment decomposition | One `FulfillmentTask` per independent line | The plan revision with its selected items (D-196); resource-level decomposition is below the Subscriptions boundary | — | — |
 | Approval routing rules | Not in this gear | The approval policy adapter's library (§5.2, Q-14) | — | — |
 | Migration of a running instance | No | — | §5.2 | — |
-| Seller-facing preview, simulation or explanation of the applied flow | No | The definition version and policy revision are pinned on every process record, so what applied is reconstructable | — | A product request |
+| Seller-facing preview, simulation or explanation of the applied flow | No; deferred | The definition version and policy revision are pinned on every process record, so what applied is reconstructable | With one active definition and four policy settings, what applies is the current version and the seller's settings | §15 *Preview and explainability* |
+
+**Scope statement.** An adopter whose commercial motion needs a different process — different steps, different decomposition, different routing authority — integrates **in front of** Orders through its own facade, or proposes a change to the canonical definition. It does not configure Orders into a different process.
 
 ## 6. Functional Requirements
 
@@ -353,7 +355,7 @@ Orders Workflow **MUST** surface pending `OrderApprovalRequest` items to eligibl
 
 Orders Workflow **MUST** build a fulfillment plan from the approved order's line items: one `FulfillmentTask` per line item. Lines are **independent**: under PriceBook a line is one plan revision with its selected items — an add-on is an optional item of the same revision, inside the line — and nothing links one revision to another, so the order carries no inter-line dependency and Workflow resolves none (`DECISIONS.md` D-196). Workflow **MUST** **freeze** the plan per `orderId` + `orderVersion` while the order is still `approved` — **before** it calls begin-fulfillment, and therefore before any provisioning intent (D-206) — and **MUST** refuse to freeze a plan whose expected fulfillment time is at or after the earliest accepted-binding activation deadline of its lines (reason `order-binding-expired`, D-194). That refusal is a **plan-level failure**, not a line failure: no `FulfillmentTask` exists, the order stays `approved` and therefore still amendable, and Workflow **MUST** open a plan-level manual task with reason `order-binding-expired` under **either** partial-failure policy so a Seller Operator can amend the order — a new order version is assessed afresh by Lifecycle and carries a later deadline (D-92). If that task is exhausted, Workflow **MUST** call begin-fulfillment and then acknowledge `in_fulfillment → fulfillment_failed` with reason `order-binding-expired` and no compensation, since nothing was provisioned; Lifecycle's `fulfillment_failed` is reachable only from `in_fulfillment` (D-92, D-109). Execution is **two-phase** per the Lifecycle atomic contract (Lifecycle PRD §6.1): wave 1 creates every line's subscription in `draft` (not resource-affecting); wave 2 activates them only after every create has succeeded **and expected fulfillment time has been reached** (`max(now, latest service-activation date among lines)`). Mixed dates on the order **MUST NOT** stagger live activations — no activation intent is dispatched while any line still waits on its date. Compensation before activation is draft void. At plan construction **and** again immediately before the first activation intent, Workflow **MUST** consume the same overlap-presence read as the Lifecycle submit gate (`SUB-O5`). A collision is a **pre-activation abort**, not a line-execution failure: Workflow **MUST NOT** mark `FulfillmentTask`s `failed` and **MUST NOT** enter the remediate/hold policy. It **MUST** halt before any activation intent, void wave-1 drafts (draft-void leg), record a machine-readable **overlap-collision** reason on the abort, and acknowledge `in_fulfillment → fulfillment_failed` after that void. Immediately before the first activation intent, Workflow **MUST** also re-check the order market against the payer's current commercial profile; divergence **MUST** follow the same abort (reason **market-divergence**). `FulfillmentTask` progress and provisioning intents apply per wave (draft-create intent, then activation intent). Each task **MUST** record the downstream transition-request identifier returned by Subscriptions (correlation only). Every line the barrier releases is dispatched, and lines **MAY** proceed in parallel, subject to §Concurrency and Back-Pressure; no line waits on another line's activation. A **plan revision with its selected items is one line item** (never expanded into items; PriceBook admits no bundle SKU as a plan item); Workflow receives the order's line items exactly as captured by Orders Lifecycle.
 
-**Rationale**: A frozen plan per order version makes the per-line requirements and their acceptance criteria implementable and replay-consistent. The PriceBook model has no inter-line product topology, so none is invented here; the two-wave barrier is the whole ordering.
+**Rationale**: A frozen plan per order version makes the per-line requirements and their acceptance criteria implementable and replay-consistent. The PriceBook model has no inter-line product topology, so none is invented here; the two-wave barrier is the whole ordering. Constructing the plan before begin-fulfillment keeps a binding-expiry refusal in `approved`, where amendment can still cure it; `in_fulfillment` is entered only once there is a plan worth executing (D-206).
 
 **Actors**: `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`
 
@@ -880,7 +882,7 @@ Completed process records (this gear's saga log, process audit, dead-letter reco
 - **And** the park **MUST NOT** suspend the Lifecycle `submitted` TTL
 - **And** Workflow **MUST** escalate to the operator queue **before** that TTL elapses
 
-Until the library adapter replaces the stand-in, criteria **1–4a** (including **2a**) are **deferred** (the stand-in returns `approval not required`; those paths are unreachable). Criteria **0, 0a, 0b** apply now.
+Until the library adapter replaces the stand-in, criteria **0b** and **1–4a** (including **2a**) are **deferred** (the stand-in returns `approval not required`; those paths are unreachable, and 0b's precondition — an adapter whose policy owner can be unavailable — does not yet exist). Criteria **0** and **0a** apply now.
 
 **1. Multi-party gate routing**
 - **Given** an order whose requirement verdict has been reflected to `pending_approval` with a two-party approval gate configured
@@ -1190,6 +1192,7 @@ Until the library adapter replaces the stand-in, criteria **1–4a** (including 
 - **When** it names a setting other than the approval escalation window, the overdue window, the manual-task SLA class or the partial-failure policy
 - **Then** the system **MUST** refuse the write
 - **And** an accepted write **MUST** be bounds-checked, recorded as a configuration revision, and applied only to process records created after it
+- **And** approval routing, thresholds, assignment and eligibility **MUST** remain unreachable through seller policy; they belong to the approval policy owner behind the adapter (R2)
 
 **23. Only the publish job publishes a definition version**
 - **Given** a candidate definition version
@@ -1207,6 +1210,23 @@ Until the library adapter replaces the stand-in, criteria **1–4a** (including 
 - **When** the publish job validates it
 - **Then** the candidate **MUST** be refused before publish
 
+**26. The opaque caller-owned reference is transported, never interpreted**
+- **Given** an order line whose intents carry the opaque caller-owned binding reference (§6.3)
+- **When** the process runs to any outcome
+- **Then** the reference **MUST** be present, unmodified, on every outbound provisioning intent for that line
+- **And** no step **MUST** branch on, validate or index its content
+
+**27. Decomposition is one task per line**
+- **Given** an approved order of N independent lines
+- **When** the fulfillment plan is frozen
+- **Then** the plan **MUST** contain exactly N `FulfillmentTask` instances, one per line
+- **And** no configuration **MUST** be able to split a line into several tasks or merge lines into one
+
+**28. Closed enumerations stay closed**
+- **Given** a trigger, process event, refusal reason, operation or manual-task action value this PRD does not define
+- **When** it is received or configured
+- **Then** the system **MUST** reject it rather than accept it as an extension
+
 ## 13. Dependencies
 
 | Dependency | Description | Criticality |
@@ -1215,6 +1235,7 @@ Until the library adapter replaces the stand-in, criteria **1–4a** (including 
 | Approval policy adapter (this gear's port; D-197, Lifecycle D-166) | Owns the approval-requirement verdict, routing, multi-party gate evaluation and escalation routing behind the §9.2 contract; the phase-1 implementation is the stand-in (`approval not required`, audited); the intended implementation embeds `cf-gears-bss-approval` as Pricing and Products do (`DECISIONS.md` Q-14; see §15 and §16) | `p1` |
 | Subscriptions (`PRD-subscriptions-entitlements-202601120119`) | Receives forward intents per line (draft-create, then activation after expected fulfillment time) and compensating draft-void / activated-cancel; owns subscription lifecycle post-creation; delivers per-wave confirmation **or failure** echoing intent identity. Upstream asks: overlap-presence (`SUB-O5`), in-flight rejection (`SUB-O6`), cancel/void of an accepted transition request (`SUB-O7`), status-read of a non-terminal intent (`SUB-O8`), identity/`correlationId` echo and propagation toward Policy Engine / OSS (`SUB-O9`) | `p1` |
 | Payments | Payment-authorization check consumed as a begin-fulfillment process precondition (§6.3); pending vs failed are process outcomes | `p1` |
+| Pricing — **PriceBook** model | The line model this PRD assumes — a line is one accepted plan revision with its selected items and price bindings (`OrderPin`), add-ons are items of that revision, and nothing links one revision to another (D-196) — is the PriceBook model of the pricing gear. **That model is not yet in the upstream repository**: it lives on the pricing owner's in-flight branch, and the upstream pricing PRD still describes Plan/Price/PriceWindow. The independence of lines (§6.3) and the `OrderPin` vocabulary **depend on PriceBook landing**; if it changes shape, §6.3 and the Lifecycle line model are re-examined, not patched. | `p1` |
 | OSS Provisioning (via Subscriptions) | Accessed exclusively through Subscriptions — Workflow consumes indirectly via Subscriptions confirmation or failure events | `p2` |
 | Platform Events / Audit bus | Receives the six named process events; provides delivery guarantees and event ID de-duplication | `p1` |
 | Durable execution infrastructure | Provides long-running process durability, retries, and durable timers; selected: the serverless-runtime platform definition (ADR-0011), with `definition_source = code` as the shipping mode until the UPSTREAM_REQS §2.9 asks are answered (D-204). Engine history is **not** the process-audit SoR; the ADR **MUST** satisfy gear-owned audit retention (§7.1) | `p1` |
@@ -1242,6 +1263,9 @@ Until the library adapter replaces the stand-in, criteria **1–4a** (including 
 | Payment outcome visibility and recovery: a declined instrument currently leaves the order in `approved` with no payment event, no operation to re-authorize or retry with another instrument, and expiry as the only exit — indistinguishable from an order about to fulfil. An SCA challenge is an asynchronous, user-facing wait with no representation either, since there is no `payment_pending` order state (Lifecycle §5.1) and process state is explicitly non-authoritative (§6.1). What is the minimum payment-outcome surface — an order-visible outcome, a failure event, and a re-authorize/re-capture operation — and does any of it belong on the order document rather than in the Payments capability? | Architecture (with Product, Lifecycle) | 2026-11-30 | — | — |
 | Reversal artifact after capture: compensation reverses posted at-sale facts through the billing chain (credit note / `ChargeAdjustment`). Where funds were **captured** at checkout rather than invoiced, the correct reversal is a refund through the payment-service provider — a different artifact, timing, and system of record. Which reversal path applies per payment ordering, and does the saga need to distinguish them (§6.4)? | Architecture (with Billing/Payments) | 2026-11-30 | — | — |
 | Post-terminal payment events: disputes, chargebacks, refunds, and asynchronous payment confirmations arrive after the order reaches a terminal state, while the trigger set in §6.1 is closed and Lifecycle-sourced and Payments **MUST NOT** drive order transitions directly. Do such events land exclusively on billing/payment artifacts, or does any of them require an inbound path here? | Architecture (with Billing/Payments) | 2026-11-30 | — | — |
+| Typed custom properties (§5.3): adopters will carry their own data on orders, tasks and intents. This phase offers only the opaque caller-owned reference. Should the platform adopt a typed characteristic model — schema-validated, authorized, indexed, propagated on APIs and events — and if so, which gear owns the schema registry? This is a platform-wide decision; Orders is one consumer of it, not its author. | Architecture (with Product) | 2026-12-15 | — | — |
+| Preview and explainability (§5.3): with one active definition and four seller-policy settings there is little to preview. Should a seller-facing "which definition and policy applies to this order" surface or a dry-run exist, and does the answer change if definition fragments (Q-10) ever open? Staged rollout is not part of this question: it is wanted and depends on the platform's scoped trigger binding (D-207). | Product | 2026-12-15 | — | — |
+| Line model alignment with PriceBook (§13): the independence of lines and the `OrderPin` vocabulary rest on the pricing gear's PriceBook model, which is not yet upstream. When it lands, confirm the add-on-as-plan-item premise holds as published, and align the Orders Lifecycle PRD's line model and *catalog price pin* naming to it in one pass rather than per document. | Architecture (with pricing) | 2026-11-15 | — | — |
 
 ## 16. Risks
 
@@ -1311,7 +1335,9 @@ flowchart TD
     BARRIER -- No --> WAIT_DATE[Durable timer: wait remaining creates\nand/or expected fulfillment time]
     WAIT_DATE --> BARRIER
     BARRIER -- Draft auto-voided before activation --> WAVE1
-    BARRIER -- Yes --> WAVE2[Wave 2: report spawn signal to Lifecycle\nthen activation intent per line]
+    BARRIER -- Yes --> PRE_ACT{Re-check SUB-O5, market\nand activation deadline\nimmediately before first activation}
+    PRE_ACT -- Collision / divergence / expired --> ABORT
+    PRE_ACT -- Clear --> WAVE2[Wave 2: report spawn signal to Lifecycle\nthen activation intent per line]
     WAVE2 --> ACT_WAIT{Activation confirmation or failure?}
     ACT_WAIT -- Success --> STEP_DONE[FulfillmentTask → activated\nPublish OrderFulfillmentStepCompleted]
     ACT_WAIT -- Submission failure, budget left --> WAVE2

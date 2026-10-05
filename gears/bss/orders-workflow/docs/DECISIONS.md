@@ -6340,6 +6340,16 @@ process definitions; a cohort-scoped binding is the one selection that serves op
 **Propagated**: `PRD.md` §5.3, §12 (22–25); `UPSTREAM_REQS.md` §2.9
 (`…-upreq-serverless-runtime-trigger-version-selection`), §4 item 19; Q-10.
 
+**Amended (2026-10-05)**: the compatible parts of a reviewer patch are merged: criterion 22 adds that
+approval routing, thresholds, assignment and eligibility are unreachable through seller policy;
+criteria 26 (the opaque caller-owned reference is transported, never interpreted), 27 (one task
+per line) and 28 (closed enumerations stay closed) are added; §5.3 gains the scope statement
+(adopters integrate in front of Orders) and the opaque reference as the phase-1 surface for adopter
+data; §13 gains the PriceBook dependency row; §15 gains three questions (typed custom properties,
+preview and explainability, PriceBook line-model alignment). The patch's cohort-forbidding
+criterion, construction-time overlap refusal and partial-failure handling of a plan refusal are not
+adopted: they contradict this decision, D-206 and `design/04` §4.2–§4.3.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
