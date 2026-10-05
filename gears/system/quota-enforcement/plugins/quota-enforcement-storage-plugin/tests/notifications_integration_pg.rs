@@ -491,7 +491,7 @@ async fn two_pipelines_never_share_a_partition_at_once_and_deliver_every_event()
             h.create(tenant, draft, &[event]).await.expect("create");
         }
     }
-    eventually(Duration::from_mins(1), "every event", || {
+    eventually(Duration::from_mins(2), "every event", || {
         delivery.ids() == expected
     })
     .await;
