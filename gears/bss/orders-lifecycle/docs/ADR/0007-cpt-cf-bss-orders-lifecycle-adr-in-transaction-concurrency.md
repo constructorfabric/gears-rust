@@ -62,7 +62,7 @@ orders carrying identical content.
 ## Decision Outcome
 
 Chosen option: **a claim table with a partial unique index**. `orders_inflight_overlap_claim`
-carries one row per distinct resolved `(payer_tenant_id, overlap_scope_key)` tuple, with `partial UNIQUE (payer_tenant_id, overlap_scope_key)
+carries one row per distinct resolved `(payer_tenant_id, resource_tenant_id, overlap_scope_key)` tuple, with `partial UNIQUE (payer_tenant_id, resource_tenant_id, overlap_scope_key)
 WHERE released_at IS NULL`, inserted inside the transition transaction. A collision maps to the
 registered `order-in-flight-for-key` refusal. The gate predicate remains as a **friendly
 pre-check** that produces a readable refusal in the common case; it is explicitly **not** the
@@ -116,10 +116,12 @@ it would make order submission depend on a second system's write availability.
 
 * **The enforcement is a constraint, so it cannot be bypassed by a code path.** This is the property the decision exists for: no slice, migration or admin surface can admit a second in-flight order on a key.
 * **The refusal is not free, and it is the sharp edge of this decision.** The collision is detected by the database mid-transaction, so it must be both *mapped* to `order-in-flight-for-key` and *observed without losing the transaction*. Two failures are possible and they are different: an unmapped violation surfaces as a 500 rather than one of the exhaustive outcomes, and a violation allowed to abort the transaction leaves the audit entry and the settled idempotency record unwritten — a silent drop of exactly the kind `ADR/0005` and the audit-completeness NFR forbid. [01 §3.6](../features/01-foundation.md#contract-01-3-6) *Attempt Transition* step 17 avoids both, by conflict-free insertion and by position.
-* **The gate predicate must exclude the requesting order.** Partition full proposed `(payer_tenant_id, overlap_scope_key)` tuples against this order's held tuples. Retain matches, acquire missing tuples and only then release superseded tuples. An unchanged overlap key with a changed payer is a replacement, not a held match. A refused acquisition preserves old claims and releases only its returned provisional claim IDs under Foundation §3.7. Never release old claims first (D-86).
+* **The gate predicate must exclude the requesting order.** Partition full proposed `(payer_tenant_id, resource_tenant_id, overlap_scope_key)` tuples against this order's held tuples. Retain matches, acquire missing tuples and only then release superseded tuples. An unchanged overlap key with a changed payer is a replacement, not a held match. A refused acquisition preserves old claims and releases only its returned provisional claim IDs under Foundation §3.7. Never release old claims first (D-86).
 * **Claims are never deleted, only released**, so the table grows with submit and amendment traffic and needs an index on `(order_id) WHERE released_at IS NULL` — the release path finds claims by order, and the unique index leads on `payer_tenant_id`.
-* **An order that never reaches a terminal state holds its key forever.** `in_fulfillment` is deliberately expiry-exempt, so a wedged fulfilment blocks that key indefinitely. The design's answer is an operational SLA raised by the sibling gear, which is a process answer to a data problem and is the sharpest residual cost of this decision.
+* **The claim is per resource tenant, not per payer alone (D-179).** A partner paying for several customers holds one claim per customer, so it no longer orders them serially, and a refusal only ever names an order of the caller's own resource tenant. The resource tenant is immutable from `submitted`, so it adds no replacement path to the partition above.
+* **An order that does not reach a terminal state holds its key until a person ends it.** `in_fulfillment` is deliberately expiry-exempt, so a wedged fulfilment blocks that `(payer_tenant_id, resource_tenant_id, overlap_scope_key)` tuple (D-179) while it lasts. Workflow's terminals release the claim, but each needs complete compensation evidence and a healthy Workflow. When neither exists, D-182 gives the data problem a data answer with a process gate: Orders' overdue gauge and Workflow's escalation (a release prerequisite) name the fulfillment operator, and after the overdue window a two-person, operator-initiated `force-fail-unreconciled` (§4.3 rows 28 and 29) moves the order to `fulfillment_failed` with compensation recorded as `unknown`, releasing the claim through the ordinary terminal path rather than a claim-table write. The residual cost that remains is the wait up to the end of that window plus the operators' response, and an order closed while a subscription may still be active, which Workflow's open manual task must reconcile.
 * **The cap is one, and this decision does not make it configurable.** D-83's first form added a slot column to express "at most N" so that raising `maxConcurrentActive` would admit concurrent in-flight orders. That overrode a PRD MUST without amendment, and is reversed: §6.1(f) and §6.1(g) are separate rules and only the former is configurable.
+* **The same pattern is what this gear asks Subscriptions to adopt (D-180).** The subscription axis cannot be closed here; `…-upreq-overlap-activation-atomicity` recommends that Subscriptions take an in-transaction `(overlapScopeKey, slot)` claim with a partial UNIQUE in the transaction that commits `active`. The slot shape rejected above is right there because §6.1(f) cardinality is configurable. Until it is delivered, subscription-side cardinality is advisory at order time and submit/activation is not production-ready.
 
 ### Confirmation
 
@@ -127,7 +129,7 @@ it would make order submission depend on a second system's write availability.
 verifiable today or planned. Every behavioural check this decision needs is in the second group.
 
 **Verifiable today, by reading the design set.** [01 §3.7](../DESIGN.md#contract-01-3-7) declares the partial UNIQUE on
-`(payer_tenant_id, overlap_scope_key) WHERE released_at IS NULL` — a UNIQUE index expresses
+`(payer_tenant_id, resource_tenant_id, overlap_scope_key) WHERE released_at IS NULL` — a UNIQUE index expresses
 *exactly one*, which is what PRD §6.1(g) fixes — declares the `(order_id) WHERE released_at IS
 NULL` index the release path needs, states that claims are released and never deleted, and names
 the terminal set of `§4.3` on whose transitions the release happens. Full-tuple partitioning
@@ -154,7 +156,7 @@ transaction-preserving acquisition.
 * Good, because the claim's mutable lifecycle (`released_at`) lives on a row that can carry it, which an append-only version-scoped line cannot.
 * Bad, because a constraint violation must be deliberately mapped to a registered refusal *and* caught without aborting the transaction, or it surfaces as an unmapped error, or it takes the audit append and the settle down with it.
 * Bad, because claims are released rather than deleted, so the table grows with traffic and needs its own index and retention thinking.
-* Bad, because an order that never terminates holds its key indefinitely, and the only answer offered is an operational SLA.
+* Bad, because an order that does not terminate holds its key until the overdue window has elapsed and two operators force it to `fulfillment_failed` (D-182); there is no automatic bound.
 
 ### Application-level counting under the aggregate row lock
 
@@ -177,14 +179,15 @@ transaction-preserving acquisition.
 
 ### An upstream reservation in Subscriptions
 
-* Good, because the key's owner would enforce its own cardinality, and route (a) of `Q-05` would resolve there too.
+* Good, because the key's owner would enforce its own cardinality. Route (a) of `Q-05` is taken for the in-flight claim locally (D-179); the subscription-side dimension still depends on the `SUB-O5` amendment.
 * Bad, because Subscriptions exposes no such capability and the ask is not registered.
 * Bad, because order submission would then depend on a second system's write availability, which the fail-closed gate already makes costly enough.
 
 ## More Information
 
 Superseded by nothing. `DECISIONS.md` D-26 records the original defect and the table; D-83 records
-the reversal of its own first form and why route (b) does not resolve `Q-05`. This ADR exists
+the reversal of its own first form and why route (b) does not resolve `Q-05`; D-179 takes route (a)
+for the claim tuple; D-182 bounds the wedged-fulfilment hold on a key with a two-person forced exit. This ADR exists
 because the gear's only concurrency-correctness mechanism was recorded as a single table row with
 no alternatives, which is precisely the shape a later author removes.
 
@@ -199,4 +202,4 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-bss-orders-lifecycle-nfr-order-snapshot-integrity` — two concurrent submits on one key would each pin a price for a purchase the other invalidates; refusing the second inside the transaction is what keeps a pin bound to an admissible order
 * `cpt-cf-bss-orders-lifecycle-fr-order-amendment` — tuple partitioning retains unchanged claims, acquires missing proposed tuples before releasing old ones, and releases exactly this attempt's provisional claims on refusal
 * `cpt-cf-bss-orders-lifecycle-component-transition-engine` — the claim insert and release are engine writes inside the transition transaction; no slice touches the table
-- **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-26, D-83, Q-05
+- **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-26, D-83, D-179, D-182, Q-05

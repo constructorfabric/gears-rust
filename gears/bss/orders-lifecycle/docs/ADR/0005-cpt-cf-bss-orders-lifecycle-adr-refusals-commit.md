@@ -92,11 +92,11 @@ which is what lets a client retry safely without a branch on the previous answer
 
 ### Consequences
 
-* **A refusal is a durable write.** On a request mix dominated by refusals, the engine writes on most requests. This is the cost, and it is bounded rather than unbounded: refusal audit rows carry a **90-day retention** distinct from committed transitions, and repeated refusals against one order are **rate-limited** (`DECISIONS.md` D-49). Those two mechanisms exist *because* of this decision.
+* **A refusal is a durable write.** On a request mix dominated by refusals, the engine writes on most requests. This is the cost, and it is bounded rather than unbounded: refusal audit rows carry a **90-day retention** distinct from committed transitions, deleted by the phase 0/1 `retention-purge` worker, and engine-entering write requests pass a **pre-engine request limiter** — per caller through the platform api-gateway's identity-keyed zone, per (caller, order) still open under Q-26 (`DECISIONS.md` D-49, D-185). Those mechanisms exist *because* of this decision; the retention bounds nothing unless the purge runs, which is why its backlog and a missed run are alerted.
 * **A settled refusal is frozen for the idempotency window.** A transient guard failure — a port that was briefly unavailable, a contract that was momentarily unresolvable — replays as that refusal for **24 hours** under the same key. A caller who wants a genuine retry must use a **new** idempotency key. This is the sharpest caller-visible consequence of the decision and the one most likely to surprise.
 * Every refusal reason must be **registered** and machine-readable, since it is persisted and replayed rather than formatted for a human once.
 * Slice pre-checks cannot short-circuit ahead of the engine: a check that refuses before the engine is consulted produces no audit row and no settled record, which is why [01 §2.1](../DESIGN.md#contract-01-2-1) requires slice checks to be **registered guards** the engine evaluates.
-* The audit store's growth is driven by traffic, not by commercial activity, so its capacity planning and its retention differ from the commercial trail's.
+* The audit store's growth is driven by traffic, not by commercial activity, so it is sized by request and refusal volume — retained refused rows ≈ mean refusal-write rate × 90 days, bounded per caller by limiter × retention ([`DESIGN.md §4.1`](../DESIGN.md#41-capacity-and-cost)) — and alerted on its refusal-write rate, while the commercial trail is sized by transition rate.
 * An auditor can answer "who tried and was refused" as easily as "who succeeded", which is what makes the trail evidence rather than a changelog.
 
 ### Confirmation
@@ -173,7 +173,7 @@ prevent.
 Superseded by nothing. This decision is why ADR-0001's four-durable-effects consequence reads
 "the state **or version** change" — on a refusal there is no state change, and the other three
 effects still occur. The two register entries it consolidates (D-05, D-08) remain in place and
-cite it; D-49 records the retention and rate limit that bound its cost.
+cite it; D-49 records the retention and rate limit that bound its cost; D-185 names the purge worker, the platform limiter and the sizing rule that make that bound real.
 
 ## Hold and resume guard rationale
 
@@ -210,5 +210,5 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-bss-orders-lifecycle-component-transition-engine` — the engine writes on the majority of its requests as a direct result, which is why the refusal retention and the rate limit exist and why the retention needs a worker behind it
 - **PRD**: [`../PRD.md`](../PRD.md) — §7.1 audit completeness, §12 show-stopper 19
 - **DESIGN**: [01 §2.1](../DESIGN.md#contract-01-2-1), §3.6, §4.1, §4.2
-- **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-05, D-08, D-49
+- **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-05, D-08, D-49, D-185
 - **Related ADR**: [`./0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md`](./0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md)

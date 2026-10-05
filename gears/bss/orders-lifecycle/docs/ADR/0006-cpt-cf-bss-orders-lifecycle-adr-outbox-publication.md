@@ -109,14 +109,14 @@ downstream processing is separate.
   inspectable dead letter and advances the queue-partition cursor. Later events may proceed. A
   strict per-order barrier was rejected because the platform outbox does not provide one and
   recreating it would restore the custom implementation this decision removes.
-* **Consumers reconcile with authority.** Consumers must use event ID for de-duplication and
-  `orderVersion` plus resulting state with an authoritative Orders read to reject stale or
-  inapplicable work. They must not reconstruct order state or assume every prior event was seen.
-  This freshness read deliberately qualifies D-67's no-callback rationale; Product/Architecture
-  reconciliation of PRD §9.2 remains open under Q-25. Consumer services need target-scoped
-  `order × read` grants, not merely root-stream access. Foundation §4.4 requires durable
-  pending work on unavailable validation and event/action-specific applicability rules;
-  a different state or a failed read alone must not silently discard work.
+* **Consumers reconcile with authority.** Every consumer meets the Foundation §4.4
+  [event consumer contract](../DESIGN.md#contract-01-event-consumer-contract) (D-186): de-duplicate
+  by event ID in a consumer-owned processed-event store, reconcile `orderVersion`/state through the
+  authorized reads before any business effect, tolerate unknown values, never reconstruct order
+  state, and keep work durably pending when a read is unavailable or denied. A read is always
+  required before a business effect; the event is a trigger and a version reference, consistent
+  with PRD §9.2's PB-2026-09-29 amendment (Q-25's §9.2 half is closed). Conformance is the shared
+  `orders-events` golden corpus, gating each consumer's integration sign-off.
 
 * **No Orders re-drive endpoint.** Its removal depends on shared platform recovery:
   `cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery`
@@ -146,11 +146,15 @@ dead letter then advances it on `Reject`. Toolkit outbox rejects payloads above 
 
 1. fault injection proving state, audit, idempotency and producer enqueue commit or roll back
    together;
-2. duplicate-delivery tests proving consumers key on event ID;
+2. duplicate-delivery tests proving consumers key on event ID — on the consumer side, the
+   `orders-events` golden corpus of the
+   [event consumer contract](../DESIGN.md#contract-01-event-consumer-contract) (D-186);
 3. transient-failure tests proving queue-partition FIFO and recovery;
 4. permanent-rejection tests proving a dead letter is visible, order state is unchanged and later
    events may proceed;
-5. stale/out-of-order contract tests proving Workflow reads authoritative Orders state/version;
+5. stale/out-of-order contract tests proving Workflow, Subscriptions and Billing read
+   authoritative Orders state/version (the same corpus's `gap`, `out-of-order`, `stale-version`
+   and read-failure cases);
 6. largest-envelope tests at the 200-line cap;
 7. readiness tests for absent Event Broker runtime, schema preparation failure, producer
    registration failure and broker-partition mismatch; and
@@ -222,4 +226,4 @@ This decision directly addresses:
 * `cpt-cf-bss-orders-lifecycle-component-transition-engine` — the engine constructs and enqueues
   event semantics, while platform workers own delivery state.
 - **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-17, D-23, D-24, D-41, D-42,
-  D-58, D-87, D-91, Q-16, Q-19, Q-26
+  D-58, D-87, D-91, D-186, Q-16, Q-19, Q-26

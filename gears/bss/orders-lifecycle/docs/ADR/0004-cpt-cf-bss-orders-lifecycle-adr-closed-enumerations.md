@@ -68,6 +68,7 @@ Chosen option: **keep both sets closed**. Concretely:
 * **A future consumer that is not the caller cannot observe six transition classes at all**: order creation, draft mutation, the administrative edit, `submitted → pending_approval`, `approved → in_fulfillment`, and the spawn signal. Analytics, an operator timeline and a reconciliation job are all plausibly such consumers. Each would need an engine change plus a PRD amendment, which is the cost this decision defers rather than removes.
 * **`OrderExpired` carries two commercially different facts** — a committed order whose TTL lapsed, and a basket never submitted. Consumers must read the payload to tell them apart.
 * The `category` enum is documented as **open to a third value** (Q-01) rather than closed, so this decision is about the state and event sets specifically, not about every enumeration in the gear.
+* **The bounded recovery of a wedged fulfillment holds this decision (D-182).** The operator-forced unreconciled exit lands in the existing `fulfillment_failed` and publishes the existing `OrderFulfillmentFailed` through two new rows (28, 29) on one new trigger; a new `failure_reason` value, `operator-forced-unreconciled`, and a forced compensation-evidence variant with `unknown` assertions carry the distinction, as D-14's payload distinguishes the two `OrderExpired` facts. Neither enumeration grows. The cost is the same kind as `OrderExpired`'s: **`OrderFulfillmentFailed` now carries two commercially different facts** — a compensated failure and an operator-closed one whose compensation is unknown — and a consumer **MUST** read `failure_reason` and the evidence and **MUST NOT** treat the second as compensated.
 
 ### Confirmation
 
@@ -75,7 +76,7 @@ Chosen option: **keep both sets closed**. Concretely:
 verifiable today or planned.
 
 **Verifiable today.** [01 §4.4](../DESIGN.md#contract-01-4-4)'s event catalogue maps all eleven events to their emitting rows
-and names the six event-less row classes with a justification each; [01 §4.3](../features/01-foundation.md#contract-01-4-3) holds twenty-seven
+and names the six event-less row classes with a justification each; [01 §4.3](../features/01-foundation.md#contract-01-4-3) holds twenty-nine
 rows across eleven states; and [01 §4.6](../DESIGN.md#contract-01-4-6) states what adding to either set would cost. Review must
 compare §4.4's catalogue and §4.3's event-declaring rows in both directions, including the event
 named by each cited row. No automated CI enforcement of this comparison is claimed here.
@@ -128,4 +129,4 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-bss-orders-lifecycle-component-transition-engine` — §4.3's row count and §4.4's event catalogue are the enumerations this decision closes, and §4.6 states what adding to either would cost
 - **PRD**: [`../PRD.md`](../PRD.md) — §6.1 state machine, §6.5 events, §15 rows 5 and 8
 - **DESIGN**: [01 §4.3](../features/01-foundation.md#contract-01-4-3), §4.4, §4.6; [02 §4.2](../features/02-capture.md#contract-02-4-2); [07 §4.4](../features/07-hold-and-expiry.md#contract-07-4-4)
-- **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-14, D-15, D-16, D-60; open questions Q-01 (the `category` enum stays open), Q-22 (the PRD diagram lacks the `draft → expired` edge this decision keeps)
+- **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-14, D-15, D-16, D-60, D-182; open questions Q-01 (the `category` enum stays open), Q-22 (the PRD diagram lacks the `draft → expired` edge this decision keeps)

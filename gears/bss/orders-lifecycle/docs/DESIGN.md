@@ -219,7 +219,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-lifecycle-fr-order-payment-auth` | Payment authorization is consumed as a begin-fulfillment guard input supplied by Workflow, not as an order state; the tolerate-failure election is a seller policy read at guard time. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-cancel` | The cancel guard is anchored on the recorded subscription-spawn signal, which is why begin-fulfillment must be durably committed before Workflow issues any activation intent. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-hold` | `on_hold` stores the pre-hold state on the order, so resume is a table lookup rather than an inference. |
-| `cpt-cf-bss-orders-lifecycle-fr-order-expiry` | A coordinated scheduler drives per-state TTL expiry as an ordinary Engine transition; `in_fulfillment` and holds taken from it are excluded by the transition table itself, not by scheduler logic. |
+| `cpt-cf-bss-orders-lifecycle-fr-order-expiry` | A coordinated scheduler drives per-state TTL expiry as an ordinary Engine transition; `in_fulfillment` and holds taken from it are excluded by the transition table itself, not by scheduler logic. Their bound is Workflow's overdue SLA, made a release prerequisite and observed by an Orders-side overdue gauge; after it, a two-person operator-forced `fulfillment_failed` (D-182) is the bounded recovery, never an automatic terminal. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-atomic-fulfillment` | The order carries no per-line fulfillment state machine. Terminals are order-level; per-line create/activate results are a read-only projection fed by Workflow acknowledgements. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-subscription-linkage` | The per-line line→subscription mapping is persisted on acknowledgement and carried in `OrderCompleted`, so acquisition provenance is answerable from the order side. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-events` | The eleven typed state events are enqueued through `event-broker-sdk::DbProducer` backed by `toolkit_db::outbox` inside the transition commit, giving exactly one producer message per committed transition **that declares an event type**, under at-least-once delivery with consumer de-duplication. Six row classes are deliberately event-less (D-15). |
@@ -568,8 +568,14 @@ The constraints each slice adds are defined here and specified normatively in [�
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-outbox-at-least-once`
   — Foundation — Delivery is at-least-once; ordering is partition-scoped ([contract](#contract-01-delivery-is-at-least-once-ordering-is-partition-scoped))
 
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-event-consumer-contract`
+  — Foundation — Every event consumer meets one published, fixture-tested contract ([contract](#contract-01-event-consumer-contract))
+
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-guard-input-ports`
   — Foundation — Guard inputs from unimplemented gears are ports ([contract](#contract-01-guard-inputs-from-unimplemented-gears-are-ports))
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-db-namespace`
+  — Foundation — Database objects carry the `bss_orders` namespace ([contract](#contract-01-database-objects-carry-the-bss_orders-namespace))
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-single-currency-basket`
   — Capture — The basket is single-currency ([contract](#contract-02-the-basket-is-single-currency))
@@ -593,7 +599,7 @@ The constraints each slice adds are defined here and specified normatively in [�
   — Gate and pin — The overlap check depends on an unagreed upstream read ([contract](#contract-03-the-overlap-check-depends-on-an-unagreed-upstream-read))
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-overlap-key-partner-collision`
-  — Gate and pin — The default overlap key collides in the partner path ([contract](#contract-03-the-default-overlap-key-collides-in-the-partner-path))
+  — Gate and pin — The in-flight claim is scoped per resource tenant ([contract](#contract-03-the-default-overlap-key-collides-in-the-partner-path))
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-total-excludes-subscription-overlays`
   — Gate and pin — The order-time total is incomplete by construction ([contract](#contract-03-the-order-time-total-is-incomplete-by-construction))
@@ -611,7 +617,7 @@ The constraints each slice adds are defined here and specified normatively in [�
   — Preconditions — There is no `payment_pending` state ([contract](#contract-05-there-is-no-payment_pending-state))
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-declined-instrument-exit`
-  — Preconditions — A declined instrument exits by expiry, and only where the TTL is set ([contract](#contract-05-a-declined-instrument-exits-by-expiry-and-only-where-the-ttl-is-set))
+  — Preconditions — A declined instrument exits by expiry at the `approved` TTL ([contract](#contract-05-a-declined-instrument-exits-by-expiry-and-only-where-the-ttl-is-set))
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-no-payment-collection`
   — Preconditions — Payment collection is out of scope entirely ([contract](#contract-05-payment-collection-is-out-of-scope-entirely))
@@ -635,7 +641,7 @@ The constraints each slice adds are defined here and specified normatively in [�
   — Hold and expiry — Hold does not pause the Subscriptions draft TTL ([contract](#contract-07-hold-does-not-pause-the-subscriptions-draft-ttl))
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-ttl-values-unchosen`
-  — Hold and expiry — TTL values are unchosen ([contract](#contract-07-ttl-values-are-unchosen))
+  — Hold and expiry — TTL values are provisional ([contract](#contract-07-ttl-values-are-unchosen))
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-read-fails-closed`
   — Reads and authorization — Fail closed on store unavailability ([contract](#contract-08-fail-closed-on-store-unavailability))
@@ -853,7 +859,7 @@ its guards, terminal set, hold/resume mapping and expiry eligibility; guard eval
 ordering; the idempotency registry and its non-success outcomes; the optimistic version
 check and its `version-conflict` refusal — the single registered name D-38 consolidated the
 `stale-version` variants into; the append-only transition audit; the typed event contract and the
-one-producer-message-per-event-declaring-transition rule; and the registry of machine-readable business reasons.
+one-producer-message-per-event-declaring-transition rule; the registry of machine-readable business reasons; and the retention purge of the three bounded-retention stores (D-185).
 
 ##### Responsibility boundaries
 
@@ -1028,10 +1034,11 @@ restarting the dwell without limit — its sibling, the amendment cap, is owned 
 [04 §4.1](features/04-versioning.md#contract-04-4-1) because its value is a commercial
 judgment; the coordinated expiry scheduler; and the transition-table
 exclusion of `in_fulfillment` and of holds taken from it, together with the handoff of those cases
-to the operational escalation owned by the sibling gear. It does **not** supply a fallback duration
-for a state whose TTL is unset — such a state is unbounded, disclosed in
-[07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2) and routed as
-[`DECISIONS.md`](./DECISIONS.md) Q-27.
+to the operational escalation owned by the sibling gear. It supplies **no code-constant
+fallback** duration: every expirable state ships a provisional platform TTL as a migration-seeded,
+revisioned policy row, and the policy channel refuses an unset duration in production
+([07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2), [`DECISIONS.md`](./DECISIONS.md) D-181,
+closing Q-27).
 
 ##### Responsibility boundaries
 
@@ -1095,6 +1102,9 @@ The internal components of each slice are defined here and specified normatively
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-lifecycle-component-reason-registry`
   — Foundation — Reason registry ([contract](#contract-01-reason-registry))
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-component-retention-purge`
+  — Foundation — Retention purge worker ([contract](#contract-01-retention-purge-worker))
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-component-capture-line-model`
   — Capture — Line-model authoring ([contract](#contract-02-line-model-authoring))
@@ -1180,6 +1190,7 @@ component:
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/cancel` | hold-and-expiry | unstable |
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/hold` | hold-and-expiry | unstable |
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/resume` | hold-and-expiry | unstable |
+| `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/forced-failure` | hold-and-expiry | unstable |
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/acceptance` | preconditions | unstable |
 | `GET` | `/bss-orders-lifecycle/v1/orders/{orderId}/acceptance` | preconditions | unstable |
 | `GET` | `/bss-orders-lifecycle/v1/orders/{orderId}/lines` | read-and-authz | unstable |
@@ -1194,7 +1205,9 @@ The line `PATCH` serves two operations: commercial line authoring in `draft`, an
 line fields in every non-terminal state; a request naming a commercial field is `draft-mutate`
 and refuses `not-admissible` outside `draft` (D-117, D-145); the line `DELETE` is draft-only.
 
-Twenty-four endpoints against the PRD's thirteen business operations.
+Twenty-five endpoints against the PRD's thirteen business operations. The operator-forced
+unreconciled failure (`/forced-failure`, D-182) is the twenty-fifth; the D-182 PRD amendment lists
+it in §9.1, so it is not among the eleven below.
 **Eleven** are surfaces the PRD describes in §6 without listing in §9.1 — line authoring
 (three), the administrative edit, the acceptance write and read, the per-line read, the audit
 read, the **version list** (§9.1's *Get order version* covers the single-version read only), the
@@ -1507,7 +1520,10 @@ sequenceDiagram
 
 **Description**: Begin fulfillment commits before Workflow may issue any activation intent,
 which establishes the cancel guard race-free. The order transitions to `fulfillment_failed`
-only on an acknowledgement asserting that operational compensation completed.
+only on an acknowledgement asserting that operational compensation completed, or — after the
+overdue window and only post-spawn — on the two-person operator-forced exit of
+[07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6), whose evidence records compensation as `unknown` and is never read as
+compensated (D-182).
 
 #### Cancellation across the spawn boundary
 
@@ -1637,6 +1653,9 @@ The detailed interaction sequences of each feature are defined here and specifie
 **ID**: `cpt-cf-bss-orders-lifecycle-seq-overdue-handoff`
 — Hold and expiry — Overdue escalation handoff ([sequence](features/07-hold-and-expiry.md#contract-07-overdue-escalation-handoff))
 
+**ID**: `cpt-cf-bss-orders-lifecycle-seq-forced-unreconciled-failure`
+— Hold and expiry — Operator-forced unreconciled failure ([sequence](features/07-hold-and-expiry.md#contract-07-operator-forced-unreconciled-failure))
+
 **ID**: `cpt-cf-bss-orders-lifecycle-seq-scoped-read`
 — Reads and authorization — Scoped read ([sequence](features/08-read-and-authz.md#contract-08-scoped-read))
 
@@ -1650,6 +1669,19 @@ The detailed interaction sequences of each feature are defined here and specifie
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-lifecycle-db-orders-store`
 
+**Physical names (D-183).** The gear declares the stable database namespace
+`db_namespace = "bss_orders"` under the platform object-namespacing decision
+([database ADR-0001](../../../../docs/arch/database/ADR/0001-cpt-cf-database-adr-object-namespacing.md)).
+Every `orders_*` table name in this design set is a **logical** name; its physical name is
+`bss_orders__` followed by the logical name with the leading `orders_` removed, as the
+**Physical name** column lists. An index or constraint given an explicit name is
+`idx_|uq_|fk_|ck_<physical table>__<purpose>`; the longest physical table name is 35 bytes, inside
+the 63-byte limit with room for a purpose. The ADR's gear-macro `db_namespace` attribute and Dylint
+prefix check do not exist yet, so until they land this is enforced by review; the rule, the alias
+reason and the byte budget are in
+[Foundation: Constraints](#contract-01-database-objects-carry-the-bss_orders-namespace)
+(`cpt-cf-bss-orders-lifecycle-constraint-db-namespace`).
+
 **One ownership rule, stated here and in the foundation and nowhere else:** the **engine owns the
 schema and is the sole writer** of every table below; a **slice owns the content** it contributes
 and the guards that admit it. Column-level definitions, keys, constraints and indexes are
@@ -1659,29 +1691,29 @@ columns are integer minor units at the currency's ISO 4217 scale. Immutability i
 table** rather than globally; the inventory below is authoritative for the Orders-owned tables
 and their mutability. Platform producer/outbox tables are not Orders-owned tables.
 
-| Table | Specified in | Content owner | Mutability |
-|-------|--------------|---------------|------------|
-| `orders_order` | [01 §3.7](DESIGN.md#contract-01-3-7) | engine | mutable — denormalized state, pointers, counters |
-| `orders_order_version` | [01 §3.7](DESIGN.md#contract-01-3-7) | versioning | append-only |
-| `orders_order_line_identity` | [01 §3.7](DESIGN.md#contract-01-3-7) | capture | append-only; no application/operational UPDATE or DELETE grant |
-| `orders_order_line` | [01 §3.7](DESIGN.md#contract-01-3-7) | capture | append-only |
-| `orders_draft_content` | [01 §3.7](DESIGN.md#contract-01-3-7) | capture | **mutable** — the pre-submit working set |
-| `orders_order_admin` | [01 §3.7](DESIGN.md#contract-01-3-7) | capture | **mutable** — administrative content |
-| `orders_order_line_admin` | [01 §3.7](DESIGN.md#contract-01-3-7) | capture | **mutable** — administrative content |
-| `orders_resolved_total` | [01 §3.7](DESIGN.md#contract-01-3-7) | gate-and-pin | append-only |
-| `orders_transition_audit` | [01 §3.7](DESIGN.md#contract-01-3-7) | engine | append-only, hash-chained over committed entries; no application/operational UPDATE grant or erasure exception (D-96, §4.3), DELETE only to the retention worker for expired refused rows — [01 §3.7](DESIGN.md#contract-01-3-7) is the canonical grant and retention contract |
-| `orders_audit_checkpoint` | [01 §3.7](DESIGN.md#contract-01-3-7) | audit worker | append-only tenant roll-up headers; D-100 |
-| `orders_audit_checkpoint_member` | [01 §3.7](DESIGN.md#contract-01-3-7) | audit worker | append-only expected order-chain heads; D-100 |
-| `orders_idempotency` | [01 §3.7](DESIGN.md#contract-01-3-7) | engine | **mutable** — marker settles |
-| `orders_line_fulfillment` | [01 §3.7](DESIGN.md#contract-01-3-7) | workflow-seam | **mutable** — projection advances |
-| `orders_inflight_overlap_claim` | [01 §3.7](DESIGN.md#contract-01-3-7) | gate-and-pin | **mutable** — only to set `released_at`; claims are never deleted |
-| `orders_acceptance` | [01 §3.7](DESIGN.md#contract-01-3-7) | preconditions | append-only |
-| `orders_gate_outcome` | [03 §3.7](DESIGN.md#contract-03-3-7) | gate-and-pin | append-only; Preview rows bounded retention |
-| `orders_approval_reflection` | [06 §3.7](DESIGN.md#contract-06-3-7) | workflow-seam | append-only |
-| `orders_state_ttl_policy` | [07 §3.7](DESIGN.md#contract-07-3-7) | hold-and-expiry | mutable policy rows |
-| `orders_date_policy` | [02 §3.7](DESIGN.md#contract-02-3-7) | capture | mutable policy rows; D-121 |
-| `orders_policy_election` | [05 §3.7](DESIGN.md#contract-05-3-7) | preconditions | **mutable** — standing policy elections, changed only by deployment promotion (D-133) |
-| `orders_read_access_log` | [08 §3.7](DESIGN.md#contract-08-3-7) | read-and-authz | append-only |
+| Table | Physical name | Specified in | Content owner | Mutability |
+|-------|---------------|--------------|---------------|------------|
+| `orders_order` | `bss_orders__order` | [01 §3.7](DESIGN.md#contract-01-3-7) | engine | mutable — denormalized state, pointers, counters |
+| `orders_order_version` | `bss_orders__order_version` | [01 §3.7](DESIGN.md#contract-01-3-7) | versioning | append-only |
+| `orders_order_line_identity` | `bss_orders__order_line_identity` | [01 §3.7](DESIGN.md#contract-01-3-7) | capture | append-only; no application/operational UPDATE or DELETE grant |
+| `orders_order_line` | `bss_orders__order_line` | [01 §3.7](DESIGN.md#contract-01-3-7) | capture | append-only |
+| `orders_draft_content` | `bss_orders__draft_content` | [01 §3.7](DESIGN.md#contract-01-3-7) | capture | **mutable** — the pre-submit working set |
+| `orders_order_admin` | `bss_orders__order_admin` | [01 §3.7](DESIGN.md#contract-01-3-7) | capture | **mutable** — administrative content |
+| `orders_order_line_admin` | `bss_orders__order_line_admin` | [01 §3.7](DESIGN.md#contract-01-3-7) | capture | **mutable** — administrative content |
+| `orders_resolved_total` | `bss_orders__resolved_total` | [01 §3.7](DESIGN.md#contract-01-3-7) | gate-and-pin | append-only |
+| `orders_transition_audit` | `bss_orders__transition_audit` | [01 §3.7](DESIGN.md#contract-01-3-7) | engine | append-only, hash-chained over committed entries; no application/operational UPDATE grant or erasure exception (D-96, §4.3), DELETE only to the retention worker for expired refused rows — [01 §3.7](DESIGN.md#contract-01-3-7) is the canonical grant and retention contract |
+| `orders_audit_checkpoint` | `bss_orders__audit_checkpoint` | [01 §3.7](DESIGN.md#contract-01-3-7) | audit worker | append-only tenant roll-up headers; D-100 |
+| `orders_audit_checkpoint_member` | `bss_orders__audit_checkpoint_member` | [01 §3.7](DESIGN.md#contract-01-3-7) | audit worker | append-only expected order-chain heads; D-100 |
+| `orders_idempotency` | `bss_orders__idempotency` | [01 §3.7](DESIGN.md#contract-01-3-7) | engine | **mutable** — marker settles |
+| `orders_line_fulfillment` | `bss_orders__line_fulfillment` | [01 §3.7](DESIGN.md#contract-01-3-7) | workflow-seam | **mutable** — projection advances |
+| `orders_inflight_overlap_claim` | `bss_orders__inflight_overlap_claim` | [01 §3.7](DESIGN.md#contract-01-3-7) | gate-and-pin | **mutable** — only to set `released_at`; claims are never deleted |
+| `orders_acceptance` | `bss_orders__acceptance` | [01 §3.7](DESIGN.md#contract-01-3-7) | preconditions | append-only |
+| `orders_gate_outcome` | `bss_orders__gate_outcome` | [03 §3.7](DESIGN.md#contract-03-3-7) | gate-and-pin | append-only; Preview rows bounded retention |
+| `orders_approval_reflection` | `bss_orders__approval_reflection` | [06 §3.7](DESIGN.md#contract-06-3-7) | workflow-seam | append-only |
+| `orders_state_ttl_policy` | `bss_orders__state_ttl_policy` | [07 §3.7](DESIGN.md#contract-07-3-7) | hold-and-expiry | mutable policy rows |
+| `orders_date_policy` | `bss_orders__date_policy` | [02 §3.7](DESIGN.md#contract-02-3-7) | capture | mutable policy rows; D-121 |
+| `orders_policy_election` | `bss_orders__policy_election` | [05 §3.7](DESIGN.md#contract-05-3-7) | preconditions | **mutable** — standing policy elections, changed only by deployment promotion (D-133) |
+| `orders_read_access_log` | `bss_orders__read_access_log` | [08 §3.7](DESIGN.md#contract-08-3-7) | read-and-authz | append-only |
 
 There is no destructive path for any **order-linked commercial** row: an abandoned draft is
 auto-voided to `expired` and remains readable. Three stores carry bounded retention by design, each Orders-owned and executed by the retention sweep
@@ -1795,7 +1827,11 @@ a daily cadence with a bounded batch per store, and purges Preview gate-outcome 
 refused-attempt audit rows past 90 days, and read-access-log rows past 90 days. It holds the only
 DELETE grant on the audit table and only for refused rows ([01 §3.7](DESIGN.md#contract-01-3-7)). **A declared retention with
 no worker behind it is an unbounded store**, and ADR-0005's cost argument depends on one of these
-three actually running.
+three actually running. The sweep is therefore the named Foundation component
+`cpt-cf-bss-orders-lifecycle-component-retention-purge` and a **phase 0/1 deliverable** (D-185):
+Foundation is not done while refused rows can be written and nothing deletes them. Its algorithm is
+[`features/01-foundation.md` §3.5](features/01-foundation.md#35-purge-bounded-retention-rows); its
+metrics and alerts are [01 §3.8](DESIGN.md#contract-01-3-8)'s.
 
 **Durability and recovery.** A committed transition is synchronously durable before
 acknowledgement, so the write path is served from a primary with **synchronous commit to a quorum
@@ -1817,11 +1853,14 @@ would answer successfully with stale state that nothing detects.
 
 **Infrastructure as code** is platform-owned: provisioning, environment parity, auto-scaling
 configuration and resource tagging are inherited from the platform's deployment tooling and this
-gear declares no infrastructure of its own. The deliberately unchosen policy values of
+gear declares no infrastructure of its own. The Product-owned policy values of
 [07 §4.5](DESIGN.md#contract-07-4-5) and
 [08 §4.5](DESIGN.md#contract-08-4-5) are delivered as
 `orders_state_ttl_policy` rows and gear configuration, promoted through environments with the
-deployment rather than edited at runtime. The same **policy channel** carries the per-tenant date
+deployment rather than edited at runtime. The TTL rows start as migration-seeded provisional
+values, and the channel's promotion validation **refuses any `orders_state_ttl_policy` row with a
+NULL `ttl_duration` bound for a production environment** — a release gate on the promotion, never a
+readiness condition of the running gear (D-181). The same **policy channel** carries the per-tenant date
 policy as `orders_date_policy` rows ([02 §3.7](DESIGN.md#contract-02-3-7), D-121)
 and the acceptance and tolerate-failure elections as `orders_policy_election` rows — no runtime
 endpoint writes them; a seller's election is requested through platform operations and its
@@ -1838,9 +1877,11 @@ Orders deployment is blocked until that runtime and its integration tests exist.
 
 The event and assessment integration contracts are owned by [Foundation contract §3.6](features/01-foundation.md#contract-01-3-6) / [Foundation contract §3.7](DESIGN.md#contract-01-3-7) / [Foundation contract §4.4](DESIGN.md#contract-01-4-4).
 Settled responses bind replay to an immutable assessment when gate evaluation was reached;
-engine-only refusals expose none. Event payload completeness does not eliminate the mandatory
-consumer applicability read. Its PRD §9.2 departure is open under D-67/Q-25, with service read
-grants and durable unavailable-read recovery required by [UPSTREAM_REQS.md §2.7](UPSTREAM_REQS.md#27-event-broker). Pricing
+engine-only refusals expose none. A business-effect consumer always reads before its effect; the
+event is a trigger and a version reference, and only effect-free consumers may act on payload alone
+([event consumer contract](#contract-01-event-consumer-contract), D-186, closing Q-25's §9.2 half
+in line with PRD §9.2 PB-2026-09-29). Service read grants and durable unavailable-read recovery
+are required by [UPSTREAM_REQS.md §2.7](UPSTREAM_REQS.md#27-event-broker). Pricing
 readiness is split in `DECOMPOSITION.md`: PriceBook revision reads exist behind REST, but the `PricingReadV1` trait, the
 `bss-orders.system` grant, the residual purchase verdict and exact-binding Rating evaluation remain pending. Complete consumed-item coverage is mandatory;
 [UPSTREAM_REQS.md §2.2](UPSTREAM_REQS.md#22-rating--price-evaluation) registers that prerequisite and fail-closed behavior. Assessment identity
@@ -1868,6 +1909,8 @@ blank because a threshold nobody set is a threshold nobody can verify against
 | Dimension | Baseline | Note |
 |-----------|----------|------|
 | Peak order transitions | **50 / second** | Working production load for validating the PRD's p95 < 1 s write-plus-publish baseline |
+| Peak engine-entering write requests | **250 / second** | Requests to the engine-entering write operations that pass the inbound limiter (D-185); refusals dominate (ADR-0005), so committed transitions are a fifth of them. Idempotent replay of a settled outcome is counted here but writes nothing |
+| Peak refusal-audit writes | **200 / second**; ratio to committed transitions **4 : 1** | Refused rows written by authorization denial, guard refusal, mismatch, still-processing and a new key per attempt; each is one `orders_transition_audit` row with NULL `sequence`. This, not the transition rate, sizes the audit store |
 | Platform producer throughput | **200 events / second** | Across the 16 toolkit queue partitions; must exceed the transition rate because one transition can emit one event |
 | Event-delivery budget | **Unresolved (Q-16)**; 30 s p95 is an unapproved proposal | Borrowed from Orders Workflow's process-event class, not validated for Lifecycle; the PRD's p95 < 1 s write-plus-publish baseline governs until an approved change |
 | Orders row growth | **~11 rows** per order at version 1, **~5** per amendment | Aggregate, identity, lines, totals and audit; platform outbox rows are measured separately |
@@ -1875,9 +1918,28 @@ blank because a threshold nobody set is a threshold nobody can verify against
 | List page size | default **50**, maximum **200** | The 200 ms read budget is per page, so an unbounded page would make it meaningless |
 
 Cost is dominated by the shared `toolkit-db` backend and scales with retained order history. The
-gear is sized by transition rate rather than data volume: an order is a handful of small rows and
-the version chain grows only on amendment, which is rare relative to submit. Read load is absorbed
-by the aggregate row rather than the write path. The Orders-owned workers are advisory-lock-coordinated and idle-cheap; toolkit outbox worker cost is
+**commercial tables** are sized by transition rate rather than data volume: an order is a handful
+of small rows and the version chain grows only on amendment, which is rare relative to submit.
+**The audit store is not**: its growth is driven by request traffic, most of it refused
+(ADR-0005), and is sized by request and refusal volume (D-185):
+
+* **Rule.** Retained refused rows ≈ mean refusal-audit write rate × 7,776,000 s (90 days), times
+  the measured bytes per refused row including its share of the table's four indexes, the
+  `WHERE outcome = 'refused'` partial index among them ([01 §3.7](DESIGN.md#contract-01-3-7)). Committed
+  rows are sized separately by transition rate and the 24-month archival tier. At the 200/s
+  refusal peak sustained the ceiling is ~1.56 × 10⁹ refused rows; capacity is provisioned for the
+  measured mean and the §3.8 refusal-rate alert fires before the ceiling is approached.
+* **Per-caller bound.** The inbound limiter bounds requests, and therefore refusal rows, per
+  authenticated caller: the identity-keyed zone admits at most 200 requests in any 60 s window
+  (sustained 3/s, burst 20), so one caller can hold at most ~2.33 × 10⁷ retained refused rows
+  (3 × 7,776,000 + 20) **per gateway replica** — × N replicas until the gateway's distributed
+  throttling lands ([`docs/arch/throttling/ADR/0001-distributed-throttling-cluster-cache.md`](../../../../docs/arch/throttling/ADR/0001-distributed-throttling-cluster-cache.md), proposed).
+  The per-(caller, order) baseline of 20/min bounds one pair at 2,592,000 rows once enforced (Q-26).
+* **Retention only bounds what the purge deletes.** The bound above holds only while the
+  `retention-purge` worker keeps its overdue backlog at zero; §3.8 alerts on its backlog and on
+  a missed daily run.
+
+Read load is absorbed by the aggregate row rather than the write path. The Orders-owned workers are advisory-lock-coordinated and idle-cheap; toolkit outbox worker cost is
 included in the platform producer profile.
 
 **Latency measurement contract.** Record correlated operation-start, transaction-commit and
@@ -1944,11 +2006,12 @@ applicable**; it consumes an authorization *outcome* only.
 | Cross-tenant order disclosure | A caller reads or lists an order outside their relationship | Tenant boundary | Scope by relationship not tenant equality; not-found rather than forbidden; delegation proof required and audited | A compromised delegation credential reads within its granted scope until revoked |
 | A partner manufactures customer consent | The commercial placing party records the acceptance instant themselves | Commercial-evidence boundary | On partner-placed orders the placing/selling party cannot attest customer consent; acceptance requires the resource-tenant party. A self-service buyer may accept an amended version | An offline collusion between partner and a customer principal is out of scope for a technical control |
 | State asserted without a guard | A caller reaches a state-setting path directly | Engine boundary | There is no such path: every state change is a guarded transition and the engine is sole writer | A privileged database credential bypasses the engine; mitigated by runtime-owned privilege and the audit hash chain making it detectable |
+| Forced failure abused to close a live order | One operator, or Workflow, forces an order to `fulfillment_failed` to free its key or end a dispute (D-182) | Authorization and integrity boundary | Break-glass, user-only `order × force-fail-unreconciled` grant held by neither Seller Operator nor Workflow; post-spawn and post-overdue-window guards; two distinct principals, both copied onto the committed chained entry; evidence records `unknown`, never compensated; every use alerts | Two colluding grant holders can still close an order whose subscription is active; Workflow's open manual task and reconciliation through Subscriptions are what catch it |
 | Sibling-gear impersonation | A caller that is not the configured Workflow `service` principal attempts a workflow-only operation (the actor class is derived from the authenticated context against configured identities, D-115, and cannot be presented) | Service boundary | Gateway-asserted service principal plus a gear-scoped claim | A compromised platform gateway; out of this gear's control |
 | Audit tampering | A holder of database privilege edits or deletes trail rows | Data boundary | No UPDATE or DELETE grant on the audit role, plus a per-order predecessor-hash chain verified by the audit-chain verifier of [01 §3.8](DESIGN.md#contract-01-3-8); identity removal never rewrites the trail (D-96) | A database owner/migration role can alter protections or rewrite a whole chain; local hashes alone do not prove completeness against that authority. Privileged changes require independent monitoring; identity removal grants no verification exemption |
 | Preview amplification | Basket calls fan out to nine operations and write outcome rows | Cost and dependency boundary | Preview authorizes resource/payer scope before commercial resolution, carries a rate limit, and its outcome rows have a bounded retention | A high-volume authorised caller can still consume port capacity, bounded by the per-port bulkhead |
-| Unbounded audit growth | Repeated refused attempts against one order | Availability boundary | Refusal rows carry 90-day retention and repeated refusals are rate-limited | A distributed low-rate refusal campaign remains possible and is a monitoring concern |
-| An order held in-flight indefinitely | An actor cycles the dwell before each TTL elapses — **hold/resume** with hold permission, or **amendment** with amend permission; both reset `state_entered_at` | Commercial-promise boundary | Two counters no transition resets, each with its own guard: `resume_count` (cap 5, [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2)) and `amendment_count` (cap 20, [04 §4.1](features/04-versioning.md#contract-04-4-1)). At most 74 TTL-covered pre-fulfillment dwell entries; `74 × T_max` sums configured budgets under [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2)'s assumptions, plus scheduler delay—not an unconditional lifetime bound | Where the states' TTLs are **unset** the caps bound nothing, because the dwell they multiply is itself unbounded; disclosed as [`DECISIONS.md`](./DECISIONS.md) Q-27 and alerted per [07 §3.8](DESIGN.md#contract-07-3-8) |
+| Unbounded audit growth | Refused attempts — denials, guard refusals, mismatch, still-processing, a new key per attempt — against one or many orders; each writes a durable row (ADR-0005) | Availability boundary | Refusal rows carry 90-day retention, deleted by the phase 0/1 `retention-purge` worker (`cpt-cf-bss-orders-lifecycle-component-retention-purge`); a pre-engine request limiter — the platform api-gateway identity-keyed zone per caller, the per-(caller, order) limit pending Q-26 — bounds rows per caller; the audit store is sized by request and refusal volume ([§4.1](#41-capacity-and-cost)) (D-185) | A distributed low-rate campaign across many callers stays under every per-caller limit, and gateway limits are per replica until throttling ADR-0001 lands; detected by the [01 §3.8](DESIGN.md#contract-01-3-8) **refusal-audit write-rate monitor** (absolute and ratio to committed transitions) and the purge backlog and missed-run alerts |
+| An order held in-flight indefinitely | An actor cycles the dwell before each TTL elapses — **hold/resume** with hold permission, or **amendment** with amend permission; both reset `state_entered_at` | Commercial-promise boundary | Two counters no transition resets, each with its own guard: `resume_count` (cap 5, [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2)) and `amendment_count` (cap 20, [04 §4.1](features/04-versioning.md#contract-04-4-1)). At most 74 TTL-covered pre-fulfillment dwell entries; every expirable state carries a finite TTL in production (provisional rows, NULL refused at promotion, D-181), so `74 × T_max` — 74 × 30 days = 2,220 days at the provisional values — sums configured budgets under [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2)'s assumptions, plus scheduler delay | A policy promotion that raises T_max raises the bound with it; the provisional values are long until Product confirms them (Q-06, Q-07), alerted as provisional per [07 §3.8](DESIGN.md#contract-07-3-8). A NULL row in production is reachable only by bypassing the policy channel with database privilege and pages as an integrity alert. `in_fulfillment` and holds from it remain outside both layers (operational SLA) |
 
 ### 4.3 Data protection, residency and retention
 
@@ -2056,8 +2119,14 @@ ask.
 **Alerting** covers both the invariant-bearing signals and latency: write-plus-publish latency
 against the governing PRD baseline, read latency, delayed producer delivery, any audit-append
 failure, any audit-chain verification mismatch, any
-non-zero unaudited-transition count, any pending toolkit producer dead letter, and orders held in `in_fulfillment`
-past the overdue window. Health reporting distinguishes readiness from liveness (§3.8).
+non-zero unaudited-transition count, any pending toolkit producer dead letter, any order overdue
+in fulfillment — the gauge of [07 §3.8](DESIGN.md#contract-07-3-8) counting orders in `in_fulfillment`, or `on_hold` with
+pre-hold `in_fulfillment`, past expected fulfillment time plus the overdue window, alerting when
+non-zero with the oldest age attached — and every operator-forced unreconciled failure (D-182).
+The overdue alert is Orders' own evidence that Workflow's escalation
+(`cpt-cf-bss-orders-lifecycle-upreq-workflow-overdue-escalation`, [`UPSTREAM_REQS.md §2.6`](./UPSTREAM_REQS.md#26-orders-workflow))
+is needed; it is not a substitute for it, and both are production release prerequisites.
+Health reporting distinguishes readiness from liveness (§3.8).
 
 Delayed-delivery and dead-letter detection **MUST** remain enabled regardless of Q-16's numerical
 outcome. Orders owns the delivery objective, queue-specific alert configuration and recovery
@@ -2086,7 +2155,8 @@ total request budget, bounded retry on transient failure only, a **circuit break
 mapping to that port's existing fail-closed reason, and a **concurrency bulkhead** per port, all
 specified in [03 §2.2](DESIGN.md#contract-03-2-2).
 
-Producer delivery is at-least-once with consumer de-duplication on event ID. Broker idempotency
+Producer delivery is at-least-once; consumers meet the
+[event consumer contract](#contract-01-event-consumer-contract) (D-186). Broker idempotency
 instead uses managed Chained producer metadata (`producer_id`, `previous`, `sequence`), not
 `event.id`; the SDK owns sequence assignment and cursor recovery as specified in [Foundation contract §4.4](DESIGN.md#contract-01-4-4).
 The Event Broker SDK
@@ -2140,8 +2210,8 @@ disclosure.
 
 | Accepted limit | Why it is accepted | Who acts when it bites |
 |----------------|--------------------|------------------------|
-| A **wedged `in_fulfillment` order holds its overlap key indefinitely**, blocking any new order on that key for that payer | `in_fulfillment` is expiry-exempt because a spawn signal may already have issued and expiry would orphan provisioned resources with no compensation path ([07 §4.3](features/07-hold-and-expiry.md#contract-07-4-3)). No transition in this gear can clear the claim, and ADR-0007 names this its sharpest residual cost | **Orders Workflow operations** — the escalation SLA on an overdue `in_fulfillment` order is the only route. If it proves too slow in practice the fix is an operator-initiated claim release, which is new scope and is not designed |
-| A **permanently rejected producer message may leave a gap before later events** | Deliberate platform ordering posture: transient retry preserves FIFO, but toolkit-db advances a queue-partition cursor after `Reject`. Orders is authoritative state, not an event-sourced ledger; blocking unrelated orders indefinitely on an invalid message is the worse failure mode (D-87, ADR-0006) | **Consumers and platform operations** — consumers de-duplicate and reconcile `orderVersion`/state against Orders; operations alert on and recover pending dead letters through the shared tooling and SDK mechanism required by `cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery` ([UPSTREAM_REQS §2.7](./UPSTREAM_REQS.md#27-event-broker)). This remains a production release prerequisite, including for terminal events |
+| A **wedged `in_fulfillment` order holds its overlap key until an operator acts**, blocking any new order on that `(payer_tenant_id, resource_tenant_id, overlap_scope_key)` tuple (D-179) | `in_fulfillment` is expiry-exempt because a spawn signal may already have issued and expiry would orphan provisioned resources with no compensation path ([07 §4.3](features/07-hold-and-expiry.md#contract-07-4-3)). Workflow's terminals (rows 14, 16, 26, 27) do release the claim, but each needs complete compensation evidence and a healthy Workflow; when neither exists the only exit is the two-person operator-forced `fulfillment_failed` of rows 28 and 29, admitted only post-spawn and after the overdue window past expected fulfillment time, which releases the claim through the ordinary terminal path and records compensation as `unknown` (D-182). ADR-0007 still names the wait up to that point its sharpest residual cost | **The fulfillment operator, named by PRD §6.3** — Workflow's overdue escalation (`…-upreq-workflow-overdue-escalation`, a production release prerequisite) and Orders' overdue gauge and alert ([07 §3.8](DESIGN.md#contract-07-3-8)) raise it; a requester and a distinct approver holding the break-glass forced-failure grant close it; Workflow keeps the orphan-subscription manual task open afterwards |
+| A **permanently rejected producer message may leave a gap before later events** | Deliberate platform ordering posture: transient retry preserves FIFO, but toolkit-db advances a queue-partition cursor after `Reject`. Orders is authoritative state, not an event-sourced ledger; blocking unrelated orders indefinitely on an invalid message is the worse failure mode (D-87, ADR-0006) | **Consumers and platform operations** — Workflow, Subscriptions and Billing each meet the [event consumer contract](#contract-01-event-consumer-contract) (D-186) and pass its `orders-events` golden corpus before integration sign-off (`cpt-cf-bss-orders-lifecycle-upreq-event-consumer-conformance`); operations alert on pending dead letters (`cpt-cf-bss-orders-lifecycle-upreq-event-delivery-observability`) and recover them through the shared tooling and SDK republication required by `cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery` ([UPSTREAM_REQS §2.7](./UPSTREAM_REQS.md#27-event-broker)). Alerting and recovery remain `p1` production release prerequisites, including for terminal events; the consumer contract makes a gap safe, not absent |
 | **Two principals can each create a duplicate order** from the same request under the same key text | The idempotency key is scoped by principal to close an IDOR (D-88), which makes the same key text from a different principal a different key. For every operation but `create` the fingerprint's `order_id` and `expected_version` still catch the duplicate; on a create there is neither | **Product** — deciding whether a cross-principal create duplicate is a real commercial scenario. If it is, the answer is an upstream de-duplication key on the request, not a change to the registry's scoping |
 | The **stored resolved total is not the amount the customer will be invoiced** — non-authoritative, pre-tax, and excluding subscription-scoped overlays | Tax has no order-time owner and overlays need context a subscription has not yet created. Reporting a total that silently omitted them would be worse than declaring the omission ([03 §4.5](DESIGN.md#contract-03-4-5)) | **Every consumer surface** — a buyer portal, partner console or confirmation email. §4.2 of [08-read-and-authz](DESIGN.md#contract-08-1-1) makes rendering the total without its declared exclusions prohibited on this gear's read, and the same obligation is stated as an expectation on surfaces this gear does not own |
 | **`new_sale` covers net-new acquisition only**; expansion has no order document, no gate at the point of change, no pin and none of this audit trail | Declared PRD phasing — `change` is modeled and refused at creation, with the enum left open (Q-01). Not a design gap | **Product** — "Orders is live" and "commercial changes are governed by Orders" become true at different times, and only the first is true at the end of this phase |
@@ -2167,7 +2237,7 @@ this design previously passed over in silence are now explicit deferrals with th
 trial-conversion and renewal classification, subscription composition granularity, and the
 quantity model — recorded as Q-01, Q-02 and Q-03. **Four of the remaining seven carry design
 interim positions**: rows 5 and 7 (retention and per-state TTLs) as Q-07 and Q-06, row 12 (the
-overlap-key dimension) as Q-05, and row 3 (the order reference on `create`) as upstream ask
+overlap-key dimension) as Q-05 (its in-flight claim side closed by D-179), and row 3 (the order reference on `create`) as upstream ask
 `SUB-O2`. Rows 2, 14 and 15 are genuinely unaffected by this
 design.
 
@@ -2468,9 +2538,9 @@ event and at-least-once delivery of that message. It does **not** guarantee glob
 strict per-order barrier. `orderId` is the event partition key, so events for one order route to one
 broker partition and retain FIFO during ordinary processing and transient retries. A permanently
 rejected message is dead-lettered and the toolkit partition cursor advances; later events may then
-proceed. Consumers **MUST** de-duplicate by event ID and **MUST** validate the event's
-`orderVersion` and resulting state against authoritative Orders state before acting. The stream is
-a notification channel, not a reconstruction ledger (§4.4).
+proceed. Consumers therefore see duplicates and gaps; what each consumer **MUST** do about them is
+the [event consumer contract](#contract-01-event-consumer-contract) (§4.4, D-186), not restated
+here. The stream is a notification channel, not a reconstruction ledger.
 
 <a id="contract-01-guard-inputs-from-unimplemented-gears-are-ports"></a>
 
@@ -2483,6 +2553,47 @@ party-eligibility check among them — are resolved through ports before the tra
 under the per-port deadlines of [03-gate-and-pin — Constraints](DESIGN.md#contract-03-2-2). The engine treats
 an unresolvable input as a refusal (§2.1) rather than blocking, so an absent counterpart degrades
 a capability instead of stalling the gear.
+
+<a id="contract-01-database-objects-carry-the-bss_orders-namespace"></a>
+
+#### Database objects carry the `bss_orders` namespace
+
+**Contract**: `cpt-cf-bss-orders-lifecycle-constraint-db-namespace` (`p1`), defined in [§2.2 Slice constraints](#register-constraints).
+
+The gear declares the stable database namespace `db_namespace = "bss_orders"` and names every
+database object whose name it can select by the platform object-namespacing decision
+([database ADR-0001](../../../../docs/arch/database/ADR/0001-cpt-cf-database-adr-object-namespacing.md), D-183):
+
+* **Logical and physical names.** The `orders_*` table names used throughout this design set — prose,
+  `#### Table:` headings, anchors, ADRs and features — are **logical names**. A table's physical
+  name is `bss_orders__<local>`, where `<local>` is the logical name with its leading `orders_`
+  removed and nothing else changed: `orders_order` → `bss_orders__order`,
+  `orders_transition_audit` → `bss_orders__transition_audit`. The [§3.7 inventory](#37-database-schemas--tables)
+  lists every physical name; that column is the one migrations and entities use.
+* **Supporting objects.** An index or constraint given an explicit name is
+  `idx_|uq_|fk_|ck_|trg_|seq_<physical table>__<purpose>`, for example
+  `uq_bss_orders__inflight_overlap_claim__open_tuple`; backend-generated names (primary keys,
+  implicit unique indexes) are outside the grammar, as the ADR states.
+* **Why the alias.** `bss_orders` is a shorter storage alias, which the ADR permits (its
+  `usage_tsdb` example). The canonical form `bss_orders_lifecycle` makes the longest table
+  `bss_orders_lifecycle__audit_checkpoint_member` 45 bytes, leaving 13 bytes for a `uq_…__`
+  purpose under the 63-byte limit; bare `orders` would read as belonging to any of the Orders gears
+  (Lifecycle, Workflow, Change Orders). With `bss_orders` the longest table name,
+  `bss_orders__audit_checkpoint_member`, is 35 bytes and a `uq_`/`idx_`/`fk_`/`ck_` name over it
+  has 22 (`idx_`) or 23 (`uq_`, `fk_`, `ck_`) bytes left for its purpose. Changing the namespace after the first migration is an
+  explicit rename migration.
+* **Enforcement today.** The ADR's `db_namespace` attribute on `#[toolkit::gear(...)]` and its
+  Dylint `<db_namespace>__` prefix check do not exist yet. Until they land, the rule is held by
+  review of entity `table_name` values and migration DDL; when they land, the gear declares the
+  attribute and the check applies with no name change.
+* **Precedent.** The shape follows the one compliant design in the repository,
+  [policy-engine](../../../system/policy-engine/docs/DESIGN.md)
+  (`cpt-cf-policy-engine-constraint-db-namespace`, its §3.7 declaration and
+  `uq_policy_engine__decision_record__evaluation`). No BSS gear complies yet: the Ledger's tables
+  are `ledger_*` and Pricing's `pricing_*`, so this gear does not copy its siblings here.
+
+Platform producer and outbox tables keep the names their libraries give them and are not in this
+gear's inventory ([Platform-managed producer persistence](#contract-01-platform-managed-producer-persistence)).
 
 
 <!-- /contract -->
@@ -2582,6 +2693,7 @@ graph TB
     A[Audit store]
     X[Platform event producer adapter]
     R[Reason registry]
+    P[Retention purge worker]
     S -->|registers| G
     O --> G
     O --> T
@@ -2590,6 +2702,7 @@ graph TB
     O --> X
     O --> R
     X -->|DbProducer + toolkit outbox| BUS[Event Broker]
+    P -->|deletes expired refused rows| A
 ```
 
 <a id="contract-01-transition-orchestrator"></a>
@@ -2848,6 +2961,46 @@ It does not author slice reasons and never carries internal diagnostics into a r
 
 - `cpt-cf-bss-orders-lifecycle-component-guard-registry` — shares model with
 
+<a id="contract-01-retention-purge-worker"></a>
+
+#### Retention purge worker
+
+**Contract**: `cpt-cf-bss-orders-lifecycle-component-retention-purge` (`p1`), defined in [§3.2 Slice components](#register-components).
+
+<a id="contract-01-why-this-component-exists-6"></a>
+
+##### Why this component exists
+
+ADR-0005 makes every refused transition a durable write and refusals are most traffic; the
+90-day refusal retention, the 7-day Preview retention and the 90-day read-log retention bound
+nothing unless a worker deletes the expired rows (D-185).
+
+<a id="contract-01-responsibility-scope-6"></a>
+
+##### Responsibility scope
+
+The `retention-purge` worker of §3.8: a daily, advisory-lock-coordinated pass with a bounded batch
+per store — Preview gate-outcome rows past 7 days, refused `orders_transition_audit` rows past 90
+days, read-access-log rows past 90 days — through each table's partial or time index and its
+restricted DELETE grant (§3.7); and its metrics (rows purged, batch duration, overdue backlog,
+oldest overdue row age, last success). Algorithm:
+[`features/01-foundation.md` §3.5](features/01-foundation.md#35-purge-bounded-retention-rows).
+
+<a id="contract-01-responsibility-boundaries-6"></a>
+
+##### Responsibility boundaries
+
+It never deletes a committed audit row, a row inside its retention, idempotency records (the
+`idempotency-cleanup` worker's) or platform outbox rows (toolkit vacuum's). It repairs nothing and
+acquires no aggregate lock.
+
+<a id="contract-01-related-components-by-id-6"></a>
+
+##### Related components (by ID)
+
+- `cpt-cf-bss-orders-lifecycle-component-audit-store` — deletes expired refused rows of
+- `cpt-cf-bss-orders-lifecycle-component-gate-preview` — deletes expired outcome rows of
+
 
 <!-- /contract -->
 
@@ -3091,7 +3244,7 @@ toolkit outbox's 64 KiB payload limit. Capacity tests cover the largest `OrderSu
 | amendment_count | integer, **NOT NULL, `0` from creation** | Amendments appended to this order. Incremented by rows 18, 19 and 20 and by nothing else; **no transition decrements or resets it**. Read by those rows' guard on the already-locked aggregate row. It is a **separate counter from `resume_count` on purpose** — a resume is a seller-side operational act and an amendment a buyer-side commercial one, so a seller's compliance holds **MUST NOT** consume a buyer's ability to revise the order ([04 §4.1](features/04-versioning.md#contract-04-4-1), [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2)) |
 | spawn_signal_at | timestamptz, nullable | Written by the spawn-signal transition; never cleared |
 | authorization_failure_tolerated_at | timestamptz, nullable | The tolerated-authorization risk flag; records a decision taken at an instant and is never cleared |
-| compensation_evidence | jsonb, nullable | Workflow-supplied evidence under the closed schema below — drafts voided, activated subscriptions rolled back, whether activation was dispatched, whether at-sale facts were emitted, and the no-active-subscription assertion; recorded only by failure acknowledgement or workflow-mediated cancellation |
+| compensation_evidence | jsonb, nullable | Workflow-supplied evidence under the closed schema below — drafts voided, activated subscriptions rolled back, whether activation was dispatched, whether at-sale facts were emitted, and the no-active-subscription assertion; recorded only by failure acknowledgement or workflow-mediated cancellation, or — in its forced variant with `unknown` assertions and an operator attestation — by the operator-forced unreconciled failure (rows 28 and 29, D-182) |
 | audit_sequence | bigint | Per-order audit counter, initialized to 0; incremented under this row's lock so the first committed audit entry is sequence 1 (D-99) |
 | created_at | timestamptz | Creation instant |
 
@@ -3112,6 +3265,21 @@ or null evidence refuses `compensation-evidence-missing`; evidence that fails th
 `no_active_subscription_remains` is not `true`, refuses `compensation-evidence-incomplete`.
 Lifecycle validates structure only. It **MUST NOT** reconcile either list against Subscriptions,
 since it holds no adapter to it ([06 §3.5](DESIGN.md#contract-06-3-5)).
+
+**Forced variant (D-182), written only by `force-fail-unreconciled` (§4.3 rows 28 and 29).** The
+same five members plus a sixth, `operator_attestation`, which every other trigger **MUST NOT**
+carry. `drafts_voided` and `activated_rolled_back` are the identifiers the operators attest as
+known, possibly empty, unverified; `activation_dispatched` is `true`, written by the engine from
+the recorded spawn signal the row requires, since dispatch may have followed it;
+`at_sale_facts_emitted` and `no_active_subscription_remains` are the string `unknown`, the only
+place either member may be anything but a boolean. `operator_attestation` is
+`{requested_by, request_audit_id, requested_at, approved_by}`: the requester's actor reference,
+refused-attempt `audit_id` and instant, and the approving caller's actor reference, copied by the
+engine from the locked inputs of [07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6) *Force Fail Unreconciled*, never from caller text. The
+forced variant **MUST NOT** assert compensation complete, and no consumer **MAY** read it as
+compensated: `unknown` means Orders closed the order without knowing whether a subscription is
+still active. The rows-14/16/26/27 guards still refuse `unknown` as
+`compensation-evidence-incomplete`, so Workflow can never submit the forced variant.
 
 This CHECK is why `§3.6` *Attempt Transition* step 20.3 clears `pre_hold_state` on **any** transition whose target is not `on_hold`, not only on resume. Rows 23 (`on_hold → cancelled`) and 24 (`on_hold → expired`) move a held order to a terminal state; clearing only on resume would leave the column populated against a non-`on_hold` state, the UPDATE would fail the constraint, and both transitions — one of them the TTL sweep's main path out of `on_hold` — would be unable to commit at all.
 
@@ -3255,6 +3423,7 @@ without one.
 |--------|------|-------------|
 | claim_id | uuid | Claim identity |
 | payer_tenant_id | uuid | Billing party that owns the overlap scope |
+| resource_tenant_id | uuid | The order's resource recipient, copied from `orders_order.resource_tenant_id`; immutable once the order is `submitted`, so a claim's value never changes. Scopes the claim to one customer so a partner paying for several customers does not collide across them (D-179) |
 | overlap_scope_key | text | Subscriptions' registry-owned `catalogSubscriptionProductKey` (SUB-G1) for this accepted line, stored as received from its owner and never computed here; the PriceBook derivation proposed to that owner is the SKU of the line's paid recurring item(s). Persisted and reused by claims and activation; D-153, D-163. |
 | order_id, version | uuid, integer | Order and proposed version of the reservation attempt; a refused attempt's version may never materialize and is not proof of admission |
 | claimed_at | timestamptz | Server-recorded reservation instant inside the transaction, not an admission or commit timestamp |
@@ -3263,7 +3432,7 @@ without one.
 **PK**: claim_id
 
 **Constraints**: **partial UNIQUE** on
-`(payer_tenant_id, overlap_scope_key) WHERE released_at IS NULL`. This is the authoritative
+`(payer_tenant_id, resource_tenant_id, overlap_scope_key) WHERE released_at IS NULL`. This is the authoritative
 one-in-flight-order constraint, and *exactly one* is what PRD §6.1(g) requires — the in-flight
 order cap is fixed there, unlike the concurrent-**subscription** cardinality of §6.1(f), which
 Catalog or Contract may configure. A UNIQUE index expresses exactly one, so it expresses the rule
@@ -3279,13 +3448,15 @@ permanently. **This table therefore carries no foreign key to `orders_order_vers
 `order_id` and the version the claim was taken for as data, and giving it an FK would force the
 version to pre-exist the claim, which is exactly the ordering that produces the phantom version.
 
-Claim identity is the full **`(payer_tenant_id, overlap_scope_key)` tuple** everywhere, not
+Claim identity is the full **`(payer_tenant_id, resource_tenant_id, overlap_scope_key)` tuple** everywhere, not
 the overlap key alone. The payer comes from the proposed version on submit/amendment; existing
-claims retain their recorded payer. Step 17 retains the intersection of held and proposed
+claims retain their recorded payer. The resource tenant is the order's, which no path changes
+after `submitted` ([04 §4.1](features/04-versioning.md#contract-04-4-1)), so it never drives a replacement (D-179). Step 17 retains the intersection of held and proposed
 tuples, acquires the proposed-minus-held set and releases the held-minus-proposed set only
 after complete acquisition. Duplicate lines resolving to the same tuple offer one claim;
-identical overlap keys under different payers are distinct claims. Missing tuples are offered
-in a shared total order by payer UUID bytes then overlap-key bytes, preventing opposite-order
+identical overlap keys under different payers, or under one payer for different resource tenants,
+are distinct claims. Missing tuples are offered
+in a shared total order by payer UUID bytes, then resource-tenant UUID bytes, then overlap-key bytes, preventing opposite-order
 acquisition among those tuples. This is not a blanket deadlock-freedom claim for transactions
 already holding other claims. Transitions run at **READ
 COMMITTED** — under a snapshot isolation level the insert raises a serialisation failure instead of
@@ -3327,7 +3498,9 @@ authoritative admission history. This deliberate semantic change preserves the e
 no-DELETE/only-`released_at`-UPDATE grant contract.
 
 **Required regression tests (pending implementation).** Cover unchanged tuples, duplicate line
-keys, payer-only changes and payer-plus-key changes. After successful payer reassignment, the old
+keys, payer-only changes and payer-plus-key changes. One payer with the same key for two resource
+tenants holds two live claims, and a same-tenant collision's refusal names only an order that
+tenant can read (D-179). After successful payer reassignment, the old
 pair is reusable by another order and only proposed tuples remain live for this order. If the new
 pair is occupied, retain the old version/payer/claims and commit the refusal without provisional
 live claims. Force a multi-tuple partial insert before a collision: only returned IDs become
@@ -3440,7 +3613,7 @@ storable: a nullable column cannot participate in a primary key.
 | actor_class | enum | `system`, `service` or `user` — the closed Orders actor class defined below (D-115), derived from the authenticated context and configured identities only |
 | delegation_proof_ref | text, nullable | The proof reference PDP reported accepting for a cross-tenant action, else the reference the caller supplied — Orders does not verify it ([08 §4.4](DESIGN.md#contract-08-4-4), D-111) |
 | reason | text | Registered machine reason, never caller text and never composed: on a committed entry exactly one closed token per trigger, listed under *Committed audit reason tokens* below (D-148); on a refused entry the registered refusal reason (§4.7) |
-| caller_reason | text, nullable | What the caller supplied as its explanation, stored as received and never interpreted (D-143): the cancel reason (mandatory, [07 §4.6](features/07-hold-and-expiry.md#contract-07-4-6) *Cancel Order*), the optional hold reason ([07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6) *Hold Then Resume*, D-138), the amendment explanation (the value a committed amendment also stores on `orders_order_version.amendment_reason`, [04 §3.6](features/04-versioning.md#contract-04-3-6)), or, on a failed acknowledgement, the closed `failure_reason` value ([06 §4.4](features/06-workflow-seam.md#contract-06-4-4), D-136). NULL where the trigger carries no such input or an optional one was not supplied, and on every refused entry, whose `reason` records why the attempt failed; a caller value that failed its own validation is therefore never stored |
+| caller_reason | text, nullable | What the caller supplied as its explanation, stored as received and never interpreted (D-143): the cancel reason (mandatory, [07 §4.6](features/07-hold-and-expiry.md#contract-07-4-6) *Cancel Order*), the optional hold reason ([07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6) *Hold Then Resume*, D-138), the amendment explanation (the value a committed amendment also stores on `orders_order_version.amendment_reason`, [04 §3.6](features/04-versioning.md#contract-04-3-6)), or, on a failed acknowledgement, the closed `failure_reason` value ([06 §4.4](features/06-workflow-seam.md#contract-06-4-4), D-136), or, on an operator-forced unreconciled failure, the approver's mandatory forced-failure reason ([07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6), D-182), whose `failure_reason` is the fixed `operator-forced-unreconciled` and not caller text. NULL where the trigger carries no such input or an optional one was not supplied, and on every refused entry, whose `reason` records why the attempt failed; a caller value that failed its own validation is therefore never stored |
 | changed_field, prior_value, new_value | text, nullable | Populated for an administrative edit, one entry per changed field; a line-level field is named with its line, as `lines/<line_id>/<field>` (D-117) |
 | idempotency_key | text | The key in force |
 | correlation_id | uuid, nullable | The sibling gear's process correlation identifier |
@@ -3452,14 +3625,15 @@ storable: a nullable column cannot participate in a primary key.
 `draft-mutate`, `administrative-edit`, `submit`, `cancel`, `auto-void`, `reflect-approval-required`,
 `reflect-approval-not-required`, `reflect-approval-granted`, `reflect-approval-denied`,
 `begin-fulfillment`, `report-spawn-signal`, `acknowledge-completed`, `acknowledge-failed`,
-`cancel-workflow-mediated`, `amendment`, `hold`, `resume`, `expire` and `record-acceptance`. A
+`cancel-workflow-mediated`, `amendment`, `hold`, `resume`, `expire`, `record-acceptance` and
+`force-fail-unreconciled` (D-182). A
 trigger that owns several rows (`cancel`, `amendment`, `acknowledge-failed`,
-`cancel-workflow-mediated`) writes the same token on each; `from_state` and `to_state` tell the
+`cancel-workflow-mediated`, `force-fail-unreconciled`) writes the same token on each; `from_state` and `to_state` tell the
 rows apart. D-82's version-reason vocabulary `{create, submit, amendment}` is unchanged and its
 three tokens are the same strings here. The six PRD §6.2 reasons D-82 places on this column map as:
 approval reflection → the four `reflect-approval-*` tokens; hold → `hold`; resume → `resume`;
-cancel → `cancel` or `cancel-workflow-mediated`; fulfillment outcome → `acknowledge-completed` or
-`acknowledge-failed`; expiry → `expire` or, for a draft, `auto-void`. No detail is composed into the
+cancel → `cancel` or `cancel-workflow-mediated`; fulfillment outcome → `acknowledge-completed`,
+`acknowledge-failed` or, for the operator-forced exit, `force-fail-unreconciled`; expiry → `expire` or, for a draft, `auto-void`. No detail is composed into the
 token: an expiry's expired state is `from_state`, and its TTL, policy identity and revisions are
 carried by the expiry contribution the request fingerprint covers and by the `OrderExpired`
 payload (§4.4, [07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6)), since this table has no detail column. Caller text goes in
@@ -3564,11 +3738,38 @@ above are the canonical audit-retention contract for the set; every other statem
 and none restates it.** Refusal rows carry a **90-day
 retention** distinct from committed transitions, purged by the retention sweep
 ([DESIGN.md](DESIGN.md) §4.2); committed entries carry the **24-month archival tier** and
-no DELETE grant at all. Repeated refusals are **rate-limited at a working
-baseline of 20 per minute per (caller, order) pair and 200 per minute per caller**, enforced at
-the inbound edge *before* the engine — a limiter refusing inside the engine would write the very
-row it exists to prevent. The values are set here so they can be measured and revised rather than
-invented by an implementer; ratification sits with Architecture (Q-26). A periodic job verifies the
+no DELETE grant at all. The purge is executed by the phase 0/1 `retention-purge` worker
+(`cpt-cf-bss-orders-lifecycle-component-retention-purge`, D-185). Engine-entering write requests are
+bounded by a **pre-engine request limiter** at the inbound edge *before* the engine — a limiter
+refusing inside the engine would write the very row it exists to prevent. It is a request limiter,
+not a repeated-refusal limiter: it counts every request to the bound operations, admitted or not,
+so it also limits legitimate retries and its values must sit above legitimate retry cadence. Two
+limits (D-185):
+
+* **Per caller — 200 per 60 s, adopted from the platform api-gateway.** One identity-keyed
+  rate-limit zone `rl_orders_caller_write` (`key: { type: identity }`, i.e.
+  `SecurityContext::subject_id()`; `rate_limit: 3/s`, `burst_limit: 20`, so at most 200 in any 60 s
+  window; `response_status_code: 429`, `response_retry_after: auto`) is bound through
+  `ThrottlingSpec { rate_limit_zone, require_security_context: true, dry_run: false }` on the
+  caller-facing engine-entering operations — create, header and line edits, submit, amendments,
+  cancel, hold, resume, acceptance. The gateway's `RateSpec` is integer `/s` only, which is why 200/min
+  is expressed as rate plus burst. The five workflow-only operations bind a separate identity zone
+  `rl_orders_workflow_write` (`rate_limit: 50/s`, `burst_limit: 100`, the §4.1 transition baseline),
+  because one service principal carries every order's workflow traffic. Preview stays on its own
+  limit ([03 §2.2](DESIGN.md#contract-03-2-2)); an operation binds one rate zone, so submit's stricter
+  10/min stays with 03 under Q-26. Gateway state is per replica: a deployment of N gateway
+  replicas admits N × the configured budget until throttling ADR-0001 lands. Precedent:
+  `gears/system/api-gateway/src/middleware/throttling.rs`, `libs/toolkit/src/api/operation_builder.rs`
+  `ThrottlingSpec`, the zone shape in `config/quickstart.yaml` and its `mini-chat` binding.
+* **Per (caller, order) — 20 per minute, open (Q-26).** The gateway keys only `Identity` and `Ip`
+  ([`docs/arch/throttling/DESIGN.md`](../../../../docs/arch/throttling/DESIGN.md) D2), so a
+  path-parameter key cannot be expressed there; the ask is
+  `cpt-cf-bss-orders-lifecycle-upreq-gateway-path-param-throttle-key`. If the gateway declines,
+  the fallback is a gear-local limiter at the REST edge keyed `(subject_id, orderId)`, running before
+  the engine call, writing no audit row and answering the same 429.
+
+Values are set here so they can be measured and revised rather than invented by an implementer.
+A periodic job verifies the
 hash chain **over committed entries**; the PRD's "tamper-evident" requirement is met by the chain
 plus the absent UPDATE grant, not by uniqueness alone.
 
@@ -3580,7 +3781,8 @@ a fresh row each time. Were it
 to lock the aggregate — which also serialises audit-sequence allocation (`§3.6` step 5) — a denial
 loop against one order would serialise every legitimate transition on it behind the attacker's lock
 acquisitions. A refused entry takes no sequence and joins no chain, so the lock buys nothing and is
-not taken; repeated denials are bounded by the rate limit above instead.
+not taken; repeated denials are bounded by the pre-engine request limiter above instead — per
+caller today, per (caller, order) once Q-26's open half lands.
 
 **Audit presentation order (D-101).** The mixed audit read orders **all** committed and refused
 entries by `(created_at ASC, audit_id ASC)`, and uses exactly that pair as its exclusive keyset
@@ -3773,7 +3975,7 @@ authoritative roster and coordination contract for the **five Orders-owned worke
 | Per-state TTL expiry | `expiry` | Locked-row eligibility/state/version recheck and deterministic transition idempotency key |
 | Draft auto-void | `draft-auto-void` | Locked-row draft/TTL recheck and deterministic transition idempotency key |
 | Idempotency-window cleanup | `idempotency-cleanup` | Recheck expiry and settlement under row lock; never delete a live/reclaimed in-flight record |
-| Retention purge | `retention-purge` | Conditional bounded deletion of still-eligible rows only; audit deletion restricted to expired refused rows |
+| Retention purge (`cpt-cf-bss-orders-lifecycle-component-retention-purge`, phase 0/1, D-185) | `retention-purge` | Conditional bounded deletion of still-eligible rows only; audit deletion restricted to expired refused rows |
 | Audit verification/checkpointing | `audit/<canonical audit-tenant UUID>` | Read-only verification; consistent checkpoint snapshot and unique next checkpoint sequence (§4.4) |
 
 **Selected primitive: `toolkit_db::Db::lock(gear, key)`**, or bounded non-blocking acquisition
@@ -3892,6 +4094,24 @@ write-plus-publish latency against the governing PRD baseline, delayed producer 
 producer dead letter, any audit-append failure, any chain-verification mismatch, and any non-zero
 unaudited-transition count.
 
+**Audit-growth monitors (D-185).** Measured: refusal-audit write rate by refusal class and actor
+class; its ratio to committed transitions; inbound-limiter 429 count per zone; and, for
+`retention-purge` per store, rows purged, batch duration, overdue backlog (rows past their retention
+still present), oldest overdue row age and last successful pass. Alerts, at working baselines
+revised with §4.1 under Q-26:
+
+* **Refusal-audit write-rate monitor** — the rate above the §4.1 refusal peak (200/s), or the
+  refused-to-committed ratio above 4 : 1, sustained for 15 minutes; this is the detector for the
+  distributed low-rate campaign §4.2 leaves as residual risk.
+* **Purge backlog** — oldest overdue refused-audit row older than 1 day (a refused row older than
+  91 days exists), or an overdue backlog growing across two consecutive passes; same for Preview
+  outcomes and read-access-log rows.
+* **Purge not run** — no successful `retention-purge` pass for more than 1 day past its daily
+  schedule (last success older than 26 h).
+
+The overdue-backlog alert follows the idempotency-window cleanup executor's
+([Foundation contract §4.2](features/01-foundation.md#contract-01-4-2) *Idempotency-window cleanup executor*).
+
 The latency boundaries and acceptance method are defined in
 [`DESIGN.md §4.1`](DESIGN.md#41-capacity-and-cost). The former 30-second publication target is
 unapproved and reopened under D-41 / Q-16; it is not an acceptance or alert threshold. Delayed
@@ -3960,7 +4180,9 @@ the caller never saw ([DECISIONS.md](DECISIONS.md) D-110; `§3.6` *Attempt Trans
 `reflect-approval-required`, `reflect-approval-not-required`, `reflect-approval-granted`,
 `reflect-approval-denied` (rows 7–10), `begin-fulfillment` (row 11), `report-spawn-signal` (row 12),
 `acknowledge-completed` (row 13), `acknowledge-failed` (rows 14, 26) and `cancel-workflow-mediated`
-(rows 16, 27). No draft trigger is in the class, so draft-revision handling is unchanged. A
+(rows 16, 27). No draft trigger is in the class, so draft-revision handling is unchanged.
+`force-fail-unreconciled` (rows 28, 29) is **not** in the class: it is a human operator's trigger
+with the ordinary admissibility-then-version order (D-182). A
 slice **MUST NOT** refuse a request before calling the engine, and **MUST NOT** depend on running
 before another slice's guard for the same row.
 
@@ -4014,7 +4236,7 @@ and by no others:
 | `OrderCancelled` | 5, 15, 16, 17, 23, 27 | the cancelling actor, the mandatory cancel reason carried from the committed audit entry's `caller_reason` (§3.7, D-143), and compensation evidence where the cancel was workflow-mediated |
 | `OrderExpired` | 6, 24 | the state that expired and its TTL, with the effective policy identity and its revisions from the expiry contribution ([07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6)); the audit entry's `reason` is only the token `expire` or `auto-void` (§3.7, D-148) |
 | `OrderCompleted` | 13 | the per-line line-to-subscription mapping and immutable-version reference, and the external reference where present |
-| `OrderFulfillmentFailed` | 14, 26 | the failure reason — one value of the closed `failure_reason` enumeration of [06 §4.4](features/06-workflow-seam.md#contract-06-4-4) (D-136), carried from the committed audit entry's `caller_reason` (§3.7, D-143) — and the compensation evidence under the closed schema of §3.7 |
+| `OrderFulfillmentFailed` | 14, 26, 28, 29 | the failure reason — one value of the closed `failure_reason` enumeration of [06 §4.4](features/06-workflow-seam.md#contract-06-4-4) (D-136): carried from the committed audit entry's `caller_reason` (§3.7, D-143) on rows 14 and 26, and the fixed `operator-forced-unreconciled` on rows 28 and 29, whose `caller_reason` is the operator's forced-failure reason, carried as `forcedReason` — and the compensation evidence under the closed schema of §3.7, in its forced variant with `unknown` assertions and the operator attestation on rows 28 and 29 (D-182) |
 | `OrderAcceptanceRecorded` | 25 | accepted_version, the acceptance instant, the recording actor and the requirement source |
 
 **One disclosed divergence in this table.** PRD §6.5 gives `OrderAmended`'s trigger as "on
@@ -4023,8 +4245,9 @@ creation of a new order version". Under D-64 **five** rows append a version — 
 `OrderAmended`: creation is event-less (row 1, below) and submit announces itself as
 `OrderSubmitted`. `OrderAmended` therefore fires **only** on an amendment, which is the useful
 contract — a consumer keyed on it wants the supersession, not the first materialisation — but it
-is not the trigger the PRD states. The §6.5 and §9.2 wording is routed to Product as
-[DECISIONS.md](DECISIONS.md) Q-25, alongside Q-24's version-reason narrowing.
+is not the trigger the PRD states. The §6.5 trigger wording is routed to Product as
+[DECISIONS.md](DECISIONS.md) Q-41 (split from Q-25 by D-186, which closed Q-25's §9.2 read
+half), alongside Q-24's version-reason narrowing.
 
 **Six row classes are deliberately event-less**: create (1), draft mutation (2), the
 administrative edit (3), `submitted → pending_approval` (7), `approved → in_fulfillment` (11), and
@@ -4040,15 +4263,17 @@ before its `TypedEvent` compiles; none is registered yet. The
 Workflow branch consumes nine of them (W/design/10:274-276) and reads commercial facts through
 `get_version`; Seam Atlas C09 lists three and must be regenerated from this table. A rejected
 message is dead-lettered and the partition cursor advances (§3.6), so consumers see a gap they
-tolerate and recover through the authorized reads; the atlas's C00 gap-free stream sequence is not
-promised here.
+tolerate and recover through the authorized reads under the
+[event consumer contract](#contract-01-event-consumer-contract) (D-186); the atlas's C00 gap-free
+stream sequence is not promised here.
 
 Every event carries a bounded common summary: `orderId`, `orderVersion`, category, resulting
 state, resource/seller/payer axes, contract reference and external reference where present, plus the
 specific fields above. **D-158 changes the prior draft wire contract:** expanded pins, descriptor
 snapshots and monetary breakdowns are read through the authorized immutable-version SDK, not copied
 into events. The existing UUID/version pair is that reference. Consumer reads never substitute the
-current version, and a separate current-state read establishes applicability before business effects.
+current version, and a separate current-state read establishes applicability before business
+effects (consumer contract C2, D-186).
 
 This adds commercial-content reads as well as freshness reads and supersedes D-67's no-missing-content
 claim. PRD amendment PB-2026-09-29 records it; availability/retention and unavailable-read recovery are
@@ -4299,10 +4524,10 @@ publish as a new message or fall back to Stateless mode. This contract follows
 followed by a lost response/transport timeout. Retry the same durable message, both with the
 worker still running and after restart/cursor recovery; verify stable producer identity and
 `meta.sequence`, SDK predecessor reconciliation, one broker append and eventual queue
-acknowledgement. Separately deliver the same event ID twice to a consumer and verify one
-business effect. Operator republication may use a new valid producer sequence while preserving
-event ID; consumers must still suppress that duplicate. These are implementation/release tests,
-not a claim that the deployed broker has been verified.
+acknowledgement. Operator republication may use a new valid producer sequence while preserving
+event ID; the consumer-side duplicate is the `orders-events` corpus case `duplicate-republished`
+of the [event consumer contract](#contract-01-event-consumer-contract). These are
+implementation/release tests, not a claim that the deployed broker has been verified.
 
 Delivery is at-least-once. `orderId` **MUST** resolve as the GTS event partition key, routing all
 events for an order to one broker partition. FIFO holds during normal processing and transient
@@ -4314,26 +4539,9 @@ an invalid event or unrecoverable producer-chain fault does not become valid thr
 attempts, and blocking an entire producer partition indefinitely would reduce availability for
 unrelated orders.
 
-Consumers **MUST** de-duplicate by event ID and **MUST** use `orderVersion` plus the resulting
-state together with an authoritative Orders read to reject stale or inapplicable work. They
-**MUST NOT** reconstruct order state from the stream or assume every prior event was observed.
-Workflow, Subscriptions and Billing must use an authenticated, explicitly PDP-authorized
-`order × read` service path scoped to the target order; root broker access grants no such read.
-The read verifies applicability, not missing historical event content. A successful read proving
-that the particular intended action is obsolete retires that work without a business effect.
-A different state alone is insufficient: hold may defer work until resume, and a historical
-financial effect may remain applicable. Each consumer must declare its event/action-specific
-applicability rule; without one it may not silently classify work as obsolete.
-A timeout, 503 or authorization/configuration failure is not evidence of stale work: retain the
-event in the consumer's durable retry/reconciliation mechanism, perform no effect, and escalate
-on its bounded retry budget. Do not mark work complete or discard it because verification is
-unavailable. De-duplication marks a business effect complete only after that effect commits;
-a pending freshness check remains retryable after restart. A read is no distributed lock:
-the downstream operation must still enforce its version/state/concurrency guards at execution.
-[UPSTREAM_REQS.md §2.7](UPSTREAM_REQS.md#27-event-broker) records the consumer integration and Q-25 reconciliation requirement.
-Test delayed and duplicate events, a recovered dead letter after newer state, Orders outage,
-missing read grants and restart while validation is pending. A
-dead letter **MUST NOT** alter order state. Recovery uses the shared platform operator interface
+Consumers see the duplicates and gaps this posture produces and meet the
+[event consumer contract](#contract-01-event-consumer-contract) below (D-186); this paragraph
+does not restate it. A dead letter **MUST NOT** alter order state. Recovery uses the shared platform operator interface
 and supported SDK republication required by
 `cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery`
 ([`UPSTREAM_REQS.md §2.7`](UPSTREAM_REQS.md#27-event-broker)); Orders exposes no REST re-drive
@@ -4342,6 +4550,83 @@ producer identity and chained sequencing. It requires no new Orders transition, 
 parked terminal event such as `OrderCompleted`. The dead letter is resolved only after broker
 acknowledgement; consumer processing is monitored separately. This is a required platform
 capability, not a claim that toolkit's existing dead-letter claim operation republishes events.
+
+<a id="contract-01-event-consumer-contract"></a>
+
+#### Event consumer contract
+
+**Contract**: `cpt-cf-bss-orders-lifecycle-constraint-event-consumer-contract` (`p1`), defined in [§2.2 Slice constraints](#register-constraints).
+
+**Scope and standing (D-186).** This is the single normative statement of what a consumer of the
+eleven Orders events must do; every other passage in this set that mentions consumer de-duplication,
+reconciliation or gap tolerance points here and adds nothing. It binds Workflow, Subscriptions and
+Billing (the **business-effect consumers**) and any later subscriber. Orders cannot enforce it from
+the producer side, so it is a published requirement verified by the `orders-events` golden corpus
+below, and passing that corpus is each consumer's integration sign-off gate
+(`cpt-cf-bss-orders-lifecycle-upreq-event-consumer-conformance`,
+[UPSTREAM_REQS.md §2.7](UPSTREAM_REQS.md#27-event-broker)). It is the consumer half of the delivery
+posture in [§2.2](#contract-01-delivery-is-at-least-once-ordering-is-partition-scoped) and D-87:
+at-least-once delivery plus a dead letter that advances the partition cursor means a consumer sees
+duplicates, gaps and, after recovery, out-of-order events.
+
+A consumer **MUST**:
+
+| # | Obligation | Normative detail |
+|---|------------|------------------|
+| C1 | **De-duplicate by event ID** | Key on the envelope `id`, never on `(orderId, orderVersion)` and never on broker `meta.sequence`, which operator republication may change while preserving `id` (§4.4 *The platform producer outbox*). Keep the processed IDs in a **consumer-owned processed-event store**: the platform supplies none — `event-broker-sdk`'s outbox and `toolkit_db::outbox` are producer-side, and the Event Broker consumer contract puts de-duplication on the consumer ([`0002-consumer-subscription-lifecycle.md` §2.3](../../../system/event-broker/docs/features/0002-consumer-subscription-lifecycle.md): "Consumers MUST handle at-least-once: dedup by event.id on the consumer side"). Mark an event complete **only in the transaction that commits its business effect** (or after it, where the effect is itself idempotent under the event ID); a crash before that commit leaves it retryable. An event retired without effect under C2 or C3 is marked complete the same way; one pending under C5 is not |
+| C2 | **Reconcile through the authorized reads before any business effect** | Read immutable content with `get_version(orderId, orderVersion)` and applicability with the current-order read `get` ([Workflow SDK contract](#orders-lifecycle-workflow-sdk)); compare the current `orderVersion` and `state` with the event's. Apply the consumer's **declared** per-event, per-action applicability rule: a successful read proving the intended action obsolete retires it without effect; a different state alone is insufficient (a hold defers until resume, and a historical financial effect may remain applicable); without a declared rule the consumer may not classify work as obsolete. Reads run on an authenticated, PDP-authorized `order × read` service path scoped to the target order; root broker access grants none (`cpt-cf-bss-orders-lifecycle-upreq-pdp-policy-integration`). A read is no distributed lock: the downstream operation still enforces its own version, state and concurrency guards at execution |
+| C3 | **Tolerate unknown values** | An unknown `state` or event-type value is "not one I act on": no error, no effect, marked complete under C1. No exhaustive match over either enumeration, and no generated client that declares them as closed enums ([Foundation §4.6](#contract-01-4-6), D-69; [Foundation §4.7](#contract-01-4-7) *Wire representation*) |
+| C4 | **Never reconstruct** | Never derive order state, the version chain or commercial content from the sequence of events, and never assume every prior event was observed or that events arrive in version order. Orders is the system of record; the stream is a trigger channel (D-87, D-178) |
+| C5 | **Keep unverifiable work durably pending** | A timeout, 503, authorization denial or configuration failure on a C2 read is not evidence of stale work and not an empty commercial result (PRD §6.5, PB-2026-09-29): perform no effect, keep the event durably pending in the consumer's retry/reconciliation mechanism, retry under a bounded consumer-owned budget and escalate to its operator when the budget is exhausted. Never mark it complete, discard it or retire it because verification is unavailable; a pending check survives restart |
+
+**A read is always required before a business effect (closes Q-25's §9.2 half).** The event is a
+**trigger and a version reference**: its common summary block is enough to route, de-duplicate,
+partition, filter and decide whether to fetch, and never enough to act on. A business effect is any
+write to another system of record keyed on the order — subscription create or activation,
+provisioning, approval routing, invoicing, payment — and is preceded by the C2 reads. Only
+**effect-free consumers** (audit, notification, analytics) may act on the payload alone; they still
+meet C1, C3 and C4 and never build order state from what they receive. This is the position of D-158
+(expanded content by immutable-version read), D-178 (gaps recovered through the authorized reads)
+and PRD §9.2's PB-2026-09-29 amendment, which supersedes the earlier "without a callback read"
+wording; no event-payload widening reopens it.
+
+**Golden conformance corpus `orders-events` (specified here, not built).** The consumer obligations
+are verified by one shared corpus rather than by each consumer's own reading of this table, following
+the joint golden fixture precedent: [`gears/bss/fixtures`](../../fixtures/README.md) holds hand-authored
+TOML under `corpus/<family>/` with a `_family.toml` manifest and a dev-only
+`bss-fixtures-conformance` runner, and Pricing gates publish-contract sign-off on its joint proration
+fixture ([`pricing/docs/design/06-consumer-contracts.md`](../../pricing/docs/design/06-consumer-contracts.md)
+K5 and its conformance criterion). `orders-events` is a new family there: one TOML case per row below,
+each a script of deliveries (envelopes) and stubbed Orders read responses, with the expected effect
+log. Because an event handler is not an arithmetic subject, the runner gains a sibling evaluator
+trait beside `CorpusEvaluator`; each consumer implements it over its real handler and supplies its
+declared C2 applicability rule as case parameters, so expected outcomes are per consumer where the
+rule decides them. The corpus is **built with the first consumer integration** (Workflow, per
+[06 §5.2](features/06-workflow-seam.md#52-cross-gear-safety-and-recovery-evidence)); until then
+no consumer may report it passed.
+
+| Case | Script | Expected | Obligation |
+|------|--------|----------|------------|
+| `duplicate-delivery` | Same envelope delivered twice | One effect; second delivery suppressed | C1 |
+| `duplicate-republished` | Recovered dead letter republished with a new `meta.sequence`, same `id`, after the original was processed | Suppressed | C1 |
+| `gap` | `v3` event dead-lettered and never delivered; `v4` arrives | `v4` handled from the C2 reads; no inferred `v3` effect; no wait for `v3` | C2, C4 |
+| `out-of-order` | `v4` processed, then recovered `v3` arrives | `v3` judged by the declared rule against the current read, never applied as current | C2, C4 |
+| `stale-version` | Event at `v2`; current read at `v5` in another state | Content from `get_version(v2)`, applicability from `get`; effect only if the rule holds | C2 |
+| `hold-defers` | Actionable event; current read `on_hold` | Deferred, not retired; acted on after resume | C2 |
+| `unknown-state` | `state` outside the eleven | No error, no effect, marked complete | C3 |
+| `unknown-event-type` | Event type outside the eleven | No error, no effect, marked complete | C3 |
+| `read-unavailable` | C2 read times out or returns 503 | No effect; pending; bounded retry then escalation; not marked complete | C5 |
+| `read-denied` | C2 read refused for a missing grant | Same as `read-unavailable`; never read as empty or not-found-means-obsolete | C5 |
+| `recovered-dead-letter-after-newer-state` | `OrderApproved` recovered after the order reached `cancelled` | Retired without effect by the declared rule | C2, C4 |
+| `restart-while-pending` | Crash after the C2 read and before the effect commits; redelivery | Exactly one effect after restart | C1, C5 |
+| `effect-free-on-payload` | Audit or notification consumer, no read | Acts on payload; still de-duplicates; builds no state | C1, C4 |
+
+These cases replace the former free-text consumer test list of this section. Producer-side
+regression evidence (lost response, cursor recovery) stays in *The platform producer outbox* above.
+The contract makes a gap **safe**, not absent: dead-letter alerting
+(`cpt-cf-bss-orders-lifecycle-upreq-event-delivery-observability`) and SDK republication with
+operator recovery (`cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery`) remain
+`p1` production release prerequisites ([§4.7 Accepted residual limits](#47-accepted-residual-limits)).
 
 
 <!-- /contract -->
@@ -4366,11 +4651,16 @@ additionally a PRD question because both sets are enumerated there.
 **The trigger vocabulary is closed and every row's key is unique.** A row is addressed by
 `(from-state, trigger)`, and `§3.6` *Attempt Transition* step 10 looks up **the** row for that
 pair before any guard runs — so a guard can never disambiguate two rows sharing a key. The
-twenty triggers are therefore named, not described: `create`, `draft-mutate`,
+twenty-one triggers are therefore named, not described: `create`, `draft-mutate`,
 `administrative-edit`, `submit`, `amendment`, `cancel`, `cancel-workflow-mediated`, `auto-void`, `expire`,
 `reflect-approval-required`, `reflect-approval-not-required`, `reflect-approval-granted`,
 `reflect-approval-denied`, `begin-fulfillment`, `report-spawn-signal`, `acknowledge-completed`,
-`acknowledge-failed`, `hold`, `resume`, `record-acceptance`. Where one caller-facing operation can
+`acknowledge-failed`, `hold`, `resume`, `record-acceptance`, `force-fail-unreconciled`.
+`force-fail-unreconciled` and its rows 28 and 29 are the D-182 **engine change** under the rule
+above: two transition rows, one trigger, the forced evidence variant on the engine-owned
+`compensation_evidence` column, and a step-13 refusal that carries its own `audit_id`. No state and
+no event type is added, so PRD §6.1 and §6.5's enumerations are unchanged and only the §6.1, §6.3
+and §6.6 prose is amended. Where one caller-facing operation can
 produce more than one outcome the **slice maps its input to a trigger** and the engine maps
 `(state, trigger)` to a row: *Reflect Verdict* resolves the verdict to one of the four
 `reflect-approval-*` triggers, and *Acknowledge Fulfillment* resolves its outcome to
@@ -4386,7 +4676,9 @@ and renaming — leaving the one §8 criterion about forward compatibility with 
 obligation is therefore stated here: **a consumer MUST tolerate an unknown `state` or event-type
 value**, treating it as "not one I act on" rather than as an error, and MUST NOT exhaustively
 match the enumeration. A consumer that cannot do so is not forward-compatible and its owner must
-say so before the set is extended ([DECISIONS.md](DECISIONS.md) D-69).
+say so before the set is extended ([DECISIONS.md](DECISIONS.md) D-69). This is obligation C3 of
+the [event consumer contract](#contract-01-event-consumer-contract), tested by its
+`unknown-state` and `unknown-event-type` corpus cases.
 
 **Stability zones**: the transition API of §3.3 and the event contract of §4.4 are the gear's two
 stability zones — additive changes are non-breaking, and removal or rename of a state, an event
@@ -4413,7 +4705,8 @@ why.
 **Identifier ownership.** This gear owns the namespace `orders` inside the `bss` package:
 `gts.cf.bss.orders.*`. Vendor `cf`, package `bss` and the version suffix follow the platform
 format; the `orders` namespace and every name under it are this gear's to allocate, and no other
-gear may define an identifier in it.
+gear may define an identifier in it. This is the GTS identifier namespace only; the gear's database
+namespace is `bss_orders` ([§3.7](#37-database-schemas--tables), D-183).
 
 <a id="contract-01-the-event-base-type-and-its-derived-types"></a>
 
@@ -4447,7 +4740,9 @@ on a closed shape.
 envelope's `properties.data` to the common order-summary contract. Each concrete schema further
 narrows that same member with its event-specific fields — the deciding authority on
 `OrderApproved`, the deciding authority and denial reason on `OrderRejected`, the failure reason
-and compensation evidence on `OrderFulfillmentFailed`, the cancel reason on `OrderCancelled`, the
+and compensation evidence on `OrderFulfillmentFailed` — whose schema admits the forced variant
+(`unknown` assertions, `operator_attestation`) and the optional `forcedReason` only with
+`failure_reason = operator-forced-unreconciled` (D-182) — the cancel reason on `OrderCancelled`, the
 hold reason on `OrderHeld` as an optional member present only when supplied (D-138, D-143), and the per-line subscription
 mapping on `OrderCompleted`. Orders schemas require `data` and the mandatory common and
 event-specific members. There is no wire member named `payload`; that word elsewhere denotes
@@ -4606,6 +4901,10 @@ pairs distinguish Orders reasons from similarly named failures in other gears.
 | `expiry-candidate-stale` | `EXPIRY_CANDIDATE_STALE` | Aborted | 409 |
 | `cancel-reason-required` | `CANCEL_REASON_REQUIRED` | InvalidArgument | 400 |
 | `direct-cancel-window-closed` | `DIRECT_CANCEL_WINDOW_CLOSED` | FailedPrecondition | 400 |
+| `forced-failure-reason-required` | `FORCED_FAILURE_REASON_REQUIRED` | InvalidArgument | 400 |
+| `spawn-signal-not-recorded` | `SPAWN_SIGNAL_NOT_RECORDED` | FailedPrecondition | 400 |
+| `overdue-window-not-elapsed` | `OVERDUE_WINDOW_NOT_ELAPSED` | FailedPrecondition | 400 |
+| `second-approver-required` | `SECOND_APPROVER_REQUIRED` | FailedPrecondition | 400 |
 | `order-not-found` | `ORDER_NOT_FOUND` | NotFound | 404 |
 | `delegation-proof-required` | `DELEGATION_PROOF_REQUIRED` | PermissionDenied | 403 |
 | `delegation-proof-invalid` | `DELEGATION_PROOF_INVALID` | PermissionDenied | 403 |
@@ -4615,6 +4914,10 @@ pairs distinguish Orders reasons from similarly named failures in other gears.
 | `cursor-invalid` | `CURSOR_INVALID` | InvalidArgument | 400 |
 | `read-store-unavailable` | `READ_STORE_UNAVAILABLE` | ServiceUnavailable | 503 |
 
+`second-approver-required` is the one refusal whose `context.data` carries `requestAuditId`, the
+refusal entry's own `audit_id`, which the engine allocates before settling so a replay returns the
+same value; a second operator names it to approve ([07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6), D-182, after Ledger's
+`DUAL_CONTROL_REQUIRED`). `operator-forced-unreconciled` is a `failure_reason` value, not a refusal.
 `authorization-failed-tolerated` is an admission risk flag, not an error variant; state/version
 audit reasons — the closed committed-entry tokens of §3.7 *Committed audit reason tokens*
 (D-148) — are also outside this refusal table.
@@ -5591,6 +5894,26 @@ that upstream enforcement is agreed — the same seam as the `SUB-O5` occupancy 
 against it in [UPSTREAM_REQS.md](UPSTREAM_REQS.md) — **the subscription axis is open, and
 this design does not bound it.** That is the honest statement and it replaces an earlier one.
 
+**Subscription-side cardinality is advisory at order time, and the path is gated on it (D-180).**
+A predicate-7 pass at submit and a `proceed` from the re-check are pre-checks, **not** admission
+guarantees, and no consumer — Workflow, a buyer surface, an operator report — **MAY** present
+either as one. Orders' own contribution to the open axis is narrow and stated: the claim index
+admits at most **one** in-flight order per `(payer_tenant_id, resource_tenant_id,
+overlap_scope_key)` (D-179), and while Subscriptions' occupancy answer is coarser than that tuple
+(per payer, as its `provenance` says) predicate 7 also counts this payer's *other* in-flight orders
+claiming the same key under another resource tenant ([03 §4.2](features/03-gate-and-pin.md#contract-03-4-2) predicate 7) — a pre-check over
+Orders-owned claim data, so two concurrent submits can still both pass it. The residual race is
+with entries into `active` that do not pass through Orders — a direct subscription, `resume`, an
+ownership `transfer`, a key-altering `changePlan`, each of which Subscriptions'
+`design/03-plan-changes.md` §4.4 already runs detection on — and only Subscriptions can close it,
+at the commit that writes `active`. Workflow **MUST** therefore handle `overlap-collision` on the
+failure-acknowledgement path ([06 §4.4](features/06-workflow-seam.md#contract-06-4-4), D-89) even after both checks passed. **The
+submit/activation path is not production-ready** until
+`cpt-cf-bss-orders-lifecycle-upreq-overlap-activation-atomicity` is agreed by Subscriptions and
+delivered; the recommended mechanism — an in-transaction slot claim mirroring
+[ADR-0007](ADR/0007-cpt-cf-bss-orders-lifecycle-adr-in-transaction-concurrency.md) — and the rejected ones are recorded with that ask in [UPSTREAM_REQS.md](UPSTREAM_REQS.md).
+Development against doubles is unaffected.
+
 **Why no timed window is stated.** An earlier version gave the proceed verdict a 30-second
 validity window and called the result "bounded rather than closed". Two of its four faults are
 design constraints a reader needs here, because they are why no *other* duration would work
@@ -5632,7 +5955,7 @@ as the closable form of this gap rather than adopted here.
 
 <a id="contract-03-the-default-overlap-key-collides-in-the-partner-path"></a>
 
-#### The default overlap key collides in the partner path
+#### The in-flight claim is scoped per resource tenant
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-constraint-overlap-key-partner-collision` (`p1`), defined in [§2.2 Slice constraints](#register-constraints).
 
@@ -5647,7 +5970,17 @@ place another, and a wedged order blocks the key until an operator clears it (AD
 refusal as "an order for this is already in progress" with a route to that order, rather than as a
 generic validation failure.
 
-The claim tuple remains `(payer_tenant_id, overlap_scope_key)`. The key is the one Subscriptions
+The claim tuple is `(payer_tenant_id, resource_tenant_id, overlap_scope_key)` (D-179). The
+payer-only form refused a partner's second order for the same product even when it was for a
+different customer, and the refusal — with its route to the conflicting order — told one customer
+that another customer under the same payer had an order in flight. Adding the resource tenant
+closes both: different customers never collide, and the conflicting order a refusal names always
+belongs to the caller's own resource tenant, so it is one the caller could already read under
+[08 §4.4](DESIGN.md#contract-08-4-4). The refusal **MUST NOT** name an order the caller cannot read. This
+follows the extra-dimension form Subscriptions already permits for its own key
+(`subscriptions/docs/design/03-plan-changes.md` §4.4: active subscriptions may coexist "when they
+differ on `overlapScopeKey` (extra dimensions)"), and the resource tenant is an immutable order
+axis after submit, not something Orders derives. The key is the one Subscriptions
 already defines and keys its own cardinality rule on: the registry-owned
 `catalogSubscriptionProductKey` of SUB-G1, "bound to a published SKU/product key" (D-163). Products
 no longer has a Product entity but still has SKUs, and resolve names each item's `sku_id` and
@@ -5658,8 +5991,18 @@ claims all of them; the owner may collapse them. Orders submits the prospective 
 Subscriptions' key operation (UPSTREAM_REQS §2.10) and stores the key(s) and provenance as answered;
 it never computes the key. Missing definition/SDK is `overlap-key-unavailable`; a successful no-key
 answer is `overlap-key-unresolvable`. Retain the resolved key with the accepted line and never
-rederive it at activation. The known partner collision is an unresolved business-policy question
-(Q-05), not permission for Orders to widen scope.
+rederive it at activation. Orders still never computes `overlap_scope_key`; the resource tenant is a
+separate claim column, not part of the key. The occupancy read predicate 7 consumes is asked for on
+the same tuple, with `resourceTenantId` as a default dimension of Subscriptions' key (`SUB-O5`
+amendment, `UPSTREAM_REQS.md` `…-upreq-overlap-presence-read`), so both halves of the rule and the
+activation commit count the same thing. Until Subscriptions enforces the resource dimension at its active commit, it answers on the tuple it
+enforces and says so in `provenance`; predicate 7 applies that answer as given, so a per-payer answer
+refuses a partner's second customer at cardinality one at submit when that customer's subscription
+is already `active` — and, because predicate 7's `proposed` also counts the lines of this payer's
+other in-flight orders claiming the same key under another resource tenant, when two such orders
+are in flight at once (D-180) — rather than passing either into an activation refusal. Orders never
+re-buckets a per-payer count locally (D-83: no local fork); the addend is its own claim data.
+Q-05 stays open for the Subscriptions-side default only.
 
 <a id="contract-03-the-order-time-total-is-incomplete-by-construction"></a>
 
@@ -5930,7 +6273,7 @@ An expired acceptance or exceeded aggregate capacity contributes `order-binding-
 |-------------------|---------------|---------|
 | `account-management` | SDK client (`AccountManagementClient::get_tenant`); commercial profile **unexposed today** | Tenant-axis validity through the existing `get_tenant`. The payer's commercial profile behind the order market has no Account Management operation — `cpt-cf-bss-orders-lifecycle-upreq-payer-commercial-profile`; until exposed the identity outcome is `identity-party-unavailable` |
 | `contracts` | SDK client — **unexposed today** | Contract status and party eligibility where a reference is present — the sole owner of party eligibility; the same operation also returns the contract's `acceptance_required` declaration, read by `05`'s acceptance guards outside the gate (D-132). The gear is specified but unimplemented, raised as `cpt-cf-bss-orders-lifecycle-upreq-contract-party-eligibility` and `cpt-cf-bss-orders-lifecycle-upreq-contract-acceptance-declaration`; until exposed the gate outcome is `contract-resolution-unavailable` and `05`'s acceptance outcome is `acceptance-requirement-unevaluable` |
-| `subscriptions` | SDK client | The overlap-occupancy read (`SUB-O5`, amended: `(activeCount, maxConcurrentActive, provenance)` per payer/key, D-126), unagreed and unimplemented |
+| `subscriptions` | SDK client | The overlap-occupancy read (`SUB-O5`, amended: `(activeCount, maxConcurrentActive, provenance)` per payer/resource tenant/key, D-126, D-179), unagreed and unimplemented. Subscription-side cardinality is **advisory at order time**: a predicate-7 or re-check pass is not an admission guarantee, and Workflow **MUST** handle `overlap-collision` on the failure-acknowledgement path (D-89). Enforcement is owed by `cpt-cf-bss-orders-lifecycle-upreq-overlap-activation-atomicity`; the submit/activation path is not production-ready before it is agreed and delivered (D-180) |
 | Billing-chain tax owner | SDK client | The indicative tax figure Preview returns and never stores |
 
 **Dependency Rules** (per project conventions):
@@ -6281,8 +6624,8 @@ other branch: if Pricing adds a hold, the activation read passes `hold_until = a
 the `accepted-price-mismatch` path becomes unreachable and fixture F-B2 expects 10; if Pricing
 declines, D-162 stands and F-B2 expects `order-binding-expired`.
 
-A hold or resume changes no deadline. State TTLs may be unset and fulfillment is expiry-exempt;
-they do not bound commercial validity. Before fulfillment, a fresh assessment uses the existing
+A hold or resume changes no deadline. State TTLs are restartable dwell budgets (provisional
+values, D-181) and fulfillment is expiry-exempt; they do not bound commercial validity. Before fulfillment, a fresh assessment uses the existing
 admissible amendment path and re-obtains approval/acceptance for the new version. During fulfillment,
 a refused comparison or a passed deadline stops further dispatch and requires void of drafts and
 compensation of already activated subscriptions before `acknowledge-failed` with
@@ -6789,7 +7132,7 @@ the version chain. That column holds only these machine reasons; what a caller w
 hold reason, the amendment explanation, a failure reason — goes in `caller_reason` ([01 §3.7](DESIGN.md#contract-01-3-7), D-143). Two of those five append a version **without** publishing `OrderAmended`,
 against PRD §6.5's stated trigger of "on creation of a new order version": creation is event-less
 and submit publishes `OrderSubmitted`. `OrderAmended` fires only on rows 18, 19 and 20
-([01 §4.4](DESIGN.md#contract-01-4-4)), and the §6.5 wording is routed as Q-25. A consumer reconstructing the commercial trail keyed on the PRD's list finds
+([01 §4.4](DESIGN.md#contract-01-4-4)), and the §6.5 wording is routed as Q-41 (split from Q-25, D-186). A consumer reconstructing the commercial trail keyed on the PRD's list finds
 six of eight values on the audit row rather than the version row; the split is stated here so the
 two are not read as one vocabulary ([DECISIONS.md](DECISIONS.md) D-82).
 
@@ -7046,19 +7389,20 @@ from the order document alone, and process visibility is the sibling gear's to p
 
 <a id="contract-05-a-declined-instrument-exits-by-expiry-and-only-where-the-ttl-is-set"></a>
 
-#### A declined instrument exits by expiry, and only where the TTL is set
+#### A declined instrument exits by expiry at the `approved` TTL
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-constraint-declined-instrument-exit` (`p1`), defined in [§2.2 Slice constraints](#register-constraints).
 
 Where authorization fails and the seller has not elected tolerate-failure, Lifecycle refuses
 begin-fulfillment and the order remains `approved` until its TTL elapses. Two qualifications, and both are
-this constraint's real content rather than footnotes. The `approved` TTL is a **Product-owned open
-question with no code default**, so **while it is unset this order has no automatic exit at all** —
-only a caller-driven cancel retires it ([07-hold-and-expiry — Policy values (open)](DESIGN.md#contract-07-4-5)). And
-where it *is* set, the **two re-entry caps** of [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2) are what stop a hold/resume or amendment
+this constraint's real content rather than footnotes. The `approved` TTL is a **Product-owned
+value shipped provisionally at 30 days** as a revisioned platform policy row, and the policy
+channel refuses an unset value in production, so this order always has its automatic exit
+([07-hold-and-expiry — Policy values (open)](DESIGN.md#contract-07-4-5), `DECISIONS.md` D-181); an
+unset value — non-production only — would leave only a caller-driven cancel. And the **two re-entry caps** of [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2) are what stop a hold/resume or amendment
 cycle restarting dwell without limit. The configured pre-fulfillment dwell budgets sum to at
-most `74 × T_max` under [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2)'s assumptions, plus scheduler delay; this is not an unconditional
-calendar exit bound (`DECISIONS.md` D-90). There is no re-authorize
+most `74 × T_max` under [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2)'s assumptions — 2,220 days at the provisional values — plus
+scheduler delay (`DECISIONS.md` D-90, D-181). There is no re-authorize
 operation, no payment failure event and no order-visible outcome, because there is no Payments
 capability to supply one. This is routed as [DECISIONS.md](DECISIONS.md) Q-08 — the PRD
 carries **no** §15 row for it — and stated as a designed limitation rather
@@ -7341,9 +7685,10 @@ instrument, and refund-as-reversal have no owning capability.
 Two consequences follow and are recorded rather than discovered. A **declined instrument** leaves
 the order `approved` with no payment event, no re-authorize operation and expiry as its only
 automatic exit, indistinguishable from a healthy order awaiting its next process step.
-**Compounded with the unset TTL of `DECISIONS.md` Q-27 it has no automatic exit at all**, and
-only a caller-driven cancel retires it — so the two open questions interact, and Q-08 should not be
-read as "the order expires eventually" while Q-06 is unanswered. The Workflow manual-task
+That exit is the `approved` TTL, provisionally **30 days** and never unset in production
+(`DECISIONS.md` D-181, which closed Q-27's no-exit case), so Q-08's order does expire; how soon is
+Product's Q-06 value to confirm, and a hold/resume or amendment cycle can restart it only within
+the caps. The Workflow manual-task
 escalation required by §4.3 makes this wait actionable to operators once that upstream path
 exists, but adds no payment outcome to the order document and no customer re-authorization
 surface. Those missing capabilities remain launch-relevant prerequisites; specifying process
@@ -7760,7 +8105,9 @@ mandatory-cancel-reason refusal `cancel-reason-required` are owned and registere
 refuses with the specific reasons of [05-preconditions — API Contracts](DESIGN.md#contract-05-3-3), which this
 slice composes and does not rename (D-134). `line-execution-failed` and `dependency-graph-invalid`
 are values of the closed `failure_reason` enumeration of §4.4, not refusal reasons: no guard
-refuses with them. The activation re-check codes — market-divergence and overlap-collision — are
+refuses with them. The same holds for `operator-forced-unreconciled`, which only 07's
+`force-fail-unreconciled` writes and which this slice's boundary rejects as `request-invalid` on a
+`/fulfillment-acknowledgement` (D-182). The activation re-check codes — market-divergence and overlap-collision — are
 Workflow-supplied failure reasons carried on `acknowledge-failed`; they are owned and registered
 by [03-gate-and-pin — API Contracts](DESIGN.md#contract-03-3-3), and this slice does not run the re-check. A
 re-check `defer` whose `activation-recheck-retry-budget` is exhausted carries the port's own
@@ -7847,7 +8194,9 @@ one requirement verdict and one gate outcome may stand per version. `requirement
 failure-acknowledgement or workflow-cancel transition, under the closed five-member schema of
 [01-foundation — Database Schemas and Tables](DESIGN.md#contract-01-3-7): `drafts_voided`, `activated_rolled_back`,
 `activation_dispatched`, `at_sale_facts_emitted` and `no_active_subscription_remains`. Lifecycle
-validates that structure only and never reconciles the lists against Subscriptions.
+validates that structure only and never reconciles the lists against Subscriptions. The forced
+variant with `unknown` assertions and `operator_attestation` is written only by 07's
+operator-forced exit, never by this slice, whose evidence guards refuse it (D-182).
 
 **Additional info**: superseded versions' reflections are retained, so the trail shows what was
 decided against a version that no longer stands.
@@ -7905,6 +8254,11 @@ Two of them are rows from `on_hold` as well: fulfillment acknowledgement's faile
 row 27) are admitted from `on_hold` only when the stored pre-hold state is `in_fulfillment`, under
 the guards of rows 14 and 16 unchanged. `acknowledge-completed` has no `on_hold` row, so a held
 order **MUST** be resumed before it completes ([DECISIONS.md](DECISIONS.md) D-109).
+
+`fulfillment_failed` has one entry that is **not** a seam operation: 07's operator-forced
+unreconciled failure (rows 28 and 29), a human two-person trigger outside the workflow-trigger
+class, taken when the order is overdue post-spawn and this seam cannot deliver complete evidence.
+It is the repair-as-a-row rule below applied, not an exception to it ([DECISIONS.md](DECISIONS.md) D-182).
 
 No operation **MAY** be added that sets order state without passing a guard, for any purpose
 including data repair. A repair need becomes a new transition row with its own guard and reason.
@@ -7990,7 +8344,10 @@ needs amendment; the Lifecycle seam does not assume the missing behavior exists.
 
 The seventh ask is `cpt-cf-bss-orders-lifecycle-upreq-overlap-activation-atomicity`: Subscriptions
 must re-evaluate `overlapScopeKey` atomically with committing `active`. Until it does, the §4.3
-activation re-check is an early abort only, with no admission guarantee (D-89).
+activation re-check is an early abort only, with no admission guarantee (D-89), subscription-side
+cardinality is advisory at order time, and the submit/activation path is not production-ready
+(D-180). The mechanism recommended to Subscriptions is an in-transaction slot claim mirroring
+ADR-0007; a `coord` lease and toolkit-db advisory locks are rejected (UPSTREAM_REQS §2.1).
 
 **Reconciled on the Workflow side (2026-10-02).** The Workflow branch (`bss/orders-workflow` @
 `3ccf7793c`) registers the provisioning-intent contract as `SUB-O11`…`SUB-O16`: an envelope with
@@ -8015,12 +8372,12 @@ D-172 and receipt retention under D-173.
 <!-- contract:07-hold-and-expiry:1.1 -->
 ### Hold and expiry: Architectural Vision
 
-This slice owns time. It pauses an order and resumes it to exactly where it was, bounds an
-in-flight state by a per-state time-to-live where one is configured, caps how many times an order
+This slice owns time. It pauses an order and resumes it to exactly where it was, bounds every
+in-flight state by a per-state time-to-live, caps how many times an order
 may be resumed so the dwell cannot be restarted without limit, sweeps abandoned drafts, and — for
 the one state it must not bound — hands off to an operational escalation owned elsewhere
-([PRD.md](PRD.md) §6.3). Where a TTL is unset the state is unbounded, and §4.2 says so
-rather than asserting a backstop this design cannot enforce.
+([PRD.md](PRD.md) §6.3). The TTL values ship as provisional, revisioned policy rows that
+Product refines, and a production deployment cannot carry an unset one (§4.2, D-181).
 
 The reason bounded lifetime matters is commercial rather than hygienic. An order sitting
 indefinitely in `submitted` pins a catalog price, holds an open promise to a customer, and
@@ -8033,18 +8390,26 @@ resources with nothing to compensate them. The same exemption covers a hold take
 `in_fulfillment`. This is the single place in the design where the bounded-lifetime rule is
 deliberately broken, and the engine enforces the exemption through row admissibility and a
 registered guard — so a scheduler defect cannot expire such an order, and the bound becomes an operational
-SLA raised by the sibling gear instead of an automatic transition.
+SLA raised by the sibling gear instead of an automatic transition. That SLA has an owner and a
+bounded end: Orders observes overdue fulfillment itself (§3.8), Workflow's escalation is a release
+prerequisite, and once the window has elapsed post-spawn a requester and a distinct approver may
+force the order to `fulfillment_failed` with compensation recorded as `unknown` — an operator act,
+never an automatic one (D-182).
 
 The bound has **two layers**, and they answer different questions. The **per-state TTL** is
-Product-owned configuration with no code default, so it is only in force where it has been
-configured. The **re-entry caps** are design-owned baselines on how many times one order may
+Product-owned configuration with no code default: its values ship as **provisional
+migration-seeded rows** (`draft` 90 days, `submitted` and `pending_approval` 14 days, `approved`
+and `on_hold` 30 days) that Product refines by policy revision, and the policy channel refuses an
+unset value in production (D-181). The **re-entry caps** are design-owned baselines on how many times one order may
 restart a dwell — **5** resumes and **20** amendments, enforced as guards on those transitions
 themselves. They exist because a per-state TTL alone bounds nothing an actor can restart: both
 resume and amendment rewrite the dwell input, so either loop was an unbounded lifetime available
 to a permitted actor. With both caps in force an order makes at most **74** TTL-covered pre-fulfillment dwell entries. Their configured budgets sum to at most
-`74 × T_max`, excluding scheduler delay and fulfillment-exempt states; §4.2 gives all assumptions. Where one is **not** configured, that state has no bound at all and the cap does not
-supply one — §4.2 states that residual gap rather than papering over it, which is the difference
-between these two layers and the absolute-lifetime backstop an earlier draft claimed.
+`74 × T_max` — 74 × 30 = 2,220 days at the provisional values — excluding scheduler delay and
+fulfillment-exempt states; §4.2 gives all assumptions. Because every expirable state is finite in
+production, that sum is a real bound rather than `74 × ∞`; only a non-production environment may
+leave a state unset, and there the cap supplies no bound — which is the difference between these
+two layers and the absolute-lifetime backstop an earlier draft claimed.
 
 Hold is narrower than it first appears, and the narrowness is the design. A hold changes **only
 the order**. Already-activated subscriptions keep serving and keep billing, the term does not
@@ -8067,7 +8432,7 @@ compliance hold silently stop a customer's billing.
 | Requirement | Design Response |
 |-------------|------------------|
 | `cpt-cf-bss-orders-lifecycle-fr-order-hold` | Hold stores the outgoing state on the aggregate; resume reads it as the target. The actor, instant and optional reason live on the hold transition's audit entry, not in hold columns (D-138). Resume is a lookup, not an inference, so a state added later cannot break resume. |
-| `cpt-cf-bss-orders-lifecycle-fr-order-expiry` | Expiry is an ordinary transition row with the system actor class, driven by one sweep pass over a per-state TTL that holds where configured. Restarting a dwell is bounded separately, by a cap on the resume transition rather than by a second sweep. `in_fulfillment` has no expiry row; the existing `on_hold` expiry row has a mandatory pre-hold exemption guard. Where a TTL is unset the state is unbounded, disclosed in §4.2 and alerted in §3.8. |
+| `cpt-cf-bss-orders-lifecycle-fr-order-expiry` | The `in_fulfillment` exemption ends in a bounded, operator-owned recovery: an Orders overdue gauge and alert, Workflow's overdue escalation as a release prerequisite, and the two-person operator-forced `fulfillment_failed` of rows 28 and 29 after the window (D-182), so exhausting the SLA still never auto-terminals an order. Expiry is an ordinary transition row with the system actor class, driven by one sweep pass over a per-state TTL that ships as a provisional, revisioned platform row for every expirable state and cannot be promoted unset to production (D-181). Restarting a dwell is bounded separately, by caps on the resume and amendment transitions rather than by a second sweep. `in_fulfillment` has no expiry row; the existing `on_hold` expiry row has a mandatory pre-hold exemption guard. A provisional value in effect is alerted in §3.8. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-cancel` | Cancel from `on_hold` applies the **pre-hold** state's guards, so a hold cannot be used to widen what cancellation is permitted. |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-retention` | The abandoned-draft sweep auto-voids to `expired` rather than deleting, preserving the audit trail. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-events` | Expiry publishes `OrderExpired`; hold and resume publish `OrderHeld` and `OrderResumed`, which is how the sibling gear knows to suspend or resume its process. |
@@ -8195,8 +8560,10 @@ Neither `in_fulfillment` nor a hold taken from it may be auto-expired, because a
 may already have been issued and expiry would orphan provisioned resources with no compensation.
 Its bound is an **operational SLA** — a configurable window with a business default of 24 hours
 past expected fulfillment time, with the fulfillment operator as named owner — raised by the
-sibling gear. Exhausting the SLA **MUST NOT** produce a new order state; the outcome is an
-incident or an operator abort.
+sibling gear. Exhausting the SLA **MUST NOT** produce a new order state and **MUST NOT**
+auto-terminal the order; the outcome is an incident or an operator abort. The operator abort is
+the two-person `force-fail-unreconciled` of rows 28 and 29, which lands in the existing
+`fulfillment_failed` with compensation recorded as `unknown` (D-182).
 
 <a id="contract-07-hold-does-not-pause-the-subscriptions-draft-ttl"></a>
 
@@ -8212,14 +8579,37 @@ otherwise.
 
 <a id="contract-07-ttl-values-are-unchosen"></a>
 
-#### TTL values are unchosen
+#### TTL values are provisional
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-constraint-ttl-values-unchosen` (`p1`), defined in [§2.2 Slice constraints](#register-constraints).
 
 The per-state TTL defaults, the draft auto-void TTL and the override scope —
 platform versus seller — are all PRD open questions owned by Product. This slice specifies the
-**policy model** and leaves the numbers as configuration with no code default, because a code
-default would quietly become the answer. The override mechanism is specified and ready, but it
+**policy model** and takes **no code default**, because a constant in code would quietly become
+the answer. It does ship **provisional values as data** ([DECISIONS.md](DECISIONS.md) D-181): the
+migration seeds the five permanent platform rows of §3.7 with `draft` **90 days**, `submitted`
+**14 days**, `pending_approval` **14 days**, `approved` **30 days** and `on_hold` **30 days**, at
+`policy_revision` 1 with `provisional = true`. Product refines any of them under Q-06 or Q-07(b) by
+promoting a new revision through the policy channel, which sets `provisional = false`; no code or
+design change follows. This is the Subscriptions posture for its own draft TTL — a 90-day platform
+default shipped while Product's value is TBD (`gears/bss/subscriptions/docs/PRD.md` §15, SUB-D-11
+amendment) — and the Orders posture for unset elections, which read as their safe value
+([05 §3.7](DESIGN.md#contract-05-3-7)). The values are deliberately long so that a
+provisional bound expires only orders that are genuinely abandoned: `submitted` and
+`pending_approval` at 14 days exceed the sibling gear's 72-hour default approval escalation
+(`gears/bss/orders-workflow/docs/PRD.md` §6.2 *Escalation Timer*) several times over, and `approved` and `on_hold` at
+30 days leave a declined instrument or a compliance hold a full month.
+
+**A production deployment cannot run with a TTL unset.** The policy channel's promotion
+validation **MUST** refuse any `orders_state_ttl_policy` row whose `ttl_duration` is NULL when the
+target environment is production, as it already refuses seller rows while
+`ttl_seller_override_enabled` is off (§3.7, D-137). This is a **release gate**, not a readiness
+condition: the running gear **MUST NOT** report not-ready, refuse to start or stop serving because
+of a TTL value, since platform readiness means "can serve traffic"
+(`docs/arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md`) and an unanswered Product
+question must not become an outage (D-90). `ttl_duration` stays nullable for **non-production**
+environments only, where an unset scope is skipped by the sweep (§3.6 step 2.2). The override
+mechanism is specified and ready, but it
 ships disabled: the gear-level `ttl_seller_override_enabled` flag defaults to **off**, so only
 platform rows take effect until Product answers Q-06, and that answer becomes configuration
 rather than a design change ([DECISIONS.md](DECISIONS.md) D-137).
@@ -8233,13 +8623,17 @@ per-state TTL Product later chooses, whatever those TTLs turn out to be. The ame
 value is additionally a **commercial** judgment about how often a buyer may revise an order, which
 is why [04 §4.1](features/04-versioning.md#contract-04-4-1) owns and argues it rather than this section.
 
-**What remains unbounded, and it is a Product dependency and not a design gap to close here.**
-Where no TTL is configured for a state, that state has **no bound**: the per-state pass skips it
-(§3.6) and the re-entry caps bound restarts of a dwell that is itself unbounded, so `74 × ∞` is
-still ∞. An earlier draft covered this with an absolute order lifetime measured from `created_at`;
-§4.2 records why that backstop was withdrawn rather than kept. Until PRD §15 row 7 is answered the
-gap is **disclosed** — surfaced as the no-configured-TTL metric and alert of §3.8 — rather than
-claimed closed.
+**What the provisional values close, and what stays Product's.** With every expirable state
+finite in production the caps bound total dwell rather than multiplying an unbounded one: at the
+provisional values `74 × T_max` is 74 × 30 = **2,220 days** of configured dwell plus scheduler
+delay, and `draft` lives at most 90 days from `created_at` (§4.2). That figure is long because
+the values are deliberately conservative; shortening it is Product's lever, by policy revision, and
+the §3.8 **provisional-default** gauge and alert keep the fact that Product has not yet confirmed
+them visible rather than letting the provisional numbers pass as the answer. An earlier draft
+closed the gap with an absolute order lifetime measured from `created_at`; §4.2 records why that
+backstop was withdrawn and is not reintroduced. A NULL row found in production can arise only by
+bypassing the channel with database privilege; the sweep then still skips it rather than invent a
+value, and §3.8 pages on it as an integrity condition.
 
 
 <!-- /contract -->
@@ -8262,8 +8656,9 @@ and no guard requires it, unlike the mandatory cancel reason of §4.6.
 
 The per-state time-to-live configuration: the state it bounds, its duration, and its
 configuration scope. Resolved at sweep time rather than stored per order, so a policy change
-takes effect on orders already in flight. It is **per-state and optional**; where it is unset the
-state is unbounded, and the re-entry caps limit restarts rather than supplying a duration.
+takes effect on orders already in flight. It is **per-state** and ships a provisional platform
+value for every state, which Product refines by revision; it may be unset only outside production
+(D-181), and the re-entry caps limit restarts rather than supplying a duration.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-entity-resume-cap` (`p1`), defined in [§3.1 Slice entities](#register-entities).
 
@@ -8308,8 +8703,9 @@ and the alternative to a pause is cancelling an order the seller intends to keep
 ##### Responsibility scope
 
 Hold admissibility from `submitted`, `pending_approval`, `approved` and `in_fulfillment`;
-reliance on the engine's storage of the pre-hold state; resume to that stored state; and the cancel-from-`on_hold` path
-that applies the pre-hold state's guards.
+reliance on the engine's storage of the pre-hold state; resume to that stored state; the cancel-from-`on_hold` path
+that applies the pre-hold state's guards; and the `/forced-failure` handler, whose guards gate the
+two-person operator-forced exit of rows 28 and 29 (D-182).
 
 <a id="contract-07-responsibility-boundaries-2"></a>
 
@@ -8342,8 +8738,9 @@ concurrently would double-expire orders.
 ##### Responsibility scope
 
 The advisory-lock-coordinated sweep ([Foundation contract §3.8](DESIGN.md#contract-01-3-8)); TTL policy resolution per state; selection of eligible orders;
-deterministic idempotency keys per expiry; and the batch and cadence controls. It has **one**
-selection pass — the restart bound lives on the resume transition, not here (§4.2).
+deterministic idempotency keys per expiry; the batch and cadence controls; and, on every pass
+independently of any TTL value, the read-only overdue-fulfillment observation of §3.8
+(D-182). It has **one** selection pass — the restart bound lives on the resume transition, not here (§4.2).
 
 <a id="contract-07-responsibility-boundaries-2"></a>
 
@@ -8351,7 +8748,8 @@ selection pass — the restart bound lives on the resume transition, not here (�
 
 Its SQL excludes exempt holds before pagination to preserve progress, while the engine's
 admissibility check and pre-hold guard independently refuse exempt targets regardless of what
-the sweep selects. It raises no escalation; that is the sibling gear's.
+the sweep selects. It raises no escalation and drives no transition on an overdue order; it
+publishes the gauge, and the escalation is the sibling gear's.
 
 <a id="contract-07-related-components-by-id-2"></a>
 
@@ -8378,8 +8776,9 @@ what a buyer nearly bought.
 ##### Responsibility scope
 
 The advisory-lock-coordinated sweep over `draft` orders past their auto-void TTL, and the auto-void
-transition to `expired` that keeps them readable. Where that TTL is unset the sweep does no work
-and `draft` accumulation is unbounded (§4.4).
+transition to `expired` that keeps them readable. The TTL ships provisionally at 90 days and
+cannot be promoted unset to production (D-181); only in a non-production environment that leaves
+it unset does the sweep do no work and `draft` accumulate without bound (§4.4).
 
 <a id="contract-07-responsibility-boundaries-2"></a>
 
@@ -8411,6 +8810,7 @@ It deletes nothing and touches no order past `draft`.
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/cancel` | Cancel from any non-terminal state, per guards | unstable |
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/hold` | Pause from an eligible state, storing the outgoing state | unstable |
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/resume` | Return to the stored pre-hold state | unstable |
+| `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/forced-failure` | Two-person operator-forced `fulfillment_failed` from an overdue post-spawn `in_fulfillment` (or a hold over it), compensation recorded as `unknown`; the requester's call refuses `second-approver-required` and returns `requestAuditId`, the approver's call names it (D-182) | unstable |
 
 **State expiry is deliberately not a public operation.** It is scheduler-driven with the system
 as actor class, which is what makes "who expired this order" answerable as `system` rather than
@@ -8419,7 +8819,10 @@ as whichever caller happened to trigger it.
 **Reasons contributed to the registry**: resume-target-missing,
 **resume-cap-exhausted**, **cancel-reason-required**,
 **direct-cancel-window-closed** (shared with the seam slice, defined once here),
-**expiry-exempt-prehold**, **expiry-not-due**, **expiry-candidate-stale**.
+**expiry-exempt-prehold**, **expiry-not-due**, **expiry-candidate-stale**, and for the forced
+exit **forced-failure-reason-required**, **spawn-signal-not-recorded**,
+**overdue-window-not-elapsed** and **second-approver-required** (D-182); the forced exit reuses
+06's `prehold-not-in-fulfillment` unchanged on row 29.
 `expiry-exempt-prehold` is the row-24 guard refusal for a hold from `in_fulfillment`.
 `expiry-not-due` means the current effective TTL is absent or has not elapsed.
 `expiry-candidate-stale` means the observed generation or effective policy identity/revision no
@@ -8462,7 +8865,7 @@ last, in 2026-09-11: a resume against an order that is not `on_hold` is an inadm
 
 None. Both sweeps are internal and neither reaches outside the gear. The `in_fulfillment`
 escalation is raised by the sibling gear, which learns what it needs from the state events this
-slice publishes.
+slice publishes; the forced exit's guard inputs are all stored Orders data (D-182).
 
 
 <!-- /contract -->
@@ -8489,7 +8892,8 @@ relative to [01-foundation — Database Schemas and Tables](DESIGN.md#contract-0
 | scope | enum | `platform` or `seller` |
 | seller_tenant_id | uuid, nullable | NULL for a platform-scope policy |
 | state | enum | The bounded state: `submitted`, `pending_approval`, `approved`, `on_hold`, or `draft` for the auto-void sweep |
-| ttl_duration | interval, nullable | Positive bound when present; NULL means unset for the permanent platform row. Seller override rows require a positive non-NULL duration; removing one restores platform fallback |
+| ttl_duration | interval, nullable | Positive bound when present; NULL means unset for the permanent platform row, admitted in non-production environments only — the policy channel refuses to promote a NULL duration to production (D-181). Seller override rows require a positive non-NULL duration; removing one restores platform fallback |
+| provisional | boolean | `true` while the platform row carries the design-seeded provisional value rather than a Product-confirmed one; seeded `true`, set `false` by the promotion that carries Product's value. Always `false` on seller rows. Read by the §3.8 provisional-default gauge; it changes no sweep or engine behaviour (D-181) |
 | policy_revision | bigint | Positive revision. Increment a changed row's revision atomically; also increment the permanent platform row's revision on every seller override insertion, update or deletion for this state. Re-creating a deleted seller override uses a fresh `policy_id` |
 | updated_by, updated_at | text, timestamptz | Audit of the policy change itself |
 
@@ -8501,9 +8905,12 @@ permitting duplicate platform policies ([DECISIONS.md](DECISIONS.md) D-28);
 `seller_tenant_id` NOT NULL exactly when `scope` is `seller`; `state` **MUST NOT** be
 `in_fulfillment` — the exemption is a schema constraint as well as a missing transition row, so a
 policy cannot be authored for it. `policy_revision > 0`; `ttl_duration IS NULL` is permitted only
-for platform scope, and a non-NULL duration must be positive. The platform-scope row for each
-of the five admitted states is created by migration with an unset duration and revision 1;
-its identity/scope/state are immutable and it **MUST NOT** be deleted. Startup checks all five
+for platform scope, and a non-NULL duration must be positive; `provisional` is `false` whenever
+`scope` is `seller`. The platform-scope row for each
+of the five admitted states is created by migration with its **provisional duration** — `draft`
+`90 days`, `submitted` `14 days`, `pending_approval` `14 days`, `approved` `30 days`, `on_hold`
+`30 days` — `provisional = true` and revision 1 (D-181); these are seeded data, not code
+constants, and any later value is a promoted revision. Its identity/scope/state are immutable and it **MUST NOT** be deleted. Startup checks all five
 rows exist; a missing row is a configuration-integrity failure, not an unset TTL. Existing
 `NULLS NOT DISTINCT` uniqueness ensures exactly one platform row per state once seeded.
 
@@ -8539,10 +8946,15 @@ seller pass of §3.6 step 2.3, the fallback exclusion of step 2.3a, the draft pa
 in-transaction re-read — ignores every `scope = seller` row, so the seller pass selects nothing and
 the platform rows are effective for every seller. Turning the flag off after seller rows were
 promoted therefore reverts to the platform rows without deleting them. There is **no code
-default** for any per-state TTL; an unconfigured effective scope is not swept, so an unset duration is
-visible as the no-configured-TTL gauge and alert of §3.8 rather than as a silently applied
-constant. It is **not** covered by a fallback duration — §4.2 states why the absolute-lifetime
-backstop that would have supplied one was withdrawn.
+default** for any per-state TTL: the provisional values are the migration-seeded rows above, so
+every value in force is a visible, revisioned row and an expiry's evidence names the
+`policy_revision` it ran under. The same promotion validation **refuses any row with a NULL
+`ttl_duration` bound for production** (D-181), so an unset effective scope exists only in
+non-production, where it is not swept and shows as the no-configured-TTL gauge of §3.8. A NULL
+row observed in production means the channel was bypassed; the sweep still skips it rather than
+apply a constant, §3.8 pages on it, and readiness is unaffected. It is **not** covered by a
+fallback duration — §4.2 states why the absolute-lifetime backstop that would have supplied one
+was withdrawn.
 
 The **resume cap is not a row in this table.** It is a single gear-level configuration value,
 platform-scoped, and the table's `state` enum admits no value for it — because it bounds a count
@@ -8576,24 +8988,47 @@ Inherited from [01-foundation — Deployment Topology](DESIGN.md#contract-01-3-8
 advisory-lock-coordinated workers owned here: the **expiry sweep** and the **draft auto-void sweep**. Both
 take session advisory locks to coordinate discovery. Engine row locks, guards and idempotency
 prevent duplicate effects even if a lock session is lost and passes overlap. Both are idle-cheap: a sweep
-with no configured TTL does no work at all.
+with no due candidate does no work, and in a non-production environment that leaves a TTL unset
+the sweep skips that scope entirely.
 
 **Observability owned here**: expiry counts per state per sweep, sweep duration, last completed
 pass, oldest due candidate and batch saturation, a **sweep-error count** of worker-defect refusals (`idempotency-mismatch`, `authorization-context-changed`) for both sweeps, plus separately scoped counts of **exempt holds**
 (excluded before the page limit, never counted as successful expiry) and guard-race refusals for holds
-taken from `in_fulfillment`, the number of states with **no configured TTL** — the signal that a
-Product-owned value is still unset and those orders are **unbounded**, which is the residual gap
-§4.2 discloses — cancel counts by actor class and reason, hold duration distribution (the hold instant read from
+taken from `in_fulfillment`, the number of states whose effective platform row is still
+**`provisional`** — the signal that a Product-owned value has not been confirmed and the
+design-seeded value of D-181 is the one expiring orders — and, separately, the number of scopes
+with **no configured TTL**, which only a non-production environment may legitimately show
+(D-181), cancel counts by actor class and reason, hold duration distribution (the hold instant read from
 the hold transition's audit entry, or from `state_entered_at` while the order is still `on_hold`;
 D-138), the **hold
 cycles per order** distribution, and the count of `resume` transitions **refused as
 `resume-cap-exhausted`**, which is how the restart bound firing becomes visible rather than
 inferred. Alerts fire on a sweep
 failing to acquire its advisory lock for longer than two cadences, on batch saturation persisting (the
-sweep is falling behind), on any state having no configured TTL in a production environment, and
-on any **`resume-cap-exhausted` refusal** at all — because the cap is a backstop, so a non-zero rate
-means either a per-state TTL is missing or an order is being held and resumed in a loop, and both
-are conditions someone should look at rather than metrics to watch drift.
+sweep is falling behind), on any state running on a **provisional default in production** (a
+standing, non-paging alert owned by Product that clears when the confirming revision is promoted),
+on any state having **no configured TTL in a production environment** (paging: the policy channel
+refuses that promotion, so it means the channel was bypassed — a configuration-integrity
+condition, not a readiness one), and on any **`resume-cap-exhausted` refusal** at all — because the
+cap is a backstop, so a non-zero rate means an order is being held and resumed in a loop, which is
+a condition someone should look at rather than a metric to watch drift. A failed read of the
+policy configuration is reported as a health signal of the worker, never as an unset or
+provisional value.
+
+**Overdue fulfillment (D-182).** On every pass, independently of any TTL value, the expiry worker computes
+two gauges over orders in `in_fulfillment` or `on_hold` with `pre_hold_state = in_fulfillment`:
+`fulfillment_overdue_orders`, the count whose database time is past expected fulfillment time plus
+the overdue window of §4.5, and `fulfillment_overdue_oldest_age_seconds`, the oldest such
+overrun. Expected fulfillment time is derived as in [07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6) *Force Fail Unreconciled*, never stored.
+The query is read-only, keyset-bounded on the `(state, state_entered_at, order_id)` index and
+drives no transition. **The alert fires while the count is non-zero**, routed to the fulfillment
+operator with the order IDs and ages; it is Orders' own evidence that Workflow's escalation
+(`cpt-cf-bss-orders-lifecycle-upreq-workflow-overdue-escalation`) is owed, and its threshold,
+routing and owner **MUST** be configured and tested before production, as for §4.4's delivery
+alerts. The forced exit adds a counter of `second-approver-required` refusals (a pending forced
+request) and a counter of committed `force-fail-unreconciled` transitions; **every committed one
+alerts individually**, carrying requester, approver and order, because each closes an order whose
+compensation is unknown.
 
 
 <!-- /contract -->
@@ -8604,18 +9039,21 @@ are conditions someone should look at rather than metrics to watch drift.
 ### Hold and expiry: Policy values (open)
 
 Two groups, distinguished because they have different owners. **PRD open questions owned by
-Product**, each cited by its §15 row:
+Product**, each cited by its §15 row. The durations ship **provisional** — migration-seeded
+platform rows at `policy_revision` 1 with `provisional = true`, not code constants
+([DECISIONS.md](DECISIONS.md) D-181) — and Product's answer is a promoted revision:
 
-| Value | PRD §15 row | Note |
-|-------|-------------|------|
-| `submitted` TTL | row 7 | Must exceed the sibling gear's escalation lead time, since expiry bounds the fail-closed park |
-| `pending_approval` TTL | row 7 | Should relate to the sibling gear's 72-hour default approval escalation window |
-| `approved` TTL | row 7 | The **ordinary** exit for a declined payment instrument, per [05-preconditions — What this design cannot express (normative statement of limitation)](DESIGN.md#contract-05-4-4) — and, while this value is unset, that order's **only** exit is a caller-driven cancel. The resume cap below stops a hold/resume cycle from restarting the TTL without limit, but it supplies no exit where the TTL itself is absent. This is the sharpest consequence of leaving this one value unset, and [05 §4.4](DESIGN.md#contract-05-4-4) states it from the other side |
-| `on_hold` TTL | row 7 | The PRD names this the worst case, being deliberately open-ended in intent |
-| Override scope | row 7 | Whether seller scope may override platform scope per state. The mechanism is specified (§3.6, §3.7) and ready; it ships behind `ttl_seller_override_enabled`, default **off**, so the open choice is answered by turning the flag on or leaving it off ([DECISIONS.md](DECISIONS.md) D-137, Q-06) |
-| `draft` auto-void TTL | row 5 | Bounds unbounded basket accumulation; the same row carries the program retention period, tracked as [DECISIONS.md](DECISIONS.md) Q-07. While unset, the draft sweep does no work and `draft` accumulation is **unbounded** — there is no fallback duration (§4.4) |
+| Value | PRD §15 row | Provisional (D-181) | Note |
+|-------|-------------|---------------------|------|
+| `submitted` TTL | row 7 | **14 days** | Must exceed the sibling gear's escalation lead time, since expiry bounds the fail-closed park; 14 days is several multiples of the 72-hour default escalation |
+| `pending_approval` TTL | row 7 | **14 days** | Should relate to the sibling gear's 72-hour default approval escalation window (`gears/bss/orders-workflow/docs/PRD.md` §6.2) |
+| `approved` TTL | row 7 | **30 days** | The **ordinary** exit for a declined payment instrument, per [05-preconditions — What this design cannot express (normative statement of limitation)](DESIGN.md#contract-05-4-4). Because it is never unset in production, that order always has its automatic exit; the caps below stop a hold/resume or amendment cycle restarting it without limit, and [05 §4.4](DESIGN.md#contract-05-4-4) states it from the other side |
+| `on_hold` TTL | row 7 | **30 days** | The PRD names this the worst case, being deliberately open-ended in intent; does not apply to holds taken from `in_fulfillment` (§4.3) |
+| Override scope | row 7 | off | Whether seller scope may override platform scope per state. The mechanism is specified (§3.6, §3.7) and ready; it ships behind `ttl_seller_override_enabled`, default **off**, so the open choice is answered by turning the flag on or leaving it off ([DECISIONS.md](DECISIONS.md) D-137, Q-06) |
+| `draft` auto-void TTL | row 5 | **90 days** | Bounds basket accumulation; matches the Subscriptions draft auto-void platform default (SUB-D-11 amendment). The same row carries the program retention period, tracked as [DECISIONS.md](DECISIONS.md) Q-07, which stays open |
 
-Rows 5 and 7 are the two §15 questions this slice waits on. Nothing else here is open: the
+Rows 5 and 7 are the two §15 questions this slice waits on for **confirmation**, no longer for a
+bound. Nothing else here is open: the
 idempotency-key window is **24 hours**, settled in [01-foundation — Idempotency Semantics (normative)](features/01-foundation.md#contract-01-4-2)
 ([DECISIONS.md](DECISIONS.md) D-39), and is not a policy value of this slice.
 
@@ -8627,17 +9065,21 @@ idempotency-key window is **24 hours**, settled in [01-foundation — Idempotenc
 |-------|----------|------|
 | Sweep cadence | every 5 minutes per worker | Starts the next pass; completion latency also depends on backlog, failures and pass duration |
 | Sweep batch size | 500 orders | Bounds each discovery page; keyset traversal continues within the pass, with one engine transaction per order |
-| Overdue window | **24 hours** past expected fulfillment time | **Not** an open question: the PRD commits this as a business default; it is recorded here as committed rather than as unchosen |
+| Overdue window | **24 hours** past expected fulfillment time | **Not** an open question: the PRD commits this as a business default; it is recorded here as committed rather than as unchosen. It also opens the forced exit's `overdue-window-not-elapsed` guard and the §3.8 overdue gauge (D-182) |
+| Forced-exit approval window | **24 hours** from the requester's refused attempt | How long a `second-approver-required` request stays approvable; past it, or after any state change, a new request is needed. Design-owned working baseline ratified under Q-26 (D-182) |
 | **Amendment cap** | **20** amendments per order | The other half of Layer 2, **owned and argued in [04-versioning — Admissibility (normative)](features/04-versioning.md#contract-04-4-1)** because its value is a commercial judgment about how often a buyer may revise an order, not an operational one. Listed here so both re-entry caps are visible in one place |
-| **Resume cap** | **5** resumes per order | Layer 2 of §4.2, enforced as a guard on [01 §4.3](features/01-foundation.md#contract-01-4-3) row 22 against `orders_order.resume_count`, which no transition resets. It bounds a **count**, not a duration, so it pre-empts no per-state TTL Product later chooses whatever that value turns out to be — which is why this design can own it while the durations stay open. Five is set from the operational shape the loop has: a compliance or dispute hold that genuinely needs re-taking more than five times on one order is an escalation, not a workflow, and the sixth attempt refuses with `resume-cap-exhausted` and says so on the audit trail. A deployment **MAY** raise or lower it and **MUST NOT** unset it; there is no "unlimited" value. This qualifies PRD §6.3's "A held order **MUST** be resumable", routed as [DECISIONS.md](DECISIONS.md) Q-31 (§4.1) |
+| **Resume cap** | **5** resumes per order | Layer 2 of §4.2, enforced as a guard on [01 §4.3](features/01-foundation.md#contract-01-4-3) row 22 against `orders_order.resume_count`, which no transition resets. It bounds a **count**, not a duration, so it pre-empts no per-state TTL Product later chooses whatever that value turns out to be — which is why this design can own it while the durations stay provisional. Five is set from the operational shape the loop has: a compliance or dispute hold that genuinely needs re-taking more than five times on one order is an escalation, not a workflow, and the sixth attempt refuses with `resume-cap-exhausted` and says so on the audit trail. A deployment **MAY** raise or lower it and **MUST NOT** unset it; there is no "unlimited" value. This qualifies PRD §6.3's "A held order **MUST** be resumable", routed as [DECISIONS.md](DECISIONS.md) Q-31 (§4.1) |
 
-Leaving the Product-owned values unset means an unconfigured state is **not swept at all**, and
-orders in it **do not expire**. Stated without softening: the re-entry caps bound restarts of a
-dwell, so where the dwell has no bound the total has none either. The failure mode is made
-**visible** instead — the no-configured-TTL gauge and its production alert (§3.8) fire on the
-condition itself rather than on orders eventually reaching a backstop — which is preferable to a
-code default silently becoming the platform answer, and honest about what is at stake in answering
-PRD §15 row 7.
+An unset Product-owned value would mean an unconfigured state is **not swept at all** and orders
+in it **do not expire**, and the re-entry caps would bound nothing, since they multiply the dwell.
+That is why D-181 ships provisional rows and the policy channel refuses an unset value in
+production: with every expirable state finite, the caps bound total configured dwell at
+`74 × T_max` = 74 × 30 = 2,220 days plus scheduler delay, and `draft` at 90 days. Readiness gating
+was rejected because an unanswered Product question must not become an outage (D-90). The
+provisional values do not pass silently as the platform answer: they are revisioned rows carrying
+`provisional = true`, each expiry records the `policy_revision` it ran under, and the
+provisional-default gauge and production alert (§3.8) stand until Product promotes its confirmed
+values under PRD §15 rows 5 and 7.
 
 
 <!-- /contract -->
@@ -9150,6 +9592,57 @@ only inside this worker exception. Never carry a broad discovery scope into a wr
 [Foundation contract §3.8](DESIGN.md#contract-01-3-8) advisory locks, bounded batches, transactional eligibility checks and database-role separation
 remain mandatory; a lease is coordination, not authorization.
 
+**Structural scope separation (D-184).** The narrowing rule above is enforced by type and lint,
+not by review alone. Pricing's discover-broad-then-narrow convention ([infra/jobs.rs:42-47](../../pricing/pricing/src/infra/jobs.rs);
+`list_due` under `allow_all` at [jobs/window_activation.rs:413](../../pricing/pricing/src/infra/jobs/window_activation.rs) vs `for_tenant` before the write at `:453`)
+is the pattern being hardened; Ledger's `expire_due_all` ([approval_repo.rs:310-331](../../ledger/ledger/src/infra/storage/repo/approval_repo.rs)), a
+cross-tenant `UPDATE` executed directly under `allow_all`, is evidence that the convention alone
+drifts. The toolkit has no read-only scope type: one `&AccessScope` is accepted by
+`SecureSelect::scope_with` (`libs/toolkit-db/src/secure/select.rs:167`), `SecureUpdateMany::scope_with`
+and `SecureDeleteMany::scope_with` (`db_ops.rs:1164`, `:1262`) and `SecureInsertOne::scope_with_model`
+(`db_ops.rs:661`), and `AccessScope::allow_all()` (`libs/toolkit-security/src/access_scope.rs:844`) is
+public without a capability check. Orders therefore adds two crate-local newtypes with private
+fields; no toolkit change is required or proposed:
+
+- `DiscoveryScope` — constructor visible only inside the maintenance-discovery module; wraps
+  `AccessScope::allow_all()` and exposes only scoped **select** construction (a method taking an
+  entity select and returning `SecureSelect<E, Scoped>`). It never exposes `&AccessScope` and
+  implements no `Deref`, `AsRef`, `Borrow` or conversion into one, so it cannot reach an update,
+  delete or insert scope method. Every discovery query runs inside
+  `SecureConn::transaction_with_config(TxConfig::read_only(), …)` (`secure_conn.rs:650`,
+  `tx_config.rs:134`), so the database also rejects a write issued from discovery. Discovery
+  returns owned discovered-row values (`DiscoveredOrder` and one type per cleanup/purge/audit
+  table) and ends its transaction before any write. PostgreSQL refuses a locking read
+  (`FOR UPDATE … SKIP LOCKED`) in a read-only transaction, so candidate locking and the
+  eligibility recheck belong to the target phase, under `TargetScope`.
+- `TargetScope` — constructible only from a discovered row's persisted identifiers.
+  `TargetScope::from_discovered(&DiscoveredOrder)` yields the standard resource-ID restriction
+  on `order_id` (`AccessScope::for_resource`, `access_scope.rs:888`) conjoined with that row's
+  stored `seller_tenant_id`, `payer_tenant_id` and `resource_tenant_id` properties (§4.3; the
+  aggregate is `no_tenant`, so never `for_tenant()`). Per-table constructors from the discovered
+  idempotency, retention-candidate and audit-namespace rows yield the record-ID or namespace
+  restriction that table's grant names. There is no constructor from a raw UUID, caller input,
+  `SecurityContext` or `AccessScope`. The private worker engine entry
+  ([01 §3.6](features/01-foundation.md#contract-01-3-6) *Internal worker entry*) and the idempotency-cleanup, retention-purge and
+  checkpoint repositories accept only `&TargetScope`; the engine still rechecks state, deadline
+  and stored properties under the aggregate lock.
+- Lint — the Orders crates deny `clippy::disallowed_methods` with an entry for
+  `AccessScope::allow_all` (path as resolved from `toolkit_security`); `#[allow]` appears only on
+  the `DiscoveryScope` constructor. Clippy reads the nearest configuration file and does not
+  merge (`libs/.clippy.toml:1-10` replaces the workspace file and drops its entries), so a
+  crate-local file carries over the whole workspace file (secure-ORM `disallowed-methods` at
+  `clippy.toml:16-27`, thresholds and `disallowed-types` through `:59`). If a crate-local file is rejected, a CI grep failing on
+  `allow_all` outside the discovery module is the fallback.
+
+Limitations, stated rather than claimed closed: `SecureInsertOne::scope_unchecked`
+(`db_ops.rs:641`) ignores its scope, so the types do not constrain such an insert; worker-path
+inserts (checkpoint rows, worker audit and outbox effects) use `scope_with_model` with a
+`TargetScope` and rest on its validation and the restricted database grants above. Workers still
+hold a connection that can write: the types restrict which scope a worker can obtain, not the
+connection, so role separation remains the second line. Toolkit-internal `allow_all` uses on
+`no_tenant` coordination tables (leases, platform outbox) are outside the Orders crates and
+unaffected.
+
 Orders intentionally differs from Pricing's nil/anonymous worker attribution: use a real
 configured service actor for evidence, never an invented human, nil UUID or caller impersonation.
 Expiry and auto-void still use the transition engine and commit audit/outbox effects atomically;
@@ -9161,7 +9654,12 @@ not obtained as a fallback after a PDP denial. Missing internal authority or dat
 fails the affected job closed. Request-driven refusal evidence uses the separately bounded
 private persistence path below, not a worker capability borrowed by a caller. Tests must prove public callers cannot reach the internal path,
 discovery scopes never reach writes, target/retention restrictions hold, and worker transitions
-retain configured actor attribution and transactional audit.
+retain configured actor attribution and transactional audit. The first two are **blocking CI
+gates** (D-184), each backed by compile-fail evidence (`trybuild`, as
+`libs/toolkit-db-macros/tests/ui.rs:16-22`): `DiscoveryScope` cannot be constructed outside its
+module or passed to an update, delete, insert or worker-entry parameter; `TargetScope` has no
+raw constructor; and the `allow_all` lint fails outside the discovery module. A write attempted
+inside a discovery transaction fails on PostgreSQL as read-only.
 
 The repository donor describes this pattern as sanctioned; this design records the bounded
 Orders exception explicitly rather than claiming blanket PDP compliance or independently
@@ -9289,7 +9787,8 @@ that separation, not a new authorization framework:
 | Orders catalog and route tests | A recording PDP test double verifies the actual resource/action and properties for every public operation. Compare coverage against registered routes so an added or mis-gated route fails; verify catalog consistency and caller-context propagation |
 | Orders enforcement tests | Missing dependency fails initialization; denied operations leave business state/outbox unchanged; missing required constraints and invalid responses fail closed; outages return sanitized 503 without settling keys; refusal persistence follows the private audit contract |
 | Orders-specific isolation tests | Resource, seller and current-payer paths; combined complete grants; required delegation; historical child reads; former-payer loss of access including cursor/replay requests; audit-read separation; old-side allow/new-side deny and the reverse |
-| Orders database integration tests | On PostgreSQL, race authorization against tenant/version changes and verify conflict without mutation or key settlement, transactional audit/outbox rollback, and isolation of concurrent idempotent attempts. Test worker target/retention limits and rejection of public access to internal capabilities |
+| Orders database integration tests | On PostgreSQL, race authorization against tenant/version changes and verify conflict without mutation or key settlement, transactional audit/outbox rollback, and isolation of concurrent idempotent attempts. Test worker target/retention limits, rejection of public access to internal capabilities (blocking CI gate, D-184) and refusal of a write inside a `TxConfig::read_only()` discovery transaction |
+| Orders compile-time and lint gates (blocking CI, D-184) | `trybuild` compile-fail cases: `DiscoveryScope` constructed outside the discovery module, passed where `&AccessScope` or `&TargetScope` is expected, or dereferenced to `&AccessScope`; `TargetScope` built from a raw UUID or `AccessScope`. `clippy::disallowed_methods` denies `AccessScope::allow_all` outside the discovery module (CI grep fallback). "Public callers cannot reach the internal path" and "discovery scopes never reach writes" fail the build |
 | Platform/deployment verification | Against the selected real provider, verify role assignments and action/relationship policy behavior under `cpt-cf-bss-orders-lifecycle-upreq-pdp-policy-integration`; record provider and policy revisions |
 
 An in-process fake PDP proves that Orders asks the correct question and enforces the supplied
@@ -9513,23 +10012,24 @@ order-scoped read the PDP adapter runs immediately after the aggregate's tenant 
 before anything is returned, since the relationship it decides is evaluated against those axes and
 cannot be decided without them; the row read to reach the decision **MUST NOT** be disclosed to a
 caller the decision refuses (§3.6). Startup **MUST** fail if an operation
-exists with no declaration. The matrix below is exhaustive over the twenty-four endpoints of
-[DESIGN.md](DESIGN.md) §3.3 — ten matrix rows covering twenty-four endpoints, since the
+exists with no declaration. The matrix below is exhaustive over the twenty-five endpoints of
+[DESIGN.md](DESIGN.md) §3.3 — eleven matrix rows covering twenty-five endpoints, since the
 authoring, read and workflow-only endpoints each share one declaration. An operation absent from
 it is a startup failure, not a default-deny.
 
-| Operation | Partner Admin | Direct Customer | Seller Operator | Orders Workflow | Payer Reader | Event Consumers |
-|-----------|---------------|-----------------|-----------------|-----------------|--------------| ---------------- |
-| create order · commercial draft edit (order or line `PATCH`) · line insert/remove · submit | ✓ delegated scope | ✓ own orders | — | — | — | — |
-| amend (append a version) | ✓ delegated scope | — | — | — | — | — |
-| administrative edit (order or line `PATCH`, administrative fields, any non-terminal state) | ✓ delegated scope | ✓ own orders | — | — | — | — |
-| preview | ✓ authorized resource/payer scope; permitted seller relationship, delegation where acting for another party | ✓ own resource/payer axes; permitted seller may differ | — | — | — | — |
-| cancel | ✓ delegated scope | ✓ own orders | ✓ seller scope, reason mandatory | via workflow-cancel only (from `in_fulfillment`, or `on_hold` with pre-hold `in_fulfillment`) | — | — |
-| hold · resume | — | — | ✓ seller scope | ✓ with service principal | — | — |
-| **record acceptance** | ✓ **only as a `resourceTenantId` principal and not the version-1 creator, the submitter or the amender of `expected_version`** (Lifecycle guard, `acceptance-recording-party-barred`, D-130) | ✓ own orders (initial submit records it; amended-version assent uses this operation) | — | — | — | — |
-| read order · list · version list · version read · line read · acceptance read | ✓ delegated scope | ✓ own orders | ✓ seller scope | ✓ with service principal and explicit PDP order-ID constraints | ✓ PDP-granted scope on current `payerTenantId` | ✓ service principal with explicit PDP order-ID constraints |
-| audit read | ✓ delegated scope | — | ✓ seller scope | — | — | — |
-| approval-reflection · begin-fulfillment · spawn-signal · fulfillment-acknowledgement · workflow-cancel | — | — | — | ✓ with service principal | — | — |
+| Operation | Partner Admin | Direct Customer | Seller Operator | Orders Workflow | Payer Reader | Event Consumers | Fulfillment Operator (break-glass) |
+|-----------|---------------|-----------------|-----------------|-----------------|--------------| ---------------- | ---------------- |
+| create order · commercial draft edit (order or line `PATCH`) · line insert/remove · submit | ✓ delegated scope | ✓ own orders | — | — | — | — | — |
+| amend (append a version) | ✓ delegated scope | — | — | — | — | — | — |
+| administrative edit (order or line `PATCH`, administrative fields, any non-terminal state) | ✓ delegated scope | ✓ own orders | — | — | — | — | — |
+| preview | ✓ authorized resource/payer scope; permitted seller relationship, delegation where acting for another party | ✓ own resource/payer axes; permitted seller may differ | — | — | — | — | — |
+| cancel | ✓ delegated scope | ✓ own orders | ✓ seller scope, reason mandatory | via workflow-cancel only (from `in_fulfillment`, or `on_hold` with pre-hold `in_fulfillment`) | — | — | — |
+| hold · resume | — | — | ✓ seller scope | ✓ with service principal | — | — | — |
+| **record acceptance** | ✓ **only as a `resourceTenantId` principal and not the version-1 creator, the submitter or the amender of `expected_version`** (Lifecycle guard, `acceptance-recording-party-barred`, D-130) | ✓ own orders (initial submit records it; amended-version assent uses this operation) | — | — | — | — | — |
+| read order · list · version list · version read · line read · acceptance read | ✓ delegated scope | ✓ own orders | ✓ seller scope | ✓ with service principal and explicit PDP order-ID constraints | ✓ PDP-granted scope on current `payerTenantId` | ✓ service principal with explicit PDP order-ID constraints | — |
+| audit read | ✓ delegated scope | — | ✓ seller scope | — | — | — | — |
+| approval-reflection · begin-fulfillment · spawn-signal · fulfillment-acknowledgement · workflow-cancel | — | — | — | ✓ with service principal | — | — | — |
+| **forced-failure** (operator-forced unreconciled `fulfillment_failed`, D-182) | — | — | — | — | — | — | ✓ seller scope, `user` actor class only, time-boxed break-glass grant, reason mandatory; **two distinct principals** — requester and approver — both recorded (Lifecycle guard `second-approver-required`) |
 
 **The Workflow seam reaches two rows from `on_hold`.** The `fulfillment-acknowledgement` and
 `workflow-cancel` declarations above cover `acknowledge-failed` and `cancel-workflow-mediated` from
@@ -9538,6 +10038,18 @@ it is a startup failure, not a default-deny.
 two endpoints and the same service-only grants apply, so only the Workflow service principal can
 drive either trigger from a hold, and the seller operator's hold/resume grant confers neither
 ([DECISIONS.md](DECISIONS.md) D-109).
+
+**The forced-failure grant is break-glass, and distinct (D-182).** `forced-failure` is the PRD's
+fulfillment operator (`cpt-cf-bss-orders-lifecycle-actor-orders-fulfillment-operator`) acting under a
+separate, time-boxed, individually alerted grant `order × force-fail-unreconciled`, following
+Products' break-glass rule that a write under elevation is separately gated by two persons and a
+distinct alert (`gears/bss/products/docs/PRD.md` *Break-glass action scope*). It is **not** conferred
+by the Seller Operator's cancel or hold grant, and the Workflow service principal **MUST NOT** hold
+it: the exit exists for when Workflow cannot close the order, so its own principal must not be able
+to bypass its evidence guards through it. The engine authorizes it only for actor class `user`.
+Both the requester's refused attempt and the approver's committed one pass this same authorization,
+so neither half can be made without the grant; the read and audit paths it needs are the operator's
+ordinary seller-scope grants under *Combining permissions* below.
 
 **Event-consumer read path.** Event Consumers means the explicitly configured Workflow,
 Subscriptions and Billing service principals validating lifecycle notifications under Foundation
@@ -9657,6 +10169,7 @@ permission catalog and enforcement calls. A grouped matrix row does not imply a 
 | `audit` | `read` | Read the order audit trail under existing order-access requirements |
 | `audit-unresolved` | `read` | Separate operational audit-read permission; append is private persistence, not a PDP action |
 | `order` | `approval-reflection`, `begin-fulfillment`, `spawn-signal`, `fulfillment-acknowledgement`, `workflow-cancel` | Separate service-only grants for the five Workflow seam operations |
+| `order` | `force-fail-unreconciled` | Break-glass, user-only grant for `/forced-failure` (D-182); implied by no other action, never granted to a service principal |
 
 The actor eligibility and all conditions in the matrix remain binding for each mapped action.
 A `PATCH` is authorized under the action of the one trigger its fields select ([02 §4.3](DESIGN.md#contract-02-4-3) *One

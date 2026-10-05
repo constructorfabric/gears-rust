@@ -20,6 +20,7 @@
   - [2.9 Platform authorization policy](#29-platform-authorization-policy)
   - [2.10 Catalog registry (Product & SKU)](#210-catalog-registry-product--sku)
   - [2.11 Contracts](#211-contracts)
+  - [2.12 API Gateway](#212-api-gateway)
 - [3. Priorities](#3-priorities)
 - [4. Traceability](#4-traceability)
 - [PriceBook readiness additions](#pricebook-readiness-additions)
@@ -40,7 +41,7 @@ Orders Workflow PRD ([`DECISIONS.md`](./DECISIONS.md) Q-04).
 | Requesting gear | Why it needs the target |
 |-----------------|-------------------------|
 | `orders-lifecycle` | Owns the order document and its state machine; needs Subscriptions to accept an explicit start instant, expose an overlap-occupancy read, and carry an order reference and a compensation cancellation reason. Needs Pricing to publish its existing reads as `PricingReadV1` and to admit a `bss-orders.system` subject with `plan:read` and `price:read`, as it does for Rating and Subscriptions; the residual purchase verdict is a separate, narrower ask. Needs Rating to expose a batched exact-binding evaluation SDK, a pre-subscription evaluation and an annualised TCV figure. Needs the billing chain to propagate the external reference and to answer an indicative tax read. Needs Account Management to issue verifiable delegation proof and expose the payer's commercial profile, Contracts to answer contract status, party eligibility and the acceptance-required declaration for a referenced contract, and the platform PDP to evaluate it from request context with distinct missing/invalid deny reasons. Needs Subscriptions to answer its `SUB-G1` overlap key for a prospective PriceBook line, and Pricing's revision-reference release report to count in-flight orders; SKU protection itself is inherited from the revision's references. Needs a Payments capability that does not exist, and needs the Event Broker runtime behind the
-landed SDK before event-producing traffic can be accepted. |
+landed SDK before event-producing traffic can be accepted. Needs the API Gateway to key a rate-limit zone by a path parameter so the per-(caller, order) request limit can run at the gateway (D-185). |
 | `orders-workflow` | Must consume `OrderAmended`, obtain the approval-requirement verdict for the new order version, and reflect the new version onward from `submitted`; without this the Lifecycle two-step re-approval seam stalls. |
 
 ## 2. Requirements
@@ -74,7 +75,7 @@ instant.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-overlap-presence-read`
 
-An **overlap-key occupancy read**: batched, and for each `(payer_tenant_id, overlap_scope_key)`
+An **overlap-key occupancy read**: batched, and for each `(payer_tenant_id, resource_tenant_id, overlap_scope_key)`
 returning `(activeCount, maxConcurrentActive, provenance)` — the number of subscriptions `active`
 on that key (drafts excluded), the effective concurrent-active cardinality, and the Catalog/Contract
 policy that cardinality was resolved from. Registered upstream as **`SUB-O5`**, unagreed.
@@ -82,10 +83,20 @@ policy that cardinality was resolved from. Registered upstream as **`SUB-O5`**, 
 presence"): a boolean cannot evaluate `activeCount + proposed ≤ maxConcurrentActive` when the limit
 exceeds one, so this design asks for the count and the limit; the Subscriptions gear's own seam map
 is not edited here ([`DECISIONS.md`](./DECISIONS.md) D-126). The requirement ID is kept for
-stability. The against-existing-subscriptions half of the
+stability. **Second amendment (D-179; open as Q-40):** the tuple carries the resource tenant, by making
+`resourceTenantId` a default dimension of `overlapScopeKey` — Subscriptions' own
+`design/03-plan-changes.md` §4.4 already permits extra dimensions — and enforcing the same tuple at
+the active commit. On self-service sales payer and resource tenant are one tenant, so only the
+partner path changes. Until Subscriptions enforces the resource dimension at its active commit, it answers on the tuple it
+enforces and says so in `provenance`; predicate 7 applies that answer as given, so a per-payer answer
+refuses a partner's second customer at cardinality one at submit when that customer's subscription
+is already `active`, and — because predicate 7's `proposed` also counts the lines of this payer's
+other in-flight orders claiming the same key under another resource tenant (D-180) — when two such
+orders are in flight at once, rather than passing either into an activation refusal. Orders never
+re-buckets a per-payer count locally (D-83: no local fork); the addend is its own claim data. The against-existing-subscriptions half of the
 submit gate's overlap predicate depends on it; until it lands that half is unevaluable and
 therefore a refusal, which fails closed. The same read serves Workflow's pre-wave-2 re-check
-(Workflow D-195); the shape is `occupancy(payer, keys[]) → [{ key, active_count, draft_count,
+(Workflow D-195); the shape is `occupancy(payer, resource_tenant, keys[]) → [{ key, active_count, draft_count,
 max_concurrent_active, source }]`, with the keys obtained through
 `…-upreq-catalog-subscription-product-key`.
 
@@ -139,6 +150,33 @@ pre-activation abort; one appearing at or after `active` is a fulfillment failur
 `overlap-collision` on the failure-acknowledgement path, whose compensation evidence must show no
 active subscription remains ([03 §2.2](DESIGN.md#contract-03-2-2), `DECISIONS.md` D-89). This is the same seam as `SUB-O5`, which supplies the *read*; this ask is
 the *enforcement*, and the read alone does not make the rule hold.
+
+**Release gate (D-180).** This ask **MUST** be agreed with Subscriptions, scheduled and delivered
+before the submit/activation path is production-ready; until then subscription-side cardinality is
+**advisory at order time** and the gate contract and consumer documents say so. What Orders
+contributes is bounded: at most one in-flight order per claim tuple (D-179), plus predicate 7's
+interim count of this payer's other in-flight orders on the same key while the occupancy answer is
+per payer. The residual race is with entries into `active` that bypass Orders — direct
+subscriptions, `resume`, `transfer`, key-altering `changePlan` — which only Subscriptions can close.
+
+**Mechanism proposed to Subscriptions.** *Recommended*: mirror this gear's
+[ADR-0007](./ADR/0007-cpt-cf-bss-orders-lifecycle-adr-in-transaction-concurrency.md) — an
+in-transaction **slot claim** `(overlapScopeKey, slot)` with a partial UNIQUE over live claims and
+a row CHECK `0 ≤ slot < maxConcurrentActive` (the limit resolved for that key), taken in the same
+transaction that commits `active` and released in the transaction that leaves `active`; a
+transaction that finds no free slot commits nothing and returns `overlap-collision`. Every entry
+into `active` that §4.4 of Subscriptions' `design/03-plan-changes.md` already detects on takes a
+slot, so the rule binds all writers, not only Orders'; how the §4.4 supersedes exemption maps onto
+slots is Subscriptions' design. The slot shape D-83 rejected for Orders is the right shape here:
+Orders' in-flight cap is fixed at one by PRD §6.1(g), whereas Subscriptions' cardinality is
+configurable by PRD §6.1(f), so "at most N" is the rule itself, not unused schema surface.
+*Alternative*: lock one per-key row (`SELECT … FOR UPDATE`) inside that transaction, then count
+and commit. *Rejected*: a `gears/bss/libs/coord` lease — its README, "Don't use `coord` when…",
+excludes hard mutual exclusion with zero tolerance for a TTL-expiry overlap, and the lease is
+TTL-based and not scoped to the committing transaction; toolkit-db advisory locks
+(`libs/toolkit-db/src/advisory_locks.rs`) — session-level `pg_try_advisory_lock` / `GET_LOCK` on a
+pinned connection, not transaction-scoped, and broken by a transaction-pooling proxy. The
+Subscriptions gear's own documents are not edited here (D-126).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-settle-create`
 
@@ -459,23 +497,72 @@ adapter owns requirement/routing decisions and receives required TCV; embedding 
 is an implementation option, not evidence the policy service exists. Payment authorization amount
 and provenance must be specified separately from TCV and Ledger settlement. See reciprocal amendments.
 
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-workflow-overdue-escalation`
+
+**Overdue fulfillment escalation with a named owner (D-182).** Orders Workflow **MUST** raise the
+PRD §6.3 overdue escalation for every order in `in_fulfillment`, or `on_hold` with pre-hold
+`in_fulfillment`, once database time passes expected fulfillment time — `max(begin-fulfillment
+instant, latest line service-activation date)` — plus the configurable overdue window (business
+default 24 hours), routed to the fulfillment operator (`cpt-cf-bss-orders-workflow-actor-owf-fulfillment-operator`)
+as the named owner, durably, once per order and window, with order, version, age and the
+unreconciled lines. The same escalation covers a stalled `active → cancelled` compensation
+(D-165). It **MUST NOT** auto-terminal the order.
+
+On consuming `OrderFulfillmentFailed` with `failure_reason = operator-forced-unreconciled`, Workflow
+**MUST** terminate the process — cease pending provisioning intents and timers — **without**
+treating the order as compensated: the event's evidence carries
+`no_active_subscription_remains = unknown`. It **MUST** keep, or open, the orphan-subscription
+manual task for that order until reconciliation through Subscriptions establishes that no active
+subscription remains, and **MUST NOT** call Lifecycle again for that order (any call is refused
+against the terminal state). Workflow's own principal **MUST NOT** hold the
+`order × force-fail-unreconciled` grant.
+
+**This is a production release prerequisite**, as the dead-letter recovery ask is: no deployment
+may admit `begin-fulfillment` in production until the escalation, its owner routing and the
+forced-failure handling are delivered and tested, together with Lifecycle's own overdue gauge and
+alert ([07 §3.8](DESIGN.md#contract-07-3-8)).
+
+**Current gap:** the Workflow PRD's process termination on terminal order events
+(`cpt-cf-bss-orders-workflow-fr-owf-terminal-order-events`, `gears/bss/orders-workflow/docs/PRD.md`)
+terminates only on `OrderCancelled`, `OrderExpired` and `OrderRejected`, because every other
+`fulfillment_failed` is Workflow's own acknowledgement; it has no rule for a terminal it did not
+cause, and its "process deadline is the overdue window" row names no escalation owner or
+forced-failure handling. Both need a Workflow PRD amendment by its owner; this document does not
+edit that gear or represent the amendment as agreed.
+
+**Owners:** Orders Workflow maintainers.
+
 ### 2.7 Event Broker
 
-**Consumer freshness integration (D-67 / Q-25).** Workflow, Subscriptions and Billing owners
-must implement Foundation §4.4's applicability read before business effects, with explicit
-PDP `order × read` grants constrained to their authorized target orders. Provisioning and
-verifying those grants is owned by §2.9 (`cpt-cf-bss-orders-lifecycle-upreq-pdp-policy-integration`);
-this section covers consumer-side read and retry behaviour. Platform-root event
-access supplies neither these grants nor business authorization. Use the existing Orders read
-surface; no new endpoint is requested. Unavailable/denied validation retains durable pending
-work, retries under bounded consumer policy and escalates without effects or silent loss.
-Each consumer must declare applicability per event/intended action: a hold can defer work,
-and a historical financial effect need not be obsolete merely because state advanced. A
-successful read proving that action obsolete may retire it; execution still uses downstream guards.
-PB-2026-09-29 amends the PRD callback contract; Product/Architecture must account for
-read load and availability in integration acceptance. This remains open consumer/deployment
-work, not evidence of implemented grants or retries. Verify delayed/duplicate events, recovered
-dead letters, unavailable reads, missing grants and restart during validation.
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-event-consumer-conformance`
+
+**Event consumer conformance (D-186).** Workflow, Subscriptions and Billing owners **MUST** each
+implement the [event consumer contract](DESIGN.md#contract-01-event-consumer-contract) (Foundation
+§4.4: C1 de-duplication by event ID in a consumer-owned processed-event store, C2 reconciliation
+through `get_version` and the current-order read before any business effect, C3 unknown-value
+tolerance, C4 no reconstruction, C5 durably pending work on an unavailable or denied read) and
+**MUST** pass the shared `orders-events` golden corpus specified there against their real handler,
+with their declared per-event applicability rule. **Passing the corpus is the integration
+sign-off gate** for each of the three; no consumer integration is accepted on a reading of the
+contract alone. Precedent: Pricing gates publish-contract sign-off on the joint proration golden
+fixture ([`../../pricing/docs/design/06-consumer-contracts.md`](../../pricing/docs/design/06-consumer-contracts.md)
+K5), held in [`gears/bss/fixtures`](../../fixtures/README.md). The corpus is specified in this gear
+and built with the first consumer integration (Workflow); Orders states the cases, each consumer
+owns its evaluator. The platform supplies no consumer-side processed-event store: the Event Broker
+consumer contract places de-duplication on the consumer
+([`0002-consumer-subscription-lifecycle.md`](../../../system/event-broker/docs/features/0002-consumer-subscription-lifecycle.md) §2.3).
+
+C2 reads need explicit PDP `order × read` grants constrained to each consumer's authorized target
+orders; provisioning and verifying them is owned by §2.9
+(`cpt-cf-bss-orders-lifecycle-upreq-pdp-policy-integration`). Platform-root event access supplies
+neither these grants nor business authorization. The existing Orders read surface is used; no new
+endpoint is requested. Q-25's §9.2 half is closed by D-186 in line with PRD §9.2's PB-2026-09-29
+amendment — a business-effect consumer always reads before its effect — so Product/Architecture
+account for that read load and availability in integration acceptance.
+
+**Owners:** Workflow, Subscriptions and Billing gear owners; Billing is unowned (D-168), so its
+obligation is recorded for whichever specification takes it.
+**Tracking status:** open; no consumer implementation or corpus run has been recorded.
 
 **Shared documentation follow-up — open (2026-09-22).** Event Broker SDK and GTS guideline
 maintainers should reconcile `guidelines/GTS.md` with the canonical declarations in
@@ -565,7 +652,9 @@ The supported SDK republication mechanism and shared operator interface remain o
 Removing the Orders re-drive endpoint does not itself supply either capability.
 
 **Release gate:** Orders production deployment **MUST** have both the supported SDK recovery
-mechanism and an operator interface. Closure **MUST** record their implementation PRs/deployed
+mechanism and an operator interface. Consumer conformance
+(`…-upreq-event-consumer-conformance`) makes a gap safe for consumers; it does not relax this gate,
+because a parked event — a terminal `OrderCompleted` included — still has to be delivered. Closure **MUST** record their implementation PRs/deployed
 revisions, the operator runbook and passing acceptance evidence.
 **Tracking status:** open; no qualifying implementation references have been recorded.
 
@@ -780,8 +869,9 @@ submits the prospective line/revision, batched and seller-scoped, to a Subscript
 (proposed `SubscriptionsOverlapKeyV1::keys`, the SUB-P8 shape: the neighbour submits, Subscriptions
 answers) and stores the key(s) plus derivation/policy provenance as answered; it never computes the
 key. Missing key and unavailable resolver are distinct. Resolve it once per assessment, store it on
-the version, and reuse it at activation. The partner/customer dimension (Q-05) remains a joint
-decision.
+the version, and reuse it at activation. The partner/customer dimension (Q-05) is closed for
+the Orders in-flight claim by D-179, which keeps `resource_tenant_id` beside the key rather than
+inside it; the subscription-side dimension rides the `SUB-O5` amendment above.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-products-sku-read-grant`
 
@@ -838,12 +928,34 @@ and platform elections ([05 §3.5](DESIGN.md#contract-05-3-5), §4.1, D-107, D-1
 exists, a contract-referenced order resolves `acceptance-requirement-unevaluable` (fail closed,
 ADR-0003) at both guards; it never falls back to an election.
 
+### 2.12 API Gateway
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-gateway-path-param-throttle-key`
+
+**A rate-limit zone keyed by authenticated subject plus a path parameter (D-185).** Orders bounds
+engine-entering write requests before the engine because every refused attempt writes a durable
+audit row (ADR-0005). The per-caller limit already uses the gateway as it is: an identity-keyed
+zone bound through `ThrottlingSpec { rate_limit_zone, require_security_context: true }`
+(`libs/toolkit/src/api/operation_builder.rs`; `gears/system/api-gateway/src/middleware/throttling.rs`).
+The per-(caller, order) limit — 20 per minute per `(subject_id, orderId)` — cannot be expressed:
+`KeyType` is `{ Identity, Ip }` and further variants are deferred until a consumer asks
+([`docs/arch/throttling/DESIGN.md`](../../../../docs/arch/throttling/DESIGN.md) D1/D2, §4). This is that
+consumer. Shape: an additive `KeyConfig` variant composing the subject id with a named route path
+parameter (`orderId`), resolved after authentication, bounded by `max_keys` like the existing
+variants. The gateway's integer `/s` `RateSpec` cannot express a sustained rate below 1/s (60/min),
+so a per-minute unit or a fractional rate is part of the ask. Cross-replica enforcement is
+the gateway's own open ADR-0001 and is not asked here.
+
+**Fallback until delivered (Q-26)**: a gear-local limiter at the Orders REST edge keyed
+`(subject_id, orderId)`, before the engine call, writing no audit row and answering 429; Orders
+removes it when the gateway variant lands. Architecture decides between waiting and the fallback.
+
 ## 3. Priorities
 
 | Priority | Requirements |
 |----------|-------------|
-| `p1` (critical) | `…-upreq-subscription-start-instant`, `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-pre-subscription-evaluation`, `…-upreq-tcv-with-annualisation`, `…-upreq-external-reference-propagation`, `…-upreq-delegation-proof-credential`, `…-upreq-authorization-outcome`, `…-upreq-workflow-amendment-verdict`, `…-upreq-event-broker-runtime`, `…-upreq-event-broker-cursor-retry`, `…-upreq-event-broker-dead-letter-recovery`, `…-upreq-event-broker-root-tenancy`, `…-upreq-event-delivery-observability`, `…-upreq-catalog-subscription-product-key`, `…-upreq-pricing-read-sdk`, `…-upreq-pricing-catalog-tenant-reads`, `…-upreq-products-sku-read-grant`, `…-upreq-pricing-purchase-assessment`, `…-upreq-initial-binding-acceptance`, `…-upreq-sku-protection`, `…-upreq-rating-evaluation`, `…-upreq-payer-commercial-profile`, `…-upreq-contract-party-eligibility`, `…-upreq-contract-acceptance-declaration`, `…-upreq-settle-create`, `…-upreq-intent-status-read`, `…-upreq-transition-outcome-echo` |
-| `p2` (important) | `…-upreq-order-reference-on-create`, `…-upreq-two-phase-pair-preserved`, `…-upreq-correlation-propagation`, `…-upreq-indicative-tax-read`, `…-upreq-audit-identity-lifecycle` |
+| `p1` (critical) | `…-upreq-subscription-start-instant`, `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-pre-subscription-evaluation`, `…-upreq-tcv-with-annualisation`, `…-upreq-external-reference-propagation`, `…-upreq-delegation-proof-credential`, `…-upreq-authorization-outcome`, `…-upreq-event-consumer-conformance`, `…-upreq-workflow-amendment-verdict`, `…-upreq-workflow-overdue-escalation`, `…-upreq-event-broker-runtime`, `…-upreq-event-broker-cursor-retry`, `…-upreq-event-broker-dead-letter-recovery`, `…-upreq-event-broker-root-tenancy`, `…-upreq-event-delivery-observability`, `…-upreq-catalog-subscription-product-key`, `…-upreq-pricing-read-sdk`, `…-upreq-pricing-catalog-tenant-reads`, `…-upreq-products-sku-read-grant`, `…-upreq-pricing-purchase-assessment`, `…-upreq-initial-binding-acceptance`, `…-upreq-sku-protection`, `…-upreq-rating-evaluation`, `…-upreq-payer-commercial-profile`, `…-upreq-contract-party-eligibility`, `…-upreq-contract-acceptance-declaration`, `…-upreq-settle-create`, `…-upreq-intent-status-read`, `…-upreq-transition-outcome-echo`, `…-upreq-overlap-activation-atomicity` (release gate for submit/activation, D-180) |
+| `p2` (important) | `…-upreq-order-reference-on-create`, `…-upreq-two-phase-pair-preserved`, `…-upreq-correlation-propagation`, `…-upreq-indicative-tax-read`, `…-upreq-audit-identity-lifecycle`, `…-upreq-gateway-path-param-throttle-key` |
 
 `cpt-cf-bss-orders-lifecycle-upreq-pdp-policy-integration` is also `p1`: verification and
 provisioning of platform authorization are required for production caller-driven access, and it
@@ -859,7 +971,7 @@ mitigation exists.
 
 - **PRD**: [`./PRD.md`](./PRD.md) — §13 dependencies, §15 open questions
 - **DESIGN**: [`./DESIGN.md`](./DESIGN.md) §3.5, §3.8; [01 §3.8](DESIGN.md#contract-01-3-8), §4.4; [03 §2.2](DESIGN.md#contract-03-2-2); [06 §4.2](DESIGN.md#contract-06-4-2), §4.6
-- **Decisions**: [`./DECISIONS.md`](./DECISIONS.md) — D-32, D-56, D-108, D-111, D-122, D-124, D-150–D-178, Q-04, Q-05, Q-08, Q-32, Q-33
+- **Decisions**: [`./DECISIONS.md`](./DECISIONS.md) — D-32, D-56, D-108, D-111, D-122, D-124, D-150–D-179, D-182, D-185, D-186, Q-04, Q-05, Q-08, Q-26, Q-32, Q-33
 - **ADRs**: [`./ADR/0003`](./ADR/0003-cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate.md) — the fail-closed posture that makes `SUB-O5` a blocker rather than a degradation; [`./ADR/0006`](./ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md) — the platform producer path and Event Broker readiness gate
 - **Upstream registers**: `gears/bss/subscriptions/docs/SEAMS.md` §I (`SUB-O1`…`SUB-O6`); the sibling Workflow PRD §13 (`SUB-O5`…`SUB-O9`); `gears/bss/rating/docs/SEAMS.md` for the three Rating asks; `gears/bss/contracts/docs/PRD.md` §6.6 (*Party eligibility predicate*, *Booking instant and acceptance*) for the Contracts asks; `gears/bss/subscriptions/docs/SEAMS.md` `SUB-G1` (PR #4177) for the catalog-registry product key; `gears/bss/pricing/docs` D-419–D-425 and PRD §2.2 for the Pricing reads and system subjects; `gears/bss/products/docs` P-D-189/P-D-194 for SKU lifecycle and references. Rating **is** specified in this repository, with a PRD, a DESIGN, ADRs and its own seam register, so its asks are raised against that specification.
 - **Billing chain ownership (D-168).** The billing chain is **not** `gears/bss/ledger`. The Ledger is built and its `LedgerClientV1` is the GL posting and settlement target (`post_balanced_entry`, `settle_payment`, `allocate_payment`, `return_payment`, `record_dispute_phase`, credit application, AR balances, revenue recognition); it generates no invoices, values no at-sale facts and answers no tax, and settlement is not payment authorization. The capabilities this gear needs are owned as follows:

@@ -63,7 +63,7 @@ Record actual buyer acceptance against an immutable commercial version and contr
 - **Dependencies**: [Foundation](01-foundation.md), [Capture](02-capture.md), [Gate and Pin](03-gate-and-pin.md).
 - **Consumer**: [Workflow Seam](06-workflow-seam.md).
 
-Schemas and architecture remain in the design. [UPSTREAM_REQS.md](../UPSTREAM_REQS.md) retains the unexposed contract acceptance SDK, Payments read-by-request contract and Workflow durable-execution prerequisites. Version-bound acceptance remains the proposed OL-26 PRD reconciliation. [DECISIONS.md](../DECISIONS.md) Q-08 (Payments limitations), Q-27 (unset TTL) and Q-30 (reachable customer acceptance) remain open; this feature does not supply a payment system or acceptance UI.
+Schemas and architecture remain in the design. [UPSTREAM_REQS.md](../UPSTREAM_REQS.md) retains the unexposed contract acceptance SDK, Payments read-by-request contract and Workflow durable-execution prerequisites. Version-bound acceptance remains the proposed OL-26 PRD reconciliation. [DECISIONS.md](../DECISIONS.md) Q-08 (Payments limitations) and Q-30 (reachable customer acceptance) remain open, and Q-27 (unset TTL) is closed by D-181's provisional TTLs; this feature does not supply a payment system or acceptance UI.
 
 **UI applicability**: UI layout, keyboard navigation, screen-reader behavior and visual accessibility are not applicable because this feature specifies backend contracts, not a user interface. API usability, actionable errors and non-disclosing diagnostics remain applicable; consuming consoles own their UI requirements.
 
@@ -185,7 +185,7 @@ This process is **owned by Workflow and must be implemented there**, not a new L
 | Begin-fulfillment with guards satisfied | `approved → in_fulfillment`, owned by Workflow Seam. |
 | Pending, non-tolerated failure or missing required acceptance | Remain `approved`; no payment state or payment outcome event. |
 
-A declined instrument has no automatic exit while `approved` TTL is unset. Only provision-then-collect is expressible; payment capture, SCA, reauthorization UI, refunds and chargebacks remain outside this feature.
+A declined instrument's only automatic exit is the `approved` TTL, provisionally 30 days and never unset in production (D-181). Only provision-then-collect is expressible; payment capture, SCA, reauthorization UI, refunds and chargebacks remain outside this feature.
 
 ## 5. Definitions of Done
 
@@ -455,8 +455,8 @@ it means the partner path **cannot complete without a `resourceTenantId` princip
 an acceptance surface**. In partner-led selling the end customer frequently has no platform
 credential at the point of sale, and where that is so nobody is permitted to record acceptance:
 begin-fulfillment refuses with `acceptance-required-not-recorded` (§3.6), the order rests in
-`approved`, and it leaves only by its TTL — or, where that TTL is unset, **not at all**
-([07-hold-and-expiry — Bounded lifetime (normative)](07-hold-and-expiry.md#contract-07-4-2), `../DECISIONS.md` Q-27). A partner-placed
+`approved`, and it leaves only by its TTL — provisionally 30 days and never unset in production
+([07-hold-and-expiry — Bounded lifetime (normative)](07-hold-and-expiry.md#contract-07-4-2), `../DECISIONS.md` D-181, which closed Q-27). A partner-placed
 order can therefore be commercially agreed offline and still be unfulfillable.
 
 Two things follow. The platform **MUST** be able to present an acceptance action to a

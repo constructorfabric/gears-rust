@@ -16,6 +16,7 @@
   - [3.2 Maintain overlap claims](#32-maintain-overlap-claims)
   - [3.3 Append and verify audit evidence](#33-append-and-verify-audit-evidence)
   - [3.4 Publish events and coordinate maintenance](#34-publish-events-and-coordinate-maintenance)
+  - [3.5 Purge bounded-retention rows](#35-purge-bounded-retention-rows)
 - [4. States (CDSL)](#4-states-cdsl)
   - [4.1 Authoritative order lifecycle](#41-authoritative-order-lifecycle)
   - [4.2 Idempotency record lifecycle](#42-idempotency-record-lifecycle)
@@ -24,6 +25,7 @@
   - [5.1 Atomic engine and persistence](#51-atomic-engine-and-persistence)
   - [5.2 Replay and evidence](#52-replay-and-evidence)
   - [5.3 Delivery and operational verification](#53-delivery-and-operational-verification)
+  - [5.4 Retention purge](#54-retention-purge)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Detailed Behavior Contracts](#7-detailed-behavior-contracts)
   - [Foundation: Interactions and Sequences](#foundation-interactions-and-sequences)
@@ -141,12 +143,12 @@ Cross-principal create duplication and post-window re-execution remain disclosed
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-algo-foundation-overlap-claims`
 
-**Input**: Locked order, target state, distinct proposed `(payer_tenant_id, overlap_scope_key)` tuples.
+**Input**: Locked order, target state, distinct proposed `(payer_tenant_id, resource_tenant_id, overlap_scope_key)` tuples.
 
 **Output**: Complete admitted claim set, or audited/settled `order-in-flight-for-key` with prior claims intact.
 
 1. On every terminal transition, release all live claims before the acquisition branch. Other non-acquiring transitions retain claims.
-2. For submit/amendment, retain already-held full tuples and insert missing tuples in payer UUID/key byte order under `READ COMMITTED`, using the partial unique constraint and conflict-safe insert with returned IDs.
+2. For submit/amendment, retain already-held full tuples and insert missing tuples in payer UUID/resource-tenant UUID/key byte order under `READ COMMITTED`, using the partial unique constraint and conflict-safe insert with returned IDs.
 3. On shortfall, release exactly this attempt's returned fresh IDs, checking the affected count; preserve every pre-existing claim. Persist the assessment with authoritative predicate-9 conflict, audit and settle refusal before any version/contribution append. Cleanup failure aborts the whole transaction.
 4. Only after full acquisition release superseded tuples. A payer change replaces the full tuple; duplicate line keys offer one claim. No claim row proves that its proposed version was admitted.
 
@@ -163,7 +165,7 @@ Cross-principal create duplication and post-window re-execution remain disclosed
 3. Keep refused entries outside the committed chain with NULL sequence/predecessor; unresolved targets retain the trusted subject tenant/requested reference without invented target facts or aggregate lookup for enrichment.
 4. Enforce append-only grants and triggers. Only the restricted retention role may purge expired refusal rows under [Foundation contract §3.7](../DESIGN.md#contract-01-3-7)'s canonical retention policy.
 5. Verify committed chains read-only and alert on any mismatch, unsupported hash version or incomplete sequence. The audit worker captures atomic daily namespace checkpoints from one consistent snapshot, reconciles current orders and previous members, and never blesses a discrepancy.
-6. Enforce the shared repeated-refusal limiter at the inbound edge before engine entry: working baselines are 20 per minute per (caller, order) and 200 per minute per caller. A limiter must not enter the engine and append the refusal row it is intended to avoid. Architecture ratification remains Q-26.
+6. Bound engine-entering write requests with the pre-engine request limiter of [Foundation contract §3.7](../DESIGN.md#contract-01-3-7) (D-185). It counts every request, admitted or refused, so it also limits legitimate retries; it is not a repeated-refusal limiter. Per caller: bind the caller-facing engine-entering operations to the api-gateway identity-keyed zone `rl_orders_caller_write` (`rate_limit: 3/s`, `burst_limit: 20`, ≤200 per 60 s) through `ThrottlingSpec { require_security_context: true, dry_run: false }`, and the five workflow-only operations to `rl_orders_workflow_write`; gateway budgets are per replica until throttling ADR-0001 lands. Per (caller, order), 20 per minute: open under Q-26 pending `cpt-cf-bss-orders-lifecycle-upreq-gateway-path-param-throttle-key`, with a gear-local REST-edge limiter keyed `(subject_id, orderId)` as fallback. No limiter may enter the engine and append the refusal row it is intended to avoid.
 7. Meet the design baselines of a checkpoint within 24 hours and full verification within 30 days with measured capacity. Checkpoints detect the specified bounded completeness failures; optional external anchoring and protection against rewriting all local evidence are not presumed delivered.
 
 ### 3.4 Publish events and coordinate maintenance
@@ -177,8 +179,22 @@ Cross-principal create duplication and post-window re-execution remain disclosed
 1. Before readiness, prepare the topic/subject and eleven event schemas, explicit root tenancy, broker partition count and managed Chained producer. Startup validation rejects incomplete registrations, unknown guard rows, duplicate transition keys or unmapped reasons.
 2. Enqueue through the bound platform producer using the transition runner. Preserve the [Foundation contract §4.4](../DESIGN.md#contract-01-4-4) payload/envelope contract; validate maximum basket events against the 64 KiB envelope limit.
 3. Let toolkit workers own sequencing, leases, retries, rejection and queue storage. Transient failures retry; permanent faults dead-letter and advance the cursor. Instrument every outcome. Orders owns no drain SQL or re-drive endpoint.
-4. Consumers deduplicate by event ID and verify action applicability against an authorized current read. Read failure keeps work pending; it is not proof of obsolete work. Recovery preserves event identity through the shared platform path.
+4. Consumers meet the [event consumer contract](../DESIGN.md#contract-01-event-consumer-contract) (D-186); Orders does not restate it. Recovery preserves event identity through the shared platform path.
 5. Coordinate exactly the five Orders workers named in [Foundation contract §3.8](../DESIGN.md#contract-01-3-8) through its toolkit advisory keys and lifecycle cancellation. Session locks are not fencing: each write remains protected by transactional eligibility/idempotency checks; verification never repairs evidence.
+
+### 3.5 Purge bounded-retention rows
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-algo-foundation-retention-purge`
+
+**Input**: Fresh database time; the three bounded-retention stores and their retention windows.
+
+**Output**: Expired rows deleted in bounded batches; per-store metrics; committed evidence untouched.
+
+1. Run daily as `cpt-cf-bss-orders-lifecycle-component-retention-purge` under advisory key `retention-purge` ([Foundation contract §3.8](../DESIGN.md#contract-01-3-8)); a contended pass skips, lifecycle cancellation stops it. This is a phase 0/1 deliverable: Foundation does not ship refusal auditing without it (D-185).
+2. Per store, select bounded batches (baseline 5,000 rows each, repeated while the pass budget lasts) in deterministic `(time, primary key)` order through the store's own index, under `SKIP LOCKED`, rechecking eligibility against fresh database time: `orders_gate_outcome` Preview rows with `order_id IS NULL` past **7 days** via `(evaluated_at) WHERE order_id IS NULL`; `orders_transition_audit` rows with `outcome = 'refused'` past **90 days** via `(created_at) WHERE outcome = 'refused'`; `orders_read_access_log` rows past **90 days** via `(accessed_at)`.
+3. Delete under the store's restricted retention grant only; the audit DELETE is granted for expired refused rows and nothing else ([Foundation contract §3.7](../DESIGN.md#contract-01-3-7)). Commit per batch; on failure roll back and retry on the next pass. Never acquire an aggregate lock, delete a committed audit row, an idempotency record (idempotency cleanup's) or a platform outbox row (toolkit vacuum's).
+4. Emit per store: rows purged, batch duration, overdue backlog (eligible rows still present after the pass), oldest overdue row age and last successful pass. [Foundation contract §3.8](../DESIGN.md#contract-01-3-8) alerts on a growing backlog, an overdue refused row older than 1 day and a missed daily run.
+5. Validate batch size and cadence against the [`DESIGN.md §4.1`](../DESIGN.md#41-capacity-and-cost) refusal-audit write baseline: one daily pass must delete at least one day's refused rows at the measured mean rate, or the backlog grows without bound.
 
 ## 4. States (CDSL)
 
@@ -192,9 +208,9 @@ Cross-principal create duplication and post-window re-execution remain disclosed
 
 **Terminal States**: `completed`, `rejected`, `cancelled`, `fulfillment_failed`, `expired`.
 
-Implement the exact **27 rows and 20 trigger tokens** of [`cpt-cf-bss-orders-lifecycle-state-order-lifecycle`](01-foundation.md#contract-01-4-3), including guards, actor classes, versioning behavior and event declarations. Expand multi-state rows into unique `(from-state, trigger)` lookup keys and reject duplicate keys at startup. There are no inferred transitions or terminal exits.
+Implement the exact **29 rows and 21 trigger tokens** of [`cpt-cf-bss-orders-lifecycle-state-order-lifecycle`](01-foundation.md#contract-01-4-3), including guards, actor classes, versioning behavior and event declarations. Expand multi-state rows into unique `(from-state, trigger)` lookup keys and reject duplicate keys at startup. There are no inferred transitions or terminal exits.
 
-Create, submit and amendment append versions; draft and administrative edits do not. Submit materializes version 2. Resume uses stored pre-hold state. `in_fulfillment` has no expiry row, and expiry of a hold from fulfillment is guard-refused. Held fulfillment can fail/cancel through the Workflow rows but cannot acknowledge completion while held. Amendment lands in `submitted` under the design's disclosed PRD reconciliation items.
+Create, submit and amendment append versions; draft and administrative edits do not. Submit materializes version 2. Resume uses stored pre-hold state. `in_fulfillment` has no expiry row, and expiry of a hold from fulfillment is guard-refused. Held fulfillment can fail/cancel through the Workflow rows but cannot acknowledge completion while held. An overdue post-spawn fulfillment, held or not, can also be forced to `fulfillment_failed` by the two-person operator trigger `force-fail-unreconciled` (rows 28 and 29, D-182), which records compensation as `unknown`. Amendment lands in `submitted` under the design's disclosed PRD reconciliation items.
 
 ### 4.2 Idempotency record lifecycle
 
@@ -221,7 +237,7 @@ The system **MUST** implement both transition branches, shared guard precedence,
 
 **Implements**: `cpt-cf-bss-orders-lifecycle-flow-foundation-attempt-transition`, `cpt-cf-bss-orders-lifecycle-flow-foundation-create-transition`, `cpt-cf-bss-orders-lifecycle-algo-foundation-overlap-claims`.
 
-**Constraints**: `cpt-cf-bss-orders-lifecycle-constraint-single-writer`, `cpt-cf-bss-orders-lifecycle-constraint-guard-input-ports`.
+**Constraints**: `cpt-cf-bss-orders-lifecycle-constraint-single-writer`, `cpt-cf-bss-orders-lifecycle-constraint-guard-input-ports`, `cpt-cf-bss-orders-lifecycle-constraint-db-namespace`.
 
 **Touches**: internal transition/registration API; `cpt-cf-bss-orders-lifecycle-db-foundation-schema`; aggregate, versions, lines, contributions and claims. Endpoint contracts remain with their owning features.
 
@@ -245,9 +261,21 @@ The system **MUST** register and enqueue the existing event/error/category contr
 
 **Implements**: `cpt-cf-bss-orders-lifecycle-algo-foundation-publication-workers`.
 
-**Constraints**: `cpt-cf-bss-orders-lifecycle-constraint-outbox-at-least-once`.
+**Constraints**: `cpt-cf-bss-orders-lifecycle-constraint-outbox-at-least-once`, `cpt-cf-bss-orders-lifecycle-constraint-event-consumer-contract`.
 
 **Touches**: `cpt-cf-bss-orders-lifecycle-dbtable-event-outbox` (platform-managed persistence), typed event/error/category registration, readiness, maintenance and recovery integration.
+
+### 5.4 Retention purge
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-dod-foundation-retention-purge`
+
+The system **MUST** ship the `retention-purge` worker with Foundation (phase 0/1): bounded daily deletion of expired Preview outcomes, refused audit rows and read-access-log rows through their indexes and restricted grants, its per-store metrics and the [Foundation contract §3.8](../DESIGN.md#contract-01-3-8) audit-growth alerts, and the pre-engine request limiter's per-caller gateway zone binding (D-185). Refusal auditing **MUST NOT** be enabled in an environment where the worker is not running.
+
+**Implements**: `cpt-cf-bss-orders-lifecycle-algo-foundation-retention-purge`.
+
+**Constraints**: `cpt-cf-bss-orders-lifecycle-constraint-single-writer`.
+
+**Touches**: `cpt-cf-bss-orders-lifecycle-dbtable-transition-audit`, `cpt-cf-bss-orders-lifecycle-dbtable-gate-outcome`, `cpt-cf-bss-orders-lifecycle-dbtable-read-access-log` (retention deletion only; the latter two remain owned by 03 and 08), inbound gateway zone configuration.
 
 ## 6. Acceptance Criteria
 
@@ -261,10 +289,11 @@ The system **MUST** register and enqueue the existing event/error/category contr
 - [ ] Faults at audit, diagnostics, response serialization, enqueue and commit leave no partial effects; an uncertain commit response is resolved through the original key.
 - [ ] Migration tests enforce append-only grants/triggers and bounded purge authority. Frozen hash/checkpoint vectors, field mutation tests and deletion/tampering tests verify integrity without identity resolution or repairs.
 - [ ] Two-worker lock-session loss tests prove transactional safety despite overlapping passes; cleanup cannot delete a live/reclaimed marker and checkpoint writers cannot fork history.
-- [ ] Event integration verifies eleven schemas, root grants, subject partitioning, retry after broker persistence/lost response, consumer deduplication and dead-letter recovery; pending SDK/runtime/recovery dependencies are not reported as passed.
+- [ ] Event integration verifies eleven schemas, root grants, subject partitioning, retry after broker persistence/lost response, consumer conformance against the `orders-events` corpus of the [event consumer contract](../DESIGN.md#contract-01-event-consumer-contract) and dead-letter recovery; pending SDK/runtime/recovery dependencies are not reported as passed.
 - [ ] Measure resolution, commit and broker acknowledgement separately and together at the design load; include backlog and failed deliveries. Demonstrate RPO zero and RTO ≤60 minutes for committed orders and pending producer messages within the declared residency boundary.
 
-- [ ] Inbound integration tests exercise both repeated-refusal rate limits and show that throttled attempts do not enter the engine or amplify transition-audit writes. Baseline values remain subject to Q-26; this document does not ratify them.
+- [ ] Inbound integration tests exercise the per-caller gateway zone (D-185) and, once Q-26's open half is decided, the per-(caller, order) limit, and show that throttled attempts return 429 without entering the engine or writing transition-audit rows, that admitted retries count against the budget, and that workflow-only operations use their own zone.
+- [ ] Retention-purge tests seed rows on both sides of each window and prove only expired Preview outcomes, refused audit rows and read-log rows are deleted in bounded batches; committed audit rows and unexpired refused rows survive; overlapping passes after lock-session loss delete nothing twice; metrics report purged count, backlog and oldest overdue age; a paused worker raises the backlog and missed-run alerts.
 
 ## 7. Detailed Behavior Contracts
 
@@ -394,10 +423,10 @@ refusal. The common infrastructure-error mapping applies, without target-specifi
 17. [ ] - `p1` - Maintain this order's overlap claims; this is where the one-in-flight-order rule of `§3.7` is enforced, and it runs on **every** row rather than only on the acquiring ones: - `inst-maintain-claims`
     1. [ ] - `p1` - **IF** the effective target is in the terminal set of `§4.3`: release every unreleased claim this order holds and **SKIP TO** step 18 — a terminal transition acquires nothing, and releasing here is what keeps a completed order from holding its key forever - `inst-release-on-terminal`
     2. [ ] - `p1` - **IF** the contribution carries no resolved overlap keys — every non-terminal row but submit and amendment: **SKIP TO** step 18, leaving the claim set untouched - `inst-skip-claims`
-    3. [ ] - `p1` - Compute the **distinct** proposed claim tuples `(proposed payer_tenant_id, overlap_scope_key)` from the incoming version. Compare full tuples with this order's unreleased claims and partition them into already-held and missing tuples; never compare overlap keys alone - `inst-partition-claim-keys`
-    4. [ ] - `p1` - Insert one claim row per missing tuple only, offered in a common total order by payer UUID bytes then overlap-key bytes, with `ON CONFLICT (payer_tenant_id, overlap_scope_key) WHERE released_at IS NULL DO NOTHING`, returning inserted claim IDs and tuples. Use the proposed version's payer even before the aggregate payer is updated - `inst-take-claims`
+    3. [ ] - `p1` - Compute the **distinct** proposed claim tuples `(proposed payer_tenant_id, resource_tenant_id, overlap_scope_key)` from the incoming version, the resource tenant being the order's own (D-179). Compare full tuples with this order's unreleased claims and partition them into already-held and missing tuples; never compare overlap keys alone - `inst-partition-claim-keys`
+    4. [ ] - `p1` - Insert one claim row per missing tuple only, offered in a common total order by payer UUID bytes, then resource-tenant UUID bytes, then overlap-key bytes, with `ON CONFLICT (payer_tenant_id, resource_tenant_id, overlap_scope_key) WHERE released_at IS NULL DO NOTHING`, returning inserted claim IDs and tuples. Use the proposed version's payer even before the aggregate payer is updated - `inst-take-claims`
     5. [ ] - `p1` - **IF** fewer rows return than distinct tuples were offered: release only the exact claim IDs returned by this attempt's insert, scoped to this order and `released_at IS NULL`, and require the affected count to equal the returned-ID count. Skip the UPDATE if that set is empty. On release error/count mismatch abort the whole transaction with an infrastructure outcome. Otherwise preserve all pre-existing claims, persist the reached assessment with predicate 9 replaced by the authoritative conflict under the diagnostic settlement contract, settle the complete response for `order-in-flight-for-key`, append refusal audit and commit by returning a successful transaction result carrying the refusal; §3.7 defines the released-reservation history - `inst-if-claim-conflict`
-    6. [ ] - `p1` - After complete acquisition, release only this order's unreleased claims whose full `(payer_tenant_id, overlap_scope_key)` tuple is absent from the proposed set. A payer-only change therefore releases `(old payer, key)` after acquiring `(new payer, key)`, in the same transaction as the amendment - `inst-release-superseded-claims`
+    6. [ ] - `p1` - After complete acquisition, release only this order's unreleased claims whose full `(payer_tenant_id, resource_tenant_id, overlap_scope_key)` tuple is absent from the proposed set. A payer-only change therefore releases `(old payer, resource tenant, key)` after acquiring `(new payer, resource tenant, key)`, in the same transaction as the amendment - `inst-release-superseded-claims`
 18. [ ] - `p1` - **IF** the row's versioning behaviour is versioning: - `inst-if-versioning-row`
     1. [ ] - `p1` - Append a new version row from the contribution, with supersedes_version set to the outgoing current version - `inst-append-version`
     2. [ ] - `p1` - Move the aggregate's current-version pointer to the new version - `inst-move-version-pointer`
@@ -491,8 +520,13 @@ user SecurityContext.
 | Row 12, `report-spawn-signal` | Set `spawn_signal_at` to the server-recorded report instant; the registered already-recorded guard prevents replacement, and no later transition clears it |
 | Row 11, `begin-fulfillment`, with tolerated authorization failure | Set `authorization_failure_tolerated_at` to the server-recorded tolerance-decision instant only when the registered tolerance guard admits that outcome; otherwise preserve its value, never clear it |
 | Row 14 or 26, `acknowledge-failed`, or row 16 or 27, `cancel-workflow-mediated` | Persist the validated `compensation_evidence` contribution after its evidence guards pass; other transitions preserve the field |
+| Row 28 or 29, `force-fail-unreconciled` | Persist the forced `compensation_evidence` after every row-28 guard passes: the operator-attested lists, `activation_dispatched = true` (the recorded spawn signal), `at_sale_facts_emitted` and `no_active_subscription_remains` both `unknown`, and the `operator_attestation` naming requester and approver ([01 §3.7](../DESIGN.md#contract-01-3-7) *Compensation evidence schema*, D-182); the terminal target releases every live claim at step 17.1 like any terminal |
 
 These writes precede audit and commit. A rollback removes them together with the transition.
+One refusal also carries an engine-allocated value: for `second-approver-required` on rows 28 and
+29 the engine allocates the refusal entry's `audit_id` before step 13.2.1 settles the response and
+settles it as `context.data.requestAuditId`, so a same-key replay returns the identical request
+reference ([07 §3.6](07-hold-and-expiry.md#contract-07-3-6) *Force Fail Unreconciled*, D-182).
 Required implementation tests must show that a committed spawn signal blocks direct cancellation,
 a tolerated failure retains its flag, and failure/workflow-cancel stores its evidence; refused
 or aborted transitions must not leave any of these writes behind.
@@ -570,7 +604,9 @@ authority, not a user-supplied system flag. They recheck due-state/TTL eligibili
 properties under the same aggregate lock and keep every business guard, idempotency rule,
 transactional audit requirement and outbox obligation. They cannot rebind tenant axes or replay
 another principal's outcomes. Orders Workflow remains a PDP-governed external caller. Broad
-worker discovery scopes must never reach transition writes. Worker audit persistence uses its
+worker discovery scopes must never reach transition writes: the entry accepts only a
+`TargetScope` constructed from the discovered row's persisted `order_id` and stored tenant
+properties, never `&AccessScope` or a `DiscoveryScope` (D-184, [08 §3.5](../DESIGN.md#contract-08-3-5)). Worker audit persistence uses its
 configured restricted internal authority, with the same audit integrity guarantees as the
 private request-persistence path; neither path may bypass database grants.
 
@@ -646,7 +682,7 @@ follow: no step **MAY** take the claim after step 17, and no path **MAY** map th
 infrastructure error.
 
 **Tuple identity and acquisition ordering.** Sub-steps 17.3 to 17.6 compare full
-`(payer_tenant_id, overlap_scope_key)` tuples: retain held tuples, acquire missing tuples and
+`(payer_tenant_id, resource_tenant_id, overlap_scope_key)` tuples: retain held tuples, acquire missing tuples and
 release superseded tuples only after complete acquisition. A refusal preserves all claims held
 on entry and releases only this attempt's provisional acquisitions as specified in §3.7. Release
 first — the earlier shape — committed the release along with the refusal, so a refused amendment
@@ -822,9 +858,8 @@ invalid data or producer state.
 partition and preserve FIFO in ordinary operation. The toolkit queue has 16 partitions and maps
 `(topic, broker partition)` to one of them; a transient retry consequently blocks that whole
 toolkit partition, not merely one order. Once a permanent message is dead-lettered, the toolkit
-cursor advances and later messages may proceed. Consumers must tolerate that gap by de-duplicating
-on event ID and reconciling `orderVersion` and resulting state against the authoritative Orders
-read. A dead letter is operational evidence, not an order state and not a replayable order ledger.
+cursor advances and later messages may proceed. Consumers tolerate that gap under the
+[event consumer contract](../DESIGN.md#contract-01-event-consumer-contract) (D-186). A dead letter is operational evidence, not an order state and not a replayable order ledger.
 
 
 <!-- /contract -->
@@ -951,8 +986,10 @@ create may be followed by a genuinely new create after the window, as the contra
 **Idempotency-window cleanup executor.** The existing worker in §3.8 uses advisory key
 `idempotency-cleanup` in namespace `bss-orders-lifecycle`. Design-selected configurable baseline:
 run every 60 seconds, at most 500 rows per pass, using the `expires_at` index and deterministic
-ordering by expiry then primary key. Select candidates under row locks with `SKIP LOCKED`,
-recheck against fresh database time, and delete only rows with `expires_at <= t` that are either
+ordering by expiry then primary key. Discover candidate keys under a `DiscoveryScope` in a
+read-only transaction (D-184), then in the deleting transaction lock those rows through their
+per-record `TargetScope` with `SKIP LOCKED` (a locking read is refused in a read-only
+transaction, so it belongs to the target phase), recheck against fresh database time, and delete only rows with `expires_at <= t` that are either
 settled or also have an expired in-flight lease. Commit the bounded batch and explicitly release
 the advisory guard; on failure roll back and retry on a later scheduled pass. Never acquire an
 aggregate lock from this worker, delete a live/reclaimed marker, or delete its referenced audit
@@ -966,7 +1003,8 @@ validate batch/cadence capacity against the request-rate baseline and alert on a
 backlog. Required tests (pending implementation): timestamp initialization, no window extension
 on replay/reclaim, expiry/reuse while the sweep is paused, bounded deletion, preservation of
 live leases, cleanup racing reclaim/settlement and concurrent new claims, crash rollback, and
-absence of cascading deletion. Audit-refusal purge remains a different worker and policy.
+absence of cascading deletion. Expired refused audit rows, Preview outcomes and read-log rows are
+purged by the separate `retention-purge` worker under its own grants and policy (§3.5, D-185).
 
 **PRD reason phrases are descriptors, not identifiers.** The PRD requires *that* a machine-readable
 reason exist and says what condition it denotes — "a machine-readable stale-version reason", "a
@@ -1006,7 +1044,7 @@ five callers and naming it per caller is the defect the registry exists to preve
 
 **Terminal states**: `completed`, `rejected`, `cancelled`, `fulfillment_failed`, `expired`
 
-**Transitions** — twenty-seven rows. Each declares its versioning behaviour and its event type;
+**Transitions** — twenty-nine rows. Each declares its versioning behaviour and its event type;
 `—` means the row is deliberately event-less (§4.4).
 
 1. [ ] - `p1` - **FROM** nothing **TO** `draft` **WHEN** `create` (versioning, event —) - `inst-tr-create`
@@ -1036,22 +1074,28 @@ five callers and naming it per caller is the defect the registry exists to preve
 25. [ ] - `p1` - **FROM** any non-terminal state except `draft` **TO** the same state **WHEN** `record-acceptance` — record acceptance of the current immutable version on either sales path, guarded by expected_version (state-only, `OrderAcceptanceRecorded`) - `inst-tr-record-acceptance`
 26. [ ] - `p1` - **FROM** `on_hold` **TO** `fulfillment_failed` **WHEN** `acknowledge-failed` — only when the stored pre-hold state is `in_fulfillment` (else `prehold-not-in-fulfillment`); failure is acknowledged and compensation evidence asserts no active subscription remains, the same evidence guards as row 14 (state-only, `OrderFulfillmentFailed`) - `inst-tr-hold-fulfillment-failed`
 27. [ ] - `p1` - **FROM** `on_hold` **TO** `cancelled` **WHEN** `cancel-workflow-mediated` — only when the stored pre-hold state is `in_fulfillment` (else `prehold-not-in-fulfillment`); the cancel carries a cancel reason and complete compensation evidence, the same evidence guard and shared cancel guard as row 16 (state-only, `OrderCancelled`) - `inst-tr-hold-mediated-cancel`
+28. [ ] - `p1` - **FROM** `in_fulfillment` **TO** `fulfillment_failed` **WHEN** `force-fail-unreconciled` — operator-initiated bounded recovery, never automatic: guarded in this order by a mandatory forced-failure reason (else `forced-failure-reason-required`), a recorded spawn signal (else `spawn-signal-not-recorded`), the overdue window elapsed past expected fulfillment time (else `overdue-window-not-elapsed`) and a distinct second approver referencing the requester's refused attempt (else `second-approver-required`), the guards of [07 §3.6](07-hold-and-expiry.md#contract-07-3-6) *Force Fail Unreconciled*; writes `failure_reason = operator-forced-unreconciled` and compensation evidence whose `no_active_subscription_remains` is `unknown`, plus the operator attestation (actor class user, state-only, `OrderFulfillmentFailed`, D-182) - `inst-tr-forced-unreconciled`
+29. [ ] - `p1` - **FROM** `on_hold` **TO** `fulfillment_failed` **WHEN** `force-fail-unreconciled` — only when the stored pre-hold state is `in_fulfillment` (else `prehold-not-in-fulfillment`); otherwise the guards and writes of row 28 unchanged (actor class user, state-only, `OrderFulfillmentFailed`, D-182) - `inst-tr-hold-forced-unreconciled`
 
 **Normative exclusions**: there is **no** row from `in_fulfillment` to `expired`. The `on_hold`
 expiry row exists, but its guard refuses `expiry-exempt-prehold` when the pre-hold state is
 `in_fulfillment`; it is not a state-table miss. Those exempt orders are bounded by an operational
-SLA raised by the sibling gear, not automatic expiry. There is **no**
+SLA raised by the sibling gear, not automatic expiry; once that SLA has elapsed after the spawn
+signal, rows 28 and 29 give a named operator role a two-person forced exit, which is still never
+automatic (D-182). There is **no**
 amendment row from `in_fulfillment` or from any terminal state, and **no** row out of a terminal
 state at all.
 
-**`on_hold` has five exits, and the resume cap never leaves a held order without a terminal one.** A held order leaves
+**`on_hold` has six exits, and the resume cap never leaves a held order without a terminal one.** A held order leaves
 `on_hold` by resume (row 22), by cancel (row 23), by expiry (row 24, refused for a pre-hold
 `in_fulfillment`), or — only when the stored pre-hold state is `in_fulfillment` — by Workflow's
 failure acknowledgement (row 26) or workflow-mediated cancel (row 27), which carry the guards of
-rows 14 and 16 unchanged. Rows 26 and 27 exist because a hold taken from `in_fulfillment` after
+rows 14 and 16 unchanged, or by the operator-forced unreconciled failure (row 29), which carries
+the guards of row 28 unchanged (D-182). Rows 26 and 27 exist because a hold taken from `in_fulfillment` after
 the spawn signal otherwise has no terminal exit once row 22's resume cap is exhausted: row 23's
 shared cancel guard refuses every non-Workflow caller after the spawn signal, and row 24 refuses the
-expiry. **There is no `on_hold` row for `acknowledge-completed`**: a held order must be resumed
+expiry. Rows 26 and 27 still need complete evidence and a healthy Workflow; row 29 is the exit
+when neither exists and the overdue window has elapsed (D-182). **There is no `on_hold` row for `acknowledge-completed`**: a held order must be resumed
 to `in_fulfillment` (row 22) before it can complete, because completion asserts an activated
 fulfillment that a hold has suspended ([`../DECISIONS.md`](../DECISIONS.md) D-109).
 
@@ -1067,7 +1111,9 @@ do; and there is no direct `approved → pending_approval`
 amendment edge, recorded as [`../DECISIONS.md`](../DECISIONS.md) D-61 and routed as Q-12.
 The third is row 6, `draft → expired` on auto-void, absent from the PRD diagram and routed as Q-22.
 The fourth is row 26, `on_hold → fulfillment_failed`, absent from the PRD diagram and recorded as D-109;
-row 27 is the PRD's own `on_hold → cancelled` edge reached through the workflow-mediated trigger.
+row 29 reuses that same edge on the forced trigger and shares its disclosure (D-182), while row 28 is
+the PRD's `in_fulfillment → fulfillment_failed` edge on the forced trigger the PRD §6.3 amendment of
+D-182 adds. Row 27 is the PRD's own `on_hold → cancelled` edge reached through the workflow-mediated trigger.
 **One requirement divergence, also disclosed.** Row 22's resume-cap guard (`resume-cap-exhausted`)
 qualifies PRD §6.3's "A held order **MUST** be resumable": a held order at the cap exits only by
 cancel, expiry or, from an `in_fulfillment`-origin hold, rows 26 and 27, never by completion. It is
@@ -1101,7 +1147,7 @@ their guard *registrations* and their reason *entries*, never their logic.
 - **Gear design**: [`../DESIGN.md`](../DESIGN.md) — this slice is the Transition Engine named in its §3.2
 - **Design set**: [`./README.md`](../DECOMPOSITION.md) — slice map and dependency order
 - **ADRs**: [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md) transition through the engine; [`ADR/0003`](../ADR/0003-cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate.md) fail closed on an unevaluable gate input; [`ADR/0004`](../ADR/0004-cpt-cf-bss-orders-lifecycle-adr-closed-enumerations.md) the closed state and event enumerations; [`ADR/0005`](../ADR/0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md) a refusal is a committed outcome; [`ADR/0006`](../ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md) asynchronous publication from an outbox; [`ADR/0007`](../ADR/0007-cpt-cf-bss-orders-lifecycle-adr-in-transaction-concurrency.md) concurrency enforced by an in-transaction constraint
-- **Decisions**: [`../DECISIONS.md`](../DECISIONS.md) — D-01, D-04…D-17, D-18…D-30, D-39, D-41…D-49, D-59, D-61, D-64…D-69, D-73, D-74, D-78…D-82
+- **Decisions**: [`../DECISIONS.md`](../DECISIONS.md) — D-01, D-04…D-17, D-18…D-30, D-39, D-41…D-49, D-59, D-61, D-64…D-69, D-73, D-74, D-78…D-82, D-109, D-182, D-185
 - **Review**: the 2026-09-08 wave — resolves R-01…R-03, R-06…R-08, R-10…R-14, R-16…R-30, R-32…R-36, R-46, R-59, R-62, R-68, R-74
 
 <!-- /contract -->

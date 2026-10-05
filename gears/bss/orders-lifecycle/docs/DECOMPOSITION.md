@@ -66,7 +66,7 @@ unbreakable by a new slice.
 - **Depends On**: None (feature-level). Platform prerequisites are listed in §3.
 
 - **Scope**:
-  - The order aggregate and its append-only version chain; the declarative state-machine table with its guards, terminal set, hold/resume mapping and expiry eligibility; guard evaluation and ordering; the idempotency registry and its non-success outcomes; the optimistic version check and its `version-conflict` refusal — the single registered name D-38 consolidated the `stale-version` variants into; the append-only transition audit; the typed event contract and the one-producer-message-per-event-declaring-transition rule; and the registry of machine-readable business reasons.
+  - The order aggregate and its append-only version chain; the declarative state-machine table with its guards, terminal set, hold/resume mapping and expiry eligibility; guard evaluation and ordering; the idempotency registry and its non-success outcomes; the optimistic version check and its `version-conflict` refusal — the single registered name D-38 consolidated the `stale-version` variants into; the append-only transition audit; the typed event contract and the one-producer-message-per-event-declaring-transition rule; the registry of machine-readable business reasons; and the retention purge of the three bounded-retention stores (D-185).
 
 - **Out of scope**:
   - It knows nothing commercial: not what a sellability predicate is, not what a price pin means, not whether an approval was warranted. It evaluates guards that slices declare, over document contributions that slices supply. It performs no money arithmetic, approval-policy evaluation, provisioning or commercial input resolution. Capability handlers own commercial input resolution; shared authorization and platform producer integration remain Foundation obligations, with external calls kept outside the transition transaction.
@@ -148,7 +148,9 @@ unbreakable by a new slice.
     - `cpt-cf-bss-orders-lifecycle-constraint-single-writer`
     - `cpt-cf-bss-orders-lifecycle-constraint-idempotency-window`
     - `cpt-cf-bss-orders-lifecycle-constraint-outbox-at-least-once`
+    - `cpt-cf-bss-orders-lifecycle-constraint-event-consumer-contract`
     - `cpt-cf-bss-orders-lifecycle-constraint-guard-input-ports`
+    - `cpt-cf-bss-orders-lifecycle-constraint-db-namespace`
   - **Entities**:
     - `cpt-cf-bss-orders-lifecycle-entity-order-root`
     - `cpt-cf-bss-orders-lifecycle-entity-order-version-chain`
@@ -167,6 +169,7 @@ unbreakable by a new slice.
     - `cpt-cf-bss-orders-lifecycle-component-audit-store`
     - `cpt-cf-bss-orders-lifecycle-component-outbox-publisher`
     - `cpt-cf-bss-orders-lifecycle-component-reason-registry`
+    - `cpt-cf-bss-orders-lifecycle-component-retention-purge`
   - **Interfaces**:
     - `cpt-cf-bss-orders-lifecycle-interface-transition-api`
     - `cpt-cf-bss-orders-lifecycle-interface-guard-registration`
@@ -199,9 +202,9 @@ unbreakable by a new slice.
   - **States**:
     - `cpt-cf-bss-orders-lifecycle-state-order-lifecycle`
 
-- **Phase**: 0/1; [detailed design](DESIGN.md#contract-01-1-1).
+- **Phase**: 0/1; [detailed design](DESIGN.md#contract-01-1-1). The `retention-purge` worker (`cpt-cf-bss-orders-lifecycle-component-retention-purge`) and the per-caller api-gateway limiter zone ship in this phase: refusal auditing is not enabled without the worker that bounds it (D-185).
 
-- **Event contract**: `cpt-cf-bss-orders-lifecycle-contract-order-events`; eleven typed events and the existing event-less transition classes, with platform producer delivery acceptance.
+- **Event contract**: `cpt-cf-bss-orders-lifecycle-contract-order-events`; eleven typed events and the existing event-less transition classes, with platform producer delivery acceptance; consumers meet the [event consumer contract](DESIGN.md#contract-01-event-consumer-contract) and its `orders-events` corpus gates their integration sign-off (D-186).
 
 ---
 
@@ -652,10 +655,10 @@ cannot be closed automatically.
 
 - **Scope**:
   - Caller-initiated cancellation with the recorded spawn-signal guard, and abandoned-draft auto-void to `expired` without deleting commercial evidence.
-  - Hold and resume with the stored pre-hold state; the per-state TTL policy for `submitted`, `pending_approval`, `approved` and `on_hold`; the **resume cap** that stops a hold/resume cycle restarting the dwell without limit — its sibling, the amendment cap, is owned in [04 §4.1](features/04-versioning.md#contract-04-4-1) because its value is a commercial judgment; the coordinated expiry scheduler; and the transition-table exclusion of `in_fulfillment` and of holds taken from it, together with the handoff of those cases to the operational escalation owned by the sibling gear. It does **not** supply a fallback duration for a state whose TTL is unset — such a state is unbounded, disclosed in [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2) and routed as [`DECISIONS.md`](./DECISIONS.md) Q-27.
+  - Hold and resume with the stored pre-hold state; the per-state TTL policy for `submitted`, `pending_approval`, `approved` and `on_hold`; the **resume cap** that stops a hold/resume cycle restarting the dwell without limit — its sibling, the amendment cap, is owned in [04 §4.1](features/04-versioning.md#contract-04-4-1) because its value is a commercial judgment; the coordinated expiry scheduler; and the transition-table exclusion of `in_fulfillment` and of holds taken from it, together with the handoff of those cases to the operational escalation owned by the sibling gear, the Orders-side overdue-fulfillment gauge and alert, and the two-person operator-forced `fulfillment_failed` that is the bounded end of that escalation (D-182). It supplies **no code-constant fallback** duration: every expirable state ships a provisional platform TTL as a migration-seeded, revisioned policy row, and the policy channel refuses an unset duration in production ([07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2), [`DECISIONS.md`](./DECISIONS.md) D-181, closing Q-27).
 
 - **Out of scope**:
-  - It does not pause entitlement or billing on already-activated subscriptions, does not extend a term, and does not void wave-1 subscription drafts. It never auto-terminals an order whose fulfillment may be in flight.
+  - It does not pause entitlement or billing on already-activated subscriptions, does not extend a term, and does not void wave-1 subscription drafts. It never auto-terminals an order whose fulfillment may be in flight; the forced exit is taken only by two fulfillment operators after the overdue window, never by a sweep.
 
 - **Requirements Covered**:
 
@@ -683,6 +686,7 @@ cannot be closed automatically.
   - `POST /bss-orders-lifecycle/v1/orders/{orderId}/cancel`
   - `POST /bss-orders-lifecycle/v1/orders/{orderId}/hold`
   - `POST /bss-orders-lifecycle/v1/orders/{orderId}/resume`
+  - `POST /bss-orders-lifecycle/v1/orders/{orderId}/forced-failure`
   - Shared contract: `cpt-cf-bss-orders-lifecycle-interface-order-operations`; PRD `cpt-cf-bss-orders-lifecycle-interface-order-ops`.
 
 - **Sequences**:
@@ -722,6 +726,7 @@ cannot be closed automatically.
     - `cpt-cf-bss-orders-lifecycle-seq-hold-resume`
     - `cpt-cf-bss-orders-lifecycle-seq-expiry-sweep`
     - `cpt-cf-bss-orders-lifecycle-seq-overdue-handoff`
+    - `cpt-cf-bss-orders-lifecycle-seq-forced-unreconciled-failure`
   - **Tables**:
     - `cpt-cf-bss-orders-lifecycle-dbtable-state-ttl-policy`
 
@@ -865,7 +870,9 @@ derived locally from the stored bindings and a seller-scoped Orders setting (D-1
 has adopted period bindings; it still needs the pinned comparison at activation over the ordinary
 resolve (D-162), the SUB-G1 key answer for a PriceBook line and the SUB-O5 count amendment (D-163),
 `order_compensation` (SUB-O1), the order reference (SUB-O2), the start instant (SUB-O10) and atomic
-activation. SKU protection is inherited from the revision's references (D-164); the only Products/
+activation (`…-upreq-overlap-activation-atomicity`). That last ask is a **release gate** (D-180):
+until Subscriptions agrees and delivers it, subscription-side cardinality is advisory at order time
+and the submit/activation path is not production-ready. SKU protection is inherited from the revision's references (D-164); the only Products/
 Pricing ask is that the release report counts in-flight orders. Workflow needs complete topology and
 the approval/payment owner contracts. The reciprocal amendments specify the missing shapes.
 
