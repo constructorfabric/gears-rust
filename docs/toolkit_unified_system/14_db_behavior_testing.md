@@ -437,7 +437,8 @@ async fn concurrent_callers_leave_the_invariant_intact() {
 ```
 
 The barrier only starts both calls together; it cannot force both to read before either writes, so a passing
-run proves nothing and a failing run proves the bug. To force the bad interleaving, add a test-only hook between
+run does not rule out the race; only a failed post-state invariant assertion demonstrates the violation. To force
+the bad interleaving, add a test-only hook between
 the read and the write (an injected callback, or one behind a test-only cargo feature; `#[cfg(test)]` code is not
 built for `tests/` integration tests) and run the second writer inside it. Use the plain barrier for likely races,
 the hook to reproduce one deterministically.
