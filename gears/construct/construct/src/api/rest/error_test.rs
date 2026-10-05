@@ -40,10 +40,16 @@ fn validation_maps_to_400_with_field_violation() {
 }
 
 #[test]
-fn forbidden_maps_to_403() {
+fn forbidden_maps_to_403_without_the_internal_message() {
     let problem = wire(DomainError::forbidden("denied by policy"));
 
     assert_eq!(problem.status, Some(403));
+    assert_eq!(
+        problem.context.get("reason").and_then(|v| v.as_str()),
+        Some("ACCESS_DENIED"),
+    );
+    // The internal message stays out of the whole response, not only `detail`.
+    assert!(!format!("{problem:?}").contains("denied by policy"));
 }
 
 #[test]

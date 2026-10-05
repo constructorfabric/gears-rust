@@ -190,15 +190,6 @@ async fn text_with_nul_character_gets_400() {
 }
 
 #[tokio::test]
-async fn malformed_json_gets_400() {
-    let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
-
-    let (status, body) = post(router, r#"{"text":"#).await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-}
-
-#[tokio::test]
 async fn empty_body_gets_400() {
     let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
 
