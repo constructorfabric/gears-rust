@@ -96,6 +96,22 @@ gears:
       priority: 100
 ```
 
+## SQLite and concurrent writes
+
+On SQLite, a write can fail with `503`, and `(code: 5) database is locked` in
+the server log.
+
+SQLite allows one writer at a time, and the plugin's background work (the
+outbox worker, the retention sweeper) writes too. A transaction reads first and
+writes second. When another connection commits in between, SQLite refuses the
+write at once, because the transaction's view of the database is out of date.
+The busy timeout does not apply, and WAL mode does not prevent it.
+
+The `503` is transient, and every write carries an idempotency key, so a caller
+can retry the same request with the same key safely. To avoid these failures,
+or to avoid handling the retries, use PostgreSQL: it locks rows rather than the
+whole database and does not have this problem.
+
 ## Tests
 
 The unit and store suites run on in-memory SQLite. The concurrency suite runs
