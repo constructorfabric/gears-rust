@@ -95,7 +95,7 @@
   - [D-74 (M) The idempotency key families gain the trigger family and two round components](#d-74-m-the-idempotency-key-families-gain-the-trigger-family-and-two-round-components)
   - [D-75 (M) Supersession is unwind-then-start, and admission waits for the prior instance](#d-75-m-supersession-is-unwind-then-start-and-admission-waits-for-the-prior-instance)
   - [D-76 (M) The seller axis is resolved inside Orders and carried from admission to start](#d-76-m-the-seller-axis-is-resolved-inside-orders-and-carried-from-admission-to-start)
-  - [D-77 (M) Twelve reasons are registered for the step operations; the catalogue holds forty-two](#d-77-m-twelve-reasons-are-registered-for-the-step-operations-the-catalogue-holds-forty-two)
+  - [D-77 (M) Twelve reasons are registered for the step operations; the catalogue holds forty-one](#d-77-m-twelve-reasons-are-registered-for-the-step-operations-the-catalogue-holds-forty-one)
   - [D-78 (M) The barrier and the park are definition patterns over Orders guards](#d-78-m-the-barrier-and-the-park-are-definition-patterns-over-orders-guards)
   - [D-79 (M) Each wave is one `call` carrying the line set as references](#d-79-m-each-wave-is-one-call-carrying-the-line-set-as-references)
   - [D-80 (M) Competing-fork arms only listen or wait; one shared return, and a hold pauses only the approval stage](#d-80-m-competing-fork-arms-only-listen-or-wait-one-shared-return-and-a-hold-pauses-only-the-approval-stage)
@@ -1687,6 +1687,8 @@ withdrawn), §2.8 (new), §3, §5; D-37 (amended).
 
 **Amended by D-105 (2026-09-26).** The catalogue holds **43** reasons — the ten engine families and thirty-three slice values, `invocation-dead` added (`design/01-foundation.md` §4.9).
 
+**Amended by D-194 and D-196 (2026-09-30).** The catalogue holds **41** reasons — the ten engine families and thirty-one slice values: `order-binding-expired` added (D-194); `invalid-dependency-graph`, `catalog-topology-unavailable` and `blocked-upstream` withdrawn (D-196).
+
 **Accepted.** *(mirrors Lifecycle `01 §4.7` *Refusal reasons are derived GTS error types*)*
 
 **Decision**: every reason in the catalogue of `01 §4.9` is a derived GTS error type under the
@@ -2132,7 +2134,7 @@ and `start-instance` needs the seller axis for every seller-scoped row it writes
 
 **Amended by D-172 (2026-09-28)**: the seller is resolved from `admit-trigger`'s Lifecycle read, so a pre-admission audit entry written before that read returns an order — its `step-start`, and the settlement of a failed or foreign-tenant read — carries `seller_tenant_id` NULL; `owf_audit_entry` admits NULL only there.
 
-### D-77 (M) Twelve reasons are registered for the step operations; the catalogue holds forty-two
+### D-77 (M) Twelve reasons are registered for the step operations; the catalogue holds forty-one
 
 **Accepted.** *(amends D-64's counts)*
 

@@ -686,8 +686,8 @@ per-variant `#[error_code(...)]` and `#[canonical(...)]`: `type`, `status` and `
 the canonical category, and the stable machine-readable business reason is the
 `error_domain`/`error_code` pair, with no internal diagnostics, stack traces or
 downstream-service error text on the wire (safe wire-error behaviour). The closed catalogue of
-`design/01-foundation.md` §4.9 registers **forty-three** reasons — ten engine families and
-thirty-three slice values (D-77, D-105) — so a caller, and a definition's `catch`, branches on the code,
+`design/01-foundation.md` §4.9 registers **forty-one** reasons — ten engine families and
+thirty-one slice values (D-77, D-105, D-194, D-196) — so a caller, and a definition's `catch`, branches on the code,
 never on `type` or `detail`. Refusal reasons are derived GTS error types under
 `gts.cf.bss.orders_workflow.err.v1~`; those identifiers are registry keys, not wire values
 (`DECISIONS.md` D-64).
