@@ -1,0 +1,40 @@
+family     = "per-unit"
+id         = "untiered-included-allowance"
+kind       = "evaluation"
+provenance = ["inst-ac-band (backup)", "D-43 (backup)", "D-45 (backup)", "PRD §17.2 (backup)"]
+
+# The included quantity is deducted from `q` before the rate applies: a
+# test-only translation (reconciliation B), since no production allowance
+# exists. On a flat rate `(q - N) x rate` is the only reading. What the case
+# pins is the boundary: the allowance is half-open, so `q = N` bills nothing and
+# `q = N + 1` bills one unit.
+
+[snapshot]
+model_kind              = "per_unit"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "storage.gb"
+amount_minor            = 250
+billing_granularity     = "whole_unit"
+tier_aggregation_window = "invoice_period"
+included_allowance      = { quantity = 20, rollover_policy = "none" }
+
+[[assert]]
+given  = { q = 0 }
+expect = { charge_minor = 0 }
+why    = "no usage bills nothing, allowance or not"
+
+[[assert]]
+given  = { q = 20 }
+expect = { charge_minor = 0 }
+why    = "exactly at the allowance: [0,20) is half-open, so the twentieth unit is the last free one and the paid band opens at 20 with nothing in it yet"
+
+[[assert]]
+given  = { q = 21 }
+expect = { charge_minor = 250 }
+why    = "the first billable unit at the row's rate"
+
+[[assert]]
+given  = { q = 120 }
+expect = { charge_minor = 25000 }
+why    = "100 billable units at 250 — the free 20 are deducted from what the paid band sees, not from the rate"

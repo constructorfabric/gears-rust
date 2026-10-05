@@ -140,8 +140,7 @@ class TestXlsxUploadAccepted:
             files={"file": ("data.xlsx", io.BytesIO(_make_minimal_xlsx()), XLSX_CONTENT_TYPE)},
             timeout=60,
         )
-        body = assert_problem(resp, 400, "invalid_argument")
-        assert body["detail"] == "Code interpreter is currently unavailable", body
+        assert_problem(resp, 400, "invalid_argument", field_reason="CODE_INTERPRETER_UNAVAILABLE")
         assert query_db("SELECT id FROM attachments WHERE chat_id = ?", (chat_id,)) == []
         assert mock_provider.get_post_paths() == []
 

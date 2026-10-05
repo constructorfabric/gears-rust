@@ -248,8 +248,8 @@ async fn set_reaction_invalid_value_rejected() {
 
     assert!(result.is_err(), "Should reject invalid reaction value");
     assert!(
-        matches!(result.unwrap_err(), DomainError::Validation { .. }),
-        "Expected Validation error"
+        matches!(result.unwrap_err(), DomainError::InvalidReaction),
+        "Expected InvalidReaction error"
     );
 }
 

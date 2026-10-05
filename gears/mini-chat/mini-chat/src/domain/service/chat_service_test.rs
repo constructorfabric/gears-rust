@@ -143,8 +143,8 @@ async fn create_chat_empty_title_rejected() {
 
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), DomainError::Validation { .. }),
-        "Expected Validation error for empty title at create"
+        matches!(result.unwrap_err(), DomainError::InvalidTitle { .. }),
+        "Expected InvalidTitle error for empty title at create"
     );
 }
 
@@ -296,7 +296,7 @@ async fn update_chat_title_empty_rejected() {
 
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), DomainError::Validation { .. }),
+        matches!(result.unwrap_err(), DomainError::InvalidTitle { .. }),
         "Expected Validation error"
     );
 }
@@ -331,7 +331,7 @@ async fn update_chat_title_whitespace_only_rejected() {
 
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), DomainError::Validation { .. }),
+        matches!(result.unwrap_err(), DomainError::InvalidTitle { .. }),
         "Expected Validation error"
     );
 }
@@ -367,7 +367,7 @@ async fn update_chat_title_too_long_rejected() {
 
     assert!(result.is_err());
     assert!(
-        matches!(result.unwrap_err(), DomainError::Validation { .. }),
+        matches!(result.unwrap_err(), DomainError::InvalidTitle { .. }),
         "Expected Validation error"
     );
 }

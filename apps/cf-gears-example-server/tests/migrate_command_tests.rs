@@ -32,7 +32,12 @@ fn test_migrate_command_help_text() {
 
 #[test]
 fn test_migrate_command_runs_migration_phases() {
+    // A fresh data root: the default is the developer's home directory, where a
+    // database left by an older migration chain makes this test fail, and where
+    // a test has no business creating or migrating anything.
+    let home = tempfile::tempdir().expect("temporary data root");
     let output = Command::new(cf_gears_binary())
+        .env("APP__SERVER__HOME_DIR", home.path())
         .arg("--config")
         .arg("../../config/e2e-local.yaml")
         .arg("migrate")

@@ -1,0 +1,38 @@
+[package]
+name = "cf-gears-bss-rest"
+edition.workspace = true
+license.workspace = true
+description = "Shared HTTP helpers for the BSS gears: a weak ETag over a response body, 304 on If-None-Match, actor names through Account Management, and the archived filter term"
+
+[lib]
+name = "bss_rest"
+
+[dependencies]
+axum = { workspace = true }       # the response type the gears return
+http = { workspace = true }       # HeaderMap, HeaderValue, status codes
+aws-lc-rs = { workspace = true }  # SHA-256 of the served body
+base64 = { workspace = true }     # base64url of that digest
+serde = { workspace = true }      # Serialize bound on the response value
+serde_json = { workspace = true } # the exact JSON bytes the tag covers
+
+# Actor names: AM's public user read, found in the client hub when it is registered (a soft
+# dependency; no BSS gear depends on AM).
+account-management-sdk = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }               # bounded concurrent lookups
+tokio = { workspace = true, features = ["time"] } # one budget per response
+toolkit = { workspace = true }                    # ClientHub
+toolkit-canonical-errors = { workspace = true, features = ["axum"] } # the 500 Problem
+toolkit-odata = { workspace = true }              # Page, the shape AM answers; the $filter AST
+toolkit-security = { workspace = true }           # SecurityContext
+tracing = { workspace = true }                    # a failed body and a degraded name lookup
+uuid = { workspace = true }
+
+[dev-dependencies]
+gts = { workspace = true }   # the metadata type id in AM's client trait, for the recording AM
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tracing-test = { workspace = true, features = ["no-env-filter"] }
+
+[lints]
+workspace = true

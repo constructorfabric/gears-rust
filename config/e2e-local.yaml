@@ -493,27 +493,29 @@ gears:
         # "hard-deleted" (see bss_ledger::config::UnregisteredTenants).
         unregistered_tenants: reconcile
 
+  bss-products:
+    # Linked by the bss-pricing feature: pricing reserves SKU references in
+    # products in-process. Config defaults suffice; the gear needs its own
+    # database for the SKU registry, approvals and the outbox.
+    database:
+      server: "sqlite_users"
+      file: "bss_products.db"
+
   bss-pricing:
-    # Gear-specific database (SQLite for E2E, like the other user gears; the
-    # gear ships dual PG/SQLite migrations). No config block needed — the
-    # defaults are correct for E2E, including the in-repository path of the
-    # joint conformance-fixture registry. That registry's nine rows all carry
-    # `oracle = true` and `publish = true`, so the gate is OPEN for every model
-    # kind here — pricing's validator has earned the corpus's `publish` half.
-    # (This comment said the opposite until 2026-08-03; it had been stale since
-    # the registry was regenerated.) Since Slice 5 the publish endpoint exists
-    # and the open gate is load-bearing here: the e2e walk's pre-check passes
-    # rather than refusing FIXTURE_MISSING per model kind.
-    #
-    # The publish still cannot COMPLETE in this deployment, and the reason is a
-    # different one: there is no CatalogVersion registry gear in this
-    # repository, so the module boots with UnconfiguredCatalogVersionRegistryV1
-    # and the commit's version request fails closed (503). There is deliberately
-    # no config key that would supply a registry — a locally invented version
-    # would make this gear a second incrementer.
+    # The PriceBook skeleton reserves /bss-pricing/v1 with no operations.
+    # Runtime migrations retain the shared coordination table; config defaults
+    # suffice until the pricing model is rebuilt.
     database:
       server: "sqlite_users"
       file: "bss_pricing.db"
+
+  bss-approvals:
+    # The approvals inbox: one list, count, card and vote over the approval units
+    # of the gears named in `sources`, each read and voted on through that gear's
+    # own door as the caller. No database: the units stay in their gears. Without
+    # a `config` object the gear does not serve.
+    config:
+      sources: ["pricing", "products"]
 
   simple-user-settings:
     # Gear-specific database configuration

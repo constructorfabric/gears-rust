@@ -162,6 +162,78 @@ pub enum ClientWiring {
     },
 }
 
+/// Whether `s` is an absolute URI (scheme + authority) — the shape a usable
+/// static endpoint override must have. A bare host, relative path or empty string
+/// would otherwise be marked resolved with no probe (`/readyz` 200 while every
+/// call fails). Enforced at parse time by [`ConsumerWiring`]'s `endpoint` deserializer.
+#[must_use]
+fn is_absolute_endpoint(s: &str) -> bool {
+    s.parse::<http::Uri>()
+        .is_ok_and(|uri| uri.scheme().is_some() && uri.authority().is_some())
+}
+
+/// `deserialize_with` for [`ConsumerWiring::endpoint`]: keeps the field a plain
+/// `Option<String>` while rejecting a present, non-absolute value at parse time
+/// (see [`is_absolute_endpoint`]).
+fn deserialize_optional_endpoint<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let endpoint = Option::<String>::deserialize(deserializer)?;
+    if let Some(ref s) = endpoint
+        && !is_absolute_endpoint(s)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "`{s}` is not an absolute URI (needs scheme + host, e.g. `http://host:port`)"
+        )));
+    }
+    Ok(endpoint)
+}
+
+/// Consumer-side wiring for one dependency, read from
+/// `gears.<owner>.config.consumer_wiring.<dep>` by the runtime's proxy-wiring
+/// phase and applied to the directory-resolving REST client that
+/// `#[toolkit::consumes]` registers.
+///
+/// An object with an optional `endpoint` (omit to keep discovery) plus a
+/// flattened [`ClientTuning`]:
+///
+/// ```yaml
+/// consumer_wiring:
+///   api-contracts:
+///     timeout: "5s"
+///     max_concurrent_requests: 256
+///     # endpoint: "http://..."   # optional; omit to keep discovery
+/// ```
+///
+/// Unlike [`ClientWiring`] there is **no** `transport` tag: the
+/// `#[toolkit::consumes]` path is REST-only, so every tuning knob applies. (A
+/// hand-written [`ConsumerRegistration`](crate::runtime) may bind a non-REST
+/// transport, which reads only the knobs it understands.)
+///
+/// Must be an object; a bare `<dep>: "http://host"` string (the old shape) is
+/// rejected at parse time — use the `endpoint` field.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ConsumerWiring {
+    /// Static-endpoint override (ADR-0004 dev/test escape hatch): when set, the
+    /// dep is wired to this fixed endpoint instead of being discovered. Rejected
+    /// at parse time unless it is an absolute URI (see [`is_absolute_endpoint`]).
+    #[serde(default, deserialize_with = "deserialize_optional_endpoint")]
+    pub endpoint: Option<String>,
+    /// REST client tuning, flattened into the same map as `endpoint`.
+    #[serde(default, flatten)]
+    pub tuning: ClientTuning,
+}
+
+impl ConsumerWiring {
+    /// Split the wiring into its static-endpoint override (if any) and the
+    /// [`ClientTuning`] to apply.
+    #[must_use]
+    pub fn into_parts(self) -> (Option<String>, ClientTuning) {
+        (self.endpoint, self.tuning)
+    }
+}
+
 #[cfg(feature = "runtime-client")]
 impl ClientTuning {
     /// Apply tuning overrides onto a fresh [`ClientConfig`] built from `endpoint`.
@@ -220,5 +292,57 @@ impl ClientTuning {
     ) -> Self {
         self.internal_token_provider = provider;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A static override is only usable if it is an absolute URI. An empty string,
+    /// a bare host, or a relative path would otherwise reach the wiring code, take
+    /// the static branch, and mark the dep resolved with no probe — 200 on
+    /// `/readyz` while every call fails.
+    #[test]
+    fn is_absolute_endpoint_accepts_only_scheme_plus_authority() {
+        assert!(is_absolute_endpoint("http://host:8081"));
+        assert!(is_absolute_endpoint("https://billing.svc/base"));
+        assert!(!is_absolute_endpoint(""));
+        assert!(!is_absolute_endpoint("billing"));
+        assert!(!is_absolute_endpoint("/path/only"));
+        assert!(!is_absolute_endpoint("not a uri"));
+    }
+
+    /// `ConsumerWiring` validates the endpoint at parse time: a present-but-invalid
+    /// value fails to deserialize (rather than yielding an unchecked string), the
+    /// valid value survives verbatim, and an omitted `endpoint` keeps discovery
+    /// while still parsing the tuning.
+    #[test]
+    fn consumer_wiring_validates_endpoint_on_deserialize() {
+        let ok: ConsumerWiring = serde_json::from_value(serde_json::json!({
+            "endpoint": "http://billing:8080",
+            "max_concurrent_requests": 256
+        }))
+        .expect("valid absolute endpoint must parse");
+        let (endpoint, tuning) = ok.into_parts();
+        assert_eq!(endpoint.as_deref(), Some("http://billing:8080"));
+        assert_eq!(tuning.max_concurrent_requests, Some(256));
+
+        assert!(
+            serde_json::from_value::<ConsumerWiring>(serde_json::json!({ "endpoint": "" }))
+                .is_err(),
+            "an empty endpoint must be rejected at deserialize time"
+        );
+        assert!(
+            serde_json::from_value::<ConsumerWiring>(serde_json::json!({ "endpoint": "billing" }))
+                .is_err(),
+            "a bare host must be rejected at deserialize time"
+        );
+
+        let no_endpoint: ConsumerWiring =
+            serde_json::from_value(serde_json::json!({ "max_concurrent_requests": 1 }))
+                .expect("omitted endpoint keeps discovery");
+        assert_eq!(no_endpoint.endpoint, None);
+        assert_eq!(no_endpoint.tuning.max_concurrent_requests, Some(1));
     }
 }

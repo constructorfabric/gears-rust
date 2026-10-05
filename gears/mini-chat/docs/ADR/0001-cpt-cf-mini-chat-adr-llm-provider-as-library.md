@@ -28,7 +28,7 @@ Chosen option: "Library crate", because `llm_provider` has no independent lifecy
 
 ### Consequences
 
-* Good, because cancellation is simpler - `CancellationToken` propagates in-process without crossing a network boundary, enabling hard cancel within a single `tokio::select!`
+* Good, because cancellation is simpler - the cancellation signal propagates in-process without crossing a network boundary, so hard cancel is a single wait on either the next provider event or the cancel signal
 * Good, because one fewer service to deploy, monitor, and scale
 * Good, because no additional network-facing authentication surface - `llm_provider` inherits the `SecurityContext` from `mini_chat_service` in-process
 * Good, because streaming latency is lower - no serialization/deserialization or network overhead between `mini_chat_service` and `llm_provider`
@@ -38,9 +38,9 @@ Chosen option: "Library crate", because `llm_provider` has no independent lifecy
 
 ### Confirmation
 
-* Code review: `llm_provider` is the in-crate module `mini-chat/src/infra/llm` (one adapter per provider kind, see `cpt-cf-mini-chat-adr-multi-provider-adapters`) and is used only by the Mini Chat gear
-* No `Dockerfile`, no `main.rs`, no health endpoint for `llm_provider`
-* Cancellation: unit tests `cancellation_stops_stream` and `disconnect_finalizes_turn_to_cancelled` (`mini-chat/src/domain/service/stream_service/mod.rs`) and `cancellation_terminates_stream` (`mini-chat/src/infra/llm/providers/openai_responses_tests.rs`) verify that the `CancellationToken` reaches the provider stream. They use mock providers/gateways; abort of the real upstream HTTP connection is not covered by an automated test
+* Code review: `llm_provider` is an in-process module of the Mini Chat gear (one adapter per provider kind, see `cpt-cf-mini-chat-adr-multi-provider-adapters`) and is used only by the Mini Chat gear
+* `llm_provider` has no container image, no executable entry point and no health endpoint
+* Cancellation: stream service unit tests cover that cancellation stops the stream and that a client disconnect finalizes the turn as cancelled; provider adapter unit tests cover that cancellation terminates the provider stream. Together they verify that the cancellation signal reaches the provider stream. They use mock providers/gateways; abort of the real upstream HTTP connection is not covered by an automated test
 
 ## Pros and Cons of the Options
 
@@ -49,7 +49,7 @@ Chosen option: "Library crate", because `llm_provider` has no independent lifecy
 `llm_provider` is a Rust library crate. `mini_chat_service` calls it via direct function invocation. No network boundary.
 
 * Good, because zero network overhead on the streaming hot path
-* Good, because `CancellationToken` propagates in-process (no RPC cancel semantics needed)
+* Good, because the cancellation signal propagates in-process (no RPC cancel semantics needed)
 * Good, because no independent deployment artifact or scaling policy
 * Good, because no additional network-facing security surface - no ports, no auth, no TLS between services (the security surface remains inside the `mini_chat_service` process)
 * Neutral, because tightly couples `llm_provider` release cycle to `mini_chat_service`
@@ -84,5 +84,5 @@ This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-mini-chat-component-llm-provider` - Defines `llm_provider` as a library, not a service
 * `cpt-cf-mini-chat-nfr-streaming-latency` - Eliminates network hop in streaming path
-* `cpt-cf-mini-chat-seq-cancellation` - Simplifies hard cancel via in-process `CancellationToken`
+* `cpt-cf-mini-chat-seq-cancellation` - Simplifies hard cancel via in-process cancellation signal
 * `cpt-cf-mini-chat-constraint-no-buffering` - No serialization boundary that could introduce buffering

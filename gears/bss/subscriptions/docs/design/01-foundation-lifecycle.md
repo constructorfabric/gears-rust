@@ -273,7 +273,7 @@ never silently dropped.
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-storage-aggregate-fnd`
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-datastore-aggregate-fnd`
 
 Owned here (tenant-partitioned by the pinned `orderingTenantId`, SUB-D-06 — stable across transfers, UTC): `subscription` (aggregate current
 state — incl. `billing_anchor`, `term_start_at`/`term_end_at`, `current_term_sequence`: the

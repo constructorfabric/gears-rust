@@ -8,9 +8,9 @@
 
 ### 1.1 Overview
 
-Mini Chat publishes usage events, audit events and background work (attachment cleanup, chat cleanup, thread summaries) through the shared transactional outbox in `toolkit-db` (`libs/toolkit-db/src/outbox`). Producers write outbox rows in the same database transaction as their side effects; background tasks deliver them to handlers with at-least-once semantics. No synchronous call to billing or audit sits on the request hot path.
+Mini Chat publishes usage events, audit events and background work (attachment cleanup, chat cleanup, thread summaries) through the shared transactional outbox of the ToolKit database library. Producers write outbox rows in the same database transaction as their side effects; background tasks deliver them to handlers with at-least-once semantics. No synchronous call to billing or audit sits on the request hot path.
 
-The outbox is a general-purpose library. A gear registers named **queues**, each split into a fixed number of **partitions**, and one handler per queue. The library reference is `libs/toolkit-db/src/outbox/README.md`.
+The outbox is a general-purpose library. A gear registers named **queues**, each split into a fixed number of **partitions**, and one handler per queue.
 
 ### 1.2 Purpose
 
@@ -27,31 +27,26 @@ Delivery is asynchronous and at-least-once.
 | Actor | Role in Feature |
 |-------|-----------------|
 | `cpt-cf-mini-chat-actor-chat-user` | Initiates an operation whose commit MUST enqueue an outbox event (when side effects are applied). |
-| `cpt-cf-mini-chat-actor-usage-outbox-dispatcher` | The outbox processor of the `toolkit-db` library: leases a partition, reads its messages in sequence order and calls the queue's handler. |
+| `cpt-cf-mini-chat-actor-usage-outbox-dispatcher` | The outbox processor of the ToolKit database library: leases a partition, reads its messages in sequence order and calls the queue's handler. |
 | `cpt-cf-mini-chat-actor-outbox-consumer` | Downstream consumer called by a handler (model-policy plugin `publish_usage`, audit plugin, provider file/vector-store APIs). MUST process redeliveries idempotently. |
 
 ### 1.4 References
 
-- `libs/toolkit-db/src/outbox/README.md` — library usage and handler guidance
-- `libs/toolkit-db/src/outbox/migrations.rs` — schema
-- `libs/toolkit-db/src/outbox/handler.rs` — `LeasedMessageHandler`, `MessageResult`, `HandlerResult`
-- `libs/toolkit-db/src/outbox/builder.rs` — queue registration, `LeaseConfig`
-- `gears/mini-chat/mini-chat/src/gear.rs` — queue registration for Mini Chat
-- `gears/mini-chat/mini-chat/src/infra/outbox.rs` — `InfraOutboxEnqueuer`, `UsageEventHandler`, `AuditEventHandler`
+- ToolKit outbox library documentation: usage, schema, handler contract, queue registration and lease configuration
 - DESIGN.md §5.6 — usage event payload and `dedupe_key` format
 
 ### 1.5 Implementation Shape (normative)
 
-- Producers enqueue through `Outbox::enqueue(runner, record)` where `record` is built with `Record::to(queue, partition).payload(bytes, payload_type).build()`. Mini Chat wraps this in the domain port `OutboxEnqueuer` (`domain/repos/outbox_enqueuer.rs`), implemented by `InfraOutboxEnqueuer`.
+- Producers enqueue a record addressed to a queue and partition and carrying a payload with its payload type. Domain services do not call the library directly; they go through a Mini Chat outbox enqueuer port that owns queue names and partition selection.
 - The enqueue call MUST run inside the same DB transaction as the side effects the event describes.
-- `enqueue` returns a `Wake`. The caller MUST fire it only after the transaction commits (`Wake::fire`), and drop it on rollback. Several enqueues in one unit of work combine with `+=`. An unfired `Wake` does not lose the message: the library's reconciler finds the partition later, so delivery is only delayed.
-- Delivery runs in library background tasks (sequencer, per-partition processor, vacuum), started by `Outbox::builder(db)...start()` in `MiniChat::start()` and stopped in `MiniChat::stop()`.
-- Handlers implement `LeasedMessageHandler` and return `MessageResult::{Ok, Retry, Reject}`.
+- Enqueue returns a wake handle. The caller MUST fire it only after the transaction commits, and drop it on rollback. The wake handles of several enqueues in one unit of work combine into one. An unfired wake handle does not lose the message: the library's reconciler finds the partition later, so delivery is only delayed.
+- Delivery runs in library background tasks (sequencer, per-partition processor, vacuum), started when the Mini Chat gear starts and stopped when it stops.
+- Handlers implement the library's leased message handler contract and return `Ok`, `Retry` or `Reject`.
 - The library has **no deduplication**. There is no `dedupe_key` column and no unique index on enqueue. Idempotency is the consumer's job (section 1.8).
 
 ### 1.6 Outbox Storage (normative)
 
-The schema is created by `toolkit_db::outbox::outbox_migrations()`, which Mini Chat appends to its own migrations. Mini Chat uses the default table prefix `toolkit_outbox`, so the tables are shared with other gears in the same database and separated by queue name. Payloads are opaque bytes; Mini Chat always writes JSON with `payload_type = "application/json"`.
+The schema comes from the outbox library's migrations, which Mini Chat appends to its own migrations. Mini Chat uses the default table prefix `toolkit_outbox`, so the tables are shared with other gears in the same database and separated by queue name. Payloads are opaque bytes; Mini Chat always writes JSON with `payload_type = "application/json"`.
 
 | Table | Purpose | Key columns |
 |---|---|---|
@@ -68,31 +63,15 @@ On MySQL the migration also creates `toolkit_outbox_body_id_sequence` and `toolk
 
 There is no per-message status column. A message's state follows from where its row is and from the partition cursor (section 4). Leases are held per partition in `toolkit_outbox_processor`, not per message.
 
-### 1.7 `toolkit_db::outbox` API used by Mini Chat
+### 1.7 Outbox library API used by Mini Chat
+
+At start-up Mini Chat registers each queue (section 1.8) with its partition count and its handler. A queue can override the lease configuration; a lease override applies only to that queue, and queues without one use the default. The thread-summary queue sets the lease duration to `thread_summary_worker.claim_timeout_secs`.
+
+A producer enqueues a record (queue, partition, JSON payload, `payload_type = "application/json"`) inside its transaction and fires the returned wake handle after commit.
+
+Handler, message and lease contract of the library (illustrative):
 
 ```rust
-// Registration (gear.rs, MiniChat::start)
-let handle = Outbox::builder(db)
-    .queue(&cfg.outbox.queue_name, Partitions::of(n))
-    .leased(UsageEventHandler { .. })
-    .queue(&cfg.outbox.thread_summary_queue_name, Partitions::of(n))
-    .leased(ThreadSummaryHandler::new(..))
-    .lease(LeaseConfig {
-        duration: Duration::from_secs(thread_summary_worker.claim_timeout_secs),
-        ..LeaseConfig::default()
-    })
-    // ... other queues
-    .start()
-    .await?;
-
-// Producer (inside a transaction)
-let wake = outbox
-    .enqueue(txn, Record::to(queue, partition).payload(json, "application/json").build()?)
-    .await?;
-// after commit:
-wake.fire();
-
-// Consumer
 #[async_trait]
 pub trait LeasedMessageHandler: Send + Sync {
     async fn handle(&self, msg: &OutboxMessage) -> MessageResult;
@@ -103,7 +82,7 @@ pub struct OutboxMessage {
     pub seq: i64,
     pub payload: Vec<u8>,
     pub payload_type: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: DateTime<Utc>,
     /// Retries of this message so far (0 on first delivery).
     pub attempts: i16,
 }
@@ -120,19 +99,17 @@ pub struct LeaseConfig {
 }
 ```
 
-`.lease(..)` applies to the queue registered just before it. Queues without `.lease(..)` use the default.
-
 ### 1.8 Mini Chat queues
 
-All queues use the same partition count, `outbox.num_partitions` (power of two, 1–64, default 4). The partition is `uuid.as_u128() % num_partitions` of the partition key (`InfraOutboxEnqueuer::compute_partition`).
+All queues use the same partition count, `outbox.num_partitions` (power of two, 1–64, default 4). The partition is the partition key UUID, read as a 128-bit integer, modulo `num_partitions`.
 
 | Queue (default name, config key) | Payload | Partition key | Handler | Lease | Retry bound |
 |---|---|---|---|---|---|
-| `mini-chat.usage_snapshot` (`outbox.queue_name`) | `UsageEvent` (SDK) | `tenant_id` | `UsageEventHandler` → model-policy plugin `publish_usage()` | default (30 s) | none; `Retry` until the plugin succeeds or returns `Permanent` |
-| `mini-chat.attachment_cleanup` (`outbox.cleanup_queue_name`) | `AttachmentCleanupEvent` (enqueued by attachment deletion and by the upload reaper, `event_type = attachment_upload_abandoned`, without `secondary_ref`) | `tenant_id` | `AttachmentCleanupHandler` → provider file delete, then Anthropic secondary delete | default | `cleanup_worker.max_attempts`, counted in `attachments.cleanup_attempts`; then the attachment is `failed` and the message `Reject` (dead letter). A delete answered with 2xx or 404 is success, any other status a failed attempt |
-| `mini-chat.chat_cleanup` (`outbox.chat_cleanup_queue_name`) | `ChatCleanupEvent` | `chat_id` | `ChatCleanupHandler` → per-attachment file deletes, vector store delete | default | `cleanup_worker.max_attempts` per attachment (attachment then `failed`, handler continues). A failing vector-store delete returns `Retry` until the delivery that reaches `cleanup_worker.max_attempts` (`msg.attempts`; deliveries that waited for pending attachments count), then `Reject`; the `chat_vector_stores` row is kept for a dead-letter replay |
-| `mini-chat.thread_summary` (`outbox.thread_summary_queue_name`) | `ThreadSummaryTaskPayload` | `chat_id` | `ThreadSummaryHandler` → non-streaming LLM call, summary persist, system usage event | `thread_summary_worker.claim_timeout_secs` | `thread_summary_worker.max_attempts` (`msg.attempts`); then `Reject`. A summary model missing from the catalog or disabled → `Reject` at once (`result = model_unavailable`) |
-| `mini-chat.audit` (`outbox.audit_queue_name`) | `AuditEnvelope` (`Turn` / `Mutation` / `Delete`) | `tenant_id` | `AuditEventHandler` → audit plugin `emit_*` (via `AuditGateway`) | 60 s | none; `Retry` on transient errors. A payload that does not deserialize → `Reject`, checked before the plugin is resolved. No audit plugin registered → `Ok` (event dropped, counted as `audit_emit_total{result="dropped"}`; looked up again on the next delivery). Instance found but its client missing from ClientHub → `Retry` |
+| `mini-chat.usage_snapshot` (`outbox.queue_name`) | `UsageEvent` (SDK) | `tenant_id` | usage handler → model-policy plugin `publish_usage()` | default (30 s) | none; `Retry` until the plugin succeeds or returns `Permanent` |
+| `mini-chat.attachment_cleanup` (`outbox.cleanup_queue_name`) | attachment cleanup event (enqueued by attachment deletion and by the upload reaper, `event_type = attachment_upload_abandoned`, without `secondary_ref`) | `tenant_id` | attachment cleanup handler → provider file delete, then Anthropic secondary delete | default | `cleanup_worker.max_attempts`, counted in `attachments.cleanup_attempts`; then the attachment is `failed` and the message `Reject` (dead letter). A delete answered with 2xx or 404 is success, any other status a failed attempt |
+| `mini-chat.chat_cleanup` (`outbox.chat_cleanup_queue_name`) | chat cleanup event | `chat_id` | chat cleanup handler → per-attachment file deletes, vector store delete | default | `cleanup_worker.max_attempts` per attachment (attachment then `failed`, handler continues). A failing vector-store delete returns `Retry` until the delivery that reaches `cleanup_worker.max_attempts` (the message's `attempts`; deliveries that waited for pending attachments count), then `Reject`; the `chat_vector_stores` row is kept for a dead-letter replay |
+| `mini-chat.thread_summary` (`outbox.thread_summary_queue_name`) | thread summary task | `chat_id` | thread-summary handler → non-streaming LLM call, summary persist, system usage event | `thread_summary_worker.claim_timeout_secs` | `thread_summary_worker.max_attempts` (the message's `attempts`); then `Reject`. A summary model missing from the catalog or disabled → `Reject` at once (`result = model_unavailable`) |
+| `mini-chat.audit` (`outbox.audit_queue_name`) | audit envelope (turn / mutation / delete event) | `tenant_id` | audit handler → audit plugin `emit_*` | 60 s | none; `Retry` on transient errors. A payload that does not deserialize → `Reject`, checked before the plugin is resolved. No audit plugin registered → `Ok` (event dropped, counted as `audit_emit_total{result="dropped"}`; looked up again on the next delivery). Instance found but its client missing from ClientHub → `Retry` |
 
 Partitioning by `chat_id` serialises work for one chat (cleanup and summaries for the same chat run in order). Partitioning by `tenant_id` keeps one tenant's usage and audit events in order.
 
@@ -149,11 +126,11 @@ The thread-summary lease comes from `claim_timeout_secs` because the handler mak
 **Actor**: `cpt-cf-mini-chat-actor-chat-user`
 
 **Success Scenarios**:
-- An operation commits, and its outbox messages (e.g. one usage event and one audit event for a finalized turn) are written to `toolkit_outbox_body` / `toolkit_outbox_incoming` in the same transaction. After the commit the combined `Wake` is fired.
+- An operation commits, and its outbox messages (e.g. one usage event and one audit event for a finalized turn) are written to `toolkit_outbox_body` / `toolkit_outbox_incoming` in the same transaction. After the commit the combined wake handle is fired.
 
 **Error Scenarios**:
-- The DB transaction fails: the side effects and the outbox rows both roll back, and the `Wake` is dropped.
-- The payload exceeds the library size limit: `Record::build()` fails before any statement runs, and the operation returns an error (`OutboxError::PayloadTooLarge`).
+- The DB transaction fails: the side effects and the outbox rows both roll back, and the wake handle is dropped.
+- The payload exceeds the library size limit (64 KiB): building the record fails before any statement runs, and the operation returns a payload-too-large error.
 
 **Behavior (normative)**:
 - The outbox insert is part of the operation's commit: it MUST be in the **same DB transaction** as the committed side effects.
@@ -195,21 +172,21 @@ The thread-summary lease comes from `claim_timeout_secs` because the handler mak
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-algo-usage-outbox-enqueue`
 
 **Input**:
-- Queue name (from `OutboxConfig`)
+- Queue name (from the `outbox` config section)
 - Partition key (`tenant_id` or `chat_id`, section 1.8)
 - Serialized JSON payload
 
-**Caller responsibility**: `enqueue` persists whatever it receives. The domain code decides whether an outcome requires an event (see section 1.2) and does not call `enqueue` otherwise.
+**Caller responsibility**: `enqueue` persists whatever it receives. The calling domain service decides whether an outcome requires an event (see section 1.2) and does not call `enqueue` otherwise.
 
 **Output**:
 - One `toolkit_outbox_body` row and one `toolkit_outbox_incoming` row, inserted in the caller's transaction
-- A `Wake` to fire after commit
+- A wake handle to fire after commit
 
 **Requirements**:
 - The enqueue MUST run inside the same DB transaction as the described side effects.
 - The payload MUST be derived from already-validated internal state (no client-provided usage fields).
 - The payload MUST include all information the handler needs; handlers MUST NOT depend on rows that may be deleted before delivery (e.g. cleanup payloads carry provider file ids and the secondary-upload reference resolved at enqueue time).
-- `Wake::fire()` MUST be called only after a successful commit.
+- The wake handle MUST be fired only after a successful commit.
 
 ### Claim Pending Outbox Rows (Lease + Skip Locked)
 
@@ -217,13 +194,13 @@ The thread-summary lease comes from `claim_timeout_secs` because the handler mak
 
 **Input**:
 - Queue and partition
-- `LeaseConfig` of the queue
-- Processor batch size (library `WorkerTuning`)
+- Lease configuration of the queue
+- Processor batch size (library processor tuning)
 
 **Output**:
-- An ordered batch of `OutboxMessage` for one partition
+- An ordered batch of outbox messages for one partition
 
-**Requirements** (implemented by the library):
+**Requirements** (provided by the library):
 - The processor takes the partition lease by setting `locked_by` / `locked_until = now() + lease.duration` on the `toolkit_outbox_processor` row, only if the row is unleased or the lease has expired. On PostgreSQL and MySQL, partition and processor rows are locked with `FOR UPDATE SKIP LOCKED` so instances do not wait on each other.
 - It reads outgoing rows with `seq > processed_seq` in `seq` order.
 - One partition is processed by at most one instance at a time while the lease is valid.
@@ -234,8 +211,8 @@ The thread-summary lease comes from `claim_timeout_secs` because the handler mak
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-algo-usage-outbox-retry`
 
 **Input**:
-- `MessageResult` of the handler
-- `OutboxMessage.attempts`
+- Handler result
+- The message's `attempts`
 - Processor tuning (`retry_base`, `retry_max`)
 
 **Output**:
@@ -244,10 +221,10 @@ The thread-summary lease comes from `claim_timeout_secs` because the handler mak
 **Requirements**:
 - `Retry` increments `attempts` on the partition's processor row and schedules the next attempt with exponential backoff between `retry_base` and `retry_max` (default processor tuning: 1 s to 60 s).
 - `Reject` moves the message to `toolkit_outbox_dead_letters` with its payload, `attempts` and the reject reason as `last_error`.
-- The library has no `max_attempts`. Bounding retries is the handler's job, using `OutboxMessage.attempts` or its own counter:
-  - `ThreadSummaryHandler` returns `Reject` when the delivery is its `thread_summary_worker.max_attempts`-th, and at once when the summary model is missing from the catalog or disabled (`mini_chat_thread_summary_execution_total{result="model_unavailable"}`);
-  - `AttachmentCleanupHandler` counts failures in `attachments.cleanup_attempts` and returns `Reject` at `cleanup_worker.max_attempts`; `ChatCleanupHandler` marks such an attachment `failed` and continues, and returns `Reject` for a failing vector-store delete on the delivery that reaches `cleanup_worker.max_attempts` (`msg.attempts`);
-  - `UsageEventHandler` and `AuditEventHandler` retry until the plugin succeeds or reports a permanent error; `AuditEventHandler` rejects a corrupt payload at once.
+- The library has no `max_attempts`. Bounding retries is the handler's job, using the message's `attempts` or its own counter:
+  - the thread-summary handler returns `Reject` when the delivery is its `thread_summary_worker.max_attempts`-th, and at once when the summary model is missing from the catalog or disabled (`mini_chat_thread_summary_execution_total{result="model_unavailable"}`);
+  - the attachment cleanup handler counts failures in `attachments.cleanup_attempts` and returns `Reject` at `cleanup_worker.max_attempts`; the chat cleanup handler marks such an attachment `failed` and continues, and returns `Reject` for a failing vector-store delete on the delivery that reaches `cleanup_worker.max_attempts` (the message's `attempts`);
+  - the usage and audit handlers retry until the plugin succeeds or reports a permanent error; the audit handler rejects a corrupt payload at once.
 
 ## 4. States (CDSL)
 
@@ -271,7 +248,7 @@ The thread-summary lease comes from `claim_timeout_secs` because the handler mak
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-dod-usage-outbox-transactional`
 
-For any domain operation defined to emit an outbox event, the system **MUST** persist the outbox rows (`toolkit_outbox_body`, `toolkit_outbox_incoming`) in the same DB transaction as that operation's committed side effects, and fire the returned `Wake` only after commit.
+For any domain operation defined to emit an outbox event, the system **MUST** persist the outbox rows (`toolkit_outbox_body`, `toolkit_outbox_incoming`) in the same DB transaction as that operation's committed side effects, and fire the returned wake handle only after commit.
 
 **Implements**:
 - `cpt-cf-mini-chat-flow-usage-outbox-enqueue`
@@ -279,17 +256,17 @@ For any domain operation defined to emit an outbox event, the system **MUST** pe
 
 **Touches**:
 - DB: `toolkit_outbox_body`, `toolkit_outbox_incoming`
-- Code: `domain/repos/outbox_enqueuer.rs`, `infra/outbox.rs`, `domain/service/finalization_service.rs`, `domain/service/turn_service.rs`, `domain/service/attachment_service.rs`, `domain/service/chat_service.rs`, `infra/workers/upload_reaper.rs`
+- Components: outbox enqueuer port; producers: turn finalization, turn mutations (retry, edit, delete), attachment service, chat service, upload reaper
 
 ### Provide Stateful Usage Outbox Dispatcher
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-dod-usage-outbox-dispatcher`
 
-The system **MUST** register every Mini Chat queue with a `LeasedMessageHandler` at start-up so that:
+The system **MUST** register every Mini Chat queue with a leased message handler at start-up so that:
 - Messages are processed in order within a partition under a partition lease.
 - Leases expire so that partitions held by a crashed instance are taken over.
 - Transient failures are retried with backoff; permanent failures are dead-lettered.
-- Dead letters are visible to operators: the usage and audit handlers log at `error!` on `Reject` (audit emits also record `result = reject` in metrics); the cleanup handlers and the thread-summary handler (bounded reject after `max_attempts`) log their rejects at `warn!`.
+- Dead letters are visible to operators: the usage and audit handlers log at `error` level on `Reject` (audit emits also record `result = reject` in metrics); the cleanup handlers and the thread-summary handler (bounded reject after `max_attempts`) log their rejects at `warn` level.
 
 **Implements**:
 - `cpt-cf-mini-chat-flow-usage-outbox-dispatch`
@@ -299,7 +276,7 @@ The system **MUST** register every Mini Chat queue with a `LeasedMessageHandler`
 
 **Touches**:
 - DB: `toolkit_outbox_partitions`, `toolkit_outbox_outgoing`, `toolkit_outbox_processor`, `toolkit_outbox_dead_letters`
-- Code: `gear.rs` (`MiniChat::start`), `infra/outbox.rs`, `infra/workers/cleanup_worker.rs`, `infra/workers/thread_summary_worker.rs`
+- Components: gear start-up (queue registration), usage and audit handlers, cleanup handlers, thread-summary handler
 
 ### Enforce Idempotent Publish Contract
 
@@ -311,7 +288,7 @@ The system **MUST** keep delivery safe under redelivery: every usage event carri
 - `cpt-cf-mini-chat-flow-usage-outbox-dispatch`
 
 **Touches**:
-- Payload: `UsageEvent.dedupe_key` (`mini-chat-sdk/src/models.rs`)
+- Payload: `UsageEvent.dedupe_key` (Mini Chat SDK)
 
 ## 6. Acceptance Criteria
 

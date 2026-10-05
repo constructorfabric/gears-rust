@@ -1,0 +1,42 @@
+[package]
+name = "cf-gears-bss-approvals"
+edition.workspace = true
+license.workspace = true
+description = "BSS approvals inbox: one paged list, count, card and vote over every BSS gear"
+
+[lib]
+name = "bss_approvals"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+aws-lc-rs = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+bss-approvals-sdk = { workspace = true }
+# AP-D-10: a weak ETag and 304 on the list and the counts.
+bss-rest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+toolkit = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-odata = { workspace = true }
+toolkit-security = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util = { workspace = true }
+tower = { workspace = true }

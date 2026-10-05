@@ -266,7 +266,7 @@ flowchart TB
 
 **Responsibility boundaries**: builds no lines and resolves no accounts (handlers do); embeds no domain policy.
 
-**Related components**: `cpt-cf-bss-ledger-component-idempotency-gate`, `cpt-cf-bss-ledger-component-fiscal-period-guard`, `cpt-cf-bss-ledger-component-balance-projector` — calls; `cpt-cf-bss-ledger-component-outbox-relay` — publishes to.
+**Related components**: `cpt-cf-bss-ledger-component-idempotency-gate`, `cpt-cf-bss-ledger-component-fiscal-period-guard`, `cpt-cf-bss-ledger-component-balance-projector` — calls; cpt-cf-bss-ledger-component-outbox-relay — publishes to. **That component is referenced here and declared nowhere in this design set**; the citation is left de-tokenized rather than resolved, because declaring it would be an architecture decision this document is not the place for. Owner: this slice.
 
 #### IdempotencyGate
 
@@ -316,13 +316,20 @@ Partition automation attaches the deferrable balance trigger to every new monthl
 
 Each handler is a module of the monolith that builds balanced lines and calls the data-access API; its domain design and owned tables live in its feature doc.
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-invoice-posting-handler` — invoice-post leg shape (DR AR / CR Revenue + Contract-liability + Tax), account mapping, suspense routing, AR aging, full reversal. See [features/invoice-posting.md](./01a-invoice-posting.md).
-- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-payments-allocation-handler` — settlement, allocation (Mode A), chargebacks/disputes, wallet. See [features/payments-allocation.md](./03-payments-allocation.md).
-- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-asc606-recognition-handler` — recognition schedules + recognition runs, ScheduleBuilder. See [features/asc606-recognition.md](./04-asc606-recognition.md).
-- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-adjustments-notes-refunds-handler` — credit/debit notes, refunds, manual governance. See [features/adjustments-notes-refunds.md](./05-adjustments-notes-refunds.md).
-- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-fx-multicurrency-handler` — functional currency, realized FX, rate snapshots. See [features/fx-multicurrency.md](./06-fx-multicurrency.md).
-- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-audit-observability-handler` — tamper chain, freeze, secured store, PII/erasure, alarm catalog. See [features/audit-immutability-observability.md](./02-audit-immutability-observability.md).
-- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-reconciliation-export-handler` — reconciliations, ERP export, period close gate. See [features/reconciliation-export.md](./07-reconciliation-export.md).
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-invoice-posting-handler`
+  invoice-post leg shape (DR AR / CR Revenue + Contract-liability + Tax), account mapping, suspense routing, AR aging, full reversal. See [features/invoice-posting.md](./01a-invoice-posting.md).
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-payments-allocation-handler`
+  settlement, allocation (Mode A), chargebacks/disputes, wallet. See [features/payments-allocation.md](./03-payments-allocation.md).
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-asc606-recognition-handler`
+  recognition schedules + recognition runs, ScheduleBuilder. See [features/asc606-recognition.md](./04-asc606-recognition.md).
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-adjustments-notes-refunds-handler`
+  credit/debit notes, refunds, manual governance. See [features/adjustments-notes-refunds.md](./05-adjustments-notes-refunds.md).
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-fx-multicurrency-handler`
+  functional currency, realized FX, rate snapshots. See [features/fx-multicurrency.md](./06-fx-multicurrency.md).
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-audit-observability-handler`
+  tamper chain, freeze, secured store, PII/erasure, alarm catalog. See [features/audit-immutability-observability.md](./02-audit-immutability-observability.md).
+- [ ] `p2` - **ID**: `cpt-cf-bss-ledger-component-reconciliation-export-handler`
+  reconciliations, ERP export, period close gate. See [features/reconciliation-export.md](./07-reconciliation-export.md).
 
 ### 3.3 API Contracts
 
@@ -380,7 +387,7 @@ All inter-gear communication is call-driven (§4.3): upstream modules **call the
 
 #### Invoice post through the Foundation
 
-**ID**: `cpt-cf-bss-ledger-seq-post-through-foundation`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-seq-post-through-foundation`
 
 **Use cases**: `cpt-cf-bss-ledger-usecase-ledger-inquiry` (balance visibility after post)
 
@@ -412,7 +419,7 @@ sequenceDiagram
 
 #### Idempotent replay under concurrency
 
-**ID**: `cpt-cf-bss-ledger-seq-idempotent-replay`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-seq-idempotent-replay`
 
 **Actors**: `cpt-cf-bss-ledger-actor-billing-orchestration`
 
@@ -420,13 +427,13 @@ The loser on a same-`business_id` conflict blocks on the in-progress dedup row; 
 
 #### Reversal
 
-**ID**: `cpt-cf-bss-ledger-seq-reversal`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-seq-reversal`
 
 Strict line-negation: side-flipped copy with positive amounts; the partial `UNIQUE` on `(tenant, reverses_period_id, reverses_entry_id)` guarantees at-most-once reversal; reversals post at current effective time. The domain reversal flow is invoice-posting; the Foundation enforces the append-only / line-negation shape.
 
 #### Provisioning seed
 
-**ID**: `cpt-cf-bss-ledger-seq-provisioning-seed`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-seq-provisioning-seed`
 
 **Actors**: `cpt-cf-bss-ledger-actor-billing-orchestration`
 
@@ -434,7 +441,7 @@ AMS/billing-setup calls `POST /v1/ledger/legal-entities/{id}/provisioning`; the 
 
 #### Tie-out and close gate
 
-**ID**: `cpt-cf-bss-ledger-seq-tieout-close-gate`
+- [ ] `p1` - **ID**: `cpt-cf-bss-ledger-seq-tieout-close-gate`
 
 **Use cases**: `cpt-cf-bss-ledger-usecase-reconciliation-review`
 

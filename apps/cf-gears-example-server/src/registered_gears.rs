@@ -114,5 +114,11 @@ use quota_enforcement as _;
 #[cfg(feature = "quota-enforcement")]
 use quota_enforcement_storage_plugin as _;
 
+#[cfg(feature = "bss-products")]
+use bss_products as _;
+
 #[cfg(feature = "bss-pricing")]
 use bss_pricing as _;
+
+#[cfg(feature = "bss-approvals")]
+use bss_approvals as _;

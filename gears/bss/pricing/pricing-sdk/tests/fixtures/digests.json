@@ -1,0 +1,780 @@
+{
+  "vectors": [
+    {
+      "domain": "pricing.money.v1",
+      "payload": {
+        "currency": "EUR",
+        "model": {
+          "kind": "per_unit",
+          "unit_amount": "0.047"
+        },
+        "minimum_fee": null
+      },
+      "canonical_text": "{\"domain\":\"pricing.money.v1\",\"payload\":{\"currency\":\"EUR\",\"minimum_fee\":null,\"model\":{\"kind\":\"per_unit\",\"unit_amount\":\"0.047\"}}}",
+      "sha256": "cbacb48590974dbee047262c4c31b8f55a46aa7dea4bc79e0ed7503eeab1e648"
+    },
+    {
+      "domain": "pricing.money.v1",
+      "payload": {
+        "currency": "EUR",
+        "model": {
+          "kind": "per_unit",
+          "unit_amount": "0.047"
+        },
+        "minimum_fee": null
+      },
+      "canonical_text": "{\"domain\":\"pricing.money.v1\",\"payload\":{\"currency\":\"EUR\",\"minimum_fee\":null,\"model\":{\"kind\":\"per_unit\",\"unit_amount\":\"0.047\"}}}",
+      "sha256": "cbacb48590974dbee047262c4c31b8f55a46aa7dea4bc79e0ed7503eeab1e648"
+    },
+    {
+      "domain": "pricing.money.v1",
+      "payload": {
+        "currency": "EUR",
+        "model": {
+          "kind": "per_unit",
+          "unit_amount": "0"
+        },
+        "minimum_fee": null
+      },
+      "canonical_text": "{\"domain\":\"pricing.money.v1\",\"payload\":{\"currency\":\"EUR\",\"minimum_fee\":null,\"model\":{\"kind\":\"per_unit\",\"unit_amount\":\"0\"}}}",
+      "sha256": "b0e7e0335b8d5da5bbc64d6c5479293a95d290bef2bdaa554067d517e868297b"
+    },
+    {
+      "domain": "pricing.money.v1",
+      "payload": {
+        "currency": "EUR",
+        "model": {
+          "kind": "per_unit",
+          "unit_amount": "0"
+        },
+        "minimum_fee": null
+      },
+      "canonical_text": "{\"domain\":\"pricing.money.v1\",\"payload\":{\"currency\":\"EUR\",\"minimum_fee\":null,\"model\":{\"kind\":\"per_unit\",\"unit_amount\":\"0\"}}}",
+      "sha256": "b0e7e0335b8d5da5bbc64d6c5479293a95d290bef2bdaa554067d517e868297b"
+    },
+    {
+      "domain": "pricing.template.v1",
+      "payload": null,
+      "canonical_text": "{\"domain\":\"pricing.template.v1\",\"payload\":null}",
+      "sha256": "84aed7fa83a8f7dbb0e90703432905b01a44ee66a07c8580400fd6c457bc21dd"
+    },
+    {
+      "domain": "pricing.template.v1",
+      "payload": "",
+      "canonical_text": "{\"domain\":\"pricing.template.v1\",\"payload\":\"\"}",
+      "sha256": "de9ff68586d48f67ab45f6d860f604662e5142aedc7511433e9a297aa91ecced"
+    },
+    {
+      "domain": "pricing.template.v1",
+      "payload": {
+        "z": false,
+        "a": null
+      },
+      "canonical_text": "{\"domain\":\"pricing.template.v1\",\"payload\":{\"a\":null,\"z\":false}}",
+      "sha256": "ee4977884bef0cb000d26b41913cd4ff4ef2636563a4f1b8318f11dee71f2581"
+    },
+    {
+      "domain": "pricing.template.v1",
+      "payload": {
+        "": "BMP",
+        "😀": "supplementary",
+        "\r": "control",
+        "a": "\b\t\n\f\r\u0000\u001f\"\\/"
+      },
+      "canonical_text": "{\"domain\":\"pricing.template.v1\",\"payload\":{\"\\r\":\"control\",\"a\":\"\\b\\t\\n\\f\\r\\u0000\\u001f\\\"\\\\/\",\"😀\":\"supplementary\",\"\":\"BMP\"}}",
+      "sha256": "d48e5ded9e8a30a496ff8e91f59685726ebd40b274cc7b117dfc62fc4199b1cb"
+    },
+    {
+      "domain": "pricing.template.v1",
+      "payload": "é",
+      "canonical_text": "{\"domain\":\"pricing.template.v1\",\"payload\":\"é\"}",
+      "sha256": "dbb2701e05114c63f5d93ca43f24dada314ce3cb91479446e2c37e4ec8ea6ed3"
+    },
+    {
+      "domain": "pricing.template.v1",
+      "payload": "é",
+      "canonical_text": "{\"domain\":\"pricing.template.v1\",\"payload\":\"é\"}",
+      "sha256": "7216f47c9984a8c283ab7ea9576a9ae7c37aa06789bde31238a4b6a9a270c470"
+    },
+    {
+      "domain": "pricing.money.v1",
+      "payload": {
+        "currency": "EUR",
+        "model": {
+          "kind": "flat",
+          "amount": "12"
+        },
+        "minimum_fee": "2"
+      },
+      "canonical_text": "{\"domain\":\"pricing.money.v1\",\"payload\":{\"currency\":\"EUR\",\"minimum_fee\":\"2\",\"model\":{\"amount\":\"12\",\"kind\":\"flat\"}}}",
+      "sha256": "2ff4da344ed5089b5c053563cd751c61b117ad38304b8df279f27f1353aaa67a"
+    },
+    {
+      "domain": "pricing.money.v1",
+      "payload": {
+        "currency": "EUR",
+        "model": {
+          "kind": "package",
+          "package_size": "10",
+          "package_price": "4.7"
+        },
+        "minimum_fee": "2"
+      },
+      "canonical_text": "{\"domain\":\"pricing.money.v1\",\"payload\":{\"currency\":\"EUR\",\"minimum_fee\":\"2\",\"model\":{\"kind\":\"package\",\"package_price\":\"4.7\",\"package_size\":\"10\"}}}",
+      "sha256": "16a188aff5c66c08bffb097aa48481c6cf6f65d7f41f8467eb6d72d50b1fadff"
+    },
+    {
+      "domain": "pricing.money.v1",
+      "payload": {
+        "currency": "EUR",
+        "model": {
+          "kind": "volume",
+          "tiers": [
+            {
+              "up_to": "10",
+              "rate": "0.047"
+            },
+            {
+              "up_to": null,
+              "rate": "0.03"
+            }
+          ]
+        },
+        "minimum_fee": "2"
+      },
+      "canonical_text": "{\"domain\":\"pricing.money.v1\",\"payload\":{\"currency\":\"EUR\",\"minimum_fee\":\"2\",\"model\":{\"kind\":\"volume\",\"tiers\":[{\"rate\":\"0.047\",\"up_to\":\"10\"},{\"rate\":\"0.03\",\"up_to\":null}]}}}",
+      "sha256": "3683a43bc69704a5a3482c661fdf53ec0a7695efd2ae60333719a81c114dc1a6"
+    },
+    {
+      "domain": "pricing.money.v1",
+      "payload": {
+        "currency": "EUR",
+        "model": {
+          "kind": "graduated",
+          "tiers": [
+            {
+              "up_to": "10",
+              "rate": "0.047"
+            },
+            {
+              "up_to": null,
+              "rate": "0.03"
+            }
+          ]
+        },
+        "minimum_fee": "2"
+      },
+      "canonical_text": "{\"domain\":\"pricing.money.v1\",\"payload\":{\"currency\":\"EUR\",\"minimum_fee\":\"2\",\"model\":{\"kind\":\"graduated\",\"tiers\":[{\"rate\":\"0.047\",\"up_to\":\"10\"},{\"rate\":\"0.03\",\"up_to\":null}]}}}",
+      "sha256": "26fd5b1060fe8cb3bb8ccbd268e6e44547a3da377b4424ad9eec53889a096f1a"
+    },
+    {
+      "domain": "pricing.vector.v1",
+      "payload": {
+        "at": "2026-09-01T00:00:00.000000000Z"
+      },
+      "canonical_text": "{\"domain\":\"pricing.vector.v1\",\"payload\":{\"at\":\"2026-09-01T00:00:00.000000000Z\"}}",
+      "sha256": "94c34ad6a513fe1327beaa24d7d7c80dc8d26300433bb90128d5ce51fe2a9cff"
+    },
+    {
+      "domain": "pricing.vector.v1",
+      "payload": {
+        "at": "2026-09-01T00:00:00.000000000Z"
+      },
+      "canonical_text": "{\"domain\":\"pricing.vector.v1\",\"payload\":{\"at\":\"2026-09-01T00:00:00.000000000Z\"}}",
+      "sha256": "94c34ad6a513fe1327beaa24d7d7c80dc8d26300433bb90128d5ce51fe2a9cff"
+    },
+    {
+      "domain": "pricing.vector.v1",
+      "payload": {
+        "version": "18446744073709551615"
+      },
+      "canonical_text": "{\"domain\":\"pricing.vector.v1\",\"payload\":{\"version\":\"18446744073709551615\"}}",
+      "sha256": "53fe2d37186f47043d1c34dda2ab363c1afa4fc67c2ed7d634f2821158484ae2"
+    },
+    {
+      "domain": "pricing.vector.v1",
+      "payload": {
+        "unit": "cloudlet_hour",
+        "tiers": [
+          {
+            "up_to": "10",
+            "rate": "0.047"
+          },
+          {
+            "up_to": null,
+            "rate": "0.03"
+          }
+        ]
+      },
+      "canonical_text": "{\"domain\":\"pricing.vector.v1\",\"payload\":{\"tiers\":[{\"rate\":\"0.047\",\"up_to\":\"10\"},{\"rate\":\"0.03\",\"up_to\":null}],\"unit\":\"cloudlet_hour\"}}",
+      "sha256": "86871d88226dad82e9c04650a6cc433b274dbd31dc8510b027005b04473f2631"
+    },
+    {
+      "domain": "pricing.vector.v1",
+      "payload": {
+        "unit": "cloudlet_second",
+        "tiers": [
+          {
+            "up_to": "10",
+            "rate": "0.047"
+          },
+          {
+            "up_to": null,
+            "rate": "0.03"
+          }
+        ]
+      },
+      "canonical_text": "{\"domain\":\"pricing.vector.v1\",\"payload\":{\"tiers\":[{\"rate\":\"0.047\",\"up_to\":\"10\"},{\"rate\":\"0.03\",\"up_to\":null}],\"unit\":\"cloudlet_second\"}}",
+      "sha256": "2fa874a32dffaa286143e67602db70ea460f646512451ae80ce1daf64caa6617"
+    },
+    {
+      "domain": "pricing.vector.v1",
+      "payload": {
+        "unit": "cloudlet_hour",
+        "tiers": [
+          {
+            "up_to": null,
+            "rate": "0.03"
+          },
+          {
+            "up_to": "10",
+            "rate": "0.047"
+          }
+        ]
+      },
+      "canonical_text": "{\"domain\":\"pricing.vector.v1\",\"payload\":{\"tiers\":[{\"rate\":\"0.03\",\"up_to\":null},{\"rate\":\"0.047\",\"up_to\":\"10\"}],\"unit\":\"cloudlet_hour\"}}",
+      "sha256": "992bf665c5785504de7fa966801e41b55ecb789d410b64025cf4480a8d9b41d5"
+    },
+    {
+      "domain": "pricing.policy.v1",
+      "payload": {
+        "rating_window": {
+          "kind": "calendar_hour",
+          "timezone": "UTC"
+        },
+        "aggregation_scope": "subscription_line",
+        "reset": "rating_window_start",
+        "partial_window": "actual_quantity_full_thresholds",
+        "fold": "SUM"
+      },
+      "canonical_text": "{\"domain\":\"pricing.policy.v1\",\"payload\":{\"aggregation_scope\":\"subscription_line\",\"fold\":\"SUM\",\"partial_window\":\"actual_quantity_full_thresholds\",\"rating_window\":{\"kind\":\"calendar_hour\",\"timezone\":\"UTC\"},\"reset\":\"rating_window_start\"}}",
+      "sha256": "2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc"
+    },
+    {
+      "domain": "pricing.bindings.v1",
+      "payload": {
+        "plan_id": "00000000-0000-0000-0000-000000000006",
+        "revision_id": "00000000-0000-0000-0000-000000000007",
+        "bindings": [
+          {
+            "selection": {
+              "item_id": "00000000-0000-0000-0000-000000000003",
+              "dimension_value": "eu"
+            },
+            "binding": {
+              "item_id": "00000000-0000-0000-0000-000000000003",
+              "price_book_entry_id": "00000000-0000-0000-0000-000000000002",
+              "dimension_key": "region",
+              "dimension_value": "eu",
+              "sku_id": "00000000-0000-0000-0000-000000000004",
+              "sku_version": "1",
+              "sku_code": "CLOUD",
+              "sku_name": "Cloudlet",
+              "unit": "cloudlet_hour",
+              "price": {
+                "price_id": "00000000-0000-0000-0000-000000000001",
+                "price_book_entry_id": "00000000-0000-0000-0000-000000000002",
+                "money_digest": "cbacb48590974dbee047262c4c31b8f55a46aa7dea4bc79e0ed7503eeab1e648",
+                "currency": "EUR",
+                "model": {
+                  "kind": "per_unit",
+                  "unit_amount": "0.047"
+                },
+                "minimum_fee": null,
+                "effective_from": "2026-09-01",
+                "ends_on": null
+              },
+              "kind": "usage",
+              "recurring_period": null,
+              "via_default": true,
+              "usage_rating_policy": {
+                "policy_id": "00000000-0000-0000-0000-000000000005",
+                "version": "18446744073709551615",
+                "digest": "2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc",
+                "content": {
+                  "rating_window": {
+                    "kind": "calendar_hour",
+                    "timezone": "UTC"
+                  },
+                  "aggregation_scope": "subscription_line",
+                  "reset": "rating_window_start",
+                  "partial_window": "actual_quantity_full_thresholds",
+                  "fold": "SUM"
+                }
+              },
+              "invoice": {
+                "template": "{sku}",
+                "template_digest": "89030c318bc320ae10e425e5a24465a7880638f6862299ada453f734b163c636",
+                "template_source": "sku_version",
+                "gl_code": "usage",
+                "tax_category": "standard",
+                "timing": "arrears",
+                "currency_scale": "2",
+                "rounding": "half_even"
+              }
+            }
+          }
+        ]
+      },
+      "canonical_text": "{\"domain\":\"pricing.bindings.v1\",\"payload\":{\"bindings\":[{\"binding\":{\"dimension_key\":\"region\",\"dimension_value\":\"eu\",\"invoice\":{\"currency_scale\":\"2\",\"gl_code\":\"usage\",\"rounding\":\"half_even\",\"tax_category\":\"standard\",\"template\":\"{sku}\",\"template_digest\":\"89030c318bc320ae10e425e5a24465a7880638f6862299ada453f734b163c636\",\"template_source\":\"sku_version\",\"timing\":\"arrears\"},\"item_id\":\"00000000-0000-0000-0000-000000000003\",\"kind\":\"usage\",\"price\":{\"currency\":\"EUR\",\"effective_from\":\"2026-09-01\",\"ends_on\":null,\"minimum_fee\":null,\"model\":{\"kind\":\"per_unit\",\"unit_amount\":\"0.047\"},\"money_digest\":\"cbacb48590974dbee047262c4c31b8f55a46aa7dea4bc79e0ed7503eeab1e648\",\"price_book_entry_id\":\"00000000-0000-0000-0000-000000000002\",\"price_id\":\"00000000-0000-0000-0000-000000000001\"},\"price_book_entry_id\":\"00000000-0000-0000-0000-000000000002\",\"recurring_period\":null,\"sku_code\":\"CLOUD\",\"sku_id\":\"00000000-0000-0000-0000-000000000004\",\"sku_name\":\"Cloudlet\",\"sku_version\":\"1\",\"unit\":\"cloudlet_hour\",\"usage_rating_policy\":{\"content\":{\"aggregation_scope\":\"subscription_line\",\"fold\":\"SUM\",\"partial_window\":\"actual_quantity_full_thresholds\",\"rating_window\":{\"kind\":\"calendar_hour\",\"timezone\":\"UTC\"},\"reset\":\"rating_window_start\"},\"digest\":\"2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc\",\"policy_id\":\"00000000-0000-0000-0000-000000000005\",\"version\":\"18446744073709551615\"},\"via_default\":true},\"selection\":{\"dimension_value\":\"eu\",\"item_id\":\"00000000-0000-0000-0000-000000000003\"}}],\"plan_id\":\"00000000-0000-0000-0000-000000000006\",\"revision_id\":\"00000000-0000-0000-0000-000000000007\"}}",
+      "sha256": "268fe0a1b05d7eaa4092bd5a4415d2669d028c865db702d73b761595e5d74457"
+    },
+    {
+      "domain": "pricing.bindings.v1",
+      "payload": {
+        "plan_id": "00000000-0000-0000-0000-000000000006",
+        "revision_id": "00000000-0000-0000-0000-000000000007",
+        "bindings": [
+          {
+            "selection": {
+              "item_id": "00000000-0000-0000-0000-000000000003",
+              "dimension_value": "eu"
+            },
+            "binding": {
+              "item_id": "00000000-0000-0000-0000-000000000003",
+              "price_book_entry_id": "00000000-0000-0000-0000-000000000002",
+              "dimension_key": "region",
+              "dimension_value": "eu",
+              "sku_id": "00000000-0000-0000-0000-000000000004",
+              "sku_version": "1",
+              "sku_code": "CLOUD",
+              "sku_name": "Cloudlet",
+              "unit": "cloudlet_second",
+              "price": {
+                "price_id": "00000000-0000-0000-0000-000000000001",
+                "price_book_entry_id": "00000000-0000-0000-0000-000000000002",
+                "money_digest": "cbacb48590974dbee047262c4c31b8f55a46aa7dea4bc79e0ed7503eeab1e648",
+                "currency": "EUR",
+                "model": {
+                  "kind": "per_unit",
+                  "unit_amount": "0.047"
+                },
+                "minimum_fee": null,
+                "effective_from": "2026-09-01",
+                "ends_on": null
+              },
+              "kind": "usage",
+              "recurring_period": null,
+              "via_default": true,
+              "usage_rating_policy": {
+                "policy_id": "00000000-0000-0000-0000-000000000005",
+                "version": "18446744073709551615",
+                "digest": "2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc",
+                "content": {
+                  "rating_window": {
+                    "kind": "calendar_hour",
+                    "timezone": "UTC"
+                  },
+                  "aggregation_scope": "subscription_line",
+                  "reset": "rating_window_start",
+                  "partial_window": "actual_quantity_full_thresholds",
+                  "fold": "SUM"
+                }
+              },
+              "invoice": {
+                "template": "{sku}",
+                "template_digest": "89030c318bc320ae10e425e5a24465a7880638f6862299ada453f734b163c636",
+                "template_source": "sku_version",
+                "gl_code": "usage",
+                "tax_category": "standard",
+                "timing": "arrears",
+                "currency_scale": "2",
+                "rounding": "half_even"
+              }
+            }
+          }
+        ]
+      },
+      "canonical_text": "{\"domain\":\"pricing.bindings.v1\",\"payload\":{\"bindings\":[{\"binding\":{\"dimension_key\":\"region\",\"dimension_value\":\"eu\",\"invoice\":{\"currency_scale\":\"2\",\"gl_code\":\"usage\",\"rounding\":\"half_even\",\"tax_category\":\"standard\",\"template\":\"{sku}\",\"template_digest\":\"89030c318bc320ae10e425e5a24465a7880638f6862299ada453f734b163c636\",\"template_source\":\"sku_version\",\"timing\":\"arrears\"},\"item_id\":\"00000000-0000-0000-0000-000000000003\",\"kind\":\"usage\",\"price\":{\"currency\":\"EUR\",\"effective_from\":\"2026-09-01\",\"ends_on\":null,\"minimum_fee\":null,\"model\":{\"kind\":\"per_unit\",\"unit_amount\":\"0.047\"},\"money_digest\":\"cbacb48590974dbee047262c4c31b8f55a46aa7dea4bc79e0ed7503eeab1e648\",\"price_book_entry_id\":\"00000000-0000-0000-0000-000000000002\",\"price_id\":\"00000000-0000-0000-0000-000000000001\"},\"price_book_entry_id\":\"00000000-0000-0000-0000-000000000002\",\"recurring_period\":null,\"sku_code\":\"CLOUD\",\"sku_id\":\"00000000-0000-0000-0000-000000000004\",\"sku_name\":\"Cloudlet\",\"sku_version\":\"1\",\"unit\":\"cloudlet_second\",\"usage_rating_policy\":{\"content\":{\"aggregation_scope\":\"subscription_line\",\"fold\":\"SUM\",\"partial_window\":\"actual_quantity_full_thresholds\",\"rating_window\":{\"kind\":\"calendar_hour\",\"timezone\":\"UTC\"},\"reset\":\"rating_window_start\"},\"digest\":\"2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc\",\"policy_id\":\"00000000-0000-0000-0000-000000000005\",\"version\":\"18446744073709551615\"},\"via_default\":true},\"selection\":{\"dimension_value\":\"eu\",\"item_id\":\"00000000-0000-0000-0000-000000000003\"}}],\"plan_id\":\"00000000-0000-0000-0000-000000000006\",\"revision_id\":\"00000000-0000-0000-0000-000000000007\"}}",
+      "sha256": "864483a8b4c10607735ea8c2905dab13f3a89c0a3189360778f8d8896c935eb8"
+    },
+    {
+      "domain": "pricing.bindings.v1",
+      "payload": {
+        "plan_id": "00000000-0000-0000-0000-000000000006",
+        "revision_id": "00000000-0000-0000-0000-000000000007",
+        "bindings": [
+          {
+            "selection": {
+              "item_id": "00000000-0000-0000-0000-000000000003",
+              "dimension_value": "eu"
+            },
+            "binding": {
+              "item_id": "00000000-0000-0000-0000-000000000003",
+              "price_book_entry_id": "00000000-0000-0000-0000-000000000002",
+              "dimension_key": "region",
+              "dimension_value": "eu",
+              "sku_id": "00000000-0000-0000-0000-000000000004",
+              "sku_version": "1",
+              "sku_code": "CLOUD",
+              "sku_name": "Cloudlet",
+              "unit": "cloudlet_hour",
+              "price": {
+                "price_id": "00000000-0000-0000-0000-000000000001",
+                "price_book_entry_id": "00000000-0000-0000-0000-000000000002",
+                "money_digest": "cbacb48590974dbee047262c4c31b8f55a46aa7dea4bc79e0ed7503eeab1e648",
+                "currency": "EUR",
+                "model": {
+                  "kind": "per_unit",
+                  "unit_amount": "0.047"
+                },
+                "minimum_fee": null,
+                "effective_from": "2026-09-01",
+                "ends_on": null
+              },
+              "kind": "usage",
+              "recurring_period": null,
+              "via_default": true,
+              "usage_rating_policy": {
+                "policy_id": "00000000-0000-0000-0000-000000000005",
+                "version": "1",
+                "digest": "2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc",
+                "content": {
+                  "rating_window": {
+                    "kind": "calendar_hour",
+                    "timezone": "UTC"
+                  },
+                  "aggregation_scope": "subscription_line",
+                  "reset": "rating_window_start",
+                  "partial_window": "actual_quantity_full_thresholds",
+                  "fold": "SUM"
+                }
+              },
+              "invoice": {
+                "template": "{sku}",
+                "template_digest": "89030c318bc320ae10e425e5a24465a7880638f6862299ada453f734b163c636",
+                "template_source": "sku_version",
+                "gl_code": "usage",
+                "tax_category": "standard",
+                "timing": "arrears",
+                "currency_scale": "2",
+                "rounding": "half_even"
+              }
+            }
+          }
+        ]
+      },
+      "canonical_text": "{\"domain\":\"pricing.bindings.v1\",\"payload\":{\"bindings\":[{\"binding\":{\"dimension_key\":\"region\",\"dimension_value\":\"eu\",\"invoice\":{\"currency_scale\":\"2\",\"gl_code\":\"usage\",\"rounding\":\"half_even\",\"tax_category\":\"standard\",\"template\":\"{sku}\",\"template_digest\":\"89030c318bc320ae10e425e5a24465a7880638f6862299ada453f734b163c636\",\"template_source\":\"sku_version\",\"timing\":\"arrears\"},\"item_id\":\"00000000-0000-0000-0000-000000000003\",\"kind\":\"usage\",\"price\":{\"currency\":\"EUR\",\"effective_from\":\"2026-09-01\",\"ends_on\":null,\"minimum_fee\":null,\"model\":{\"kind\":\"per_unit\",\"unit_amount\":\"0.047\"},\"money_digest\":\"cbacb48590974dbee047262c4c31b8f55a46aa7dea4bc79e0ed7503eeab1e648\",\"price_book_entry_id\":\"00000000-0000-0000-0000-000000000002\",\"price_id\":\"00000000-0000-0000-0000-000000000001\"},\"price_book_entry_id\":\"00000000-0000-0000-0000-000000000002\",\"recurring_period\":null,\"sku_code\":\"CLOUD\",\"sku_id\":\"00000000-0000-0000-0000-000000000004\",\"sku_name\":\"Cloudlet\",\"sku_version\":\"1\",\"unit\":\"cloudlet_hour\",\"usage_rating_policy\":{\"content\":{\"aggregation_scope\":\"subscription_line\",\"fold\":\"SUM\",\"partial_window\":\"actual_quantity_full_thresholds\",\"rating_window\":{\"kind\":\"calendar_hour\",\"timezone\":\"UTC\"},\"reset\":\"rating_window_start\"},\"digest\":\"2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc\",\"policy_id\":\"00000000-0000-0000-0000-000000000005\",\"version\":\"1\"},\"via_default\":true},\"selection\":{\"dimension_value\":\"eu\",\"item_id\":\"00000000-0000-0000-0000-000000000003\"}}],\"plan_id\":\"00000000-0000-0000-0000-000000000006\",\"revision_id\":\"00000000-0000-0000-0000-000000000007\"}}",
+      "sha256": "4d742631d38e2553496bc2cda0a04a475d7fa1d7defbff0b3339ab3c6df2faf3"
+    },
+    {
+      "domain": "pricing.bindings.v1",
+      "payload": {
+        "plan_id": "00000000-0000-0000-0000-000000000006",
+        "revision_id": "00000000-0000-0000-0000-000000000007",
+        "bindings": [
+          {
+            "selection": {
+              "item_id": "00000000-0000-0000-0000-000000000003",
+              "dimension_value": "eu"
+            },
+            "binding": {
+              "item_id": "00000000-0000-0000-0000-000000000003",
+              "price_book_entry_id": "00000000-0000-0000-0000-000000000002",
+              "dimension_key": "region",
+              "dimension_value": "eu",
+              "sku_id": "00000000-0000-0000-0000-000000000004",
+              "sku_version": "1",
+              "sku_code": "CLOUD",
+              "sku_name": "Cloudlet",
+              "unit": "cloudlet_hour",
+              "price": {
+                "price_id": "00000000-0000-0000-0000-000000000001",
+                "price_book_entry_id": "00000000-0000-0000-0000-000000000002",
+                "money_digest": "cbacb48590974dbee047262c4c31b8f55a46aa7dea4bc79e0ed7503eeab1e648",
+                "currency": "EUR",
+                "model": {
+                  "kind": "per_unit",
+                  "unit_amount": "0.047"
+                },
+                "minimum_fee": null,
+                "effective_from": "2026-09-01",
+                "ends_on": null
+              },
+              "kind": "usage",
+              "recurring_period": null,
+              "via_default": true,
+              "usage_rating_policy": {
+                "policy_id": "00000000-0000-0000-0000-000000000005",
+                "version": "18446744073709551615",
+                "digest": "2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc",
+                "content": {
+                  "rating_window": {
+                    "kind": "calendar_hour",
+                    "timezone": "UTC"
+                  },
+                  "aggregation_scope": "subscription_line",
+                  "reset": "rating_window_start",
+                  "partial_window": "actual_quantity_full_thresholds",
+                  "fold": "SUM"
+                }
+              },
+              "invoice": {
+                "template": "{sku} changed",
+                "template_digest": "0a5fae8d525fa468a554154603c92b42a51ce4d79ea00503014418e122a28c9b",
+                "template_source": "sku_version",
+                "gl_code": "usage",
+                "tax_category": "standard",
+                "timing": "arrears",
+                "currency_scale": "2",
+                "rounding": "half_even"
+              }
+            }
+          }
+        ]
+      },
+      "canonical_text": "{\"domain\":\"pricing.bindings.v1\",\"payload\":{\"bindings\":[{\"binding\":{\"dimension_key\":\"region\",\"dimension_value\":\"eu\",\"invoice\":{\"currency_scale\":\"2\",\"gl_code\":\"usage\",\"rounding\":\"half_even\",\"tax_category\":\"standard\",\"template\":\"{sku} changed\",\"template_digest\":\"0a5fae8d525fa468a554154603c92b42a51ce4d79ea00503014418e122a28c9b\",\"template_source\":\"sku_version\",\"timing\":\"arrears\"},\"item_id\":\"00000000-0000-0000-0000-000000000003\",\"kind\":\"usage\",\"price\":{\"currency\":\"EUR\",\"effective_from\":\"2026-09-01\",\"ends_on\":null,\"minimum_fee\":null,\"model\":{\"kind\":\"per_unit\",\"unit_amount\":\"0.047\"},\"money_digest\":\"cbacb48590974dbee047262c4c31b8f55a46aa7dea4bc79e0ed7503eeab1e648\",\"price_book_entry_id\":\"00000000-0000-0000-0000-000000000002\",\"price_id\":\"00000000-0000-0000-0000-000000000001\"},\"price_book_entry_id\":\"00000000-0000-0000-0000-000000000002\",\"recurring_period\":null,\"sku_code\":\"CLOUD\",\"sku_id\":\"00000000-0000-0000-0000-000000000004\",\"sku_name\":\"Cloudlet\",\"sku_version\":\"1\",\"unit\":\"cloudlet_hour\",\"usage_rating_policy\":{\"content\":{\"aggregation_scope\":\"subscription_line\",\"fold\":\"SUM\",\"partial_window\":\"actual_quantity_full_thresholds\",\"rating_window\":{\"kind\":\"calendar_hour\",\"timezone\":\"UTC\"},\"reset\":\"rating_window_start\"},\"digest\":\"2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc\",\"policy_id\":\"00000000-0000-0000-0000-000000000005\",\"version\":\"18446744073709551615\"},\"via_default\":true},\"selection\":{\"dimension_value\":\"eu\",\"item_id\":\"00000000-0000-0000-0000-000000000003\"}}],\"plan_id\":\"00000000-0000-0000-0000-000000000006\",\"revision_id\":\"00000000-0000-0000-0000-000000000007\"}}",
+      "sha256": "bc38671c1d23452aea95981f44e180767bd83e83d1dde4dea1b61a7503acb8ce"
+    },
+    {
+      "name": "billing_terms_v1",
+      "domain": "bss.billing-terms.v1",
+      "payload": {
+        "schema_version": "1",
+        "cycle": "month",
+        "anchor": "calendar",
+        "anchor_at": "2026-10-01T00:00:00.000000000Z",
+        "timezone": "UTC",
+        "source": "explicit_order"
+      },
+      "canonical_text": "{\"domain\":\"bss.billing-terms.v1\",\"payload\":{\"anchor\":\"calendar\",\"anchor_at\":\"2026-10-01T00:00:00.000000000Z\",\"cycle\":\"month\",\"schema_version\":\"1\",\"source\":\"explicit_order\",\"timezone\":\"UTC\"}}",
+      "sha256": "8bbd1652e172dcb1c4498d7dec92af3b6d7f727d34bb7ffebc8aed1181bda983"
+    },
+    {
+      "name": "commercial_request_v1",
+      "domain": "pricing.request.v1",
+      "payload": {
+        "tenant_axes": {
+          "seller_tenant_id": "00000000-0000-0000-0000-000000000008",
+          "payer_tenant_id": "00000000-0000-0000-0000-000000000009",
+          "resource_tenant_id": "00000000-0000-0000-0000-00000000000a"
+        },
+        "order_id": "00000000-0000-0000-0000-00000000000b",
+        "order_version": "18446744073709551615",
+        "line_id": "00000000-0000-0000-0000-00000000000c",
+        "plan_id": "00000000-0000-0000-0000-000000000006",
+        "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+        "selections": [
+          {
+            "item_id": "00000000-0000-0000-0000-000000000003",
+            "dimension_value": "eu"
+          }
+        ],
+        "quantity": "1",
+        "market": {
+          "currency": "EUR",
+          "region": "eu"
+        },
+        "start_at": "2026-10-01T10:30:00.000000000Z",
+        "term": {
+          "kind": "fixed_periods",
+          "count": "12"
+        },
+        "billing_terms": {
+          "schema_version": "1",
+          "cycle": "month",
+          "anchor": "calendar",
+          "anchor_at": "2026-10-01T00:00:00.000000000Z",
+          "timezone": "UTC",
+          "source": "explicit_order",
+          "digest": "8bbd1652e172dcb1c4498d7dec92af3b6d7f727d34bb7ffebc8aed1181bda983"
+        },
+        "resolved_bindings_digest": "268fe0a1b05d7eaa4092bd5a4415d2669d028c865db702d73b761595e5d74457",
+        "hold_policy_version": "18446744073709551615"
+      },
+      "canonical_text": "{\"domain\":\"pricing.request.v1\",\"payload\":{\"billing_terms\":{\"anchor\":\"calendar\",\"anchor_at\":\"2026-10-01T00:00:00.000000000Z\",\"cycle\":\"month\",\"digest\":\"8bbd1652e172dcb1c4498d7dec92af3b6d7f727d34bb7ffebc8aed1181bda983\",\"schema_version\":\"1\",\"source\":\"explicit_order\",\"timezone\":\"UTC\"},\"hold_policy_version\":\"18446744073709551615\",\"line_id\":\"00000000-0000-0000-0000-00000000000c\",\"market\":{\"currency\":\"EUR\",\"region\":\"eu\"},\"order_id\":\"00000000-0000-0000-0000-00000000000b\",\"order_version\":\"18446744073709551615\",\"plan_id\":\"00000000-0000-0000-0000-000000000006\",\"plan_revision_id\":\"00000000-0000-0000-0000-000000000007\",\"quantity\":\"1\",\"resolved_bindings_digest\":\"268fe0a1b05d7eaa4092bd5a4415d2669d028c865db702d73b761595e5d74457\",\"selections\":[{\"dimension_value\":\"eu\",\"item_id\":\"00000000-0000-0000-0000-000000000003\"}],\"start_at\":\"2026-10-01T10:30:00.000000000Z\",\"tenant_axes\":{\"payer_tenant_id\":\"00000000-0000-0000-0000-000000000009\",\"resource_tenant_id\":\"00000000-0000-0000-0000-00000000000a\",\"seller_tenant_id\":\"00000000-0000-0000-0000-000000000008\"},\"term\":{\"count\":\"12\",\"kind\":\"fixed_periods\"}}}",
+      "sha256": "4165066beb75653777c14064c15e678a6b87804496f7963ce986e6d7f394521c"
+    },
+    {
+      "name": "accepted_terms_v1",
+      "domain": "pricing.terms.v1",
+      "payload": {
+        "query": {
+          "tenant_axes": {
+            "seller_tenant_id": "00000000-0000-0000-0000-000000000008",
+            "payer_tenant_id": "00000000-0000-0000-0000-000000000009",
+            "resource_tenant_id": "00000000-0000-0000-0000-00000000000a"
+          },
+          "order_id": "00000000-0000-0000-0000-00000000000b",
+          "order_version": "18446744073709551615",
+          "line_id": "00000000-0000-0000-0000-00000000000c",
+          "plan_id": "00000000-0000-0000-0000-000000000006",
+          "plan_revision_id": "00000000-0000-0000-0000-000000000007",
+          "selections": [
+            {
+              "item_id": "00000000-0000-0000-0000-000000000003",
+              "dimension_value": "eu"
+            }
+          ],
+          "quantity": "1",
+          "market": {
+            "currency": "EUR",
+            "region": "eu"
+          },
+          "start_at": "2026-10-01T10:30:00.000000000Z",
+          "term": {
+            "kind": "fixed_periods",
+            "count": "12"
+          },
+          "billing_terms": {
+            "schema_version": "1",
+            "cycle": "month",
+            "anchor": "calendar",
+            "anchor_at": "2026-10-01T00:00:00.000000000Z",
+            "timezone": "UTC",
+            "source": "explicit_order",
+            "digest": "8bbd1652e172dcb1c4498d7dec92af3b6d7f727d34bb7ffebc8aed1181bda983"
+          },
+          "resolved_bindings_digest": "268fe0a1b05d7eaa4092bd5a4415d2669d028c865db702d73b761595e5d74457",
+          "hold_policy_version": "18446744073709551615"
+        },
+        "bindings": [
+          {
+            "item_id": "00000000-0000-0000-0000-000000000003",
+            "price_book_entry_id": "00000000-0000-0000-0000-000000000002",
+            "dimension_key": "region",
+            "dimension_value": "eu",
+            "sku_id": "00000000-0000-0000-0000-000000000004",
+            "sku_version": "1",
+            "sku_code": "CLOUD",
+            "sku_name": "Cloudlet",
+            "unit": "cloudlet_hour",
+            "price": {
+              "price_id": "00000000-0000-0000-0000-000000000001",
+              "price_book_entry_id": "00000000-0000-0000-0000-000000000002",
+              "money_digest": "cbacb48590974dbee047262c4c31b8f55a46aa7dea4bc79e0ed7503eeab1e648",
+              "currency": "EUR",
+              "model": {
+                "kind": "per_unit",
+                "unit_amount": "0.047"
+              },
+              "minimum_fee": null,
+              "effective_from": "2026-09-01",
+              "ends_on": null
+            },
+            "kind": "usage",
+            "recurring_period": null,
+            "via_default": true,
+            "usage_rating_policy": {
+              "policy_id": "00000000-0000-0000-0000-000000000005",
+              "version": "18446744073709551615",
+              "digest": "2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc",
+              "content": {
+                "rating_window": {
+                  "kind": "calendar_hour",
+                  "timezone": "UTC"
+                },
+                "aggregation_scope": "subscription_line",
+                "reset": "rating_window_start",
+                "partial_window": "actual_quantity_full_thresholds",
+                "fold": "SUM"
+              }
+            },
+            "invoice": {
+              "template": "{sku}",
+              "template_digest": "89030c318bc320ae10e425e5a24465a7880638f6862299ada453f734b163c636",
+              "template_source": "sku_version",
+              "gl_code": "usage",
+              "tax_category": "standard",
+              "timing": "arrears",
+              "currency_scale": "2",
+              "rounding": "half_even"
+            }
+          }
+        ]
+      },
+      "canonical_text": "{\"domain\":\"pricing.terms.v1\",\"payload\":{\"bindings\":[{\"dimension_key\":\"region\",\"dimension_value\":\"eu\",\"invoice\":{\"currency_scale\":\"2\",\"gl_code\":\"usage\",\"rounding\":\"half_even\",\"tax_category\":\"standard\",\"template\":\"{sku}\",\"template_digest\":\"89030c318bc320ae10e425e5a24465a7880638f6862299ada453f734b163c636\",\"template_source\":\"sku_version\",\"timing\":\"arrears\"},\"item_id\":\"00000000-0000-0000-0000-000000000003\",\"kind\":\"usage\",\"price\":{\"currency\":\"EUR\",\"effective_from\":\"2026-09-01\",\"ends_on\":null,\"minimum_fee\":null,\"model\":{\"kind\":\"per_unit\",\"unit_amount\":\"0.047\"},\"money_digest\":\"cbacb48590974dbee047262c4c31b8f55a46aa7dea4bc79e0ed7503eeab1e648\",\"price_book_entry_id\":\"00000000-0000-0000-0000-000000000002\",\"price_id\":\"00000000-0000-0000-0000-000000000001\"},\"price_book_entry_id\":\"00000000-0000-0000-0000-000000000002\",\"recurring_period\":null,\"sku_code\":\"CLOUD\",\"sku_id\":\"00000000-0000-0000-0000-000000000004\",\"sku_name\":\"Cloudlet\",\"sku_version\":\"1\",\"unit\":\"cloudlet_hour\",\"usage_rating_policy\":{\"content\":{\"aggregation_scope\":\"subscription_line\",\"fold\":\"SUM\",\"partial_window\":\"actual_quantity_full_thresholds\",\"rating_window\":{\"kind\":\"calendar_hour\",\"timezone\":\"UTC\"},\"reset\":\"rating_window_start\"},\"digest\":\"2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc\",\"policy_id\":\"00000000-0000-0000-0000-000000000005\",\"version\":\"18446744073709551615\"},\"via_default\":true}],\"query\":{\"billing_terms\":{\"anchor\":\"calendar\",\"anchor_at\":\"2026-10-01T00:00:00.000000000Z\",\"cycle\":\"month\",\"digest\":\"8bbd1652e172dcb1c4498d7dec92af3b6d7f727d34bb7ffebc8aed1181bda983\",\"schema_version\":\"1\",\"source\":\"explicit_order\",\"timezone\":\"UTC\"},\"hold_policy_version\":\"18446744073709551615\",\"line_id\":\"00000000-0000-0000-0000-00000000000c\",\"market\":{\"currency\":\"EUR\",\"region\":\"eu\"},\"order_id\":\"00000000-0000-0000-0000-00000000000b\",\"order_version\":\"18446744073709551615\",\"plan_id\":\"00000000-0000-0000-0000-000000000006\",\"plan_revision_id\":\"00000000-0000-0000-0000-000000000007\",\"quantity\":\"1\",\"resolved_bindings_digest\":\"268fe0a1b05d7eaa4092bd5a4415d2669d028c865db702d73b761595e5d74457\",\"selections\":[{\"dimension_value\":\"eu\",\"item_id\":\"00000000-0000-0000-0000-000000000003\"}],\"start_at\":\"2026-10-01T10:30:00.000000000Z\",\"tenant_axes\":{\"payer_tenant_id\":\"00000000-0000-0000-0000-000000000009\",\"resource_tenant_id\":\"00000000-0000-0000-0000-00000000000a\",\"seller_tenant_id\":\"00000000-0000-0000-0000-000000000008\"},\"term\":{\"count\":\"12\",\"kind\":\"fixed_periods\"}}}}",
+      "sha256": "8492527ed383d24781b13963589f7f8073424fd1d831ab9dd4320933a3c5ec93"
+    },
+    {
+      "name": "seller_billing_terms_max_version",
+      "domain": "bss.billing-terms.v1",
+      "payload": {
+        "schema_version": "1",
+        "cycle": "month",
+        "anchor": "calendar",
+        "anchor_at": "2026-10-01T00:00:00.000000000Z",
+        "timezone": "UTC",
+        "source": {
+          "kind": "seller_policy",
+          "id": "00000000-0000-0000-0000-000000000014",
+          "version": "18446744073709551615"
+        }
+      },
+      "canonical_text": "{\"domain\":\"bss.billing-terms.v1\",\"payload\":{\"anchor\":\"calendar\",\"anchor_at\":\"2026-10-01T00:00:00.000000000Z\",\"cycle\":\"month\",\"schema_version\":\"1\",\"source\":{\"id\":\"00000000-0000-0000-0000-000000000014\",\"kind\":\"seller_policy\",\"version\":\"18446744073709551615\"},\"timezone\":\"UTC\"}}",
+      "sha256": "330fa67c5203671aa5ba9079c672eb514d5034605966afb8b2e9ee8049cf382e"
+    }
+  ],
+  "semantic_projections": [
+    {
+      "kind": "money",
+      "input": "0.047",
+      "vector": 0
+    },
+    {
+      "kind": "money",
+      "input": "0.04700",
+      "vector": 1
+    },
+    {
+      "kind": "money",
+      "input": "-0.000",
+      "vector": 2
+    },
+    {
+      "kind": "money",
+      "input": "0.000",
+      "vector": 3
+    },
+    {
+      "kind": "instant",
+      "input": "2026-09-01T01:00:00+01:00",
+      "vector": 14
+    },
+    {
+      "kind": "instant",
+      "input": "2026-09-01T00:00:00Z",
+      "vector": 15
+    },
+    {
+      "kind": "u64",
+      "input": "18446744073709551615",
+      "vector": 16
+    }
+  ],
+  "policy_vector": 20,
+  "binding_vectors": [
+    {
+      "change": "original",
+      "vector": 21
+    },
+    {
+      "change": "unit",
+      "vector": 22
+    },
+    {
+      "change": "policy_version",
+      "vector": 23
+    },
+    {
+      "change": "template",
+      "vector": 24
+    }
+  ],
+  "commercial_vectors": {
+    "billing_terms": 25,
+    "request": 26,
+    "terms": 27,
+    "seller_terms": 28
+  }
+}
