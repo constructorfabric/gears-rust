@@ -53,7 +53,7 @@ documents below and nowhere else, so there is exactly one normative statement of
   hook, versioning, pinning and publish roles, the signals, the canonical definition as six path
   fragments, and the fence of protected operations.
 - [`02-triggers-and-start.md`](./02-triggers-and-start.md) — admission and start: `admit-trigger`
-  over the nine-trigger closed vocabulary, the two platform start triggers, supersession as
+  over the ten-trigger closed vocabulary, the two platform start triggers, supersession as
   unwind-then-start, and `terminate-on-terminal-event`.
 - [`03-approval-execution.md`](./03-approval-execution.md) — the approval step: verdict,
   reflection, gates, decision recording, the fail-closed park and escalation as six operations

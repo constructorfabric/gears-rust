@@ -480,7 +480,7 @@ projectors — is declared, scoped and bounded by that slice and is **not** rest
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-triggers-and-start`
 
-  admission of the nine-trigger closed vocabulary (`admit-trigger`), supersession as unwind-then-start, and termination on a terminal order event. Realized by [`design/02-triggers-and-start.md`](./design/02-triggers-and-start.md).
+  admission of the ten-trigger closed vocabulary (`admit-trigger`), supersession as unwind-then-start, and termination on a terminal order event. Realized by [`design/02-triggers-and-start.md`](./design/02-triggers-and-start.md).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-approval-execution`
 

@@ -271,10 +271,11 @@ invocation, or lands on a named failure route where §4.6 names one. Whether the
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-definition-listen-targets`
 
-A `listen` filter `with.type` **MUST** be one of: the nine Orders Lifecycle state events
+A `listen` filter `with.type` **MUST** be one of: the ten Orders Lifecycle state events
 (`OrderSubmitted` and `OrderAmended` as the two platform event triggers of §3.3; `OrderApproved`,
 `OrderAmended`, `OrderHeld`, `OrderResumed`, `OrderAcceptanceRecorded`, `OrderCancelled`,
-`OrderExpired`, `OrderRejected` as `listen` targets), whose GTS identifiers are Lifecycle's
+`OrderExpired`, `OrderRejected` and `OrderFulfillmentFailed` as `listen` targets — the last
+terminates only Lifecycle's operator-forced failure, `02 §3.6` step 9, decision D-208), whose GTS identifiers are Lifecycle's
 (`gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.<name>.v1~`,
 [Lifecycle `01 §4.4`](../../../orders-lifecycle/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative));
 the approval decision event of [`03 §3.3`](./03-approval-execution.md#33-api-contracts); the
@@ -288,7 +289,7 @@ and the operator signal types of §3.3 — `cancel-requested` (08), `reauthorize
 without one (decision D-122). Every filter **MUST** `correlate` on
 `orderId` and `orderVersion` against `$context`, except the `OrderAmended` `listen`, which
 correlates on `orderId` only because the amended version is newer (`02 §4.7` item 8). Every
-`listen` that consumes one of the nine Lifecycle triggers **MUST** be followed by `admit-trigger`
+`listen` that consumes one of the ten Lifecycle triggers **MUST** be followed by `admit-trigger`
 with `role: listen` before any consuming operation (`02 §4.7` item 1). Any other type is refused
 before publish.
 
@@ -1648,7 +1649,11 @@ The fulfillment stage, the `do` list of `process.fulfillment`:
 - onReport:
     switch:
       - held:     { when: '${ $context.lifecycleCall == "held" }', then: enterHeldReport }   # a completed acknowledgement of an on_hold order (06 §3.3): resume first
+      - forced:   { when: '${ $context.lifecycleCall == "forced-terminal" }', then: forcedTerminalUnwind }   # Lifecycle's operator-forced failure overtook the report (06 §4.9, D-208): no completion, take the terminal unwind
       - reported: { then: beforeComplete }   # acknowledged | already-applied
+- forcedTerminalUnwind:                  # the settled forced-terminal report is the terminal-event cause (06 §3.6 fence step 2, D-208): the unwind cancels the activated subscriptions through Subscriptions; report-outcome then makes no Lifecycle call
+    set: { unwind: terminal-event, triggerEventId: null, preAdmitted: false, nextStage: unwind, stageLoop: null }
+    then: exit
 - beforeComplete:                       # as beforeReject: an overtaken Orders suspension is closed before terminate-instance (D-175, D-183)
     switch:
       - heldPoll: { when: '${ $context.suspensionRef != null }', then: pollBeforeComplete }
@@ -2568,14 +2573,17 @@ spawn signal or completion report is called again after the resume (`01 §3.3` *
             correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
           - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.rejected.v1~ }
             correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
+          - with: { type: gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.fulfillment_failed.v1~ }   # Lifecycle's operator-forced failure (D-182); admit-trigger absorbs this gear's own (02 §3.6 step 9, D-208)
+            correlate: { orderId: { from: '${ .data.orderId }', expect: '${ $context.orderId }' }, orderVersion: { from: '${ .data.orderVersion }', expect: '${ $context.orderVersion }' } }
       read: envelope
-    output:                             # triggerKind by exact-type lookup into admit-trigger's closed nine-value enum (02 §3.3), as input.from does for the start (D-107); nothing branches on it
+    output:                             # triggerKind by exact-type lookup into admit-trigger's closed ten-value enum (02 §3.3), as input.from does for the start (D-107); nothing branches on it
       as: >-
         ${ .[0] | { eventId: .id,
                     triggerKind: ({ "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.amended.v1~": "OrderAmended",
                                     "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.cancelled.v1~": "OrderCancelled",
                                     "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.expired.v1~": "OrderExpired",
-                                    "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.rejected.v1~": "OrderRejected" }[.type]) } }
+                                    "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.rejected.v1~": "OrderRejected",
+                                    "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.fulfillment_failed.v1~": "OrderFulfillmentFailed" }[.type]) } }
 - arm: { set: { arm: lifecycle, lifecycleEventId: '${ .eventId }', triggerKind: '${ .triggerKind }', preAdmitted: false } }   # preAdmitted false: a new event is admitted by the stage, never routed on an earlier event's admission (D-161); no version is copied from the event: an OrderCancelled at the pinned version carries the instance's own (D-155)
 ```
 
@@ -2601,7 +2609,7 @@ alone decides (`02 §4.7` items 1 and 3):
 - supersedePath:                        # fragment (c): fence (supersede) cancels open gates, voids un-activated wave-1 drafts, compensates activated; report-outcome makes no seam call
     set: { unwind: supersede, triggerEventId: '${ $context.lifecycleEventId }', preAdmitted: false, nextStage: unwind, stageLoop: null }
     then: exit
-- terminalEvent:                        # protected (02): OrderCancelled | OrderExpired | OrderRejected for an active instance
+- terminalEvent:                        # protected (02): OrderCancelled | OrderExpired | OrderRejected | an operator-forced OrderFulfillmentFailed (D-208) for an active instance
     timeout: step
     try:
       - call: { step: terminate-on-terminal-event }   # body: ref + triggerEventId: $context.lifecycleEventId; output: terminate (bool)

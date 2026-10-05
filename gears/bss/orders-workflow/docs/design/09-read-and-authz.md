@@ -1143,7 +1143,7 @@ sequenceDiagram
 4. [ ] - `p1` - Before any effect, the consuming operation re-reads the system of record under this gear's configured authority: `admit-trigger` performs the PDP-authorized Lifecycle `order × read` scoped to the event's order (`02 §2.1`); `record-decision` reads the decision record by `decisionEventId` (`03 §3.3`); `reconcile-intent` treats a Subscriptions confirmation as a wake-up and reads the intent's status (`05 §3.3`). A denial, timeout or configuration failure is `retryable-failure`, never staleness evidence - `inst-ev-read-gate`
 5. [ ] - `p1` - A delivery the platform cannot hand to any invocation, or whose consuming call keeps failing, is the platform trigger path's dead letter (`01 §4.8`), never an Orders record - `inst-ev-admit`
 
-**Description**: The nine Orders Lifecycle triggers, the approval decision event and the
+**Description**: The ten Orders Lifecycle triggers, the approval decision event and the
 two Subscriptions outcome events still arrive by subscription, not through the REST gateway; what
 changes under ADR-0011 is that the **platform** subscribes (`02 §2.2`). Their authenticity is
 still the **broker's produce grant on the topic plus platform-root tenancy**: only the gear granted
@@ -1579,7 +1579,7 @@ to reporting an outcome; none of the three may drive an order state transition d
 holds a pair. Only this gear's own step operations, invoked by the definition and subject to the
 `Gr` grant, drive transitions, through seam calls made under this gear's authority.
 
-**The event transport is the platform's, and Orders re-verifies inside the operation.** The nine
+**The event transport is the platform's, and Orders re-verifies inside the operation.** The ten
 Lifecycle triggers, the approval decision event and the two Subscriptions outcome events
 arrive by **event subscription**, and the subscriber is now the platform — the event triggers
 bound to the order-process workflow and the running invocation's `listen` tasks (`02 §2.2`,

@@ -29,6 +29,7 @@
   - [4.5 Void-on-superseded-version rule](#45-void-on-superseded-version-rule)
   - [4.6 What this slice does not decide](#46-what-this-slice-does-not-decide)
   - [4.7 Constraints this slice places on the definition](#47-constraints-this-slice-places-on-the-definition)
+  - [4.8 Lifecycle's event consumer contract](#48-lifecycles-event-consumer-contract)
 - [5. Traceability](#5-traceability)
 
 <!-- /toc -->
@@ -58,7 +59,7 @@ what Orders keeps is the admission record: a step-log row and an audit entry for
 under the derived `correlationId`, whether or not an instance ever results.
 
 The vision still has three parts. First, the trigger vocabulary is **closed**: the process reacts
-to exactly nine named Orders Lifecycle events, so "does this event touch a process instance?" is
+to exactly ten named Orders Lifecycle events, so "does this event touch a process instance?" is
 one table (§3.3), and ADR-0012's validation hook refuses a definition that `listen`s for anything
 else. Second, admission is **stateful, not stateless**: before any effect, `admit-trigger` reads
 current order state and version from Orders Lifecycle and compares them against the event and
@@ -136,11 +137,14 @@ Orders Lifecycle state events (event broker)
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-principle-closed-trigger-vocabulary`
 
-The process starts or advances on exactly nine Orders Lifecycle triggers and no others:
+The process starts or advances on exactly ten Orders Lifecycle triggers and no others:
 `OrderSubmitted`, `OrderApproved`, `OrderAmended`, `OrderHeld`, `OrderResumed`,
-`OrderAcceptanceRecorded`, and the three terminal events `OrderCancelled`, `OrderExpired`,
-`OrderRejected`. Two of them start an invocation through a platform event trigger —
-`OrderSubmitted`, and `OrderAmended` for the new version (§2.2) — and the other seven, plus
+`OrderAcceptanceRecorded`, the three terminal events `OrderCancelled`, `OrderExpired`,
+`OrderRejected`, and `OrderFulfillmentFailed`, which ends a process only when Lifecycle's
+two fulfillment operators forced it (`failure_reason = operator-forced-unreconciled`, Lifecycle
+D-182; decision D-208) and is otherwise this gear's own acknowledgement. Two of them start an
+invocation through a platform event trigger —
+`OrderSubmitted`, and `OrderAmended` for the new version (§2.2) — and the other eight, plus
 `OrderAmended` for the running prior version, are `listen` targets of a running invocation. The
 `admit-trigger` input schema declares `triggerKind` as this closed enum, so an unlisted kind is a
 schema refusal at the envelope (`01 §3.3` step 3). On the start path the definition derives
@@ -354,7 +358,7 @@ entities on top of the engine's process-instance aggregate; it does not redefine
 
 | Entity | Description | Schema |
 |--------|-------------|--------|
-| `TriggerEventRecord` | Orders' record of one admission of one Lifecycle event: event id, event kind (one of the nine), consumer role (`start` · `listen`), `orderId` and `orderVersion` as carried on the event, `resource_tenant_id`, the `orderVersion` and state the Lifecycle read returned, the admission outcome (the eight-value set below), and the platform `invocationId`/`attemptId` of each attempt | Two engine-owned rows, not one: the **dedup** record is `owf_idempotency_registry` under `operation = 'admit-trigger'`, key per §2.1, which refuses a redelivery; the **execution** record is the `owf_step_log` row each attempt writes (`attempt_id` from the platform, `result` carrying the outcome and the read version), which is the admission history. Per `01 §3.7` |
+| `TriggerEventRecord` | Orders' record of one admission of one Lifecycle event: event id, event kind (one of the ten), consumer role (`start` · `listen`), `orderId` and `orderVersion` as carried on the event, `resource_tenant_id`, the `orderVersion` and state the Lifecycle read returned, the admission outcome (the eight-value set below), and the platform `invocationId`/`attemptId` of each attempt | Two engine-owned rows, not one: the **dedup** record is `owf_idempotency_registry` under `operation = 'admit-trigger'`, key per §2.1, which refuses a redelivery; the **execution** record is the `owf_step_log` row each attempt writes (`attempt_id` from the platform, `result` carrying the outcome and the read version), which is the admission history. Per `01 §3.7` |
 | `ProcessCorrelation` | The process `correlationId` derived as a UUIDv5 over (`resource_tenant_id`, `orderId`, `orderVersion`), plus the `orderId` + `orderVersion` pair it is pinned to; distinct from any idempotency key, downstream transition-request identifier or platform invocation id (§2.1) | Derived by `admit-trigger`, persisted by `start-instance` on `owf_process_instance` and `owf_definition_binding`, per `01 §3.7` |
 
 **Admission outcomes** — the closed set `admit-trigger` returns as `admission`. Every settled
@@ -366,7 +370,7 @@ fall-through:
 | `start` | Start role; no **active** instance exists for the order, the trigger is a start trigger (`OrderSubmitted`, `OrderAmended`) and the read shows the order in `submitted` at the event's version | `start-instance` (01) under the returned `correlationId` |
 | `advance` | Listen role; the running instance is active and pinned to the event's version, which is the order's current version | The arm's consuming operation (§3.3 trigger-to-outcome table) |
 | `supersede` | Listen role; the running instance is pinned to a version older than the order's current version | The supersede unwind of `10 §3.6` (f) (§4.3) |
-| `terminate` | Listen role; the running instance is active and the read shows the order in a terminal state | `terminate-on-terminal-event`, then the terminal unwind |
+| `terminate` | Listen role; the running instance is active and the read shows the order in a terminal state — for `OrderFulfillmentFailed` only `fulfillment_failed` with `failure_reason = operator-forced-unreconciled` (D-208); any other `OrderFulfillmentFailed` is this gear's own acknowledgement and answers `ignored-terminated` | `terminate-on-terminal-event`, then the terminal unwind |
 | `ignored-superseded` | The event's `orderVersion` is older than the order's current version and the consumer's instance is not behind it | Nothing: the start path ends its invocation; a `listen` arm returns to the stage it left |
 | `absorbed-duplicate` | The consumer already holds an instance at the event's version — a second start trigger for a version that already has an instance (active or terminated), or an amendment whose version equals the running instance's | As `ignored-superseded` |
 | `no-active-instance` | Start role; no instance has ever existed for the order at this version, yet the read shows the order in a state only a running process could have produced (`pending_approval`, `approved`, `in_fulfillment`), or in `held`; or the read shows an order whose `category` is not `new_sale`, which this process does not start (D-107) | **Never** start an instance at that state; the start path ends its invocation. The settled record and the observability counter of §3.8 are the operator signal |
@@ -502,14 +506,14 @@ Approval. Does not compute or adjust price.
 This slice exposes no caller-facing HTTP surface and no REST read. Its surface is two step
 operations, callable only by the serverless-runtime service principal under the PDP resource
 `gts.cf.bss.orders_workflow.process_step.v1~` × `execute` with the operation name as the resource
-property (`01 §3.3` steps 1–2). The nine Lifecycle events are inputs to the definition, not to
+property (`01 §3.3` steps 1–2). The ten Lifecycle events are inputs to the definition, not to
 this gear.
 
 | Method | Path | Description | Stability |
 |--------|------|--------------|-----------|
 | `POST` | `/bss-orders-workflow/v1/steps/admit-trigger` | Admission decision for one Lifecycle event, for one consumer role | unstable — internal |
 | `POST` | `/bss-orders-workflow/v1/steps/terminate-on-terminal-event` | Record that a terminal order event ends the running instance | unstable — internal |
-| `EVENT` | `OrderSubmitted` \| `OrderApproved` \| `OrderAmended` \| `OrderHeld` \| `OrderResumed` \| `OrderAcceptanceRecorded` \| `OrderCancelled` \| `OrderExpired` \| `OrderRejected` | The nine closed-vocabulary triggers (§2.1), consumed by the platform event trigger (start) or a definition `listen`, each admitted through `admit-trigger` | unstable |
+| `EVENT` | `OrderSubmitted` \| `OrderApproved` \| `OrderAmended` \| `OrderHeld` \| `OrderResumed` \| `OrderAcceptanceRecorded` \| `OrderCancelled` \| `OrderExpired` \| `OrderRejected` \| `OrderFulfillmentFailed` | The ten closed-vocabulary triggers (§2.1), consumed by the platform event trigger (start) or a definition `listen`, each admitted through `admit-trigger` | unstable |
 
 **Operation contracts** — declared once here and mirrored into `owf_step_operation`
 ([`01 §3.7`](./01-foundation.md#37-database-schemas--tables)):
@@ -517,8 +521,8 @@ this gear.
 | Field | `admit-trigger` | `terminate-on-terminal-event` |
 |-------|-----------------|-------------------------------|
 | `protection` | `protected` — first operation of the start path (before `start-instance`) and of every `listen` arm that consumes a Lifecycle trigger (ADR-0012 rule 1) | `protected` — on the terminal-event path, after `admit-trigger` answers `terminate` and before `run-cancellation-fence` |
-| `input` | `gts.cf.bss.orders_workflow.step.admit-trigger.input.v1~`: `triggerEventId`, `triggerKind` (closed nine-value enum), `role` (`start` · `listen`), `orderId`, `orderVersion` (as carried on the event), `resourceTenantId`, `correlationId` (listen role only — the running instance; absent on start), `invocationId`, `attemptId` | `gts.cf.bss.orders_workflow.step.terminate-on-terminal-event.input.v1~`: `correlationId`, `triggerEventId` (the event admitted as `terminate`), `orderId`, `orderVersion`, `resourceTenantId`, `invocationId`, `attemptId` |
-| `output` | `gts.cf.bss.orders_workflow.step.admit-trigger.output.v1~`: `admission` (the eight outcomes of §3.1), `correlationId` (derived on start; the running instance's on listen), `currentOrderVersion` (the version the Lifecycle read returned) | `gts.cf.bss.orders_workflow.step.terminate-on-terminal-event.output.v1~`: `terminate` (bool), `lifecycleState` (`cancelled` · `expired` · `rejected`), `terminationKind` (`terminal-order-event`), `rowVersion` |
+| `input` | `gts.cf.bss.orders_workflow.step.admit-trigger.input.v1~`: `triggerEventId`, `triggerKind` (closed ten-value enum), `role` (`start` · `listen`), `orderId`, `orderVersion` (as carried on the event), `resourceTenantId`, `correlationId` (listen role only — the running instance; absent on start), `invocationId`, `attemptId` | `gts.cf.bss.orders_workflow.step.terminate-on-terminal-event.input.v1~`: `correlationId`, `triggerEventId` (the event admitted as `terminate`), `orderId`, `orderVersion`, `resourceTenantId`, `invocationId`, `attemptId` |
+| `output` | `gts.cf.bss.orders_workflow.step.admit-trigger.output.v1~`: `admission` (the eight outcomes of §3.1), `correlationId` (derived on start; the running instance's on listen), `currentOrderVersion` (the version the Lifecycle read returned) | `gts.cf.bss.orders_workflow.step.terminate-on-terminal-event.output.v1~`: `terminate` (bool), `lifecycleState` (`cancelled` · `expired` · `rejected` · `fulfillment_failed`), `terminationKind` (`terminal-order-event` · `operator-forced-unreconciled`), `rowVersion` |
 | `idempotency_key` | Event-scoped (§2.1): `{tenant}:{triggerEventId}:admit-trigger` on start, `{tenant}:{triggerEventId}:admit-trigger:listen` on listen; the fingerprint covers `triggerKind`, `role`, `orderId`, `orderVersion`, `resourceTenantId` and, on listen, `correlationId`; it excludes `invocationId` and `attemptId` | Instance-scoped: `{tenant}:{correlationId}:terminate-on-terminal-event` — one per instance |
 | `declared_event` | none | none (`OrderFulfillmentAborted` belongs to `report-outcome`, slice 06) |
 | `compensation` | none | none |
@@ -577,7 +581,7 @@ order that closed before this gear acted on it has nothing to compensate.
 
 | Dependency Gear | Interface Used | Purpose |
 |--------------------|----------------|----------|
-| `serverless-runtime` | Event triggers and the running invocation's `listen` (by reference, `10 §3.3`) | Delivers the nine triggers to the definition, which calls this slice's operations; **no code today** (`10 §1`) |
+| `serverless-runtime` | Event triggers and the running invocation's `listen` (by reference, `10 §3.3`) | Delivers the ten triggers to the definition, which calls this slice's operations; **no code today** (`10 §1`) |
 | `orders-lifecycle` | Versioned contract / SDK client: `order × read` (R1), per [`../../../orders-lifecycle/docs/features/06-workflow-seam.md`](../../../orders-lifecycle/docs/features/06-workflow-seam.md) §3.3 | Read current order state and version inside `admit-trigger`; the five seam operations (`approval-reflection`, `begin-fulfillment`, `spawn-signal`, `fulfillment-acknowledgement`, `workflow-cancel`) are called by slices 03, 04, 05 and 06, not by this slice |
 | `authz-resolver` | `PolicyEnforcer` adapter, through the envelope | The `execute` decision on both step routes |
 
@@ -693,7 +697,7 @@ Output: `admission`, `correlationId`, `currentOrderVersion`, or a retryable fail
 6. [ ] - `p1` - Lock the order's instance rows (`owf_process_instance` by `order_id`) for the rest of the transaction; select the active instance, if any, and whether an instance ever existed at the event's version - `inst-at-lock-instances`
 7. [ ] - `p1` - **IF** `role = listen` **AND** the running instance's pinned `order_version` is less than the read version: **RETURN** `supersede` - `inst-at-supersede`
 8. [ ] - `p1` - **IF** the event's `orderVersion` is less than the read version: **RETURN** `ignored-superseded` - `inst-at-superseded`
-9. [ ] - `p1` - **IF** `role = listen`: **RETURN** `ignored-terminated` when the running instance's `terminal_outcome` is set, `terminate` when the read state is terminal, `absorbed-duplicate` for an `OrderAmended` at the pinned version, otherwise `advance` - `inst-at-listen-table`
+9. [ ] - `p1` - **IF** `role = listen`: **RETURN** `ignored-terminated` when the running instance's `terminal_outcome` is set, or when `triggerKind = OrderFulfillmentFailed` and the read's `failure_reason` is not `operator-forced-unreconciled` (this gear's own acknowledgement, D-208); `terminate` when the read state is terminal, `absorbed-duplicate` for an `OrderAmended` at the pinned version, otherwise `advance` - `inst-at-listen-table`
 10. [ ] - `p1` - **IF** `role = start` **AND** an instance at the event's version exists (active or terminated): **RETURN** `absorbed-duplicate` - `inst-at-start-duplicate`
 11. [ ] - `p1` - **IF** `role = start` **AND** the read state is terminal: **RETURN** `ignored-terminated` - `inst-at-start-terminal`
 12. [ ] - `p1` - **IF** `role = start` **AND** an active instance exists at an older version: **RETURN** `retryable-failure` with `prior-instance-active`; the key stays `open` (§4.3) - `inst-at-prior-active`
@@ -759,7 +763,11 @@ the unwind through slice 06's operations — never a direct void or cancel — a
 sets `terminal_outcome = aborted`. `compensationState = pending-escalation` loops through the
 manual task of fragment (c) and never reaches `terminate-instance`, so the instance stays
 non-terminal until compensation reaches a known outcome. The same unwind runs, unchanged, on the
-supersede path (below).
+supersede path (below). An operator-forced `OrderFulfillmentFailed` (Lifecycle D-182) enters this
+same unwind with `terminationKind = operator-forced-unreconciled`: the order's evidence says
+compensation is unknown, so the walk still cancels activated subscriptions through Subscriptions,
+and a compensation that cannot complete keeps its `activated-cancel-failed` task open until
+Subscriptions confirms no active subscription remains (D-208).
 
 **Algorithm: Terminate on Terminal Event**
 
@@ -770,7 +778,7 @@ Output: `terminate`, `lifecycleState`, `terminationKind`, `rowVersion`
 2. [ ] - `p1` - Lock the instance row; **IF** `terminal_outcome` is set: **RETURN** `permanent-failure` with `version-mismatch` - `inst-tt-lock`
 3. [ ] - `p1` - Take `lifecycleState` from the admission's step record; no second Lifecycle read is made, because Lifecycle's terminal states are absorbing and the admission's read therefore still holds - `inst-tt-state`
 4. [ ] - `p1` - **IF** `phase = compensating` (a fence already claimed by a cancel, failure or supersede path): **RETURN** `terminate = false`; the claimed fence's own path reaches `terminate-instance` - `inst-tt-already-fenced`
-5. [ ] - `p1` - Record the termination cause (terminal event kind, `triggerEventId`) in the step record and the `step-completion` entry; **RETURN** `terminate = true`, `terminationKind = terminal-order-event` - `inst-tt-record`
+5. [ ] - `p1` - Record the termination cause (terminal event kind, `triggerEventId`) in the step record and the `step-completion` entry; **RETURN** `terminate = true`, `terminationKind = operator-forced-unreconciled` when `lifecycleState = fulfillment_failed` (Lifecycle D-182: the unwind compensates through Subscriptions but never reports the order compensated, and `report-outcome` makes no Lifecycle call), else `terminal-order-event` - `inst-tt-record`
 
 #### Supersession on `OrderAmended`
 
@@ -953,7 +961,7 @@ enforced item is refused through the rule or fence row it restates; every other 
 canonical-definition guidance, which the canonical version carries and the behavioural gate of
 `10 §4.2` asserts for every candidate version (decision D-136).
 
-1. [ ] - `p1` - **Admission first.** `admit-trigger` **MUST** be the first operation of the start path and of every `listen` arm that consumes one of the nine Lifecycle triggers, with `role: listen` and the running `correlationId` on an arm. The canonical fragments satisfy it: (b) calls `admitAcceptance` before `evaluate-payment-auth-eligibility`, (e) calls `admitHold` before `apply-hold` and `admitResume` before `apply-resume` (the resume listen is `awaitResume`), and (f) calls `admitLifecycle` before `terminate-on-terminal-event` or supersession (**alignment**: an earlier revision of those fragments called the consuming operation directly) - `inst-def02-admit-first`
+1. [ ] - `p1` - **Admission first.** `admit-trigger` **MUST** be the first operation of the start path and of every `listen` arm that consumes one of the ten Lifecycle triggers, with `role: listen` and the running `correlationId` on an arm. The canonical fragments satisfy it: (b) calls `admitAcceptance` before `evaluate-payment-auth-eligibility`, (e) calls `admitHold` before `apply-hold` and `admitResume` before `apply-resume` (the resume listen is `awaitResume`), and (f) calls `admitLifecycle` before `terminate-on-terminal-event` or supersession (**alignment**: an earlier revision of those fragments called the consuming operation directly) - `inst-def02-admit-first`
 2. [ ] - `p1` - **Start-path branching.** After `admit-trigger` on the start role, only `start` may reach `start-instance`; `absorbed-duplicate`, `ignored-superseded`, `ignored-terminated` and `no-active-instance` **MUST** end the invocation with no further call - `inst-def02-start-branch`
 3. [ ] - `p1` - **Listen-arm branching.** `advance` continues to the arm's consuming operation; `supersede` routes to the supersede unwind; `terminate` routes to `terminate-on-terminal-event`; `absorbed-duplicate`, `ignored-superseded` and `ignored-terminated` return to the stage the arm left. No arm may branch on event data instead of the returned `admission` - `inst-def02-listen-branch`
 4. [ ] - `p1` - **Unwind order.** On the terminal-event path, `terminate-on-terminal-event` **<** `run-cancellation-fence` **<** `compensate-order` **<** `report-outcome` **<** `terminate-instance`; `terminate: false` returns to the arm's stage and never skips to `terminate-instance`. On the supersede path, `admit-trigger` (`supersede`) **<** `run-cancellation-fence` with the same order thereafter - `inst-def02-unwind-order`
@@ -962,7 +970,27 @@ canonical-definition guidance, which the canonical version carries and the behav
 7. [ ] - `p1` - **Supersession wait.** The start path's `try` around `admit-trigger` **MUST** retry `prior-instance-active` (409) under a policy whose horizon covers the prior instance's pre-fulfillment unwind and nests below the lifetime ceiling (working value: constant 5 min, `limit.duration` 24 h); the generic `transient` policy's five attempts do not suffice - `inst-def02-supersession-wait`
 8. [ ] - `p1` - **Amendment reachability.** Every competing `fork` before `begin-fulfillment` settles **MUST** contain the amendment `listen` arm (correlated on `orderId` only, since the amended version is newer), and a `begin-fulfillment` refusal caused by a concurrent amendment **MUST** route to that arm rather than to failure compensation that would report `failed` or `cancelled` - `inst-def02-amendment-reachable`
 9. [ ] - `p1` - **Start bindings.** The event-trigger set that starts the order-process workflow is exactly `{OrderSubmitted, OrderAmended}` (§2.2), declared in the repository beside the definition and applied only by the definition publish job (`10 §4.2`); the start path derives `triggerKind` from the exact event type and never defaults an unknown type (D-107) - `inst-def02-start-bindings`
-10. [ ] - `p2` - **Signals.** This slice handles no operator signal; it handles the nine Lifecycle events only. `cancel-requested` and `reauthorize-requested` are slices 08 and 04 - `inst-def02-signals`
+10. [ ] - `p2` - **Signals.** This slice handles no operator signal; it handles the ten Lifecycle events only. `cancel-requested` and `reauthorize-requested` are slices 08 and 04 - `inst-def02-signals`
+
+### 4.8 Lifecycle's event consumer contract
+
+Orders Lifecycle publishes one normative consumer contract for its events (Lifecycle D-186,
+Foundation §4.4 `cpt-cf-bss-orders-lifecycle-constraint-event-consumer-contract`), and this
+slice is where Workflow meets it (decision D-208):
+
+| Clause | Lifecycle requires | Where this slice meets it |
+|--------|--------------------|---------------------------|
+| C1 | De-duplicate by event id in a consumer-owned store, marked complete only when the effect commits | `admit-trigger`'s event-scoped idempotency key `{tenant}:{eventId}:admit-trigger[:listen]` (§2.1 *Duplicates are absorbed*) |
+| C2 | Reconcile version and state through `get_version` and the current-order read before any business effect, under a declared per-event applicability rule | §2.1 *Ground truth is read before acting*; the per-event rule is the admission table of §3.1 and the trigger-to-outcome table of §3.3 |
+| C3 | Tolerate unknown `state` and event-type values | An unlisted event type is never consumed: the start bindings and every `listen` filter name only the ten types, and the exact-type lookup yields no `triggerKind` for any other, which the schema refuses with no business effect (§2.1, D-107). A state value this slice does not recognise is not terminal, so step 9 of §3.6 never terminates on it; the arm's consuming operation applies its own guards |
+| C4 | Never reconstruct order state or assume every prior event was observed | §2.2 *No caching of order state across triggers*; admission decides from the read alone |
+| C5 | An unavailable or denied read keeps work durably pending with bounded retry and escalation | A read that times out, answers 503 or is refused for authorization or configuration answers `retryable-failure` with `trigger-applicability-unverified` and records no outcome (§3.6 `inst-at-read`), so the trigger is neither retired nor read as empty |
+
+**Sign-off gate.** Workflow is the first consumer integration, so it builds Lifecycle's
+`orders-events` golden corpus family in `gears/bss/fixtures` with that integration and runs it
+against the real `admit-trigger` handler and its declared applicability rule; passing it is this
+gear's integration sign-off (PRD acceptance criterion 15c). Lifecycle states the cases; this gear
+owns the harness and its result.
 
 ## 5. Traceability
 

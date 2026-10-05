@@ -104,6 +104,12 @@ rather than one task, fails closed before a definition can be executed, and stil
   convention (every competing `fork` followed by a `switch` on `arm`) as rules 7 and 8, which
   restate this ADR's grammar and D-80's routing rule rather than adding a fence (D-67).
 
+  > **Amended 2026-10-05 by D-208**: the Lifecycle trigger set rule 3 counts as nine is **ten**.
+  > `OrderFulfillmentFailed` joins it as a `listen` target that ends a process only for Lifecycle's
+  > operator-forced failure (`failure_reason = operator-forced-unreconciled`, Lifecycle D-182); every
+  > other `OrderFulfillmentFailed` is this gear's own acknowledgement and is absorbed
+  > (`design/02-triggers-and-start.md` §2.1, §3.6). The set stays PRD-owned and closed.
+
   > **Amended 2026-09-26 by D-126**: the rules are restated where a validator could not check
   > them as written (`design/10-process-definition.md` §2.2, §4.1, §4.6).
   > **Rule 1**: `start-instance` is the first operation after `admit-trigger` (`role: start`),

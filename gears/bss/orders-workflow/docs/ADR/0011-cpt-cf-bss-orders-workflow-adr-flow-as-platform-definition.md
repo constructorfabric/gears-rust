@@ -221,6 +221,12 @@ operation's input or output schema; the reason catalogue; the six-event set and 
 set; the seam calls; the idempotency families; audit kinds; the record tables; the PDP catalogue.
 A definition cannot make Orders do anything an operation does not already do.
 
+> **Amended 2026-10-05 by D-208**: the Lifecycle trigger set this ADR counts as nine is **ten**.
+> `OrderFulfillmentFailed` joins it as a `listen` target that ends a process only for Lifecycle's
+> operator-forced failure (`failure_reason = operator-forced-unreconciled`, Lifecycle D-182); every
+> other `OrderFulfillmentFailed` is this gear's own acknowledgement and is absorbed
+> (`design/02-triggers-and-start.md` §2.1, §3.6). The set stays PRD-owned and closed.
+
 > **Amended 2026-09-26 by D-134, D-135, D-136 and D-138**: this contract is now the one table of
 > `design/10-process-definition.md` §4.7, which this paragraph no longer restates. Four
 > corrections. (1) The **business windows** — the approval escalation window, the overdue window

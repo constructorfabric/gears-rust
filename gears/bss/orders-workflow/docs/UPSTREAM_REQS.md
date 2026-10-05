@@ -96,8 +96,11 @@ Subscriptions therefore receives one list from the two Orders gears (DECISIONS D
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-overlap-presence-read`
 
-Subscriptions **MUST** expose an overlap-occupancy read: given the distinct `(payer, overlap_scope_key)`
-pairs of an order's lines, answer per key the **active count** (drafts excluded — this gear's own
+Subscriptions **MUST** expose an overlap-occupancy read: given the distinct
+`(payer, resource_tenant, overlap_scope_key)` tuples of an order's lines (Lifecycle D-179: the
+resource tenant is a default dimension of the key, so a partner's orders for different customers
+never share an answer; until Subscriptions enforces it this gear applies the tuple Subscriptions
+answers and never re-buckets locally, D-208), answer per key the **active count** (drafts excluded — this gear's own
 wave-1 drafts must not collide with the order that created them), the **effective
 `max_concurrent_active`** and the policy provenance (Lifecycle D-126 amended the presence read to
 counts; D-153/D-163 fix the key as Subscriptions' registry-owned `catalogSubscriptionProductKey` of
@@ -105,7 +108,10 @@ counts; D-153/D-163 fix the key as Subscriptions' registry-owned `catalogSubscri
 Workflow consumes this at fulfillment-plan construction and again immediately before the first
 activation intent (pre-activation abort check, PRD §6.1), an early abort only: Subscriptions
 serialises the cardinality rule at its own `active` commit, and a collision it raises after the
-re-check is a wave-2 failure (D-195). This gear cannot answer it alone because Subscriptions owns
+re-check is a wave-2 failure (D-195). Subscriptions-side cardinality is therefore **advisory at
+order time** (Lifecycle D-180): a pass is a pre-check, not an admission guarantee, and that wave-2
+collision reaches Lifecycle as `overlap-collision` on the failure acknowledgement (`design/06` §4.8);
+atomic activation is Lifecycle's release-gating ask `…-upreq-overlap-activation-atomicity`. This gear cannot answer it alone because Subscriptions owns
 subscription state; the check is only partially evaluable without it.
 
 - **Rationale**: Registered upstream in `SEAMS.md` as `SUB-O5` (HIGH, "neighbour-extends"),
@@ -616,6 +622,15 @@ record".
   read-by-key alternative is not provided and is no longer needed (D-203).
 - **Source**: `DECISIONS.md` D-188, D-185; Lifecycle D-173. Raised against
   `gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md`.
+
+**Received from Orders Lifecycle (D-208, 2026-10-05).** Lifecycle's design is merged on `main`
+(#4775, `b26ef8720`) with D-179…D-186; its asks toward this gear are answered here, not re-asked:
+`cpt-cf-bss-orders-lifecycle-upreq-workflow-overdue-escalation` (D-182) by PRD §6.3 *Overdue
+Escalation* and §6.1 *Process Termination on Terminal Order Events*, acceptance criterion 15b,
+`design/02` §3.6 step 9 and `design/06` §4.9; `cpt-cf-bss-orders-lifecycle-upreq-event-consumer-conformance`
+(D-186) by `design/02` §4.8 and acceptance criterion 15c, this gear building the `orders-events`
+corpus as the first consumer; and the D-179 occupancy tuple by the overlap-presence read of §2.1.
+Both D-182 items and the corpus are production release prerequisites on Lifecycle's side.
 
 ### 2.5 Pricing, Products and Rating
 
@@ -1558,6 +1573,14 @@ it would shorten (D-105).
    release and no-tenant-code limits. This also answers item 7's question on tenant-authored
    steps: none in phase 1 (Q-10). Applied to the PRD on 2026-10-05.
 
+20. **§6.1, §6.3 and §12 — Lifecycle's merged design D-179…D-186 (D-208).** The PRD **MUST** add
+   `OrderFulfillmentFailed` to the closed trigger set for Lifecycle's operator-forced failure only,
+   terminate the process on it without treating the order as compensated and without calling
+   Lifecycle again, route the overdue escalation durably to the fulfillment operator with the
+   forced failure as an end, deny this gear's principal the force-fail grant, bind every Lifecycle
+   event to Lifecycle's consumer contract with the `orders-events` corpus as the sign-off gate, and
+   carry acceptance criteria 15b and 15c. Applied to the PRD on 2026-10-05.
+
 ## 5. Traceability
 
 - **PRD**: [`./PRD.md`](./PRD.md) — §6.1 (Fulfillment Plan Construction), §6.2 (Approval
@@ -1578,7 +1601,7 @@ it would shorten (D-105).
   authorization, §2.8); `ADR/0011`, `ADR/0012`, `ADR/0013` and `DECISIONS.md` D-65…D-157, Q-10…Q-13
   (serverless-runtime, §2.9); `DECISIONS.md` D-110 (the `failure_reason` coverage ask, §2.4);
   D-91 and Q-08 (the overlap read's fail-closed reason, §2.1); D-97 as amended (no further
-  Subscriptions ask, §2.1); D-72, D-65, D-105 as amended, D-134 and D-140 (PRD amendments 11–14, §4); D-207 (customization scope, PRD amendment 19 and the §2.9 trigger version-selection ask)
+  Subscriptions ask, §2.1); D-72, D-65, D-105 as amended, D-134 and D-140 (PRD amendments 11–14, §4); D-207 (customization scope, PRD amendment 19 and the §2.9 trigger version-selection ask); D-208 (Lifecycle D-179…D-186 received, §2.1, §2.4, PRD amendment 20)
 - **Platform register**: serverless-runtime has no upstream-requirements register; §2.9 cites its
   [DESIGN.md](../../../serverless-runtime/docs/DESIGN.md), [PRD.md](../../../serverless-runtime/docs/PRD.md),
   [NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) and ADR-0004/0005 by line

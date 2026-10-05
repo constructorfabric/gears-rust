@@ -226,6 +226,7 @@
   - [D-205 (L) The overlap key is never derived here; Q-08 is narrowed to Subscriptions' derivation answer](#d-205-l-the-overlap-key-is-never-derived-here-q-08-is-narrowed-to-subscriptions-derivation-answer)
   - [D-206 (L) The plan is frozen before begin-fulfillment; the PRD states one normative ordering](#d-206-l-the-plan-is-frozen-before-begin-fulfillment-the-prd-states-one-normative-ordering)
   - [D-207 (M) Phase 1 is a canonical process with four seller-policy settings; customization stays in the owning gears](#d-207-m-phase-1-is-a-canonical-process-with-four-seller-policy-settings-customization-stays-in-the-owning-gears)
+  - [D-208 (H) Lifecycle's merged design D-179…D-186 is received: forced failure, overdue owner, resource-tenant tuple, consumer contract](#d-208-h-lifecycles-merged-design-d-179d-186-is-received-forced-failure-overdue-owner-resource-tenant-tuple-consumer-contract)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -5994,6 +5995,9 @@ removes the commercial payload from the consumed events without a thin variant o
 producer baseline is diffora `bss/products` at `16705a243`; the Lifecycle rewrite (ADR-0008,
 D-150–D-168) is uncommitted in its worktree, so this entry cites it by decision number.
 
+**Amended by D-208 (2026-10-05)**: the Lifecycle rewrite is merged on `main` (#4775, `b26ef8720`),
+so the decision numbers cited here resolve in the repository.
+
 **Propagated**: `DESIGN.md` §2.2 (*No price computation*), §3.1, §3.5; `design/03-approval-execution.md`
 §3.2, §3.4, §3.6; `design/04-fulfillment-plan.md` §1.3, §3.2, §3.4, §3.6; `design/05-provisioning-intents.md`
 §2.2, §3.2, §3.5; `design/06-saga-and-compensation.md` §3.2, §3.3; `design/08-hold-and-cancel.md` §3.5;
@@ -6294,6 +6298,9 @@ Subscriptions may answer it.
 
 **Propagated**: `UPSTREAM_REQS.md` §2.1 (`…-upreq-overlap-presence-read`); Q-08.
 
+**Amended by D-208 (2026-10-05)**: per Lifecycle D-179 the read is keyed by
+`(payer, resource_tenant, key)`, the resource tenant a default dimension of Subscriptions' key.
+
 ### D-206 (L) The plan is frozen before begin-fulfillment; the PRD states one normative ordering
 
 **Accepted (2026-10-05).** *(PRD alignment with D-92, D-109; answers PR #4787 review)*
@@ -6349,6 +6356,45 @@ data; §13 gains the PriceBook dependency row; §15 gains three questions (typed
 preview and explainability, PriceBook line-model alignment). The patch's cohort-forbidding
 criterion, construction-time overlap refusal and partial-failure handling of a plan refusal are not
 adopted: they contradict this decision, D-206 and `design/04` §4.2–§4.3.
+
+### D-208 (H) Lifecycle's merged design D-179…D-186 is received: forced failure, overdue owner, resource-tenant tuple, consumer contract
+
+**Accepted (2026-10-05).** *(reciprocal of Lifecycle D-179, D-180, D-182, D-186; amends D-193, D-205)*
+
+**Decision**: Orders Lifecycle is merged on `main` (#4775, `b26ef8720`); its asks toward this gear
+are answered as follows. (1) **Forced failure (D-182).** `OrderFulfillmentFailed` joins the closed
+trigger set as a `listen` target; `admit-trigger` answers `terminate` only when the read shows
+`failure_reason = operator-forced-unreconciled` and absorbs every other one as this gear's own
+acknowledgement (`ignored-terminated`). The terminal unwind runs unchanged with
+`terminationKind = operator-forced-unreconciled`: it compensates through Subscriptions, never
+reports the order compensated, makes no Lifecycle call, and keeps an `activated-cancel-failed`
+task open until Subscriptions confirms no active subscription remains — that task is the
+"orphan-subscription manual task" Lifecycle names. A `completed` report that meets the forced
+terminal answers `lifecycleCall = forced-terminal`, which the fence accepts as the cause of a
+`terminal-event` unwind with no trigger event, so the definition takes the same unwind; Lifecycle's report-outcome table row is split accordingly (`design/06`
+§4.9). (2) **Overdue owner (D-182).** The overdue escalation is durable, once per order and window,
+routed to the fulfillment operator with order, version, age and unreconciled lines; its ends are
+the workflow-mediated cancel or Lifecycle's two-person forced failure; this gear's principal never
+holds `order × force-fail-unreconciled`. (3) **Resource-tenant tuple (D-179).** The occupancy read
+is keyed by `(payer, resource_tenant, key)`; this gear applies the tuple Subscriptions answers and
+never re-buckets. (4) **Advisory cardinality (D-180).** Already met: a wave-2 collision Subscriptions
+raises after the re-check reaches Lifecycle as `overlap-collision` on the failure acknowledgement
+(`design/06` §4.8); atomic activation is Lifecycle's release-gating ask on Subscriptions.
+(5) **Consumer contract (D-186).** Clauses C1–C5 map onto `design/02` §4.8; this gear, the first
+consumer integration, builds the `orders-events` corpus and passing it is its integration
+sign-off (PRD acceptance criterion 15c). (6) D-181, D-183, D-184 and D-185 are internal to
+Lifecycle and need nothing here.
+
+**Rationale**: the forced failure is the first Lifecycle exit after the spawn signal that this gear
+did not cause, so the claim in `design/06` §4.9 that only this gear's reports leave
+`in_fulfillment` after the spawn signal no longer holds; reusing the terminal unwind keeps one
+compensation path and one manual-task family rather than adding a reason.
+
+**Propagated**: `PRD.md` §6.1, §6.3, §12 (15b, 15c); `design/02-triggers-and-start.md` §2.1, §3.1,
+§3.3, §3.6, §4.7, §4.8; `design/06-saga-and-compensation.md` §3.3, §4.9;
+`design/10-process-definition.md` §2.1, §3.6 (b), (f); `design/09-read-and-authz.md`; `DESIGN.md`;
+`design/README.md`; `ADR/0011`, `ADR/0012` (amendment notes); `UPSTREAM_REQS.md` §2.1, §2.4, §4
+item 20; D-193, D-205.
 
 ## Open Questions
 
@@ -6695,6 +6741,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-01–D-04 | 01 Process engine | `design/01-foundation.md` |
 | D-206 | 04 Fulfillment plan (PRD alignment, 2026-10-05) | `PRD.md` §6.3, §9.1, UC-002, §17.1 |
 | D-207 | cross-cutting (customization scope, 2026-10-05) | `PRD.md` §5.3, §12; `UPSTREAM_REQS.md` §2.9, §4 |
+| D-208 | cross-cutting (Lifecycle D-179…D-186 received, 2026-10-05) | `PRD.md` §6.1, §6.3, §12; `design/02`, `design/06`, `design/10`; `UPSTREAM_REQS.md` §2.1, §2.4, §4 |
 | D-200–D-205 | cross-cutting (Seam Atlas alignment, 2026-10-02) | `UPSTREAM_REQS.md` §2.1, §2.2, §2.4, §2.5, §4; `PRD.md` §9.1, §13, §15, §16; `design/05` §3.3; `design/06` §4.8 |
 | D-05–D-08 | 02 Triggers and start | `design/02-triggers-and-start.md` |
 | D-09–D-14 | 03 Approval execution | `design/03-approval-execution.md` |
@@ -6872,6 +6919,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-205 | L Overlap key never derived here; occupancy shape per Lifecycle; Q-08 narrowed | `UPSTREAM_REQS.md` §2.1; Q-08 |
 | D-206 | L Plan frozen before begin-fulfillment; PRD UC-002, §6.3, §9.1, §17.1 aligned; binding expiry is a plan-level task | `PRD.md` §6.3, §9.1, UC-002, §17.1 |
 | D-207 | M Canonical process, four seller-policy settings; customization in owning gears; Q-10 answered; cohort binding required | `PRD.md` §5.3, §12; `UPSTREAM_REQS.md` §2.9, §4 item 19 |
+| D-208 | H Lifecycle D-179…D-186 received: forced-failure trigger and unwind, overdue owner, resource-tenant tuple, consumer contract and corpus | `PRD.md` §6.1, §6.3, §12; `design/02` §4.8; `design/06` §4.9; `design/10`; `UPSTREAM_REQS.md` §2.1, §2.4, §4 item 20 |
 
-Highest decision number used: **D-207**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-208**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.
