@@ -129,7 +129,7 @@ The DESIGN's largest component, subject control, is split across four features. 
   - None. The shell is not a DESIGN component. It realizes `cpt-cf-construct-adr-construct-is-a-gear` and the gear anatomy of `cpt-cf-construct-tech-rust-gear`.
 
 - **API**:
-  - POST /construct/v1/foundation-notes (as registered in code; the gateway adds the public `/api` prefix)
+  - POST /construct/v1/foundation-notes (as registered in code; the DESIGN's public paths carry an `/api` prefix that a deployment sets in the gateway's `prefix_path`)
 
 - **Sequences**:
 
