@@ -29,8 +29,11 @@ impl Default for SeaOrmNoteRepository {
     }
 }
 
+/// @cpt-dod:cpt-cf-construct-dod-gear-foundation-error-mapping:p1
+///
 /// Map scope errors to domain errors.
 pub(super) fn map_scope_error(e: ScopeError) -> DomainError {
+    // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-scope
     match e {
         ScopeError::Denied(msg) => DomainError::forbidden(msg),
         ScopeError::Invalid(msg) => DomainError::internal(format!("scope invalid: {msg}")),
@@ -44,6 +47,7 @@ pub(super) fn map_scope_error(e: ScopeError) -> DomainError {
             DomainError::internal(format!("unhandled scope error: {other}"))
         }
     }
+    // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-scope
 }
 
 #[async_trait]
@@ -65,6 +69,8 @@ impl NoteRepository for SeaOrmNoteRepository {
             text: ActiveValue::Set(note.text.clone()),
         };
 
+        // @cpt-begin:cpt-cf-construct-flow-gear-foundation-create-note:p1:inst-create-insert
+        // @cpt-begin:cpt-cf-construct-flow-gear-foundation-create-note:p1:inst-create-insert-fail-return
         NoteEntity::insert(row)
             .secure()
             .scope_with_model(scope, &scope_columns)
@@ -72,6 +78,8 @@ impl NoteRepository for SeaOrmNoteRepository {
             .exec(conn)
             .await
             .map_err(map_scope_error)?;
+        // @cpt-end:cpt-cf-construct-flow-gear-foundation-create-note:p1:inst-create-insert-fail-return
+        // @cpt-end:cpt-cf-construct-flow-gear-foundation-create-note:p1:inst-create-insert
 
         Ok(note)
     }
@@ -82,6 +90,7 @@ impl NoteRepository for SeaOrmNoteRepository {
         scope: &AccessScope,
         id: Uuid,
     ) -> Result<Option<FoundationNote>, DomainError> {
+        // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-get-select
         let row = NoteEntity::find()
             .secure()
             .scope_with(scope)
@@ -89,6 +98,7 @@ impl NoteRepository for SeaOrmNoteRepository {
             .one(conn)
             .await
             .map_err(map_scope_error)?;
+        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-get-select
 
         Ok(row.map(Into::into))
     }

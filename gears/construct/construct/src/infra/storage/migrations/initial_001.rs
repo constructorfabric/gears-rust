@@ -1,6 +1,7 @@
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;
 
+/// @cpt-dod:cpt-cf-construct-dod-gear-foundation-storage:p1
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 

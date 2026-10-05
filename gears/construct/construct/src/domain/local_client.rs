@@ -22,6 +22,7 @@ impl<R: NoteRepository + 'static> LocalClient<R> {
     }
 }
 
+/// @cpt-dod:cpt-cf-construct-dod-gear-foundation-client:p1
 #[async_trait]
 impl<R: NoteRepository + 'static> ConstructClientV1 for LocalClient<R> {
     async fn create_note(
@@ -29,10 +30,18 @@ impl<R: NoteRepository + 'static> ConstructClientV1 for LocalClient<R> {
         ctx: &SecurityContext,
         note: NewFoundationNote,
     ) -> Result<FoundationNote, CanonicalError> {
+        // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-create
+        // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-create-run
         self.service
             .create_note(ctx, note)
             .await
+            // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-create-run
+            // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map
+            // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map-return
             .map_err(CanonicalError::from)
+        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map-return
+        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map
+        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-create
     }
 
     async fn get_note(
@@ -40,9 +49,15 @@ impl<R: NoteRepository + 'static> ConstructClientV1 for LocalClient<R> {
         ctx: &SecurityContext,
         id: Uuid,
     ) -> Result<FoundationNote, CanonicalError> {
+        // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-get
         self.service
             .get_note(ctx, id)
             .await
+            // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map
+            // @cpt-begin:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map-return
             .map_err(CanonicalError::from)
+        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map-return
+        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-map
+        // @cpt-end:cpt-cf-construct-flow-gear-foundation-client-note:p1:inst-client-get
     }
 }

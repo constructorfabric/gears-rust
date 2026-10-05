@@ -33,17 +33,21 @@ impl ConstructConfig {
     /// Reject limits that would break the gear at request time rather than at
     /// startup, where a typo is cheap to notice.
     ///
+    /// @cpt-dod:cpt-cf-construct-dod-gear-foundation-text-validation:p1
+    ///
     /// # Errors
     ///
     /// When `max_text_length` is 0 (every note refused) or above
     /// [`MAX_TEXT_BYTES`].
     pub fn validate(&self) -> anyhow::Result<()> {
+        // @cpt-begin:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config-fail
         if self.max_text_length == 0 || self.max_text_length > MAX_TEXT_BYTES {
             anyhow::bail!(
                 "construct: max_text_length must be between 1 and {MAX_TEXT_BYTES}, got {}",
                 self.max_text_length
             );
         }
+        // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-config-fail
         Ok(())
     }
 }

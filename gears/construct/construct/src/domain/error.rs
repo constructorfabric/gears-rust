@@ -58,6 +58,7 @@ fn log_evaluation_failed(e: &authz_resolver_sdk::EnforcerError) {
     tracing::error!(error = %e, "AuthZ scope resolution failed");
 }
 
+/// @cpt-dod:cpt-cf-construct-dod-gear-foundation-error-mapping:p1
 // TODO(DE1302): `Forbidden` and `Internal` only carry Strings, so the
 // `EnforcerError` source is lost. Extend the variants to hold a boxed source,
 // then remove this allow.
@@ -70,9 +71,17 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
         log_enforcer_error(&e);
         match e {
+            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-denied
+            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-denied-return
             authz_resolver_sdk::EnforcerError::Denied { .. }
             | authz_resolver_sdk::EnforcerError::CompileFailed(_) => Self::Forbidden(e.to_string()),
+            // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-denied-return
+            // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-denied
+            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed
+            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed-return
             authz_resolver_sdk::EnforcerError::EvaluationFailed(_) => Self::Internal(e.to_string()),
+            // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed-return
+            // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed
         }
     }
 }

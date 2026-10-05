@@ -2,6 +2,7 @@ use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
+/// @cpt-dod:cpt-cf-construct-dod-gear-foundation-storage:p1
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "construct__foundation_notes")]
 #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]

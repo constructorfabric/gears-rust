@@ -16,11 +16,13 @@ impl AsRef<str> for License {
 
 impl LicenseFeature for License {}
 
+/// @cpt-dod:cpt-cf-construct-dod-gear-foundation-create-route:p1
 pub fn register_routes(
     mut router: Router,
     openapi: &dyn OpenApiRegistry,
     service: Arc<ConcreteService>,
 ) -> Router {
+    // @cpt-begin:cpt-cf-construct-flow-gear-foundation-create-note:p1:inst-create-send
     router = OperationBuilder::post("/construct/v1/foundation-notes")
         .operation_id("construct.create_foundation_note")
         .summary("Create a foundation note")
@@ -38,6 +40,7 @@ pub fn register_routes(
         .standard_errors(openapi)
         .error_422(openapi)
         .register(router, openapi);
+    // @cpt-end:cpt-cf-construct-flow-gear-foundation-create-note:p1:inst-create-send
 
     router.layer(Extension(service))
 }
