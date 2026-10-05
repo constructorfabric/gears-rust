@@ -401,7 +401,7 @@ async fn the_lowered_compat_forced_boolean_refuses_a_value_outside_zero_and_one(
         &db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (id, operation_id, item_no, gts_id, dry_run, kind, \
+             (id, operation_id, item_no, entity_key, dry_run, kind, \
               expected_resource_version, compat_forced, status, request_payload, created_at) \
              VALUES (1, {OP_ID}, 0, '{GTS_TYPE}', 0, 1, 0, 7, 1, '{{}}', '{TS}')"
         ),
@@ -893,7 +893,7 @@ async fn operation_item_state_check_rejects_succeeded_registration_without_a_rev
         &db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, result_revision_no, result_resource_version, error_payload, \
               created_at, started_at, completed_at) \
              VALUES ({OP_ID}, 0, '{GTS_TYPE}', 0, 1, 0, 3, NULL, NULL, 1, NULL, \
@@ -915,7 +915,7 @@ async fn operation_item_state_check_accepts_succeeded_registration_with_a_revisi
         &db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, result_revision_no, result_resource_version, error_payload, \
               created_at, started_at, completed_at) \
              VALUES ({OP_ID}, 0, '{GTS_TYPE}', 0, 1, 0, 3, NULL, 1, 1, NULL, \
@@ -934,7 +934,7 @@ async fn operation_item_state_check_rejects_a_dry_run_success_that_allocated_a_v
         &db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, result_revision_no, result_resource_version, error_payload, \
               created_at, started_at, completed_at) \
              VALUES ({OP_ID}, 0, '{GTS_TYPE}', 1, 1, 0, 3, NULL, NULL, 1, NULL, \
@@ -953,7 +953,7 @@ async fn operation_item_state_check_rejects_unchanged_on_a_first_admission() {
         &db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, result_revision_no, result_resource_version, error_payload, \
               created_at, started_at, completed_at) \
              VALUES ({OP_ID}, 0, '{GTS_TYPE}', 0, 1, 0, 4, NULL, NULL, 1, NULL, \
@@ -974,7 +974,7 @@ async fn operation_item_composite_fk_rejects_a_kind_disagreeing_with_its_parent(
         &db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, created_at) \
              VALUES ({OP_ID}, 0, '{GTS_TYPE}', 0, 2, 0, 1, '{{}}', '{TS}')"
         ),
@@ -984,7 +984,7 @@ async fn operation_item_composite_fk_rejects_a_kind_disagreeing_with_its_parent(
 }
 
 #[tokio::test]
-async fn operation_item_gts_id_is_unique_within_one_operation() {
+async fn operation_item_entity_key_is_unique_within_one_operation() {
     let db = migrated_db().await;
     insert_operation(&db, OP_ID, 1, 0).await;
     for item_no in [0, 1] {
@@ -992,7 +992,7 @@ async fn operation_item_gts_id_is_unique_within_one_operation() {
             &db,
             format!(
                 "INSERT INTO types_registry__operation_item \
-                 (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, \
+                 (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, \
                   status, request_payload, created_at) \
                  VALUES ({OP_ID}, {item_no}, '{GTS_TYPE}', 0, 1, 0, 1, '{{}}', '{TS}')"
             ),
@@ -1247,7 +1247,7 @@ async fn insert_succeeded_item(
         db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, result_revision_no, result_resource_version, error_payload, \
               created_at, started_at, completed_at) \
              VALUES ({OP_ID}, {item_no}, '{GTS_TYPE}{item_no}', 0, 1, \
@@ -1306,7 +1306,7 @@ async fn operation_item_status_outside_the_vocabulary_is_rejected() {
         &db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, created_at) \
              VALUES ({OP_ID}, 0, '{GTS_TYPE}', 0, 1, 0, 9, '{{}}', '{TS}')"
         ),
@@ -1323,7 +1323,7 @@ async fn operation_item_failed_requires_an_error_payload() {
         &db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, result_revision_no, result_resource_version, error_payload, \
               created_at, started_at, completed_at) \
              VALUES ({OP_ID}, 0, '{GTS_TYPE}', 0, 1, 0, 5, NULL, NULL, NULL, NULL, \
@@ -1342,7 +1342,7 @@ async fn operation_item_failed_requires_started_at_before_completed_at() {
         &db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, result_revision_no, result_resource_version, error_payload, \
               created_at, started_at, completed_at) \
              VALUES ({OP_ID}, 0, '{GTS_TYPE}', 0, 1, 0, 5, NULL, NULL, NULL, '{{}}', \
@@ -1466,7 +1466,7 @@ async fn insert_succeeded_item_named(
         db,
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, result_revision_no, result_resource_version, error_payload, \
               created_at, started_at, completed_at) \
              VALUES ({OP_ID}, {item_no}, '{gts_id}', 0, 1, 0, 3, NULL, 1, 1, NULL, \
@@ -1538,7 +1538,7 @@ async fn operation_item_dry_run_is_constrained_to_the_boolean_domain() {
     let item = |dry_run: i64| {
         format!(
             "INSERT INTO types_registry__operation_item \
-             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
               request_payload, created_at) \
              VALUES ({OP_ID}, {dry_run}, '{GTS_TYPE}{dry_run}', {dry_run}, 1, 0, 1, '{{}}', \
                      '{TS}')"
@@ -1617,4 +1617,186 @@ async fn instance_revision_numbers_start_at_one() {
     )
     .await
     .expect_err("fk_tr_instance_revision_schema must name an existing Type Schema revision");
+}
+
+// ---------------------------------------------------------------------------
+// operation_item.entity_key (migration 6)
+// ---------------------------------------------------------------------------
+
+const DELETION_OP_ID: &str = "x'000000000000000000000000000000a2'";
+
+async fn scalar_text(db: &DatabaseConnection, sql: &str) -> Result<String, sea_orm::DbErr> {
+    db.query_one_raw(stmt(db, sql))
+        .await?
+        .ok_or_else(|| sea_orm::DbErr::Custom(format!("no row for {sql}")))?
+        .try_get_by_index::<String>(0)
+}
+
+async fn applied_migrations(db: &DatabaseConnection) -> i64 {
+    db.query_one_raw(stmt(db, "SELECT COUNT(*) FROM seaql_migrations"))
+        .await
+        .expect("count applied migrations")
+        .expect("one row")
+        .try_get_by_index::<i64>(0)
+        .expect("migration count")
+}
+
+/// An admitted registration as migration 5 stored it: the item, the entity it
+/// created and the revision that pins the item.
+async fn seed_admitted_registration_at_version_five(db: &DatabaseConnection) {
+    Migrator::up(db, Some(5))
+        .await
+        .expect("apply migrations 1-5");
+    insert_family(db).await;
+    insert_operation(db, OP_ID, 1, 0).await;
+    exec(
+        db,
+        format!(
+            "INSERT INTO types_registry__operation_item \
+             (operation_id, item_no, gts_id, dry_run, kind, expected_resource_version, status, \
+              request_payload, result_revision_no, result_resource_version, error_payload, \
+              created_at, started_at, completed_at) \
+             VALUES ({OP_ID}, 0, '{GTS_TYPE}', 0, 1, 0, 3, NULL, 1, 1, NULL, \
+                     '{TS}', '{TS}', '{TS}')"
+        ),
+    )
+    .await
+    .expect("insert the admitted item");
+    exec(
+        db,
+        format!(
+            "INSERT INTO types_registry__entity \
+             (gts_uuid, gts_id, entity_kind, chain_depth, family_id, ownership_scope, owner_tenant_id, \
+              owning_gear, lifecycle_status, resource_version, created_at, updated_at) \
+             VALUES ({ENTITY_UUID}, '{GTS_TYPE}', 1, 1, 1, 1, NULL, 'types-registry', 1, 1, \
+                     '{TS}', '{TS}')"
+        ),
+    )
+    .await
+    .expect("insert the entity");
+    exec(
+        db,
+        format!(
+            "INSERT INTO types_registry__type_schema_revision \
+             (entity_id, revision_no, raw_schema, gts_spec_version, \
+              gts_impl_version, compat_forced, operation_item_id, created_at, updated_at) \
+             VALUES (1, 1, '{{}}', '0.13', '0.12.0', 0, 1, '{TS}', '{TS}')"
+        ),
+    )
+    .await
+    .expect("insert the revision that pins the item");
+}
+
+#[tokio::test]
+async fn the_entity_key_rename_keeps_items_and_the_revisions_that_pin_them() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    exec(&db, "PRAGMA foreign_keys = ON;")
+        .await
+        .expect("enable foreign keys");
+    seed_admitted_registration_at_version_five(&db).await;
+
+    Migrator::up(&db, None).await.expect("apply the rename");
+    assert_eq!(
+        scalar_text(
+            &db,
+            "SELECT i.entity_key FROM types_registry__operation_item i \
+             JOIN types_registry__type_schema_revision r ON r.operation_item_id = i.id"
+        )
+        .await
+        .expect("the revision still reaches its item"),
+        GTS_TYPE
+    );
+    assert!(
+        exec(&db, "SELECT gts_id FROM types_registry__operation_item")
+            .await
+            .is_err()
+    );
+    assert!(
+        db.query_one_raw(stmt(&db, "PRAGMA foreign_key_check"))
+            .await
+            .expect("check foreign keys")
+            .is_none(),
+        "every reference still resolves after the rename"
+    );
+    exec(
+        &db,
+        "DELETE FROM types_registry__operation_item WHERE id = 1",
+    )
+    .await
+    .expect_err("the revision still pins its item");
+
+    // A registration-only installation rolls back.
+    Migrator::down(&db, Some(1))
+        .await
+        .expect("roll back the rename");
+    assert_eq!(
+        scalar_text(&db, "SELECT gts_id FROM types_registry__operation_item")
+            .await
+            .expect("the previous column is back"),
+        GTS_TYPE
+    );
+}
+
+/// A deletion accepted after the rename stores a Registry-Reference fingerprint
+/// even when every key is an identifier; the previous code would `409` its
+/// replay, so down refuses and changes nothing.
+#[tokio::test]
+async fn rolling_back_the_entity_key_rename_refuses_while_a_deletion_exists() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    exec(&db, "PRAGMA foreign_keys = ON;")
+        .await
+        .expect("enable foreign keys");
+    seed_admitted_registration_at_version_five(&db).await;
+    Migrator::up(&db, None).await.expect("apply the rename");
+    exec(
+        &db,
+        format!(
+            "INSERT INTO types_registry__operation \
+             (id, kind, dry_run, plane, tenant_id, principal_id, idempotency_key, \
+              idempotency_scope_hash, request_fingerprint, status, created_at) \
+             VALUES ({DELETION_OP_ID}, 2, 0, 1, NULL, {PRINCIPAL}, 'idem-del', \
+                     X'00', X'02', 1, '{TS}')"
+        ),
+    )
+    .await
+    .expect("insert a deletion operation");
+    exec(
+        &db,
+        format!(
+            "INSERT INTO types_registry__operation_item \
+             (operation_id, item_no, entity_key, dry_run, kind, expected_resource_version, status, \
+              request_payload, created_at) \
+             VALUES ({DELETION_OP_ID}, 0, '{GTS_TYPE}', 0, 2, 1, 1, 'null', '{TS}')"
+        ),
+    )
+    .await
+    .expect("insert its identifier-keyed item");
+    let applied = applied_migrations(&db).await;
+
+    let err = Migrator::down(&db, Some(1))
+        .await
+        .expect_err("down must refuse while a deletion operation exists");
+    assert!(
+        matches!(&err, sea_orm::DbErr::Migration(message) if message.contains("deletion")),
+        "{err:?}"
+    );
+    assert_eq!(applied_migrations(&db).await, applied);
+    assert!(
+        exec(&db, "SELECT gts_id FROM types_registry__operation_item")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        scalar_text(
+            &db,
+            "SELECT entity_key FROM types_registry__operation_item WHERE kind = 2"
+        )
+        .await
+        .expect("the deletion item is untouched"),
+        GTS_TYPE
+    );
 }

@@ -13,8 +13,8 @@
 // Control-plane system gears
 use api_gateway as _;
 use authn_resolver as _;
-use gear_orchestrator as _;
 use grpc_hub as _;
+use service_discovery as _;
 use types_registry as _;
 
 // === Plugins (selected via Cargo features; active vendor chosen by config) ===

@@ -22,6 +22,7 @@ from .conftest import (
     SUBJECT_TYPE,
     TOPIC_STREAM,
     TOPIC_STRICT,
+    TRACE_ID,
 )
 
 
@@ -94,7 +95,7 @@ async def test_schema_validation_failure_returns_400(api):
         "status": 400,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -117,7 +118,7 @@ async def test_rate_limited_returns_429(api):
         "status": 429,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
     assert "retry-after" in {k.lower() for k in resp.headers}
@@ -146,6 +147,6 @@ async def test_readonly_partition_rejected_returns_400(api):
         "status": 400,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }

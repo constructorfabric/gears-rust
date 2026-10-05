@@ -888,6 +888,34 @@ async fn validate_of_a_cascading_setting_carries_the_impact_the_change_would_hav
 }
 
 #[tokio::test]
+async fn validate_answers_without_the_impact_when_the_body_declines_it() {
+    let h = RestHarness::new().await;
+    let id = h.inner.declare("proxy", "cascading", json!(true)).await;
+    h.inner.set(id, h.inner.tree.root, json!(true)).await;
+
+    let answer = h
+        .send(
+            "POST",
+            &format!(
+                "/settings-service/v1/settings/{}/validate",
+                h.inner.key("proxy").to_string().replace('~', "%7E")
+            ),
+            Some(json!({ "value": false, "impact": false })),
+            None,
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert!(
+        answer.body.get("impact").is_none(),
+        "the type check alone: {}",
+        answer.body
+    );
+    assert_eq!(answer.body["valid"], json!(true));
+    assert_eq!(answer.body["effective"]["value"], json!(true));
+}
+
+#[tokio::test]
 async fn a_batch_entry_naming_an_undeclared_setting_is_rejected_alone() {
     let h = RestHarness::new().await;
     h.inner.declare("declared", "cascading", json!(true)).await;

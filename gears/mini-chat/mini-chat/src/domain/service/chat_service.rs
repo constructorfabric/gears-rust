@@ -430,14 +430,14 @@ fn validate_title(title: Option<&str>) -> Result<(), DomainError> {
     if let Some(t) = title {
         let trimmed = t.trim();
         if trimmed.is_empty() {
-            return Err(DomainError::validation(
-                "Title cannot be empty or whitespace-only",
-            ));
+            return Err(DomainError::InvalidTitle {
+                message: "Title cannot be empty or whitespace-only".to_owned(),
+            });
         }
         if trimmed.chars().count() > 255 {
-            return Err(DomainError::validation(
-                "Title must be 255 characters or fewer",
-            ));
+            return Err(DomainError::InvalidTitle {
+                message: "Title must be 255 characters or fewer".to_owned(),
+            });
         }
     }
     Ok(())

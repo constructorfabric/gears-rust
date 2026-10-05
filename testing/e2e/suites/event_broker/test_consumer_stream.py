@@ -32,6 +32,7 @@ from .conftest import (
     EVENT_TYPE_4P,
     MultipartReader,
     SseFrameReader,
+    TRACE_ID,
 )
 
 
@@ -286,7 +287,7 @@ async def test_positions_not_set_returns_409(api):
         "status": 409,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.subscription.v1~",
             "violations": [
@@ -316,7 +317,7 @@ async def test_unknown_subscription_returns_404(api):
         "status": 404,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.subscription.v1~",
             "resource_name": fake_sub_id,
@@ -369,7 +370,7 @@ async def test_stream_rejects_unknown_query_params(api):
         "status": 400,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -404,7 +405,7 @@ async def test_second_stream_on_same_subscription_returns_409(api, test_env):
         "status": 409,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.subscription.v1~",
             "violations": [

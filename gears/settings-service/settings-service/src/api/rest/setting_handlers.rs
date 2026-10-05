@@ -8,12 +8,9 @@ use axum::http::header;
 use axum::{Extension, Json};
 use serde::Deserialize;
 use settings_service_sdk::SettingKey;
-use settings_service_sdk::odata::SettingFilterField;
 use toolkit::api::canonical_prelude::*;
 use toolkit::api::odata::OData;
 use toolkit_odata::ODataQuery;
-use toolkit_odata::ast::{CompareOperator, Expr, Value as ODataValue};
-use toolkit_odata::filter::convert_expr_to_filter_node;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
@@ -21,6 +18,8 @@ use crate::api::authz::{self, resource};
 use crate::api::rest::setting_dto::{
     AuditRecordDto, EffectiveValueDto, SettingItemDto, render, render_flagged, render_record,
 };
+use crate::api::rest::setting_filter::interpret;
+pub(crate) use crate::api::rest::setting_filter::unsupported;
 use crate::domain::category::visibility;
 use crate::domain::error::DomainError;
 use crate::domain::resolution::{SUBTREE_BUDGET, ScopeTarget, subtree_too_large};
@@ -199,107 +198,6 @@ pub async fn get_setting(
     Ok(([(header::ETAG, super::etag_header(&etag))], Json(dto)))
     // @cpt-end:cpt-cf-settings-service-flow-value-resolution-source-trail:p1:inst-vr-trail-9
 }
-
-/// What a browse filter asks for, once interpreted.
-#[derive(Debug, Default)]
-struct BrowseFilter {
-    /// `needs_review eq true`: list flagged rows instead of resolving.
-    needs_review: bool,
-    /// `key in (…)` or `key eq …`: the named key set, for per-key outcomes.
-    keys: Option<Vec<String>>,
-    /// The remainder, which selects declarations: `category_id`, `key`.
-    declarations: Option<Expr>,
-}
-
-pub(crate) fn unsupported(message: impl Into<String>) -> DomainError {
-    DomainError::Validation {
-        field: "$filter".to_owned(),
-        code: field::ODATA_QUERY,
-        message: message.into(),
-    }
-}
-
-/// Interpret the browse filter.
-///
-/// Every field and operator is checked against the declared surface first, so
-/// an unmapped field or an unsupported operator is refused rather than
-/// ignored; then the expression is split into what selects declarations and
-/// the `needs_review` switch.
-fn interpret(filter: Option<&Expr>) -> Result<BrowseFilter, DomainError> {
-    // @cpt-begin:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-5
-    let Some(expr) = filter else {
-        return Ok(BrowseFilter::default());
-    };
-    convert_expr_to_filter_node::<SettingFilterField>(expr)
-        .map_err(|e| unsupported(e.to_string()))?;
-    let mut out = BrowseFilter::default();
-    out.declarations = split(expr, &mut out)?;
-    Ok(out)
-    // @cpt-end:cpt-cf-settings-service-flow-value-resolution-admin-browse:p1:inst-vr-browse-5
-}
-
-/// Split one conjunction: returns the declaration-selecting remainder.
-fn split(expr: &Expr, out: &mut BrowseFilter) -> Result<Option<Expr>, DomainError> {
-    match expr {
-        Expr::And(left, right) => {
-            let left = split(left, out)?;
-            let right = split(right, out)?;
-            Ok(match (left, right) {
-                (Some(l), Some(r)) => Some(Expr::And(Box::new(l), Box::new(r))),
-                (Some(one), None) | (None, Some(one)) => Some(one),
-                (None, None) => None,
-            })
-        }
-        Expr::Compare(left, CompareOperator::Eq, right) => match (&**left, &**right) {
-            (Expr::Identifier(name), ODataValueExpr(ODataValue::Bool(flag)))
-                if name.eq_ignore_ascii_case("needs_review") =>
-            {
-                if !flag {
-                    return Err(unsupported(
-                        "`needs_review eq false` is not a listing; omit the filter to browse",
-                    ));
-                }
-                out.needs_review = true;
-                Ok(None)
-            }
-            (Expr::Identifier(name), ODataValueExpr(ODataValue::String(key)))
-                if name.eq_ignore_ascii_case("key") =>
-            {
-                out.keys = Some(vec![key.clone()]);
-                Ok(Some(expr.clone()))
-            }
-            (Expr::Identifier(name), ODataValueExpr(ODataValue::Uuid(_)))
-                if name.eq_ignore_ascii_case("category_id") =>
-            {
-                Ok(Some(expr.clone()))
-            }
-            _ => Err(unsupported(
-                "only `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true` \
-                 are supported, joined by `and`",
-            )),
-        },
-        Expr::In(left, values) => match &**left {
-            Expr::Identifier(name) if name.eq_ignore_ascii_case("key") => {
-                let keys = values
-                    .iter()
-                    .filter_map(|v| match v {
-                        ODataValueExpr(ODataValue::String(s)) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                out.keys = Some(keys);
-                Ok(Some(expr.clone()))
-            }
-            _ => Err(unsupported("`in` is supported on `key` only")),
-        },
-        _ => Err(unsupported(
-            "only `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true` \
-             are supported, joined by `and`",
-        )),
-    }
-}
-
-use Expr::Value as ODataValueExpr;
 
 /// `GET /settings-service/v1/settings?tenant={tenant_id}` with `OData`
 /// `$filter`, `$orderby` and cursor pagination.

@@ -202,8 +202,6 @@ RESOURCE_ATTACHMENT = "cf.core.mini_chat.attachment.v1~"
 RESOURCE_MODEL = "cf.core.mini_chat.model.v1~"
 # `detail` of the 409 `aborted` turn conflicts (turn_conflict_detail in
 # src/api/rest/error.rs).
-DETAIL_TURN_ALREADY_RUNNING = "Another turn is running in this chat"
-DETAIL_REQUEST_ID_CONFLICT = "request_id is already used by another turn in this chat"
 
 # `$filter` / `$orderby` / `limit` / cursor errors (libs/toolkit-odata/src/errors.rs).
 RESOURCE_ODATA = "cf.core.odata.query.v1~"
@@ -238,7 +236,6 @@ def assert_problem(
     violation_type: str | None = None,
     violation_subject: str | None = None,
     resource_type: str | None = None,
-    detail: str | None = None,
 ) -> dict:
     """Assert `resp` is a canonical Problem of `category` (RFC 9457,
     `Content-Type: application/problem+json`) and return its body.
@@ -251,7 +248,9 @@ def assert_problem(
       resource_exhausted: subject only).
     - `resource_type`: `context.resource_type` ends with this value (use the
       `RESOURCE_*` constants).
-    - `detail`: the exact `detail`.
+
+    `detail` is human-readable and not part of the contract, so it is not
+    asserted.
     """
     assert resp.status_code == status, (
         f"expected HTTP {status}, got {resp.status_code}: {resp.text[:500]}"
@@ -269,8 +268,6 @@ def assert_problem(
     assert body["type"].endswith(suffix), (
         f"expected Problem type ending with {suffix!r}, got {body['type']!r}"
     )
-    if detail is not None:
-        assert body["detail"] == detail, f"expected detail {detail!r}: {body}"
     ctx = body["context"]
     if reason is not None:
         assert ctx.get("reason") == reason, (

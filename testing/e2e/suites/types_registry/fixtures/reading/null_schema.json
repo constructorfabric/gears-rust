@@ -1,0 +1,8 @@
+{
+  "gts_id": "gts.cf.e2e.reading.null_value.v1~",
+  "content": {
+    "$id": "gts://gts.cf.e2e.reading.null_value.v1~",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "null"
+  }
+}

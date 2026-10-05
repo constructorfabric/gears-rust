@@ -18,7 +18,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::resolution::TenantHierarchy;
+use crate::domain::resolution::{Subtree, TenantHierarchy};
 
 /// The adapter.
 pub struct HubTenantHierarchy {
@@ -102,11 +102,7 @@ impl TenantHierarchy for HubTenantHierarchy {
             .map_err(map)
     }
 
-    async fn descendants_bfs(
-        &self,
-        tenant: Uuid,
-        budget: usize,
-    ) -> Result<(Vec<Uuid>, bool), DomainError> {
+    async fn subtree(&self, tenant: Uuid, budget: usize) -> Result<Subtree, DomainError> {
         let client = self.client()?;
         // Bounded on the request as far as the SDK allows — by depth. There is
         // no count and no cursor on `get_descendants`, so a wide tree still
@@ -135,7 +131,11 @@ impl TenantHierarchy for HubTenantHierarchy {
                 children.entry(parent.0).or_default().push(r.id.0);
             }
         }
+        // The link each descendant was reached through is kept with the
+        // order: a walk over the whole subtree reads every descendant's chain
+        // off it instead of asking the resolver again per node.
         let mut order = Vec::new();
+        let mut parent = std::collections::HashMap::new();
         let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::from([tenant]);
         let mut queue = std::collections::VecDeque::from([(tenant, 0_u32)]);
         let mut truncated = false;
@@ -149,6 +149,7 @@ impl TenantHierarchy for HubTenantHierarchy {
                     break 'walk;
                 }
                 order.push(*child);
+                parent.insert(*child, next);
                 // A node at the ceiling was answered without its children: what
                 // lies below is unknown, and the walk says so.
                 if depth + 1 >= SUBTREE_DEPTH_CEILING {
@@ -158,7 +159,11 @@ impl TenantHierarchy for HubTenantHierarchy {
                 }
             }
         }
-        Ok((order, truncated))
+        Ok(Subtree {
+            order,
+            parent,
+            truncated,
+        })
     }
 }
 

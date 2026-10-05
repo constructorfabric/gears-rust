@@ -76,19 +76,19 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 
 **Error Scenarios**:
 - `q` shorter than two characters after trimming, or longer than two hundred
-- An OData `$filter`, `$orderby` or `$select`, which the resource does not take
+- An OData `$filter` outside browse's grammar, or `$orderby` or `$select`, which the resource does not take
 - The target outside the caller's subtree, or a standalone descendant
 - A cursor minted for a different query, target or corpus
 - The target's subtree exceeds the subtree budget, or the page's matching overrides exceed the override bound: refused with the bound named, never answered incomplete
 
 **Steps**:
-1. [x] - `p2` - Actor sends GET /settings-service/v1/search with `q`, optional `tenant`, `limit` and `cursor`; **IF** `q` trimmed is shorter than two characters or longer than two hundred → **RETURN** `400`, since below two characters every row matches and above two hundred a trigram scan stops being cheap - `inst-sd-search-1`
+1. [x] - `p2` - Actor sends GET /settings-service/v1/search with `q`, optional `tenant`, `limit`, `cursor` and `$filter`; **IF** `$orderby` or `$select` is present → **RETURN** `400`; the filter is read by the code browse reads it with — `category_id` and `key` select declarations, `needs_review eq true` narrows the corpus to settings with a flagged override — and one outside the grammar → **RETURN** `400`; **IF** `q` trimmed is shorter than two characters or longer than two hundred → **RETURN** `400`, since below two characters every row matches and above two hundred a trigram scan stops being cheap - `inst-sd-search-1`
 2. [x] - `p2` - Authorize `read` on the value resource once for the request; its constraints are the secure scope of the declarations query, so a setting the caller may not read is absent from the results and from the count - `inst-sd-search-2`
 3. [x] - `p2` - Confirm the target is the caller's own tenant or a descendant that is not standalone; **IF** not → **RETURN** `403` - `inst-sd-search-3`
 4. [x] - `p2` - Bound the override corpus to the target and its non-standalone descendants, obtained from the tenant resolver under the shared subtree budget; **IF** the budget cuts the subtree → **RETURN** `400` naming the bound, since a silently incomplete corpus would hide overrides: an override the caller could not read is never matched - `inst-sd-search-4`
 5. [x] - `p2` - Decide the classification corpus once, before any match: `public`, and `pii` only for a caller holding `read_unmasked` on the value resource; `secret` never - `inst-sd-search-5`
-6. [x] - `p2` - Bind the pagination cursor to the query text, the target and the corpus, so a cursor minted for one search is refused for another - `inst-sd-search-6`
-7. [x] - `p2` - DB: SELECT a page of active declarations, ordered by key, that match on key, description, the name of their category, their Schema Default within the corpus, or an override set at one of the bounded tenants within the corpus; domain visibility and the secure scope apply in the same query - `inst-sd-search-7`
+6. [x] - `p2` - Bind the pagination cursor to the query text, the target, the corpus and the parsed filter, so a cursor minted for one search is refused for another — a cursor minted under one filter would otherwise page on under another - `inst-sd-search-6`
+7. [x] - `p2` - DB: SELECT a page of active declarations, ordered by key, that match on key, description, the name of their category, their Schema Default within the corpus, or an override set at one of the bounded tenants within the corpus, narrowed by the filter's declaration selectors and, under `needs_review eq true`, to declarations with a flagged override at one of the bounded tenants — in the query, never over a page already cut; domain visibility and the secure scope apply in the same query - `inst-sd-search-7`
 8. [x] - `p2` - DB: SELECT the overrides of the page's declarations at the bounded tenants whose text projection matches, within the corpus and never a secret row, one row past the override bound; **IF** more than the bound matched → **RETURN** `400` naming the bound, so a page is never cut short of its hits - `inst-sd-search-8`
 9. [x] - `p2` - Attribute each declaration-level match to the first field that matched — key, description, category name, Schema Default — and emit one hit per matching override naming the tenant and scope where it is set - `inst-sd-search-9`
 10. [x] - `p2` - Exclude every hit whose declaration is `hidden` for the caller, silently, exactly as browse excludes it — in the page query, on the caller's root-to-self chain, so the page is cut after the exclusion and comes back full - `inst-sd-search-10`
@@ -146,7 +146,7 @@ No stateful entity: search reads and stores nothing.
 
 - [x] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-surface`
 
-`GET /settings-service/v1/search` **MUST** be served authenticated, take `q`, `tenant`, `limit` and `cursor`, refuse OData options, and answer a cursor-paginated flat list of hits under the same authorization, target, visibility and `hidden` rules as browsing. Both fan-outs **MUST** be bounded — the corpus by the subtree budget, a page by the override bound — and a request past either **MUST** be refused with the bound named rather than answered incomplete.
+`GET /settings-service/v1/search` **MUST** be served authenticated, take `q`, `tenant`, `limit`, `cursor` and an OData `$filter` in the grammar `GET /settings` takes — `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`, read by the same code — applied in the page query so the cursor pages the filtered set, with `needs_review eq true` narrowing to settings that carry an override flagged for review in the target's subtree; **MUST** refuse `$orderby` and `$select`; and answer a cursor-paginated flat list of hits under the same authorization, target, visibility and `hidden` rules as browsing. Both fan-outs **MUST** be bounded — the corpus by the subtree budget, a page by the override bound — and a request past either **MUST** be refused with the bound named rather than answered incomplete.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-search-discoverability-search`
@@ -207,6 +207,8 @@ On PostgreSQL the predicates **MUST** use `ILIKE` over the exact indexed express
 - [x] A declaration `hidden` for the caller is absent from the results, and the page is still full: the exclusion happens before the page is cut, not after
 - [x] A search whose target subtree exceeds the subtree budget, or whose page would carry more matching overrides than the override bound, is refused `400` naming the bound
 - [x] `q` of one character, or of two hundred and one, is refused `400` on field `q`
-- [x] `$filter`, `$orderby` or `$select` on the resource is refused `400`
+- [x] `$filter` in browse's grammar narrows the search in the query: a filtered search reaches matches beyond its first page, every page holds only the filtered set, and the cursor follows it to its end without a repeat or a gap; `needs_review eq true` keeps the settings with a flagged override, `category_id eq`, `key eq` and `key in (...)` select declarations, and a conjunction narrows further
+- [x] A `$filter` outside the grammar — an unmapped field, `needs_review eq false` — is refused `400` with the refusal browse gives, and `$orderby` or `$select` is refused `400`
+- [x] A cursor minted under one filter is refused under another, and a filtered search hides what an unfiltered one hides
 - [x] A page holds at most `limit` settings, ordered by key, and the cursor continues from the last one; a cursor from a different needle, target or corpus is refused
 - [x] Every hit carries its declaration's `mode`, and no hit is withheld by it

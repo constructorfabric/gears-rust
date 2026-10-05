@@ -67,7 +67,10 @@ The `#[toolkit::rest_contract]` macro now emits, inside each generated client me
 (`otel.kind = "client"`, `rpc.system`, `rpc.service`, `rpc.method`, `http.method`, `http.route`,
 `error`), entered across the awaited dispatch. Because the span is `Context::current()` at send time,
 `toolkit-http`'s `OtelLayer` injects **this span's** W3C `traceparent`, so `trace_id`/`span_id`
-propagate downstream automatically. `request_id == trace_id` by the existing platform convention.
+propagate downstream automatically. The binding introduces no request-id of its own: a client→server
+call is correlated by its `trace_id`, and the platform's `x-request-id` (the gateway's per-request
+id, used by the access log, audit records, and response headers) is a *distinct* identifier the
+client neither reads nor forwards.
 
 The span path is routed through a `#[doc(hidden)] pub use tracing as __tracing;` re-export in
 `toolkit-contract`, so SDK crates need no direct `tracing` dependency.
@@ -127,4 +130,5 @@ rewritten to match.
 - `tracing` re-export: `libs/toolkit-contract/src/lib.rs` (`__tracing`)
 - Transport span + `traceparent` injection: `libs/toolkit-http/src/layers/otel.rs`,
   `libs/toolkit-http/src/otel.rs`
-- Server-side `request_id`/`trace_id` derivation: `libs/toolkit/src/api/canonical_error_layer.rs`
+- Server-side `request_id`/`trace_id` derivation: `libs/toolkit-trace-context/src/lib.rs`
+  (`extract_trace_id`, re-exported as `toolkit::api::extract_trace_id`)

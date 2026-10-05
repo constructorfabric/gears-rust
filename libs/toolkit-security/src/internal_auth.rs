@@ -371,7 +371,7 @@ mod tests {
     fn platform_security_context_roundtrips_serde() {
         let ctx = PlatformSecurityContext::new(PlatformIdentity::KubernetesServiceAccount {
             namespace: "toolkit".to_owned(),
-            service_account: "directory-service".to_owned(),
+            service_account: "service-discovery".to_owned(),
             pod: None,
         });
         let json = serde_json::to_string(&ctx).unwrap();

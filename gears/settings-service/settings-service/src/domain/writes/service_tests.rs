@@ -2,10 +2,12 @@
 //! The write path over the resolution harness: gates, commit, fallthrough.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use settings_service_sdk::EffectiveSource;
+use toolkit_db::test_support::QueryRecorder;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
@@ -14,11 +16,12 @@ use std::sync::atomic::Ordering;
 use super::{
     Change, Committed, Gated, StagePrecondition, Staged, StepUpPolicy, ValueWriter, WriteActor,
 };
+use super::{ImpactPage, ImpactReport};
 use crate::audit::{AuditOperation, AuditValue};
 use crate::domain::access::{AccessRepository, RestrictionDraft, TenantAccess};
 use crate::domain::error::DomainError;
 use crate::domain::ports::{NoMetrics, NoSecretManager, SecretManager, ValueEvent};
-use crate::domain::resolution::{ScopeTarget, scope_class};
+use crate::domain::resolution::{ScopeTarget, TenantHierarchy, scope_class};
 use crate::domain::stepup::{StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
 use crate::domain::value::ValueRepository;
 use crate::infra::storage::access_repo::AccessRepo;
@@ -27,8 +30,8 @@ use crate::infra::storage::pending_secret_repo::PendingSecretRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 use crate::infra::type_validator::GtsTypeValidator;
 use crate::test_support::{
-    FixedStepUp, RecordingAudit, RecordingPublisher, RecordingSecrets, ResolutionHarness, SECRET,
-    resolution_catalogue,
+    FakeHierarchy, FixedStepUp, RecordingAudit, RecordingPublisher, RecordingSecrets,
+    ResolutionHarness, SECRET, resolution_catalogue,
 };
 
 type Writer =
@@ -65,11 +68,41 @@ impl WriteHarness {
         (harness, secrets)
     }
 
+    /// A harness whose database records every statement.
+    async fn recorded() -> (Self, QueryRecorder) {
+        let (base, recorder) = ResolutionHarness::recorded().await;
+        let harness = Self::over(
+            base,
+            Arc::new(FixedStepUp::refusing(StepUpRefusal::NotConfigured)),
+            Arc::new(NoSecretManager),
+            None,
+        );
+        (harness, recorder)
+    }
+
+    /// A harness whose impact walk gives up after `budget`.
+    async fn hurried(budget: Duration) -> Self {
+        Self::over(
+            ResolutionHarness::new().await,
+            Arc::new(FixedStepUp::refusing(StepUpRefusal::NotConfigured)),
+            Arc::new(NoSecretManager),
+            Some(budget),
+        )
+    }
+
     async fn build(step_up: Arc<dyn StepUpVerifier>, secrets: Arc<dyn SecretManager>) -> Self {
-        let base = ResolutionHarness::new().await;
+        Self::over(ResolutionHarness::new().await, step_up, secrets, None)
+    }
+
+    fn over(
+        base: ResolutionHarness,
+        step_up: Arc<dyn StepUpVerifier>,
+        secrets: Arc<dyn SecretManager>,
+        impact_budget: Option<Duration>,
+    ) -> Self {
         let audit = Arc::new(RecordingAudit::default());
         let published = Arc::new(RecordingPublisher::default());
-        let writer = Arc::new(ValueWriter::new(
+        let mut writer = ValueWriter::new(
             ValueRepo,
             Arc::clone(&base.resolver),
             Arc::new(GtsTypeValidator::new(resolution_catalogue())),
@@ -79,7 +112,11 @@ impl WriteHarness {
             PendingSecretRepo,
             Arc::clone(&published) as Arc<dyn crate::domain::ports::ChangePublisher>,
             Arc::new(NoMetrics),
-        ));
+        );
+        if let Some(budget) = impact_budget {
+            writer = writer.with_impact_budget(budget);
+        }
+        let writer = Arc::new(writer);
         Self {
             base,
             writer,
@@ -1676,4 +1713,266 @@ async fn a_rejection_event_names_the_field_and_code_of_a_validation_failure_and_
         }
         other => panic!("one rejection event expected, got {other:?}"),
     }
+}
+
+/// Grow `count` tenants below `under`, breadth first, `width` children each:
+/// a tree, not a chain, so the node count grows while the depth stays small.
+fn grow(hierarchy: &FakeHierarchy, under: Uuid, count: usize, width: usize) -> Vec<Uuid> {
+    let mut grown = Vec::with_capacity(count);
+    let mut frontier = vec![under];
+    while grown.len() < count {
+        let mut next = Vec::new();
+        for parent in &frontier {
+            for _ in 0..width {
+                if grown.len() == count {
+                    break;
+                }
+                let id = Uuid::new_v4();
+                hierarchy.add_tenant(id, *parent);
+                grown.push(id);
+                next.push(id);
+            }
+        }
+        frontier = next;
+    }
+    grown
+}
+
+#[tokio::test]
+async fn the_impact_walk_asks_the_resolver_and_the_database_a_fixed_number_of_times() {
+    // The regression that matters: a walk that resolved each descendant on
+    // its own cost a tenant-resolver call and two queries per node, so a
+    // subtree of a thousand tenants took seconds. The round trips are pinned
+    // as counts — one chain, one subtree, one set query — and stay the same
+    // when the subtree doubles.
+    let (h, recorder) = WriteHarness::recorded().await;
+    let d = h
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.base.tree;
+    let conn = h.base.db.conn().expect("connection");
+    let declaration = h
+        .base
+        .resolver
+        .find_declaration(&conn, &h.base.key("strict"))
+        .await
+        .expect("lookup")
+        .expect("declared");
+    // Twenty more children of `a`, their four hundred, and eighty under the
+    // first four grandchildren. The first child's row shields its subtree —
+    // itself, twenty, eighty: a hundred and one; the second child's flagged
+    // row shields nothing, so it and its twenty fall through and change.
+    let grown = grow(&h.base.hierarchy, t.a, 500, 20);
+    let shield = grown[0];
+    let mut shielded = h
+        .base
+        .hierarchy
+        .subtree(shield, ImpactReport::NODE_BUDGET)
+        .await
+        .expect("subtree")
+        .order;
+    shielded.push(shield);
+    assert_eq!(shielded.len(), 101, "the shape the walk is measured on");
+    h.base.set(d, shield, json!(false)).await;
+    h.base.set_flagged(d, grown[1], json!("bad")).await;
+
+    let walk = |recorder: &QueryRecorder| {
+        recorder.clear();
+        (
+            h.base.hierarchy.chain_calls(),
+            h.base.hierarchy.subtree_calls(),
+        )
+    };
+    let before = walk(&recorder);
+    let report = h
+        .writer
+        .impact(
+            &conn,
+            &declaration,
+            ScopeTarget::Tenant(t.a),
+            &json!(true),
+            None,
+        )
+        .await
+        .expect("walks");
+    let asked = (
+        h.base.hierarchy.chain_calls() - before.0,
+        h.base.hierarchy.subtree_calls() - before.1,
+        recorder.total(),
+    );
+    assert_eq!(
+        asked,
+        (1, 1, 1),
+        "the target's chain, the subtree, one set query over both"
+    );
+    // `b` and the five hundred grown, less the shielded hundred and one; `s`
+    // is standalone and never scanned.
+    assert_eq!((report.scanned, report.total_changed), (501, 400));
+    assert_eq!(report.changed.len(), ImpactReport::DEFAULT_LIMIT);
+    assert!(
+        report.truncated,
+        "the page cut the list; the budget did not"
+    );
+    assert!(
+        report
+            .changed
+            .iter()
+            .all(|e| !shielded.contains(&e.tenant_id) && e.tenant_id != t.s),
+        "{report:?}"
+    );
+    assert!(
+        report.changed.iter().all(|e| e.current == json!(false)),
+        "every listed descendant inherits the Schema Default today"
+    );
+
+    // Twice the tree, the same three round trips.
+    grow(&h.base.hierarchy, t.a, 500, 20);
+    let before = walk(&recorder);
+    let doubled = h
+        .writer
+        .impact(
+            &conn,
+            &declaration,
+            ScopeTarget::Tenant(t.a),
+            &json!(true),
+            None,
+        )
+        .await
+        .expect("walks");
+    assert_eq!(
+        (
+            h.base.hierarchy.chain_calls() - before.0,
+            h.base.hierarchy.subtree_calls() - before.1,
+            recorder.total(),
+        ),
+        asked
+    );
+    assert_eq!((doubled.scanned, doubled.total_changed), (1001, 900));
+
+    // `validate` carries exactly this report.
+    let validated = h
+        .writer
+        .validate(
+            &conn,
+            &declaration,
+            ScopeTarget::Tenant(t.a),
+            &json!(true),
+            ImpactPage::Of(None),
+        )
+        .await
+        .expect("validates");
+    assert_eq!(validated.impact, Some(doubled));
+    assert!(validated.violations.is_empty());
+}
+
+#[tokio::test]
+async fn a_walk_the_resolver_never_answers_is_cut_by_the_time_budget() {
+    // The node budget bounds what is examined, not how long a dependency may
+    // take: a tenant resolver that stops answering used to hold `validate`
+    // for as long as it liked. The walk is cut at its time budget and says
+    // so — nothing scanned, truncated — and the type check answers.
+    let h = WriteHarness::hurried(Duration::from_millis(25)).await;
+    h.declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let conn = h.base.db.conn().expect("connection");
+    let declaration = h
+        .base
+        .resolver
+        .find_declaration(&conn, &h.base.key("strict"))
+        .await
+        .expect("lookup")
+        .expect("declared");
+    h.base
+        .hierarchy
+        .stall_subtrees
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let report = h
+        .writer
+        .impact(
+            &conn,
+            &declaration,
+            ScopeTarget::Platform,
+            &json!(true),
+            None,
+        )
+        .await
+        .expect("answers");
+    assert_eq!(
+        report,
+        ImpactReport {
+            changed: Vec::new(),
+            total_changed: 0,
+            scanned: 0,
+            truncated: true,
+        }
+    );
+    let validated = h
+        .writer
+        .validate(
+            &conn,
+            &declaration,
+            ScopeTarget::Platform,
+            &json!(true),
+            ImpactPage::Of(None),
+        )
+        .await
+        .expect("answers");
+    assert!(
+        validated
+            .impact
+            .as_ref()
+            .is_some_and(|impact| impact.truncated && impact.scanned == 0),
+        "{:?}",
+        validated.impact
+    );
+    assert!(validated.violations.is_empty());
+    assert_eq!(validated.effective.value, json!(false));
+}
+
+#[tokio::test]
+async fn validate_skips_the_impact_walk_when_the_caller_says_so() {
+    // A client that fetches the report through `impact` on its own time asks
+    // for the type check alone: no report, and no walk behind it.
+    let h = WriteHarness::new().await;
+    h.declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let conn = h.base.db.conn().expect("connection");
+    let declaration = h
+        .base
+        .resolver
+        .find_declaration(&conn, &h.base.key("strict"))
+        .await
+        .expect("lookup")
+        .expect("declared");
+    let walks = h.base.hierarchy.subtree_calls();
+
+    let report = h
+        .writer
+        .validate(
+            &conn,
+            &declaration,
+            ScopeTarget::Platform,
+            &json!(true),
+            ImpactPage::Skipped,
+        )
+        .await
+        .expect("answers");
+    assert!(report.impact.is_none());
+    assert!(report.violations.is_empty());
+    assert_eq!(h.base.hierarchy.subtree_calls(), walks, "no walk was made");
+
+    let carried = h
+        .writer
+        .validate(
+            &conn,
+            &declaration,
+            ScopeTarget::Platform,
+            &json!(true),
+            ImpactPage::Of(Some(1)),
+        )
+        .await
+        .expect("answers");
+    assert!(carried.impact.is_some());
+    assert_eq!(h.base.hierarchy.subtree_calls(), walks + 1);
 }

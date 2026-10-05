@@ -807,10 +807,14 @@ therefore happens automatically via `Context::current()` — no manual threading
 The span code is routed through a `#[doc(hidden)] pub use tracing as __tracing;` re-export in
 `toolkit-contract`, so SDK crates need no direct `tracing` dependency.
 
-**`request_id`.** By convention `request_id == trace_id` (the W3C `traceparent` 32-hex trace-id). The
-server-side error envelope already derives it via the fallback chain
-`traceparent → x-trace-id → x-request-id → span-id` (`libs/toolkit/src/api/canonical_error_layer.rs`).
-No separate request-context type is introduced.
+**`request_id`.** The binding introduces no request-id of its own: a client→server call is correlated
+by its `trace_id` (the W3C `traceparent` 32-hex trace-id), propagated automatically via `traceparent`
+(above). The server-side error envelope derives that `trace_id` from the live `OTel` span context,
+falling back to the inbound W3C `traceparent` (`toolkit::api::extract_trace_id`, in
+`libs/toolkit-trace-context/src/lib.rs`). This is **distinct** from the platform's `x-request-id` —
+the gateway's per-request id, used by the access log, audit records, and response headers — which the
+client neither reads nor forwards; the two are different identifiers with different owners and
+lifetimes. No separate request-context type is introduced.
 
 **Metrics.** RED metrics (`http.client.request.duration`, labeled by `client_type` = the projection
 trait name) are **feature-gated on `otel`**. The `toolkit-contract` `otel` feature forwards

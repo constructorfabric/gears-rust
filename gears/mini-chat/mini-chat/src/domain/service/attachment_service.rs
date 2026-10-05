@@ -1363,9 +1363,7 @@ impl<
                 .filter(|p| *p != AttachmentPurpose::CodeInterpreter)
                 .collect();
             if filtered.is_empty() {
-                return Err(DomainError::validation(
-                    "Code interpreter is currently unavailable",
-                ));
+                return Err(DomainError::CodeInterpreterUnavailable);
             }
             tracing::debug!(
                 %filename,

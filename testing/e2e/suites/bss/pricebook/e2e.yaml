@@ -1,0 +1,31 @@
+suite: bss-pricebook
+# `bss-pricing` links `bss-products` (apps/cf-gears-example-server/Cargo.toml), so
+# one binary carries both gears and pricing reserves SKU references in products
+# in-process. The rest is the ledger suite's static plugin set; pricing declares
+# an `account_management` dependency, so that gear comes along too.
+# A usage SKU needs a usage-type catalog to publish. Products links the usage
+# collector, so the collector is its catalog, and this binary links no collector
+# storage plugin: the flow's usage variant skips with the collector's answer and
+# the recurring variant carries the flow (see test_pricebook_flow.py).
+features:
+  - bss-pricing
+  - bss-approvals
+  - account-management
+  - static-idp
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: e2e-launcher
+config_gears:
+  - bss-products
+  - bss-pricing
+  - bss-approvals
+  - account-management
+  # Linked through account-management; it boots only with its database block.
+  - resource-group
+  - static-idp-plugin
+env:
+  # An isolated data root. The shared config's `~/.cf-gears` may hold a
+  # pre-PriceBook `bss_pricing.db` whose legacy tables break the new chain at
+  # boot, and a test run must never write to a developer's data root.
+  APP__SERVER__HOME_DIR: "{root}/target/e2e-home-{suite_key}"

@@ -42,7 +42,7 @@ env:
   # passed through to `make shear` below so the toolchain this job installs and
   # caches is provably the one that compiles. The Makefile's RUST_NIGHTLY
   # default only covers local runs.
-  RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-04-16
+  RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-08-21
   # Notified in the issue body when the nightly fails. A username or team;
   # empty still files the issue, but nothing would actively alert anyone.
   SHEAR_ISSUE_MENTION: '@MikeFalcon77'

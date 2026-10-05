@@ -1,7 +1,7 @@
 # CF/Gears Flight Control configuration (static-authn default).
 #
 # Tailored to the minimal `apps/cf-gears-flight-control` composition: the control-plane
-# system gears (gear-orchestrator, types-registry, api-gateway, grpc-hub) +
+# system gears (service-discovery, types-registry, api-gateway, grpc-hub) +
 # embedded authn-resolver, wired with the static/dev authn plugin so it boots
 # with zero external dependencies. The AuthZ plane (authz-resolver,
 # tenant-resolver, resource-group) runs as its own OoP unit and is configured
@@ -43,7 +43,7 @@ gears:
       auth_disabled: false
       require_auth_by_default: true
 
-  gear-orchestrator:
+  service-discovery:
     config: {}
 
   grpc-hub:

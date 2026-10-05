@@ -3,6 +3,7 @@
 mod cursor;
 pub mod dto;
 pub mod error;
+mod etag;
 pub mod handlers;
 mod params;
 mod paths;

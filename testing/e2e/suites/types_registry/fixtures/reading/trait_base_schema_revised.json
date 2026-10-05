@@ -1,0 +1,43 @@
+{
+  "gts_id": "gts.cf.e2e.reading.record.v1~",
+  "content": {
+    "$id": "gts://gts.cf.e2e.reading.record.v1~",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "payload": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "name",
+      "payload"
+    ],
+    "x-gts-traits-schema": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "enum": [
+            "internal",
+            "public"
+          ]
+        }
+      },
+      "required": [
+        "category"
+      ],
+      "additionalProperties": false
+    },
+    "x-gts-traits": {
+      "category": "internal"
+    },
+    "additionalProperties": false,
+    "title": "Revised Record"
+  },
+  "expected_resource_version": 1
+}

@@ -29,7 +29,7 @@ use crate::api::rest::value_dto::{
 use crate::domain::category::{DomainVisibility, domain_visibility};
 use crate::domain::error::DomainError;
 use crate::domain::validation::guards;
-use crate::domain::writes::{Change, WriteActor};
+use crate::domain::writes::{Change, ImpactPage, WriteActor};
 use crate::field;
 use crate::infra::value_writes::{
     BATCH_LIMIT, BatchChange, RefusedEntry, WriteCoordinator, batch_too_large,
@@ -48,11 +48,6 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-fn request_id(headers: &HeaderMap) -> String {
-    toolkit::api::error_layer::extract_trace_id(headers)
-        .unwrap_or_else(|| Uuid::new_v4().to_string())
-}
-
 pub(crate) fn actor(
     ctx: &SecurityContext,
     headers: &HeaderMap,
@@ -67,7 +62,7 @@ pub(crate) fn actor(
         .or_else(|| ctx.bearer_token().cloned());
     WriteActor {
         ctx: ctx.clone(),
-        request_id: request_id(headers),
+        request_id: super::audit_request_id(headers),
         step_up_token,
         visibility,
     }
@@ -467,14 +462,13 @@ pub async fn validate_value(
     let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-2
     let actor = actor(&ctx, &headers, domain_visibility(&scope));
+    let page = if body.impact == Some(false) {
+        ImpactPage::Skipped
+    } else {
+        ImpactPage::Of(body.limit)
+    };
     let report = writes
-        .validate(
-            &actor,
-            &key,
-            tenant,
-            &checked_value(&body.value)?,
-            body.limit,
-        )
+        .validate(&actor, &key, tenant, &checked_value(&body.value)?, page)
         .await?;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-validate:p1:inst-vw-val-8
     let pii = may_read_pii(&enforcer, &ctx).await;

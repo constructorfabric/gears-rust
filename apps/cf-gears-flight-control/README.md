@@ -27,7 +27,7 @@ profiles) and the DESIGN "Flight Control Composition" section.
 
 ## What it links
 
-- `gear-orchestrator` — hosts the `DirectoryService` that OoP gears register with.
+- `service-discovery` — hosts the `DirectoryService` that OoP gears register with.
 - `grpc-hub` — the gRPC transport surface for the directory and platform-plane RPCs.
 - `api-gateway` — the built-in edge and REST host; reverse-proxies `exposed` OoP
   routes it discovers via the directory (see ADR-0003, gateway abstraction), and

@@ -18,6 +18,7 @@ use toolkit_odata::{
 use toolkit_odata::filter::FieldKind;
 
 use crate::odata::LimitCfg;
+use crate::odata::sea_orm_filter::escaped_like;
 use crate::secure::{DBRunner, DBRunnerInternal, SeaOrmRunner};
 
 /// Type alias for cursor extraction function to reduce type complexity
@@ -545,21 +546,21 @@ where
                         .get(name)
                         .ok_or_else(|| ODataBuildError::UnknownField(name.clone()))?;
                     ensure_string_field(f, name)?;
-                    Condition::all().add(Expr::col(f.col).like(like_contains(s)))
+                    Condition::all().add(Expr::col(f.col).like(escaped_like(like_contains(s))))
                 }
                 ("startswith", [X::Identifier(name), X::Value(core::Value::String(s))]) => {
                     let f = fmap
                         .get(name)
                         .ok_or_else(|| ODataBuildError::UnknownField(name.clone()))?;
                     ensure_string_field(f, name)?;
-                    Condition::all().add(Expr::col(f.col).like(like_starts(s)))
+                    Condition::all().add(Expr::col(f.col).like(escaped_like(like_starts(s))))
                 }
                 ("endswith", [X::Identifier(name), X::Value(core::Value::String(s))]) => {
                     let f = fmap
                         .get(name)
                         .ok_or_else(|| ODataBuildError::UnknownField(name.clone()))?;
                     ensure_string_field(f, name)?;
-                    Condition::all().add(Expr::col(f.col).like(like_ends(s)))
+                    Condition::all().add(Expr::col(f.col).like(escaped_like(like_ends(s))))
                 }
                 _ => return Err(ODataBuildError::UnsupportedFn(fname.clone())),
             }

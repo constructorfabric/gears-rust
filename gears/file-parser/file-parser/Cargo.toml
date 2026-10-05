@@ -15,6 +15,12 @@ metadata.docs.rs.all-features = true
 [lib]
 name = "file_parser"
 
+# `ort` is never named in code: it is a direct dep only to select the features
+# `magika`'s copy builds with (`load-dynamic`, and `api-24`, which this rc needs
+# to compile — see the workspace `ort` entry).
+[package.metadata.cargo-shear]
+ignored = ["ort"]
+
 [lints]
 workspace = true
 

@@ -1,0 +1,32 @@
+[package]
+name = "cf-gears-toolkit-onnx-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ToolKit ONNX Runtime support: one pinned `ort`, a session opened on an abandonable thread under a deadline, and inference that does not stall the async runtime"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "cf-gears-toolkit", "onnx"]
+categories = ["development-tools"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "toolkit_onnx_runtime"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The runtime is resolved by `dlopen` at first use (`ORT_DYLIB_PATH`): building
+# needs no ONNX Runtime headers, running needs the shared library. The pin and
+# its features are the workspace's (see the root manifest for why `api-24` and
+# the exact rc are load-bearing).
+ort = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

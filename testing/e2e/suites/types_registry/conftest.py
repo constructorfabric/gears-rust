@@ -9,20 +9,24 @@ import uuid
 import httpx
 import pytest
 
+from .helpers import RECEIPT, TRACEPARENT, assert_operation, submit_and_poll
+
 
 SCENARIO_TESTS = pytest.StashKey[dict[str, list[str]]]()
 
 
 @pytest.fixture
 def registry_api_path():
-    """T24a changes this default to v1; there is intentionally no fallback."""
+    """Use the configured API version without an automatic fallback."""
     return f"types-registry/{os.getenv('TYPES_REGISTRY_API_VERSION', 'v2')}"
 
 
 @pytest.fixture
 async def registry_http(base_url, auth_headers):
     async with httpx.AsyncClient(
-        base_url=base_url.rstrip("/") + "/", headers=auth_headers, timeout=3.0
+        base_url=base_url.rstrip("/") + "/",
+        headers={**auth_headers, "traceparent": TRACEPARENT},
+        timeout=3.0,
     ) as client:
         yield client
 
@@ -62,6 +66,62 @@ def registration_fixture():
 def deletion_fixture():
     """Load the files linked from scenarios/deletion.md."""
     return _topic_loader("deletion")
+
+
+@pytest.fixture
+def discovery_fixture():
+    """Load the inheritance trees linked from scenarios/discovery.md."""
+    return _topic_loader("discovery")
+
+
+@pytest.fixture
+def neighbour_discovery_fixture():
+    """The same trees in a second namespace, which a target pattern must exclude."""
+    return _topic_loader("discovery")
+
+
+@pytest.fixture
+def reading_fixture():
+    """Load authored documents and expected artifacts for read scenarios."""
+    return _topic_loader("reading")
+
+
+@pytest.fixture
+def given_registered(registry_http, registry_api_path):
+    """Register prerequisites and prove that every one of them committed.
+
+    The whole operation is compared, so a missing outcome fails the setup
+    instead of leaving an exclusion test with nothing to exclude.
+    """
+
+    async def register(*items):
+        operation = await submit_and_poll(
+            registry_http, registry_api_path, list(items), RECEIPT
+        )
+        assert_operation(
+            operation,
+            {
+                "operation_id": "<operation_id>",
+                "kind": "registration",
+                "dry_run": False,
+                "status": "completed",
+                "created_at": "<created_at>",
+                "started_at": "<started_at>",
+                "completed_at": "<completed_at>",
+                "items": [
+                    {
+                        "gts_id": item["gts_id"],
+                        "status": "succeeded",
+                        "resource_version": 1,
+                        "error": None,
+                    }
+                    for item in items
+                ],
+            },
+        )
+        return operation
+
+    return register
 
 
 def pytest_configure(config):

@@ -56,8 +56,7 @@ impl<RR: ReactionRepository, MR: MessageRepository, CR: ChatRepository>
         tracing::debug!("Setting reaction on message");
 
         // Validate reaction value
-        let kind = ReactionKind::parse(reaction)
-            .ok_or_else(|| DomainError::validation("Reaction must be 'like' or 'dislike'"))?;
+        let kind = ReactionKind::parse(reaction).ok_or(DomainError::InvalidReaction)?;
 
         let conn = self.db.conn().map_err(DomainError::from)?;
 

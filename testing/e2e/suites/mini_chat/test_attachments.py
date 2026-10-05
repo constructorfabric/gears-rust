@@ -45,7 +45,6 @@ FIXTURES_DIR = pathlib.Path(__file__).parent / "fixtures"
 
 # `detail` of a canonical service_unavailable Problem (a provider error,
 # src/api/rest/error.rs `DomainError::ProviderError`).
-DETAIL_SERVICE_UNAVAILABLE = "Service temporarily unavailable"
 
 # ThumbnailConfig default width and height (config.rs), not overridden in base.yaml.
 THUMBNAIL_MAX_SIDE = 128
@@ -733,9 +732,7 @@ class TestUploadSizeEnforcement:
         # not apply.
         assert content_type == "application/problem+json", content_type
         problem = json.loads(body)
-        assert (problem["type"], problem["title"], problem["status"], problem["detail"]) == (
-            "about:blank", "Payload Too Large", 413, "Payload Too Large",
-        ), problem
+        assert (problem["type"], problem["status"]) == ("about:blank", 413), problem
         assert query_db("SELECT id FROM attachments WHERE chat_id = ?", (chat_id,)) == []
         assert _file_upload_calls(mock_provider) == []
 
@@ -955,7 +952,7 @@ class TestUploadProviderFailure:
         mock_provider.set_fault("POST", FILES_PATH, 500)
 
         resp = _upload(chat_id, "fail.txt", b"provider will fail", "text/plain")
-        assert_problem(resp, 503, "service_unavailable", detail=DETAIL_SERVICE_UNAVAILABLE)
+        assert_problem(resp, 503, "service_unavailable")
         assert resp.headers.get("Retry-After") == "10", resp.headers
 
         # The Problem carries no attachment id; the row is found in the DB.
@@ -1420,7 +1417,6 @@ class TestUploadVectorStoreProviderMismatch:
         mock_provider.clear_captured_requests()
         resp = _upload(chat_id, "second.txt", b"stored with openai", "text/plain")
         body = assert_problem(resp, 409, "already_exists", resource_type=RESOURCE_CHAT)
-        assert body["detail"] == "chat vector store belongs to another provider", body
         assert body["context"]["resource_name"] == "provider_mismatch", body
 
         rows = query_db(
@@ -1498,7 +1494,7 @@ class TestUploadVectorStoreIndexing:
         )
 
         resp = _upload(chat_id, "broken.txt", b"cannot be indexed", "text/plain")
-        assert_problem(resp, 503, "service_unavailable", detail=DETAIL_SERVICE_UNAVAILABLE)
+        assert_problem(resp, 503, "service_unavailable")
         assert resp.headers.get("Retry-After") == "10", resp.headers
         # The provider error code stays internal.
         assert "indexing_failed" not in resp.text, resp.text
@@ -1524,7 +1520,7 @@ class TestUploadVectorStoreIndexing:
         mock_provider.set_fault("POST", "/v1/vector_stores", 500)
 
         resp = _upload(chat_id, "no-store.txt", b"no vector store", "text/plain")
-        assert_problem(resp, 503, "service_unavailable", detail=DETAIL_SERVICE_UNAVAILABLE)
+        assert_problem(resp, 503, "service_unavailable")
         assert resp.headers.get("Retry-After") == "10", resp.headers
         assert "vector_store_failed" not in resp.text, resp.text
 

@@ -6,6 +6,7 @@ use toolkit_db::secure::AccessScope;
 use toolkit_macros::domain_model;
 
 use super::errors::{ItemFailure, WorkerError};
+use super::outcome::registration_gts_id;
 use super::revision::{
     RevisionCommit, read_current_content, revision_entity, terminalize_unchanged,
 };
@@ -36,25 +37,19 @@ pub(super) async fn probe(
     let Precondition::Version(expected) = item.precondition else {
         return Ok(None);
     };
-    let Some(entity) = stores.find_by_gts_id(tx, scope, &item.gts_id).await? else {
+    let gts_id = registration_gts_id(item)?;
+    let Some(entity) = stores.find_by_gts_id(tx, scope, gts_id).await? else {
         return Ok(None);
     };
     if entity.lifecycle_status == LifecycleStatus::Deleted || entity.resource_version != expected {
         return Ok(None);
     }
-    let current = read_current_content(
-        stores,
-        tx,
-        scope,
-        &item.gts_id,
-        entity.entity_kind,
-        entity.id,
-    )
-    .await?;
+    let current =
+        read_current_content(stores, tx, scope, gts_id, entity.entity_kind, entity.id).await?;
     Ok(current
         .matches_authored(payload)
         .then_some(UnchangedCandidate {
-            gts_id: item.gts_id.clone(),
+            gts_id: gts_id.to_owned(),
             entity_id: entity.id,
             resource_version: expected,
             operation_item_id: item.id,

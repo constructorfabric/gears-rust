@@ -1015,10 +1015,14 @@ fn llm_body_logging_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        std::env::var("MINI_CHAT_LOG_LLM_BODIES")
-            .ok()
-            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
+        body_logging_opted_in(std::env::var("MINI_CHAT_LOG_LLM_BODIES").ok().as_deref())
     })
+}
+
+/// Whether a `MINI_CHAT_LOG_LLM_BODIES` value opts in to body logging. An
+/// unset or non-UTF-8 variable arrives as `None`.
+fn body_logging_opted_in(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "TRUE" | "yes"))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1289,6 +1293,32 @@ mod tests {
             id: None,
             retry: None,
         }
+    }
+
+    // ── Body logging opt-in ───────────────────────────────────────────────
+
+    #[test]
+    fn body_logging_opts_in_only_for_the_documented_values() {
+        for value in ["1", "true", "TRUE", "yes"] {
+            assert!(body_logging_opted_in(Some(value)), "{value} opts in");
+        }
+        for value in ["", "0", "false", "True", "YES", "on"] {
+            assert!(
+                !body_logging_opted_in(Some(value)),
+                "{value} does not opt in"
+            );
+        }
+        assert!(
+            !body_logging_opted_in(None),
+            "an unset variable does not opt in"
+        );
+    }
+
+    #[test]
+    fn body_logging_flag_follows_the_environment() {
+        let expected =
+            body_logging_opted_in(std::env::var("MINI_CHAT_LOG_LLM_BODIES").ok().as_deref());
+        assert_eq!(llm_body_logging_enabled(), expected);
     }
 
     // ── FromServerEvent — SSE parsing ─────────────────────────────────────

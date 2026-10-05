@@ -169,16 +169,18 @@ pub fn request_fingerprint(input: &FingerprintInput<'_>) -> RequestFingerprint {
     let mut hasher = Context::new(&SHA256);
     // A version tag, so a future change to what the fingerprint covers cannot
     // read as a matching replay of a request accepted under the old rules.
-    write_field(&mut hasher, b"tr-fingerprint-v1");
-    write_field(&mut hasher, &[kind_tag(input.kind)]);
-    write_field(&mut hasher, &[u8::from(input.dry_run)]);
-    write_field(&mut hasher, &[plane_tag(input.plane)]);
-    write_field(&mut hasher, &[ownership_tag(input.ownership_scope)]);
-    write_field(
+    write_header(
         &mut hasher,
-        input.tenant_id.as_ref().map_or(&[][..], |t| t.as_bytes()),
+        b"tr-fingerprint-v1",
+        RequestScope {
+            kind: input.kind,
+            dry_run: input.dry_run,
+            plane: input.plane,
+            tenant_id: input.tenant_id,
+            principal_id: input.principal_id,
+            ownership_scope: input.ownership_scope,
+        },
     );
-    write_field(&mut hasher, input.principal_id.as_bytes());
     write_field(&mut hasher, &field_len(input.candidates.len()));
     for candidate in input.candidates {
         write_field(&mut hasher, candidate.gts_id.as_bytes());
@@ -189,6 +191,65 @@ pub fn request_fingerprint(input: &FingerprintInput<'_>) -> RequestFingerprint {
         );
         write_field(&mut hasher, &[u8::from(candidate.force)]);
     }
+    finish(hasher)
+}
+
+/// What a request fingerprint covers besides its items.
+#[domain_model]
+#[derive(Clone, Copy, Debug)]
+pub struct RequestScope {
+    pub kind: OperationKind,
+    pub dry_run: bool,
+    pub plane: Plane,
+    pub tenant_id: Option<Uuid>,
+    pub principal_id: Uuid,
+    pub ownership_scope: OwnershipScope,
+}
+
+/// One deletion target's contribution.
+#[domain_model]
+#[derive(Clone, Copy, Debug)]
+pub struct DeletionFingerprintTarget {
+    /// Both key spellings of one entity share it, and it does not depend on
+    /// whether the entity exists, so neither moves the digest.
+    pub gts_uuid: Uuid,
+    pub precondition: Precondition,
+}
+
+/// A deletion's digest, in request order. Its own tag keeps it apart from every
+/// registration digest, whose bytes this does not change.
+#[must_use]
+pub fn deletion_fingerprint(
+    scope: RequestScope,
+    targets: &[DeletionFingerprintTarget],
+) -> RequestFingerprint {
+    let mut hasher = Context::new(&SHA256);
+    write_header(&mut hasher, b"tr-deletion-fingerprint-v1", scope);
+    write_field(&mut hasher, &field_len(targets.len()));
+    for target in targets {
+        write_field(&mut hasher, target.gts_uuid.as_bytes());
+        write_field(
+            &mut hasher,
+            &target.precondition.stored_value().to_be_bytes(),
+        );
+    }
+    finish(hasher)
+}
+
+fn write_header(hasher: &mut Context, tag: &[u8], scope: RequestScope) {
+    write_field(hasher, tag);
+    write_field(hasher, &[kind_tag(scope.kind)]);
+    write_field(hasher, &[u8::from(scope.dry_run)]);
+    write_field(hasher, &[plane_tag(scope.plane)]);
+    write_field(hasher, &[ownership_tag(scope.ownership_scope)]);
+    write_field(
+        hasher,
+        scope.tenant_id.as_ref().map_or(&[][..], |t| t.as_bytes()),
+    );
+    write_field(hasher, scope.principal_id.as_bytes());
+}
+
+fn finish(hasher: Context) -> RequestFingerprint {
     let digest = hasher.finish();
     let mut bytes = [0; 32];
     bytes.copy_from_slice(digest.as_ref());

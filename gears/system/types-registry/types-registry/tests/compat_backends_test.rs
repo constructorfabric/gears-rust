@@ -27,7 +27,7 @@ use types_registry::domain::admission::worker::{
 use types_registry::domain::admission::{
     AdmissionFailureReason, Candidate, OperationDispatch, SubmitRequest,
 };
-use types_registry::domain::enums::{OperationItemStatus, OperationKind};
+use types_registry::domain::enums::OperationItemStatus;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::infra::storage::entity::{entity, instance_revision, type_schema_revision};
 
@@ -123,7 +123,6 @@ async fn admit(
         &(Arc::new(NoDispatch) as Arc<dyn OperationDispatch>),
         &SubmitRequest {
             idempotency_key: Some(key.to_owned()),
-            kind: OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
                 gts_id: gts_id.to_owned(),

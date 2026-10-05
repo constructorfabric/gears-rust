@@ -285,6 +285,39 @@ async fn the_descendants_are_the_set_the_resolver_answers_in_breadth_first_order
 }
 
 #[tokio::test]
+async fn the_walk_keeps_the_link_each_descendant_was_reached_through() {
+    // A walk over the whole subtree reads every descendant's chain off the
+    // links, instead of asking the resolver again per node: one request for
+    // the subtree, and the chains are the links'.
+    let parent = Uuid::new_v4();
+    let a = Uuid::new_v4();
+    let a_child = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let (hierarchy, resolver) = over(FakeResolver {
+        descendants: vec![
+            tenant_ref(a_child, Some(a)),
+            tenant_ref(b, Some(parent)),
+            tenant_ref(a, Some(parent)),
+        ],
+        ..FakeResolver::default()
+    });
+
+    let subtree = hierarchy.subtree(parent, 100).await.expect("subtree");
+    assert_eq!(subtree.order, vec![b, a, a_child]);
+    assert_eq!(
+        subtree.parent,
+        std::collections::HashMap::from([(b, parent), (a, parent), (a_child, a)])
+    );
+    assert_eq!(subtree.path_from(parent, a_child), vec![parent, a, a_child]);
+    assert!(!subtree.truncated);
+    assert_eq!(
+        resolver.asked.load(Ordering::SeqCst),
+        1,
+        "one request for the whole subtree"
+    );
+}
+
+#[tokio::test]
 async fn the_breadth_first_walk_is_rebuilt_from_the_parent_links() {
     // The impact report shows the nearest affected scopes first, so the flat
     // set the resolver answers has to be re-ordered level by level. Depth-first

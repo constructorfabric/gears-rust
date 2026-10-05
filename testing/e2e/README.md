@@ -216,13 +216,19 @@ in the most efficient way:
 **Self-managed suites are skipped by `make e2e-local`.** Suites that have
 `launcher: pytest` in `testing/e2e/suites/<suite>/e2e.yaml` (`mini-chat` and
 `usage-collector`) need their own server — and `usage-collector` also needs a
-TimescaleDB container — so they can't use the shared server. Run each of them on
-its own instead:
+TimescaleDB or ClickHouse container — so they can't use the shared server. Run
+each of them on its own instead:
 
 ```bash
 make e2e-mini-chat                    # or: make e2e-local SUITE=mini-chat
-make e2e-usage-collector              # or: make e2e-local SUITE=usage-collector
+make e2e-usage-collector              # both storage backends, one after the other
+make e2e-usage-collector-timescaledb  # or: make e2e-local SUITE=usage-collector
+make e2e-usage-collector-clickhouse   # ClickHouse lane (no `make e2e-local` equivalent)
 ```
+
+`e2e.yaml` pins the TimescaleDB feature set, so `make e2e-local
+SUITE=usage-collector` runs only that backend; the ClickHouse lane selects its own
+features and `UC_E2E_BACKEND` from the Makefile.
 
 ### `launcher: e2e-launcher` vs `launcher: pytest`
 
@@ -470,7 +476,9 @@ async def test_my_endpoint(base_url, auth_headers):
 | `make e2e-local SUITE=file-parser`   | Local  | Run **one** suite: build its server + run its tests |
 | `make e2e-local-smoke`               | Local  | Smoke tests only (add `SUITE=<name>` to focus on one suite)  |
 | `make e2e-mini-chat`                 | Local  | Alias for `make e2e-local SUITE=mini-chat` (self-managed, offline) |
-| `make e2e-usage-collector`           | Local  | Alias for `make e2e-local SUITE=usage-collector` (self-managed; **requires Docker** for TimescaleDB) |
+| `make e2e-usage-collector`           | Local  | Usage-collector suite, run against both storage backends: a dedicated binary + container per backend, TimescaleDB then ClickHouse (**requires Docker**) |
+| `make e2e-usage-collector-timescaledb` | Local | Usage-collector suite, TimescaleDB backend only (**requires Docker**) |
+| `make e2e-usage-collector-clickhouse` | Local  | Usage-collector suite, ClickHouse backend only (**requires Docker**) |
 | `make e2e-tr-authz`                  | Local  | resource-group suite, `tr-authz` profile  |
 
 ## Troubleshooting

@@ -8,7 +8,6 @@ import pytest
 
 from .conftest import (
     API_PREFIX,
-    DETAIL_REQUEST_ID_CONFLICT,
     assert_problem,
     delta_text,
     expect_done,
@@ -46,7 +45,7 @@ def total_daily_used() -> int:
 
 def assert_request_id_conflict(resp: httpx.Response) -> None:
     assert_problem(
-        resp, 409, "aborted", reason="request_id_conflict", detail=DETAIL_REQUEST_ID_CONFLICT,
+        resp, 409, "aborted", reason="request_id_conflict",
     )
 
 

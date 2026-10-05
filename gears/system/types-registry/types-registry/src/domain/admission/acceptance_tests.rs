@@ -9,10 +9,14 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 use toolkit_gts::{gts_id, gts_uri};
 
-use super::super::{Candidate, Precondition, SubmitRequest};
-use super::{AcceptanceContext, AcceptanceError, validate};
+use super::super::{Candidate, DeleteRequest, DeleteTarget, Precondition, SubmitRequest};
+use super::{
+    AcceptanceContext, AcceptanceError, legacy_deletion_fingerprint, validate, validate_deletion,
+};
 use crate::config::{PolicyEntry, TypesRegistryConfig};
 use crate::domain::enums::OperationKind;
+use crate::domain::key::EntityKey;
+use crate::domain::key::MAX_KEY_LEN;
 use crate::domain::policy::RegistrationPolicy;
 
 fn noop_metrics() -> std::sync::Arc<dyn crate::domain::ports::metrics::AdmissionMetrics> {
@@ -44,7 +48,6 @@ fn candidate(gts_id: &str) -> Candidate {
 fn request(candidates: Vec<Candidate>) -> SubmitRequest {
     SubmitRequest {
         idempotency_key: Some("key-1".to_owned()),
-        kind: OperationKind::Registration,
         dry_run: false,
         candidates,
     }
@@ -103,7 +106,7 @@ fn a_platform_vendor_creation_is_accepted_and_records_its_item() {
     assert_eq!(validated.items.len(), 1);
     let item = &validated.items[0];
     assert_eq!(item.item_no, 0);
-    assert_eq!(item.gts_id, CF_TYPE);
+    assert_eq!(item.key.gts_id(), Some(CF_TYPE));
     assert_eq!(item.precondition, Precondition::MustNotExist);
     assert!(
         item.request_payload.starts_with(r#"{"$id":"#),
@@ -126,7 +129,10 @@ fn items_are_numbered_in_submission_order() {
         ]),
     )
     .expect("accepted");
-    assert_eq!(validated.items[0].gts_id, gts_id!("cf.core.b.type.v1~"));
+    assert_eq!(
+        validated.items[0].key.gts_id(),
+        Some(gts_id!("cf.core.b.type.v1~"))
+    );
     assert_eq!(validated.items[0].item_no, 0);
     assert_eq!(validated.items[1].item_no, 1);
 }
@@ -208,6 +214,26 @@ fn an_unparsable_identifier_is_refused_with_the_library_reason() {
         }
         other => panic!("expected InvalidIdentifier, got {other:?}"),
     }
+}
+
+/// Refused before parsing, carrying the length only: the identifier is unbounded
+/// caller input, and a refusal would otherwise echo all of it.
+#[test]
+fn an_over_long_identifier_is_refused_without_being_echoed() {
+    let pair = closed();
+    let long = format!("gts.{}", "a".repeat(MAX_KEY_LEN));
+    match run(&pair, &request(vec![candidate(&long)])) {
+        Err(err @ AcceptanceError::IdentifierTooLong { length }) => {
+            assert_eq!(length, long.len());
+            assert!(!err.to_string().contains(&long));
+        }
+        other => panic!("expected IdentifierTooLong, got {other:?}"),
+    }
+    let at_bound = format!("gts.{}", "a".repeat(MAX_KEY_LEN - 4));
+    assert!(matches!(
+        run(&pair, &request(vec![candidate(&at_bound)])),
+        Err(AcceptanceError::InvalidIdentifier { .. }),
+    ));
 }
 
 /// A non-canonical spelling is refused rather than rewritten: two spellings of one
@@ -802,32 +828,13 @@ fn a_minor_bearing_type_schema_cannot_be_content_revised() {
 // Deletion (T20)
 // ---------------------------------------------------------------------------
 
-/// A deletion names an existing entity and a version, and submits no document.
-fn deletion(gts_id: &str, expected_resource_version: Option<i64>) -> Candidate {
-    Candidate {
-        gts_id: gts_id.to_owned(),
-        content: None,
-        expected_resource_version,
-        force: false,
-    }
-}
-
-fn deletion_request(candidates: Vec<Candidate>) -> SubmitRequest {
-    SubmitRequest {
-        idempotency_key: Some("del-1".to_owned()),
-        kind: OperationKind::Deletion,
-        dry_run: false,
-        candidates,
-    }
-}
+// A deletion is a `DeleteRequest`, so a document or `force` on one cannot be
+// expressed at all; what remains are the checks its targets still owe.
 
 #[test]
 fn a_deletion_is_accepted_with_a_positive_precondition() {
-    let accepted = run(
-        &closed(),
-        &deletion_request(vec![deletion(CF_TYPE, Some(3))]),
-    )
-    .expect("a well-formed deletion is accepted");
+    let accepted =
+        run_deletion(vec![target(CF_TYPE, Some(3))]).expect("a well-formed deletion is accepted");
     assert_eq!(accepted.kind, OperationKind::Deletion);
     assert_eq!(accepted.items.len(), 1);
     assert_eq!(accepted.items[0].precondition, Precondition::Version(3));
@@ -837,37 +844,9 @@ fn a_deletion_is_accepted_with_a_positive_precondition() {
 /// other reading is a deletion that races whoever last wrote the entity.
 #[test]
 fn a_deletion_without_a_precondition_is_refused() {
-    match run(&closed(), &deletion_request(vec![deletion(CF_TYPE, None)])) {
+    match run_deletion(vec![target(CF_TYPE, None)]) {
         Err(AcceptanceError::DeletionRequiresVersion { gts_id }) => assert_eq!(gts_id, CF_TYPE),
         other => panic!("expected DeletionRequiresVersion, got {other:?}"),
-    }
-}
-
-/// A deletion carrying a document is a confused request, not a deletion with a
-/// harmless extra field: nothing downstream would ever read it.
-#[test]
-fn a_deletion_carrying_content_is_refused() {
-    let mut candidate = deletion(CF_TYPE, Some(1));
-    candidate.content = Some(schema(CF_TYPE));
-    match run(&closed(), &deletion_request(vec![candidate])) {
-        Err(AcceptanceError::DeletionCarriesContent { gts_id }) => assert_eq!(gts_id, CF_TYPE),
-        other => panic!("expected DeletionCarriesContent, got {other:?}"),
-    }
-}
-
-/// `force` waives a compatibility check (ADR-0004), and a deletion runs none.
-#[test]
-fn a_forced_deletion_is_refused_because_there_is_nothing_to_waive() {
-    let mut candidate = deletion(CF_TYPE, Some(1));
-    candidate.force = true;
-    let config = TypesRegistryConfig {
-        allow_compatibility_force: true,
-        ..TypesRegistryConfig::default()
-    };
-    let pair = (RegistrationPolicy::default(), config);
-    match run(&pair, &deletion_request(vec![candidate])) {
-        Err(AcceptanceError::ForceHasNothingToWaive { gts_id }) => assert_eq!(gts_id, CF_TYPE),
-        other => panic!("expected ForceHasNothingToWaive, got {other:?}"),
     }
 }
 
@@ -878,11 +857,8 @@ fn a_forced_deletion_is_refused_because_there_is_nothing_to_waive() {
 fn a_deletion_is_not_gated_by_the_registration_policy() {
     // The default policy admits `cf` only, so registering this identifier fails.
     assert!(run(&closed(), &request(vec![candidate(ACME_TYPE)])).is_err());
-    run(
-        &closed(),
-        &deletion_request(vec![deletion(ACME_TYPE, Some(1))]),
-    )
-    .expect("a deletion passes the policy gate untouched");
+    run_deletion(vec![target(ACME_TYPE, Some(1))])
+        .expect("a deletion passes the policy gate untouched");
 }
 
 /// ADR-0004 makes a minor-bearing Type Schema content-**immutable**; it does not
@@ -890,7 +866,7 @@ fn a_deletion_is_not_gated_by_the_registration_policy() {
 #[test]
 fn a_minor_bearing_type_schema_can_be_deleted() {
     let minor = gts_id!("cf.core.example.thing.v1.1~");
-    run(&closed(), &deletion_request(vec![deletion(minor, Some(2))]))
+    run_deletion(vec![target(minor, Some(2))])
         .expect("content immutability is not a deletion rule");
 }
 
@@ -900,10 +876,7 @@ fn a_minor_bearing_type_schema_can_be_deleted() {
 fn a_deletion_still_obeys_the_identifier_profile() {
     let uuid_tail = gts_id!("cf.core.example.type.v1~01890c7e-0000-7000-8000-000000000000");
     assert!(matches!(
-        run(
-            &closed(),
-            &deletion_request(vec![deletion(uuid_tail, Some(1))]),
-        ),
+        run_deletion(vec![target(uuid_tail, Some(1))]),
         Err(AcceptanceError::ExplicitUuidTail { .. }),
     ));
 }
@@ -912,10 +885,198 @@ fn a_deletion_still_obeys_the_identifier_profile() {
 /// payload while the item is pending, and a deletion submitted no document.
 #[test]
 fn a_deletion_item_records_the_absence_of_a_document() {
-    let accepted = run(
-        &closed(),
-        &deletion_request(vec![deletion(CF_TYPE, Some(1))]),
-    )
-    .expect("accepted");
+    let accepted = run_deletion(vec![target(CF_TYPE, Some(1))]).expect("accepted");
     assert_eq!(accepted.items[0].request_payload, "null");
+}
+
+// ---------------------------------------------------------------------------
+// Deletion by `DeleteRequest`, the path both REST routes take
+// ---------------------------------------------------------------------------
+
+fn run_deletion(targets: Vec<DeleteTarget>) -> Result<super::Validated, AcceptanceError> {
+    let pair = closed();
+    validate_deletion(
+        &AcceptanceContext {
+            policy: &pair.0,
+            config: &pair.1,
+            metrics: &noop_metrics(),
+        },
+        &DeleteRequest {
+            idempotency_key: Some("del-1".to_owned()),
+            dry_run: false,
+            targets,
+        },
+    )
+}
+
+/// Classified exactly as the REST routes classify the wire key.
+fn target(entity_key: &str, expected_resource_version: Option<i64>) -> DeleteTarget {
+    DeleteTarget {
+        key: EntityKey::parse(entity_key),
+        expected_resource_version,
+    }
+}
+
+const REFERENCE: &str = "0f5c1e2a-3b4d-5e6f-8a9b-0c1d2e3f4a5b";
+
+/// The key is unbounded caller input, so the refusal carries its length only:
+/// the Problem detail and the refusal log would otherwise echo all of it.
+#[test]
+fn an_over_long_deletion_key_is_refused_without_being_echoed() {
+    let long = format!("gts.{}", "a".repeat(MAX_KEY_LEN));
+    match run_deletion(vec![target(&long, Some(1))]) {
+        Err(err @ AcceptanceError::KeyTooLong { length }) => {
+            assert_eq!(length, long.len());
+            assert!(!err.to_string().contains(&long));
+        }
+        other => panic!("expected KeyTooLong, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_deletion_key_at_the_bound_is_parsed_rather_than_refused_for_length() {
+    let at_bound = format!("gts.{}", "a".repeat(MAX_KEY_LEN - 4));
+    assert!(matches!(
+        run_deletion(vec![target(&at_bound, Some(1))]),
+        Err(AcceptanceError::InvalidIdentifier { .. }),
+    ));
+}
+
+/// A Registry Reference is validated without resolving it, and each refusal
+/// names the reference as the request spelled it.
+#[test]
+fn a_deletion_by_reference_requires_a_positive_version() {
+    match run_deletion(vec![target(REFERENCE, None)]) {
+        Err(AcceptanceError::DeletionRequiresVersion { gts_id }) => assert_eq!(gts_id, REFERENCE),
+        other => panic!("expected DeletionRequiresVersion, got {other:?}"),
+    }
+    match run_deletion(vec![target(REFERENCE, Some(0))]) {
+        Err(err @ AcceptanceError::DeletionZeroPrecondition { .. }) => {
+            assert!(err.to_string().contains(REFERENCE), "{err}");
+            assert!(!err.to_string().contains("omit"), "{err}");
+        }
+        other => panic!("expected DeletionZeroPrecondition, got {other:?}"),
+    }
+    match run_deletion(vec![target(REFERENCE, Some(-1))]) {
+        Err(AcceptanceError::NegativePrecondition { gts_id, version }) => {
+            assert_eq!(gts_id, REFERENCE);
+            assert_eq!(version, -1);
+        }
+        other => panic!("expected NegativePrecondition, got {other:?}"),
+    }
+    let accepted = run_deletion(vec![target(REFERENCE, Some(2))]).expect("accepted");
+    assert_eq!(accepted.items[0].key, EntityKey::parse(REFERENCE));
+    assert_eq!(accepted.items[0].precondition, Precondition::Version(2));
+}
+
+#[test]
+fn a_non_canonical_deletion_identifier_is_refused_rather_than_normalized() {
+    let padded = format!("  {CF_TYPE}  ");
+    match run_deletion(vec![target(&padded, Some(1))]) {
+        Err(AcceptanceError::InvalidIdentifier { gts_id, reason }) => {
+            assert_eq!(gts_id, padded);
+            assert!(
+                reason.contains(CF_TYPE),
+                "names the canonical form: {reason}"
+            );
+        }
+        other => panic!("expected InvalidIdentifier, got {other:?}"),
+    }
+}
+
+/// Any UUID spelling is a Registry Reference, recorded in its canonical form.
+#[test]
+fn a_deletion_records_its_registry_reference_canonically() {
+    let accepted =
+        run_deletion(vec![target(&REFERENCE.to_uppercase(), Some(1))]).expect("accepted");
+    assert_eq!(accepted.items[0].key.to_string(), REFERENCE);
+}
+
+/// Two keys naming one entity are one duplicate whichever kind of key each is,
+/// and the refusal names both positions: the strings need not repeat.
+#[test]
+fn a_duplicate_deletion_target_names_both_positions() {
+    let gts_uuid = EntityKey::parse(CF_TYPE)
+        .gts_uuid()
+        .expect("a canonical identifier")
+        .to_string();
+    let other = gts_id!("cf.core.example.other.v1~");
+    for (keys, expected) in [
+        (vec![CF_TYPE.to_owned(), CF_TYPE.to_owned()], (0, 1)),
+        (vec![CF_TYPE.to_owned(), gts_uuid.to_uppercase()], (0, 1)),
+        (
+            vec![gts_uuid.clone(), other.to_owned(), CF_TYPE.to_owned()],
+            (0, 2),
+        ),
+    ] {
+        let targets = keys.iter().map(|key| target(key, Some(1))).collect();
+        match run_deletion(targets) {
+            Err(AcceptanceError::DuplicateTarget {
+                first_index,
+                second_index,
+            }) => assert_eq!((first_index, second_index), expected, "{keys:?}"),
+            other => panic!("{keys:?}: expected DuplicateTarget, got {other:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The legacy deletion fallback
+// ---------------------------------------------------------------------------
+
+/// The rows a previous acceptance stored for `validated`, every key resolved to
+/// its identifier as that acceptance did.
+fn legacy_rows(validated: &super::Validated) -> Vec<crate::domain::ports::OperationItemRow> {
+    validated
+        .items
+        .iter()
+        .map(|item| crate::domain::ports::OperationItemRow {
+            id: i64::from(item.item_no),
+            operation_id: uuid::Uuid::nil(),
+            item_no: item.item_no,
+            key: EntityKey::GtsId(CF_TYPE.to_owned()),
+            dry_run: validated.dry_run,
+            kind: OperationKind::Deletion,
+            precondition: item.precondition,
+            compat_forced: false,
+            status: crate::domain::enums::OperationItemStatus::Succeeded,
+            request_payload: None,
+            result_revision_no: None,
+            result_resource_version: None,
+            error_payload: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            started_at: None,
+            completed_at: None,
+        })
+        .collect()
+}
+
+/// Everything but the kind is held equal, so only the guard can tell them apart.
+#[test]
+fn only_a_deletion_takes_the_legacy_fallback() {
+    let deletion = run_deletion(vec![target(CF_TYPE, Some(1))]).expect("accepted");
+    let rows = legacy_rows(&deletion);
+    assert!(legacy_deletion_fingerprint(&deletion, &rows).is_some());
+
+    let mut registration = deletion;
+    registration.kind = OperationKind::Registration;
+    assert_eq!(legacy_deletion_fingerprint(&registration, &rows), None);
+}
+
+/// A Registry Reference borrows the stored identifier only when it names it.
+#[test]
+fn a_reference_is_matched_to_the_legacy_identifier_it_names() {
+    let by_id = run_deletion(vec![target(CF_TYPE, Some(1))]).expect("accepted");
+    let rows = legacy_rows(&by_id);
+    let reference = EntityKey::parse(CF_TYPE)
+        .gts_uuid()
+        .expect("canonical")
+        .to_string();
+    let by_reference = run_deletion(vec![target(&reference, Some(1))]).expect("accepted");
+    assert_eq!(
+        legacy_deletion_fingerprint(&by_reference, &rows),
+        legacy_deletion_fingerprint(&by_id, &rows),
+    );
+    let elsewhere = run_deletion(vec![target(REFERENCE, Some(1))]).expect("accepted");
+    assert_eq!(legacy_deletion_fingerprint(&elsewhere, &rows), None);
 }

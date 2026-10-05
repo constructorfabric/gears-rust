@@ -46,7 +46,6 @@ toolkit-http = { workspace = true, optional = true }
 
 # Direct deps emitted into generated server route registration (rest-server).
 axum = { workspace = true, optional = true }
-http = { workspace = true, optional = true }
 
 [features]
 # Generated directory-resolving REST client (`AuthZResolverApiRestClient` +
@@ -54,7 +53,7 @@ http = { workspace = true, optional = true }
 rest-client = ["toolkit-contract/rest-client", "dep:toolkit-http"]
 # Generated server route registration (`register_..._routes`) used by the
 # authz-resolver gear to host the contract's REST surface.
-rest-server = ["toolkit-contract/rest-server", "dep:axum", "dep:http"]
+rest-server = ["toolkit-contract/rest-server", "dep:axum"]
 # Real OTEL propagation + client metrics in the generated REST client.
 otel = ["rest-client", "toolkit-contract/otel"]
 

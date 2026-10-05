@@ -76,7 +76,7 @@ The architectural rules of the selected model are:
   * lifecycle, ownership/visibility, and tenant-state assertions;
   * opaque `external_revision` and conditional-read semantics (ADR-0002);
   * structured source failures; and
-  * for a Type Schema result — an identifier with a trailing `~` — resolved effective schema and trait artifacts, because Types Registry does not compute them for external content and consumers cannot obtain them otherwise (ADR-0002).
+  * for a Type Schema result — an identifier with a trailing `~` — resolved effective schema and trait artifacts whenever requested, because Types Registry does not compute them for external content and consumers cannot obtain them otherwise (ADR-0002).
 * ADR-0011 keeps two operations out of the contract rather than making them optional:
   * dependency registration toward managed identifiers is excluded because ADR-0011 leaves no cross-boundary dependency to register;
   * reverse dependency-impact lookup is excluded because it could report only external dependents of an external entity, while Types Registry exposes no dependent-enumeration operation and mutation Dry Run answers the actionable impact question.

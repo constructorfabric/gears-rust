@@ -103,20 +103,20 @@ An active Source Claim must be backed by a plugin implementing ADR-0007's P1 fed
 
 Every live external entity result must include at least:
 
-* the exact canonical GTS Identifier;
-* entity kind and canonical content — the authored document, in the same slot a Managed Entity's authored document occupies;
-* for a Type Schema, the resolved effective schema and the effective trait artifacts, computed by the plugin;
+* the exact canonical GTS Identifier and entity kind;
 * an opaque `external_revision`;
 * the ownership scope: platform-wide, or the identifier of the one tenant that owns the entity. This is mandatory, so there is no default to get wrong; an absent scope, or one naming a tenant the platform does not know, is an `INVALID_SOURCE_RESPONSE`. The plugin states this flat fact only — Types Registry expands it into the descendant-visibility relation itself, and the assertion confers no authority, since no write path reaches an external entity (ADR-0009);
 * tenant enablement state when the operation requires tenant-specific availability.
+
+A source must be able to produce canonical content — the authored document, in the same slot a Managed Entity's authored document occupies — and, for a Type Schema, the resolved effective schema and the effective trait artifacts, computed by the plugin. A result that transfers the entity includes the applicable documents the registry requested, and an unchanged answer carries none; a missing requested document is an `INVALID_SOURCE_RESPONSE`.
 
 ### The plugin resolves its own type chains
 
 Producing the resolved effective schema and the effective trait artifacts is a **mandatory** part of the contract, not an optional one, and the decision turns on what the alternative leaves a consumer holding.
 
-If a plugin omits the artifacts, a consumer must fetch every base and resolve the chain locally. That means several round trips and a GTS resolution implementation in every consumer — precisely the duplication Types Registry removes.
+If a plugin cannot produce requested artifacts, a consumer must fetch every base and resolve the chain locally. That means several round trips and a GTS resolution implementation in every consumer — precisely the duplication Types Registry removes.
 
-There is no degraded mode: an absent resolved schema is a dead end, not a smaller answer. Types Registry cannot fill the gap because ADR-0011 keeps external documents out of managed closures and ADR-0014 forbids inspecting their `$schema`.
+There is no degraded mode: a requested but absent resolved schema is a dead end, not a smaller answer. Types Registry cannot fill the gap because ADR-0011 keeps external documents out of managed closures and ADR-0014 forbids inspecting their `$schema`.
 
 The obligation is affordable because a plugin is already a full registry adapter responsible for batch resolution, querying, pagination, revision and freshness semantics, Registry Reference retention, and tombstones.
 
@@ -161,7 +161,7 @@ For one exact external entity:
 The revision is opaque protocol metadata; no content digest accompanies it. Types Registry:
 
 * requires it on every result and rejects a result without one, or one exceeding the length bound, as an invalid source response;
-* carries it verbatim in the external validator and delegates every conditional read to the owning plugin, which alone decides whether the caller's revision is still current;
+* carries it verbatim in the external validator and, once the platform-owned validator inputs match, delegates the conditional read to the owning plugin, which alone decides whether the caller's revision is still current;
 * never compares, interprets, or persists it as registry state.
 
 Plugin contract tests and source monitoring verify the revision contract across requests without requiring prior values in Types Registry. `cpt-cf-types-registry-fr-cache-freshness-metadata` makes this conditional metadata a P1 obligation.

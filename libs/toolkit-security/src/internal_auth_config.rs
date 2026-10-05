@@ -6,7 +6,7 @@
 //! - **`OoP` gears** (`oop_http.internal_auth`) — selects the *inbound* HTTP
 //!   validator for the gear's own routes **and** the *outbound* credential the
 //!   gear attaches to its `DirectoryService` calls.
-//! - **The `gear-orchestrator`** — selects the *inbound* gRPC validator that
+//! - **The `service-discovery`** — selects the *inbound* gRPC validator that
 //!   protects the `DirectoryService` RPCs.
 //! - **The `api-gateway`** (`gateway_proxy.internal_auth`) — selects the
 //!   *outbound* credential attached to the edge's `DirectoryService` polls.

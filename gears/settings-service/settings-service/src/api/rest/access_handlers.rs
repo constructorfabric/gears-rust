@@ -64,8 +64,7 @@ fn parse_target(raw: Option<&str>) -> Result<Uuid, DomainError> {
 fn actor(ctx: &SecurityContext, headers: &HeaderMap, scope: &AccessScope) -> AccessActor {
     AccessActor {
         ctx: ctx.clone(),
-        request_id: toolkit::api::error_layer::extract_trace_id(headers)
-            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        request_id: super::audit_request_id(headers),
         visibility: domain_visibility(scope),
     }
 }

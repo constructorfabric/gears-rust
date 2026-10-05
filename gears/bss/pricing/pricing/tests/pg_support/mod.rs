@@ -179,9 +179,8 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use bss_pricing::infra::storage::migrations::Migrator;
+use bss_pricing::module::BssPricingGear;
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
-use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::bollard::Docker;
 use testcontainers_modules::testcontainers::bollard::errors::Error as BollardError;
@@ -193,6 +192,7 @@ use testcontainers_modules::testcontainers::core::client::docker_client_instance
 use testcontainers_modules::testcontainers::core::ports::Ports;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
+use toolkit::contracts::DatabaseCapability;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, Db, connect_db};
 
@@ -668,7 +668,35 @@ impl Pg {
 
         let this = Self { port, database };
         let db = this.db().await;
-        run_migrations_for_testing(&db, Migrator::migrations())
+        run_migrations_for_testing(&db, BssPricingGear::default().migrations())
+            .await
+            .expect("apply the chain");
+        drop(db);
+        this
+    }
+
+    /// [`Pg::applied`] on a database whose locale is `C` (`LC_COLLATE` and
+    /// `LC_CTYPE`), the shape `initdb --locale=C` and `CloudNativePG` give a
+    /// cluster: there the database's own `lower()` folds ASCII only (D-442).
+    pub async fn applied_in_c_locale() -> Self {
+        let port = server_port();
+        let database = next_database();
+        let admin = Database::connect(small_pool(&url(port, "postgres", false)))
+            .await
+            .expect("connect to the maintenance database");
+        admin
+            .execute_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "CREATE DATABASE {database} TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"
+                ),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("create database {database}: {e}"));
+        drop(admin);
+        let this = Self { port, database };
+        let db = this.db().await;
+        run_migrations_for_testing(&db, BssPricingGear::default().migrations())
             .await
             .expect("apply the chain");
         drop(db);
@@ -731,57 +759,6 @@ impl Pg {
             .expect("connect plainly")
     }
 }
-
-/// Block until some backend **in this test's own database** is waiting on a lock
-/// it has not been granted.
-///
-/// This is what turns a two-task race into a race rather than a coin toss: a
-/// backend in a lock wait has already executed everything before the statement
-/// that blocked, so observing it proves the loser's read happened *before* the
-/// winner committed. Without it the loser could read the winner's committed
-/// state, both would succeed, and the test would be green about nothing.
-///
-/// **Narrowed to `current_database()`**, which the shared-server harness makes
-/// necessary: `pg_locks` is server-wide and a sibling test blocking in its own
-/// database would otherwise satisfy this wait. The narrowing goes through
-/// `pg_stat_activity` rather than `pg_locks.database`, because the wait a
-/// duplicate key or a row lock produces is `locktype = 'transactionid'` and that
-/// row's `database` is NULL.
-///
-/// It is deliberately **not** narrowed by relation: filtering to one table's oid
-/// would return zero forever and every wait would time out on a race that was
-/// working perfectly.
-///
-/// # Panics
-/// After fifteen seconds, because a race that never contends is a refuted claim
-/// and not a slow one.
-pub async fn wait_until_a_backend_blocks(conn: &DatabaseConnection) {
-    for _ in 0..600_u32 {
-        if blocked_backends(conn).await > 0 {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    panic!("no backend ever blocked: the two statements did not contend");
-}
-
-/// How many backends of this database are waiting on a lock they do not hold.
-pub async fn blocked_backends(conn: &DatabaseConnection) -> i64 {
-    conn.query_one_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT count(*)::bigint AS n
-           FROM pg_locks l
-           JOIN pg_stat_activity a ON a.pid = l.pid
-          WHERE NOT l.granted AND a.datname = current_database()"
-            .to_owned(),
-    ))
-    .await
-    .expect("query pg_locks")
-    .expect("one row")
-    .try_get::<i64>("", "n")
-    .expect("read the count")
-}
-
 /// A database name unique to this process and this call.
 ///
 /// The process id is in it because the server is now shared across binaries and
@@ -808,121 +785,4 @@ fn small_pool(url: &str) -> ConnectOptions {
     let mut options = ConnectOptions::new(url.to_owned());
     options.max_connections(2).min_connections(0);
     options
-}
-
-// ---------------------------------------------------------------------------
-// The frozen-column census, parameterised on the table
-// ---------------------------------------------------------------------------
-
-/// What a table's append-only guard owes, read off the **table** rather than off
-/// the guard.
-///
-/// A whitelist enumerated by hand cannot notice a column added later, and this
-/// crate keeps producing exactly that defect: `trg_pricing_price_append_only` paid for the tax
-/// columns, `000051` for the proration ones, `000055` for the reservation pair,
-/// `000057` for the floors and `000069` for the `per_unit` rate — five waves in
-/// which a column arrived and its guard line did not. A census cross-checked
-/// against a **count** is the same blindness one layer up: a 46th column added to
-/// `pricing_price` and forgotten moves neither a hand-written array nor the
-/// literal beside it, and the column becomes mutable under a frozen
-/// `CatalogVersion` with both green.
-///
-/// So the owed set is derived from `information_schema.columns` and nothing here
-/// is counted. See [`frozen_columns`] for the arm slicing, which is the only part
-/// a caller supplies an anchor for.
-pub struct FrozenColumns {
-    /// Every column the guard must freeze: the table's own columns, less the
-    /// ones the design set sanctions as mutable on a frozen row.
-    pub owed: Vec<String>,
-    /// The text of the guard's frozen-column arm, sliced out of the function
-    /// body.
-    pub predicate: String,
-}
-
-impl FrozenColumns {
-    /// The owed columns the arm does not name — empty is the passing state.
-    #[must_use]
-    pub fn missing(&self) -> Vec<&str> {
-        self.owed
-            .iter()
-            .map(String::as_str)
-            // The trailing space is what keeps `min_qty_usage` from matching
-            // `min_qty_usage_fallback`'s line, and `plan_tier` from matching
-            // `plan_tier_override`'s.
-            .filter(|column| !self.predicate.contains(&format!("NEW.{column} ")))
-            .collect()
-    }
-}
-
-/// Read a table's frozen-column census off the catalog.
-///
-/// `arm_opens_on` is the first `IF NEW.<column>` of the frozen-column arm, and
-/// the slicing it drives is load-bearing rather than tidy: these guard functions
-/// carry several arms and a comment block, so a column named in the `DELETE` ban,
-/// in a lifecycle whitelist or in a comment would satisfy a function-wide match
-/// while being unguarded. `bss.pricing_price_append_only()` shows the hazard
-/// concretely — `grandfather_until` appears in its **monotonicity** arm and not in
-/// the frozen-column one, so a function-wide `contains` would report it frozen
-/// when it is not.
-///
-/// # Panics
-/// When the function, the arm opener or the arm's closing `THEN` is absent: each
-/// of those is a guard that no longer has the shape this census reads, and a
-/// census that quietly returned an empty predicate would report every column
-/// unguarded — or, worse, be silenced with an exemption.
-pub async fn frozen_columns(
-    conn: &DatabaseConnection,
-    table: &str,
-    guard_function: &str,
-    arm_opens_on: &str,
-    sanctioned_mutable: &[&str],
-) -> FrozenColumns {
-    let owed = catalog_strings(
-        conn,
-        &format!(
-            "SELECT column_name AS v FROM information_schema.columns \
-             WHERE table_schema = 'bss' AND table_name = '{table}' ORDER BY 1"
-        ),
-    )
-    .await
-    .into_iter()
-    .filter(|column| !sanctioned_mutable.contains(&column.as_str()))
-    .collect();
-
-    let bodies = catalog_strings(
-        conn,
-        &format!(
-            "SELECT prosrc AS v FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-             WHERE n.nspname = 'bss' AND p.proname = '{guard_function}'"
-        ),
-    )
-    .await;
-    let body = bodies
-        .first()
-        .unwrap_or_else(|| panic!("the guard function bss.{guard_function}() must exist"));
-    let arm_start = body.find(arm_opens_on).unwrap_or_else(|| {
-        panic!("the frozen-column arm of bss.{guard_function}() must open on `{arm_opens_on}`")
-    });
-    let arm = &body[arm_start..];
-    let arm_end = arm
-        .find(" THEN")
-        .unwrap_or_else(|| panic!("the frozen-column arm of bss.{guard_function}() must close"));
-
-    FrozenColumns {
-        owed,
-        predicate: arm[..arm_end].to_owned(),
-    }
-}
-
-/// One text column of a catalog query, in order.
-pub async fn catalog_strings(conn: &DatabaseConnection, sql: &str) -> Vec<String> {
-    conn.query_all_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_owned(),
-    ))
-    .await
-    .expect("run the catalog query")
-    .iter()
-    .map(|row| row.try_get::<String>("", "v").expect("read the value"))
-    .collect()
 }

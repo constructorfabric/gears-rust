@@ -1,0 +1,366 @@
+{
+  "golden": "resolve_refusals",
+  "proves": "D-419 refusals, whole request: 400 QUERY_INVALID, DATE_INVALID, PIN_FOREIGN (a pin that does not parse, a forged pin on another entry's chain, a draft price, a value pin on a value-chain price, another tenant's price), PIN_DUPLICATE, PINS_TOO_MANY; 404 for an unknown revision, another tenant's revision and an item the revision lacks; 409 REVISION_NOT_PUBLISHED for a draft and a pending revision - each a plan resource error; and the pinned price read's 404 and its 400 ID_INVALID for an id that is not an id - each a price resource error",
+  "exchanges": [
+    {
+      "case": "no date",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>",
+      "status": 400,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "context": {
+          "field_violations": [
+            {
+              "field": "date",
+              "description": "DATE_INVALID",
+              "reason": "DATE_INVALID"
+            }
+          ],
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "a date that is not a calendar date",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-02-30",
+      "status": 400,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "context": {
+          "field_violations": [
+            {
+              "field": "date",
+              "description": "DATE_INVALID",
+              "reason": "DATE_INVALID"
+            }
+          ],
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "an unknown parameter",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-05&as_of=2026-10-05",
+      "status": 400,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "context": {
+          "field_violations": [
+            {
+              "field": "query",
+              "description": "QUERY_INVALID",
+              "reason": "QUERY_INVALID"
+            }
+          ],
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "a revision id that is not an id",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=pro-2&date=2026-10-05",
+      "status": 400,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "context": {
+          "field_violations": [
+            {
+              "field": "plan_revision_id",
+              "description": "QUERY_INVALID",
+              "reason": "QUERY_INVALID"
+            }
+          ],
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "a pin whose value is not spelled as a value",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-05&pins=<price:10>:EU",
+      "status": 400,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "context": {
+          "field_violations": [
+            {
+              "field": "pins",
+              "description": "PIN_FOREIGN",
+              "reason": "PIN_FOREIGN"
+            }
+          ],
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "a forged pin on another entry's chain",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-05&pins=<price:archive>",
+      "status": 400,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "context": {
+          "field_violations": [
+            {
+              "field": "pins",
+              "description": "PIN_FOREIGN",
+              "reason": "PIN_FOREIGN"
+            }
+          ],
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "a pin on a draft price",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-05&pins=<price:pro-draft>",
+      "status": 400,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "context": {
+          "field_violations": [
+            {
+              "field": "pins",
+              "description": "PIN_FOREIGN",
+              "reason": "PIN_FOREIGN"
+            }
+          ],
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "a value pin on a price that is not a default-chain price",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-05&pins=<price:storage-eu>:us",
+      "status": 400,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "context": {
+          "field_violations": [
+            {
+              "field": "pins",
+              "description": "PIN_FOREIGN",
+              "reason": "PIN_FOREIGN"
+            }
+          ],
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "a pin on another tenant's price",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-05&pins=<price:other-tenant>",
+      "status": 400,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "context": {
+          "field_violations": [
+            {
+              "field": "pins",
+              "description": "PIN_FOREIGN",
+              "reason": "PIN_FOREIGN"
+            }
+          ],
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "two pins for one item and value",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-05&pins=<price:10>,<price:12>",
+      "status": 400,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "context": {
+          "field_violations": [
+            {
+              "field": "pins",
+              "description": "PIN_DUPLICATE",
+              "reason": "PIN_DUPLICATE"
+            }
+          ],
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "1 001 pins",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-05&pins=<price:10>,... (1001 pins)",
+      "status": 400,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "context": {
+          "field_violations": [
+            {
+              "field": "pins",
+              "description": "PINS_TOO_MANY",
+              "reason": "PINS_TOO_MANY"
+            }
+          ],
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "an unknown revision",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:unknown>&date=2026-10-05",
+      "status": 404,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+        "title": "Not Found",
+        "status": 404,
+        "detail": "plan_revision not found",
+        "context": {
+          "resource_type": "gts.cf.bss.pricing.plan.v1~",
+          "resource_name": "plan_revision"
+        }
+      }
+    },
+    {
+      "case": "another tenant's revision",
+      "caller": "another tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-05",
+      "status": 404,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+        "title": "Not Found",
+        "status": 404,
+        "detail": "plan_revision not found",
+        "context": {
+          "resource_type": "gts.cf.bss.pricing.plan.v1~",
+          "resource_name": "plan_revision"
+        }
+      }
+    },
+    {
+      "case": "an item of another revision",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-05&item_id=<item:pro-1/legacy>",
+      "status": 404,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+        "title": "Not Found",
+        "status": 404,
+        "detail": "plan_item not found",
+        "context": {
+          "resource_type": "gts.cf.bss.pricing.plan.v1~",
+          "resource_name": "plan_item"
+        }
+      }
+    },
+    {
+      "case": "a draft revision",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-3>&date=2026-10-05",
+      "status": 409,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~",
+        "title": "Aborted",
+        "status": 409,
+        "detail": "REVISION_NOT_PUBLISHED",
+        "context": {
+          "reason": "REVISION_NOT_PUBLISHED",
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "a pending revision",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:trial-1>&date=2026-10-05",
+      "status": 409,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~",
+        "title": "Aborted",
+        "status": 409,
+        "detail": "REVISION_NOT_PUBLISHED",
+        "context": {
+          "reason": "REVISION_NOT_PUBLISHED",
+          "resource_type": "gts.cf.bss.pricing.plan.v1~"
+        }
+      }
+    },
+    {
+      "case": "an unknown price",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:unknown>",
+      "status": 404,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+        "title": "Not Found",
+        "status": 404,
+        "detail": "price not found",
+        "context": {
+          "resource_type": "gts.cf.bss.pricing.price.v1~",
+          "resource_name": "price"
+        }
+      }
+    },
+    {
+      "case": "a price id that is not an id",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/not-an-id",
+      "status": 400,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+        "title": "Invalid Argument",
+        "status": 400,
+        "detail": "Request validation failed",
+        "context": {
+          "field_violations": [
+            {
+              "field": "id",
+              "description": "ID_INVALID",
+              "reason": "ID_INVALID"
+            }
+          ],
+          "resource_type": "gts.cf.bss.pricing.price.v1~"
+        }
+      }
+    }
+  ]
+}

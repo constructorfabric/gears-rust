@@ -1,4 +1,7 @@
 {
   "gts_id": "gts.cf.e2e.registration.unresolved.v1~cf.e2e.registration.blocked.v1",
-  "content": { "name": "Blocked" }
+  "content": {
+    "name": "Blocked",
+    "payload": {}
+  }
 }

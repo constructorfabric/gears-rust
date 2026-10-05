@@ -33,7 +33,7 @@ The implementation went further, and this ADR records what was built:
 
 Chosen option: "In-process adapter per provider kind, with provider entries in Mini Chat config and OAGW upstreams provisioned by the gear".
 
-**Adapters.** `ProviderKind` (`mini-chat/src/infra/llm/providers/mod.rs`) selects the adapter. The kinds are:
+**Adapters.** The provider entry's `kind` selects the adapter. The kinds are:
 
 * `openai_responses` — OpenAI and Azure OpenAI Responses API;
 * `openai_chat_completions` — Chat Completions API;
@@ -42,9 +42,9 @@ Chosen option: "In-process adapter per provider kind, with provider entries in M
 
 Each catalog model names its `provider_id`, which points at a `providers.<id>` entry.
 
-**Tool support per adapter.** The Chat Completions adapter drops `file_search`, `web_search` and `code_interpreter` and keeps function tools. The vLLM Responses adapter drops all tools. The Anthropic adapter drops `file_search`. The domain service builds the tool list, tool guards, reserve surcharges and daily tool quota checks without knowing the adapter kind; the `web_search` tool is gated only by the catalog `tool_support.web_search`. On an adapter that drops a tool, the surcharge is still reserved, the guard is still sent and the daily quota is still checked, so the catalog `tool_support` must match the adapter.
+**Tool support per adapter.** The Chat Completions adapter drops `file_search`, `web_search` and `code_interpreter` and keeps function tools. The vLLM Responses adapter drops all tools. The Anthropic adapter drops `file_search`. The turn and stream services build the tool list, tool guards, reserve surcharges and daily tool quota checks without knowing the adapter kind; the `web_search` tool is gated only by the catalog `tool_support.web_search`. On an adapter that drops a tool, the surcharge is still reserved, the guard is still sent and the daily quota is still checked, so the catalog `tool_support` must match the adapter.
 
-**Provider entries.** Each entry (`mini-chat/src/config.rs`, `ProviderEntry`) has these fields:
+**Provider entries.** Each `providers.<id>` entry has these fields:
 
 * `kind`, `host`, `port`, `use_http`, `upstream_alias`, `api_path` (with a `{model}` placeholder);
 * `auth_plugin_type` and `auth_config` for the OAGW auth plugin;
@@ -54,15 +54,15 @@ Each catalog model names its `provider_id`, which points at a `providers.<id>` e
 
 `host` and `auth_config` support `${VAR}` expansion, both on the entry and in a tenant override.
 
-**OAGW provisioning.** In `start()` the gear obtains an S2S token via `authn_resolver` client credentials. It then registers an OAGW upstream and route for every provider entry (`mini-chat/src/infra/oagw_provisioning.rs`):
+**OAGW provisioning.** When the gear starts, it obtains an S2S token from `authn_resolver` (client credentials). It then registers an OAGW upstream and route for every provider entry:
 
-* `init()` fills `upstream_alias` with the host when it is not configured, so the alias is always passed to OAGW. The upstream is created, or reused when it already exists, under that alias. `ProviderResolver` is built in `init()` from these entries and routes by that alias. Registration runs on a copy of the entries: the alias OAGW returns is written into the copy, and the resolver does not see it.
+* During gear initialization, `upstream_alias` defaults to the host when it is not configured, so the alias is always passed to OAGW. The upstream is created, or reused when it already exists, under that alias. The provider resolver is built at initialization from these entries and routes by that alias. Registration runs on a copy of the entries: the alias OAGW returns is written into the copy, and the resolver does not see it.
 * A deterministically misconfigured entry fails startup.
 * An entry whose credstore secret is not yet readable is retried by a background reconcile loop.
 
-Requests are sent through the in-process `oagw_sdk::ServiceGatewayClientV1::proxy_request` to `{alias}{api_path}`.
+Requests are sent through the in-process OAGW client (`ServiceGatewayClientV1`, `proxy_request`) to `{alias}{api_path}`.
 
-**Storage dispatch.** `DispatchingFileStorage` and `DispatchingVectorStore` pick the file and vector-store implementation by the provider's `storage_kind`. For chats whose model is served by an `anthropic_messages` provider, uploaded images also get a secondary copy in the Anthropic Files API (`attachments.secondary_*` columns). Documents get no copy, and an image larger than `thumbnail.max_decode_bytes` gets no copy (its bytes are not kept in memory).
+**Storage dispatch.** A file-storage dispatcher and a vector-store dispatcher pick the file and vector-store implementation by the provider's `storage_kind`. For chats whose model is served by an `anthropic_messages` provider, uploaded images also get a secondary copy in the Anthropic Files API (`attachments.secondary_*` columns). Documents get no copy, and an image larger than `thumbnail.max_decode_bytes` gets no copy (its bytes are not kept in memory).
 
 The gear therefore declares `deps = [types_registry, authn_resolver, authz_resolver, oagw]` and `capabilities = [db, rest, stateful]`.
 
@@ -77,9 +77,9 @@ The gear therefore declares `deps = [types_registry, authn_resolver, authz_resol
 
 ### Confirmation
 
-* Unit tests per adapter: `openai_responses_tests.rs` and `vllm_responses_tests.rs` in `mini-chat/src/infra/llm/providers/`; the Chat Completions and Anthropic adapters have inline test modules in `openai_chat.rs` and `anthropic_messages.rs`.
-* Provisioning tests in `mini-chat/src/infra/oagw_provisioning.rs`.
-* E2E tests that use the `provider` fixture (directly or via `provider_chat`) run against both configured providers, `openai` and `azure` (`testing/e2e/suites/mini_chat/conftest.py`). Both E2E providers use `kind: openai_responses` (`config/base.yaml`); the Chat Completions, vLLM and Anthropic adapters have no E2E coverage.
+* Unit tests cover each adapter: OpenAI Responses, vLLM Responses, Chat Completions and Anthropic Messages.
+* Unit tests cover OAGW provisioning.
+* Provider-parametrized E2E scenarios run against both configured providers, `openai` and `azure`. Both E2E providers use `kind: openai_responses` in the E2E configuration; the Chat Completions, vLLM and Anthropic adapters have no E2E coverage.
 
 ## Pros and Cons of the Options
 
