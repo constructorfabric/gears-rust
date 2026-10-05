@@ -32,8 +32,10 @@ use crate::domain::Service;
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotSubjectDto {
-    /// Scope kind, for example `user`, or `tenant` for the tenant's own
-    /// Quotas only (its id must then be `tenant_id`).
+    /// Scope kind: the full GTS id of a scope instance, for example
+    /// `gts.cf.core.qe.scope.v1~cf.core.qe.user.v1`. The tenant scope
+    /// `gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1` selects the tenant's own
+    /// Quotas only, and its id must then be `tenant_id`.
     pub kind: String,
     /// Subject identifier.
     pub id: String,

@@ -2165,10 +2165,10 @@ pub struct QuotaSnapshot {
 /// projection; callers never name a projection.
 ///
 /// A filter describes a target, not an evaluation claim. A non-tenant kind
-/// (for example `user`) selects the active Quotas on the metric whose subject
-/// is that subject or the request's tenant. The `tenant` kind is a tenant-only
-/// filter: its `id` must equal the request's `tenant_id`, and it selects the
-/// tenant's own Quotas only.
+/// (for example [`SCOPE_USER`]) selects the active Quotas on the metric whose
+/// subject is that subject or the request's tenant. The tenant kind
+/// ([`SCOPE_TENANT`]) is a tenant-only filter: its `id` must equal the
+/// request's `tenant_id`, and it selects the tenant's own Quotas only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotSubject {
