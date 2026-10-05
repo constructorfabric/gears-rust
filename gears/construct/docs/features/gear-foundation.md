@@ -157,7 +157,7 @@ The client returns the note or a canonical error. It has no HTTP status of its o
 
 ### Start the Gear
 
-- [ ] `p1` - **ID**: `cpt-cf-construct-algo-gear-foundation-start-gear`
+- [x] `p1` - **ID**: `cpt-cf-construct-algo-gear-foundation-start-gear`
 
 **Input**: The gear configuration (optional), the database provider and the AuthZ resolver client, both supplied by the runtime.
 
@@ -166,35 +166,35 @@ The client returns the note or a canonical error. It has no HTTP status of its o
 The gear declares the dependency `authz_resolver` and the capabilities `rest` and `db`. It holds no raw database connection of its own. The runtime supplies the database provider, and all statements go through the secure ORM.
 
 **Steps** (the order of `init` in `gear.rs`):
-1. [ ] - `p1` - Read the config, or use defaults when none is set. The only key is `max_text_length` (bytes, default 1000). An unknown key is rejected. - `inst-start-config`
-2. [ ] - `p1` - Ask the runtime for the database provider. Fail `init` if the gear has none. - `inst-start-db`
-3. [ ] - `p1` - Resolve the AuthZ resolver client from ClientHub and build the policy enforcer. Fail `init` if it is missing. - `inst-start-authz`
-4. [ ] - `p1` - Convert the config to the service limit with `ServiceConfig::try_from`, which checks the range - `inst-start-config-range`
-   1. [ ] - `p1` - **IF** `max_text_length` is 0 or above 65535 (the capacity of a MySQL TEXT column), fail `init` with an error that names the allowed range - `inst-start-config-fail`
-5. [ ] - `p1` - Build the service from the database provider, the repository, the policy enforcer and the validated limit. Store it once. **IF** the gear is initialized a second time, fail. - `inst-start-service`
-6. [ ] - `p1` - Register `ConstructClientV1`, backed by the service, in ClientHub - `inst-start-client`
-7. [ ] - `p1` - **RETURN** success - `inst-start-return`
+1. [x] - `p1` - Read the config, or use defaults when none is set. The only key is `max_text_length` (bytes, default 1000). An unknown key is rejected. - `inst-start-config`
+2. [x] - `p1` - Ask the runtime for the database provider. Fail `init` if the gear has none. - `inst-start-db`
+3. [x] - `p1` - Resolve the AuthZ resolver client from ClientHub and build the policy enforcer. Fail `init` if it is missing. - `inst-start-authz`
+4. [x] - `p1` - Convert the config to the service limit with `ServiceConfig::try_from`, which checks the range - `inst-start-config-range`
+   1. [x] - `p1` - **IF** `max_text_length` is 0 or above 65535 (the capacity of a MySQL TEXT column), fail `init` with an error that names the allowed range - `inst-start-config-fail`
+5. [x] - `p1` - Build the service from the database provider, the repository, the policy enforcer and the validated limit. Store it once. **IF** the gear is initialized a second time, fail. - `inst-start-service`
+6. [x] - `p1` - Register `ConstructClientV1`, backed by the service, in ClientHub - `inst-start-client`
+7. [x] - `p1` - **RETURN** success - `inst-start-return`
 
 **Capability hooks, called separately by the runtime**:
-1. [ ] - `p1` - The runtime calls the database capability hook, which returns the migration set with one migration, `initial_001`. - `inst-start-migrations`
-2. [ ] - `p1` - When the runtime registers REST routes, the REST capability hook registers the single route on the router. It fails if the service is not initialized. - `inst-start-rest`
+1. [x] - `p1` - The runtime calls the database capability hook, which returns the migration set with one migration, `initial_001`. - `inst-start-migrations`
+2. [x] - `p1` - When the runtime registers REST routes, the REST capability hook registers the single route on the router. It fails if the service is not initialized. - `inst-start-rest`
 
 ### Validate the Note Text
 
-- [ ] `p1` - **ID**: `cpt-cf-construct-algo-gear-foundation-validate-text`
+- [x] `p1` - **ID**: `cpt-cf-construct-algo-gear-foundation-validate-text`
 
 **Input**: The text of a new note and the configured maximum length in bytes.
 
 **Output**: Accepted, or a validation error on the field `text`.
 
 **Steps**:
-1. [ ] - `p1` - **IF** the text is empty after trimming white space - `inst-text-blank`
-   1. [ ] - `p1` - **RETURN** a validation error "must not be empty" - `inst-text-blank-return`
-2. [ ] - `p1` - **IF** the text contains the NUL character - `inst-text-nul`
-   1. [ ] - `p1` - **RETURN** a validation error "must not contain the NUL character" - `inst-text-nul-return`
-3. [ ] - `p1` - **IF** the text is longer than the maximum, counted in bytes and not in characters - `inst-text-long`
-   1. [ ] - `p1` - **RETURN** a validation error that names the maximum - `inst-text-long-return`
-4. [ ] - `p1` - **RETURN** accepted. A text of exactly the maximum is accepted. - `inst-text-ok`
+1. [x] - `p1` - **IF** the text is empty after trimming white space - `inst-text-blank`
+   1. [x] - `p1` - **RETURN** a validation error "must not be empty" - `inst-text-blank-return`
+2. [x] - `p1` - **IF** the text contains the NUL character - `inst-text-nul`
+   1. [x] - `p1` - **RETURN** a validation error "must not contain the NUL character" - `inst-text-nul-return`
+3. [x] - `p1` - **IF** the text is longer than the maximum, counted in bytes and not in characters - `inst-text-long`
+   1. [x] - `p1` - **RETURN** a validation error that names the maximum - `inst-text-long-return`
+4. [x] - `p1` - **RETURN** accepted. A text of exactly the maximum is accepted. - `inst-text-ok`
 
 ### Scope Note Access to the Caller's Tenant
 
@@ -215,22 +215,22 @@ The gear declares the dependency `authz_resolver` and the capabilities `rest` an
 
 ### Map Domain Errors to Problem Errors
 
-- [ ] `p1` - **ID**: `cpt-cf-construct-algo-gear-foundation-map-errors`
+- [x] `p1` - **ID**: `cpt-cf-construct-algo-gear-foundation-map-errors`
 
 **Input**: A domain error.
 
 **Output**: A canonical error. On the REST route it is written as an RFC 9457 Problem response. The resource type id for notes is written in the source as `cf.construct.foundation.note.v1~`, with the toolkit's `gts_id!` macro. The final wire form was not confirmed (the macro adds a configurable prefix at compile time, and the tests build the expected value with the same macro).
 
 **Steps**:
-1. [ ] - `p1` - First, scope errors from the secure ORM are turned into domain errors (`sea_orm_repo.rs`): denied and tenant-not-in-scope become forbidden, an invalid scope becomes internal, and a database error stays a database error. An unknown scope-error variant is logged at error level and then becomes internal. - `inst-map-scope`
-2. [ ] - `p1` - **IF** the error is not found - `inst-map-not-found`
-   1. [ ] - `p1` - **RETURN** not found (404) with the message "Note not found" and the resource type "note" - `inst-map-not-found-return`
-3. [ ] - `p1` - **IF** the error is a validation error - `inst-map-validation`
-   1. [ ] - `p1` - **RETURN** invalid argument (400) with a field violation: the field, the message and the reason `VALIDATION_ERROR` - `inst-map-validation-return`
-4. [ ] - `p1` - **IF** the error is forbidden - `inst-map-forbidden`
-   1. [ ] - `p1` - Log a warning (in `api/rest/error.rs`; an enforcer denial was already logged at debug level when it became a domain error). **RETURN** permission denied (403) with the reason `ACCESS_DENIED`. The internal message is not sent to the caller. - `inst-map-forbidden-return`
-5. [ ] - `p1` - **IF** the error is internal or from the database - `inst-map-internal`
-   1. [ ] - `p1` - Log at error level. **RETURN** internal (500). The tests check that the `detail` of the response does not contain the internal text. - `inst-map-internal-return`
+1. [x] - `p1` - First, scope errors from the secure ORM are turned into domain errors (`sea_orm_repo.rs`): denied and tenant-not-in-scope become forbidden, an invalid scope becomes internal, and a database error stays a database error. An unknown scope-error variant is logged at error level and then becomes internal. - `inst-map-scope`
+2. [x] - `p1` - **IF** the error is not found - `inst-map-not-found`
+   1. [x] - `p1` - **RETURN** not found (404) with the message "Note not found" and the resource type "note" - `inst-map-not-found-return`
+3. [x] - `p1` - **IF** the error is a validation error - `inst-map-validation`
+   1. [x] - `p1` - **RETURN** invalid argument (400) with a field violation: the field, the message and the reason `VALIDATION_ERROR` - `inst-map-validation-return`
+4. [x] - `p1` - **IF** the error is forbidden - `inst-map-forbidden`
+   1. [x] - `p1` - Log a warning (in `api/rest/error.rs`; an enforcer denial was already logged at debug level when it became a domain error). **RETURN** permission denied (403) with the reason `ACCESS_DENIED`. The internal message is not sent to the caller. - `inst-map-forbidden-return`
+5. [x] - `p1` - **IF** the error is internal or from the database - `inst-map-internal`
+   1. [x] - `p1` - Log at error level. **RETURN** internal (500). The tests check that the `detail` of the response does not contain the internal text. - `inst-map-internal-return`
 
 ## 4. States (CDSL)
 
@@ -240,7 +240,7 @@ None. A foundation note has no lifecycle: it is created once and read. It is nev
 
 ### Gear Anatomy and Startup
 
-- [ ] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-anatomy`
+- [x] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-anatomy`
 
 The system **MUST** be built as two crates with separated layers: the SDK crate `cf-gears-construct-sdk` (client trait and models, with no infrastructure types) and the gear crate `cf-gears-construct` (API, domain and infrastructure layers). The gear **MUST** declare the dependency `authz_resolver` and the capabilities `rest` and `db`, and **MUST** hold no raw database connection. It **MUST** start as in `cpt-cf-construct-algo-gear-foundation-start-gear`.
 
@@ -255,7 +255,7 @@ The system **MUST** be built as two crates with separated layers: the SDK crate 
 
 ### Create Route
 
-- [ ] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-create-route`
+- [x] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-create-route`
 
 The system **MUST** expose `POST /construct/v1/foundation-notes`, authenticated, taking a JSON body with `text` and answering 201 with id, tenant id and text. An empty or invalid JSON body with a JSON content type **MUST** get 400, valid JSON of the wrong shape (for example a `text` that is not a string) **MUST** get 422, and a request without a JSON content type, whatever the body, **MUST** get 415. All three **MUST** be `application/problem+json`, produced by the toolkit's `Json` extractor before the handler body runs. A body the server cannot read, or one over the framework body limit, **MUST** get the status of the extractor's rejection (for example 413) as `application/problem+json`. The route **MUST** be registered with OperationBuilder with the operation id `construct.create_foundation_note` and the tag `Foundation`, and it **MUST** declare explicitly that it requires no license feature: it calls `.require_license_features::<License>([])` with an empty list, which the builder demands for an authenticated route and which sets no license requirement on the operation. The handler **MUST** take the `SecurityContext` and the service from the request extensions, then the `Json` body, in that parameter order.
 
@@ -270,7 +270,7 @@ The system **MUST** expose `POST /construct/v1/foundation-notes`, authenticated,
 
 ### Text Validation
 
-- [ ] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-text-validation`
+- [x] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-text-validation`
 
 The system **MUST** reject a text that is empty after trimming, contains the NUL character, or is longer than the configured maximum in bytes. It **MUST** accept a text of exactly the maximum. The maximum **MUST** be between 1 and 65535 and default to 1000.
 
@@ -284,7 +284,7 @@ The system **MUST** reject a text that is empty after trimming, contains the NUL
 
 ### Permission Check and Tenant Scoping
 
-- [ ] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-access-scope`
+- [x] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-access-scope`
 
 The system **MUST** check the permission for each operation (`create`, `get`) on the resource type `construct.foundation_note` through the AuthZ resolver, **MUST** take the tenant only from the security context, and **MUST** limit every insert and read to the returned scope. A note of another tenant **MUST** look the same as an unknown note. This is the platform pattern for `cpt-cf-construct-fr-tenant-isolation` and `cpt-cf-construct-fr-access-control`.
 
@@ -301,7 +301,7 @@ The system **MUST** check the permission for each operation (`create`, `get`) on
 
 ### Client in ClientHub
 
-- [ ] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-client`
+- [x] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-client`
 
 The system **MUST** provide `ConstructClientV1` in the SDK with `create_note` and `get_note`, both taking a security context and returning canonical errors. The gear **MUST** register it in ClientHub.
 
@@ -315,7 +315,7 @@ The system **MUST** provide `ConstructClientV1` in the SDK with `create_note` an
 
 ### RFC 9457 Error Behavior
 
-- [ ] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-error-mapping`
+- [x] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-error-mapping`
 
 The system **MUST** answer every error as an RFC 9457 Problem with the status in `cpt-cf-construct-algo-gear-foundation-map-errors` and **MUST NOT** leak internal detail in 403 or 500 answers. Body errors (400, 422, 415) are also Problems, produced by the toolkit's `Json` extractor (see `cpt-cf-construct-dod-gear-foundation-create-route`). An unknown scope-error variant **MUST** be logged at error level before it is mapped. An enforcer denial is logged at debug level in the domain mapping and at warn level in the REST mapping.
 
@@ -329,7 +329,7 @@ The system **MUST** answer every error as an RFC 9457 Problem with the status in
 
 ### Tenant-Scoped Storage and Migration
 
-- [ ] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-storage`
+- [x] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-storage`
 
 The system **MUST** supply to the runtime a migration that creates the table `construct__foundation_notes` (id, tenant id, text) and the index `idx_construct__foundation_notes__tenant` on the tenant column, following the `construct__` naming prefix. The migration **MUST** be safe to run twice (create if not exists). The entity **MUST** be declared tenant-scoped for the secure ORM, with the tenant column `tenant_id` and the resource column `id`.
 
