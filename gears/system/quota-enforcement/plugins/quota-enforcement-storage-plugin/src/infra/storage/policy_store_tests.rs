@@ -558,3 +558,58 @@ async fn scope_read_resolves_recreated_policy_without_old_history() {
     assert_eq!(current.state, PolicyVersionState::Active);
     handle.stop().await;
 }
+
+#[tokio::test]
+async fn transitions_on_an_unknown_policy_or_version_are_refused_and_write_nothing() {
+    let db = test_db().await;
+    let (handle, outbox) = bound_outbox(&db).await;
+    let store = SqlPolicyStore::new(db.clone(), outbox);
+    let unknown = PolicyId::new("no-such-policy");
+
+    assert_eq!(
+        store
+            .update_policy(&context(), unknown.clone(), patch(1), &[])
+            .await
+            .expect_err("unknown policy"),
+        StorageError::PolicyNotFound {
+            policy_id: unknown.clone()
+        }
+    );
+    assert_eq!(
+        store
+            .rollback_policy(&context(), unknown.clone(), 1, None, &[])
+            .await
+            .expect_err("unknown policy"),
+        StorageError::PolicyNotFound {
+            policy_id: unknown.clone()
+        }
+    );
+
+    let id = store
+        .create_policy(&context(), draft(), &[])
+        .await
+        .expect("create")
+        .policy_id;
+    let before = enqueued_messages(&db).await.len();
+    assert_eq!(
+        store
+            .rollback_policy(&context(), id.clone(), 7, None, &[policy_changed(None)])
+            .await
+            .expect_err("no version 7"),
+        StorageError::UnknownPolicyVersion {
+            policy_id: id.clone(),
+            version: 7
+        }
+    );
+    assert_eq!(
+        enqueued_messages(&db).await.len(),
+        before,
+        "a refused rollback enqueues nothing"
+    );
+    assert_eq!(
+        store.read_policy_version(&id, 2).await.expect("read"),
+        None,
+        "and creates no version"
+    );
+    handle.stop().await;
+}

@@ -587,3 +587,33 @@ async fn a_contract_read_through_brackets_is_persisted_and_the_version_rebuilds_
         })
         .expect("the version rebuilds from what storage holds");
 }
+
+#[tokio::test]
+async fn an_oversized_config_a_zero_timeout_or_a_long_comment_is_refused_before_any_write() {
+    let h = harness(permitted()).await;
+    let policies = h.service.policies().expect("bound");
+    let reason = |err: DomainError| match err {
+        DomainError::InvalidPolicy { reason, .. } => reason,
+        other => panic!("expected an invalid policy, got {other:?}"),
+    };
+
+    let mut oversized = mrw(PolicyScope::Metric { metric: tokens() });
+    oversized.engine_config = json!({ "padding": "x".repeat(20_000) });
+    let mut zero_timeout = mrw(PolicyScope::Metric { metric: tokens() });
+    zero_timeout.timeout_ms = Some(0);
+    let mut long_comment = mrw(PolicyScope::Metric { metric: tokens() });
+    long_comment.comment = Some("c".repeat(2_000));
+
+    for (spec, expected) in [
+        (oversized, "POLICY_CONFIG_TOO_LARGE"),
+        (zero_timeout, "INVALID_TIMEOUT"),
+        (long_comment, "COMMENT_TOO_LONG"),
+    ] {
+        let err = policies.create(&ctx(), spec).await.expect_err(expected);
+        assert_eq!(reason(err), expected);
+    }
+    assert!(
+        transitions(&h).is_empty(),
+        "a refused policy reaches neither storage nor the transition metric"
+    );
+}

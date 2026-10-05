@@ -580,3 +580,40 @@ async fn an_item_the_transport_could_not_convert_fails_after_the_envelope_checks
         .at_item(1)
     );
 }
+
+#[tokio::test]
+async fn an_empty_envelope_or_a_blank_envelope_key_is_refused_before_any_pdp_call() {
+    let pdp = Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]));
+    let h = Harness::new(pdp.clone()).await;
+
+    let empty = h
+        .quotas()
+        .bulk_create(&ctx(), creates("pack", Vec::new()))
+        .await
+        .expect_err("no items");
+    assert_eq!(
+        empty,
+        DomainError::InvalidArgument {
+            field: "items",
+            reason: tokens::BATCH_EMPTY,
+        }
+    );
+
+    let blank = h
+        .quotas()
+        .bulk_create(&ctx(), creates("  ", vec![draft("u1")]))
+        .await
+        .expect_err("blank envelope key");
+    assert_eq!(
+        blank,
+        DomainError::InvalidArgument {
+            field: "idempotency_key",
+            reason: tokens::IDEMPOTENCY_KEY_REQUIRED,
+        }
+    );
+    assert_eq!(
+        pdp.calls(),
+        0,
+        "envelope checks come before any authorization"
+    );
+}

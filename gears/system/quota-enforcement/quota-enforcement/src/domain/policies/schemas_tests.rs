@@ -163,3 +163,77 @@ async fn adding_a_resource_projection_strands_only_policies_that_read_resources(
         "{err:?}"
     );
 }
+
+fn reason_of(err: DomainError) -> &'static str {
+    match err {
+        DomainError::InvalidPolicy { reason, .. } => reason,
+        other => panic!("expected an invalid policy, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_cel_snapshot_outside_or_without_the_catalogue_is_refused() {
+    let full = CatalogPolicySchemas::new(catalog(false).await, limits());
+    let foreign = PolicyScope::Metric {
+        metric: MetricId::parse(crate::test_support::METRIC_OTHER).expect("metric"),
+    };
+    let err = full
+        .snapshot(&foreign, "cel", EnvironmentInputs::ALL)
+        .await
+        .expect_err("a metric no projection admits");
+    assert_eq!(reason_of(err), DomainError::PROJECTION_NOT_RESOLVABLE);
+
+    let registry = FakeContractRegistry::llm_gateway();
+    let metrics = RecordingMetrics::default();
+    let empty = Arc::new(
+        CatalogBuilder::new(&registry, &metrics)
+            .build(&CatalogConfig {
+                subject_projections: Vec::new(),
+                resource_projections: Vec::new(),
+            })
+            .await
+            .expect("an empty catalogue builds"),
+    );
+    let err = CatalogPolicySchemas::new(empty, limits())
+        .snapshot(&PolicyScope::Global, "cel", EnvironmentInputs::ALL)
+        .await
+        .expect_err("nothing to type-check against");
+    assert_eq!(reason_of(err), "POLICY_SCHEMA_EMPTY");
+}
+
+#[tokio::test]
+async fn each_snapshot_bound_refuses_with_its_own_reason() {
+    let catalogue = catalog(true).await;
+    let bounded = |bytes, schemas, depth| {
+        CatalogPolicySchemas::new(
+            Arc::clone(&catalogue),
+            SnapshotLimits {
+                bytes,
+                schemas,
+                depth,
+            },
+        )
+    };
+    let generous = limits();
+    let cases = [
+        (
+            bounded(generous.bytes, 0, generous.depth),
+            "POLICY_SCHEMA_TOO_LARGE",
+        ),
+        (
+            bounded(16, generous.schemas, generous.depth),
+            "POLICY_SCHEMA_TOO_LARGE",
+        ),
+        (
+            bounded(generous.bytes, generous.schemas, 1),
+            "POLICY_SCHEMA_TOO_DEEP",
+        ),
+    ];
+    for (schemas, expected) in cases {
+        let err = schemas
+            .snapshot(&scope(), "cel", EnvironmentInputs::ALL)
+            .await
+            .expect_err(expected);
+        assert_eq!(reason_of(err), expected);
+    }
+}

@@ -461,3 +461,69 @@ fn a_bulk_item_error_keeps_its_category_and_names_the_item() {
         internal.detail()
     );
 }
+
+/// The variants the status table does not reach: each keeps its documented
+/// status and names its own precondition token or dependency on the wire.
+#[test]
+fn the_remaining_variants_map_to_their_status_and_their_own_token() {
+    let cases: Vec<(DomainError, u16, &str)> = vec![
+        (
+            DomainError::OverCommitNotAuthorized {
+                reserved: 5,
+                actual: 9,
+            },
+            400,
+            "OVER_COMMIT_NOT_AUTHORIZED",
+        ),
+        (
+            DomainError::MetricNotRegistered {
+                metric: "gts.m".to_owned(),
+            },
+            400,
+            "METRIC_NOT_REGISTERED",
+        ),
+        (
+            DomainError::MetricNotQuotaGated {
+                metric: "gts.m".to_owned(),
+            },
+            400,
+            "METRIC_NOT_QUOTA_GATED",
+        ),
+        (
+            DomainError::PolicyScopeOccupied {
+                scope: quota_enforcement_sdk::PolicyScope::Global,
+            },
+            409,
+            "POLICY_SCOPE_OCCUPIED",
+        ),
+        (
+            DomainError::InvalidPluginInstance {
+                kind: PluginKind::Storage,
+                gts_id: "gts.x".to_owned(),
+                reason: "bad".to_owned(),
+            },
+            503,
+            "plugin unavailable",
+        ),
+        (
+            DomainError::PluginClientNotRegistered {
+                kind: PluginKind::Storage,
+                gts_id: "gts.x".to_owned(),
+            },
+            503,
+            "plugin unavailable",
+        ),
+        (
+            DomainError::ClusterUnavailable("down".to_owned()),
+            503,
+            "cluster unavailable",
+        ),
+    ];
+    for (err, expected, token) in cases {
+        let label = format!("{err:?}");
+        let problem = Problem::from(CanonicalError::from(err));
+        assert_eq!(problem.status, Some(expected), "{label}");
+        let body = serde_json::to_string(&problem).expect("problem serializes");
+        assert!(body.contains(token), "{label}: {body}");
+    }
+}

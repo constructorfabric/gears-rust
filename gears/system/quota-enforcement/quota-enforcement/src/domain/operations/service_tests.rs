@@ -525,3 +525,37 @@ async fn a_replayed_denial_is_counted_once_however_the_replay_arrives() {
         "a replay is one operation reported twice, not a second denial"
     );
 }
+
+#[tokio::test]
+async fn a_replica_with_a_cold_cache_replays_or_refuses_from_the_stored_record() {
+    let h = Harness::new().await;
+    let id = h.quota(Some(100)).await;
+    let original = h
+        .operations()
+        .debit(&ctx(), debit(10, "k1"))
+        .await
+        .expect("debit");
+
+    // A second replica: its replay cache is empty, so only the record answers.
+    let replica = Harness::new_over(&h).await;
+    let replayed = replica
+        .operations()
+        .debit(&ctx(), debit(10, "k1"))
+        .await
+        .expect("replay");
+    assert_eq!(replayed, original, "the stored decision, verbatim");
+    assert_eq!(h.consumed(id), 10, "applied once");
+    assert_eq!(replica.metrics.replays(), vec![OperationKind::Debit]);
+
+    let cold = Harness::new_over(&h).await;
+    let err = cold
+        .operations()
+        .debit(&ctx(), debit(20, "k1"))
+        .await
+        .expect_err("the same key under another amount");
+    assert!(
+        matches!(err, DomainError::IdempotencyPayloadMismatch),
+        "{err:?}"
+    );
+    assert_eq!(h.consumed(id), 10);
+}

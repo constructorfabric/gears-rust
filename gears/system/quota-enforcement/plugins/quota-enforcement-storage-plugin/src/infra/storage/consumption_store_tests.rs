@@ -312,6 +312,21 @@ impl Harness {
             .map_or(0, |snapshot| snapshot.consumed)
     }
 
+    /// The current period row's counter, read directly: a snapshot skips a
+    /// deactivated Quota.
+    async fn period_consumed(&self, id: QuotaId) -> i64 {
+        let conn = self.db.conn().expect("conn");
+        crate::infra::storage::repo::consumption_counter_repo::find_latest(
+            &conn,
+            &AccessScope::allow_all(),
+            id.as_uuid(),
+        )
+        .await
+        .expect("read the period row")
+        .expect("the period row exists")
+        .consumed
+    }
+
     async fn events(&self) -> Vec<String> {
         enqueued_messages(&self.db)
             .await
@@ -1789,5 +1804,101 @@ async fn a_batch_spans_allocation_and_consumption_quotas() {
     assert_eq!(allowed(&outcome), [true, true]);
     assert_eq!(h.consumed("u1", allocation).await, 7);
     assert_eq!(h.consumed("u2", consumption).await, 9);
+    h.down().await;
+}
+
+// --- consumption leases and acquisition outcomes ---------------------------
+
+#[tokio::test]
+async fn deactivating_a_consumption_quota_returns_its_lease_hold_to_the_period_row() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(100), Vec::new()).await;
+    let acquired = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let token = acquired.get().token.expect("acquired");
+    assert_eq!(
+        h.period_consumed(id).await,
+        40,
+        "the hold occupies the period"
+    );
+
+    let outcome = h
+        .quotas
+        .deactivate_quota(&actor(), &scope_for(tenant()), id, &[])
+        .await
+        .expect("deactivate");
+    assert_eq!(outcome.resolved_leases, vec![token]);
+    assert_eq!(
+        h.period_consumed(id).await,
+        0,
+        "the cascade gives the hold back to the period row"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn the_first_writer_returns_an_expired_consumption_hold() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(100), Vec::new()).await;
+    h.acquire("u1", 80, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    assert_eq!(h.consumed("u1", id).await, 80);
+
+    // Past the TTL, inside the same daily period, with no sweeper.
+    h.set_now(DAY_ONE + time::Duration::hours(2));
+    h.debit("u1", 30, &write(OperationType::Debit, "d1", 2))
+        .await
+        .expect("debit");
+    assert_eq!(
+        h.consumed("u1", id).await,
+        30,
+        "the debit reconciled the expired hold on its period row"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_repeated_acquisition_replays_the_stored_lease() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let first = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    assert!(matches!(first, TransitionOutcome::Applied(_)));
+
+    let replay = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("replay");
+    match replay {
+        TransitionOutcome::NoOp(lease) => assert_eq!(&lease, first.get(), "the same lease"),
+        TransitionOutcome::Applied(_) => panic!("a replay must not hold again"),
+    }
+    assert_eq!(h.consumed("u1", id).await, 40, "held once");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_denied_acquisition_holds_nothing_and_returns_no_token() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(10)).await;
+    let outcome = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("a denial is an outcome, not an error");
+    let lease = outcome.get();
+    assert_eq!(lease.token, None);
+    assert!(
+        matches!(
+            &lease.decision.result,
+            DecisionResult::Denied { violated_quota_ids, .. } if violated_quota_ids == &vec![id]
+        ),
+        "{lease:?}"
+    );
+    assert_eq!(h.consumed("u1", id).await, 0);
     h.down().await;
 }
