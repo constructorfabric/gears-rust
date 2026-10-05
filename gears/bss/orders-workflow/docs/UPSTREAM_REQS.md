@@ -1130,9 +1130,10 @@ that an invocation is pinned to "the exact version at start time"
 `deprecated` versions are callable (line 924). The ask is (1) that a trigger starts the newest
 `active` version of the major it names, or the version its binding pins, stated as one rule;
 (2) that a binding **MAY** pin an exact version, so a version is switched on by re-pointing the
-binding rather than by deprecating its predecessor; and (3) optionally, a binding scoped to a
-tenant or a share of events, so a candidate version can start the orders of a canary seller
-before all others.
+binding rather than by deprecating its predecessor; and (3) a binding scoped to a tenant or a
+share of events, so a candidate version can start the orders of a canary seller before all
+others. Item (3) is **required** since `DECISIONS.md` D-207: it is the only staged-rollout
+mechanism this design accepts, since a definition per tenant or segment is excluded (PRD §5.3).
 
 - **What the design cannot do until it lands**: know which version new orders start on after a
   publish. The publish job therefore deprecates the replaced version in the same run, so that one
@@ -1550,6 +1551,13 @@ it would shorten (D-105).
    §13, §15 and §16 that the engine is selected (ADR-0011) and that `definition_source = code` is the
    shipping mode until the §2.9 asks are answered. Applied to the PRD on 2026-10-02.
 
+19. **§5.3 and §12 — customization and extensibility scope (D-207).** The PRD **MUST** state that
+   this gear is a canonical, platform-operated process with four per-seller policy settings, list
+   per kind of change what is adjustable, by whom and through which vehicle, why the rest is
+   excluded and what reopens it, and carry acceptance criteria for the seller-policy, publish-job,
+   release and no-tenant-code limits. This also answers item 7's question on tenant-authored
+   steps: none in phase 1 (Q-10). Applied to the PRD on 2026-10-05.
+
 ## 5. Traceability
 
 - **PRD**: [`./PRD.md`](./PRD.md) — §6.1 (Fulfillment Plan Construction), §6.2 (Approval
@@ -1570,7 +1578,7 @@ it would shorten (D-105).
   authorization, §2.8); `ADR/0011`, `ADR/0012`, `ADR/0013` and `DECISIONS.md` D-65…D-157, Q-10…Q-13
   (serverless-runtime, §2.9); `DECISIONS.md` D-110 (the `failure_reason` coverage ask, §2.4);
   D-91 and Q-08 (the overlap read's fail-closed reason, §2.1); D-97 as amended (no further
-  Subscriptions ask, §2.1); D-72, D-65, D-105 as amended, D-134 and D-140 (PRD amendments 11–14, §4)
+  Subscriptions ask, §2.1); D-72, D-65, D-105 as amended, D-134 and D-140 (PRD amendments 11–14, §4); D-207 (customization scope, PRD amendment 19 and the §2.9 trigger version-selection ask)
 - **Platform register**: serverless-runtime has no upstream-requirements register; §2.9 cites its
   [DESIGN.md](../../../serverless-runtime/docs/DESIGN.md), [PRD.md](../../../serverless-runtime/docs/PRD.md),
   [NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md) and ADR-0004/0005 by line

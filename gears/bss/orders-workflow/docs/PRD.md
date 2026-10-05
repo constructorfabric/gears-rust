@@ -27,6 +27,7 @@ Updated:  2026-09-01 by Virtuozzo International GmbH
 - [5. Scope](#5-scope)
   - [5.1 In Scope](#51-in-scope)
   - [5.2 Out of Scope](#52-out-of-scope)
+  - [5.3 Customization and Extensibility (Phase 1)](#53-customization-and-extensibility-phase-1)
 - [6. Functional Requirements](#6-functional-requirements)
   - [6.1 Process State Ownership](#61-process-state-ownership)
   - [6.2 Approval Execution](#62-approval-execution)
@@ -55,6 +56,7 @@ Updated:  2026-09-01 by Virtuozzo International GmbH
   - [Boundary with Orders Lifecycle (R1–R5)](#boundary-with-orders-lifecycle-r1r5)
   - [Non-Functional Requirements (Show-Stoppers)](#non-functional-requirements-show-stoppers)
   - [Authorization](#authorization)
+  - [Customization and Extensibility](#customization-and-extensibility)
 - [13. Dependencies](#13-dependencies)
 - [14. Assumptions](#14-assumptions)
 - [15. Open Questions](#15-open-questions)
@@ -232,6 +234,26 @@ No module-specific deviations — project defaults apply.
 - **Approval routing configuration authoring** → the approval policy adapter's library implementation (Open Questions §15; `DECISIONS.md` Q-14).
 - **Change-category orders** (`category = change`) — out of scope for this phase. Lifecycle rejects that category until its path ships; this gear defines process only for `new_sale`.
 - **System-driven subscription transitions** (renewal, trial conversion, dunning-driven suspension) → remain owned by Subscriptions; they produce no order. Commercially initiated changes are inside the Orders boundary, phased per the Lifecycle PRD (§1.1, §15 there).
+
+### 5.3 Customization and Extensibility (Phase 1)
+
+Orders Workflow is a **canonical, platform-operated process** protecting a `p1` order-taking saga, with a deliberately small set of per-seller policy settings. It is not a tenant-configurable order-orchestration product in this phase. Customization lives in the gears that own the meaning: order data in Orders Lifecycle, decomposition in the catalog (PriceBook), approval routing in the approval policy adapter (`DECISIONS.md` D-207). Every change reaches only process instances started after it (§5.2).
+
+| **Kind of change** | **Phase 1** | **Vehicle and owner** | **Why the rest is excluded** | **Reopens when** |
+|---|---|---|---|---|
+| Process flow: reorder, insert or drop a composable step; a wait, a retry, a branch over operation-result enums | Yes, platform-wide | A new definition version, published only by the Orders definition publish job after validation and the behavioural gate (D-138) | — | — |
+| Seller- or tenant-authored definition fragments; tenant functions, scripts, hooks or connectors | No | — | A new authorship surface over a `p1` saga; the platform has no pre-publish validation hook or publish audit yet; no definition `call` targets a platform Function (D-136) | The serverless-runtime validation-hook and publish-audit asks land (`DECISIONS.md` Q-10) |
+| A different definition per market, channel, product or order class | No, deliberately | — | Each variant is another protected process to gate and audit; commercial variation belongs in seller policy, in branches inside the one definition, or in the owning gear | Not planned |
+| Staged rollout of a version to a tenant or a share of orders | No, blocked on the platform | A version-scoped trigger binding | — | The serverless-runtime trigger version-selection ask lands (`UPSTREAM_REQS.md` §2.9) |
+| Per-seller runtime policy | Yes: approval escalation window, overdue window, manual-task SLA class, partial-failure policy | A seller-policy write, bounds-checked, recorded and pinned onto new process records only (D-134, D-140) | Any other runtime setting is a definition or release change | A PRD change |
+| What a step does: guards, seam calls, schemas, new operations, the protected list, manual-task actions, tables | Not without a release | An Orders release of the owning slice, then a definition version that uses it (DESIGN §4.7) | Keeps the protected invariants in reviewed code | — |
+| Lifecycle triggers, process events, reasons, process phases | Not without a PRD change | A PRD change and an Orders release | Closed sets by design (§6.1, §6.6) | — |
+| Custom order properties or characteristics | Not in this gear | Orders Lifecycle or the catalog; they reach Workflow only as references (ADR-0013) | Workflow carries references, never a local extension bag | The owning gear's PRD |
+| Customer-derived GTS payload types | No | — | Step, event, reason and authorization catalogues are fixed contracts | — |
+| Fulfillment decomposition | One `FulfillmentTask` per independent line | The plan revision with its selected items (D-196); resource-level decomposition is below the Subscriptions boundary | — | — |
+| Approval routing rules | Not in this gear | The approval policy adapter's library (§5.2, Q-14) | — | — |
+| Migration of a running instance | No | — | §5.2 | — |
+| Seller-facing preview, simulation or explanation of the applied flow | No | The definition version and policy revision are pinned on every process record, so what applied is reconstructable | — | A product request |
 
 ## 6. Functional Requirements
 
@@ -1160,6 +1182,30 @@ Until the library adapter replaces the stand-in, criteria **1–4a** (including 
 - **And** after compensation completes, the order **MUST** transition to `cancelled` via the workflow-mediated cancel (with compensation evidence)
 - **And** the action **MUST** be recorded in the audit log with actor identity and reason
 - **And** the same request by a Seller Operator whose seller scope does not include the order **MUST** be denied
+
+### Customization and Extensibility
+
+**22. Seller policy is limited to the four settings**
+- **Given** a seller-policy write for a seller
+- **When** it names a setting other than the approval escalation window, the overdue window, the manual-task SLA class or the partial-failure policy
+- **Then** the system **MUST** refuse the write
+- **And** an accepted write **MUST** be bounds-checked, recorded as a configuration revision, and applied only to process records created after it
+
+**23. Only the publish job publishes a definition version**
+- **Given** a candidate definition version
+- **When** a principal other than the Orders definition publish job attempts to publish it
+- **Then** the publish **MUST** be refused
+- **And** a version the publish job publishes **MUST** have passed the pre-publish validation rules and, in the first non-production environment, the behavioural gate over every process path
+
+**24. A step change needs an Orders release**
+- **Given** a candidate definition that calls an operation, or relies on a guard or schema, that the Orders release deployed in the environment does not declare
+- **When** the publish job validates it
+- **Then** the candidate **MUST** be refused before publish
+
+**25. No tenant-supplied code runs in the process**
+- **Given** a candidate definition containing a call to a platform Function or any tenant-authored script, hook or connector
+- **When** the publish job validates it
+- **Then** the candidate **MUST** be refused before publish
 
 ## 13. Dependencies
 

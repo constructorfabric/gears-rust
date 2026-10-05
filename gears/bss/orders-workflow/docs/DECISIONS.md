@@ -225,6 +225,7 @@
   - [D-204 (L) The PRD names the spawn-signal call and the shipping mode; hold and resume are event-driven](#d-204-l-the-prd-names-the-spawn-signal-call-and-the-shipping-mode-hold-and-resume-are-event-driven)
   - [D-205 (L) The overlap key is never derived here; Q-08 is narrowed to Subscriptions' derivation answer](#d-205-l-the-overlap-key-is-never-derived-here-q-08-is-narrowed-to-subscriptions-derivation-answer)
   - [D-206 (L) The plan is frozen before begin-fulfillment; the PRD states one normative ordering](#d-206-l-the-plan-is-frozen-before-begin-fulfillment-the-prd-states-one-normative-ordering)
+  - [D-207 (M) Phase 1 is a canonical process with four seller-policy settings; customization stays in the owning gears](#d-207-m-phase-1-is-a-canonical-process-with-four-seller-policy-settings-customization-stays-in-the-owning-gears)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -6313,6 +6314,32 @@ showed the opposite order, which moved the state in which a plan refusal occurs.
 
 **Propagated**: `PRD.md` §6.3, §9.1, UC-002, §17.1.
 
+### D-207 (M) Phase 1 is a canonical process with four seller-policy settings; customization stays in the owning gears
+
+**Accepted (2026-10-05).** *(answers Q-10; answers the PR #4787 customization and extensibility review)*
+
+**Decision**: Orders Workflow is a canonical, platform-operated process, not a tenant-configurable
+orchestration product. In phase 1: definitions are platform-wide and published only by the
+definition publish job (D-138); no seller-published fragment and no tenant function, script, hook
+or connector (Q-10 answered no; D-136); no definition per market, channel, product or order class,
+by design; staged rollout by tenant or share is wanted and depends on the platform, so item (3) of
+`…-upreq-serverless-runtime-trigger-version-selection` becomes required; per-seller policy is the
+four settings of D-134 and D-140; step behaviour, closed sets and phases change only by an Orders
+release or a PRD change (DESIGN §4.7); custom order properties belong to Orders Lifecycle or the
+catalog and reach this gear as references (ADR-0013); decomposition is one task per independent
+line (D-196); approval routing is the adapter's library (Q-14); no running-instance migration
+(§5.2); no seller-facing preview or explanation, the definition version and policy revision being
+pinned on every record. PRD §5.3 states this as a table and §12 carries criteria 22 to 25.
+
+**Rationale**: each of these was decided piecemeal (ADR-0011, ADR-0012, D-134, D-136, D-138,
+D-196, Q-10, Q-14) but the PRD never stated them as product limits, so a reviewer comparing the
+gear with configurable order-management products could not tell intent from omission. Commercial
+variation is cheaper and safer in seller policy and in the owning gears than in more protected
+process definitions; a cohort-scoped binding is the one selection that serves operational safety.
+
+**Propagated**: `PRD.md` §5.3, §12 (22–25); `UPSTREAM_REQS.md` §2.9
+(`…-upreq-serverless-runtime-trigger-version-selection`), §4 item 19; Q-10.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -6495,7 +6522,7 @@ lands this gear's roster runs on `Db::lock` with its rechecks intact.
 
 **Owner**: Architecture, with Product.
 
-**Open; recommendation: no.** ADR-0012 grants publish to the platform operator only. A
+**Answered by D-207 (2026-10-05): no for phase 1.** *(Was: open; recommendation: no.)* ADR-0012 grants publish to the platform operator only. A
 seller-scoped role that publishes a fragment of the definition — a seller's own escalation arms,
 waits or SLA branches — and tenant-authored Functions called from the definition would let the
 adjustability contract reach the people who own the commercial policy, but each is a new
@@ -6657,6 +6684,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 |----------|-------|---------------------|
 | D-01–D-04 | 01 Process engine | `design/01-foundation.md` |
 | D-206 | 04 Fulfillment plan (PRD alignment, 2026-10-05) | `PRD.md` §6.3, §9.1, UC-002, §17.1 |
+| D-207 | cross-cutting (customization scope, 2026-10-05) | `PRD.md` §5.3, §12; `UPSTREAM_REQS.md` §2.9, §4 |
 | D-200–D-205 | cross-cutting (Seam Atlas alignment, 2026-10-02) | `UPSTREAM_REQS.md` §2.1, §2.2, §2.4, §2.5, §4; `PRD.md` §9.1, §13, §15, §16; `design/05` §3.3; `design/06` §4.8 |
 | D-05–D-08 | 02 Triggers and start | `design/02-triggers-and-start.md` |
 | D-09–D-14 | 03 Approval execution | `design/03-approval-execution.md` |
@@ -6833,6 +6861,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-204 | L PRD names `report_spawn_signal`, `workflow_cancel`, reserved hold/resume, shipping mode `code` | `PRD.md` §9.1, §13, §15, §16; `UPSTREAM_REQS.md` §4 |
 | D-205 | L Overlap key never derived here; occupancy shape per Lifecycle; Q-08 narrowed | `UPSTREAM_REQS.md` §2.1; Q-08 |
 | D-206 | L Plan frozen before begin-fulfillment; PRD UC-002, §6.3, §9.1, §17.1 aligned; binding expiry is a plan-level task | `PRD.md` §6.3, §9.1, UC-002, §17.1 |
+| D-207 | M Canonical process, four seller-policy settings; customization in owning gears; Q-10 answered; cohort binding required | `PRD.md` §5.3, §12; `UPSTREAM_REQS.md` §2.9, §4 item 19 |
 
-Highest decision number used: **D-206**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-207**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.
