@@ -122,17 +122,40 @@ async fn router_with(resolver: Arc<dyn AuthZResolverApi>, tenant_id: Uuid) -> Ro
     register_routes(Router::new(), &OpenApiRegistryImpl::new(), service).layer(Extension(ctx))
 }
 
-async fn post(router: Router, body: &str) -> (StatusCode, String) {
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri(PATH)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body.to_owned()))
-        .unwrap();
+/// Sends `body` with the given content type (none when `None`) and returns
+/// the status, the response content type and the response body.
+async fn post_raw(
+    router: Router,
+    body: &str,
+    content_type: Option<&str>,
+) -> (StatusCode, Option<String>, String) {
+    let mut builder = Request::builder().method(Method::POST).uri(PATH);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    let request = builder.body(Body::from(body.to_owned())).unwrap();
     let response = router.oneshot(request).await.unwrap();
     let status = response.status();
+    let response_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    (status, String::from_utf8_lossy(&bytes).into_owned())
+    (
+        status,
+        response_type,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+async fn post(router: Router, body: &str) -> (StatusCode, String) {
+    let (status, _, body) = post_raw(router, body, Some("application/json")).await;
+    (status, body)
+}
+
+fn is_problem_json(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|v| v.starts_with("application/problem+json"))
 }
 
 #[tokio::test]
@@ -182,6 +205,47 @@ async fn empty_body_gets_400() {
     let (status, body) = post(router, "").await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+#[tokio::test]
+async fn malformed_json_gets_a_problem_body() {
+    let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
+
+    let (status, content_type, body) =
+        post_raw(router, r#"{"text":"#, Some("application/json")).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        is_problem_json(content_type.as_deref()),
+        "content type: {content_type:?}"
+    );
+}
+
+#[tokio::test]
+async fn json_of_the_wrong_shape_gets_a_problem_body() {
+    let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
+
+    let (status, content_type, body) =
+        post_raw(router, r#"{"text":5}"#, Some("application/json")).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+    assert!(
+        is_problem_json(content_type.as_deref()),
+        "content type: {content_type:?}"
+    );
+}
+
+#[tokio::test]
+async fn missing_content_type_gets_a_problem_body() {
+    let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
+
+    let (status, content_type, body) = post_raw(router, r#"{"text":"hello"}"#, None).await;
+
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "body: {body}");
+    assert!(
+        is_problem_json(content_type.as_deref()),
+        "content type: {content_type:?}"
+    );
 }
 
 #[tokio::test]

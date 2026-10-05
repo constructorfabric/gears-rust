@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use axum::{Json, extract::Extension};
+use axum::extract::Extension;
 use toolkit::api::canonical_prelude::*;
+use toolkit::api::rest::extract::Json;
 use toolkit_security::SecurityContext;
 
 use crate::api::rest::types::ConcreteService;
