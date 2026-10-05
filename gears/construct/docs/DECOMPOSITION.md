@@ -43,7 +43,7 @@ This document splits the Construct design (`cpt-cf-construct-design-construct-ge
 
 The DESIGN's largest component, subject control, is split across four features. Subject Control owns the component; Subject Settings, the Review Queue and Administrator Fact Management extend it.
 
-**The gear foundation is built.** The backend shell already exists in `gears/construct/construct` and `gears/construct/construct-sdk`. The feature `cpt-cf-construct-feature-gear-foundation` describes that code as it is, so a FEATURE document and code markers can be added to it later. It is a placeholder, not a DESIGN element. Its note table and entity have no DESIGN id and are not counted as Data. It registers its REST route with OperationBuilder (the toolkit's builder for REST operations) and its client in ClientHub (the platform's registry of in-process clients).
+**The gear foundation is built.** The backend shell already exists in `gears/construct/construct` and `gears/construct/construct-sdk`. The feature `cpt-cf-construct-feature-gear-foundation` describes that code as it is. Its FEATURE document is [features/gear-foundation.md](./features/gear-foundation.md), and the shell code carries `@cpt` markers for it. It is a placeholder, not a DESIGN element. Its note table and entity have no DESIGN id and are not counted as Data. It registers its REST route with OperationBuilder (the toolkit's builder for REST operations) and its client in ClientHub (the platform's registry of in-process clients).
 
 **Interfaces and contracts.** The REST API (`cpt-cf-construct-interface-rest-api`) is realized by the features that add routes. The MCP tools (`cpt-cf-construct-interface-mcp-tools`) are realized by Agent Access over MCP. The Rust SDK (`cpt-cf-construct-interface-rust-sdk`) has one primary owner, the Gear Foundation, which holds the client trait; each later feature extends it. The interface, contract and topology ids in this paragraph are tracked in prose and have no checkbox line. The deployment topology (`cpt-cf-construct-topology-deployment`) is Construct running as a gear on the platform. Record Intake takes the connector record types (`cpt-cf-construct-contract-gts-record`), and the Profile Writer uses Construct's person types (`cpt-cf-construct-contract-person-types`). Both are GTS (Global Type System) types, the platform's versioned and registered type identifiers.
 
@@ -85,7 +85,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
 ## 2. Entries
 
-### 2.1 [Gear Foundation](feature-gear-foundation/) - HIGH
+### 2.1 [Gear Foundation](features/gear-foundation.md) - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-gear-foundation`
 
