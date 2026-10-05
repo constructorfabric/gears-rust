@@ -11,6 +11,9 @@ use crate::domain::repo::NoteRepository;
 
 use super::entity::{self, Entity as NoteEntity};
 
+/// `SeaORM`-backed [`NoteRepository`]; every query and insert goes through the
+/// secure ORM and is constrained by the caller's `AccessScope`.
+#[derive(Debug)]
 pub struct SeaOrmNoteRepository;
 
 impl SeaOrmNoteRepository {
@@ -27,7 +30,7 @@ impl Default for SeaOrmNoteRepository {
 }
 
 /// Map scope errors to domain errors.
-fn map_scope_error(e: ScopeError) -> DomainError {
+pub(super) fn map_scope_error(e: ScopeError) -> DomainError {
     match e {
         ScopeError::Denied(msg) => DomainError::forbidden(msg),
         ScopeError::Invalid(msg) => DomainError::internal(format!("scope invalid: {msg}")),
@@ -36,7 +39,10 @@ fn map_scope_error(e: ScopeError) -> DomainError {
             DomainError::forbidden(format!("tenant {tenant_id} not in scope"))
         }
         // `ScopeError` is `#[non_exhaustive]`.
-        other => DomainError::internal(format!("scope invalid: {other}")),
+        other => {
+            tracing::error!(error = %other, "unhandled scope error variant");
+            DomainError::internal(format!("unhandled scope error: {other}"))
+        }
     }
 }
 
@@ -48,15 +54,20 @@ impl NoteRepository for SeaOrmNoteRepository {
         scope: &AccessScope,
         note: FoundationNote,
     ) -> Result<FoundationNote, DomainError> {
-        let row = || entity::ActiveModel {
+        let scope_columns = entity::ActiveModel {
+            id: ActiveValue::Set(note.id),
+            tenant_id: ActiveValue::Set(note.tenant_id),
+            text: ActiveValue::NotSet,
+        };
+        let row = entity::ActiveModel {
             id: ActiveValue::Set(note.id),
             tenant_id: ActiveValue::Set(note.tenant_id),
             text: ActiveValue::Set(note.text.clone()),
         };
 
-        NoteEntity::insert(row())
+        NoteEntity::insert(row)
             .secure()
-            .scope_with_model(scope, &row())
+            .scope_with_model(scope, &scope_columns)
             .map_err(map_scope_error)?
             .exec(conn)
             .await

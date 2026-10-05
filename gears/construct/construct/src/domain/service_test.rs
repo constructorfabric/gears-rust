@@ -18,6 +18,7 @@ use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
 use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 use uuid::Uuid;
 
+use crate::config::ConstructConfig;
 use crate::domain::error::DomainError;
 use crate::domain::local_client::LocalClient;
 use crate::domain::service::{Service, ServiceConfig};
@@ -122,14 +123,16 @@ fn service_with(db: &Db, resolver: Arc<dyn AuthZResolverApi>) -> ConcreteService
         Arc::new(DBProvider::new(db.clone())),
         Arc::new(SeaOrmNoteRepository::new()),
         PolicyEnforcer::new(resolver),
-        ServiceConfig::default(),
+        test_service_config(),
     )
 }
 
 fn note(text: &str) -> NewFoundationNote {
-    NewFoundationNote {
-        text: text.to_owned(),
-    }
+    NewFoundationNote::new(text)
+}
+
+fn test_service_config() -> ServiceConfig {
+    ServiceConfig::try_from(&ConstructConfig::default()).expect("default config is valid")
 }
 
 #[tokio::test]
@@ -192,7 +195,7 @@ async fn blank_and_oversized_text_is_rejected() {
     let blank = svc.create_note(&ctx, note("   ")).await;
     assert!(matches!(blank, Err(DomainError::Validation { .. })));
 
-    let too_long = "x".repeat(ServiceConfig::default().max_text_length + 1);
+    let too_long = "x".repeat(test_service_config().max_text_length + 1);
     let oversized = svc.create_note(&ctx, note(&too_long)).await;
     assert!(matches!(oversized, Err(DomainError::Validation { .. })));
 }
@@ -222,4 +225,32 @@ async fn local_client_round_trips_a_note_and_maps_not_found() {
 
     let missing = client.get_note(&ctx, Uuid::new_v4()).await.unwrap_err();
     assert_eq!(Problem::from(missing).status, Some(404));
+}
+
+#[tokio::test]
+async fn text_of_exactly_the_byte_limit_is_accepted() {
+    let db = inmem_db().await;
+    let svc = service_with(&db, Arc::new(AllowResolver));
+    let ctx = context_in(Uuid::new_v4());
+
+    let at_limit = "x".repeat(test_service_config().max_text_length);
+    let created = svc.create_note(&ctx, note(&at_limit)).await.unwrap();
+    assert_eq!(created.text, at_limit);
+}
+
+#[tokio::test]
+async fn multibyte_text_over_the_byte_limit_is_rejected() {
+    let db = inmem_db().await;
+    let svc = service_with(&db, Arc::new(AllowResolver));
+    let ctx = context_in(Uuid::new_v4());
+
+    let limit = test_service_config().max_text_length;
+    let chars_under_limit_bytes_over = "\u{e4}".repeat(limit.div_ceil(2) + 1);
+    assert!(chars_under_limit_bytes_over.chars().count() < limit);
+    assert!(chars_under_limit_bytes_over.len() > limit);
+
+    let rejected = svc
+        .create_note(&ctx, note(&chars_under_limit_bytes_over))
+        .await;
+    assert!(matches!(rejected, Err(DomainError::Validation { .. })));
 }

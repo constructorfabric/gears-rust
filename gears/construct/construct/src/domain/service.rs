@@ -31,14 +31,6 @@ pub struct ServiceConfig {
     pub max_text_length: usize,
 }
 
-impl Default for ServiceConfig {
-    fn default() -> Self {
-        Self {
-            max_text_length: 1000,
-        }
-    }
-}
-
 #[domain_model]
 pub struct Service<R: NoteRepository> {
     db: Arc<DbProvider>,
@@ -82,11 +74,7 @@ impl<R: NoteRepository> Service<R> {
             .await?;
 
         let conn = self.db.conn().map_err(DomainError::from)?;
-        let note = FoundationNote {
-            id: Uuid::new_v4(),
-            tenant_id,
-            text: new.text,
-        };
+        let note = FoundationNote::new(Uuid::new_v4(), tenant_id, new.text);
         self.repo.insert(&conn, &scope, note).await
     }
 

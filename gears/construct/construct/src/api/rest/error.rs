@@ -6,9 +6,10 @@ use crate::domain::error::DomainError;
 pub struct FoundationNoteError;
 
 impl From<DomainError> for CanonicalError {
-    // A flat match on the domain enum is the whole conversion; the structured
-    // `tracing::*!` macros count toward the complexity.
-    #[allow(clippy::cognitive_complexity)]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "flat match on the domain enum; the tracing macros count toward the complexity"
+    )]
     fn from(e: DomainError) -> Self {
         match e {
             DomainError::NotFound => FoundationNoteError::not_found("Note not found")

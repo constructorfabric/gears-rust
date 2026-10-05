@@ -1,6 +1,12 @@
 use serde::Deserialize;
 
+use crate::domain::service::ServiceConfig;
+
+/// Default for [`ConstructConfig::max_text_length`], in bytes.
+pub const DEFAULT_MAX_TEXT_LENGTH: usize = 1000;
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConstructConfig {
     /// Longest foundation note text, in bytes.
     #[serde(default = "default_max_text_length")]
@@ -16,7 +22,7 @@ impl Default for ConstructConfig {
 }
 
 fn default_max_text_length() -> usize {
-    1000
+    DEFAULT_MAX_TEXT_LENGTH
 }
 
 /// Upper bound on `max_text_length`: the capacity of `MySQL`'s `TEXT`, the
@@ -42,6 +48,23 @@ impl ConstructConfig {
     }
 }
 
+impl TryFrom<&ConstructConfig> for ServiceConfig {
+    type Error = anyhow::Error;
+
+    /// Build the domain configuration from a config that passed
+    /// [`ConstructConfig::validate`].
+    ///
+    /// # Errors
+    ///
+    /// When validation fails.
+    fn try_from(cfg: &ConstructConfig) -> anyhow::Result<Self> {
+        cfg.validate()?;
+        Ok(Self {
+            max_text_length: cfg.max_text_length,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,5 +77,35 @@ mod tests {
         with(1).validate().expect("smallest usable");
         ConstructConfig::default().validate().expect("defaults");
         with(MAX_TEXT_BYTES).validate().expect("the largest text");
+    }
+
+    fn parse(key: &'static str) -> Result<ConstructConfig, serde::de::value::Error> {
+        use serde::de::value::MapDeserializer;
+        ConstructConfig::deserialize(MapDeserializer::new([(key, 5_usize)].into_iter()))
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        assert_eq!(
+            parse("max_text_length").expect("known key").max_text_length,
+            5
+        );
+        assert!(
+            parse("max_text_lenght").is_err(),
+            "typo must not be ignored"
+        );
+    }
+
+    #[test]
+    fn default_config_converts_to_the_default_service_limit() {
+        let service = ServiceConfig::try_from(&ConstructConfig::default()).expect("defaults");
+        assert_eq!(service.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
+        assert_eq!(DEFAULT_MAX_TEXT_LENGTH, 1000);
+    }
+
+    #[test]
+    fn invalid_config_does_not_convert() {
+        let zero = ConstructConfig { max_text_length: 0 };
+        assert!(ServiceConfig::try_from(&zero).is_err());
     }
 }

@@ -5,11 +5,7 @@ use super::dto::{CreateFoundationNoteRequest, FoundationNoteDto};
 
 #[test]
 fn note_converts_to_dto_field_for_field() {
-    let note = FoundationNote {
-        id: Uuid::new_v4(),
-        tenant_id: Uuid::new_v4(),
-        text: "hello".to_owned(),
-    };
+    let note = FoundationNote::new(Uuid::new_v4(), Uuid::new_v4(), "hello".to_owned());
 
     let dto = FoundationNoteDto::from(note.clone());
 

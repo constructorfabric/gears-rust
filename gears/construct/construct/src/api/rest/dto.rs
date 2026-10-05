@@ -29,6 +29,6 @@ pub struct CreateFoundationNoteRequest {
 
 impl From<CreateFoundationNoteRequest> for NewFoundationNote {
     fn from(req: CreateFoundationNoteRequest) -> Self {
-        Self { text: req.text }
+        Self::new(req.text)
     }
 }

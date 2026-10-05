@@ -4,7 +4,7 @@ use axum::{Json, extract::Extension};
 use toolkit::api::canonical_prelude::*;
 use toolkit_security::SecurityContext;
 
-use crate::api::rest::routes::ConcreteService;
+use crate::api::rest::types::ConcreteService;
 
 use super::dto::{CreateFoundationNoteRequest, FoundationNoteDto};
 

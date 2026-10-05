@@ -61,7 +61,11 @@ fn log_evaluation_failed(e: &authz_resolver_sdk::EnforcerError) {
 // TODO(DE1302): `Forbidden` and `Internal` only carry Strings, so the
 // `EnforcerError` source is lost. Extend the variants to hold a boxed source,
 // then remove this allow.
-#[allow(unknown_lints, de1302_error_from_to_string)]
+#[allow(unknown_lints, reason = "dylint lint names are unknown to rustc")]
+#[allow(
+    de1302_error_from_to_string,
+    reason = "the source error is flattened to a String until the variants carry a boxed source"
+)]
 impl From<authz_resolver_sdk::EnforcerError> for DomainError {
     fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
         log_enforcer_error(&e);

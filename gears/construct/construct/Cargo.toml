@@ -50,3 +50,4 @@ toolkit-macros = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 toolkit-gts = { workspace = true }
 tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }
