@@ -8,7 +8,9 @@
 //! - the cap holds under concurrent debits, which is the row lock doing its job
 //!   (I9, ADR-0002 acquisition order);
 //! - two writers that share an idempotency scope but lock disjoint Quota rows
-//!   are arbitrated by the record's primary key, not by the row locks;
+//!   are serialized by the scope lock, not by the row locks, and a writer that
+//!   still loses the record's primary key replays the winner or reports the
+//!   mismatch;
 //! - an update that waits out a period boundary reads the counter row a debit
 //!   opened while it waited, so a cap can never be lowered below live usage
 //!   (I6).
@@ -936,5 +938,95 @@ async fn retention_skips_a_record_whose_stripe_a_writer_holds() {
         .await
         .expect("reclaim");
     assert_eq!(reclaimed, 1, "once the stripe is free the record goes");
+    h.down().await;
+}
+
+/// Commit a record under `write`'s scope directly, without the scope lock: the
+/// writer a debit can still lose the record's primary key to, once the scope
+/// lock and the record recheck are behind it.
+async fn commit_record_out_of_band(h: &PgHarness, write: &IdempotencyWrite, decision: &Decision) {
+    use quota_enforcement_storage_plugin::infra::storage::entity::idempotency_record;
+    use sea_orm::ActiveValue::Set;
+    let now = OffsetDateTime::now_utc();
+    let conn = h.db.conn().expect("conn");
+    toolkit_db::secure::secure_insert::<idempotency_record::Entity>(
+        idempotency_record::ActiveModel {
+            tenant_id: Set(write.scope.tenant_id.as_uuid()),
+            subject_key: Set(write.scope.subject_key.as_bytes().to_vec()),
+            operation_type: Set(write.scope.operation_type.as_str().to_owned()),
+            idem_key: Set(write.scope.key.clone()),
+            payload_hash: Set(write.payload_hash.as_bytes().to_vec()),
+            decision_blob: Set(serde_json::to_string(decision).expect("decision")),
+            applied_entries: Set(None),
+            attribution_hash: Set(Some(vec![7; 32])),
+            reversed_by_key: Set(None),
+            engine_id: Set(None),
+            policy_id: Set(None),
+            policy_version: Set(None),
+            created_at: Set(now),
+            expires_at: Set(now + Duration::from_hours(1)),
+        },
+        &AccessScope::allow_all(),
+        &conn,
+    )
+    .await
+    .expect("commit the competing record");
+}
+
+fn winners_decision() -> Decision {
+    Decision {
+        result: DecisionResult::Denied {
+            violated_quota_ids: Vec::new(),
+            reason: "WINNER".to_owned(),
+        },
+        debit_plan: std::collections::BTreeMap::new(),
+        diagnostics: std::collections::BTreeMap::new(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_debit_that_loses_the_record_key_replays_the_winner_and_applies_nothing() {
+    let h = PgHarness::up().await;
+    let id = h.quota("u1", METRIC_TOKENS, Some(100)).await;
+    // The holder is past the scope lock and the record recheck, inside its
+    // evaluation; the competing record lands now, so only the key can stop it.
+    let (holder, release) = hold_the_row(&h, "raced");
+    commit_record_out_of_band(&h, &write("raced", 1), &winners_decision()).await;
+    release.send(()).expect("release");
+
+    match holder.await.expect("join") {
+        Ok(TransitionOutcome::NoOp(replayed)) => {
+            assert_eq!(
+                replayed.decision,
+                winners_decision(),
+                "the winner's decision"
+            );
+        }
+        other => panic!("expected a replay of the winner, got {other:?}"),
+    }
+    assert_eq!(
+        h.consumed("u1", METRIC_TOKENS, id).await,
+        0,
+        "the loser's debit rolled back with its transaction"
+    );
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_debit_that_loses_the_record_key_to_another_payload_is_a_mismatch() {
+    let h = PgHarness::up().await;
+    let id = h.quota("u1", METRIC_TOKENS, Some(100)).await;
+    let (holder, release) = hold_the_row(&h, "raced");
+    commit_record_out_of_band(&h, &write("raced", 2), &winners_decision()).await;
+    release.send(()).expect("release");
+
+    assert!(
+        matches!(
+            holder.await.expect("join"),
+            Err(StorageError::IdempotencyPayloadMismatch)
+        ),
+        "the same key under another payload is the caller's conflict"
+    );
+    assert_eq!(h.consumed("u1", METRIC_TOKENS, id).await, 0);
     h.down().await;
 }

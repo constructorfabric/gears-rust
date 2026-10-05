@@ -451,7 +451,16 @@ async fn a_cold_start_delivers_a_committed_debit_at_once_and_dead_letters_what_i
     })
     .await;
 
-    let reasons = h.dead_letter_reasons(&handle).await;
+    // The handler reports the row before its dead letter commits, so read
+    // the dead letters until both have landed.
+    let deadline = tokio::time::Instant::now() + PROMPTLY;
+    let reasons = loop {
+        let reasons = h.dead_letter_reasons(&handle).await;
+        if reasons.len() >= 2 || tokio::time::Instant::now() >= deadline {
+            break reasons;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(reasons.len(), 2, "{reasons:?}");
     assert!(reasons.contains(&"sink refused".to_owned()), "{reasons:?}");
     assert!(

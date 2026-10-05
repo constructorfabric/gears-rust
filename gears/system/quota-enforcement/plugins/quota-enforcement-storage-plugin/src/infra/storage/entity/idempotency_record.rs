@@ -3,9 +3,10 @@
 //! (PRD section 5.8).
 //!
 //! The primary key is load-bearing twice over. It keeps the same key string
-//! independent across tenants, subject sets, and operation kinds, and it
-//! arbitrates two writers that share a scope while locking disjoint Quota
-//! rows: the loser's insert violates it and its whole transaction rolls back.
+//! independent across tenants, subject sets, and operation kinds, and it is
+//! the backstop behind the scope's stripe lock: a writer that inserts under a
+//! scope without holding that lock makes the other's insert violate the key,
+//! and the loser's whole transaction rolls back.
 //!
 //! The row has no resource column. Records are addressed by their scope, never
 //! by a Quota, and one record can span several Quotas.

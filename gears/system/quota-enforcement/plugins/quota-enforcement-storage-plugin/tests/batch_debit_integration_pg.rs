@@ -693,3 +693,122 @@ async fn a_lease_release_cannot_change_a_counter_while_a_debit_evaluates_it() {
     assert_eq!(h.consumed("u1", id).await, 40);
     h.down().await;
 }
+
+/// Commit a batch envelope record under the scope `holders` batch with,
+/// without the scope lock: the writer a batch can still lose the record's key
+/// to.
+async fn commit_envelope_out_of_band(
+    h: &PgHarness,
+    holders: &[&str],
+    key: &str,
+    payload: u8,
+    record: &quota_enforcement_sdk::BatchRecord,
+) {
+    use quota_enforcement_storage_plugin::infra::storage::entity::idempotency_record;
+    use sea_orm::ActiveValue::Set;
+    let now = OffsetDateTime::now_utc();
+    let conn = h.db.conn().expect("conn");
+    toolkit_db::secure::secure_insert::<idempotency_record::Entity>(
+        idempotency_record::ActiveModel {
+            tenant_id: Set(tenant().as_uuid()),
+            subject_key: Set(IdempotencySubjectKey::of(&subjects(holders))
+                .as_bytes()
+                .to_vec()),
+            operation_type: Set(OperationType::BatchDebit.as_str().to_owned()),
+            idem_key: Set(key.to_owned()),
+            payload_hash: Set(vec![payload; 32]),
+            decision_blob: Set(serde_json::to_string(record).expect("record")),
+            applied_entries: Set(None),
+            attribution_hash: Set(None),
+            reversed_by_key: Set(None),
+            engine_id: Set(None),
+            policy_id: Set(None),
+            policy_version: Set(None),
+            created_at: Set(now),
+            expires_at: Set(now + Duration::from_hours(1)),
+        },
+        &AccessScope::allow_all(),
+        &conn,
+    )
+    .await
+    .expect("commit the competing envelope");
+}
+
+fn winners_batch() -> quota_enforcement_sdk::BatchRecord {
+    quota_enforcement_sdk::BatchRecord::new(vec![Decision {
+        result: DecisionResult::Denied {
+            violated_quota_ids: Vec::new(),
+            reason: "WINNER".to_owned(),
+        },
+        debit_plan: std::collections::BTreeMap::new(),
+        diagnostics: std::collections::BTreeMap::new(),
+    }])
+}
+
+/// Start a one-item batch of 10 on `u1` under `key` that stops in its
+/// evaluation, past its scope lock and envelope recheck.
+fn hold_a_batch(
+    h: &PgHarness,
+    key: &str,
+) -> (
+    tokio::task::JoinHandle<Batched>,
+    std::sync::mpsc::SyncSender<()>,
+) {
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let batch = h.batch_with(
+        &[("u1", 10)],
+        key,
+        held_evaluator(locked_tx, release_rx),
+        Duration::from_secs(30),
+    );
+    locked_rx.recv().expect("the batch is evaluating");
+    (batch, release_tx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_that_loses_the_envelope_key_replays_the_winner_and_applies_nothing() {
+    let h = PgHarness::up().await;
+    let id = h.quota("u1", Some(100)).await;
+    let (batch, release) = hold_a_batch(&h, "raced");
+    // The harness envelope payload is `[1; 32]`.
+    commit_envelope_out_of_band(&h, &["u1"], "raced", 1, &winners_batch()).await;
+    release.send(()).expect("release");
+
+    match batch.await.expect("join") {
+        Ok(TransitionOutcome::NoOp(replayed)) => {
+            let decisions: Vec<Decision> = replayed.into_iter().map(|item| item.decision).collect();
+            assert_eq!(
+                decisions,
+                winners_batch().decisions,
+                "the winner's decisions"
+            );
+        }
+        other => panic!("expected a replay of the winner, got {other:?}"),
+    }
+    assert_eq!(
+        h.consumed("u1", id).await,
+        0,
+        "the loser's batch rolled back"
+    );
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_that_loses_the_envelope_key_to_another_payload_is_a_mismatch() {
+    let h = PgHarness::up().await;
+    let id = h.quota("u1", Some(100)).await;
+    let (batch, release) = hold_a_batch(&h, "raced");
+    commit_envelope_out_of_band(&h, &["u1"], "raced", 2, &winners_batch()).await;
+    release.send(()).expect("release");
+
+    assert!(
+        matches!(
+            batch.await.expect("join"),
+            Err(StorageError::IdempotencyPayloadMismatch)
+        ),
+        "the same key under another payload is the caller's conflict"
+    );
+    assert_eq!(h.consumed("u1", id).await, 0);
+    h.down().await;
+}
