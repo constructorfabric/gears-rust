@@ -224,6 +224,7 @@
   - [D-203 (H) Lifecycle's alignment D-169…D-178 is received; the §2.4 asks and the §2.5 hand-off close as stated](#d-203-h-lifecycles-alignment-d-169d-178-is-received-the-24-asks-and-the-25-hand-off-close-as-stated)
   - [D-204 (L) The PRD names the spawn-signal call and the shipping mode; hold and resume are event-driven](#d-204-l-the-prd-names-the-spawn-signal-call-and-the-shipping-mode-hold-and-resume-are-event-driven)
   - [D-205 (L) The overlap key is never derived here; Q-08 is narrowed to Subscriptions' derivation answer](#d-205-l-the-overlap-key-is-never-derived-here-q-08-is-narrowed-to-subscriptions-derivation-answer)
+  - [D-206 (L) The plan is frozen before begin-fulfillment; the PRD states one normative ordering](#d-206-l-the-plan-is-frozen-before-begin-fulfillment-the-prd-states-one-normative-ordering)
 - [Open Questions](#open-questions)
   - [Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?](#q-01-which-durable-execution-substrate-backs-the-process--the-oss-workflow-engine-or-a-bss-local-mechanism)
   - [Q-02: The Generic Approval escalation threshold — the one PRD-deferred numeric value this design deliberately leaves unset](#q-02-the-generic-approval-escalation-threshold--the-one-prd-deferred-numeric-value-this-design-deliberately-leaves-unset)
@@ -6290,6 +6291,26 @@ Subscriptions may answer it.
 
 **Propagated**: `UPSTREAM_REQS.md` §2.1 (`…-upreq-overlap-presence-read`); Q-08.
 
+### D-206 (L) The plan is frozen before begin-fulfillment; the PRD states one normative ordering
+
+**Accepted (2026-10-05).** *(PRD alignment with D-92, D-109; answers PR #4787 review)*
+
+**Decision**: the normative ordering is `evaluate-payment-auth-eligibility` → `construct-and-freeze-plan`
+→ `begin-fulfillment`, as `design/04-fulfillment-plan.md` §2.2 *Begin-Fulfillment Ordering* and the
+*Plan* row of `10 §4.1` already enforce. PRD §6.3 *Fulfillment Plan Construction*, the §9.1
+Lifecycle-transition contract, UC-002 (main flow and new alternative flow 1a) and the §17.1 process
+diagram are rewritten to it: the plan freezes while the order is `approved`; an
+`order-binding-expired` refusal is a plan-level manual task under either policy, not the
+partial-failure policy; an exhausted task passes `begin-fulfillment` before acknowledging
+`fulfillment_failed` (D-92).
+
+**Rationale**: begin-fulfillment is the amendment fence. A refusal raised while the order is
+`approved` can still be cured by amendment, since a new version carries a later activation deadline; the same
+refusal after `in_fulfillment` could only end in `fulfillment_failed`. The PRD's UC-002 and diagram
+showed the opposite order, which moved the state in which a plan refusal occurs.
+
+**Propagated**: `PRD.md` §6.3, §9.1, UC-002, §17.1.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -6633,6 +6654,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | Decision | Slice | Consuming document |
 |----------|-------|---------------------|
 | D-01–D-04 | 01 Process engine | `design/01-foundation.md` |
+| D-206 | 04 Fulfillment plan (PRD alignment, 2026-10-05) | `PRD.md` §6.3, §9.1, UC-002, §17.1 |
 | D-200–D-205 | cross-cutting (Seam Atlas alignment, 2026-10-02) | `UPSTREAM_REQS.md` §2.1, §2.2, §2.4, §2.5, §4; `PRD.md` §9.1, §13, §15, §16; `design/05` §3.3; `design/06` §4.8 |
 | D-05–D-08 | 02 Triggers and start | `design/02-triggers-and-start.md` |
 | D-09–D-14 | 03 Approval execution | `design/03-approval-execution.md` |
@@ -6808,6 +6830,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-203 | H Lifecycle D-169…D-178 received; §2.4 key retention answered (D-173), failure coverage part-answered (D-172), §2.5 hand-off closed | `UPSTREAM_REQS.md` §2.4, §2.5, `design/06` §4.8 |
 | D-204 | L PRD names `report_spawn_signal`, `workflow_cancel`, reserved hold/resume, shipping mode `code` | `PRD.md` §9.1, §13, §15, §16; `UPSTREAM_REQS.md` §4 |
 | D-205 | L Overlap key never derived here; occupancy shape per Lifecycle; Q-08 narrowed | `UPSTREAM_REQS.md` §2.1; Q-08 |
+| D-206 | L Plan frozen before begin-fulfillment; PRD UC-002, §6.3, §9.1, §17.1 aligned; binding expiry is a plan-level task | `PRD.md` §6.3, §9.1, UC-002, §17.1 |
 
-Highest decision number used: **D-205**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-206**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.
