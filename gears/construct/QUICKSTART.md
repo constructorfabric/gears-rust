@@ -1,6 +1,6 @@
 # Construct - Quickstart
 
-The gear foundation of Construct: the base on which the Construct features are built. It has one route that creates a note in the caller's tenant, a client for other gears (`create_note` and `get_note`), and tenant-scoped storage. The note is a placeholder. It has no DESIGN id and is replaced by Construct's own model, starting with Subject Settings.
+The gear foundation of Construct: the base on which the Construct features are built. It has one route that creates a note in the caller's tenant, a client for other gears (`create_note` and `get_note`), and tenant-scoped storage. The note is a placeholder. It has no DESIGN id and is replaced by Construct's own model, starting with Record Intake.
 
 **Features:**
 - One authenticated route, `POST /construct/v1/foundation-notes`, with a permission check per operation
