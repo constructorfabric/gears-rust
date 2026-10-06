@@ -9,6 +9,14 @@ fn wire(err: DomainError) -> Problem {
     Problem::from(CanonicalError::from(err))
 }
 
+/// Everything a caller can read in a `Problem`, as one string.
+fn visible_text(problem: &Problem) -> String {
+    format!(
+        "{} {} {} {}",
+        problem.problem_type, problem.title, problem.detail, problem.context
+    )
+}
+
 #[test]
 fn not_found_maps_to_404_with_resource_type() {
     let problem = wire(DomainError::NotFound);
@@ -49,7 +57,7 @@ fn forbidden_maps_to_403_without_the_internal_message() {
         Some("ACCESS_DENIED"),
     );
     // The internal message stays out of the whole response, not only `detail`.
-    assert!(!format!("{problem:?}").contains("denied by policy"));
+    assert!(!visible_text(&problem).contains("denied by policy"));
 }
 
 #[test]
@@ -77,5 +85,5 @@ fn unavailable_maps_to_503_without_leaking_detail() {
     ));
 
     assert_eq!(problem.status, Some(503));
-    assert!(!format!("{problem:?}").contains("10.0.0.7"));
+    assert!(!visible_text(&problem).contains("10.0.0.7"));
 }

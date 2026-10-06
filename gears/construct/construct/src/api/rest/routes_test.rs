@@ -20,6 +20,7 @@ use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties}
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use crate::api::rest::error::FoundationNoteError;
 use crate::api::rest::routes::register_routes;
 use crate::api::rest::types::ConcreteService;
 use crate::config::ConstructConfig;
@@ -58,7 +59,6 @@ impl AuthZResolverApi for AllowResolver {
             .ok_or_else(|| {
                 CanonicalError::internal("tenant context is required".to_owned()).create()
             })?;
-
         Ok(EvaluationResponse {
             decision: true,
             context: EvaluationResponseContext {
@@ -88,6 +88,20 @@ impl AuthZResolverApi for DenyResolver {
             decision: false,
             context: EvaluationResponseContext::default(),
         })
+    }
+}
+
+/// The policy service answers with an error instead of a decision.
+struct ErroringResolver(fn() -> CanonicalError);
+
+#[async_trait]
+impl AuthZResolverApi for ErroringResolver {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Err((self.0)())
     }
 }
 
@@ -230,6 +244,17 @@ async fn json_of_the_wrong_shape_gets_a_problem_body() {
 }
 
 #[tokio::test]
+async fn unknown_field_in_the_body_gets_a_problem_body() {
+    let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
+    let body = format!(r#"{{"text":"hello","tenant_id":"{}"}}"#, Uuid::new_v4());
+
+    let (status, content_type, body) = post_raw(router, &body, Some("application/json")).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+    assert!(is_problem_json(content_type.as_deref()), "{content_type:?}");
+}
+
+#[tokio::test]
 async fn missing_content_type_gets_a_problem_body() {
     let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
 
@@ -240,6 +265,48 @@ async fn missing_content_type_gets_a_problem_body() {
         is_problem_json(content_type.as_deref()),
         "content type: {content_type:?}"
     );
+}
+
+#[tokio::test]
+async fn retryable_policy_failures_get_503_without_internal_detail() {
+    let failures: [fn() -> CanonicalError; 3] = [
+        || {
+            CanonicalError::service_unavailable()
+                .with_detail("pdp at 10.0.0.7 is down")
+                .create()
+        },
+        || FoundationNoteError::deadline_exceeded("pdp at 10.0.0.7 is slow").create(),
+        || {
+            FoundationNoteError::resource_exhausted("pdp at 10.0.0.7 is busy")
+                .with_quota_violation("policy", "rate limit")
+                .create()
+        },
+    ];
+
+    for failure in failures {
+        let router = router_with(Arc::new(ErroringResolver(failure)), Uuid::new_v4()).await;
+
+        let (status, content_type, body) =
+            post_raw(router, r#"{"text":"hello"}"#, Some("application/json")).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+        assert!(is_problem_json(content_type.as_deref()), "{content_type:?}");
+        assert!(!body.contains("10.0.0.7"), "body: {body}");
+    }
+}
+
+#[tokio::test]
+async fn broken_policy_service_gets_500_without_its_cause() {
+    let resolver =
+        ErroringResolver(|| CanonicalError::internal("client wiring secret".to_owned()).create());
+    let router = router_with(Arc::new(resolver), Uuid::new_v4()).await;
+
+    let (status, content_type, body) =
+        post_raw(router, r#"{"text":"hello"}"#, Some("application/json")).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert!(is_problem_json(content_type.as_deref()), "{content_type:?}");
+    assert!(!body.contains("secret"), "body: {body}");
 }
 
 #[tokio::test]

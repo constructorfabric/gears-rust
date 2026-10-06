@@ -1,3 +1,4 @@
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::DbError;
 use toolkit_macros::domain_model;
 
@@ -40,12 +41,34 @@ impl DomainError {
     }
 }
 
+/// Whether retrying the failed call can help: the categories that the platform
+/// answers with 429, 503 or 504, its retryable HTTP statuses (`is_retryable_status`
+/// in `toolkit-contract`). Any other category, and any category added later, is
+/// not retryable.
+fn is_retryable(inner: &CanonicalError) -> bool {
+    matches!(
+        inner,
+        CanonicalError::ServiceUnavailable { .. }
+            | CanonicalError::DeadlineExceeded { .. }
+            | CanonicalError::ResourceExhausted { .. }
+    )
+}
+
+/// The cause of a failed evaluation, for the log and the internal message. The
+/// diagnostic of an internal error holds its real cause; it never reaches a caller.
+fn describe_failure(inner: &CanonicalError) -> String {
+    match inner.diagnostic() {
+        Some(diagnostic) => format!("authorization evaluation failed: {inner}: {diagnostic}"),
+        None => format!("authorization evaluation failed: {inner}"),
+    }
+}
+
 fn log_enforcer_error(e: &authz_resolver_sdk::EnforcerError) {
     use authz_resolver_sdk::EnforcerError as E;
     match e {
         E::Denied { .. } => log_denied(e),
         E::CompileFailed(_) => log_compile_failed(e),
-        E::EvaluationFailed(_) => log_evaluation_failed(e),
+        E::EvaluationFailed(inner) => log_evaluation_failed(inner),
     }
 }
 
@@ -57,12 +80,17 @@ fn log_compile_failed(e: &authz_resolver_sdk::EnforcerError) {
     tracing::warn!(error = %e, "AuthZ scope compilation failed");
 }
 
-fn log_evaluation_failed(e: &authz_resolver_sdk::EnforcerError) {
-    tracing::error!(error = %e, "AuthZ scope resolution failed");
+fn log_evaluation_failed(inner: &CanonicalError) {
+    let cause = describe_failure(inner);
+    if is_retryable(inner) {
+        tracing::warn!(error = %cause, "AuthZ scope resolution failed, retryable");
+    } else {
+        tracing::error!(error = %cause, "AuthZ scope resolution failed");
+    }
 }
 
 /// @cpt-dod:cpt-cf-construct-dod-gear-foundation-error-mapping:p1
-// TODO(DE1302): `Forbidden` and `Unavailable` only carry Strings, so the
+// TODO(DE1302): `Forbidden`, `Unavailable` and `Internal` only carry Strings, so the
 // `EnforcerError` source is lost. Extend the variants to hold a boxed source,
 // then remove this allow.
 #[allow(unknown_lints, reason = "dylint lint names are unknown to rustc")]
@@ -82,8 +110,13 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-denied
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed-return
-            authz_resolver_sdk::EnforcerError::EvaluationFailed(_) => {
-                Self::Unavailable(e.to_string())
+            // A failure that the caller may retry is unavailable; any other
+            // failure of the policy service is an internal error.
+            authz_resolver_sdk::EnforcerError::EvaluationFailed(inner) if is_retryable(&inner) => {
+                Self::Unavailable(describe_failure(&inner))
+            }
+            authz_resolver_sdk::EnforcerError::EvaluationFailed(inner) => {
+                Self::Internal(describe_failure(&inner))
             }
         }
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed-return
