@@ -55,6 +55,7 @@ impl<R: NoteRepository> Service<R> {
         }
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %ctx.subject_tenant_id()))]
     pub async fn create_note(
         &self,
         ctx: &SecurityContext,
@@ -95,6 +96,7 @@ impl<R: NoteRepository> Service<R> {
         // @cpt-end:cpt-cf-construct-flow-gear-foundation-create-note:p1:inst-create-insert
     }
 
+    #[tracing::instrument(skip_all, fields(tenant_id = %ctx.subject_tenant_id(), note_id = %id))]
     pub async fn get_note(
         &self,
         ctx: &SecurityContext,
