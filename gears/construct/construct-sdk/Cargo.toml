@@ -27,3 +27,8 @@ toolkit = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
+toolkit-gts = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { workspace = true }
+serde_json = { workspace = true }
