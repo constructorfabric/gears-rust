@@ -3,15 +3,13 @@ use std::sync::Arc;
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use construct_sdk::models::{FoundationNote, NewFoundationNote};
-use toolkit_db::DBProvider;
 use toolkit_macros::domain_model;
 use toolkit_security::{SecurityContext, pep_properties};
 use uuid::Uuid;
 
+use super::DbProvider;
 use super::error::DomainError;
 use super::repo::NoteRepository;
-
-pub(crate) type DbProvider = DBProvider<toolkit_db::DbError>;
 
 /// Authorization resource type for foundation notes, scoped by tenant and
 /// note id. The PDP uses `supported_properties` to decide which predicates it

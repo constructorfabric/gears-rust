@@ -78,7 +78,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 - One-step plan path: the Review Queue owns the path that turns an add or an edit into a plan with one add or replace step, and Administrator Fact Management uses it.
 - Root node of a new subject: the Profile Writer owns writing the root node, including creating it for a new subject, in the same write as the facts.
 - Drop audit event (with the review hooks, one of the two choices closest to a design call): Record Intake owns the shape of the content-free drop audit event, and the Planner, the Sensitive-Data Checks, Admission and the Profile Writer reuse it.
-- Placeholder retirement: the first feature that adds a real route or table replaces the foundation's placeholder route, client operations and table.
+- Placeholder retirement: Record Intake, the first feature that adds a real route, replaces the foundation's placeholder route, client operations and table. Subject Settings adds the first of Construct's own tables and leaves the placeholder in place.
 - Node keys: the Planner gives new node keys, including to a returning deleted entity, and the one-step path of the Review Queue gives them the same way. The Profile Writer stores the keys the plan carries and finds the new root key after an erasure.
 - Erase route: Erasure owns the erase route and the call into Deletion, although the DESIGN credits the hand-off to the Subject control component, because Subject Control is built earlier.
 - Closing call from retention: Retention owns the closing call into the Review Queue for the facts it removes.
@@ -106,7 +106,7 @@ The DESIGN's largest component, subject control, is split across four features. 
   - Any DESIGN table, entity, component or sequence. The note table and entity are a placeholder that Construct's own model replaces; they have no DESIGN id
   - Construct's own permissions and routes for records, profiles and subjects
   - The Rust SDK interface of the full design (`cpt-cf-construct-interface-rust-sdk`), which grows with each later feature; the foundation owns the client trait of the shell only
-  - Retiring the placeholder route, client operations and table: the first feature that adds a real route or table replaces them, which is Subject Settings (`cpt-cf-construct-feature-subject-settings`)
+  - Retiring the placeholder route, client operations and table: the first feature that adds a real route replaces them, which is Record Intake (`cpt-cf-construct-feature-record-intake`)
 
 - **Requirements Covered**:
 
@@ -206,7 +206,6 @@ The DESIGN's largest component, subject control, is split across four features. 
   - Personalization off and an erasure under way as stored state that other features read
   - A setting change applies from the next request
   - The subject's settings shown in the subject's view and included in the export (the view and the export themselves belong to subject control)
-  - Replacing the foundation's placeholder route, client operations and table with its own, once its own table and routes exist
 
 - **Out of scope**:
   - Refusing records, dropping plans and hiding facts when personalization is off; intake, admission and the reader enforce that
@@ -268,6 +267,7 @@ The DESIGN's largest component, subject control, is split across four features. 
   - The shape of the content-free drop audit event, which the Planner, the Sensitive-Data Checks, Admission and the Profile Writer reuse
   - Loss of a received record without an audit event when an instance stops
   - Depending only on the base record shape, never on a connector's type
+  - Replacing the foundation's placeholder route, client operations and table, in the same migration that creates `construct__record_ids`
 
 - **Out of scope**:
   - Deciding what a record means (planner), checks and admission rules, and storage

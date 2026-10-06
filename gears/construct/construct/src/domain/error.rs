@@ -44,7 +44,7 @@ impl DomainError {
 /// Whether retrying the failed call can help: the error answers with one of the
 /// platform's retryable HTTP statuses, 429, 503 or 504 (`is_retryable_status` in
 /// `toolkit-contract`). Any other status is not retryable.
-fn is_retryable(inner: &CanonicalError) -> bool {
+pub(crate) fn is_retryable(inner: &CanonicalError) -> bool {
     matches!(inner.status_code(), 429 | 503 | 504)
 }
 

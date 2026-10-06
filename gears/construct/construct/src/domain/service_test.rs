@@ -6,96 +6,28 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use authz_resolver_sdk::{
     AuthZResolverApi, PolicyEnforcer,
-    constraints::{Constraint, InPredicate, Predicate},
     models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
 };
 use construct_sdk::ConstructClientV1;
 use construct_sdk::models::NewFoundationNote;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_canonical_errors::{Problem, resource_error};
-use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
-use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
+use toolkit_db::{DBProvider, Db};
+use toolkit_security::{PlatformSecurityContext, pep_properties};
 use uuid::Uuid;
 
 use crate::config::ConstructConfig;
 use crate::domain::error::DomainError;
 use crate::domain::local_client::LocalClient;
 use crate::domain::service::{Service, ServiceConfig};
-use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::sea_orm_repo::SeaOrmNoteRepository;
+use crate::test_support::{AllowResolver, DenyResolver, context_in, inmem_db};
 
 type ConcreteService = Service<SeaOrmNoteRepository>;
 
 /// Builds resource errors for the policy service stubs, without the REST layer.
 #[resource_error(gts_id!("cf.construct.foundation.note.v1~"))]
 struct PolicyTestError;
-
-/// Allows every request and constrains the answer to the subject's tenant and,
-/// when the request names one, the resource id (like a real PDP).
-struct AllowResolver;
-
-#[async_trait]
-impl AuthZResolverApi for AllowResolver {
-    async fn evaluate(
-        &self,
-        _ctx: PlatformSecurityContext,
-        request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, CanonicalError> {
-        let root_id = request
-            .context
-            .tenant_context
-            .as_ref()
-            .and_then(|tc| tc.root_id)
-            .or_else(|| {
-                request
-                    .subject
-                    .properties
-                    .get("tenant_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| Uuid::parse_str(s).ok())
-            })
-            .ok_or_else(|| {
-                CanonicalError::internal("tenant context is required".to_owned()).create()
-            })?;
-
-        let mut predicates = vec![Predicate::In(InPredicate::new(
-            pep_properties::OWNER_TENANT_ID,
-            [root_id],
-        ))];
-        if let Some(resource_id) = request.resource.id {
-            predicates.push(Predicate::In(InPredicate::new(
-                pep_properties::RESOURCE_ID,
-                [resource_id],
-            )));
-        }
-
-        Ok(EvaluationResponse {
-            decision: true,
-            context: EvaluationResponseContext {
-                constraints: vec![Constraint { predicates }],
-                ..Default::default()
-            },
-        })
-    }
-}
-
-/// Denies every request: a subject without permission.
-struct DenyResolver;
-
-#[async_trait]
-impl AuthZResolverApi for DenyResolver {
-    async fn evaluate(
-        &self,
-        _ctx: PlatformSecurityContext,
-        _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, CanonicalError> {
-        Ok(EvaluationResponse {
-            decision: false,
-            context: EvaluationResponseContext::default(),
-        })
-    }
-}
 
 /// One request to the policy service: resource type, action, the tenant named
 /// as the owner of the resource and the id of the resource (none for a create).
@@ -173,31 +105,6 @@ impl AuthZResolverApi for UnconstrainedResolver {
             context: EvaluationResponseContext::default(),
         })
     }
-}
-
-async fn inmem_db() -> Db {
-    use sea_orm_migration::MigratorTrait;
-
-    let opts = ConnectOpts {
-        max_conns: Some(1),
-        min_conns: Some(1),
-        ..Default::default()
-    };
-    let db = connect_db("sqlite::memory:", opts)
-        .await
-        .expect("connect in-memory database");
-    run_migrations_for_testing(&db, Migrator::migrations())
-        .await
-        .expect("run migrations");
-    db
-}
-
-fn context_in(tenant_id: Uuid) -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::new_v4())
-        .subject_tenant_id(tenant_id)
-        .build()
-        .unwrap()
 }
 
 fn service_with(db: &Db, resolver: Arc<dyn AuthZResolverApi>) -> ConcreteService {

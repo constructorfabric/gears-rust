@@ -46,9 +46,9 @@ The Gear Foundation is the small backend shell that every other Construct featur
 
 Construct needs a base that is a real platform gear: an SDK crate, an implementation crate, a permission check for each operation, and storage that is limited to the caller's tenant. The shell proves this pattern once, so later features can copy it. The decision to build Construct as a gear is in `cpt-cf-construct-adr-construct-is-a-gear`. The standard gear layout is described in `cpt-cf-construct-tech-rust-gear`.
 
-The shell stores a "foundation note": an id, a tenant id and a text. The note is a placeholder. The entity `FoundationNote` is the placeholder entity. `NewFoundationNote` is the SDK request model, not a DESIGN entity. It has no DESIGN id, and the DESIGN has no table, entity, component or sequence for it. The first feature that adds a real route or table replaces it. Per DECOMPOSITION, that feature is Subject Settings.
+The shell stores a "foundation note": an id, a tenant id and a text. The note is a placeholder. The entity `FoundationNote` is the placeholder entity. `NewFoundationNote` is the SDK request model, not a DESIGN entity. It has no DESIGN id, and the DESIGN has no table, entity, component or sequence for it. The first feature that adds a real route replaces it. Per DECOMPOSITION, that feature is Record Intake.
 
-**Out of scope** (as in DECOMPOSITION entry 2.1): any DESIGN table, entity, component or sequence; routes for records, profiles and subjects; the full Rust SDK interface `cpt-cf-construct-interface-rust-sdk`, which grows with each later feature (the foundation owns only the client trait of the shell); and the replacement of the placeholder, which the first feature with a real route or table does (Subject Settings).
+**Out of scope** (as in DECOMPOSITION entry 2.1): any DESIGN table, entity, component or sequence; routes for records, profiles and subjects; the full Rust SDK interface `cpt-cf-construct-interface-rust-sdk`, which grows with each later feature (the foundation owns only the client trait of the shell); and the replacement of the placeholder, which the first feature with a real route does (Record Intake).
 
 **Requirements**: `cpt-cf-construct-fr-tenant-isolation`, `cpt-cf-construct-fr-access-control`
 
@@ -177,7 +177,7 @@ The gear declares the dependency `authz_resolver` and the capabilities `rest` an
 7. [x] - `p1` - **RETURN** success - `inst-start-return`
 
 **Capability hooks, called separately by the runtime**:
-1. [x] - `p1` - The runtime calls the database capability hook, which returns the migration set with one migration, `initial_001`. - `inst-start-migrations`
+1. [x] - `p1` - The runtime calls the database capability hook, which returns the migration set: `initial_001`, followed by the migrations of later features. - `inst-start-migrations`
 2. [x] - `p1` - When the runtime registers REST routes, the REST capability hook registers the single route on the router. It fails if the service is not initialized. - `inst-start-rest`
 
 ### Validate the Note Text
@@ -349,7 +349,7 @@ The system **MUST** supply to the runtime a migration that creates the table `co
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-placeholder-boundary`
 
-The system **MUST NOT** add a DESIGN table, entity, component or sequence, a route for records, profiles or subjects, or a permission defined in the DESIGN or PRD. The route, the client operations, the table and the placeholder checks on `construct.foundation_note` (`create`, `get`) are a placeholder. Subject Settings replaces them together with the note.
+The system **MUST NOT** add a DESIGN table, entity, component or sequence, a route for records, profiles or subjects, or a permission defined in the DESIGN or PRD. The route, the client operations, the table and the placeholder checks on `construct.foundation_note` (`create`, `get`) are a placeholder. Record Intake replaces them together with the note.
 
 **Implements**:
 - `cpt-cf-construct-flow-gear-foundation-create-note`
@@ -389,4 +389,4 @@ The system **MUST NOT** add a DESIGN table, entity, component or sequence, a rou
 - **Compile-time gates**: The SDK forbids unsafe code. The workspace lints apply to both crates. The `domain_model` marker keeps infrastructure types out of the models and the domain at compile time. The config type rejects unknown keys when it is read. The secure ORM needs a scope before an insert or a select can run on the entity.
 - **Performance, compliance and UX**: Performance and UX: not applicable. The shell has no performance target and no user interface. Compliance and personal data: the shell makes no personal-data decision. The note text is free-form, and the shell has no delete or retention path. Erasure and retention come with features 2.14 and 2.15 and with the replacement of the placeholder (see DECOMPOSITION).
 - **Deviations from platform baselines**: None.
-- **Not done by this feature** (see the out-of-scope paragraph in 1.2): Any DESIGN table, entity, component or sequence. Routes for records, profiles or subjects. The full Rust SDK interface `cpt-cf-construct-interface-rust-sdk`. A route to read a note: reading exists only through the client. Retiring the placeholder, which Subject Settings does.
+- **Not done by this feature** (see the out-of-scope paragraph in 1.2): Any DESIGN table, entity, component or sequence. Routes for records, profiles or subjects. The full Rust SDK interface `cpt-cf-construct-interface-rust-sdk`. A route to read a note: reading exists only through the client. Retiring the placeholder, which Record Intake does.
