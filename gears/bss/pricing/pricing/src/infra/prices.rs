@@ -122,13 +122,6 @@ impl PriceBookEntryContext {
         siblings: &[Price],
         today: Date,
     ) -> Option<RuleError> {
-        if candidate.min_fee.is_some()
-            && self.policy.as_ref().is_some_and(|p| {
-                crate::domain::usage_policy::refuses_minimum_fee(&(&p.content).into())
-            })
-        {
-            return Some(RuleError::new("UNSUPPORTED_TERMS"));
-        }
         price::validate(
             candidate,
             self.kind,

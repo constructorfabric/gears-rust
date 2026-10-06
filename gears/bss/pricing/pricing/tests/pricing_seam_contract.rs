@@ -50,7 +50,6 @@ struct Amount {
 #[serde(rename_all = "snake_case")]
 enum Refusal {
     MissingPolicy,
-    MinimumFee,
     UnalignedAnchor,
     Package,
     MissingBillingTerms,
@@ -987,12 +986,11 @@ async fn f22_f31_unsupported_inputs_fail_before_acceptance() {
         let mut q = w.publish(&mut bindings).await;
         let before = receipt_count(&w).await;
         match refusal {
-            Refusal::MissingPolicy | Refusal::MinimumFee | Refusal::Package => {
+            Refusal::MissingPolicy | Refusal::Package => {
                 // Legacy/corrupt catalog rows cannot be authored through the modern gates.
                 // Inject them after publication to prove the actual sellability provider fails closed.
                 match refusal {
                     Refusal::MissingPolicy => execute(&w,"UPDATE pricing_price_book_entry SET usage_policy_id=NULL,usage_policy_version=NULL,usage_policy_digest=NULL,usage_sku_version=NULL").await,
-                    Refusal::MinimumFee => execute(&w,"UPDATE pricing_price SET min_fee='0'").await,
                     Refusal::Package => {
                         execute(&w,"UPDATE pricing_price_book_entry SET model='package'").await;
                         execute(&w,r#"UPDATE pricing_price SET price_json='{"package_size":"10","package_price":"1"}'"#).await;

@@ -1440,80 +1440,83 @@ async fn submit_price(f: &Fixture, id: Uuid) -> (u16, Value, String) {
     .await
 }
 
+/// D-525: a usage price on an hourly or per-resource policy carries its floor through create,
+/// submit and apply, and reads it back approved.
 #[tokio::test]
-async fn hourly_minimum_fee_is_rejected_at_create_submit_and_apply() {
-    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
-    let f = Fixture::new(Arc::new(Script::default())).await;
-    let (book, _) = f.book().await;
-    let entry = create_entry(
-        &f,
-        plan_support::id_of(&book["id"]),
-        Uuid::new_v4(),
-        policy(),
-    )
-    .await;
-    let today = time::OffsetDateTime::now_utc().date().to_string();
-    let rejected = draft_price(&f, entry, &today, Some("1")).await;
-    assert_eq!(rejected.0, 400, "{rejected:?}");
-    assert!(rejected.1.to_string().contains("UNSUPPORTED_TERMS"));
-    let draft = draft_price(&f, entry, &today, None).await;
-    assert_eq!(draft.0, 201, "{draft:?}");
-    let id = plan_support::id_of(&draft.1["items"][0]["id"]);
-    let raw = Database::connect(&f.dsn).await.unwrap();
-    raw.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE pricing_price SET min_fee = '1' WHERE id = ?",
-        [id.into()],
-    ))
-    .await
-    .unwrap();
-    let rejected = submit_price(&f, id).await;
-    assert_eq!(rejected.0, 400, "{rejected:?}");
-    assert!(rejected.1.to_string().contains("UNSUPPORTED_TERMS"));
-    raw.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE pricing_price SET min_fee = NULL WHERE id = ?",
-        [id.into()],
-    ))
-    .await
-    .unwrap();
-    let pending = submit_price(&f, id).await;
-    assert_eq!(pending.0, 201, "{pending:?}");
-    raw.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE pricing_price SET min_fee = '1' WHERE id = ?",
-        [id.into()],
-    ))
-    .await
-    .unwrap();
-    let reviewer = plan_support::entry_support::user_of(f.ctx.subject_tenant_id());
-    let path = format!(
-        "/approval-units/{}/approve",
-        pending.1["unit"]["id"].as_str().unwrap()
-    );
-    let stale = f
-        .call_as(
-            &reviewer,
-            "POST",
-            &path,
-            json!({"generation":1}),
-            None,
-            Some("stale-fee"),
-        )
-        .await;
-    assert_eq!(stale.0, 400, "{stale:?}");
-    let refused = f
-        .call_as(
-            &reviewer,
-            "POST",
-            &path,
-            json!({"generation":2}),
-            None,
-            Some("apply-fee"),
-        )
-        .await;
-    assert_eq!(refused.0, 409, "{refused:?}");
-    assert!(refused.1.to_string().contains("UNSUPPORTED_TERMS"));
+async fn hourly_and_resource_minimum_fees_are_accepted_at_create_submit_and_apply() {
+    for resource in [false, true] {
+        let f = Fixture::new(Arc::new(Script::default())).await;
+        let (book, _) = f.book().await;
+        let mut rules = policy();
+        if resource {
+            rules["aggregation_scope"] = json!("resource");
+        }
+        let book = plan_support::id_of(&book["id"]);
+        let sku = Uuid::new_v4();
+        let entry = create_entry(&f, book, sku, rules).await;
+        let today = time::OffsetDateTime::now_utc().date().to_string();
+        let draft = draft_price(&f, entry, &today, Some("1")).await;
+        assert_eq!(draft.0, 201, "resource={resource}: {draft:?}");
+        assert_eq!(draft.1["items"][0]["min_fee"], json!("1"), "{draft:?}");
+        let negative = draft_price(&f, entry, &today, Some("-1")).await;
+        assert_eq!(negative.0, 400, "resource={resource}: {negative:?}");
+        assert!(
+            negative.1.to_string().contains("MIN_FEE_INVALID"),
+            "a negative floor is still refused: {negative:?}"
+        );
+        let id = plan_support::id_of(&draft.1["items"][0]["id"]);
+        let pending = submit_price(&f, id).await;
+        assert_eq!(pending.0, 201, "resource={resource}: {pending:?}");
+        let reviewer = plan_support::entry_support::user_of(f.ctx.subject_tenant_id());
+        let path = format!(
+            "/approval-units/{}/approve",
+            pending.1["unit"]["id"].as_str().unwrap()
+        );
+        let applied = f
+            .call_as(
+                &reviewer,
+                "POST",
+                &path,
+                json!({"generation":1}),
+                None,
+                Some("apply-fee"),
+            )
+            .await;
+        assert_eq!(applied.0, 200, "resource={resource}: {applied:?}");
+        let prices = f
+            .call(
+                "GET",
+                &format!("/price-book-entries/{entry}/prices"),
+                json!({}),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(prices.0, 200, "{prices:?}");
+        let row = &prices.1["items"][0];
+        assert_eq!(
+            (row["state"].as_str(), row["min_fee"].as_str()),
+            (Some("approved"), Some("1")),
+            "{row}"
+        );
+        // The plan-revision gate no longer refuses the floor (D-525).
+        let (_, revision) = plan_support::plan(&f, "FLOOR", book).await;
+        plan_support::item(&f, revision, sku, Some(entry), "paid").await;
+        let submitted = f
+            .call(
+                "POST",
+                &format!("/plan-revisions/{revision}/submit"),
+                json!({}),
+                None,
+                Some("plan-floor"),
+            )
+            .await;
+        assert_eq!(submitted.0, 201, "resource={resource}: {submitted:?}");
+        assert!(
+            !submitted.1.to_string().contains("UNSUPPORTED_TERMS"),
+            "{submitted:?}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -62,6 +62,8 @@ types-registry = { workspace = true }
 types-registry-sdk = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-gts = { workspace = true }
+# `gts_instance!`'s expansion references the `gts` crate directly.
+gts = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 
 [dev-dependencies]
