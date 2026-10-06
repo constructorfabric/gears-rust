@@ -97,7 +97,8 @@ The shell has these public surfaces:
 - The text is empty after trimming, contains the NUL character, or is longer than the configured maximum in bytes: 400 with the field `text` named.
 - The platform does not allow the caller to create notes: 403.
 - The scope the platform returns does not cover the caller's tenant at insert: 403.
-- The permission check itself fails, or the database connection or insert fails: 500, without internal detail.
+- The permission check itself fails (the policy service errors or times out): 503, which callers may retry, without internal detail.
+- The database connection or insert fails: 500, without internal detail.
 
 **Steps**:
 1. [ ] - `p1` - Caller sends `POST /construct/v1/foundation-notes` with a JSON content type and a JSON body that has one field, `text`. The route is marked authenticated, so the platform authenticates the caller first. - `inst-create-send`
@@ -210,7 +211,7 @@ The gear declares the dependency `authz_resolver` and the capabilities `rest` an
 3. [ ] - `p1` - **IF** the platform denies the request, or the constraints it returns cannot be compiled into a scope - `inst-scope-denied`
    1. [ ] - `p1` - **RETURN** a forbidden domain error (shown to the caller as 403). A denial is logged at debug level, a compile failure at warn level (both in `domain/error.rs`). - `inst-scope-denied-return`
 4. [ ] - `p1` - **IF** the evaluation itself fails - `inst-scope-failed`
-   1. [ ] - `p1` - **RETURN** an internal domain error (shown to the caller as 500). It is logged at error level. - `inst-scope-failed-return`
+   1. [ ] - `p1` - **RETURN** an unavailable domain error (shown to the caller as 503). A timeout of the policy service reaches this branch as a service-unavailable result of the policy enforcer, so the retryable meaning is kept. It is logged at error level. - `inst-scope-failed-return`
 5. [ ] - `p1` - **RETURN** the scope - `inst-scope-return`
 
 ### Map Domain Errors to Problem Errors
@@ -229,7 +230,9 @@ The gear declares the dependency `authz_resolver` and the capabilities `rest` an
    1. [x] - `p1` - **RETURN** invalid argument (400) with a field violation: the field, the message and the reason `VALIDATION_ERROR` - `inst-map-validation-return`
 4. [x] - `p1` - **IF** the error is forbidden - `inst-map-forbidden`
    1. [x] - `p1` - Log a warning (in `api/rest/error.rs`; an enforcer denial was already logged at debug level when it became a domain error). **RETURN** permission denied (403) with the reason `ACCESS_DENIED`. The internal message is not sent to the caller. - `inst-map-forbidden-return`
-5. [x] - `p1` - **IF** the error is internal or from the database - `inst-map-internal`
+5. [x] - `p1` - **IF** the error is unavailable (the policy service failed or timed out) - `inst-map-unavailable`
+   1. [x] - `p1` - Log a warning. **RETURN** service unavailable (503), so callers may retry. The internal message is not sent to the caller. - `inst-map-unavailable-return`
+6. [x] - `p1` - **IF** the error is internal or from the database - `inst-map-internal`
    1. [x] - `p1` - Log at error level. **RETURN** internal (500). The tests check that the `detail` of the response does not contain the internal text. - `inst-map-internal-return`
 
 ## 4. States (CDSL)
@@ -251,7 +254,7 @@ The system **MUST** be built as two crates with separated layers: the SDK crate 
 - API: `POST /construct/v1/foundation-notes`
 - Entities: `FoundationNote` (placeholder entity), `NewFoundationNote` (SDK request model, not a DESIGN entity)
 
-**Verified by**: the config unit tests `max_text_length_is_bounded_by_the_text_column`, `unknown_keys_are_rejected`, `default_config_converts_to_the_default_service_limit` and `invalid_config_does_not_convert`. They cover the config conversion, which rejects a limit below 1 or above 65535. `init` is not run in tests. The startup order itself (database provider, AuthZ resolver, client registration, double initialization) has no test. The declared dependency (`deps = [authz_resolver]`), the capabilities (`rest`, `db`), the two-crate layout and the absence of a raw database connection are verified by review and compilation only.
+**Verified by**: the config unit tests `max_text_length_is_bounded_by_the_text_column`, `unknown_keys_are_rejected`, `default_config_converts_to_the_default_service_limit`, `omitted_max_text_length_takes_the_default_through_deserialization` and `invalid_config_does_not_convert`. They cover the config conversion, which rejects a limit below 1 or above 65535. `init` is not run in tests. The startup order itself (database provider, AuthZ resolver, client registration, double initialization) has no test. The declared dependency (`deps = [authz_resolver]`), the capabilities (`rest`, `db`), the two-crate layout and the absence of a raw database connection are verified by review and compilation only.
 
 ### Create Route
 
@@ -297,7 +300,7 @@ The system **MUST** check the permission for each operation (`create`, `get`) on
 - DB Table: `construct__foundation_notes`
 - Entities: `FoundationNote`
 
-**Verified by**: `permitted_subject_creates_and_reads_a_note`, `subject_without_permission_is_denied`, `note_of_another_tenant_is_not_found`, `unknown_note_is_not_found`, `failing_policy_service_gives_an_internal_error`, `allow_without_constraints_is_forbidden` (service), `insert_outside_scope_is_forbidden`, `insert_inside_scope_round_trips` (repository), and `denied_subject_gets_403` (routes). The denied-subject case is covered only with a stub resolver. It was never run through the real gateway and the real AuthZ resolver. The two failure paths of the policy service are covered with stub resolvers: an evaluation failure gives the internal error (500 on the route), and an allow without constraints, a compile failure, gives the forbidden error (403). The denial of `get_note` is tested on the service only, not through the client.
+**Verified by**: `permitted_subject_creates_and_reads_a_note`, `subject_without_permission_is_denied`, `note_of_another_tenant_is_not_found`, `unknown_note_is_not_found`, `failing_policy_service_gives_an_unavailable_error`, `allow_without_constraints_is_forbidden`, `service_asks_for_the_note_resource_and_the_matching_action` (service), `insert_outside_scope_is_forbidden`, `insert_inside_scope_round_trips` (repository), and `denied_subject_gets_403` (routes). The denied-subject case is covered only with a stub resolver. It was never run through the real gateway and the real AuthZ resolver. The two failure paths of the policy service are covered with stub resolvers: an evaluation failure gives the unavailable error (503 on the route), and an allow without constraints, a compile failure, gives the forbidden error (403). The test `service_asks_for_the_note_resource_and_the_matching_action` records what the service asks the policy service for (the note resource, then the actions `create` and `get`), and the stub resolver of the route tests asserts the resource type and the action `create`. The denial of `get_note` is tested on the service only, not through the client.
 
 ### Client in ClientHub
 
@@ -311,13 +314,13 @@ The system **MUST** provide `ConstructClientV1` in the SDK with `create_note` an
 **Touches**:
 - Entities: `FoundationNote` (placeholder entity), `NewFoundationNote` (SDK request model, not a DESIGN entity)
 
-**Verified by**: `local_client_round_trips_a_note_and_maps_not_found`. The registration in ClientHub at startup is not tested.
+**Verified by**: `local_client_round_trips_a_note_and_maps_not_found`, and in the SDK crate `client_trait_is_object_safe` and `client_trait_object_is_send_sync` (the trait works as `Arc<dyn ConstructClientV1>`, which is how ClientHub stores it) and the model tests `new_note_input_accepts_str_and_string` and `note_keeps_the_given_id_tenant_and_text`. The registration in ClientHub at startup is not tested.
 
 ### RFC 9457 Error Behavior
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-gear-foundation-error-mapping`
 
-The system **MUST** answer every error as an RFC 9457 Problem with the status in `cpt-cf-construct-algo-gear-foundation-map-errors` and **MUST NOT** leak internal detail in 403 or 500 answers. Body errors (400, 422, 415) are also Problems, produced by the toolkit's `Json` extractor (see `cpt-cf-construct-dod-gear-foundation-create-route`). An unknown scope-error variant **MUST** be logged at error level before it is mapped. An enforcer denial is logged at debug level in the domain mapping and at warn level in the REST mapping.
+The system **MUST** answer every error as an RFC 9457 Problem with the status in `cpt-cf-construct-algo-gear-foundation-map-errors` and **MUST NOT** leak internal detail in 403, 503 or 500 answers. Body errors (400, 422, 415) are also Problems, produced by the toolkit's `Json` extractor (see `cpt-cf-construct-dod-gear-foundation-create-route`). An unknown scope-error variant **MUST** be logged at error level before it is mapped. An enforcer denial is logged at debug level in the domain mapping and at warn level in the REST mapping.
 
 **Implements**:
 - `cpt-cf-construct-algo-gear-foundation-map-errors`
@@ -325,7 +328,7 @@ The system **MUST** answer every error as an RFC 9457 Problem with the status in
 **Touches**:
 - API: `POST /construct/v1/foundation-notes`
 
-**Verified by**: `not_found_maps_to_404_with_resource_type`, `validation_maps_to_400_with_field_violation`, `forbidden_maps_to_403_without_the_internal_message`, `internal_maps_to_500_without_leaking_detail`, `database_maps_to_500_without_leaking_detail` (error mapping), and `map_scope_error_maps_each_variant`, `unknown_scope_error_message_is_neutral` (repository). The two 500 tests check the `detail` of the response for the internal and the database error. The 403 test checks the reason `ACCESS_DENIED` and that the internal message appears nowhere in the response. No test checks the log output.
+**Verified by**: `not_found_maps_to_404_with_resource_type`, `validation_maps_to_400_with_field_violation`, `forbidden_maps_to_403_without_the_internal_message`, `unavailable_maps_to_503_without_leaking_detail`, `internal_maps_to_500_without_leaking_detail`, `database_maps_to_500_without_leaking_detail` (error mapping), and `map_scope_error_maps_each_variant`, `unknown_scope_error_message_is_neutral` (repository). The two 500 tests check the `detail` of the response for the internal and the database error. The 403 test checks the reason `ACCESS_DENIED` and that the internal message appears nowhere in the response. The 503 test checks that the internal text appears nowhere in the response. No test checks the log output.
 
 ### Tenant-Scoped Storage and Migration
 
@@ -369,6 +372,7 @@ The system **MUST NOT** add a DESIGN table, entity, component or sequence, a rou
 - [ ] The client creates and reads a note, and an unknown id comes back as a 404 problem (`local_client_round_trips_a_note_and_maps_not_found`).
 - [ ] The config conversion rejects `max_text_length` below 1 or above 65535, and an unknown config key is rejected (`max_text_length_is_bounded_by_the_text_column`, `invalid_config_does_not_convert`, `unknown_keys_are_rejected`). `init` is not run in tests.
 - [ ] The `detail` of a 500 answer does not contain the internal text, for an internal error and for a database error (`internal_maps_to_500_without_leaking_detail`, `database_maps_to_500_without_leaking_detail`).
+- [ ] A failure of the policy service gives 503, which callers may retry, and the internal text stays out of the response (`failing_policy_service_gives_an_unavailable_error`, `unavailable_maps_to_503_without_leaking_detail`).
 - [ ] The migration names the table `construct__foundation_notes` and the index `idx_construct__foundation_notes__tenant` for each backend (`postgres_and_sqlite_ddl_use_namespaced_names`, `mysql_ddl_uses_binary_uuid_columns`).
 - [ ] The tests named in this document pass. They run on an in-memory SQLite database.
 
@@ -376,10 +380,10 @@ The system **MUST NOT** add a DESIGN table, entity, component or sequence, a rou
 
 - **Security**: The caller and tenant come only from the security context that the platform supplies. The route is marked authenticated, and each operation has its own permission check. Another tenant's note answers as not found. The code sends no internal message in a 403 answer, and the tests check the `detail` of 500 answers (internal and database errors). The 403 test checks that the internal message stays out of the response. The unit tests use stub resolvers. The real gateway and the real AuthZ resolver were not exercised, so the 401 case is a gap.
 - **Data integrity**: The id is generated by the gear. The text is stored as sent, after validation. The limit is in bytes and cannot be set above what a MySQL TEXT column holds. Inserts and reads go through the secure ORM, which applies the scope. A note is never updated or deleted by the shell.
-- **Reliability**: A bad config, a missing database provider or a missing AuthZ resolver makes `init` fail, so errors show early. The migration uses create-if-not-exists. A failure of the AuthZ evaluation gives 500, not an open door (`failing_policy_service_gives_an_internal_error`).
-- **Observability**: The gear logs when it provides migrations and when it registers its route (info). It logs an enforcer denial (debug in the domain mapping, warn in the REST mapping), a compile failure (warn), an unknown scope-error variant (error), and internal or database errors (error). Metrics and traces were not checked on a running instance.
+- **Reliability**: A bad config, a missing database provider or a missing AuthZ resolver makes `init` fail, so errors show early. The migration uses create-if-not-exists. A failure of the AuthZ evaluation, including a timeout of the policy service, gives 503 (retryable), not an open door (`failing_policy_service_gives_an_unavailable_error`).
+- **Observability**: The gear logs when it provides migrations and when it registers its route (info). It logs an enforcer denial (debug in the domain mapping, warn in the REST mapping), a compile failure (warn), an evaluation failure (error in the domain mapping, then warn in the REST mapping), an unknown scope-error variant (error), and internal or database errors (error). Metrics and traces were not checked on a running instance.
 - **Rollback**: The migration has a `down` step that drops the table. It has no test, and it was not run. The placeholder is removed by the feature that replaces it.
-- **Test layering**: At the time of writing there are 38 tests. All are unit-level, in process and on in-memory SQLite: config (4), migration DDL text (4), service and client (11), routes (8), DTO (2), error mapping (5), repository (4). There is no integration test with a real database, gateway or AuthZ resolver, and no end-to-end test.
+- **Test layering**: At the time of writing there are 45 tests. All are unit-level, in process and on in-memory SQLite. The gear crate has 41: config (5), migration DDL text (4), service and client (12), routes (8), DTO (2), error mapping (6), repository (4). The SDK crate has 4: the trait object checks (2) and the models (2). There is no integration test with a real database, gateway or AuthZ resolver, and no end-to-end test.
 - **Untested paths**: the denial of `get_note` through the client (only the service is tested, with a stub resolver); the migration `down` step; running the migration twice; the OperationBuilder registration, the authenticated flag and the empty license feature list; the 401 case; an unreadable or oversized body; `init` and the startup order.
 - **Compile-time gates**: The SDK forbids unsafe code. The workspace lints apply to both crates. The `domain_model` marker keeps infrastructure types out of the models and the domain at compile time. The config type rejects unknown keys when it is read. The secure ORM needs a scope before an insert or a select can run on the entity.
 - **Performance, compliance and UX**: Performance and UX: not applicable. The shell has no performance target and no user interface. Compliance and personal data: the shell makes no personal-data decision. The note text is free-form, and the shell has no delete or retention path. Erasure and retention come with features 2.14 and 2.15 and with the replacement of the placeholder (see DECOMPOSITION).
