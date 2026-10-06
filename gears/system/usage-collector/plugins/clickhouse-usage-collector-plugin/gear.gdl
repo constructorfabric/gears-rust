@@ -1,0 +1,24 @@
+# Gearbox product metadata for the clickhouse-usage-collector-plugin gear.
+#
+# Projected from #[toolkit::gear]: id, colocated_deps (types-registry).
+
+gear(
+    maturity = "preview",
+    name = "ClickHouse Usage Collector Plugin",
+    description = "ClickHouse storage backend plugin for usage collection.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-clickhouse-usage-collector-plugin",
+        lib = "clickhouse_usage_collector_plugin",
+        path = ".",
+    ),
+
+    # The point this plugin implements, by the GTS spec its host declares.
+    implements = "cf.core.uc.plugin.v1~",
+
+    # Nothing exposed: `database_url` carries credentials (a `SecretString`),
+    # and a form offering a box for it would be offering to commit them.
+    config_schema = config(),
+)

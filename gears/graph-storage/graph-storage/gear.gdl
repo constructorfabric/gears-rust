@@ -1,0 +1,25 @@
+# Gearbox product metadata for the graph-storage gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest),
+# colocated_deps (authz-resolver).
+
+gear(
+    maturity = "preview",
+    name = "Graph Storage",
+    description = "Typed, multi-tenant knowledge graph with search and traversal over a pluggable store.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-graph-storage",
+        lib = "graph_storage",
+        path = ".",
+    ),
+    sdk = cargo(
+        crate_name = "cf-gears-graph-storage-sdk",
+        lib = "graph_storage_sdk",
+        path = "../graph-storage-sdk",
+    ),
+
+    config_schema = config(),
+)

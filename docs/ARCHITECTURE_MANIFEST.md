@@ -106,9 +106,11 @@ Persistence follows the same separation-of-concerns model as APIs and security: 
 
 Constructor Fabric Gears does not ship ready-to-use services. It ships a set of well-integrated libraries that vendors compose into their own service binaries. Each gear is infrastructure-agnostic and deployment-agnostic, supporting three deployment shapes:
 
-- **Single-node** — all gears in one process. Suitable for edge devices, on-prem appliances, development, and testing.
-- **Multi-node** — gears distributed across processes or machines over REST API or gRPC, without container orchestration. Suitable for bare-metal on-prem or small-scale deployments.
-- **Kubernetes cluster** — gears as containerized services with full orchestration and cloud-native operations.
+- **Embedded** — all gears in one process. Suitable for edge devices, on-prem appliances, development, and testing.
+- **Self-Hosted** — gears distributed across processes or machines over REST API or gRPC, without container orchestration. Suitable for bare-metal on-prem or small-scale deployments. Its across-hosts form is the multi-node variant.
+- **K8s Native** — gears as containerized services with full orchestration and cloud-native operations.
+
+These are the three profiles named in [ADR-0001](arch/toolkit-oop/ADR/0001-cpt-cf-adr-deployment-profiles.md), and `embedded` / `self_hosted` / `kubernetes` is how a `product.gdl` spells them.
 
 Gears talk to each other through a Rust-native SDK that facades the communication interface (local vs. remote) and encapsulates internal logic. The platform provides DB-agnostic persistence (SeaORM-based) and infrastructure-agnostic cluster primitives (distributed cache, distributed locks, leader election, service discovery).
 

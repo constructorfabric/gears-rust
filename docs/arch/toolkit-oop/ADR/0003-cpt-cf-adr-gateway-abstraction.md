@@ -14,7 +14,7 @@ date: 2026-04-07
 ## Context and Problem Statement
 
 The current `api-gateway` gear is an in-process Axum gear that directly aggregates routes from other in-process
-gears. In Profile 2 (Host + Workers), it must also reverse-proxy to OoP gears. In Profile 3 (K8s Native), the
+gears. In Profile 2 (Self-Hosted), it must also reverse-proxy to OoP gears. In Profile 3 (K8s Native), the
 built-in gateway is replaced entirely by an external gateway (Kong, Tyk, Envoy). How should gears register their
 public routes when the gateway implementation varies by deployment profile? Should gears call `api-gateway` directly,
 or should there be an abstraction?

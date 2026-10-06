@@ -77,7 +77,7 @@ application gears run out-of-process. The architecture is built on four pillars:
 
 | ADR ID                              | Decision Summary                                                                                       |
 |-------------------------------------|--------------------------------------------------------------------------------------------------------|
-| `cpt-cf-adr-deployment-profiles`    | Three named deployment profiles (Embedded, Host+Workers, K8s Native) instead of arbitrary combinations |
+| `cpt-cf-adr-deployment-profiles`    | Three named deployment profiles (Embedded, Self-Hosted, K8s Native) instead of arbitrary combinations |
 | `cpt-cf-adr-two-plane-auth`         | Two-plane auth: tenant plane re-validates JWT per hop; platform plane uses SA tokens (mTLS+SPIFFE next) |
 | `cpt-cf-adr-platform-plane-auth`   | Platform-plane authentication: SA tokens (Profile 3) / bootstrap token (Profile 2) first, mTLS + SPIFFE next |
 | `cpt-cf-adr-rest-first-oop`         | REST as primary OoP protocol; each gear runs its own HTTP server                                     |
@@ -229,7 +229,7 @@ token). `encode_bin` / `decode_bin` (which exclude `bearer_token`) remain in use
 
 | Entity                   | Description                                                                                       |
 |--------------------------|---------------------------------------------------------------------------------------------------|
-| DeploymentProfile        | Enum: `Embedded`, `HostWorkers`, `K8sNative`. Determines bootstrap behavior.                      |
+| DeploymentProfile        | Enum: `Embedded`, `SelfHosted`, `K8sNative`. Determines bootstrap behavior.                      |
 | OopWorkerConfig          | Configuration for an OoP gear: gear list, listen address, DirectoryService endpoint, profile. |
 | ServiceEndpoint          | Extended with `rest_url` field. Represents a discovered gear's HTTP endpoint.                   |
 | RegisterInstanceInfo     | Extended with `rest_endpoint` and `openapi_spec` fields for REST service registration.            |
@@ -1055,7 +1055,7 @@ and no bespoke gateway admin API is needed. Notes:
 - **Single-endpoint selection (Profile 3)**: a matched path resolves to a single, stable upstream endpoint (the first
   in deterministic instance order); cross-replica load balancing is delegated to the gear's stable k8s Service DNS
   rather than balanced in the proxy. The registry is instance-keyed and retains *all* of a gear's registered endpoints,
-  so this selection is a localized policy — the extension seam for Profile 2 (Host + Workers), where the proxy is the
+  so this selection is a localized policy — the extension seam for Profile 2 (Self-Hosted), where the proxy is the
   only load balancer and must select across distinct worker endpoints (e.g. round-robin), and for future metadata
   routing. In k8s all replicas advertise the same Service DNS address, so the retained endpoints are identical and
   selection reduces to that one VIP.
@@ -1347,7 +1347,7 @@ service discovery state. Persistent state (if needed for multi-host P2) will be 
 - No network calls between gears.
 - api-gateway serves all routes directly from the shared Axum router.
 
-#### Profile 2: Host + Workers (On-Premise)
+#### Profile 2: Self-Hosted
 
 ```
 ┌──────────────────────────────┐
@@ -1893,11 +1893,43 @@ Flight Control itself.** OoP gears register with Flight Control's directory and 
 
 | Component | Role | State | Notes |
 |-----------|------|-------|-------|
-| service-discovery (DirectoryService) | Service registration + discovery | No DB; in-memory registry. Gears re-register on heartbeat, so restart recovery is handled. | Serves gRPC via grpc-hub; its REST surface (co-hosted on api-gateway) enables k8s-native discovery. |
+| service-discovery (DirectoryService) | Service registration + discovery | No DB; in-memory registry. Gears re-register on heartbeat, so restart recovery is handled. | Serves gRPC via grpc-hub; its REST surface (co-hosted on api-gateway) enables k8s-native discovery. **One per installation** — see below. |
 | grpc-hub | gRPC transport for the directory + platform-plane RPCs | Stateless. | Hosts the DirectoryService gRPC endpoint. |
 | api-gateway | Edge + REST host: reverse-proxies exposed OoP routes and co-hosts the other control-plane gears' REST routes (directory, types-registry) on one HTTP server | No DB; in-memory route table populated from directory registrations. | Built-in edge in Profile 2 and Profile 3 Mode A; in Mode B an external gateway (Kong/Tyk) replaces the edge. |
 | types-registry | GTS catalogue | In-memory (link-time inventory + config seed + runtime registrations). Shared/DB persistence is a future optimization for multi-instance. | `post_init` graph validation must see a consistent view across distributed registrations. |
 | authn-resolver | Edge JWT validation (bearer token → tenant `SecurityContext`) | No DB; JWKS cache only. | Stateless. Runs at the edge here and also embeds in each OoP pod for per-hop re-validation. |
+
+##### One directory per installation
+
+The row above answers *restart* and not *duplication*, and the two are different
+questions. The registry is this process's own instance map — a `DashMap` in
+`GearManager`, with no store, no replication, no gossip and no quorum — and
+every worker is handed exactly one endpoint: `TOOLKIT_DIRECTORY_ENDPOINT` is a
+string, not a list, and there is no failover path.
+
+So two `service-discovery` instances in one installation are two disjoint maps
+that never meet, and every consequence is silent rather than loud:
+
+* **The edge withdraws the other half's public routes.** api-gateway's
+  `compute_removals` treats an *empty* snapshot as a transient directory hiccup
+  and skips the prune. A second directory produces a **partial** snapshot, which
+  takes the ordinary filter path — so the routes belonging to gears registered
+  with the other directory are deregistered and the public API returns 404, with
+  no warning, because from the edge's point of view those gears legitimately
+  went away.
+* **Readiness never arrives.** A gear whose dependency registered with the other
+  directory stays at `503 {"state":"starting"}`. The re-registration loop is
+  idempotent and unbounded, so it neither succeeds nor fails.
+* **Instance targeting answers wrongly rather than emptily.** A half-view yields
+  a complete-looking ownership map over half the shards, and a non-match is
+  specified as `Ok(empty)` — so a caller cannot tell "no such shard" from "that
+  shard is registered with the other directory".
+
+This cannot be enforced the way `MultipleRestHosts` and `MultipleGrpcHubs` are.
+Those work because a process can enumerate its own gears; no process can
+enumerate another, so an installation-wide claim has no runtime vantage point.
+The gear therefore states it — `#[toolkit::gear(one_per_installation = true)]` —
+and composition tooling refuses a topology that would deploy it twice.
 
 #### Runs outside Flight Control (OoP)
 

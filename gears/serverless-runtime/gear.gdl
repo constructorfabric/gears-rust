@@ -1,0 +1,14 @@
+# Gearbox description for the serverless-runtime gear, which has no crate yet.
+#
+# `maturity = "design"`: listed in the catalogue with its documents, and not
+# usable in a product (GBX0321). When the crate exists, describe it beside the
+# crate instead -- `package = cargo(...)`, no `maturity`, no `id` (projected
+# from #[toolkit::gear] then) -- and delete this file.
+
+gear(
+    maturity = "design",
+    id = "serverless-runtime",
+    name = "Serverless Runtime",
+    description = "Pluggable serverless runtime for Starlark, serverlessworkflow, and Python function execution.",
+    category = "serverless",
+)

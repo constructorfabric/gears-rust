@@ -90,7 +90,7 @@ impl GatewayProvider for ToolKitGatewayProvider {
     /// because it is neither re-registered nor removed.
     ///
     /// Public routes are extracted **once per gear**: co-located instances of
-    /// the same gear (Profile 2, Host + Workers) advertise an identical
+    /// the same gear (Profile 2, Self-Hosted) advertise an identical
     /// `OpenAPI` document, so the first instance's parse is cached (keyed by
     /// [`GearName`]) and reused for the rest rather than re-parsing the same
     /// document per instance. The cache is local to this call, so a spec change

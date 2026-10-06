@@ -7,6 +7,9 @@ license.workspace = true
 authors.workspace = true
 description = "SDK for user_info gear: API trait, types, and error definitions"
 
+[lib]
+name = "users_info_sdk"
+
 [lints]
 workspace = true
 

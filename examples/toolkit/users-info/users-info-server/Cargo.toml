@@ -7,6 +7,9 @@ license.workspace = true
 authors.workspace = true
 description = "Standalone server binary for the users-info example module"
 
+[[bin]]
+name = "users-info-server"
+
 [lints]
 workspace = true
 

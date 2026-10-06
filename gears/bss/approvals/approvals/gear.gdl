@@ -1,0 +1,24 @@
+# Gearbox product metadata for the bss-approvals gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (rest).
+
+gear(
+    maturity = "preview",
+    name = "BSS Approvals",
+    description = "One approvals inbox over every BSS gear: a paged list, a count, a card and a vote, routed to the gear that owns the unit.",
+    category = "bss",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-bss-approvals",
+        lib = "bss_approvals",
+        path = ".",
+    ),
+    sdk = cargo(
+        crate_name = "cf-gears-bss-approvals-sdk",
+        lib = "bss_approvals_sdk",
+        path = "../approvals-sdk",
+    ),
+
+    config_schema = config(),
+)

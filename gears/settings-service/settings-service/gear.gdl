@@ -1,0 +1,28 @@
+# Gearbox product metadata for the settings-service gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful),
+# colocated_deps (types-registry, credstore), lifecycle; the authz-resolver
+# edge from #[toolkit::consumes].
+
+gear(
+    maturity = "preview",
+    name = "Settings Service",
+    description = "Typed configuration and feature flags with tenant-scoped inheritance and validate-then-set writes.",
+    category = "serverless",
+    visibility = "internal",
+
+    # Both crates name their library target explicitly, after the package
+    # name with underscores -- not `settings_service`.
+    package = cargo(
+        crate_name = "cf-gears-settings-service",
+        lib = "cf_gears_settings_service",
+        path = ".",
+    ),
+    sdk = cargo(
+        crate_name = "cf-gears-settings-service-sdk",
+        lib = "cf_gears_settings_service_sdk",
+        path = "../settings-service-sdk",
+    ),
+
+    config_schema = config(),
+)

@@ -1,0 +1,21 @@
+# Gearbox description for the model-registry gear, which has no crate yet.
+#
+# `maturity = "design"`: listed in the catalogue with its documents, and not
+# usable in a product (GBX0321). When the crate exists, describe it beside the
+# crate instead -- `package = cargo(...)`, no `maturity`, no `id` (projected
+# from #[toolkit::gear] then) -- and delete this file.
+
+gear(
+    maturity = "design",
+    id = "model-registry",
+    name = "Models Registry",
+    description = "Catalog of available models with tenant-level availability and approval workflows.",
+    category = "gen-ai",
+
+    # The SDK is published ahead of the gear; the catalogue records where it is.
+    sdk = cargo(
+        crate_name = "cf-gears-model-registry-sdk",
+        lib = "model_registry_sdk",
+        path = "model-registry-sdk",
+    ),
+)

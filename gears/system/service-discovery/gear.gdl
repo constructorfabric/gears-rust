@@ -1,0 +1,19 @@
+# Gearbox product metadata for the service-discovery gear.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (grpc, system, rest),
+# `client = cf_system_sdks::directory::DirectoryClient` -- the only gear in the
+# slice declaring a client trait -- and `one_per_installation`.
+
+gear(
+    maturity = "preview",
+    name = "Service Discovery",
+    description = "Service discovery and gear directory for the runtime: instance registration, tracking, and resolution.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-service-discovery",
+        lib = "service_discovery",
+        path = ".",
+    ),
+)

@@ -1,0 +1,14 @@
+# Gearbox description for the approval-service gear, which has no crate yet.
+#
+# `maturity = "design"`: listed in the catalogue with its documents, and not
+# usable in a product (GBX0321). When the crate exists, describe it beside the
+# crate instead -- `package = cargo(...)`, no `maturity`, no `id` (projected
+# from #[toolkit::gear] then) -- and delete this file.
+
+gear(
+    maturity = "design",
+    id = "approval-service",
+    name = "Approval Service",
+    description = "Generic approval workflow with configurable policies, conditions, and access controls.",
+    category = "core-functionality",
+)

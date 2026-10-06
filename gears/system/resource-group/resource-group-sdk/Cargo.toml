@@ -12,6 +12,9 @@ keywords = ["constructorfabric", "cf-gears", "resource-group"]
 categories = ["api-bindings"]
 metadata.docs.rs.all-features = true
 
+[lib]
+name = "cf_gears_resource_group_sdk"
+
 [lints]
 workspace = true
 

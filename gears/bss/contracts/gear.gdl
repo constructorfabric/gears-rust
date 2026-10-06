@@ -1,0 +1,14 @@
+# Gearbox description for the bss-contracts gear, which has no crate yet.
+#
+# `maturity = "design"`: listed in the catalogue with its documents, and not
+# usable in a product (GBX0321). When the crate exists, describe it beside the
+# crate instead -- `package = cargo(...)`, no `maturity`, no `id` (projected
+# from #[toolkit::gear] then) -- and delete this file.
+
+gear(
+    maturity = "design",
+    id = "bss-contracts",
+    name = "Contracts & Agreements",
+    description = "System of Record for signed commercial terms, negotiated prices, and commitments.",
+    category = "bss",
+)
