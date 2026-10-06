@@ -1,7 +1,7 @@
 {
   "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.identity.v1~",
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "description": "A person's identity: names, external ids, public profiles, location, background. One node holds one value of one property.",
+  "description": "A person's identity: names, external ids, public profiles, location, background. One node is one fact: its payload holds one property, which names the fact, and the origin of the fact.",
   "type": "object",
   "allOf": [
     {
@@ -13,9 +13,15 @@
         "payload": {
           "type": "object",
           "additionalProperties": false,
-          "minProperties": 1,
-          "maxProperties": 1,
+          "minProperties": 2,
+          "maxProperties": 2,
+          "required": [
+            "origin"
+          ],
           "properties": {
+            "origin": {
+              "$ref": "gts://gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~"
+            },
             "background": {
               "type": "string",
               "minLength": 1

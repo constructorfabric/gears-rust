@@ -2501,6 +2501,7 @@ dependencies = [
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
+ "jsonschema",
  "serde_json",
  "uuid",
 ]

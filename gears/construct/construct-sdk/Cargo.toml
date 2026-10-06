@@ -30,7 +30,6 @@ toolkit-canonical-errors = { workspace = true }
 toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
-toolkit-gts = { workspace = true }
 
 [dev-dependencies]
 jsonschema = { workspace = true }
