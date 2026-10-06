@@ -6,8 +6,11 @@ use crate::{
         rest::authoring::support::{self, DoorError},
     },
     authz::{actions, resource_types},
-    domain::commercial_terms::{
-        SaleObservation, validate_commercial_terms, validate_new_sale_observation,
+    domain::{
+        book,
+        commercial_terms::{
+            SaleObservation, validate_commercial_terms, validate_new_sale_observation,
+        },
     },
     infra::{
         meter_semantics, plan_revisions,
@@ -158,7 +161,7 @@ impl CommercialTermsService {
                     .ok_or_else(|| CanonicalError::from(R::PermissionDenied))?;
             }
             let evidence = self
-                .observe(ctx, &request.query, &snapshot, &bindings)
+                .observe(ctx, &request.query, &snapshot, &bindings, captured_on)
                 .await?;
             if selected_bindings_digest(&resolved, &request.query.selections)?
                 != request.query.resolved_bindings_digest
@@ -192,6 +195,7 @@ impl CommercialTermsService {
         q: &NewSaleQuery,
         s: &ReadSnapshot,
         bindings: &[AcceptedBinding],
+        captured_on: time::Date,
     ) -> Result<serde_json::Value, DoorError> {
         let mut evidence = Vec::new();
         let registry = reference_registry::resolve(&self.state.hub)
@@ -205,6 +209,8 @@ impl CommercialTermsService {
         let by_id: BTreeMap<Uuid, bss_products_sdk::models::Sku> =
             found.into_iter().map(|sku| (sku.id, sku)).collect();
         let mut observations = Vec::with_capacity(bindings.len());
+        // D-524: the book sells on the acceptance day and on the start day, as a price must.
+        let book_valid = book_sells_on(s, [captured_on, q.start_at.date()]);
         for b in bindings {
             let sku = match by_id.get(&b.sku_id).cloned() {
                 Some(sku) => sku,
@@ -230,6 +236,7 @@ impl CommercialTermsService {
                     && !sku.retire_pending,
                 sku_sellable: sku.sellable,
                 covered: true,
+                book_valid,
             });
         }
         for observation in &observations {
@@ -238,6 +245,11 @@ impl CommercialTermsService {
         validate_commercial_terms(q, bindings).map_err(CanonicalError::from)?;
         Ok(serde_json::Value::Array(evidence))
     }
+}
+/// D-524: whether the revision's book, as the snapshot read it, sells on each of the two days.
+fn book_sells_on(s: &ReadSnapshot, days: [time::Date; 2]) -> bool {
+    let stored = s.generation.book();
+    book::sells_on_each(stored.valid_from, stored.valid_until, &days)
 }
 /// A complete detached observation, consumed only after its local rows still match.
 struct Capture {
@@ -278,6 +290,10 @@ async fn commit(
         return Err(DoorError::SelectionMoved);
     }
     let now = clock.now();
+    // D-524 on the commit's clock, as a selected price's window is judged below.
+    if !book_sells_on(snapshot, [now.date(), r.query.start_at.date()]) {
+        return Err(CanonicalError::from(R::NotSellable).into());
+    }
     if snapshot
         .generation
         .revisions

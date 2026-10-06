@@ -29,6 +29,9 @@ pub mod labels {
     ];
 }
 /// Independent authoring and governance actions.
+///
+/// Every (label, action) pair a door enforces has its permission in `crate::gts::permissions::all()`
+/// (D-526); a new pair adds its instance in the same change.
 pub mod actions {
     pub const CREATE: &str = "create";
     pub const HOLD: &str = "hold";
