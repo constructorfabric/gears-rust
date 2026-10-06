@@ -24,8 +24,10 @@ derives from graph storage's owned node:
 
 `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.<category>.v1~`
 
-A node's `payload` holds exactly one property of its type, so one node is one value of one property. The payload is
-closed: an unknown property is refused, and a new property is a backward-compatible change.
+One node is one fact. Its `payload` holds one fact property, which names the fact, and `origin`, graph storage's
+provenance attribute. The payload is closed: an unknown property is refused, and a new property is a
+backward-compatible change. `PROPERTIES` and `cardinality` say whether a subject holds one value of a property or
+many.
 
 The schemas live in `schemas/` and are embedded in `person_types::PERSON_TYPES` for registration with the types
-registry and graph storage.
+registry and graph storage. The design is in [the Profile Writer feature](../docs/features/profile-writer.md).
