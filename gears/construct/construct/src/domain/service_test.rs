@@ -93,6 +93,27 @@ impl AuthZResolverApi for DenyResolver {
     }
 }
 
+/// Records what the service asks the policy service for, then allows it like
+/// `AllowResolver`.
+struct RecordingResolver {
+    asked: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait]
+impl AuthZResolverApi for RecordingResolver {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        self.asked.lock().unwrap().push((
+            request.resource.resource_type.clone(),
+            request.action.name.clone(),
+        ));
+        AllowResolver.evaluate(ctx, request).await
+    }
+}
+
 /// The policy service fails: it answers with an error instead of a decision.
 struct FailingResolver;
 
@@ -195,19 +216,41 @@ async fn subject_without_permission_is_denied() {
 }
 
 #[tokio::test]
-async fn failing_policy_service_gives_an_internal_error() {
+async fn service_asks_for_the_note_resource_and_the_matching_action() {
+    let db = inmem_db().await;
+    let resolver = Arc::new(RecordingResolver {
+        asked: std::sync::Mutex::new(Vec::new()),
+    });
+    let svc = service_with(&db, resolver.clone());
+    let ctx = context_in(Uuid::new_v4());
+
+    let created = svc.create_note(&ctx, note("hello")).await.unwrap();
+    svc.get_note(&ctx, created.id).await.unwrap();
+
+    let note_resource = "construct.foundation_note".to_owned();
+    assert_eq!(
+        *resolver.asked.lock().unwrap(),
+        vec![
+            (note_resource.clone(), "create".to_owned()),
+            (note_resource, "get".to_owned()),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn failing_policy_service_gives_an_unavailable_error() {
     let db = inmem_db().await;
     let svc = service_with(&db, Arc::new(FailingResolver));
     let ctx = context_in(Uuid::new_v4());
 
     let created = svc.create_note(&ctx, note("hello")).await;
     assert!(
-        matches!(created, Err(DomainError::Internal(_))),
+        matches!(created, Err(DomainError::Unavailable(_))),
         "{created:?}"
     );
 
     let read = svc.get_note(&ctx, Uuid::new_v4()).await;
-    assert!(matches!(read, Err(DomainError::Internal(_))), "{read:?}");
+    assert!(matches!(read, Err(DomainError::Unavailable(_))), "{read:?}");
 }
 
 #[tokio::test]

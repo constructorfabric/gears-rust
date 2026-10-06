@@ -101,6 +101,16 @@ mod tests {
     }
 
     #[test]
+    fn omitted_max_text_length_takes_the_default_through_deserialization() {
+        use serde::de::value::MapDeserializer;
+        let config = ConstructConfig::deserialize(
+            MapDeserializer::<_, serde::de::value::Error>::new(std::iter::empty::<(&str, usize)>()),
+        )
+        .expect("an empty config is valid");
+        assert_eq!(config.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
+    }
+
+    #[test]
     fn default_config_converts_to_the_default_service_limit() {
         let service = ServiceConfig::try_from(&ConstructConfig::default()).expect("defaults");
         assert_eq!(service.max_text_length, DEFAULT_MAX_TEXT_LENGTH);

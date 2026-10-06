@@ -51,3 +51,7 @@ impl NewFoundationNote {
         Self { text: text.into() }
     }
 }
+
+#[cfg(test)]
+#[path = "models_tests.rs"]
+mod models_tests;

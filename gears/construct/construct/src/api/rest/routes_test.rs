@@ -39,6 +39,9 @@ impl AuthZResolverApi for AllowResolver {
         _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
+        // The route creates a note, so the policy service must be asked for that.
+        assert_eq!(request.resource.resource_type, "construct.foundation_note");
+        assert_eq!(request.action.name, "create");
         let root_id = request
             .context
             .tenant_context

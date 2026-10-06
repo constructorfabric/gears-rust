@@ -30,3 +30,7 @@ pub trait ConstructClientV1: Send + Sync {
         id: Uuid,
     ) -> Result<FoundationNote, CanonicalError>;
 }
+
+#[cfg(test)]
+#[path = "api_tests.rs"]
+mod api_tests;

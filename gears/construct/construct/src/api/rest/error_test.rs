@@ -69,3 +69,13 @@ fn database_maps_to_500_without_leaking_detail() {
     assert_eq!(problem.status, Some(500));
     assert!(!problem.detail.contains("secret"));
 }
+
+#[test]
+fn unavailable_maps_to_503_without_leaking_detail() {
+    let problem = wire(DomainError::Unavailable(
+        "pdp at 10.0.0.7 timed out".to_owned(),
+    ));
+
+    assert_eq!(problem.status, Some(503));
+    assert!(!format!("{problem:?}").contains("10.0.0.7"));
+}

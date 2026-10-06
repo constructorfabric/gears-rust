@@ -13,6 +13,9 @@ pub enum DomainError {
     #[error("Access forbidden: {0}")]
     Forbidden(String),
 
+    #[error("Service unavailable: {0}")]
+    Unavailable(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 
@@ -59,7 +62,7 @@ fn log_evaluation_failed(e: &authz_resolver_sdk::EnforcerError) {
 }
 
 /// @cpt-dod:cpt-cf-construct-dod-gear-foundation-error-mapping:p1
-// TODO(DE1302): `Forbidden` and `Internal` only carry Strings, so the
+// TODO(DE1302): `Forbidden` and `Unavailable` only carry Strings, so the
 // `EnforcerError` source is lost. Extend the variants to hold a boxed source,
 // then remove this allow.
 #[allow(unknown_lints, reason = "dylint lint names are unknown to rustc")]
@@ -79,9 +82,11 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
             // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-denied
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed-return
-            authz_resolver_sdk::EnforcerError::EvaluationFailed(_) => Self::Internal(e.to_string()),
-            // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed-return
-            // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed
+            authz_resolver_sdk::EnforcerError::EvaluationFailed(_) => {
+                Self::Unavailable(e.to_string())
+            }
         }
+        // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed-return
+        // @cpt-end:cpt-cf-construct-algo-gear-foundation-scope-note-access:p1:inst-scope-failed
     }
 }
