@@ -1,0 +1,33 @@
+[package]
+name = "cf-gears-credstore-v2"
+description = "credstore v2 gear (temporary, assembled over several PRs)"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "credstore_v2"
+
+[lints]
+workspace = true
+
+[dependencies]
+credstore-sdk = { package = "cf-gears-credstore-v2-sdk", version = "0.1.0", path = "../credstore-sdk" }
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-db = { workspace = true }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+toolkit-db = { workspace = true, features = ["sqlite"] }
