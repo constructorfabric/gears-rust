@@ -100,12 +100,13 @@ class TestCreateChat:
         assert resp.json()["title"] == "T" * 255
         assert_problem(
             httpx.post(f"{API_PREFIX}/chats", json={"title": "T" * 256}), 400, "invalid_argument",
+            field_reason="INVALID_TITLE",
         )
 
     def test_create_chat_whitespace_title_rejected(self, server):
         """A whitespace-only title is 400 invalid_argument."""
         resp = httpx.post(f"{API_PREFIX}/chats", json={"title": "   "})
-        assert_problem(resp, 400, "invalid_argument")
+        assert_problem(resp, 400, "invalid_argument", field_reason="INVALID_TITLE")
 
     def test_create_chat_schema_invalid_is_422(self, server):
         """A body that does not match the schema (`model` is not a string) is 422."""
@@ -432,7 +433,7 @@ class TestUpdateChat:
             f"{API_PREFIX}/chats/{chat_id}",
             json={"title": "   "},
         )
-        assert_problem(resp, 400, "invalid_argument")
+        assert_problem(resp, 400, "invalid_argument", field_reason="INVALID_TITLE")
         assert httpx.get(f"{API_PREFIX}/chats/{chat_id}").json().get("title") == provider_chat.get("title")
 
     @pytest.mark.multi_provider
@@ -459,7 +460,7 @@ class TestUpdateChat:
         assert resp.json()["title"] == "A" * 255
 
         resp = httpx.patch(f"{API_PREFIX}/chats/{chat_id}", json={"title": "A" * 256})
-        assert_problem(resp, 400, "invalid_argument")
+        assert_problem(resp, 400, "invalid_argument", field_reason="INVALID_TITLE")
         assert httpx.get(f"{API_PREFIX}/chats/{chat_id}").json()["title"] == "A" * 255
 
 

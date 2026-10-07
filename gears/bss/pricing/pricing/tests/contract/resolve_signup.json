@@ -1,0 +1,664 @@
+{
+  "golden": "resolve_signup",
+  "proves": "D-419/D-420 rule 1, D-421, D-425: a signup (no pins) of the published revision on one date - every item, the default chain then every registered value in registry order, each binding the price in force (own chain, else the default, dim_used saying which) with its own end (ends_on), every price model's money as stored (flat, per_unit, graduated and volume bands with an open top band, package), an item without an entry with no chains, the SKU version in force and the resolved invoice inputs with their sources; no totals",
+  "exchanges": [
+    {
+      "case": "signup on 2026-10-05",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:pro-2>&date=2026-10-05",
+      "status": 200,
+      "body": {
+        "plan_revision_id": "<revision:pro-2>",
+        "plan_id": "<plan:pro>",
+        "rev_no": 2,
+        "state": "published",
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "currency_minor_digits": 2,
+        "rounding_policy": "half_even",
+        "date": "2026-10-05",
+        "items": [
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:pro-2/pro>",
+            "sku_id": "<sku:pro>",
+            "price_book_entry_id": "<entry:pro>",
+            "charge_kind": "recurring",
+            "period": "month",
+            "model": "flat",
+            "sku_version": {
+              "published_version": 2,
+              "effective_from": "2026-10-01"
+            },
+            "invoice_line_template": {
+              "value": "Pro plan, {period}",
+              "source": "entry"
+            },
+            "gl_code": {
+              "value": "4100",
+              "source": "sku"
+            },
+            "tax_category": {
+              "value": "std",
+              "source": "tenant"
+            },
+            "billing_timing": {
+              "value": "advance",
+              "source": "sku"
+            },
+            "meter": {
+              "usage_type_ref": null,
+              "unit": null
+            },
+            "chains": [
+              {
+                "dim_value": null,
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:10>",
+                  "dim_used": null,
+                  "pinned_from": null,
+                  "price": {
+                    "amount": "10.00"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": "2026-11-01",
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              }
+            ]
+          },
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:pro-2/storage>",
+            "sku_id": "<sku:storage>",
+            "price_book_entry_id": "<entry:storage>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "per_unit",
+            "sku_version": {
+              "published_version": 1,
+              "effective_from": "2026-01-01"
+            },
+            "invoice_line_template": {
+              "value": "{sku} ({dimension}) in {unit}",
+              "source": "tenant"
+            },
+            "gl_code": {
+              "value": "9000",
+              "source": "tenant"
+            },
+            "tax_category": {
+              "value": "reduced",
+              "source": "sku"
+            },
+            "billing_timing": {
+              "value": "arrears",
+              "source": "tenant"
+            },
+            "meter": {
+              "usage_type_ref": "gts.cf.core.uc.usage_record.v1~cf.test.usage.storage.v1",
+              "unit": "GB"
+            },
+            "chains": [
+              {
+                "dim_value": null,
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-default>",
+                  "dim_used": null,
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.10"
+                  },
+                  "min_fee": "5.00",
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": "2027-01-01",
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "eu",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-eu>",
+                  "dim_used": "eu",
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.08"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "us",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-us>",
+                  "dim_used": "us",
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.09"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-10-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "apac",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-apac>",
+                  "dim_used": "apac",
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.11"
+                  },
+                  "min_fee": null,
+                  "eligibility": "new",
+                  "effective_from": "2026-10-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "latam",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:storage-default>",
+                  "dim_used": null,
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.10"
+                  },
+                  "min_fee": "5.00",
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": "2027-01-01",
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              }
+            ]
+          },
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:pro-2/egress>",
+            "sku_id": "<sku:egress>",
+            "price_book_entry_id": "<entry:egress>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "per_unit",
+            "sku_version": {
+              "published_version": 1,
+              "effective_from": "2026-01-01"
+            },
+            "invoice_line_template": {
+              "value": "Egress {dimension}, {unit}",
+              "source": "sku"
+            },
+            "gl_code": {
+              "value": "4300",
+              "source": "sku"
+            },
+            "tax_category": {
+              "value": "std",
+              "source": "tenant"
+            },
+            "billing_timing": {
+              "value": "arrears",
+              "source": "tenant"
+            },
+            "meter": {
+              "usage_type_ref": "gts.cf.core.uc.usage_record.v1~cf.test.usage.egress.v1",
+              "unit": "GB"
+            },
+            "chains": [
+              {
+                "dim_value": null,
+                "uncovered": true,
+                "binding": null
+              },
+              {
+                "dim_value": "eu",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:egress-eu>",
+                  "dim_used": "eu",
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.02"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "us",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:egress-us>",
+                  "dim_used": "us",
+                  "pinned_from": null,
+                  "price": {
+                    "rate": "0.03"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "apac",
+                "uncovered": true,
+                "binding": null
+              },
+              {
+                "dim_value": "latam",
+                "uncovered": true,
+                "binding": null
+              }
+            ]
+          },
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:pro-2/backup>",
+            "sku_id": "<sku:backup>",
+            "price_book_entry_id": null,
+            "charge_kind": null,
+            "period": null,
+            "model": null,
+            "sku_version": {
+              "published_version": 1,
+              "effective_from": "2026-01-01"
+            },
+            "invoice_line_template": {
+              "value": "{sku} ({dimension}) in {unit}",
+              "source": "tenant"
+            },
+            "gl_code": {
+              "value": "9000",
+              "source": "tenant"
+            },
+            "tax_category": {
+              "value": "std",
+              "source": "tenant"
+            },
+            "billing_timing": {
+              "value": "arrears",
+              "source": "tenant"
+            },
+            "meter": {
+              "usage_type_ref": "gts.cf.core.uc.usage_record.v1~cf.test.usage.backup.v1",
+              "unit": "GB"
+            },
+            "chains": []
+          },
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:pro-2/requests>",
+            "sku_id": "<sku:requests>",
+            "price_book_entry_id": "<entry:requests>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "graduated",
+            "sku_version": {
+              "published_version": 1,
+              "effective_from": "2026-01-01"
+            },
+            "invoice_line_template": {
+              "value": "{sku} ({dimension}) in {unit}",
+              "source": "tenant"
+            },
+            "gl_code": {
+              "value": "9000",
+              "source": "tenant"
+            },
+            "tax_category": {
+              "value": "std",
+              "source": "tenant"
+            },
+            "billing_timing": {
+              "value": "arrears",
+              "source": "tenant"
+            },
+            "meter": {
+              "usage_type_ref": "gts.cf.core.uc.usage_record.v1~cf.test.usage.requests.v1",
+              "unit": "GB"
+            },
+            "chains": [
+              {
+                "dim_value": null,
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:requests-graduated>",
+                  "dim_used": null,
+                  "pinned_from": null,
+                  "price": {
+                    "tiers": [
+                      {
+                        "up_to": "1000",
+                        "rate": "0.010"
+                      },
+                      {
+                        "up_to": null,
+                        "rate": "0.008"
+                      }
+                    ]
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "eu",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:requests-graduated>",
+                  "dim_used": null,
+                  "pinned_from": null,
+                  "price": {
+                    "tiers": [
+                      {
+                        "up_to": "1000",
+                        "rate": "0.010"
+                      },
+                      {
+                        "up_to": null,
+                        "rate": "0.008"
+                      }
+                    ]
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "us",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:requests-graduated>",
+                  "dim_used": null,
+                  "pinned_from": null,
+                  "price": {
+                    "tiers": [
+                      {
+                        "up_to": "1000",
+                        "rate": "0.010"
+                      },
+                      {
+                        "up_to": null,
+                        "rate": "0.008"
+                      }
+                    ]
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "apac",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:requests-graduated>",
+                  "dim_used": null,
+                  "pinned_from": null,
+                  "price": {
+                    "tiers": [
+                      {
+                        "up_to": "1000",
+                        "rate": "0.010"
+                      },
+                      {
+                        "up_to": null,
+                        "rate": "0.008"
+                      }
+                    ]
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "latam",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:requests-graduated>",
+                  "dim_used": null,
+                  "pinned_from": null,
+                  "price": {
+                    "tiers": [
+                      {
+                        "up_to": "1000",
+                        "rate": "0.010"
+                      },
+                      {
+                        "up_to": null,
+                        "rate": "0.008"
+                      }
+                    ]
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              }
+            ]
+          },
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:pro-2/requests-volume>",
+            "sku_id": "<sku:requests-volume>",
+            "price_book_entry_id": "<entry:requests-volume>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "volume",
+            "sku_version": {
+              "published_version": 1,
+              "effective_from": "2026-01-01"
+            },
+            "invoice_line_template": {
+              "value": "{sku} ({dimension}) in {unit}",
+              "source": "tenant"
+            },
+            "gl_code": {
+              "value": "9000",
+              "source": "tenant"
+            },
+            "tax_category": {
+              "value": "std",
+              "source": "tenant"
+            },
+            "billing_timing": {
+              "value": "arrears",
+              "source": "tenant"
+            },
+            "meter": {
+              "usage_type_ref": "gts.cf.core.uc.usage_record.v1~cf.test.usage.requests_volume.v1",
+              "unit": "GB"
+            },
+            "chains": [
+              {
+                "dim_value": null,
+                "uncovered": true,
+                "binding": null
+              },
+              {
+                "dim_value": "eu",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:requests-volume>",
+                  "dim_used": "eu",
+                  "pinned_from": null,
+                  "price": {
+                    "tiers": [
+                      {
+                        "up_to": "1000",
+                        "rate": "0.009"
+                      },
+                      {
+                        "up_to": null,
+                        "rate": "0.007"
+                      }
+                    ]
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "us",
+                "uncovered": true,
+                "binding": null
+              },
+              {
+                "dim_value": "apac",
+                "uncovered": true,
+                "binding": null
+              },
+              {
+                "dim_value": "latam",
+                "uncovered": true,
+                "binding": null
+              }
+            ]
+          },
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:pro-2/requests-package>",
+            "sku_id": "<sku:requests-package>",
+            "price_book_entry_id": "<entry:requests-package>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "package",
+            "sku_version": {
+              "published_version": 1,
+              "effective_from": "2026-01-01"
+            },
+            "invoice_line_template": {
+              "value": "{sku} ({dimension}) in {unit}",
+              "source": "tenant"
+            },
+            "gl_code": {
+              "value": "9000",
+              "source": "tenant"
+            },
+            "tax_category": {
+              "value": "std",
+              "source": "tenant"
+            },
+            "billing_timing": {
+              "value": "arrears",
+              "source": "tenant"
+            },
+            "meter": {
+              "usage_type_ref": "gts.cf.core.uc.usage_record.v1~cf.test.usage.requests_package.v1",
+              "unit": "GB"
+            },
+            "chains": [
+              {
+                "dim_value": null,
+                "uncovered": true,
+                "binding": null
+              },
+              {
+                "dim_value": "eu",
+                "uncovered": true,
+                "binding": null
+              },
+              {
+                "dim_value": "us",
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:requests-package>",
+                  "dim_used": "us",
+                  "pinned_from": null,
+                  "price": {
+                    "package_size": "1000",
+                    "package_price": "5.00"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-01-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              },
+              {
+                "dim_value": "apac",
+                "uncovered": true,
+                "binding": null
+              },
+              {
+                "dim_value": "latam",
+                "uncovered": true,
+                "binding": null
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

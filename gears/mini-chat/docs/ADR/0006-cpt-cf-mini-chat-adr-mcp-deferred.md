@@ -19,11 +19,11 @@ PRD §5.9 and §7.1 specify MCP server support as P1:
 
 DESIGN described the full design: components `McpPool`/`McpService`, tables `mcp_servers`, `mcp_server_tools` and `role_mcp_servers`, twelve REST endpoints marked "stable", and "MCP Implementation Phases" with several phases marked **Done** (rate limiter, DLP redactor, refresh worker, OAuth, hub sync).
 
-None of this exists in the code:
+None of this was built:
 * no MCP modules, routes, tables or migrations;
 * the only trace is the unused catalog flag `ModelToolSupport.mcp`.
 
-The DESIGN text came from a design-only commit (`07cb460e5`, "Add PRD and design document for MCP servers support feature"). The "Done" markers were never true.
+The DESIGN text came from a design-only change that added the PRD and design for MCP server support. The "Done" markers were never true.
 
 ## Decision Drivers
 
@@ -60,7 +60,7 @@ The MCP design text moves from DESIGN to [features/mcp-servers-support.md](../fe
 
 ### Confirmation
 
-* `grep -ri mcp gears/mini-chat/mini-chat/src` finds no MCP implementation; the only matches are test fixtures setting the catalog flag `ModelToolSupport.mcp` (defined in `mini-chat-sdk`).
+* Code review: the gear has no MCP implementation; the catalog flag `ModelToolSupport.mcp` (Mini Chat SDK) is set only by test fixtures.
 * DESIGN §3.3 endpoint table lists no MCP endpoints.
 
 ## More Information

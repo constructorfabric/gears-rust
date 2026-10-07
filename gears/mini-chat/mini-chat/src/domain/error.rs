@@ -67,6 +67,13 @@ pub enum DomainError {
     #[error("Invalid reaction target: message {id} is not an assistant message")]
     InvalidReactionTarget { id: Uuid },
 
+    #[error("Reaction must be 'like' or 'dislike'")]
+    InvalidReaction,
+
+    /// Chat title empty after trim, or longer than 255 characters.
+    #[error("Invalid title: {message}")]
+    InvalidTitle { message: String },
+
     #[error("Model not found: {model_id}")]
     ModelNotFound { model_id: String },
 
@@ -88,6 +95,11 @@ pub enum DomainError {
 
     #[error("Unsupported file type: {mime}")]
     UnsupportedFileType { mime: String },
+
+    /// The file is usable only by code interpreter, which is not available
+    /// for this chat (kill switch, or the model has no code interpreter).
+    #[error("Code interpreter is currently unavailable")]
+    CodeInterpreterUnavailable,
 
     #[error("File too large: {message}")]
     FileTooLarge { message: String },

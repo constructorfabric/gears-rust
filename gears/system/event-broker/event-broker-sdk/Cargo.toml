@@ -18,6 +18,11 @@ all-features = true
 name = "event_broker_sdk"
 path = "src/lib.rs"
 
+# The crate keeps its own lint set; it only declares the coverage lane's cfg, which the
+# trybuild suites read, so `cfg(coverage_nightly)` is an expected condition here too.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
 [features]
 default = []
 db = ["dep:sea-orm", "dep:toolkit-db", "toolkit-db/sqlite"]

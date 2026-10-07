@@ -42,7 +42,7 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 Base Selection & Eligibility is the **steps 1–2 evaluator** registered into the Foundation
 pipeline ([`01-foundation.md`](./01-foundation.md) §3.2): resolve the active plan **phase**
 (`phase_id`) at `t`, then select **the single** `Price`/`PriceWindow` row on the pricing
-**8-axis canonical scope key** — per emitted line's `chargeKind`. Everything downstream (model
+**ten-axis canonical scope key** — per emitted line's `chargeKind`, and for usage lines its `(skuId, dimensionKey)` (T-D-35). Everything downstream (model
 math, overlays, commitments, coupons, FX) prices *the row this slice selected*; a selection
 defect is therefore the worst class of mispricing, and the slice's whole posture is
 **fail-closed over frozen inputs**: no silent fallback, no `activatedAt` heuristics, no
@@ -65,7 +65,7 @@ price ids with their `cohort` in the `pricingSnapshotRef` pre-stamp
 
 | Requirement | Design Response |
 |-------------|-----------------|
-| `cpt-cf-bss-rating-fr-base-catalog-selection` | `SelectionEvaluator` selects on the full 8-axis key with `t in [effectiveFrom, effectiveTo)`; "at most one window matches" is asserted **only on the full key** — coexisting hybrid `chargeKind` rows and `cohort` generations are disambiguated by the key, never fail-closed (§4.1); no match on billable usage ⇒ fail-closed problem (§4.4). |
+| `cpt-cf-bss-rating-fr-base-catalog-selection` | `SelectionEvaluator` selects on the full ten-axis key (T-D-35) with `t in [effectiveFrom, effectiveTo)`; "at most one window matches" is asserted **only on the full key** — coexisting hybrid `chargeKind` rows and `cohort` generations are disambiguated by the key, never fail-closed (§4.1); no match on billable usage ⇒ fail-closed problem (§4.4). |
 | `cpt-cf-bss-rating-fr-price-eligibility-grandfathering` | `EligibilityClassFilter` applies `existing_grandfathered > new_subscriptions_only > all_subscriptions`; `CohortGenerationSelector` picks the generation whose `cohort` equals the cohort of the subscription's **pinned price id** in `pricingSnapshotRef` — never `activatedAt` alone (§4.2). |
 | `cpt-cf-bss-rating-fr-plan-phases` | `PhaseResolver` resolves the active `phase_id` (uuid, pricing D-19) at `t` from the frozen Subscriptions phase context; `CandidateSetBuilder` implements the D-15 phase-invariant usage fallback so the no-gap rule applies to the *resolved* set (§4.3). |
 | `cpt-cf-bss-rating-fr-evaluation-order` (steps 1–2 slots) | The evaluator registers into the fixed step-1/step-2 slots of the Foundation pipeline; the order itself is owned by 01 — this slice contributes policy, not sequencing. |
@@ -82,10 +82,10 @@ price ids with their `cohort` in the `pricingSnapshotRef` pre-stamp
 
 | ADR ID | Decision Summary |
 |--------|------------------|
-| `cpt-cf-bss-rating-adr-scope-key-adoption` | Adopt the pricing 8-axis key verbatim for selection + non-overlap; no Rating-local key (SEAMS K1–K5). |
-| `cpt-cf-bss-pricing-adr-canonical-scope-key` (adopted) | The key definition — 8 additive axes; the pricing gear is its SoR. |
-| `cpt-cf-bss-pricing-adr-grandfathering-cohort-axis` (adopted) | `cohort` = the cutover instant; N generations coexist; the generation is selected by the pinned price id's cohort. |
-| `cpt-cf-bss-pricing-adr-pricewindow-consolidation` (adopted) | `PriceWindow*` events (all four, incl. `Cancelled`) are read-only resolution inputs; pricing owns the window store and state machine. |
+| `cpt-cf-bss-rating-adr-scope-key-adoption` | Adopt the pricing canonical key (ten axes since D-196) verbatim for selection + non-overlap; no Rating-local key (SEAMS K1–K5; K6 resolved T-D-35). |
+| Canonical scope key (superseded by the PriceBook model, see T-D-37 in rating DECISIONS) (adopted) | The key definition — eight additive axes at adoption, **ten since pricing D-196** (usage pair `(skuId, dimensionKey)`; absorbed by this slice's `SelectionKey` per T-D-35 — SEAMS K6 resolved); the pricing gear is its SoR. |
+| Grandfathering cohort axis (superseded by the PriceBook model, see T-D-37 in rating DECISIONS) (adopted) | `cohort` = the cutover instant; N generations coexist; the generation is selected by the pinned price id's cohort. |
+| PriceWindow consolidation (superseded by the PriceBook model, see T-D-37 in rating DECISIONS) (adopted) | `PriceWindow*` events (all four, incl. `Cancelled`) are read-only resolution inputs; pricing owns the window store and state machine. |
 
 ### 1.3 Architecture Layers
 
@@ -117,7 +117,7 @@ Frozen inputs                     pinned catalog read model (pricing) · phase/e
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-principle-full-key-only-sel`
 
-Uniqueness exists **only on the full 8-axis key**. Shorter tuples are non-unique *by pricing
+Uniqueness exists **only on the full ten-axis key**. Shorter tuples are non-unique *by pricing
 design* (hybrid `chargeKind` rows; grandfathered generations + successor coexisting); treating
 a short-tuple multi-match as an error is itself the defect (SEAMS K1/K3). The evaluator never
 selects, asserts, or fails on a partial key.
@@ -175,7 +175,7 @@ or catalog query** on the hot path (01 §2.1). Re-resolution replays the same fr
 All value objects; the slice owns no entities — catalog rows are frozen inputs.
 
 - **`PhaseContext`** — the frozen Subscriptions phase timeline for the subscription; yields the active `phase_id` at `t` (or a typed absence).
-- **`SelectionKey`** — the materialized 8-axis tuple `(planId, currency, region, priceOverlay, phase, priceEligibility, chargeKind, cohort)` produced via the Foundation `ScopeKeyAdapter`; the `priceOverlay` axis of the **base** row (overlay lists are step-4 material, slice 04).
+- **`SelectionKey`** — the materialized **ten-axis** tuple `(planId, currency, region, priceOverlay, phase, priceEligibility, chargeKind, cohort)` **plus the usage pair `(skuId, dimensionKey)`** (T-D-35: taken from the evaluation line for `chargeKind = usage`, absent otherwise — and *absent* is spelled per surface, exactly as pricing spells it (corrected 2026-08-26: this said "the `''` sentinel", which is only pricing's index-expression spelling and would have put `''` into a **rendered** key that pricing renders `none`, breaking the byte-identity ADR-0001 requires of the shared fixture set): the rendered `SelectionKey` carries pricing's absent-axis token — the literal `none` — in both usage positions, while the storage/index surface mirrors pricing's `COALESCE(meter,'')` index spelling) produced via the Foundation `ScopeKeyAdapter`; the `priceOverlay` axis of the **base** row (overlay lists are step-4 material, slice 04).
 - **`CandidateSet`** — the pinned-read-model rows admitted for `(t, phase_id ∪ phase-invariant, chargeKind)` before eligibility filtering; retains per-row provenance for diagnostics.
 - **`EligibilityClass`** — `existing_grandfathered > new_subscriptions_only > all_subscriptions` (ordered; the order *is* the domain fact).
 - **`CohortPin`** — the pinned price id and its `cohort` extracted from the `pricingSnapshotRef` pricing pre-stamp; absence while an `existing_grandfathered` candidate exists is a torn-pin failure (§4.4).
@@ -217,7 +217,7 @@ evaluator over the pinned snapshot for corrections.
 
 | Dependency | What arrives frozen | Contract |
 |------------|--------------------|----------|
-| Pricing (Product Catalog) | pinned read-model rows on the 8-axis key (windows, eligibility, cohorts); `PriceWindowScheduled/Activated/Expired/Cancelled` + `CatalogVersionPublished` as **cache-invalidation** signals only | [`11-consumer-contracts.md`](./11-consumer-contracts.md); SEAMS C1, W1 |
+| Pricing (Product Catalog) | pinned read-model rows on the ten-axis key (windows, eligibility, cohorts); `PriceWindowScheduled/Activated/Expired/Cancelled` + `CatalogVersionPublished` as **cache-invalidation** signals only | [`11-consumer-contracts.md`](./11-consumer-contracts.md); SEAMS C1, W1 |
 | Subscriptions | phase timeline / active `phase_id` inputs, `activatedAt`, the subscription's pinned price id binding | PRD §9.2 Subscriptions input |
 | Pricing pre-stamp (via snapshot) | resolved price ids **incl. `cohort`** | 01 §4.3; SEAMS S1 |
 
@@ -243,7 +243,7 @@ the fallback flag so fixtures can assert which path priced the line.
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-storage-none-sel`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-datastore-none-sel`
 
 **None owned.** Selection reads pinned read-model pages through the Foundation's
 non-authoritative resolved-window cache (01 §3.7); cache loss degrades latency, never
@@ -267,7 +267,7 @@ For evaluation at `t` (UTC) over a frozen context, per emitted line (`chargeKind
 1. Resolve the active `phase_id` at `t` (step 1). Unresolvable ⇒ `missing_phase_context`.
 2. Build the candidate set: rows with `t in [effectiveFrom, effectiveTo)` keyed to `phase_id`, **plus** phase-invariant usage rows; phase-specific wins on collision (§4.3).
 3. Apply the eligibility class order; within `existing_grandfathered`, apply the cohort pin (§4.2).
-4. Assert exactly one survivor **on the full 8-axis key**: `0` on billable usage ⇒ `no_eligible_window`; `>1` ⇒ `selection_ambiguity` (§4.4).
+4. Assert exactly one survivor **on the full ten-axis key**: `0` on billable usage ⇒ `no_eligible_window`; `>1` ⇒ `selection_ambiguity` (§4.4).
 5. Emit `SelectionOutcome`; when invoice currency equals the row's price currency, set the FX-skip flag (advisory metadata — [`07-currency-fx.md`](./07-currency-fx.md) re-derives the skip authoritatively from `CurrencyRoles`).
 
 The algorithm is a pure function of `(EvaluationContext, pinned read model)`; replay and
@@ -314,7 +314,7 @@ candidate-set provenance for diagnosis:
 **Traces to**: `cpt-cf-bss-rating-fr-base-catalog-selection`, `cpt-cf-bss-rating-fr-price-eligibility-grandfathering`, `cpt-cf-bss-rating-fr-plan-phases`
 
 - **PRD**: §6.3 `fr-base-catalog-selection` + steps 1–2 slots of `fr-evaluation-order`; §6.5 `fr-price-eligibility-grandfathering`, `fr-plan-phases`; §17.1 steps 1–2 (normative order).
-- **Seams**: K1 (full 8-axis key), K2 (cohort by pinned price id), K4 (class order), K5 (`phase_id` typing), F1 (phase-invariant fallback) — [`../SEAMS.md`](../SEAMS.md).
+- **Seams**: K1 (full canonical key), K6 (ten-axis adoption — resolved T-D-35), K2 (cohort by pinned price id), K4 (class order), K5 (`phase_id` typing), F1 (phase-invariant fallback) — [`../SEAMS.md`](../SEAMS.md).
 - **Decisions**: T-D-01, T-D-08 (F1 part) — [`../DECISIONS.md`](../DECISIONS.md).
 - **ADR**: [`../ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md`](../ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md); adopted pricing ADRs per §1.2.
 - **Related slices**: [`01-foundation.md`](./01-foundation.md) (pipeline, `ScopeKeyAdapter`, snapshot pre-stamp), [`03-metering-models.md`](./03-metering-models.md) (step 3 consumes the outcome), [`04-overlays-precedence.md`](./04-overlays-precedence.md) (overlay `priceOverlay` stacking), [`07-currency-fx.md`](./07-currency-fx.md) (FX-skip flag), [`08-retroactivity-corrections.md`](./08-retroactivity-corrections.md) (snapshot replay of this evaluator).

@@ -432,3 +432,60 @@ async fn compatibility_holds_when_every_active_binding_is_admitted() {
     );
     let _ = METRIC_BASE_TYPE;
 }
+
+#[tokio::test]
+async fn a_projection_or_request_contract_missing_its_traits_is_rejected() {
+    let traitless = |trait_name: &str| {
+        let mut projection = resolved(LLM_USER_PROJECTION);
+        if let Some(traits) = projection.effective_traits.as_object_mut() {
+            traits.remove(trait_name);
+        }
+        projection
+    };
+
+    let registry = FakeContractRegistry::llm_gateway();
+    registry.add_type(traitless("scope"));
+    let (outcome, metrics) = build(&registry, &llm_config()).await;
+    assert_rejected(
+        outcome,
+        &metrics,
+        ValidationReason::SchemaInvalid,
+        "declares no scope trait",
+    );
+
+    let registry = FakeContractRegistry::llm_gateway();
+    registry.add_type(traitless("admitted_metrics"));
+    let (outcome, metrics) = build(&registry, &llm_config()).await;
+    assert_rejected(
+        outcome,
+        &metrics,
+        ValidationReason::SchemaInvalid,
+        "declares no admitted metrics",
+    );
+
+    let registry = FakeContractRegistry::llm_gateway();
+    let mut numeric = resolved(LLM_USER_PROJECTION);
+    numeric.effective_traits["admitted_metrics"] = json!([1]);
+    registry.add_type(numeric);
+    let (outcome, metrics) = build(&registry, &llm_config()).await;
+    assert_rejected(
+        outcome,
+        &metrics,
+        ValidationReason::SchemaInvalid,
+        "admitted metric is not a string",
+    );
+
+    let registry = FakeContractRegistry::llm_gateway();
+    let mut unconstrained = resolved(LLM_TOKEN_REQUEST);
+    if let Some(traits) = unconstrained.effective_traits.as_object_mut() {
+        traits.remove("constraint_contract");
+    }
+    registry.add_type(unconstrained);
+    let (outcome, metrics) = build(&registry, &llm_config()).await;
+    assert_rejected(
+        outcome,
+        &metrics,
+        ValidationReason::ConstraintInvalid,
+        "declares no constraint contract",
+    );
+}

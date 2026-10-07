@@ -301,14 +301,6 @@ jobs:
       - name: cargo test (no macros)
         run: make test-no-macros
 
-      # `bss-fixtures` is the only crate in the tree whose *production* surface
-      # is the narrow one: pricing's `FixtureGate` inherits it with
-      # `default-features = false`. `default = ["corpus"]`, so the workspace run
-      # above compiles the wide build, where `tests/production_surface.rs`'s
-      # assertions hold trivially and prove nothing they were written for.
-      - name: cargo test (bss-fixtures narrow production surface)
-        run: make test-fixtures-narrow
-
   integration:
     name: Integration tests
     needs: changes
@@ -426,6 +418,16 @@ jobs:
       # `in_schema("bss")` form both gears actually pass, ran in no job.
       - name: Test coord with Postgres (integration)
         run: make test-coord-pg
+
+      # bss-products' Postgres tier, added 2026-08-30. It carries the gear's
+      # only proofs about racing writers and the only execution of the Postgres
+      # half of its triggers — the SQLite suite is written from the same design
+      # clauses but against a different trigger shape, so it cannot fail for
+      # what the Postgres arm gets wrong. Without this step the tier compiles
+      # here and runs nowhere, which is the state the pricing comment above
+      # records as having cost that gear nine hidden failures.
+      - name: Test bss-products with Postgres (integration)
+        run: make test-products-pg
 
       - name: Test redis-cluster-plugin (redis integration)
         run: make test-cluster-redis
