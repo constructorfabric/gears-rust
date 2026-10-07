@@ -40,6 +40,20 @@ mod wire_vocabulary_round_trip {
     }
 
     #[test]
+    fn operation_resource_type_round_trips_to_context_resource_type() {
+        let err = crate::gts::OperationResource::not_found("x")
+            .with_resource("x")
+            .create();
+        assert_eq!(err.resource_type(), Some(gts::OPERATION_RESOURCE_TYPE));
+        let json = problem(err);
+        assert_eq!(
+            json["context"]["resource_type"],
+            gts::OPERATION_RESOURCE_TYPE,
+            "resource type must round-trip into context.resource_type",
+        );
+    }
+
+    #[test]
     fn field_reason_constants_round_trip_to_field_violations() {
         for (field_name, reason) in [
             (field::GTS_ID_FIELD, field::INVALID_GTS_ID),

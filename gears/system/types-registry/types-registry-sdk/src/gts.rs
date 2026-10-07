@@ -37,3 +37,7 @@ pub const OPERATION_RESOURCE_TYPE: &str = gts_id!("cf.core.types_registry.operat
 /// [`TYPE_RESOURCE_TYPE`] — pinned by `gts_resource_type_round_trips`.
 #[resource_error(gts_id!("cf.core.types_registry.entity.v1~"))]
 pub(crate) struct TypeResource;
+
+/// Operation error scope; its literal must equal [`OPERATION_RESOURCE_TYPE`].
+#[resource_error(gts_id!("cf.core.types_registry.operation.v1~"))]
+pub(crate) struct OperationResource;
