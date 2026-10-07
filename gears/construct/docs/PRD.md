@@ -371,7 +371,7 @@ Before it stores any fact, Construct **MUST** check the content for these specia
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-fr-tenant-isolation`
 
-Every operation **MUST** be confined to the caller's tenant. A read, count, search or error message **MUST NOT** reveal data of another tenant: facts, settings, review requests, audit events or tenant settings. Adversarial tests that seed several tenants with the same subject identifiers and records **MUST** find zero such cases.
+Every operation **MUST** be confined to one tenant, determined as `cpt-cf-construct-fr-access-control` states. A read, count, search or error message **MUST NOT** reveal data of another tenant: facts, settings, review requests, audit events or tenant settings. Adversarial tests that seed several tenants with the same subject identifiers and records **MUST** find zero such cases.
 
 - **Rationale**: One deployment serves many tenants; a leak between them is a personal-data breach.
 - **Actors**: `cpt-cf-construct-actor-platform-auth`, `cpt-cf-construct-actor-graph-storage`, `cpt-cf-construct-actor-audit`
@@ -380,7 +380,7 @@ Every operation **MUST** be confined to the caller's tenant. A read, count, sear
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-fr-access-control`
 
-Every request **MUST** carry a caller identity and a tenant that the platform has authenticated, and Construct **MUST** refuse a request without them. Construct **MUST** take the caller and the tenant only from the platform, never from the content of a record or request. The platform **MUST** authorize every operation. Sending records, reading profiles, managing facts, controlling the profiles one owns, resolving review requests, administering a subject's facts, changing tenant settings and exporting a subject's data **MUST** be separate permissions. Audit events are read in the Audit gear, under its own permissions.
+Every request **MUST** carry a caller identity and a tenant that the platform has authenticated, and Construct **MUST** refuse a request without them. Construct **MUST** take the caller only from the platform, never from the content of a record or request. Construct **MUST NOT** take the tenant from the content of a record. When a request names no tenant, Construct **MUST** take the tenant from the platform. When a request names a tenant, Construct **MUST** refuse it unless the platform authorizes the caller for that tenant. Only record intake accepts a tenant in the request. The platform **MUST** authorize every operation. Sending records, reading profiles, managing facts, controlling the profiles one owns, resolving review requests, administering a subject's facts, changing tenant settings and exporting a subject's data **MUST** be separate permissions. Audit events are read in the Audit gear, under its own permissions.
 
 - **Rationale**: Each actor needs a different level of access; separate permissions let the tenant grant exactly what each needs.
 - **Actors**: `cpt-cf-construct-actor-platform-auth`, `cpt-cf-construct-actor-connector`, `cpt-cf-construct-actor-consumer-app`, `cpt-cf-construct-actor-audit`
