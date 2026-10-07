@@ -1,0 +1,5 @@
+error[E0639]: cannot create non-exhaustive struct using struct expression
+ --> tests/ui/wrong_options.rs:3:13
+  |
+3 |     let _ = StartOptions { idempotency_key: None, coalescing_key: None, expected_fingerprint: None };
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

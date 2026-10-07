@@ -28,6 +28,7 @@ pub struct ApiGateway {
 
 - `entry`: Method name to run as the background task
 - `stop_timeout`: Graceful shutdown timeout (e.g., "30s", "1m")
+- `stop_timeout_fn`: Method name returning `Duration` from `&self`, evaluated at stop after initialization. Mutually exclusive with `stop_timeout`. Available in `#[gear(..., lifecycle(...))]` and `#[lifecycle(...)]`.
 - `await_ready`: Wait for ready signal before marking as Running
 
 ## WithLifecycle states and transitions

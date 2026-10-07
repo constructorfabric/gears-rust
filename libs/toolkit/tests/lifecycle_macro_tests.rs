@@ -91,3 +91,135 @@ async fn drop_cleans_up_background_task() {
     drop(m);
     // Nothing to assert directly; this test exercises Drop paths without hanging.
 }
+
+#[derive(Default)]
+struct ConfiguredStop {
+    seconds: std::sync::atomic::AtomicU64,
+    finished: std::sync::atomic::AtomicBool,
+    started: tokio::sync::Notify,
+}
+
+#[lifecycle_attr(method = "serve", stop_timeout_fn = "shutdown_timeout")]
+impl ConfiguredStop {
+    fn shutdown_timeout(&self) -> Duration {
+        Duration::from_secs(self.seconds.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    async fn serve(&self, cancel: CancellationToken) -> Result<()> {
+        self.started.notify_one();
+        cancel.cancelled().await;
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        self.finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_provider_reads_initialized_configuration_at_stop() {
+    let wrapper = ConfiguredStop::default().into_gear();
+    wrapper
+        .inner()
+        .seconds
+        .store(60, std::sync::atomic::Ordering::SeqCst);
+    wrapper.start(CancellationToken::new()).await.unwrap();
+    wrapper.inner().started.notified().await;
+    let began = tokio::time::Instant::now();
+    wrapper.stop(CancellationToken::new()).await.unwrap();
+    assert_eq!(began.elapsed(), Duration::from_secs(40));
+    assert!(
+        wrapper
+            .inner()
+            .finished
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn host_deadline_overrides_computed_timeout() {
+    let wrapper = ConfiguredStop::default().into_gear();
+    wrapper
+        .inner()
+        .seconds
+        .store(60, std::sync::atomic::Ordering::SeqCst);
+    wrapper.start(CancellationToken::new()).await.unwrap();
+    wrapper.inner().started.notified().await;
+    let deadline = CancellationToken::new();
+    let token = deadline.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        token.cancel();
+    });
+    let began = tokio::time::Instant::now();
+    wrapper.stop(deadline).await.unwrap();
+    assert_eq!(began.elapsed(), Duration::from_secs(5));
+    assert!(
+        !wrapper
+            .inner()
+            .finished
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
+    assert_eq!(wrapper.status(), Status::Stopped);
+}
+
+static GEAR_CLEANED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static GEAR_STARTED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+#[toolkit::gear(name = "configured-stop-test", capabilities = [stateful], lifecycle(entry = "serve", stop_timeout_fn = "shutdown_timeout", await_ready))]
+struct ConfiguredStopGear {
+    timeout: Duration,
+}
+
+impl Default for ConfiguredStopGear {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+impl ConfiguredStopGear {
+    fn shutdown_timeout(&self) -> Duration {
+        self.timeout
+    }
+    async fn serve(&self, cancel: CancellationToken, ready: ReadySignal) -> Result<()> {
+        ready.notify();
+        GEAR_STARTED.notify_one();
+        cancel.cancelled().await;
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        GEAR_CLEANED.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+#[async_trait::async_trait]
+impl toolkit::Gear for ConfiguredStopGear {
+    async fn init(&self, _: &toolkit::GearCtx) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn gear_macro_uses_computed_timeout_in_wrapper_and_registered_capability() {
+    let mut builder = toolkit::registry::RegistryBuilder::default();
+    __configured_stop_gear_registrator(&mut builder);
+    let registry = builder.build_topo_sorted().unwrap();
+    let registered = registry
+        .gears()
+        .iter()
+        .find(|entry| entry.name() == "configured-stop-test")
+        .unwrap()
+        .caps()
+        .query::<toolkit::registry::RunnableCap>()
+        .unwrap();
+    let wrapped: std::sync::Arc<dyn RunnableCapability> =
+        std::sync::Arc::new(ConfiguredStopGear::default().into_gear());
+    for lifecycle in [wrapped, registered] {
+        GEAR_CLEANED.store(false, std::sync::atomic::Ordering::SeqCst);
+        lifecycle.start(CancellationToken::new()).await.unwrap();
+        GEAR_STARTED.notified().await;
+        let began = tokio::time::Instant::now();
+        lifecycle.stop(CancellationToken::new()).await.unwrap();
+        assert_eq!(began.elapsed(), Duration::from_secs(40));
+        assert!(GEAR_CLEANED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
