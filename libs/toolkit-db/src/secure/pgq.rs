@@ -42,6 +42,7 @@ use sea_orm::{Condition, EntityTrait, FromQueryResult, QueryTrait, StatementBuil
 use toolkit_sea_orm_pgq::{EdgeTable, EndpointRef, PropertyGraph as GraphDdl, VertexTable};
 
 use crate::secure::cond::{ColumnAddress, SiblingSupport, build_scope_predicate};
+use crate::secure::entity_traits::checked_table;
 use crate::secure::select::{Scoped, SecureSelect};
 use crate::secure::{
     AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, ScopeError, ScopeProperties,
@@ -160,7 +161,7 @@ impl GraphDeclaration {
         // time there is a `Condition` the two are indistinguishable.
         // Read the table, not the list: emptiness is a const fact, and building
         // a Vec to ask about it would allocate for something the compiler knows.
-        if J::SCOPE_PROPERTIES.is_empty() {
+        if checked_table::<J>().is_empty() {
             return Err(ScopeError::Invalid(
                 "a property-graph element must resolve at least one scope column; \
                  an element that resolves none would traverse as a silent deny-all",
@@ -569,7 +570,7 @@ impl<G: PropertyGraph> PathBuilder<G> {
         J::Column: sea_orm::ColumnTrait + Copy,
     {
         // Per element, per query: the const answers without allocating.
-        if J::SCOPE_PROPERTIES.is_empty() {
+        if checked_table::<J>().is_empty() {
             return Err(ScopeError::Invalid(
                 "a graph element must resolve at least one scope column; \
                  an element that resolves none would traverse as a silent deny-all",

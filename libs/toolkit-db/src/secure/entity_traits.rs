@@ -325,14 +325,17 @@ pub trait ScopeProperties: ScopableEntity {
     /// const puts the check back, and unlike the warning it covers hand-written
     /// tables as well as derived ones.
     ///
-    /// An associated const is only evaluated where it is used, so the two
-    /// readers below force it with a `const` block. An entity whose table is
-    /// never read is never checked — and never scopes anything either.
+    /// An associated const is only evaluated where it is used, so every reader
+    /// of the table in this crate takes it from `checked_table`, which forces
+    /// this const and the two below. An entity whose table is never read is
+    /// never checked — and never scopes anything either.
     ///
     /// `Self` is generic here, so the assertion is evaluated at monomorphization:
     /// it fails a build (`cargo build`, `cargo test`, and every CI job that
-    /// compiles) but **not** a `cargo check`, which stops at metadata. That is
-    /// also why this cannot be a `trybuild` fixture — trybuild runs `cargo check`.
+    /// compiles) but **not** a `cargo check`, which stops at metadata. A
+    /// `trybuild` fixture sees it only when its case set also has a `pass`
+    /// case, which is what switches trybuild from `cargo check` to `cargo build`
+    /// (`tests/ui.rs`, `post_monomorphization_guards`).
     const PROPERTIES_ARE_UNIQUE: () = assert!(
         properties_are_unique(Self::SCOPE_PROPERTIES),
         "SCOPE_PROPERTIES names one property twice: resolve_property would answer \
@@ -392,10 +395,7 @@ pub trait ScopeProperties: ScopableEntity {
     /// dropping the constraint and falling to `WHERE false`.
     #[must_use]
     fn resolve_property(property: &str) -> Option<Self::Column> {
-        const { Self::PROPERTIES_ARE_UNIQUE }
-        const { Self::DIMENSIONS_ARE_DECLARED }
-        const { Self::UNRESTRICTED_SCOPES_ON_NOTHING }
-        Self::SCOPE_PROPERTIES
+        checked_table::<Self>()
             .iter()
             .find(|(name, _)| *name == property)
             .map(|(_, column)| *column)
@@ -413,10 +413,7 @@ pub trait ScopeProperties: ScopableEntity {
     /// than compiling to a deny-all traversal (Policy 2).
     #[must_use]
     fn scope_columns() -> Vec<Self::Column> {
-        const { Self::PROPERTIES_ARE_UNIQUE }
-        const { Self::DIMENSIONS_ARE_DECLARED }
-        const { Self::UNRESTRICTED_SCOPES_ON_NOTHING }
-        Self::SCOPE_PROPERTIES
+        checked_table::<Self>()
             .iter()
             .map(|(_, column)| *column)
             .collect()
@@ -461,6 +458,21 @@ pub trait ScopeProperties: ScopableEntity {
 /// `tests/ui/fail/scope_properties_cannot_be_overridden.rs` pins that: an
 /// entity trying to supply its own `resolve_property` fails to compile.
 impl<E: ScopableEntity> ScopeProperties for E {}
+
+/// [`ScopableEntity::SCOPE_PROPERTIES`], with the three compile-time checks of
+/// [`ScopeProperties`] forced for `E`.
+///
+/// The one way this crate reads the table. A reader that took the const
+/// directly would let an entity used only through that reader skip the
+/// checks: `secure_insert_from_select` asks the table whether it is empty, and
+/// an entity that names nothing in it and decides nothing in
+/// `UNSCOPED_DIMENSIONS` would pass that gate unchecked.
+pub fn checked_table<E: ScopableEntity>() -> &'static [(&'static str, E::Column)] {
+    const { <E as ScopeProperties>::PROPERTIES_ARE_UNIQUE }
+    const { <E as ScopeProperties>::DIMENSIONS_ARE_DECLARED }
+    const { <E as ScopeProperties>::UNRESTRICTED_SCOPES_ON_NOTHING }
+    E::SCOPE_PROPERTIES
+}
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -781,9 +793,9 @@ mod tests {
 
     /// The rule [`ScopeProperties::DIMENSIONS_ARE_DECLARED`] enforces.
     ///
-    /// Tested here rather than as a `trybuild` fixture for the reason that
-    /// const documents: the assertion is evaluated at monomorphization, and
-    /// `trybuild` runs `cargo check`, which stops at metadata.
+    /// Tested here, case by case, because a `trybuild` fixture costs a build
+    /// of its own; `tests/ui.rs` holds the fixtures that prove the const is
+    /// forced where the table is read.
     mod dimension_rule {
         use super::super::dimensions_are_declared;
         use toolkit_security::access_scope::pep_properties;

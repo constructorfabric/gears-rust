@@ -6,6 +6,7 @@ use sea_orm::{
 use std::marker::PhantomData;
 
 use crate::secure::cond::build_scope_condition;
+use crate::secure::entity_traits::checked_table;
 use crate::secure::error::ScopeError;
 use crate::secure::{
     AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, ScopeProperties, Scoped, SeaOrmRunner,
@@ -310,7 +311,7 @@ where
 /// gives `None` four times while declaring a scope column all the same -- and
 /// this path exists precisely because rows produced inside the database cannot
 /// be validated against a scope per row. The Policy 2 gates in
-/// [`crate::secure::pgq`] ask the same question of the same const, for the
+/// [`crate::secure::pgq`] ask the same question of the same table, for the
 /// same reason.
 ///
 /// `type_col` is still asked separately: it has no property name, so it is the
@@ -323,7 +324,7 @@ fn insert_from_select_allowed<E>() -> Result<(), ScopeError>
 where
     E: ScopableEntity + EntityTrait,
 {
-    if !E::SCOPE_PROPERTIES.is_empty() || E::type_col().is_some() {
+    if !checked_table::<E>().is_empty() || E::type_col().is_some() {
         return Err(ScopeError::Invalid(
             "insert-from-select is limited to entities without scope columns: \
              rows produced inside the database cannot be validated per row",

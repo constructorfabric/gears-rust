@@ -1,0 +1,35 @@
+error[E0080]: evaluation panicked: every one of `owner_tenant_id`, `id` and `owner_id` must be named by SCOPE_PROPERTIES or by UNSCOPED_DIMENSIONS, and by exactly one of them: a dimension in neither is one nobody decided about, and the write guards that ask for its column would skip themselves in silence
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `<link::Entity as toolkit_db::secure::ScopeProperties>::DIMENSIONS_ARE_DECLARED` failed here
+  |
+ ::: src/secure/entity_traits.rs
+  |
+  |       const DIMENSIONS_ARE_DECLARED: () = assert!(
+  |  _________________________________________-
+  | |         Self::IS_UNRESTRICTED
+  | |             || dimensions_are_declared(Self::SCOPE_PROPERTIES, Self::UNSCOPED_DIMENSIONS),
+  | |         "every one of `owner_tenant_id`, `id` and `owner_id` must be named by \
+... |
+  | |          write guards that ask for its column would skip themselves in silence"
+  | |     );
+  | |_____- in this macro invocation
+
+note: erroneous constant encountered
+ --> src/secure/entity_traits.rs
+  |
+  |     const { <E as ScopeProperties>::DIMENSIONS_ARE_DECLARED }
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: erroneous constant encountered
+ --> src/secure/entity_traits.rs
+  |
+  |     const { <E as ScopeProperties>::DIMENSIONS_ARE_DECLARED }
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn secure::entity_traits::checked_table::<link::Entity>`
+ --> src/secure/db_ops.rs
+  |
+  |     if !checked_table::<E>().is_empty() || E::type_col().is_some() {
+  |         ^^^^^^^^^^^^^^^^^^^^
