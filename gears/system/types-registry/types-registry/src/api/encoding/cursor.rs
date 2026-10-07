@@ -6,13 +6,11 @@
 //! build understands. A cursor that outlives a protocol change is then a `400`
 //! rather than a silently wrong page.
 //!
-//! # Why this lives in the transport layer
+//! # Adapter boundary
 //!
 //! The domain's position is a stored `gts_id` — [`DiscoveryQuery::after`]. The
-//! base64url envelope is how one page hands that to the next *over HTTP*, so it is
-//! encoding, not policy: `discover` never sees a token, and the bound below is a
-//! contract rule a gRPC adapter would restate in its own encoding rather than
-//! inherit.
+//! base64url envelope is shared by both adapters; discovery sees only a key.
+//! Refusals use the transport-free [`crate::api::error`] ladder.
 //!
 //! # What the cursor binds
 //!
@@ -29,7 +27,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::pagination::short_filter_hash;
 use toolkit_odata::{CursorV1, ODataOrderBy, OrderKey, SortDir, ast, validate_cursor_against};
 
-use super::error::{cursor_not_usable, cursor_too_long};
+use crate::api::error::{cursor_not_usable, cursor_too_long};
 use crate::domain::enums::{EntityKind, LifecycleFilter};
 use crate::domain::registry_service::{DiscoveryQuery, MAX_KEY_LEN, is_canonical};
 use crate::domain::selection::FieldSelection;

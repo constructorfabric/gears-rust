@@ -1,8 +1,8 @@
 //! REST API layer for the Types Registry gear.
 
-mod cursor;
 pub mod dto;
-pub mod error;
+/// The crate's error ladder, transport-free; kept reachable at its REST path.
+pub use super::error;
 mod etag;
 pub mod handlers;
 mod params;

@@ -41,15 +41,8 @@ impl std::fmt::Display for ValidationError {
     }
 }
 
-/// Domain-level errors for the Types Registry gear.
-///
-/// This enum is intentionally **kind-agnostic** — the storage layer doesn't
-/// know whether a string identifies a type-schema or an instance, it just
-/// stores and retrieves entities by their GTS ID. Per [ADR 0005][adr] this
-/// enum is mapped to the platform [`CanonicalError`] by the single
-/// `From<DomainError> for CanonicalError` ladder in `crate::api::rest::error`;
-/// both the REST boundary and the in-process `TypesRegistryLocalClient` route
-/// through that one ladder.
+/// Kind-agnostic Types Registry errors, projected to [`CanonicalError`] through
+/// `crate::api::error` for REST and local calls ([ADR 0005][adr]).
 ///
 /// [`CanonicalError`]: toolkit_canonical_errors::CanonicalError
 /// [adr]: https://github.com/constructorfabric/gears-rust/blob/main/docs/arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md
@@ -71,14 +64,9 @@ pub enum DomainError {
     #[error("Entity already exists: {0}")]
     AlreadyExists(String),
 
-    /// A batch-register item could not be registered because its required
-    /// parent type-schema is not yet registered. Produced only by the
-    /// in-process `TypesRegistryLocalClient` parent pre-check (never by the
-    /// kind-agnostic service), and surfaced only as a per-item
-    /// `RegisterResult::Err` — it is unreachable from REST handlers. Maps to a
-    /// `FailedPrecondition` (wire `type` `PARENT_NOT_REGISTERED`) that carries
-    /// `parent_type_id` / `dependent_id` losslessly; see
-    /// `crate::api::rest::error`.
+    /// Local batch-register parent pre-check failure; only a per-item `RegisterResult::Err`,
+    /// never produced by the service or REST. Maps to `FailedPrecondition` with reason
+    /// `PARENT_NOT_REGISTERED` and lossless `parent_type_id` / `dependent_id` context.
     #[error(
         "Cannot register {dependent_id}: required type-schema {parent_type_id} is not registered"
     )]

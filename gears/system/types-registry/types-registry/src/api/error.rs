@@ -1,4 +1,5 @@
-//! REST error mapping for the Types Registry gear.
+//! Shared domain/service-to-`CanonicalError` ladder; re-exported at `api::rest::error` for
+//! compatibility.
 
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 use types_registry_sdk::{field, precondition};

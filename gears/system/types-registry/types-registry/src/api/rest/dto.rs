@@ -851,13 +851,7 @@ pub struct SubmitEntityDto {
     pub force: Option<bool>,
 }
 
-/// A submission of one or more entities.
-///
-/// `items` and not `entities`: the operation result, the discovery page and
-/// `Page<T>` all call their array `items`, so this is the house word for "the
-/// array in this envelope". It is also the name v1 does *not* use, which keeps
-/// the T24a promotion a loud break rather than one that turns on the element
-/// shape.
+/// Entity submission envelope; `items` matches operation and page envelopes.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
@@ -1516,7 +1510,7 @@ pub struct PageInfoDto {
     pub limit: u32,
 }
 
-/// One bounded page of discovery results (SPEC §10.1's `EntityPage`).
+/// One bounded page of discovery results (SPEC §10.1's `ListEntitiesResponse`).
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct EntityPageDto {

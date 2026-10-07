@@ -11,7 +11,6 @@ use toolkit::api::canonical_prelude::*;
 use toolkit::api::rest::extract;
 use uuid::Uuid;
 
-use super::cursor::Binding;
 use super::dto::{
     BatchGetRequest, DeleteEntitiesRequest, DeleteEntityQuery, EntityDto, EntityLookupDto,
     EntityLookupsDto, EntityPageDto, GtsEntityDto, ListEntitiesQuery, ListEntitiesResponse,
@@ -20,6 +19,7 @@ use super::dto::{
 };
 use super::params::{DiscoveryParams, ExactReadSelection, NoQuery};
 use super::paths::V2;
+use crate::api::encoding::cursor::{self, Binding};
 use crate::domain::admission::{Accepted, Candidate, SubmitRequest};
 use crate::domain::error::DomainError;
 use crate::domain::registry_service::{
@@ -116,17 +116,9 @@ pub async fn get_entity(
     Ok(Json(entity.into()))
 }
 
-// ---------------------------------------------------------------------------
-// The database-backed platform-plane handlers (T9)
-// ---------------------------------------------------------------------------
-//
-// Mapping steps only. Every one of these reads a request, calls exactly one domain
-// method, and maps the result — no policy, no existence check and no vocabulary
-// decision lives here, which is what lets a future `api/grpc` adapter reuse the
-// same domain surface (SPEC §8.4). Size bounds checked here only fail early; the
-// domain enforces the same ones for every adapter.
-//
-// The handlers above this line are the pre-database path T27 deletes.
+// Database-backed platform handlers (T9): decode, call one domain method, encode.
+// Domain methods own policy and bounds; adapter checks only fail early.
+// T26 removes the pre-database handlers above.
 
 /// Advisory only: how long a client should wait before its first poll. The
 /// operation may well be terminal sooner — while admission is inline (T21) it
@@ -515,7 +507,7 @@ pub async fn discover_entities(
         selection: params.selection,
     };
     if let Some(cursor) = &params.cursor {
-        query.after = Some(super::cursor::resume(cursor, &Binding::from(&query))?);
+        query.after = Some(cursor::resume(cursor, &Binding::from(&query))?);
     }
 
     let page = service
@@ -526,7 +518,7 @@ pub async fn discover_entities(
     let next_cursor = page
         .next_after
         .as_deref()
-        .map(|after| super::cursor::encode(after, &Binding::from(&query)))
+        .map(|after| cursor::encode(after, &Binding::from(&query)))
         .transpose()?;
     let body = EntityPageDto {
         items: page.items.into_iter().map(Into::into).collect(),

@@ -1,61 +1,13 @@
-//! HTTP entity-tag framing of the domain validator (RFC 9110 §8.8.3). The exact
-//! read's `ETag` and a batch result's `etag` carry identical bytes (SPEC §8.5).
-//!
-//! A condition that cannot be read is refused rather than dropped: a caller that
-//! sent one believes the read is conditional, and answering unconditionally
-//! would be answering a different question.
+//! If-None-Match parsing (RFC 9110 §13.1.2), sharing exact/batch tag bytes via
+//! [`crate::api::encoding::entity_tag`]. Unreadable conditions are refused.
 
 use axum::http::{HeaderMap, header};
 use toolkit_canonical_errors::CanonicalError;
 
-use super::error::{malformed_condition, validator_too_long, violation_field};
-use crate::domain::registry_service::MAX_KEY_LEN;
-use crate::domain::validator::{IfNoneMatch, Validator};
-
-/// A strong entity-tag: the validator, quoted.
-pub fn entity_tag(etag: Validator) -> String {
-    format!("\"{}\"", etag.encode())
-}
-
-/// The opaque part of one entity-tag, `W/` dropped as the weak comparison
-/// `If-None-Match` uses requires. `None` when `tag` is not an entity-tag: the
-/// opaque part is `etagc` (RFC 9110 §8.8.3), visible ASCII but `"`; `obs-text`
-/// is refused with the rest of non-ASCII.
-fn opaque(tag: &str) -> Option<&str> {
-    let tag = tag.strip_prefix("W/").unwrap_or(tag);
-    let inner = tag.strip_prefix('"')?.strip_suffix('"')?;
-    inner
-        .bytes()
-        .all(|byte| byte == b'!' || (b'#'..=b'~').contains(&byte))
-        .then_some(inner)
-}
-
-/// One entity-tag, bounded like a key, as a validator token.
-fn token(tag: &str, field: &'static str) -> Result<String, CanonicalError> {
-    let inner = opaque(tag)
-        .ok_or_else(|| malformed_condition(field, "each value must be a quoted entity-tag"))?;
-    if inner.len() > MAX_KEY_LEN {
-        return Err(validator_too_long(field, inner.len()));
-    }
-    Ok(inner.to_owned())
-}
-
-/// A batch item's `if_none_match`: exactly one entity-tag from an earlier read of
-/// that key. `*` is not one — "unchanged if it exists" is not a question a batch
-/// item asks.
-pub fn item_condition(tag: &str) -> Result<IfNoneMatch, CanonicalError> {
-    let tag = tag.trim();
-    if tag == "*" {
-        return Err(malformed_condition(
-            violation_field::IF_NONE_MATCH_ITEM,
-            "if_none_match takes the etag of an earlier read, and `*` is not one",
-        ));
-    }
-    Ok(IfNoneMatch::Validators(vec![token(
-        tag,
-        violation_field::IF_NONE_MATCH_ITEM,
-    )?]))
-}
+use super::error::{malformed_condition, violation_field};
+use crate::api::encoding::entity_tag::token;
+pub use crate::api::encoding::entity_tag::{entity_tag, item_condition};
+use crate::domain::validator::IfNoneMatch;
 
 /// The `If-None-Match` header: `*` or a list of entity-tags (RFC 9110 §13.1.2),
 /// across however many header lines. Empty list elements are ignored (§5.6.1.2);

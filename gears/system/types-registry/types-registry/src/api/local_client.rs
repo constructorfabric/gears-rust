@@ -1,0 +1,597 @@
+//! In-process platform API over `RegistryService` (SPEC §10.1, D15).
+//! Shares cursor/tag encodings and errors with REST. Outbox mutations read back accepted
+//! operations; failures return Aborted with `operation_id` for same-key replay (D19).
+//! Contexts stay unvalidated with no principal (C2); publisher reaches the service at T45/Phase 9.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use gts::GtsId;
+use serde_json::value::RawValue;
+use toolkit_canonical_errors::CanonicalError;
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk as sdk;
+use types_registry_sdk::{AdmissionFailure, PlatformTypesRegistryApi};
+use uuid::Uuid;
+
+use super::encoding::cursor::{self, Binding};
+use super::encoding::entity_tag;
+use super::error::{OperationError, TypeRegistryError, malformed_condition, violation_field};
+use crate::domain::admission::{
+    Candidate, DeleteRequest, DeleteTarget, StoredFailure, SubmitRequest, UnreadableFailure,
+};
+use crate::domain::enums::{
+    EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus, OperationKind,
+    OperationStatus,
+};
+use crate::domain::key::EntityKey;
+use crate::domain::registry_service::{
+    BatchGetItem, DiscoveryQuery, EntityLookup, EntityRecord, OperationItemRecord, OperationRecord,
+    RegistryService,
+};
+use crate::domain::selection::{EntityField, FieldSelection};
+use crate::domain::validator::Validator;
+
+/// [`PlatformTypesRegistryApi`] served from this process's [`RegistryService`].
+pub struct PlatformLocalClient {
+    service: Arc<RegistryService>,
+}
+
+impl PlatformLocalClient {
+    #[must_use]
+    pub fn new(service: Arc<RegistryService>) -> Self {
+        Self { service }
+    }
+
+    /// The operation an accepted submit created, read back (D19).
+    async fn read_back(&self, operation_id: Uuid) -> Result<OperationRecord, CanonicalError> {
+        match self.service.operation(operation_id).await {
+            Ok(Some(record)) => Ok(record),
+            Ok(None) => Err(read_back_failed(operation_id, "it could not be found")),
+            Err(e) => {
+                tracing::warn!(
+                    %operation_id,
+                    cause = e.cause_kind(),
+                    "types_registry could not read back an accepted operation"
+                );
+                Err(read_back_failed(operation_id, "the read failed"))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl PlatformTypesRegistryApi for PlatformLocalClient {
+    async fn batch_get_entities(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        request: sdk::BatchGetEntitiesRequest,
+    ) -> Result<sdk::BatchGetEntitiesResponse, CanonicalError> {
+        let selection = selection(&request.projection);
+        let mut asked: HashMap<EntityKey, sdk::EntityKey> =
+            HashMap::with_capacity(request.items.len());
+        let mut reads = Vec::with_capacity(request.items.len());
+        for item in request.items {
+            let key = domain_key(&item.key);
+            let if_none_match = item
+                .if_none_match
+                .map(|v| entity_tag::item_condition(validator_text(&v)?))
+                .transpose()?;
+            asked.entry(key.clone()).or_insert(item.key);
+            reads.push(BatchGetItem { key, if_none_match });
+        }
+
+        let results = self
+            .service
+            .batch_get(&reads, selection)
+            .await
+            .map_err(CanonicalError::from)?;
+
+        let mut lookups = HashMap::with_capacity(results.len());
+        for (key, lookup) in results {
+            let Some(asked_key) = asked.remove(&key) else {
+                tracing::error!(unexpected_key = ?key, "types_registry batch read answered a key it was not asked");
+                return Err(CanonicalError::internal(
+                    "the registry could not match a batch read result",
+                )
+                .create());
+            };
+            lookups.insert(asked_key, lookup_from(lookup)?);
+        }
+        Ok(sdk::BatchGetEntitiesResponse(lookups))
+    }
+
+    async fn list_entities(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        query: sdk::ListEntitiesRequest,
+    ) -> Result<sdk::ListEntitiesResponse, CanonicalError> {
+        let mut discovery = DiscoveryQuery {
+            pattern: query.filter.pattern.as_ref().map(ToString::to_string),
+            after: None,
+            limit: query.page.limit.map(u64::from),
+            kind: query.filter.kind.map(domain_kind),
+            lifecycle: domain_lifecycle(query.filter.lifecycle),
+            max_chain_depth: query.filter.max_chain_depth,
+            selection: selection(&query.projection),
+        };
+        if let Some(position) = &query.page.cursor {
+            let token = cursor::read(position.as_str())?;
+            discovery.after = Some(cursor::resume(&token, &Binding::from(&discovery))?);
+        }
+
+        let page = self
+            .service
+            .discover(&discovery)
+            .await
+            .map_err(CanonicalError::from)?;
+
+        let next = page
+            .next_after
+            .as_deref()
+            .map(|after| cursor::encode(after, &Binding::from(&discovery)))
+            .transpose()?
+            .map(sdk::Cursor::from_token);
+        Ok(sdk::ListEntitiesResponse {
+            items: page
+                .items
+                .into_iter()
+                .map(snapshot_from)
+                .collect::<Result<_, _>>()?,
+            next,
+        })
+    }
+
+    async fn register_entities(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        key: sdk::IdempotencyKey,
+        request: sdk::RegisterEntitiesRequest,
+    ) -> Result<sdk::RegistrationOperation, CanonicalError> {
+        let candidates = request
+            .items
+            .into_iter()
+            .map(|item| {
+                let gts_id = item.gts_id.to_string();
+                let expected_resource_version = item
+                    .expected_resource_version
+                    .map(|v| stored_version(&gts_id, v))
+                    .transpose()?;
+                Ok(Candidate {
+                    gts_id,
+                    content: Some(item.content),
+                    expected_resource_version,
+                    force: item.force,
+                })
+            })
+            .collect::<Result<Vec<_>, CanonicalError>>()?;
+        let submit = SubmitRequest {
+            idempotency_key: Some(key.as_str().to_owned()),
+            dry_run: request.dry_run,
+            candidates,
+        };
+
+        let accepted = self
+            .service
+            .submit(&submit, time::OffsetDateTime::now_utc())
+            .await
+            .map_err(CanonicalError::from)?;
+        let operation_id = accepted.operation_id;
+        match operation_from(self.read_back(operation_id).await?)
+            .map_err(|e| unrepresentable(operation_id, &e))?
+        {
+            sdk::Operation::Registration(operation) => Ok(operation),
+            sdk::Operation::Deletion(_) => Err(wrong_kind(operation_id)),
+        }
+    }
+
+    async fn delete_entities(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        key: sdk::IdempotencyKey,
+        request: sdk::DeleteEntitiesRequest,
+    ) -> Result<sdk::DeletionOperation, CanonicalError> {
+        let targets = request
+            .items
+            .into_iter()
+            .map(|item| {
+                let key = domain_key(&item.key);
+                let expected_resource_version =
+                    stored_version(&key.to_string(), item.expected_resource_version)?;
+                Ok(DeleteTarget {
+                    key,
+                    expected_resource_version: Some(expected_resource_version),
+                })
+            })
+            .collect::<Result<Vec<_>, CanonicalError>>()?;
+        let delete = DeleteRequest {
+            idempotency_key: Some(key.as_str().to_owned()),
+            dry_run: request.dry_run,
+            targets,
+        };
+
+        let accepted = self
+            .service
+            .delete(&delete, time::OffsetDateTime::now_utc())
+            .await
+            .map_err(CanonicalError::from)?;
+        let operation_id = accepted.operation_id;
+        match operation_from(self.read_back(operation_id).await?)
+            .map_err(|e| unrepresentable(operation_id, &e))?
+        {
+            sdk::Operation::Deletion(operation) => Ok(operation),
+            sdk::Operation::Registration(_) => Err(wrong_kind(operation_id)),
+        }
+    }
+
+    async fn get_operation(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        operation_id: Uuid,
+    ) -> Result<sdk::Operation, CanonicalError> {
+        let record = self
+            .service
+            .operation(operation_id)
+            .await
+            .map_err(CanonicalError::from)?
+            .ok_or_else(|| super::error::operation_not_found(operation_id))?;
+        operation_from(record)
+    }
+}
+
+// ---- errors -----------------------------------------------------------------
+
+/// Aborted read-back after acceptance; names the operation for same-key replay.
+fn read_back_failed(operation_id: Uuid, why: &str) -> CanonicalError {
+    OperationError::aborted(format!(
+        "operation {operation_id} was accepted, but {why}; retry with the same idempotency key"
+    ))
+    .with_resource(operation_id.to_string())
+    .with_reason("OPERATION_READ_FAILED")
+    .create()
+}
+
+/// Wrong-kind read-back names the accepted operation (D19).
+fn wrong_kind(operation_id: Uuid) -> CanonicalError {
+    tracing::error!(%operation_id, "types_registry read back an operation of the other kind");
+    OperationError::unknown(format!(
+        "operation {operation_id} was accepted, but read back as an operation of an \
+         unexpected kind"
+    ))
+    .with_resource(operation_id.to_string())
+    .create()
+}
+
+/// Conversion failure still names the accepted operation.
+fn unrepresentable(operation_id: Uuid, error: &CanonicalError) -> CanonicalError {
+    tracing::error!(%operation_id, %error, "types_registry cannot represent an accepted operation");
+    OperationError::unknown(format!(
+        "operation {operation_id} was accepted, but its record could not be represented"
+    ))
+    .with_resource(operation_id.to_string())
+    .create()
+}
+
+/// Corrupt stored value, never caller input; log its row/value subject and failure cause.
+fn corrupt(
+    what: &str,
+    subject: &dyn std::fmt::Display,
+    cause: &dyn std::fmt::Display,
+) -> CanonicalError {
+    tracing::error!(
+        what,
+        %subject,
+        %cause,
+        "types_registry local client met an unrepresentable stored value"
+    );
+    CanonicalError::internal("the registry could not represent a stored value").create()
+}
+
+/// Decode opaque validator bytes as entity-tag text; reject invalid UTF-8 instead of altering it.
+fn validator_text(validator: &sdk::Validator) -> Result<&str, CanonicalError> {
+    std::str::from_utf8(validator.as_bytes()).map_err(|_| {
+        malformed_condition(
+            violation_field::IF_NONE_MATCH_ITEM,
+            "a validator from this registry is entity-tag text",
+        )
+    })
+}
+
+/// `u64` precondition to the service's `i64`; above `i64::MAX` cannot exist.
+fn stored_version(key: &str, version: u64) -> Result<i64, CanonicalError> {
+    i64::try_from(version).map_err(|_| {
+        TypeRegistryError::invalid_argument()
+            .with_field_violation(
+                "expected_resource_version",
+                format!("'{key}': {version} is not a resource version this registry issues"),
+                "INVALID_RESOURCE_VERSION",
+            )
+            .create()
+    })
+}
+
+fn sdk_version(version: i64, subject: &dyn std::fmt::Display) -> Result<u64, CanonicalError> {
+    u64::try_from(version).map_err(|e| corrupt("negative resource_version", subject, &e))
+}
+
+// ---- keys, selection, enums --------------------------------------------------
+
+fn domain_key(key: &sdk::EntityKey) -> EntityKey {
+    match key {
+        sdk::EntityKey::GtsId(id) => EntityKey::GtsId(id.to_string()),
+        sdk::EntityKey::GtsUuid(uuid) => EntityKey::Uuid(*uuid),
+    }
+}
+
+fn sdk_key(key: EntityKey) -> Result<sdk::EntityKey, CanonicalError> {
+    match key {
+        EntityKey::GtsId(id) => Ok(sdk::EntityKey::GtsId(gts_id(&id)?)),
+        EntityKey::Uuid(uuid) => Ok(sdk::EntityKey::GtsUuid(uuid)),
+    }
+}
+
+fn gts_id(id: &str) -> Result<GtsId, CanonicalError> {
+    GtsId::try_new(id).map_err(|e| corrupt("stored gts_id", &id.escape_debug(), &e))
+}
+
+/// The typed selection, field by field: no names are spelled and re-parsed.
+fn selection(projection: &sdk::Projection) -> FieldSelection {
+    FieldSelection::from_fields(projection.normalized().fields().map(domain_field))
+}
+
+const fn domain_field(field: sdk::EntityField) -> EntityField {
+    match field {
+        sdk::EntityField::GtsId => EntityField::GtsId,
+        sdk::EntityField::GtsUuid => EntityField::GtsUuid,
+        sdk::EntityField::Kind => EntityField::Kind,
+        sdk::EntityField::LifecycleStatus => EntityField::LifecycleStatus,
+        sdk::EntityField::Origin => EntityField::Origin,
+        sdk::EntityField::Content => EntityField::Content,
+        sdk::EntityField::ResolvedSchema => EntityField::ResolvedSchema,
+        sdk::EntityField::EffectiveTraits => EntityField::EffectiveTraits,
+        sdk::EntityField::EffectiveTraitsSchema => EntityField::EffectiveTraitsSchema,
+        sdk::EntityField::Provenance => EntityField::Provenance,
+    }
+}
+
+const fn domain_kind(kind: sdk::EntityKind) -> EntityKind {
+    match kind {
+        sdk::EntityKind::TypeSchema => EntityKind::TypeSchema,
+        sdk::EntityKind::Instance => EntityKind::Instance,
+    }
+}
+
+const fn sdk_kind(kind: EntityKind) -> sdk::EntityKind {
+    match kind {
+        EntityKind::TypeSchema => sdk::EntityKind::TypeSchema,
+        EntityKind::Instance => sdk::EntityKind::Instance,
+    }
+}
+
+const fn domain_lifecycle(filter: sdk::LifecycleFilter) -> LifecycleFilter {
+    match filter {
+        sdk::LifecycleFilter::Active => LifecycleFilter::Active,
+        sdk::LifecycleFilter::Deleted => LifecycleFilter::Deleted,
+        sdk::LifecycleFilter::All => LifecycleFilter::All,
+    }
+}
+
+const fn sdk_lifecycle(status: LifecycleStatus) -> sdk::LifecycleStatus {
+    match status {
+        LifecycleStatus::Active => sdk::LifecycleStatus::Active,
+        LifecycleStatus::Deleted => sdk::LifecycleStatus::Deleted,
+    }
+}
+
+const fn sdk_operation_status(status: OperationStatus) -> sdk::OperationStatus {
+    match status {
+        OperationStatus::Pending => sdk::OperationStatus::Pending,
+        OperationStatus::Running => sdk::OperationStatus::Running,
+        OperationStatus::Completed => sdk::OperationStatus::Completed,
+    }
+}
+
+const fn sdk_candidate_status(status: OperationItemStatus) -> sdk::CandidateStatus {
+    match status {
+        OperationItemStatus::Pending => sdk::CandidateStatus::Pending,
+        OperationItemStatus::Running => sdk::CandidateStatus::Running,
+        OperationItemStatus::Succeeded => sdk::CandidateStatus::Succeeded,
+        OperationItemStatus::Unchanged => sdk::CandidateStatus::Unchanged,
+        OperationItemStatus::Failed => sdk::CandidateStatus::Failed,
+    }
+}
+
+// ---- reads ------------------------------------------------------------------
+
+/// The validator as the REST surface spells it: the same entity-tag bytes.
+fn sdk_validator(validator: Validator) -> sdk::Validator {
+    sdk::Validator::from_bytes(entity_tag::entity_tag(validator).into_bytes())
+}
+
+fn lookup_from(lookup: EntityLookup) -> Result<sdk::EntityLookup, CanonicalError> {
+    Ok(match lookup {
+        EntityLookup::Found { record, etag } => sdk::EntityLookup::Found {
+            snapshot: Box::new(snapshot_from(record)?),
+            etag: sdk_validator(etag),
+        },
+        EntityLookup::Unchanged { etag } => sdk::EntityLookup::Unchanged {
+            etag: sdk_validator(etag),
+        },
+        EntityLookup::NotFound => sdk::EntityLookup::NotFound,
+    })
+}
+
+/// A selected JSON `null` stays `Some(Value::Null)`; `None` stays unselected.
+fn document(
+    raw: Option<Box<RawValue>>,
+    gts_id: &str,
+    field: EntityField,
+) -> Result<Option<sdk::JsonDocument>, CanonicalError> {
+    raw.map(|raw| {
+        serde_json::from_str(raw.get()).map_err(|e| {
+            corrupt(
+                "stored document",
+                &format_args!("{} {}", gts_id.escape_debug(), field.name()),
+                &e,
+            )
+        })
+    })
+    .transpose()
+}
+
+fn snapshot_from(record: EntityRecord) -> Result<sdk::EntitySnapshot, CanonicalError> {
+    let id = record.gts_id.as_str();
+    Ok(sdk::EntitySnapshot {
+        gts_id: gts_id(&record.gts_id)?,
+        gts_uuid: record.gts_uuid,
+        kind: sdk_kind(record.kind),
+        lifecycle_status: sdk_lifecycle(record.lifecycle_status),
+        origin: record
+            .origin
+            .map(|origin| {
+                Ok::<_, CanonicalError>(sdk::Origin::Managed {
+                    resource_version: sdk_version(origin.resource_version, &id.escape_debug())?,
+                    created_at: origin.created_at,
+                    updated_at: origin.updated_at,
+                })
+            })
+            .transpose()?,
+        content: document(record.content, id, EntityField::Content)?,
+        resolved_schema: document(record.resolved_schema, id, EntityField::ResolvedSchema)?,
+        effective_traits: document(record.effective_traits, id, EntityField::EffectiveTraits)?,
+        effective_traits_schema: document(
+            record.effective_traits_schema,
+            id,
+            EntityField::EffectiveTraitsSchema,
+        )?,
+        provenance: record.provenance.map(|p| sdk::Provenance {
+            gts_spec_version: p.gts_spec_version,
+            gts_impl_version: p.gts_impl_version,
+            compat_forced: p.compat_forced,
+        }),
+    })
+}
+
+// ---- operations -------------------------------------------------------------
+
+fn operation_from(record: OperationRecord) -> Result<sdk::Operation, CanonicalError> {
+    let operation_id = record.operation_id;
+    let status = sdk_operation_status(record.status);
+    Ok(match record.kind {
+        OperationKind::Registration => sdk::Operation::Registration(sdk::RegistrationOperation {
+            operation_id,
+            status,
+            items: record
+                .items
+                .into_iter()
+                .map(|item| {
+                    let (key, status, resource_version, error) = item_parts(item, operation_id)?;
+                    let sdk::EntityKey::GtsId(gts_id) = key else {
+                        return Err(corrupt(
+                            "registration item keyed by reference",
+                            &operation_id,
+                            &"a registration names its candidates by identifier",
+                        ));
+                    };
+                    Ok(sdk::RegistrationItemResult {
+                        gts_id,
+                        status,
+                        resource_version,
+                        error,
+                    })
+                })
+                .collect::<Result<_, CanonicalError>>()?,
+        }),
+        OperationKind::Deletion => sdk::Operation::Deletion(sdk::DeletionOperation {
+            operation_id,
+            status,
+            items: record
+                .items
+                .into_iter()
+                .map(|item| {
+                    let (entity_key, status, resource_version, error) =
+                        item_parts(item, operation_id)?;
+                    Ok(sdk::DeletionItemResult {
+                        entity_key,
+                        status,
+                        resource_version,
+                        error,
+                    })
+                })
+                .collect::<Result<_, CanonicalError>>()?,
+        }),
+    })
+}
+
+type ItemParts = (
+    sdk::EntityKey,
+    sdk::CandidateStatus,
+    Option<u64>,
+    Option<CanonicalError>,
+);
+
+fn item_parts(item: OperationItemRecord, operation_id: Uuid) -> Result<ItemParts, CanonicalError> {
+    let canonical = item.key.to_string();
+    let error = item
+        .error
+        .map(|stored| item_failure(&item.key, stored, operation_id).into_canonical(&canonical));
+    Ok((
+        sdk_key(item.key)?,
+        sdk_candidate_status(item.status),
+        item.resource_version
+            .map(|v| sdk_version(v, &format_args!("{operation_id} {canonical}")))
+            .transpose()?,
+        error,
+    ))
+}
+
+/// Reversible SDK item failure; expose only the reason of unreadable records, matching REST.
+fn item_failure(
+    key: &EntityKey,
+    stored: Result<StoredFailure, UnreadableFailure>,
+    operation_id: Uuid,
+) -> AdmissionFailure {
+    match stored {
+        Ok(failure) => {
+            let context = [
+                (
+                    sdk::item_failure::context::DEPENDENCY_ID,
+                    failure.dependency_id,
+                ),
+                (
+                    sdk::item_failure::context::DEPENDENCY_KIND,
+                    failure.dependency_kind,
+                ),
+                (
+                    sdk::item_failure::context::DIAGNOSTIC_CODE,
+                    failure.error_code,
+                ),
+            ];
+            context
+                .into_iter()
+                .filter_map(|(name, value)| Some((name, value?)))
+                .fold(
+                    AdmissionFailure::new(failure.reason, failure.message),
+                    |acc, (name, value)| acc.with_context(name, value),
+                )
+        }
+        Err(unreadable) => {
+            tracing::error!(
+                %operation_id,
+                entity_key = %key,
+                reason = unreadable.reason.as_str(),
+                cause = %unreadable.cause,
+                "types_registry cannot read a stored item failure"
+            );
+            AdmissionFailure::new(
+                unreadable.reason.as_str(),
+                "the recorded failure could not be read",
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "local_client_tests.rs"]
+mod local_client_tests;

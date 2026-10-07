@@ -67,6 +67,8 @@ toolkit = { workspace = true }
 # runtime; dev-dependency feature unification must not be what enables it.
 toolkit-db = { workspace = true, features = ["sqlite"] }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
+# The platform-plane security context of `PlatformTypesRegistryApi` (local client).
+toolkit-security = { workspace = true }
 toolkit-gts = { workspace = true }
 # Versioned base64url keyset cursors for content-free discovery (D12): `CursorV1`
 # refuses an unknown version, which is the property the page contract needs.

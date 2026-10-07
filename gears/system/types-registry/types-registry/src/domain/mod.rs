@@ -1,22 +1,12 @@
-//! Domain layer for the Types Registry gear.
+//! Domain layer: database and legacy in-memory paths coexist until T26–T30.
 //!
-//! # Two paths live here at once, and three pairs of names collide
-//!
-//! P0 builds a database-backed path beside the pre-P0 in-memory one and cuts over
-//! at T24–T30, so until then both are present under confusingly close names:
-//!
-//! | new (keep) | legacy (goes at T24–T30) | what the pair is |
+//! | Database | Legacy | Responsibility |
 //! |---|---|---|
-//! | [`ports`] | [`repo`] | the persistence seam |
-//! | [`registry_service`] | [`service`] | the domain surface transports call |
-//! | [`enums`] + the row types in [`ports`] | [`model`] | the domain's own vocabulary |
+//! | [`ports`] | [`repo`] | Persistence |
+//! | [`registry_service`] | [`service`] | Domain API |
+//! | [`enums`] + [`ports`] rows | [`model`] | Domain vocabulary |
 //!
-//! # One concept per file until a concept earns a directory
-//!
-//! [`admission`] is a directory because the operation pipeline has six modules.
-//! The grouping axis is the concept — which is also the table in `database.sql` —
-//! never "these are all pure functions"; `docs/p0/todo.md` records why a
-//! `rules/`-style bucket was rejected.
+//! Group modules by concept. [`admission`] has a directory for its six-module pipeline.
 
 // ---------------------------------------------------------------------------
 // The database-backed path (P0)
@@ -57,16 +47,8 @@ pub mod validator;
 pub mod enums;
 pub mod error;
 
-// ---------------------------------------------------------------------------
-// LEGACY — the pre-P0 in-memory path, deleted at T24-T30
-// ---------------------------------------------------------------------------
-//
-// `repo`/`GtsRepository` (with `InMemoryGtsRepository` and the `switch_to_ready`
-// ready-mode split) goes at T24; `service` with it; `model` follows
-// `TypesRegistryClient` at T26 (D6) and the cache retyping at T30.
-//
-// Nothing new should reference these three: a read that needs the database goes
-// through `ports`, a transport that needs the domain through `registry_service`.
+// Legacy: repo/service retire at T26; model retires with the old client/cache at T29/T30.
+// New callers use ports and registry_service.
 
 pub mod model;
 pub mod repo;
