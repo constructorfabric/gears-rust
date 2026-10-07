@@ -1151,7 +1151,7 @@ async fn list_users_happy_path_returns_page() {
         let u3 = Uuid::new_v4();
         // `top = 2`, 3-member fixture (fits one page) → has_more=true after
         // the drain → next_cursor must be set.
-        // Items are sorted by (createdTimestamp ASC, id ASC) client-side.
+        // Items are sorted by the default (username ASC, id ASC) client-side.
         Mock::given(method("GET"))
             .and(path(format!(
                 "/admin/realms/platform/groups/{group_uuid}/members"
@@ -1206,8 +1206,8 @@ async fn list_users_happy_path_returns_page() {
 #[tokio::test]
 async fn list_users_with_cursor_continues_from_tiebreaker() {
     // DESIGN "Interactions & Sequences": both page requests hit KC with first=0; cursor carries
-    // (last_created_at, last_user_id) and client-side filtering skips the
-    // already-returned users.
+    // the last emitted user's (username, id) key tuple and client-side
+    // filtering skips the already-returned users.
     //
     // Both fetches are identical (first=0&max=3), so we mount a single
     // permissive mock that returns all 3 users on every call, and rely on
@@ -1224,9 +1224,11 @@ async fn list_users_with_cursor_continues_from_tiebreaker() {
         let u3 = Uuid::parse_str("aaaaaaaa-0000-0000-0000-000000000003").unwrap();
 
         // Single mock for both pages: KC always returns all 3 users.
-        // sorted order: u1(ts=1000) < u2(ts=2000) < u3(ts=3000).
+        // Creation order is the REVERSE of username order, so the walk
+        // proves the sort key is `username`, not `createdTimestamp`.
+        // sorted order: u1("a") < u2("b") < u3("c").
         // Page 1: limit=2, no cursor → emit u1,u2; cursor encodes u2.
-        // Page 2: limit=2, cursor=(ts=2000,u2) → skip u1,u2 → emit u3 only.
+        // Page 2: limit=2, cursor=("b",u2) → skip u1,u2 → emit u3 only.
         Mock::given(method("GET"))
             .and(path(format!(
                 "/admin/realms/platform/groups/{group_uuid}/members"
@@ -1238,9 +1240,9 @@ async fn list_users_with_cursor_continues_from_tiebreaker() {
             // `first=0` call still serves the request.
             .and(query_param("max", "200"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"id": u1.to_string(), "username": "a", "createdTimestamp": 1000_i64},
+                {"id": u3.to_string(), "username": "c", "createdTimestamp": 1000_i64},
                 {"id": u2.to_string(), "username": "b", "createdTimestamp": 2000_i64},
-                {"id": u3.to_string(), "username": "c", "createdTimestamp": 3000_i64},
+                {"id": u1.to_string(), "username": "a", "createdTimestamp": 3000_i64},
             ])))
             .expect(2) // page 1 + page 2 each call the same endpoint
             .mount(&server)
@@ -1275,10 +1277,9 @@ async fn list_users_with_cursor_continues_from_tiebreaker() {
             .clone()
             .expect("page 1 produced cursor");
 
-        // Verify cursor encodes u2's tiebreaker.
-        let decoded = UserFacade::decode_cursor(&cursor).expect("cursor decodes");
-        assert_eq!(decoded.last_created_at, 2000_i64);
-        assert_eq!(decoded.last_user_id, u2);
+        // Verify cursor encodes u2's key tuple under the default order.
+        let decoded = UserFacade::decode_cursor(&cursor, &default_order()).expect("cursor decodes");
+        assert_eq!(decoded.last_key, vec!["b".to_owned(), u2.to_string()]);
 
         // Page 2 — re-issue with cursor; client-side skip removes u1,u2.
         let req2 = list_users_req(
@@ -1313,16 +1314,18 @@ async fn list_users_cursor_filter_mismatch_returns_rejected() {
     let filter_a = Uuid::new_v4();
     let filter_b = Uuid::new_v4();
     let group_uuid = Uuid::new_v4();
-    let stale_cursor = UserFacade::encode_cursor(&ListUsersCursor {
-        filter_hash: UserFacade::filter_hash(
-            tenant_uuid,
-            "platform",
-            Some(filter_a),
-            &StringMatcher::Always,
-        ),
-        last_created_at: 1_716_400_001_000_i64,
-        last_user_id: filter_a,
-    });
+    let stale_cursor = UserFacade::encode_cursor(
+        &ListUsersCursor {
+            filter_hash: UserFacade::filter_hash(
+                tenant_uuid,
+                "platform",
+                Some(filter_a),
+                &StringMatcher::Always,
+            ),
+            last_key: vec!["alice".into(), filter_a.to_string()],
+        },
+        &default_order(),
+    );
 
     let facade = build_facade(&server);
     let ctx = build_system_ctx(Uuid::nil());
@@ -1393,30 +1396,28 @@ async fn list_users_5xx_returns_unavailable() {
 // Tasks 8+9 — cursor codec round-trips and list_users tiebreaker
 // -----------------------------------------------------------------
 
-// `cursor_round_trip_first_page_has_null_tiebreaker` (pre-CursorV1)
-// was retired with the CursorV1 migration: the new envelope always
-// carries a concrete `(last_created_at, last_user_id)` pair (the
-// plugin only emits a cursor when `has_more=true`, which means at
-// least one row was emitted and its tiebreaker is known). The
-// "first page" case is now "no cursor at all" — covered implicitly
-// by every test that calls `list_users_inner` without a cursor.
+// The plugin only emits a cursor when `has_more=true`, which means at
+// least one row was emitted and its key tuple is known. The "first
+// page" case is "no cursor at all" — covered implicitly by every test
+// that calls `list_users_inner` without a cursor.
+
+/// Effective order for a request that carries no `order`.
+fn default_order() -> ListUsersOrder {
+    ListUsersOrder::resolve(None).expect("default order is supported")
+}
 
 #[test]
 fn cursor_round_trip_with_tiebreaker() {
-    use uuid::uuid;
     let c = ListUsersCursor {
         filter_hash: "abc123".into(),
-        last_created_at: 1_716_400_000_000_i64,
-        last_user_id: uuid!("9c4a6b2e-0000-0000-0000-000000000001"),
+        last_key: vec![
+            "alice".into(),
+            "9c4a6b2e-0000-0000-0000-000000000001".into(),
+        ],
     };
-    let encoded = UserFacade::encode_cursor(&c);
-    let decoded = UserFacade::decode_cursor(&encoded).expect("decodes");
-    assert_eq!(decoded.last_created_at, 1_716_400_000_000_i64);
-    assert_eq!(
-        decoded.last_user_id,
-        uuid!("9c4a6b2e-0000-0000-0000-000000000001"),
-    );
-    assert_eq!(decoded.filter_hash, "abc123");
+    let encoded = UserFacade::encode_cursor(&c, &default_order());
+    let decoded = UserFacade::decode_cursor(&encoded, &default_order()).expect("decodes");
+    assert_eq!(decoded, c);
 }
 
 /// `CursorV1` envelope is wire-compatible with `toolkit_odata::CursorV1`:
@@ -1424,25 +1425,71 @@ fn cursor_round_trip_with_tiebreaker() {
 /// parse our cursor through the same `CursorV1::decode` path it uses
 /// for tenant `list_children`. Verify the plugin's emitted cursor
 /// decodes cleanly as `CursorV1` and carries the documented
-/// `(o, s, d)` triple plus our `(k[0], k[1])` tiebreaker.
+/// `(o, s, d)` triple plus the `(username, id)` key tuple.
 #[test]
 fn cursor_wire_shape_is_cursor_v1_compatible() {
     use toolkit_odata::{CursorV1, SortDir};
-    use uuid::uuid;
     let c = ListUsersCursor {
         filter_hash: "abc123".into(),
-        last_created_at: 1_716_400_000_000_i64,
-        last_user_id: uuid!("9c4a6b2e-0000-0000-0000-000000000001"),
+        last_key: vec![
+            "alice".into(),
+            "9c4a6b2e-0000-0000-0000-000000000001".into(),
+        ],
     };
-    let encoded = UserFacade::encode_cursor(&c);
+    let encoded = UserFacade::encode_cursor(&c, &default_order());
     let parsed = CursorV1::decode(&encoded).expect("encoded cursor MUST be a valid CursorV1");
     assert_eq!(parsed.o, SortDir::Asc);
-    assert_eq!(parsed.s, "+created_at,+id");
+    assert_eq!(parsed.s, "+username,+id");
     assert_eq!(parsed.d, "fwd");
     assert_eq!(parsed.f.as_deref(), Some("abc123"));
-    assert_eq!(parsed.k.len(), 2);
-    assert_eq!(parsed.k[0], "1716400000000");
-    assert_eq!(parsed.k[1], "9c4a6b2e-0000-0000-0000-000000000001");
+    assert_eq!(parsed.k, c.last_key);
+}
+
+/// The order a cursor pins is caller input to AM: on a continuation
+/// request the users handler recovers it from `s` and refuses any field
+/// outside `IdpUserFilterField` with a 400. Every order the plugin can
+/// emit must therefore name allow-listed fields only — `created_at`
+/// pinned here broke paging past page 1.
+#[test]
+fn cursor_order_pin_names_only_allow_listed_fields() {
+    use toolkit_odata::{CursorV1, ODataOrderBy, OrderKey, SortDir};
+    let allowed: Vec<&str> = IdpUserFilterField::FIELDS
+        .iter()
+        .map(FilterField::name)
+        .collect();
+    let mut orders = vec![None];
+    for field in IdpUserFilterField::FIELDS {
+        for dir in [SortDir::Asc, SortDir::Desc] {
+            orders.push(Some(ODataOrderBy(vec![OrderKey {
+                field: field.name().to_owned(),
+                dir,
+            }])));
+        }
+    }
+    for requested in orders {
+        let order = ListUsersOrder::resolve(requested.as_ref()).expect("allow-listed order");
+        let encoded = UserFacade::encode_cursor(
+            &ListUsersCursor {
+                filter_hash: "abc123".into(),
+                last_key: vec![String::new(); order.keys.len()],
+            },
+            &order,
+        );
+        let parsed = CursorV1::decode(&encoded).expect("valid CursorV1");
+        let recovered = ODataOrderBy::from_signed_tokens(&parsed.s).expect("signed tokens parse");
+        for key in &recovered.0 {
+            assert!(
+                allowed.contains(&key.field.as_str()),
+                "cursor for {requested:?} pins `{}`, which AM rejects (allowed: {allowed:?})",
+                key.field,
+            );
+        }
+        assert_eq!(
+            recovered.0.last().map(|k| k.field.as_str()),
+            Some("id"),
+            "the pinned order must end in the `id` tiebreaker",
+        );
+    }
 }
 
 /// Cursors emitted under one `(o, s)` order-pin MUST be rejected
@@ -1453,15 +1500,37 @@ fn cursor_wire_shape_is_cursor_v1_compatible() {
 fn cursor_decode_rejects_mismatched_order_pin() {
     use toolkit_odata::{CursorV1, SortDir};
     let forged = CursorV1 {
-        k: vec!["1716400000000".into(), Uuid::nil().to_string()],
-        o: SortDir::Desc,      // mismatched
-        s: "+username".into(), // mismatched
+        k: vec!["alice".into(), Uuid::nil().to_string()],
+        o: SortDir::Desc,          // mismatched
+        s: "-username,+id".into(), // mismatched
         f: Some("abc123".into()),
         d: "fwd".into(),
     }
     .encode()
     .expect("forged cursor encodes");
-    let err = UserFacade::decode_cursor(&forged).expect_err("mismatched order rejected");
+    let err = UserFacade::decode_cursor(&forged, &default_order())
+        .expect_err("mismatched order rejected");
+    assert!(matches!(err, PluginError::UserOpRejected { .. }));
+}
+
+/// A cursor minted by a build that pinned the fixed
+/// `(createdTimestamp ASC, id ASC)` order carries a creation-time
+/// position, which is meaningless in a `username` walk. Reject it as
+/// `invalid cursor` so the caller restarts instead of skipping rows.
+#[test]
+fn cursor_decode_rejects_created_at_order_pin() {
+    use toolkit_odata::{CursorV1, SortDir};
+    let stale = CursorV1 {
+        k: vec!["1716400000000".into(), Uuid::nil().to_string()],
+        o: SortDir::Asc,
+        s: "+created_at,+id".into(),
+        f: Some("abc123".into()),
+        d: "fwd".into(),
+    }
+    .encode()
+    .expect("stale cursor encodes");
+    let err = UserFacade::decode_cursor(&stale, &default_order())
+        .expect_err("created_at order pin rejected");
     assert!(matches!(err, PluginError::UserOpRejected { .. }));
 }
 
@@ -1474,15 +1543,15 @@ fn cursor_decode_rejects_mismatched_order_pin() {
 fn cursor_decode_rejects_missing_filter_hash() {
     use toolkit_odata::{CursorV1, SortDir};
     let forged = CursorV1 {
-        k: vec!["1716400000000".into(), Uuid::nil().to_string()],
+        k: vec!["alice".into(), Uuid::nil().to_string()],
         o: SortDir::Asc,
-        s: "+created_at,+id".into(),
+        s: "+username,+id".into(),
         f: None, // missing
         d: "fwd".into(),
     }
     .encode()
     .expect("forged cursor encodes");
-    let err = UserFacade::decode_cursor(&forged).expect_err("missing f rejected");
+    let err = UserFacade::decode_cursor(&forged, &default_order()).expect_err("missing f rejected");
     assert!(matches!(err, PluginError::UserOpRejected { .. }));
 }
 
@@ -1533,13 +1602,17 @@ async fn list_users_emits_cursor_when_more_results_exist() {
             page.page_info.next_cursor.is_some(),
             "next_cursor must be set when more results exist",
         );
-        let next =
-            UserFacade::decode_cursor(page.page_info.next_cursor.as_ref().unwrap())
-                .expect("decodes");
-        assert_eq!(next.last_created_at, 1_716_400_001_000_i64);
+        let next = UserFacade::decode_cursor(
+            page.page_info.next_cursor.as_ref().unwrap(),
+            &default_order(),
+        )
+        .expect("decodes");
         assert_eq!(
-            next.last_user_id,
-            uuid!("9c4a6b2e-0000-0000-0000-000000000002"),
+            next.last_key,
+            vec![
+                "u2".to_owned(),
+                uuid!("9c4a6b2e-0000-0000-0000-000000000002").to_string(),
+            ],
         );
     })
     .await;
@@ -1762,6 +1835,256 @@ async fn list_users_filter_finds_member_past_first_page() {
         );
     })
     .await;
+}
+
+/// Order AM forwards on a users continuation request: recovered from the
+/// cursor's `s` (the `OData` extractor rejects `cursor + $orderby`),
+/// checked against the `IdpUserFilterField` allow-list exactly as the
+/// users handler's `ensure_known_order_fields` does (a miss there is the
+/// 400 `invalid cursor order: unknown field`), then given the `id`
+/// tiebreaker the AM service appends before SPI dispatch.
+fn am_continuation_order(cursor: &str) -> ODataOrderBy {
+    let parsed = CursorV1::decode(cursor).expect("AM's extractor decodes the cursor");
+    let order =
+        ODataOrderBy::from_signed_tokens(&parsed.s).expect("AM recovers the order from `s`");
+    let allowed: Vec<&str> = IdpUserFilterField::FIELDS
+        .iter()
+        .map(FilterField::name)
+        .collect();
+    for key in &order.0 {
+        assert!(
+            allowed.contains(&key.field.as_str()),
+            "AM's users handler rejects this cursor with 400: unknown field `{}` (allowed: {allowed:?})",
+            key.field,
+        );
+    }
+    order.ensure_tiebreaker("id", SortDir::Asc)
+}
+
+/// Walk every page the way AM drives the plugin: page 1 with the order
+/// AM injects, each later page with the order AM recovers from the
+/// previous `next_cursor`. Returns the ids in visit order plus every
+/// cursor's `s` pin.
+async fn walk_like_am(
+    facade: &UserFacade,
+    tenant_id: Uuid,
+    metadata: Option<serde_json::Value>,
+    top: u32,
+    first_order: ODataOrderBy,
+) -> (Vec<Uuid>, Vec<String>) {
+    let ctx = build_system_ctx(Uuid::nil());
+    let mut visited = Vec::new();
+    let mut pins = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let order = match cursor.as_deref() {
+            Some(c) => am_continuation_order(c),
+            None => first_order.clone(),
+        };
+        let req = list_users_req(
+            tenant_id,
+            metadata.clone(),
+            IdpUserPagination::new(top, cursor.clone()).expect("valid pagination"),
+            None,
+        )
+        .with_order(order);
+        let page = facade
+            .list_users_inner(&ctx, &req)
+            .await
+            .expect("every page of the walk must succeed");
+        visited.extend(page.items.iter().map(|u| u.id));
+        match page.page_info.next_cursor {
+            Some(next) => {
+                pins.push(CursorV1::decode(&next).expect("valid CursorV1").s);
+                cursor = Some(next);
+            }
+            None => return (visited, pins),
+        }
+        assert!(visited.len() <= 100, "walk does not terminate");
+    }
+}
+
+#[tokio::test]
+async fn list_users_walk_through_am_continuation_visits_every_user() {
+    // regression: the plugin pinned `+created_at,+id` in every cursor,
+    // which AM's users handler rejects on the continuation request
+    // (`created_at` is not an `IdpUserFilterField`), so no caller could
+    // list past page 1. The walk below drives page 2+ with the order AM
+    // recovers from the cursor and must reach every member exactly once,
+    // in `username` order (creation order deliberately disagrees).
+    let server = MockServer::start().await;
+    temp_env::async_with_vars([("TEST_REALM_ADMIN_SECRET", Some("ra"))], async move {
+        mount_token_endpoint(&server, "platform").await;
+
+        let group_uuid = Uuid::new_v4();
+        let ids: Vec<Uuid> = (1..=5)
+            .map(|n| Uuid::parse_str(&format!("dddddddd-0000-0000-0000-00000000000{n}")).unwrap())
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/admin/realms/platform/groups/{group_uuid}/members"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": ids[3].to_string(), "username": "dave", "createdTimestamp": 1000_i64},
+                {"id": ids[0].to_string(), "username": "alice", "createdTimestamp": 5000_i64},
+                {"id": ids[4].to_string(), "username": "erin", "createdTimestamp": 2000_i64},
+                {"id": ids[2].to_string(), "username": "carol", "createdTimestamp": 4000_i64},
+                {"id": ids[1].to_string(), "username": "bob", "createdTimestamp": 3000_i64},
+            ])))
+            .mount(&server)
+            .await;
+
+        let facade = build_facade(&server);
+        let metadata = Some(make_metadata(
+            "platform",
+            RealmBinding::Shared,
+            group_uuid,
+            None,
+        ));
+        // AM injects `username ASC` + the `id ASC` tiebreaker on page 1.
+        let injected = ODataOrderBy(vec![OrderKey {
+            field: "username".into(),
+            dir: SortDir::Asc,
+        }])
+        .ensure_tiebreaker("id", SortDir::Asc);
+
+        let (visited, pins) = walk_like_am(&facade, Uuid::new_v4(), metadata, 2, injected).await;
+        assert_eq!(visited, ids, "every member once, in username order");
+        assert_eq!(pins, vec!["+username,+id", "+username,+id"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn list_users_honors_requested_order_across_pages() {
+    // DESIGN "Interactions & Sequences": ordering is honored, not fixed.
+    // `last_name DESC` with a tie (broken by `id ASC`) and an absent
+    // value (projects as "", so it sorts last under DESC).
+    let server = MockServer::start().await;
+    temp_env::async_with_vars([("TEST_REALM_ADMIN_SECRET", Some("ra"))], async move {
+        mount_token_endpoint(&server, "platform").await;
+
+        let group_uuid = Uuid::new_v4();
+        let smith_a = Uuid::parse_str("eeeeeeee-0000-0000-0000-000000000001").unwrap();
+        let smith_b = Uuid::parse_str("eeeeeeee-0000-0000-0000-000000000002").unwrap();
+        let jones = Uuid::parse_str("eeeeeeee-0000-0000-0000-000000000003").unwrap();
+        let nameless = Uuid::parse_str("eeeeeeee-0000-0000-0000-000000000004").unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/admin/realms/platform/groups/{group_uuid}/members"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": nameless.to_string(), "username": "a", "lastName": ""},
+                {"id": jones.to_string(), "username": "b", "lastName": "Jones"},
+                {"id": smith_b.to_string(), "username": "c", "lastName": "Smith"},
+                {"id": smith_a.to_string(), "username": "d", "lastName": "Smith"},
+            ])))
+            .mount(&server)
+            .await;
+
+        let facade = build_facade(&server);
+        let metadata = Some(make_metadata(
+            "platform",
+            RealmBinding::Shared,
+            group_uuid,
+            None,
+        ));
+        let requested = ODataOrderBy(vec![OrderKey {
+            field: "last_name".into(),
+            dir: SortDir::Desc,
+        }])
+        .ensure_tiebreaker("id", SortDir::Asc);
+
+        let (visited, pins) = walk_like_am(&facade, Uuid::new_v4(), metadata, 1, requested).await;
+        assert_eq!(visited, vec![smith_a, smith_b, jones, nameless]);
+        assert_eq!(pins, vec!["-last_name,+id"; 3]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn list_users_rejects_order_field_outside_allow_list() {
+    // DESIGN "Interactions & Sequences": a key outside
+    // `IdpUserFilterField` arriving over the SPI is
+    // `UnsupportedOperation` before any provider call. No KC mocks
+    // are mounted — reaching KC would surface as `UserOpUnavailable`.
+    let server = MockServer::start().await;
+    let facade = build_facade(&server);
+    let ctx = build_system_ctx(Uuid::nil());
+    let req = list_users_req(
+        Uuid::new_v4(),
+        Some(make_metadata(
+            "platform",
+            RealmBinding::Shared,
+            Uuid::new_v4(),
+            None,
+        )),
+        IdpUserPagination::new(2, None).expect("valid pagination"),
+        None,
+    )
+    .with_order(ODataOrderBy(vec![OrderKey {
+        field: "created_at".into(),
+        dir: SortDir::Asc,
+    }]));
+
+    let err = facade
+        .list_users_inner(&ctx, &req)
+        .await
+        .expect_err("created_at is not an order key");
+    assert!(
+        matches!(err, PluginError::UserOpUnsupported { ref detail } if detail.contains("created_at")),
+        "expected UserOpUnsupported naming created_at, got {err:?}",
+    );
+}
+
+#[tokio::test]
+async fn list_users_rejects_cursor_issued_under_other_order() {
+    // Changing the order mid-walk invalidates the cursor: its key tuple
+    // is a position in the old order, not the new one.
+    let server = MockServer::start().await;
+    let tenant_uuid = Uuid::new_v4();
+    let cursor = UserFacade::encode_cursor(
+        &ListUsersCursor {
+            filter_hash: UserFacade::filter_hash(
+                tenant_uuid,
+                "platform",
+                None,
+                &StringMatcher::Always,
+            ),
+            last_key: vec!["alice".into(), Uuid::nil().to_string()],
+        },
+        &default_order(),
+    );
+
+    let facade = build_facade(&server);
+    let ctx = build_system_ctx(Uuid::nil());
+    let req = list_users_req(
+        tenant_uuid,
+        Some(make_metadata(
+            "platform",
+            RealmBinding::Shared,
+            Uuid::new_v4(),
+            None,
+        )),
+        IdpUserPagination::new(2, Some(cursor)).expect("valid pagination"),
+        None,
+    )
+    .with_order(
+        ODataOrderBy(vec![OrderKey {
+            field: "email".into(),
+            dir: SortDir::Asc,
+        }])
+        .ensure_tiebreaker("id", SortDir::Asc),
+    );
+
+    let err = facade
+        .list_users_inner(&ctx, &req)
+        .await
+        .expect_err("order drift must reject the cursor");
+    assert!(
+        matches!(err, PluginError::UserOpRejected { ref detail } if detail == "invalid cursor"),
+        "expected UserOpRejected{{ detail == 'invalid cursor' }}, got {err:?}",
+    );
 }
 
 // =============================================================================
@@ -2280,7 +2603,6 @@ fn make_rep(
 ) -> UserRep {
     UserRep {
         id,
-        created_timestamp: 0,
         username: Some(username.into()),
         email: email.map(str::to_owned),
         first_name: first.map(str::to_owned),
