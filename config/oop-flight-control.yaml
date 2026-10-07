@@ -1,0 +1,56 @@
+# Local multi-process: flight-control (edge + DirectoryService).
+#
+# Run:
+#   cargo run -p cf-gears-flight-control -- --config config/oop-flight-control.yaml run
+#
+# grpc-hub listens on TCP so a separate OoP gear process can register; the
+# api-gateway edge reverse-proxies discovered OoP routes.
+
+server:
+  home_dir: "~/.cf-gears-flight-control"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/oop-flight-control.log"
+    file_level: info
+
+gears:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8087"
+      enable_docs: true
+      cors_enabled: false
+      openapi:
+        title: "CF/Gears Flight Control API"
+        version: "0.1.0"
+        description: "CF/Gears Flight Control API Documentation"
+      defaults:
+        body_limit_bytes: 64000000
+      auth_disabled: false
+      require_auth_by_default: true
+      gateway_proxy:
+        enabled: true
+        directory_endpoint: "http://127.0.0.1:50051"
+        # set low (1s) so the lifecycle e2e tests observe route sync promptly
+        sync_interval_secs: 1
+
+  service-discovery:
+    config: {}
+
+  grpc-hub:
+    config:
+      listen_addr: "127.0.0.1:50051"
+
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: accept_all
+
+  types-registry:
+    config: {}

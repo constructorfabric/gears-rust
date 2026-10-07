@@ -354,6 +354,21 @@ async fn withdraw(
     )
     .await
 }
+/// The unit read grant together with the approve and submit grants behind `caller_can_approve`
+/// (P-D-228): three independent PDP questions asked at once, so the list, the card and the inbox
+/// source wait for one round trip. A denied read still answers 403, and the flag grants never fail
+/// on a denial ([`g::grant_scope`] reads it as no grant).
+pub(super) async fn unit_read_scopes(
+    enforcer: &PolicyEnforcer,
+    ctx: &SecurityContext,
+) -> Result<(AccessScope, AccessScope, AccessScope), CanonicalError> {
+    let unit = resource_types::APPROVAL_UNIT;
+    tokio::try_join!(
+        g::scope(enforcer, ctx, &unit, actions::READ),
+        g::grant_scope(enforcer, ctx, actions::APPROVE),
+        g::grant_scope(enforcer, ctx, actions::SUBMIT),
+    )
+}
 async fn list(
     Extension(state): Extension<Arc<ApiState>>,
     Extension(enforcer): Extension<PolicyEnforcer>,
@@ -361,19 +376,11 @@ async fn list(
     query: Result<Query<UnitListQuery>, QueryRejection>,
 ) -> Result<Response, CanonicalError> {
     let ctx = require_authenticated(ctx)?;
-    let scope = g::scope(
-        &enforcer,
-        &ctx,
-        &resource_types::APPROVAL_UNIT,
-        actions::READ,
-    )
-    .await?;
+    let (scope, approve_scope, submit_scope) = unit_read_scopes(&enforcer, &ctx).await?;
     let Query(q) =
         query.map_err(|e| CanonicalError::from(g::validation("query", e.to_string())))?;
     let filter = narrowing(q.state.as_deref(), q.kind.as_deref(), q.ref_id)?;
     let page = unit_page(&filter, q.limit, q.cursor.as_deref(), q.orderby.as_deref())?;
-    let approve_scope = g::grant_scope(&enforcer, &ctx, actions::APPROVE).await?;
-    let submit_scope = g::grant_scope(&enforcer, &ctx, actions::SUBMIT).await?;
     let mut list = page_of(
         &state,
         scope,
@@ -688,9 +695,7 @@ async fn card(
     ctx: &SecurityContext,
     id: Uuid,
 ) -> Result<UnitDto, CanonicalError> {
-    let scope = g::scope(enforcer, ctx, &resource_types::APPROVAL_UNIT, actions::READ).await?;
-    let approve_scope = g::grant_scope(enforcer, ctx, actions::APPROVE).await?;
-    let submit_scope = g::grant_scope(enforcer, ctx, actions::SUBMIT).await?;
+    let (scope, approve_scope, submit_scope) = unit_read_scopes(enforcer, ctx).await?;
     let ttl = state.fence_ttl_minutes;
     let caller = ctx.clone();
     state
