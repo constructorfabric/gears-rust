@@ -7,7 +7,8 @@
 //! - [`PlatformTypesRegistryApi`] — the toolkit contract; [`PlatformTypesRegistryApiExt`] —
 //!   helpers composed from it
 //! - [`entity_models`] — the serde-free request, snapshot and operation models
-//! - [`publication`] — publisher identity and per-identifier publication state
+//! - [`publish`], [`reconcile`](mod@reconcile), [`publication`], [`supervised`] — per-gear
+//!   publication
 //!
 //! **Old surface** (`legacy`, deleted in T29 with no shim):
 //! - `TypesRegistryClient` trait for inter-gear communication. Per
@@ -50,6 +51,9 @@ pub mod gts;
 pub mod item_failure;
 pub mod precondition;
 pub mod publication;
+pub mod publish;
+pub mod reconcile;
+pub mod supervised;
 
 /// An in-memory `PlatformTypesRegistryApi` for consumer and SDK tests.
 #[cfg(any(test, feature = "test-util"))]
@@ -77,6 +81,9 @@ pub use publication::{
     GtsDeclaration, PendingReason, PublicationState, PublicationStatus, PublisherVersionError,
     RejectionReason, SupersededEntity,
 };
+pub use publish::{PublishOptions, publish_gts, publish_gts_with};
+pub use reconcile::{Liveness, Outcome, PendingCause, ReconcileOptions, Reconciliation, reconcile};
+pub use supervised::{Supervised, SupervisedStatus, TaskExit};
 
 // The old surface, deleted in T29 (see `legacy`). Re-exported at its original paths.
 mod legacy;
