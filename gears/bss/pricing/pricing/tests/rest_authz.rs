@@ -182,8 +182,9 @@ fn the_authentication_and_authz_parsers_have_positive_controls() {
     // D-506 adds the shared commercial service gate (four SDK methods).
     // Both needles are also the approvals inbox's source, whose page and counts judge the caller
     // as the list and the counts doors do, once, in one helper (D-490); its card and votes call
-    // the doors.
-    for (needle, more) in [("require_authenticated(", 2), ("authz::access_scope(", 5)] {
+    // the doors. The source's page also authenticates once more before it asks its read grant and
+    // the two flag grants at once (one PDP round trip), so a 401 still comes first.
+    for (needle, more) in [("require_authenticated(", 3), ("authz::access_scope(", 5)] {
         assert_eq!(census::count_in_functions(census::CONTROL, needle), 2);
         assert_eq!(census::production_count(needle), 60 + more, "{needle}");
     }

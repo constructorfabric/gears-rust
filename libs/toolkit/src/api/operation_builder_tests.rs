@@ -827,3 +827,36 @@ fn response_content_types_must_not_contain_parameters() {
         );
     }
 }
+
+#[test]
+fn an_enum_query_param_carries_its_values_and_leaves_the_others_alone() {
+    let builder = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/test")
+        .query_param_enum("status", false, "which ones", ["open", "closed"])
+        .query_param_typed("limit", false, "how many", "integer")
+        .query_param("cursor", false, "where from");
+
+    let by_name = |name: &str| {
+        builder
+            .spec
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("{name} must be declared"))
+            .clone()
+    };
+
+    let status = by_name("status");
+    assert_eq!(status.enum_values, ["open", "closed"]);
+    assert_eq!(
+        status.param_type, "string",
+        "a closed set is still a string; the values are what narrow it"
+    );
+
+    let limit = by_name("limit");
+    assert_eq!(limit.param_type, "integer");
+    assert!(limit.enum_values.is_empty());
+
+    let cursor = by_name("cursor");
+    assert_eq!(cursor.param_type, "string");
+    assert!(cursor.enum_values.is_empty());
+}

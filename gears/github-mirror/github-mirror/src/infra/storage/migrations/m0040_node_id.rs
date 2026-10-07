@@ -12,9 +12,6 @@ const TABLES: [&str; 3] = ["gm_repositories", "gm_issues", "gm_pull_requests"];
 /// Adds `node_id`, GitHub's GraphQL global id, to the three tables DESIGN
 /// specifies it on. REST returns it on every entity, and it is what lets a
 /// GraphQL response be matched to an already-mirrored row.
-///
-/// Named with a `z_` prefix because the migration runner applies migrations in
-/// **name** order and this one alters tables created by earlier migrations.
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
