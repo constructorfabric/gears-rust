@@ -45,6 +45,7 @@ use toolkit_db::{ConnectOpts, connect_db};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
+use quota_enforcement_storage_plugin::infra::outbox::NOTIFICATION_POLL_INTERVAL;
 use quota_enforcement_storage_plugin::infra::storage::Migrator;
 use quota_enforcement_storage_plugin::{
     Actor, ConsumptionStore, NOTIFICATION_QUEUE, NotificationOutbox, QeOutbox, QuotaStore,
@@ -491,7 +492,7 @@ async fn two_pipelines_never_share_a_partition_at_once_and_deliver_every_event()
             h.create(tenant, draft, &[event]).await.expect("create");
         }
     }
-    eventually(Duration::from_mins(2), "every event", || {
+    eventually(NOTIFICATION_POLL_INTERVAL * 6, "every event", || {
         delivery.ids() == expected
     })
     .await;

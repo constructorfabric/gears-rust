@@ -19,6 +19,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
@@ -26,7 +27,9 @@ use quota_enforcement_sdk::{
     StorageError, TenantId,
 };
 use toolkit_db::Db;
-use toolkit_db::outbox::{Outbox, OutboxError, OutboxHandle, Partitions, Records, Wake};
+use toolkit_db::outbox::{
+    Outbox, OutboxError, OutboxHandle, Partitions, Records, Wake, WorkerTuning,
+};
 use toolkit_db::secure::DBRunner;
 
 use super::outbox_handler::NotificationHandler;
@@ -40,6 +43,9 @@ pub const NOTIFICATION_QUEUE: &str = "qe_notifications";
 /// Partitions of [`NOTIFICATION_QUEUE`]; a tenant always lands on one
 /// partition, so its events stay ordered.
 pub const NOTIFICATION_PARTITIONS: u16 = 8;
+
+/// Idle poll of a partition processor; a commit wakes only its own replica.
+pub const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Why an enqueue failed inside the caller's transaction.
 #[derive(Debug, thiserror::Error)]
@@ -285,6 +291,9 @@ pub async fn start_notification_pipeline(
     // framework's vacuum workers reclaim delivered rows.
     let handle = Outbox::builder(db)
         .table_prefix(OUTBOX_TABLE_PREFIX)?
+        .processor_tuning(
+            WorkerTuning::processor_default().idle_interval(NOTIFICATION_POLL_INTERVAL),
+        )
         .queue(NOTIFICATION_QUEUE, Partitions::of(NOTIFICATION_PARTITIONS))
         .leased(NotificationHandler::new(delivery))
         .start()
