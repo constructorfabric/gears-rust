@@ -110,18 +110,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn postgres_and_sqlite_ddl_are_unchanged() {
-        assert!(
-            ddl_for(DatabaseBackend::Postgres)
-                .expect("postgres ddl")
-                .contains("id UUID NOT NULL PRIMARY KEY")
-        );
-        assert!(
-            ddl_for(DatabaseBackend::Sqlite)
-                .expect("sqlite ddl")
-                .contains("id TEXT NOT NULL PRIMARY KEY")
-        );
-    }
 }

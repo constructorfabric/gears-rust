@@ -97,9 +97,9 @@ impl AuthZResolverApi for DenyResolver {
     }
 }
 
-/// One request to the policy service: resource type, action and the tenant
-/// named as the owner of the resource.
-type AskedOfPolicyService = (String, String, Option<String>);
+/// One request to the policy service: resource type, action, the tenant named
+/// as the owner of the resource and the id of the resource (none for a create).
+type AskedOfPolicyService = (String, String, Option<String>, Option<Uuid>);
 
 /// Records what the service asks the policy service for, then allows it like
 /// `AllowResolver`.
@@ -123,6 +123,7 @@ impl AuthZResolverApi for RecordingResolver {
                 .get(pep_properties::OWNER_TENANT_ID)
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
+            request.resource.id,
         ));
         AllowResolver.evaluate(ctx, request).await
     }
@@ -257,7 +258,7 @@ async fn subject_without_permission_is_denied() {
 }
 
 #[tokio::test]
-async fn service_asks_for_the_note_resource_the_matching_action_and_the_tenant() {
+async fn service_asks_for_the_note_resource_the_matching_action_the_tenant_and_the_id() {
     let db = inmem_db().await;
     let resolver = Arc::new(RecordingResolver {
         asked: std::sync::Mutex::new(Vec::new()),
@@ -275,8 +276,13 @@ async fn service_asks_for_the_note_resource_the_matching_action_and_the_tenant()
     assert_eq!(
         asked,
         vec![
-            (note_resource.clone(), "create".to_owned(), tenant.clone()),
-            (note_resource, "get".to_owned(), tenant),
+            (
+                note_resource.clone(),
+                "create".to_owned(),
+                tenant.clone(),
+                None
+            ),
+            (note_resource, "get".to_owned(), tenant, Some(created.id)),
         ],
     );
 }

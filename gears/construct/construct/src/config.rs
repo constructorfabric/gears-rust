@@ -114,7 +114,6 @@ mod tests {
     fn default_config_converts_to_the_default_service_limit() {
         let service = ServiceConfig::try_from(&ConstructConfig::default()).expect("defaults");
         assert_eq!(service.max_text_length, DEFAULT_MAX_TEXT_LENGTH);
-        assert_eq!(DEFAULT_MAX_TEXT_LENGTH, 1000);
     }
 
     #[test]

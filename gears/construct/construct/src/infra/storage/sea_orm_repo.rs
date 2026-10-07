@@ -42,10 +42,7 @@ pub(super) fn map_scope_error(e: ScopeError) -> DomainError {
             DomainError::forbidden(format!("tenant {tenant_id} not in scope"))
         }
         // `ScopeError` is `#[non_exhaustive]`.
-        other => {
-            tracing::error!(error = %other, "unhandled scope error variant");
-            DomainError::internal(format!("unhandled scope error: {other}"))
-        }
+        other => DomainError::internal(format!("unhandled scope error: {other}")),
     }
     // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-scope
 }
