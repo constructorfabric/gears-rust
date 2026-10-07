@@ -42,8 +42,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -78,7 +82,8 @@ async fn submit(
     let policy = RegistrationPolicy::default();
     let config = TypesRegistryConfig::default();
     let dispatch: Arc<dyn OperationDispatch> = Arc::new(NoDispatch);
-    accept(
+    common::accept_as(
+        kind,
         &stores(),
         &provider,
         &allow_all(),
@@ -88,9 +93,8 @@ async fn submit(
             metrics: &common::metrics(),
         },
         &dispatch,
-        &SubmitRequest {
-            idempotency_key: key.to_owned(),
-            kind,
+        SubmitRequest {
+            idempotency_key: Some(key.to_owned()),
             dry_run,
             candidates,
         },
@@ -503,8 +507,7 @@ async fn forced_dry_run(db: &Provider, key: &str, gts_id: &str, content: Value) 
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
-            kind: OperationKind::Registration,
+            idempotency_key: Some(key.to_owned()),
             dry_run: true,
             candidates: vec![Candidate {
                 gts_id: gts_id.to_owned(),

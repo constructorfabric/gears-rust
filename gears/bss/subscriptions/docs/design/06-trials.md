@@ -204,7 +204,7 @@ them.
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-storage-trial-trl`
+- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-datastore-trial-trl`
 
 Owned here: `trial_phase_state` (active phase, duration, `convertsToPhaseId`) and `conversion_record`
 (idempotency-keyed). Trial attributes ride the aggregate; extension uses the Foundation `approval`.

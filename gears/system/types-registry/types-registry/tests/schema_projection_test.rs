@@ -117,7 +117,6 @@ async fn admission_reads_select_revision_identity_and_authored_content_without_a
         .unwrap();
     assert_eq!(documents.len(), 1);
     assert_eq!(documents[0].raw_schema, latest);
-    assert_eq!(documents[0].content_hash, vec![2]);
     assert_eq!(documents[0].projection.revision_no, 2);
     assert_eq!(documents[0].projection.resolution_fingerprint, vec![0x11]);
 

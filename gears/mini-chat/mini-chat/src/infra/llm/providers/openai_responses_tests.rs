@@ -305,6 +305,23 @@ fn builder_code_interpreter_tool() {
     assert_eq!(body["tools"][0]["container"]["type"], "auto");
     assert_eq!(body["tools"][0]["container"]["file_ids"][0], "file-abc");
     assert_eq!(body["tools"][0]["container"]["file_ids"][1], "file-def");
+    assert_eq!(
+        body["include"],
+        serde_json::json!(["code_interpreter_call.outputs"])
+    );
+}
+
+#[test]
+fn builder_no_include_without_code_interpreter() {
+    let request = llm_request("gpt-4o")
+        .tool(LlmTool::WebSearch {
+            search_context_size: WebSearchContextSize::Low,
+        })
+        .build_streaming();
+
+    let body = build_request_body(&request, true);
+
+    assert!(body.get("include").is_none(), "{body}");
 }
 
 #[test]
@@ -506,10 +523,10 @@ fn builder_function_tool_included() {
 /// individual tests override field-by-field.
 fn test_api_params() -> mini_chat_sdk::ModelApiParams {
     mini_chat_sdk::ModelApiParams {
-        temperature: 0.7,
-        top_p: 1.0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
+        temperature: Some(0.7),
+        top_p: Some(1.0),
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
         stop: vec![],
         extra_body: None,
         reasoning_effort: None,
@@ -521,7 +538,7 @@ fn builder_reasoning_effort_nested_under_reasoning() {
     let request = llm_request("o3")
         .message(LlmMessage::user("Think hard"))
         .api_params(mini_chat_sdk::ModelApiParams {
-            temperature: 1.0,
+            temperature: Some(1.0),
             reasoning_effort: Some("high".into()),
             ..test_api_params()
         })
@@ -538,6 +555,35 @@ fn builder_reasoning_effort_nested_under_reasoning() {
     assert_eq!(body["reasoning"]["effort"], "high");
     // Other typed params land at top level
     assert_eq!(body["temperature"], 1.0);
+}
+
+/// Unset sampling parameters are not sent: reasoning models (gpt-5-mini)
+/// reject `temperature` with 400 "Unsupported parameter".
+#[test]
+fn builder_omits_unset_sampling_params() {
+    let request = llm_request("gpt-5-mini")
+        .message(LlmMessage::user("Hello"))
+        .api_params(mini_chat_sdk::ModelApiParams {
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            reasoning_effort: Some("low".into()),
+            ..test_api_params()
+        })
+        .build_streaming();
+
+    let body = build_request_body(&request, true);
+
+    for key in [
+        "temperature",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+    ] {
+        assert!(body.get(key).is_none(), "{key} must not be sent: {body}");
+    }
+    assert_eq!(body["reasoning"]["effort"], "low");
 }
 
 #[test]
@@ -565,6 +611,53 @@ fn parse_text_delta_event() {
     };
     let result = ProviderEvent::from_server_event(event).unwrap();
     assert!(matches!(result, ProviderEvent::ResponseOutputTextDelta { delta } if delta == "Hello"));
+}
+
+#[test]
+fn parse_event_without_event_line_uses_data_type() {
+    for name in [None, Some("message".to_string())] {
+        let event = ServerEvent {
+            event: name,
+            data: r#"{"type":"response.output_text.delta","delta":"Hi"}"#.to_string(),
+            id: None,
+            retry: None,
+        };
+        let result = ProviderEvent::from_server_event(event).unwrap();
+        assert!(
+            matches!(result, ProviderEvent::ResponseOutputTextDelta { delta } if delta == "Hi")
+        );
+    }
+}
+
+#[test]
+fn parse_event_line_takes_precedence_over_data_type() {
+    let event = ServerEvent {
+        event: Some("response.output_text.done".to_string()),
+        data: r#"{"type":"response.output_text.delta","text":"Done"}"#.to_string(),
+        id: None,
+        retry: None,
+    };
+    let result = ProviderEvent::from_server_event(event).unwrap();
+    assert!(matches!(result, ProviderEvent::ResponseOutputTextDone { text } if text == "Done"));
+}
+
+#[test]
+fn parse_event_without_event_line_or_type_is_unknown() {
+    // Unparseable data, valid JSON without `type`, and JSON with other keys:
+    // none names the event, so it stays the SSE default `message`.
+    for data in ["not json", "{}", r#"{"foo":1}"#] {
+        let event = ServerEvent {
+            event: None,
+            data: data.to_string(),
+            id: None,
+            retry: None,
+        };
+        let result = ProviderEvent::from_server_event(event).unwrap();
+        assert!(
+            matches!(&result, ProviderEvent::Unknown { event_name } if event_name == "message"),
+            "{data}: {result:?}"
+        );
+    }
 }
 
 #[test]
@@ -674,43 +767,107 @@ fn parse_code_interpreter_interpreting_event_is_ignored() {
 }
 
 #[test]
-fn parse_code_interpreter_completed_event_extracts_logs() {
+fn parse_code_interpreter_completed_event_is_ignored() {
+    // Real shape: no outputs; they come in `response.output_item.done`.
     let event = ServerEvent {
         event: Some("response.code_interpreter_call.completed".to_string()),
-        data: r#"{"outputs":[{"type":"logs","logs":"result text"}]}"#.to_string(),
+        data: r#"{"type":"response.code_interpreter_call.completed","item_id":"ci_1","output_index":0,"sequence_number":7}"#.to_string(),
         id: None,
         retry: None,
     };
+    let result = ProviderEvent::from_server_event(event).unwrap();
+    assert!(matches!(result, ProviderEvent::Unknown { .. }));
+}
+
+fn output_item_done(item: &str) -> ServerEvent {
+    ServerEvent {
+        event: Some("response.output_item.done".to_string()),
+        data: format!(
+            r#"{{"type":"response.output_item.done","output_index":0,"sequence_number":9,"item":{item}}}"#
+        ),
+        id: None,
+        retry: None,
+    }
+}
+
+#[test]
+fn parse_output_item_done_code_interpreter_extracts_logs() {
+    let event = output_item_done(
+        r#"{"type":"code_interpreter_call","id":"ci_1","status":"completed","code":"print(42)","container_id":"cntr_1","outputs":[{"type":"logs","logs":"result text"}]}"#,
+    );
     let result = ProviderEvent::from_server_event(event).unwrap();
     match result {
         ProviderEvent::ResponseCodeInterpreterCallCompleted { output } => {
             assert_eq!(output, "result text");
         }
-        _ => panic!("expected ResponseCodeInterpreterCallCompleted"),
+        other => panic!("expected ResponseCodeInterpreterCallCompleted, got {other:?}"),
     }
 }
 
 #[test]
-fn parse_code_interpreter_completed_event_ignores_file_outputs() {
-    let event = ServerEvent {
-        event: Some("response.code_interpreter_call.completed".to_string()),
-        data: r#"{
-            "outputs": [
-                {"type":"files","file_id":"file-abc"},
-                {"type":"logs","logs":"only this"},
-                {"type":"files","file_id":"file-def"}
-            ]
-        }"#
-        .to_string(),
-        id: None,
-        retry: None,
-    };
+fn parse_output_item_done_code_interpreter_ignores_image_outputs() {
+    let event = output_item_done(
+        r#"{"type":"code_interpreter_call","id":"ci_1","status":"completed","outputs":[
+            {"type":"image","url":"https://example.com/a.png"},
+            {"type":"logs","logs":"only this"},
+            {"type":"logs","logs":"and this"}
+        ]}"#,
+    );
     let result = ProviderEvent::from_server_event(event).unwrap();
     match result {
         ProviderEvent::ResponseCodeInterpreterCallCompleted { output } => {
-            assert_eq!(output, "only this");
+            assert_eq!(output, "only this\nand this");
         }
-        _ => panic!("expected ResponseCodeInterpreterCallCompleted"),
+        other => panic!("expected ResponseCodeInterpreterCallCompleted, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_output_item_done_code_interpreter_null_outputs() {
+    // Without `include: ["code_interpreter_call.outputs"]` outputs is null.
+    let event = output_item_done(
+        r#"{"type":"code_interpreter_call","id":"ci_1","status":"completed","outputs":null}"#,
+    );
+    let result = ProviderEvent::from_server_event(event).unwrap();
+    match result {
+        ProviderEvent::ResponseCodeInterpreterCallCompleted { output } => {
+            assert_eq!(output, "");
+        }
+        other => panic!("expected ResponseCodeInterpreterCallCompleted, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_output_item_done_code_interpreter_truncates_long_output() {
+    let long = "x".repeat(MAX_CODE_INTERPRETER_OUTPUT_CHARS + 10);
+    let event = output_item_done(&format!(
+        r#"{{"type":"code_interpreter_call","outputs":[{{"type":"logs","logs":"{long}"}}]}}"#
+    ));
+    let result = ProviderEvent::from_server_event(event).unwrap();
+    match result {
+        ProviderEvent::ResponseCodeInterpreterCallCompleted { output } => {
+            let expected = format!(
+                "{}...[truncated]",
+                "x".repeat(MAX_CODE_INTERPRETER_OUTPUT_CHARS)
+            );
+            assert_eq!(output, expected);
+        }
+        other => panic!("expected ResponseCodeInterpreterCallCompleted, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_output_item_done_other_items_are_ignored() {
+    for item in [
+        r#"{"type":"message","id":"msg_1","role":"assistant","content":[]}"#,
+        r#"{"type":"file_search_call","id":"fs_1","status":"completed","queries":["q"],"results":null}"#,
+        r#"{"type":"web_search_call","id":"ws_1","status":"completed"}"#,
+    ] {
+        let result = ProviderEvent::from_server_event(output_item_done(item)).unwrap();
+        assert!(
+            matches!(result, ProviderEvent::Unknown { .. }),
+            "{item}: {result:?}"
+        );
     }
 }
 
@@ -767,21 +924,98 @@ fn parse_response_completed_with_token_details() {
     }
 }
 
-#[test]
-fn parse_response_failed_event() {
+fn parse_error(event_name: &str, data: &str) -> ProviderErrorPayload {
     let event = ServerEvent {
-        event: Some("response.failed".to_string()),
-        data: r#"{"error":{"code":"server_error","message":"internal failure"}}"#.to_string(),
+        event: Some(event_name.to_string()),
+        data: data.to_string(),
         id: None,
         retry: None,
     };
-    let result = ProviderEvent::from_server_event(event).unwrap();
-    match result {
-        ProviderEvent::ResponseFailed { error } => {
-            assert_eq!(error.code, "server_error");
-            assert_eq!(error.message, "internal failure");
+    match ProviderEvent::from_server_event(event).unwrap() {
+        ProviderEvent::ResponseFailed { error, .. } => error,
+        other => panic!("expected ResponseFailed, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_response_failed_event() {
+    // Real shape: the error is inside `response`.
+    let error = parse_error(
+        "response.failed",
+        r#"{"type":"response.failed","sequence_number":5,"response":{"id":"resp_1","object":"response","status":"failed","error":{"code":"server_error","message":"internal failure"},"incomplete_details":null,"output":[],"usage":null}}"#,
+    );
+    assert_eq!(error.code, "server_error");
+    assert_eq!(error.message, "internal failure");
+}
+
+#[test]
+fn parse_response_failed_top_level_error_fallback() {
+    let error = parse_error(
+        "response.failed",
+        r#"{"error":{"code":"server_error","message":"internal failure"}}"#,
+    );
+    assert_eq!(error.code, "server_error");
+    assert_eq!(error.message, "internal failure");
+}
+
+/// No known error shape: the raw payload becomes the message, as for the
+/// `error` event, so the cause is not lost.
+#[test]
+fn parse_response_failed_without_error_keeps_payload() {
+    let data = r#"{"response":{"id":"resp_1","status":"failed","error":null}}"#;
+    let error = parse_error("response.failed", data);
+    assert_eq!(error.code, "");
+    assert_eq!(error.message, data);
+}
+
+#[test]
+fn parse_error_event_flat() {
+    let error = parse_error(
+        "error",
+        r#"{"type":"error","code":"rate_limit_exceeded","message":"Slow down","param":null,"sequence_number":1}"#,
+    );
+    assert_eq!(error.code, "rate_limit_exceeded");
+    assert_eq!(error.message, "Slow down");
+}
+
+#[test]
+fn parse_error_event_flat_null_code() {
+    let error = parse_error(
+        "error",
+        r#"{"type":"error","code":null,"message":"Something broke","param":null}"#,
+    );
+    assert_eq!(error.code, "");
+    assert_eq!(error.message, "Something broke");
+}
+
+#[test]
+fn parse_error_event_nested() {
+    let error = parse_error(
+        "error",
+        r#"{"type":"error","error":{"type":"invalid_request_error","code":null,"message":"Bad input","param":"input"}}"#,
+    );
+    assert_eq!(error.code, "");
+    assert_eq!(error.message, "Bad input");
+}
+
+#[test]
+fn parse_error_event_unparseable_uses_raw_data() {
+    let error = parse_error("error", "upstream exploded");
+    assert_eq!(error.code, "");
+    assert_eq!(error.message, "upstream exploded");
+}
+
+#[test]
+fn parse_error_response_envelope_with_null_code() {
+    let err = parse_error_response(
+        br#"{"error":{"message":"Invalid model","type":"invalid_request_error","param":"model","code":null}}"#,
+    );
+    match err {
+        LlmProviderError::ProviderError { code, message, .. } => {
+            assert_eq!(code, "");
+            assert_eq!(message, "Invalid model");
         }
-        _ => panic!("expected ResponseFailed"),
+        other => panic!("expected ProviderError, got {other:?}"),
     }
 }
 
@@ -1027,6 +1261,38 @@ fn translate_completed_propagates_token_details() {
     }
 }
 
+/// `response.failed` carries `response.usage` when the provider billed the
+/// request; it reaches the terminal outcome, so settlement can use it.
+#[test]
+fn response_failed_usage_reaches_terminal_outcome() {
+    let event = ServerEvent {
+        event: Some("response.failed".to_string()),
+        data: r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"boom"},"usage":{"input_tokens":12,"output_tokens":3}}}"#.to_string(),
+        id: None,
+        retry: None,
+    };
+    let parsed = ProviderEvent::from_server_event(event).unwrap();
+    match translate_provider_event(&parsed, "") {
+        TranslatedEvent::Terminal(TerminalOutcome::Failed { usage: Some(u), .. }) => {
+            assert_eq!(u.input_tokens, 12);
+            assert_eq!(u.output_tokens, 3);
+        }
+        _ => panic!("expected Terminal(Failed) with usage"),
+    }
+
+    let without = ServerEvent {
+        event: Some("response.failed".to_string()),
+        data: r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"boom"},"usage":null}}"#.to_string(),
+        id: None,
+        retry: None,
+    };
+    let parsed = ProviderEvent::from_server_event(without).unwrap();
+    assert!(matches!(
+        translate_provider_event(&parsed, ""),
+        TranslatedEvent::Terminal(TerminalOutcome::Failed { usage: None, .. })
+    ));
+}
+
 #[test]
 fn translate_failed_returns_terminal() {
     let event = ProviderEvent::ResponseFailed {
@@ -1034,6 +1300,7 @@ fn translate_failed_returns_terminal() {
             code: "err".into(),
             message: "failed".into(),
         },
+        usage: None,
     };
     let translated = translate_provider_event(&event, "partial");
     match translated {
@@ -1089,6 +1356,21 @@ fn translate_unknown_is_skip() {
 }
 
 #[test]
+fn char_slice_counts_characters_and_rejects_bad_ranges() {
+    assert_eq!(char_slice("h\u{e9}llo", 1, 3).as_deref(), Some("\u{e9}l"));
+    assert_eq!(
+        char_slice("h\u{e9}llo", 0, 5).as_deref(),
+        Some("h\u{e9}llo")
+    );
+    // Empty or reversed range.
+    assert_eq!(char_slice("h\u{e9}llo", 2, 2), None);
+    assert_eq!(char_slice("h\u{e9}llo", 3, 1), None);
+    // End past the text.
+    assert_eq!(char_slice("h\u{e9}llo", 3, 6), None);
+    assert_eq!(char_slice("h\u{e9}llo", 5, 6), None);
+}
+
+#[test]
 fn extract_citations_file_citation() {
     let response = ResponseObject {
         id: "resp-1".into(),
@@ -1099,12 +1381,13 @@ fn extract_citations_file_citation() {
                 text: "Hello".into(),
                 annotations: vec![Annotation {
                     r#type: "file_citation".into(),
-                    title: "Report.pdf".into(),
+                    title: String::new(),
                     url: None,
                     file_id: Some("file-xyz".into()),
-                    start_index: Some(0),
-                    end_index: Some(5),
-                    text: Some("snippet".into()),
+                    filename: Some("Report.pdf".into()),
+                    start_index: None,
+                    end_index: None,
+                    text: None,
                 }],
             }],
             ..Default::default()
@@ -1117,13 +1400,69 @@ fn extract_citations_file_citation() {
         },
         incomplete_details: None,
     };
-    let citations = extract_citations(&response, "");
+    let citations = extract_citations(&response, "Hello");
     assert_eq!(citations.len(), 1);
     assert!(matches!(citations[0].source, CitationSource::File));
     assert_eq!(citations[0].title, "Report.pdf");
     assert_eq!(citations[0].attachment_id.as_deref(), Some("file-xyz"));
-    assert_eq!(citations[0].span.unwrap().start, 0);
-    assert_eq!(citations[0].span.unwrap().end, 5);
+    assert_eq!(citations[0].snippet, "");
+    assert!(citations[0].span.is_none());
+    assert!(citations[0].url.is_none());
+}
+
+#[test]
+fn extract_citations_file_citation_from_real_json() {
+    let response: ResponseObject = serde_json::from_value(serde_json::json!({
+        "id": "resp-1",
+        "output": [{
+            "type": "message",
+            "content": [{
+                "type": "output_text",
+                "text": "Revenue grew.",
+                "annotations": [
+                    {"type": "file_citation", "file_id": "file-1", "filename": "q3.pdf", "index": 13},
+                    {"type": "url_citation", "url": "https://example.com", "title": "Example",
+                     "start_index": 0, "end_index": 7}
+                ]
+            }]
+        }],
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    }))
+    .unwrap();
+    let citations = extract_citations(&response, "Revenue grew.");
+    assert_eq!(citations.len(), 2);
+    assert!(matches!(citations[0].source, CitationSource::File));
+    assert_eq!(citations[0].title, "q3.pdf");
+    assert_eq!(citations[0].attachment_id.as_deref(), Some("file-1"));
+    assert_eq!(citations[0].snippet, "");
+    assert!(citations[0].span.is_none());
+    assert!(matches!(citations[1].source, CitationSource::Web));
+    assert_eq!(citations[1].snippet, "Revenue");
+    let span = citations[1].span.unwrap();
+    assert_eq!((span.start, span.end), (0, 7));
+}
+
+#[test]
+fn extract_citations_file_citation_keeps_text_and_range_when_sent() {
+    let response: ResponseObject = serde_json::from_value(serde_json::json!({
+        "id": "resp-1",
+        "output": [{
+            "type": "message",
+            "content": [{
+                "type": "output_text",
+                "text": "Based on docs",
+                "annotations": [{"type": "file_citation", "file_id": "file-1", "title": "doc.pdf",
+                                 "start_index": 0, "end_index": 5, "text": "Based"}]
+            }]
+        }],
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    }))
+    .unwrap();
+    let citations = extract_citations(&response, "Based on docs");
+    assert_eq!(citations[0].title, "doc.pdf");
+    assert_eq!(citations[0].snippet, "Based");
+    let span = citations[0].span.unwrap();
+    assert_eq!((span.start, span.end), (0, 5));
 }
 
 #[test]
@@ -1140,6 +1479,7 @@ fn extract_citations_url_citation() {
                     title: "Example".into(),
                     url: Some("https://example.com".into()),
                     file_id: None,
+                    filename: None,
                     start_index: None,
                     end_index: None,
                     text: None,
@@ -1187,6 +1527,55 @@ fn extract_citations_empty_annotations() {
     assert!(citations.is_empty());
 }
 
+// Indices are character offsets into the annotated part, not byte offsets
+// into the whole answer: a second message part with non-ASCII text.
+#[test]
+fn extract_citations_range_uses_characters_of_its_own_part() {
+    let first = "Intro \u{e9}t\u{e9}. ";
+    let second = "Caf\u{e9} cr\u{e8}me is sold here.";
+    let response = ResponseObject {
+        id: "resp-1".into(),
+        output: vec![
+            OutputItem {
+                r#type: "message".into(),
+                content: vec![ResponseContentPart {
+                    r#type: "output_text".into(),
+                    text: first.into(),
+                    annotations: vec![],
+                }],
+                ..Default::default()
+            },
+            OutputItem {
+                r#type: "message".into(),
+                content: vec![ResponseContentPart {
+                    r#type: "output_text".into(),
+                    text: second.into(),
+                    annotations: vec![Annotation {
+                        r#type: "url_citation".into(),
+                        title: "Wiki".into(),
+                        url: Some("https://example.org".into()),
+                        file_id: None,
+                        filename: None,
+                        start_index: Some(0),
+                        end_index: Some(10),
+                        text: None,
+                    }],
+                }],
+                ..Default::default()
+            },
+        ],
+        usage: RawUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            input_tokens_details: None,
+            output_tokens_details: None,
+        },
+        incomplete_details: None,
+    };
+    let citations = extract_citations(&response, &format!("{first}{second}"));
+    assert_eq!(citations[0].snippet, "Caf\u{e9} cr\u{e8}me");
+}
+
 #[test]
 fn extract_citations_url_citation_snippet_from_text_range() {
     let accumulated = "0123456789The capital of France is Paris.";
@@ -1202,6 +1591,7 @@ fn extract_citations_url_citation_snippet_from_text_range() {
                     title: "Wikipedia".into(),
                     url: Some("https://en.wikipedia.org/wiki/France".into()),
                     file_id: None,
+                    filename: None,
                     start_index: Some(10),
                     end_index: Some(31),
                     text: None,
@@ -1236,6 +1626,7 @@ fn extract_citations_url_citation_snippet_from_annotation_text() {
                     title: "Example".into(),
                     url: Some("https://example.com".into()),
                     file_id: None,
+                    filename: None,
                     start_index: Some(0),
                     end_index: Some(5),
                     text: Some("explicit snippet".into()),
@@ -1270,6 +1661,7 @@ fn extract_citations_url_citation_no_text_no_indices() {
                     title: "Example".into(),
                     url: Some("https://example.com".into()),
                     file_id: None,
+                    filename: None,
                     start_index: None,
                     end_index: None,
                     text: None,
@@ -1366,6 +1758,105 @@ async fn stream_interleaved_tool_events() {
             assert_eq!(content, "ABC");
         }
         _ => panic!("expected Completed"),
+    }
+}
+
+#[tokio::test]
+async fn stream_code_interpreter_start_then_done_with_output() {
+    let events = vec![
+        sse_event(
+            "response.output_item.added",
+            r#"{"output_index":0,"item":{"type":"code_interpreter_call","id":"ci_1","status":"in_progress","outputs":null}}"#,
+        ),
+        sse_event(
+            "response.code_interpreter_call.in_progress",
+            r#"{"item_id":"ci_1","output_index":0,"sequence_number":1}"#,
+        ),
+        sse_event(
+            "response.code_interpreter_call.interpreting",
+            r#"{"item_id":"ci_1","output_index":0,"sequence_number":2}"#,
+        ),
+        sse_event(
+            "response.code_interpreter_call.completed",
+            r#"{"item_id":"ci_1","output_index":0,"sequence_number":3}"#,
+        ),
+        sse_event(
+            "response.output_item.done",
+            r#"{"output_index":0,"sequence_number":4,"item":{"type":"code_interpreter_call","id":"ci_1","status":"completed","outputs":[{"type":"logs","logs":"Total: 42"}]}}"#,
+        ),
+        sse_event("response.output_text.delta", r#"{"delta":"42"}"#),
+        sse_event(
+            "response.completed",
+            r#"{"response":{"id":"resp-ci","output":[],"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+        ),
+    ];
+    let gw = MockGateway::returning_sse(events);
+    let provider = OpenAiResponsesProvider::new(gw);
+    let request = llm_request("gpt-4o").build_streaming();
+    let stream = provider
+        .stream(
+            test_security_context(),
+            request,
+            "openai",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let sse: Vec<ClientSseEvent> = stream.map(Result::unwrap).collect().await;
+    let tools: Vec<(ToolPhase, serde_json::Value)> = sse
+        .iter()
+        .filter_map(|e| match e {
+            ClientSseEvent::Tool {
+                phase,
+                name: "code_interpreter",
+                details,
+            } => Some((*phase, details.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tools,
+        vec![
+            (ToolPhase::Start, serde_json::json!({})),
+            (ToolPhase::Done, serde_json::json!({"output": "Total: 42"})),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn stream_response_failed_real_shape_keeps_message() {
+    let events = vec![
+        sse_event("response.output_text.delta", r#"{"delta":"Par"}"#),
+        sse_event(
+            "response.failed",
+            r#"{"type":"response.failed","response":{"id":"resp-f","status":"failed","error":{"code":"server_error","message":"The model failed"},"output":[],"usage":null}}"#,
+        ),
+    ];
+    let gw = MockGateway::returning_sse(events);
+    let provider = OpenAiResponsesProvider::new(gw);
+    let request = llm_request("gpt-4o").build_streaming();
+    let stream = provider
+        .stream(
+            test_security_context(),
+            request,
+            "openai",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    match stream.into_outcome().await {
+        TerminalOutcome::Failed {
+            error: LlmProviderError::ProviderError { code, message, .. },
+            partial_content,
+            ..
+        } => {
+            assert_eq!(code, "server_error");
+            assert_eq!(message, "The model failed");
+            assert_eq!(partial_content, "Par");
+        }
+        other => panic!("expected Failed(ProviderError), got {other:?}"),
     }
 }
 
@@ -1664,4 +2155,37 @@ fn file_search_wire_format_with_filters() {
     assert_eq!(tool["filters"]["key"], "attachment_id");
     assert_eq!(tool["filters"]["values"][0], "uuid-a");
     assert_eq!(tool["filters"]["values"][1], "uuid-b");
+}
+
+/// `extra_body` cannot lift the quota-derived caps or change the model; other
+/// keys are merged.
+#[test]
+fn extra_body_does_not_override_reserved_keys() {
+    let request = llm_request("gpt-4o")
+        .message(LlmMessage::user("Hello"))
+        .max_output_tokens(256)
+        .max_tool_calls(2)
+        .api_params(mini_chat_sdk::ModelApiParams {
+            extra_body: Some(serde_json::json!({
+                "max_output_tokens": 100_000,
+                "max_tool_calls": 50,
+                "model": "other-model",
+                "user": "someone-else",
+                "store": true,
+                "include": [],
+                "seed": 7
+            })),
+            ..test_api_params()
+        })
+        .build_streaming();
+
+    let body = build_request_body(&request, true);
+
+    assert_eq!(body["max_output_tokens"], 256);
+    assert_eq!(body["max_tool_calls"], 2);
+    assert_eq!(body["model"], "gpt-4o");
+    assert!(body.get("user").is_none(), "{body}");
+    assert_eq!(body["store"], false);
+    assert!(body.get("include").is_none(), "{body}");
+    assert_eq!(body["seed"], 7);
 }

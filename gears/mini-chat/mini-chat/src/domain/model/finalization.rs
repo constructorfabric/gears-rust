@@ -59,6 +59,9 @@ pub struct FinalizationInput {
 
     /// Context window size of the effective model (tokens) — for summary trigger.
     pub context_window: u32,
+    /// Input token limit of the effective model (`max_input_tokens`, 0 = none)
+    /// — caps the summary trigger budget like the context assembly budget.
+    pub max_input_tokens: u32,
     /// Estimated input tokens from context assembly (all messages + system prompt).
     pub assembled_context_tokens: u64,
     /// `true` when context assembly dropped older messages due to budget.
@@ -76,8 +79,15 @@ pub struct FinalizationInput {
 #[derive(Debug, Clone)]
 pub struct FinalizationOutcome {
     pub won_cas: bool,
+    /// State the turn was committed with. Differs from the requested state
+    /// when a completed turn is downgraded to `Failed` because its message
+    /// could not be persisted.
+    pub persisted_state: TurnState,
     pub billing_outcome: Option<BillingDerivation>,
     pub settlement_outcome: Option<SettlementOutcome>,
+    /// `thread_summary_trigger` result label when the trigger was evaluated
+    /// (`scheduled` or `not_needed`); recorded after commit.
+    pub summary_trigger: Option<&'static str>,
 }
 
 /// Determine whether provider-reported usage is "known" for billing purposes.

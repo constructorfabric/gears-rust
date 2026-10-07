@@ -4,12 +4,11 @@ Updated:  2026-07-08 by Constructor Tech
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-featstatus-ownership-transfer-implemented`
 
-> **Status: PARTIAL.** The endpoint, atomic owner swap, audit row, file event,
-> and usage-delta reporting are all shipped and tested. What is **not**
-> implemented is validating that `new_owner_id` names a real principal: the
-> only guard is rejecting the nil UUID. See
-> [§1.2's caveat](#12-purpose) and the acceptance criteria in §6 for the
-> explicit, tracked gap.
+> The endpoint, atomic owner swap, audit row, file event, and usage-delta
+> reporting are fully tested. Target-owner validation is partial: the only
+> guard is rejecting the nil UUID; `new_owner_id` is not verified to name a
+> real principal. See [§1.2's caveat](#12-purpose) and the acceptance
+> criteria in §6.
 
 
 
@@ -56,7 +55,7 @@ references to it. Because the swap, the audit row, and the file event are all
 written in one transaction, a caller can never observe a state where the
 owner changed but no audit trail exists for it, or vice versa.
 
-> **Caveat (P2 2.12 — target-owner validation is PARTIAL).** `transfer_ownership`
+> **Caveat: target-owner validation is partial.** `transfer_ownership`
 > rejects `new_owner_id` only when it is the **nil UUID** — an obviously
 > malformed sentinel value, checked with `Uuid::is_nil()`
 > (`src/domain/service/write.rs::transfer_ownership`). It does **not** verify
@@ -74,8 +73,8 @@ owner changed but no audit trail exists for it, or vice versa.
 > into a different tenant, only to (mis)attribute it to an arbitrary UUID
 > within the caller's own tenant. Whether ownership transfer should also
 > require a distinct privileged-transfer grant (rather than reusing the
-> ordinary file `WRITE` authorization) is a related, separately open decision
-> tied to item 0.7's admin-scope work — not resolved by this feature either.
+> ordinary file `WRITE` authorization) is a related, separately open
+> admin-scope authorization decision — not resolved by this feature either.
 
 **Requirements**: `cpt-cf-file-storage-fr-ownership-transfer`
 
@@ -111,9 +110,25 @@ owner changed but no audit trail exists for it, or vice versa.
 - The file's `owner_kind`/`owner_id` are atomically replaced; an audit row and
   a `file.owner_transferred` event are recorded in the same transaction; usage
   deltas are reported for the old and new owner; the caller receives the
-  updated `File` representation (captured metadata is read **before** the
-  transfer, since the caller may lose read access under the new owner
-  immediately afterward)
+  updated `File` representation, reflecting the new owner and bumped
+  `last_modified_at` — both the `File` row and its custom metadata are
+  **re-read after the commit**, under the tenant-only scope used for the
+  initial prefetch (not the authz `AccessScope`, which may be owner-constrained
+  and would no longer match the row under its new owner, incorrectly surfacing
+  a successful transfer as `404`). The re-read means the response also
+  reflects any concurrent metadata write that landed between the prefetch and
+  the commit, rather than echoing a stale `meta_version`/`content_id`/custom
+  metadata. If the row has disappeared by the time of the re-read (a
+  concurrent delete racing the already-committed transfer), the response
+  falls back to the **step-4 prefetch `File` value held in memory**, with only
+  `owner_kind`/`owner_id`/`last_modified_at` patched onto it — `meta_version`,
+  `content_id`, and every other field keep their pre-transfer prefetch values
+  — since the transfer itself is already committed and a `404` for it would be
+  wrong. The custom metadata shipped alongside is whatever the post-commit
+  `list_metadata` read (taken before the `File` re-read) returned regardless
+  of which branch fires: normally empty on the fallback path, since
+  `files_custom_metadata` cascade-deletes with the file, but not guaranteed to
+  be if that read raced ahead of the delete's cascade
 
 **Error Scenarios**:
 - `new_owner_id` is the nil UUID — `400` (`Validation`, field `new_owner_id`)
@@ -129,13 +144,28 @@ owner changed but no audit trail exists for it, or vice versa.
 1. [x] - `p1` - Client: POST /api/file-storage/v1/files/{id}/transfer with body {new_owner_kind, new_owner_id} - `inst-transfer-request`
 2. [x] - `p1` - API: reject `new_owner_id == Uuid::nil()` with `400` before touching the DB (**the only target-owner validation implemented — see the §1.2 caveat**) - `inst-transfer-nil-check`
 3. [x] - `p1` - API: parse `new_owner_kind`; reject anything other than `"user"`/`"app"` with `400` - `inst-transfer-kind-parse`
-4. [x] - `p1` - Control plane: load the file scoped to the caller's tenant; authorize `WRITE` on `file_id` - `inst-transfer-authz`
-5. [x] - `p1` - Control plane: capture the file's custom metadata **before** the transfer, so a caller who loses read access under the new owner still receives accurate metadata in the response - `inst-transfer-capture-meta`
-6. [x] - `p1` - Build the `TransferOwnership` audit row and the `file.owner_transferred` file event, both carrying `from_owner_kind`/`from_owner_id`/`to_owner_kind`/`to_owner_id` - `inst-transfer-build-audit-event`
-7. [x] - `p1` - DB: `transfer_ownership_atomic` — in one transaction, `UPDATE files SET owner_kind, owner_id` scoped to the tenant + `file_id`, insert the audit row (only if the update matched a row), insert the event row; RETURN whether a row was updated - `inst-transfer-atomic-update`
-8. [x] - `p1` - **IF** no row was updated (file not found, or removed by a concurrent delete): RETURN `404 FileNotFound`, no audit row, no event - `inst-transfer-not-found`
-9. [x] - `p1` - Compute the file's total available-version bytes; fire (fire-and-forget) a usage-delta debit for the old owner and a credit for the new owner using `cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance` - `inst-transfer-usage-rebalance`
-10. [x] - `p1` - RETURN `200` with the updated `File` (+ the pre-captured metadata) - `inst-transfer-return`
+4. [x] - `p1` - Control plane: load the file scoped to the caller's tenant (`prefetch`); authorize `WRITE` on `file_id`, yielding the (possibly owner-constrained) authz `AccessScope` - `inst-transfer-authz`
+5. [x] - `p1` - Build the `TransferOwnership` audit row and the `file.owner_transferred` file event, both carrying `from_owner_kind`/`from_owner_id`/`to_owner_kind`/`to_owner_id` - `inst-transfer-build-audit-event`
+6. [x] - `p1` - DB: `transfer_ownership_atomic` — in one transaction, `UPDATE files SET owner_kind, owner_id` scoped to the tenant + `file_id`, insert the audit row (only if the update matched a row), insert the event row; RETURN whether a row was updated - `inst-transfer-atomic-update`
+7. [x] - `p1` - **IF** no row was updated (file not found, or removed by a concurrent delete): RETURN `404 FileNotFound`, no audit row, no event - `inst-transfer-not-found`
+8. [x] - `p1` - Compute the file's total available-version bytes; fire (fire-and-forget) a usage-delta debit for the old owner and a credit for the new owner using `cpt-cf-file-storage-algo-ownership-transfer-usage-rebalance` - `inst-transfer-usage-rebalance`
+9. [x] - `p1` - Control plane, now that the swap has committed: read the custom metadata (`list_metadata(file_id)`,
+   tenant-unscoped — it neither re-checks the file's existence nor its tenant) **first**, then re-read the `File`
+   row via `require_file` under the tenant-only `prefetch` scope from step 4 (**not** the authz `AccessScope` from
+   that step, which may be owner-constrained and would no longer match the row under its new owner, falsely
+   surfacing `404` for an already-committed transfer), so the response reflects the committed state — including any
+   concurrent metadata write that landed between the prefetch and the commit. **IF** that `File` re-read returns
+   `FileNotFound` (a concurrent delete racing the already-committed transfer): fall back to the **step-4 prefetch
+   `File` value held in memory** (not a fresh read), with only `owner_kind`/`owner_id`/`last_modified_at` patched
+   onto it — `meta_version`, `content_id`, and every other field keep their pre-transfer prefetch values, since the
+   transfer already committed and a `404` for it would be wrong. The custom metadata already read above ships
+   unchanged either way — it is never itself replaced by a fallback: after a real concurrent delete it is normally
+   empty, since `files_custom_metadata` rows cascade-delete with the file, but a `list_metadata` call that raced
+   ahead of the delete's cascade can still come back non-empty, so its accuracy on this fallback path is not
+   guaranteed - `inst-transfer-post-commit-read`
+10. [x] - `p1` - RETURN `200` with the `File` from step 9 (the re-read value, or its pre-transfer-prefetch fallback
+    if the row raced a concurrent delete) and the custom metadata read in step 9, which is always the post-commit
+    `list_metadata` result and is never itself substituted with a fallback - `inst-transfer-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -213,5 +243,5 @@ nil-UUID guard.
 - [x] `new_owner_id == Uuid::nil()` is rejected with a validation error before any DB write (`::transfer_to_malformed_owner_is_rejected`)
 - [x] A well-formed `new_owner_id` under the caller's own tenant succeeds (`::transfer_to_same_tenant_member_succeeds`) — this is also the only kind of transfer the endpoint can perform, since `tenant_id` is never taken from the request
 - [x] Usage deltas are reported: the old owner is debited and the new owner is credited by the file's total available-version bytes, and by one `file_count_delta` each
-- [ ] `new_owner_id` is validated against a real, existing, same-tenant principal — **PARTIAL / NOT IMPLEMENTED**; only the nil-UUID sentinel is rejected today, blocked on an account-management SDK dependency (P2 remediation item 2.12; see the caveat in §1.2 and the DoD in §5)
-- [ ] Ownership transfer requires a distinct privileged-transfer authorization grant rather than reusing the file's ordinary `WRITE` grant — **not decided/not implemented**; tracked alongside item 0.7's admin-scope work, out of this feature's current scope
+- [ ] `new_owner_id` is validated against a real, existing, same-tenant principal — **PARTIAL**; only the nil-UUID sentinel is rejected today, blocked on an account-management SDK dependency (see the caveat in §1.2 and the DoD in §5)
+- [ ] Ownership transfer requires a distinct privileged-transfer authorization grant rather than reusing the file's ordinary `WRITE` grant — **not decided**; a separate, open admin-scope authorization question, out of this feature's current scope

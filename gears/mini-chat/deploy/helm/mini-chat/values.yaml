@@ -18,6 +18,7 @@ leaderElection:
   prefix: mini-chat
   roles:
     - orphan-watchdog
+    - upload-reaper
 
 postgres:
   host: "postgres.default.svc.cluster.local"

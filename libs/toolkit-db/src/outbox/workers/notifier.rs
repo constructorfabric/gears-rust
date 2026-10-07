@@ -65,14 +65,14 @@ impl Notifier {
     /// arrive. The per-row cancel check only avoids *starting* new claims once
     /// shutdown is under way.
     async fn collect(&self, cancel: &CancellationToken) -> Result<u64, OutboxError> {
-        let mailbox = self.outbox.mailbox();
+        let trace_mailbox = self.outbox.trace_mailbox();
         let store = OutboxStore::new(self.outbox.statements());
         let conn = self.db.sea_internal();
         let limit = i64::from(self.batch_size);
         let rows = match MailRow::find_by_statement(Statement::from_sql_and_values(
             store.backend(),
             store.trace_mail(),
-            [mailbox.instance_id().into(), limit.into()],
+            [trace_mailbox.instance_id().into(), limit.into()],
         ))
         .all(&conn)
         .await
@@ -97,12 +97,12 @@ impl Notifier {
             // before anything is handed over, so a completion is never
             // announced from a claim that did not stick.
             match store
-                .claim_trace_mail_alone(&conn, &row.trace, mailbox.instance_id())
+                .claim_trace_mail_alone(&conn, &row.trace, trace_mailbox.instance_id())
                 .await
             {
                 Ok(Some(outcome)) => {
                     let trace = outcome.trace.clone();
-                    if mailbox.subscriptions().deliver(outcome) {
+                    if trace_mailbox.registry().deliver(outcome) {
                         delivered += 1;
                     } else {
                         // Nobody is waiting any more - the guard was dropped,
@@ -133,7 +133,7 @@ impl WorkerAction for Notifier {
     type Error = OutboxError;
 
     async fn execute(&mut self, cancel: &CancellationToken) -> Result<Directive<u64>, Self::Error> {
-        if self.outbox.mailbox().subscriptions().is_idle() {
+        if self.outbox.trace_mailbox().registry().is_idle() {
             // Nothing outstanding: no query, no round trip, nothing. Sleep
             // until a subscription is taken, and be tight again when it is.
             self.next_look = FIRST_LOOK;

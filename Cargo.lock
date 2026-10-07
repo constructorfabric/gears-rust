@@ -454,7 +454,7 @@ dependencies = [
  "nom 7.1.3",
  "num-traits",
  "rusticata-macros",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
 ]
 
@@ -529,6 +529,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-broadcast"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "435a87a52755b8f27fcf321ac4f04b2802e337c8c4872923137471ec39c37532"
+dependencies = [
+ "event-listener",
+ "event-listener-strategy",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "async-compression"
 version = "0.4.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -580,7 +592,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -696,7 +708,7 @@ dependencies = [
  "num-traits",
  "pastey 0.1.1",
  "rayon",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "v_frame",
  "y4m",
 ]
@@ -833,6 +845,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+ "gloo-timers",
+ "tokio",
+]
+
+[[package]]
 name = "backtrace"
 version = "0.3.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -852,6 +875,12 @@ name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
+
+[[package]]
+name = "base64"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
 name = "base64"
@@ -912,7 +941,7 @@ dependencies = [
  "quick-xml 0.37.5",
  "regex",
  "serde",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1066,6 +1095,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bnum"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "119771309b95163ec7aaf79810da82f7cd0599c19722d48b9c03894dca833966"
+
+[[package]]
 name = "bollard"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1099,7 +1134,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_urlencoded",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-stream",
@@ -1374,7 +1409,7 @@ dependencies = [
  "http",
  "inventory",
  "serde",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -1391,7 +1426,7 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-transport-grpc",
  "prost",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -1407,7 +1442,7 @@ dependencies = [
  "calculator-gateway",
  "cf-gears-toolkit",
  "cf-gears-toolkit-security",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -1441,7 +1476,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1507,19 +1542,21 @@ dependencies = [
  "async-trait",
  "axum",
  "cf-api-contracts-sdk",
+ "cf-gears-authn-resolver",
+ "cf-gears-static-authn-plugin",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-contract",
- "cf-gears-toolkit-http",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-transport-grpc",
+ "cf-gears-types-registry",
+ "clap",
  "futures-core",
  "futures-util",
- "http",
+ "mimalloc",
  "mockall",
  "parking_lot",
- "secrecy",
  "serde",
  "serde_json",
  "tokio",
@@ -1540,11 +1577,15 @@ dependencies = [
  "axum",
  "cf-api-contracts",
  "cf-api-contracts-sdk",
+ "cf-gears-authn-resolver",
+ "cf-gears-static-authn-plugin",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-contract",
- "cf-gears-toolkit-http",
  "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "clap",
+ "mimalloc",
  "parking_lot",
  "serde_json",
  "tokio",
@@ -1585,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "cf-chat-engine"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1614,7 +1655,7 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-retry",
@@ -1636,7 +1677,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio-util",
  "uuid",
@@ -1644,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-account-management"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1656,6 +1697,7 @@ dependencies = [
  "cf-gears-authz-resolver-sdk",
  "cf-gears-resource-group",
  "cf-gears-resource-group-sdk",
+ "cf-gears-static-idp-plugin",
  "cf-gears-tenant-resolver",
  "cf-gears-tenant-resolver-sdk",
  "cf-gears-test-containers",
@@ -1690,7 +1732,7 @@ dependencies = [
  "serde_json",
  "testcontainers",
  "testcontainers-modules",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
@@ -1703,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-account-management-sdk"
-version = "0.7.3"
+version = "0.7.5"
 dependencies = [
  "async-trait",
  "cf-gears-tenant-resolver-sdk",
@@ -1718,7 +1760,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "uuid",
@@ -1726,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-api-gateway"
-version = "0.5.0"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1763,13 +1805,14 @@ dependencies = [
  "parking_lot",
  "rust-embed",
  "serde",
- "serde-saphyr 0.0.22",
+ "serde-saphyr 1.3.0",
  "serde_json",
  "tokio",
  "tokio-util",
  "tower",
  "tower-http",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "ureq",
  "utoipa",
@@ -1778,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-authn-resolver"
-version = "0.2.35"
+version = "0.2.37"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1792,13 +1835,13 @@ dependencies = [
  "inventory",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
 [[package]]
 name = "cf-gears-authn-resolver-sdk"
-version = "0.3.35"
+version = "0.3.37"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit",
@@ -1809,13 +1852,13 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
 [[package]]
 name = "cf-gears-authz-resolver"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1831,7 +1874,7 @@ dependencies = [
  "inventory",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1840,7 +1883,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-authz-resolver-sdk"
-version = "0.5.0"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -1852,15 +1895,77 @@ dependencies = [
  "cf-gears-toolkit-http",
  "cf-gears-toolkit-security",
  "gts",
- "http",
  "schemars 1.2.1",
  "secrecy",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-bss-approval"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "cf-gears-toolkit-db",
+ "parking_lot",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-bss-approvals"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "aws-lc-rs",
+ "axum",
+ "base64 0.22.1",
+ "cf-gears-bss-approvals-sdk",
+ "cf-gears-bss-rest",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-security",
+ "futures",
+ "http-body-util",
+ "proptest",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-bss-approvals-sdk"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-security",
+ "serde",
+ "serde_json",
+ "time",
  "uuid",
 ]
 
@@ -1877,32 +1982,11 @@ dependencies = [
  "sea-orm",
  "sea-orm-migration",
  "testcontainers-modules",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "cf-gears-bss-fixtures"
-version = "0.0.0"
-dependencies = [
- "chrono",
- "serde",
- "thiserror 2.0.18",
- "toml 1.1.2+spec-1.1.0",
-]
-
-[[package]]
-name = "cf-gears-bss-fixtures-conformance"
-version = "0.0.0"
-dependencies = [
- "cf-gears-bss-fixtures",
- "chrono",
- "serde",
- "thiserror 2.0.18",
- "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]
@@ -1921,6 +2005,8 @@ dependencies = [
  "cf-gears-bss-coord",
  "cf-gears-bss-ledger",
  "cf-gears-bss-ledger-sdk",
+ "cf-gears-tenant-resolver",
+ "cf-gears-tenant-resolver-sdk",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
@@ -1942,7 +2028,7 @@ dependencies = [
  "serde",
  "serde_json",
  "testcontainers-modules",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
@@ -1954,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-bss-ledger-sdk"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-canonical-errors",
@@ -1967,7 +2053,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "uuid",
 ]
@@ -1981,16 +2067,17 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "axum",
- "base64 0.22.1",
- "cf-gears-account-management",
- "cf-gears-account-management-sdk",
  "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
+ "cf-gears-bss-approval",
+ "cf-gears-bss-approvals-sdk",
  "cf-gears-bss-coord",
- "cf-gears-bss-fixtures",
- "cf-gears-bss-fixtures-conformance",
  "cf-gears-bss-pricing",
  "cf-gears-bss-pricing-sdk",
+ "cf-gears-bss-products-sdk",
+ "cf-gears-bss-rest",
+ "cf-gears-event-broker",
+ "cf-gears-event-broker-sdk",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
@@ -2002,23 +2089,23 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
- "futures-util",
- "gts",
- "opentelemetry",
- "opentelemetry_sdk",
  "parking_lot",
+ "proptest",
+ "rust_decimal",
  "sea-orm",
  "sea-orm-migration",
  "serde",
  "serde_json",
+ "tempfile",
  "testcontainers-modules",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
+ "tokio-retry",
  "tokio-util",
+ "toml 0.8.23",
  "tower",
  "tracing",
- "tracing-subscriber",
  "utoipa",
  "uuid",
 ]
@@ -2028,18 +2115,94 @@ name = "cf-gears-bss-pricing-sdk"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
+ "cf-gears-toolkit-security",
+ "rust_decimal",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-bss-products"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "aws-lc-rs",
+ "axum",
+ "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-bss-approval",
+ "cf-gears-bss-approvals",
+ "cf-gears-bss-approvals-sdk",
+ "cf-gears-bss-coord",
+ "cf-gears-bss-pricing",
+ "cf-gears-bss-pricing-sdk",
+ "cf-gears-bss-products-sdk",
+ "cf-gears-bss-rest",
+ "cf-gears-event-broker",
+ "cf-gears-event-broker-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-http",
+ "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-odata-macros",
  "cf-gears-toolkit-security",
- "thiserror 2.0.18",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "cf-gears-usage-collector",
+ "cf-gears-usage-collector-sdk",
+ "gts",
+ "opentelemetry",
+ "rust_decimal",
+ "sea-orm",
+ "sea-orm-migration",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "testcontainers-modules",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-opentelemetry",
+ "unicode-normalization",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-bss-products-sdk"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-security",
+ "proptest",
+ "rust_decimal",
+ "serde",
  "time",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-bss-rate-provider"
-version = "0.1.8"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2060,7 +2223,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-bss-rate-provider-ecb-plugin"
-version = "0.1.8"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2082,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-bss-rate-provider-http-json-plugin"
-version = "0.1.8"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2096,7 +2259,7 @@ dependencies = [
  "inventory",
  "secrecy",
  "serde",
- "serde-saphyr 0.0.22",
+ "serde-saphyr 1.3.0",
  "serde_json",
  "temp-env",
  "time",
@@ -2108,7 +2271,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-bss-rate-provider-sdk"
-version = "0.1.8"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "axum",
@@ -2131,8 +2294,71 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-bss-rest"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "axum",
+ "base64 0.22.1",
+ "cf-gears-account-management-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-security",
+ "futures-util",
+ "gts",
+ "http",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-clickhouse-usage-collector-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bigdecimal",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "cf-gears-usage-collector-sdk",
+ "chrono",
+ "clickhouse",
+ "hyper-rustls",
+ "hyper-util",
+ "inventory",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "percent-encoding",
+ "postcard",
+ "rust_decimal",
+ "rustls",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "testcontainers",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-cluster"
-version = "0.2.6"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2149,6 +2375,7 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-transport-grpc",
  "cf-gears-toolkit-utils",
+ "cf-k8s-cluster-plugin",
  "cf-postgres-cluster-plugin",
  "cf-redis-cluster-plugin",
  "clap",
@@ -2159,7 +2386,7 @@ dependencies = [
  "rand 0.10.1",
  "secrecy",
  "serde",
- "serde-saphyr 0.0.22",
+ "serde-saphyr 1.3.0",
  "serde_json",
  "temp-env",
  "tempfile",
@@ -2177,7 +2404,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-cluster-conformance"
-version = "0.3.6"
+version = "0.3.8"
 dependencies = [
  "async-trait",
  "cf-gears-cluster-sdk",
@@ -2189,7 +2416,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-cluster-sdk"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2210,7 +2437,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temp-env",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "toml 0.8.23",
@@ -2223,7 +2450,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-credstore"
-version = "0.5.0"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2250,7 +2477,7 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
@@ -2263,7 +2490,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-credstore-sdk"
-version = "0.2.15"
+version = "0.2.17"
 dependencies = [
  "async-trait",
  "cf-gears-tenant-resolver-sdk",
@@ -2275,7 +2502,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "uuid",
  "zeroize",
@@ -2283,55 +2510,97 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-event-broker"
-version = "0.2.5"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bytes",
+ "cf-gears-api-gateway",
+ "cf-gears-authn-resolver",
+ "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-sdk",
  "cf-gears-cluster",
  "cf-gears-cluster-sdk",
  "cf-gears-event-broker-sdk",
+ "cf-gears-sqlite-event-broker-plugin",
+ "cf-gears-standalone-cluster-plugin",
+ "cf-gears-static-authn-plugin",
+ "cf-gears-static-authz-plugin",
  "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
+ "cf-gears-toolkit-stable-hash",
  "cf-gears-toolkit-utils",
+ "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
  "chrono",
+ "clap",
+ "criterion",
  "gts",
+ "http",
+ "http-body-util",
+ "jsonschema",
+ "pingora-core",
+ "pingora-http",
+ "reqwest",
+ "sea-orm",
+ "sea-orm-migration",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "serde_urlencoded",
+ "tempfile",
+ "thiserror 2.0.20",
  "tokio",
+ "tokio-stream",
  "tokio-util",
+ "tower",
  "tracing",
+ "tracing-test",
+ "utoipa",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-event-broker-sdk"
-version = "0.2.4"
+version = "0.2.6"
 dependencies = [
  "async-stream",
  "async-trait",
+ "axum",
+ "bytes",
+ "cf-gears-event-broker",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-db",
  "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-http",
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-stable-hash",
  "cf-gears-toolkit-utils",
  "chrono",
+ "clap",
  "futures-core",
  "futures-util",
  "gts",
- "gts-id",
+ "http-body-util",
  "jsonschema",
+ "rusqlite",
  "schemars 1.2.1",
  "sea-orm",
+ "secrecy",
  "serde",
+ "serde_html_form",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "trybuild",
  "uuid",
 ]
@@ -2348,16 +2617,19 @@ dependencies = [
  "cf-gears-api-gateway",
  "cf-gears-authn-resolver",
  "cf-gears-authz-resolver",
+ "cf-gears-bss-approvals",
  "cf-gears-bss-ledger",
  "cf-gears-bss-pricing",
+ "cf-gears-bss-products",
  "cf-gears-bss-rate-provider",
  "cf-gears-bss-rate-provider-ecb-plugin",
  "cf-gears-bss-rate-provider-http-json-plugin",
+ "cf-gears-clickhouse-usage-collector-plugin",
  "cf-gears-credstore",
  "cf-gears-file-parser",
  "cf-gears-file-storage",
- "cf-gears-gear-orchestrator",
  "cf-gears-github-mirror",
+ "cf-gears-graph-storage",
  "cf-gears-grpc-hub",
  "cf-gears-license-resolver",
  "cf-gears-mini-chat",
@@ -2365,6 +2637,8 @@ dependencies = [
  "cf-gears-oagw",
  "cf-gears-resource-group",
  "cf-gears-rg-tr-plugin",
+ "cf-gears-service-discovery",
+ "cf-gears-settings-service",
  "cf-gears-simple-user-settings",
  "cf-gears-single-tenant-tr-plugin",
  "cf-gears-static-authn-plugin",
@@ -2381,16 +2655,19 @@ dependencies = [
  "cf-gears-usage-collector",
  "clap",
  "mimalloc",
- "serde-saphyr 0.0.22",
+ "sea-orm",
+ "serde-saphyr 1.3.0",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "users-info",
+ "uuid",
 ]
 
 [[package]]
 name = "cf-gears-file-parser"
-version = "0.1.44"
+version = "0.1.46"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2412,7 +2689,7 @@ dependencies = [
  "ort",
  "serde",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
@@ -2428,12 +2705,12 @@ dependencies = [
  "async-trait",
  "bytes",
  "cf-gears-toolkit-security",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "cf-gears-file-storage"
-version = "0.2.3"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2471,7 +2748,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-retry",
@@ -2485,7 +2762,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-file-storage-sdk"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-gts",
@@ -2506,31 +2783,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "cf-gears-gear-orchestrator"
-version = "0.2.1"
+name = "cf-gears-flight-control"
+version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
- "axum",
  "cf-gears-api-gateway",
- "cf-gears-system-sdks",
+ "cf-gears-authn-resolver",
+ "cf-gears-grpc-hub",
+ "cf-gears-oidc-authn-plugin",
+ "cf-gears-service-discovery",
+ "cf-gears-static-authn-plugin",
  "cf-gears-toolkit",
- "cf-gears-toolkit-macros",
- "cf-gears-toolkit-security",
- "cf-gears-toolkit-transport-grpc",
- "http",
- "inventory",
- "secrecy",
- "serde",
- "serde_json",
+ "cf-gears-types-registry",
+ "clap",
+ "mimalloc",
+ "tempfile",
  "tokio",
- "tokio-util",
- "tonic",
- "tower",
  "tracing",
- "tracing-test",
- "utoipa",
- "uuid",
 ]
 
 [[package]]
@@ -2539,6 +2808,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
@@ -2552,6 +2822,8 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-utils",
  "chrono",
+ "flate2",
+ "hex",
  "httpmock",
  "inventory",
  "reqwest",
@@ -2560,7 +2832,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum 0.27.2",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
@@ -2582,12 +2854,113 @@ dependencies = [
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
  "chrono",
+ "serde",
  "serde_json",
 ]
 
 [[package]]
+name = "cf-gears-graph-storage"
+version = "0.1.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-lc-rs",
+ "axum",
+ "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-graph-storage",
+ "cf-gears-graph-storage-onnx-embedding-plugin",
+ "cf-gears-graph-storage-remote-embedding-plugin",
+ "cf-gears-graph-storage-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-http",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-odata-macros",
+ "cf-gears-toolkit-security",
+ "gts",
+ "hex",
+ "http",
+ "jsonschema",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-graph-storage-onnx-embedding-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "cf-gears-graph-storage-sdk",
+ "cf-gears-toolkit-onnx-runtime",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokenizers",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "cf-gears-graph-storage-remote-embedding-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-graph-storage-sdk",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "cf-gears-graph-storage-sdk"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-odata-macros",
+ "cf-gears-toolkit-security",
+ "hex",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-grpc-hub"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2615,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-keycloak-idp-plugin"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2643,10 +3016,10 @@ dependencies = [
  "reqwest",
  "secrecy",
  "serde",
- "serde-saphyr 0.0.22",
+ "serde-saphyr 1.3.0",
  "serde_json",
  "temp-env",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
@@ -2658,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-license-resolver"
-version = "0.1.3"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2677,7 +3050,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2686,7 +3059,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-license-resolver-sdk"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-canonical-errors",
@@ -2696,13 +3069,13 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-llm-gateway-sdk"
-version = "0.1.9"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "cf-gears-model-registry-sdk",
@@ -2714,12 +3087,12 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "cf-gears-mini-chat"
-version = "0.4.3"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2762,7 +3135,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temp-env",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-retry",
@@ -2775,7 +3148,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-mini-chat-sdk"
-version = "0.10.24"
+version = "0.10.26"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit",
@@ -2784,7 +3157,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "utoipa",
  "uuid",
@@ -2792,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-model-registry-sdk"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-gts",
@@ -2803,13 +3176,13 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-nodes-registry"
-version = "0.1.41"
+version = "0.1.43"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2823,7 +3196,7 @@ dependencies = [
  "chrono",
  "inventory",
  "serde",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tracing",
  "utoipa",
  "uuid",
@@ -2831,20 +3204,20 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-nodes-registry-sdk"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-node-info",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-noop-usage-collector-plugin"
-version = "0.1.13"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2866,7 +3239,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-oagw"
-version = "0.5.3"
+version = "0.5.5"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2918,7 +3291,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-retry",
  "tokio-rustls",
@@ -2931,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-oagw-sdk"
-version = "0.5.14"
+version = "0.5.15"
 dependencies = [
  "async-openai",
  "async-trait",
@@ -2948,7 +3321,7 @@ dependencies = [
  "octocrab",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tower",
  "tracing",
@@ -2957,7 +3330,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-oidc-authn-plugin"
-version = "0.2.11"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2987,7 +3360,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-retry",
  "tracing",
@@ -2997,7 +3370,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-resource-group"
-version = "0.4.3"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3029,19 +3402,18 @@ dependencies = [
  "serde_json",
  "testcontainers",
  "testcontainers-modules",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tower",
  "tracing",
- "tracing-test",
  "utoipa",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-resource-group-sdk"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-canonical-errors",
@@ -3053,13 +3425,13 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-rg-tr-plugin"
-version = "0.1.19"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3100,7 +3472,7 @@ dependencies = [
  "subtle",
  "temp-env",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tracing",
  "zeroize",
 ]
@@ -3114,8 +3486,102 @@ dependencies = [
 ]
 
 [[package]]
-name = "cf-gears-simple-user-settings"
+name = "cf-gears-service-discovery"
 version = "0.2.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "cf-gears-api-gateway",
+ "cf-gears-system-sdks",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-toolkit-transport-grpc",
+ "http",
+ "inventory",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-test",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-settings-service"
+version = "0.1.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "cf-gears-authn-resolver-sdk",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-credstore",
+ "cf-gears-credstore-sdk",
+ "cf-gears-settings-service-sdk",
+ "cf-gears-tenant-resolver-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "http",
+ "inventory",
+ "jsonschema",
+ "opentelemetry",
+ "regex",
+ "sea-orm",
+ "sea-orm-migration",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-settings-service-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-odata-macros",
+ "cf-gears-toolkit-security",
+ "gts-id",
+ "jsonschema",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-simple-user-settings"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3135,8 +3601,9 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
+ "tower",
  "tracing",
  "utoipa",
  "uuid",
@@ -3144,19 +3611,20 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-simple-user-settings-sdk"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
+ "serde_json",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-single-tenant-tr-plugin"
-version = "0.1.38"
+version = "0.1.40"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3174,8 +3642,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-sqlite-event-broker-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cf-gears-event-broker-sdk",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-security",
+ "chrono",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-standalone-cluster-plugin"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "async-trait",
  "cf-gears-cluster-sdk",
@@ -3188,7 +3675,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-static-authn-plugin"
-version = "0.3.16"
+version = "0.3.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3208,7 +3695,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-static-authz-plugin"
-version = "0.1.36"
+version = "0.1.38"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3229,7 +3716,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-static-credstore-plugin"
-version = "0.2.13"
+version = "0.2.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3241,7 +3728,7 @@ dependencies = [
  "cf-gears-types-registry-sdk",
  "inventory",
  "serde",
- "serde-saphyr 0.0.22",
+ "serde-saphyr 1.3.0",
  "tokio",
  "tracing",
  "uuid",
@@ -3249,7 +3736,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-static-idp-plugin"
-version = "0.1.16"
+version = "0.1.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3275,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-static-license-plugin"
-version = "0.1.3"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3297,7 +3784,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-static-tr-plugin"
-version = "0.1.37"
+version = "0.1.39"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3338,7 +3825,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-tenant-resolver"
-version = "0.1.39"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3352,14 +3839,14 @@ dependencies = [
  "inventory",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-tenant-resolver-sdk"
-version = "0.4.3"
+version = "0.4.5"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit",
@@ -3369,7 +3856,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "utoipa",
  "uuid",
 ]
@@ -3386,7 +3873,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-timescaledb-usage-collector-plugin"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3418,7 +3905,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3437,6 +3924,7 @@ dependencies = [
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-sdk",
  "cf-gears-toolkit-security",
+ "cf-gears-toolkit-trace-context",
  "cf-gears-toolkit-transport-grpc",
  "cf-gears-toolkit-utils",
  "chrono",
@@ -3460,13 +3948,13 @@ dependencies = [
  "sea-orm-migration",
  "secrecy",
  "serde",
- "serde-saphyr 0.0.22",
+ "serde-saphyr 1.3.0",
  "serde_json",
  "serial_test",
  "supports-color",
  "temp-env",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -3487,7 +3975,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-auth"
-version = "0.7.10"
+version = "0.7.11"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3502,7 +3990,7 @@ dependencies = [
  "rand 0.10.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
@@ -3515,7 +4003,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-canonical-errors"
-version = "0.9.4"
+version = "0.9.5"
 dependencies = [
  "axum",
  "cf-gears-toolkit-canonical-errors-macro",
@@ -3524,7 +4012,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tracing",
  "trybuild",
  "utoipa",
@@ -3532,7 +4020,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-canonical-errors-macro"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "gts-id",
  "proc-macro-crate",
@@ -3543,7 +4031,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-contract"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3570,10 +4058,9 @@ dependencies = [
  "serde",
  "serde_html_form",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tonic",
- "tower",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -3583,7 +4070,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-contract-macros"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "heck 0.5.0",
  "proc-macro-crate",
@@ -3598,33 +4085,31 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-contract",
- "cf-gears-toolkit-contract-macros",
  "cf-gears-toolkit-security",
  "futures-core",
  "secrecy",
  "serde",
- "thiserror 2.0.18",
- "tokio",
+ "thiserror 2.0.20",
  "trybuild",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-toolkit-contract-protogen"
-version = "0.1.7"
+version = "0.1.9"
 dependencies = [
  "cf-gears-toolkit-contract",
  "heck 0.5.0",
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "toml 0.8.23",
 ]
 
 [[package]]
 name = "cf-gears-toolkit-db"
-version = "0.16.0"
+version = "0.16.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3648,14 +4133,15 @@ dependencies = [
  "sea-orm",
  "sea-orm-migration",
  "serde",
- "serde-saphyr 0.0.22",
+ "serde-saphyr 1.3.0",
  "serde_json",
  "sqlx",
+ "strum 0.27.2",
  "temp-env",
  "tempfile",
  "testcontainers",
  "testcontainers-modules",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-retry",
@@ -3682,7 +4168,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-gateway"
-version = "0.2.6"
+version = "0.2.8"
 dependencies = [
  "async-trait",
  "axum",
@@ -3696,7 +4182,7 @@ dependencies = [
  "matchit 0.9.2",
  "parking_lot",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "utoipa",
@@ -3704,7 +4190,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-gts"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "cf-gears-toolkit-gts-macros",
@@ -3718,7 +4204,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-gts-macros"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "gts",
  "gts-id",
@@ -3730,12 +4216,13 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-http"
-version = "0.6.17"
+version = "0.6.18"
 dependencies = [
  "bytes",
  "cf-gears-rustls-corecrypto-provider",
  "cf-gears-rustls-fips-shim",
  "cf-gears-toolkit-security",
+ "cf-gears-toolkit-trace-context",
  "flate2",
  "http",
  "http-body",
@@ -3759,7 +4246,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "tempfile",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tower",
  "tower-http",
@@ -3772,14 +4259,14 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-toolkit-http-middleware"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axum",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-security",
  "http",
  "secrecy",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tower",
  "tracing",
@@ -3792,7 +4279,7 @@ dependencies = [
  "cf-gears-toolkit-security",
  "k8s-openapi",
  "kube",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -3833,14 +4320,14 @@ dependencies = [
  "regex",
  "starship-battery",
  "sysinfo",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-toolkit-odata"
-version = "0.9.6"
+version = "0.9.7"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal",
@@ -3851,7 +4338,8 @@ dependencies = [
  "peg",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "strum 0.27.2",
+ "thiserror 2.0.20",
  "utoipa",
  "uuid",
 ]
@@ -3870,8 +4358,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-toolkit-onnx-runtime"
+version = "0.1.0"
+dependencies = [
+ "ort",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cf-gears-toolkit-sdk"
-version = "0.7.12"
+version = "0.7.13"
 dependencies = [
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-odata-macros",
@@ -3888,7 +4386,7 @@ name = "cf-gears-toolkit-sea-orm-pgq"
 version = "0.1.0"
 dependencies = [
  "sea-orm",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3902,7 +4400,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "trybuild",
@@ -3914,6 +4412,18 @@ name = "cf-gears-toolkit-stable-hash"
 version = "0.1.0"
 
 [[package]]
+name = "cf-gears-toolkit-trace-context"
+version = "0.1.0"
+dependencies = [
+ "http",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cf-gears-toolkit-transport-grpc"
 version = "0.9.0"
 dependencies = [
@@ -3922,11 +4432,10 @@ dependencies = [
  "futures-util",
  "http",
  "parking_lot",
- "rand 0.10.1",
  "secrecy",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-retry",
  "tokio-stream",
@@ -3952,7 +4461,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-tr-authz-plugin"
-version = "0.1.19"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3975,12 +4484,13 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-types-registry"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "aws-lc-rs",
  "axum",
+ "base64 0.22.1",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
@@ -3988,12 +4498,14 @@ dependencies = [
  "cf-gears-toolkit-db-macros",
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
  "cf-gears-toolkit-utils",
  "cf-gears-types-registry-sdk",
+ "chrono",
  "gts",
  "heck 0.5.0",
  "inventory",
- "lru 0.18.2",
+ "lru 0.18.4",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",
@@ -4002,9 +4514,10 @@ dependencies = [
  "serde",
  "serde_json",
  "testcontainers",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -4015,20 +4528,20 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-types-registry-sdk"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-gts",
  "gts",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "uuid",
 ]
 
 [[package]]
 name = "cf-gears-usage-collector"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4052,9 +4565,9 @@ dependencies = [
  "opentelemetry_sdk",
  "rust_decimal",
  "serde",
- "serde-saphyr 0.0.22",
+ "serde-saphyr 1.3.0",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
@@ -4066,7 +4579,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-usage-collector-sdk"
-version = "0.3.12"
+version = "0.3.14"
 dependencies = [
  "async-trait",
  "bigdecimal",
@@ -4080,14 +4593,46 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "uuid",
 ]
 
 [[package]]
+name = "cf-k8s-cluster-plugin"
+version = "0.1.2"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "cf-gears-cluster-conformance",
+ "cf-gears-cluster-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "dashmap",
+ "futures-util",
+ "http",
+ "k8s-openapi",
+ "kube",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "rand 0.10.1",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.10.9",
+ "temp-env",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "cf-postgres-cluster-plugin"
-version = "0.4.4"
+version = "0.4.6"
 dependencies = [
  "async-trait",
  "cf-gears-cluster",
@@ -4116,7 +4661,7 @@ dependencies = [
 
 [[package]]
 name = "cf-redis-cluster-plugin"
-version = "0.1.3"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "cf-gears-cluster",
@@ -4277,6 +4822,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cityhash-rs"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93a719913643003b84bd13022b4b7e703c09342cd03b679c4641c7d2e50dc34d"
+
+[[package]]
 name = "clang-sys"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4289,9 +4840,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.0"
+version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b193af5b67834b676abd72466a96c1024e6a6ad978a1f484bd90b85c94041351"
+checksum = "aa8876b300ab35ba921adea3dfd70157a46249b33f95c9084ae5709785478946"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -4299,9 +4850,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.0"
+version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714a53001bf66416adb0e2ef5ac857140e7dc3a0c48fb28b2f10762fc4b5069f"
+checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
 dependencies = [
  "anstream",
  "anstyle",
@@ -4311,14 +4862,14 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.0"
+version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1110bd8a634a1ab8cb04345d8d878267d57c3cf1b38d91b71af6686408bbca6a"
+checksum = "f9c751b79415d4e559e3d1fcf128e09e720eb673a06d26cf6f392d37d75b66e0"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -4326,6 +4877,57 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "clickhouse"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8063696febb0a10a6fb9df1460c52c509188f1d19da2157694ab3ca0feffc74"
+dependencies = [
+ "bnum",
+ "bstr",
+ "bytes",
+ "cityhash-rs",
+ "clickhouse-macros",
+ "clickhouse-types",
+ "futures-channel",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "lz4_flex",
+ "polonius-the-crab",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "clickhouse-macros"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff6669899e23cb87b43daf7996f0ea3b9c07d0fb933d745bb7b815b052515ae3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "clickhouse-types"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30a5efddc880ce9e2573bd867413d9056fa2bea0206af88dec21e72178b9dc74"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "cmake"
@@ -4348,7 +4950,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4393,6 +4995,7 @@ dependencies = [
  "itoa",
  "rustversion",
  "ryu",
+ "serde",
  "static_assertions",
 ]
 
@@ -4724,6 +5327,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "daachorse"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5614204febbc33cc07a2806aa6440b904ac012b68eecc37f4493ea4a76455a3d"
+
+[[package]]
 name = "daemonize"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4808,6 +5417,15 @@ dependencies = [
  "darling_core 0.23.0",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "dary_heap"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b1e3a325bc115f096c8b77bbf027a7c2592230e70be2d985be950d3d5e60ebe"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -5145,6 +5763,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "educe"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d7bc049e1bd8cdeb31b68bbd586a9464ecf9f3944af3958a7a9d0f8b9799417"
+dependencies = [
+ "enum-ordinalize",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5208,6 +5838,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5320ae4c3782150d900b79807611a59a99fc9a1d61d686faafc24b93fc8d7ca"
 
 [[package]]
+name = "enum-ordinalize"
+version = "4.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89dd01549b09589510cf0647475075d12071456586d70f5c75c98ae2a5537677"
+dependencies = [
+ "enum-ordinalize-derive",
+]
+
+[[package]]
+name = "enum-ordinalize-derive"
+version = "4.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a65863d15a4ce2888bd2f0f543cc963d3879c3a022c8ee43f6141d479a3ac815"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "equator"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5240,8 +5890,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "esaxx-rs"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 
 [[package]]
 name = "etcetera"
@@ -5299,6 +5955,18 @@ dependencies = [
  "smallvec",
  "zune-inflate",
 ]
+
+[[package]]
+name = "fallible-iterator"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fancy-regex"
@@ -5768,6 +6436,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "governor"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5801,20 +6481,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "gts"
-version = "0.12.0"
+name = "granit-parser"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50466a7592e7bf40cb7a7d264831b7585bd5fc46bea6721956ec773860f86e2e"
+checksum = "e20f99e46474f56bd905c56e817ebddcf377a611f94c53ac4649e4d3fa3c0cd0"
+dependencies = [
+ "arraydeque",
+ "smallvec",
+]
+
+[[package]]
+name = "gts"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "021167e175f3810efd05ffcca9804681183a38ad89074d821dcf502bd6580b85"
 dependencies = [
  "gts-id",
  "jsonschema",
  "num-cmp",
  "schemars 1.2.1",
  "serde",
- "serde-saphyr 0.0.24",
+ "serde-saphyr 1.3.0",
  "serde_json",
  "shellexpand",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tracing",
  "walkdir",
 ]
@@ -5837,19 +6527,19 @@ dependencies = [
 
 [[package]]
 name = "gts-id"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "616caf5d36d9f91fe219c7f11beeb061964f55bfee8ed67ac055758b2a34721f"
+checksum = "29bbb4c89400d552569283dd7ea6f8da1f3b58be13f1d9213e0d348a6967221a"
 dependencies = [
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "uuid",
 ]
 
 [[package]]
 name = "gts-macros"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b5284f7190894d6f0030493ce0dba9d92ea0428491f065470f3537e79f16836"
+checksum = "785b0213cd86538089d91ba7c491e861cce964bdb0d5a5590626bac6e9d4e073"
 dependencies = [
  "gts-id",
  "proc-macro2",
@@ -5962,6 +6652,15 @@ dependencies = [
 
 [[package]]
 name = "hashlink"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
+dependencies = [
+ "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "hashlink"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f"
@@ -6006,6 +6705,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hello"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "clap",
+ "http",
+ "inventory",
+ "mimalloc",
+ "serde",
+ "tokio",
+ "tracing",
+ "utoipa",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6025,6 +6743,17 @@ checksum = "1f7685beb53fc20efc2605f32f5d51e9ba18b8ef237961d1760169d2290d3bee"
 dependencies = [
  "outref",
  "vsimd",
+]
+
+[[package]]
+name = "higher-kinded-types"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e690f8474c6c5d8ff99656fcbc195a215acc3949481a8b0b3351c838972dc776"
+dependencies = [
+ "macro_rules_attribute",
+ "never-say-never",
+ "paste",
 ]
 
 [[package]]
@@ -6086,13 +6815,13 @@ dependencies = [
  "html-escape",
  "html5ever",
  "image",
- "lru 0.18.2",
+ "lru 0.18.4",
  "memchr",
  "once_cell",
  "regex",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -6107,9 +6836,9 @@ dependencies = [
 
 [[package]]
 name = "http"
-version = "1.4.2"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6970f50e31d6fc17d3fa27329444bfa74e196cf62e95052a3f6fee181dba6425"
+checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
 dependencies = [
  "bytes",
  "itoa",
@@ -6178,7 +6907,7 @@ dependencies = [
  "similar",
  "stringmetrics",
  "tabwriter",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "url",
@@ -6211,9 +6940,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.10.1"
+version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498"
+checksum = "27b501faa50e7a26c3d3560ca625132f4078a17771f4810baf70475ae48cbe43"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -6558,7 +7287,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0a2cad967c3b727c000ebfdcd14974539e8c6f59e1d044c8034179df2c6fe250"
 dependencies = [
  "instant-xml-macros",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "xmlparser",
 ]
 
@@ -6664,7 +7393,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6705,7 +7434,7 @@ dependencies = [
  "jni-sys",
  "log",
  "simd_cesu8",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "walkdir",
  "windows-link",
 ]
@@ -6771,6 +7500,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "json-patch"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7421438de105a0827e44fadd05377727847d717c80ce29a229f85fd04c427b72"
+dependencies = [
+ "jsonptr",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "jsonpath-rust"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6780,7 +7521,17 @@ dependencies = [
  "pest_derive",
  "regex",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "jsonptr"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5a3cc660ba5d72bce0b3bb295bf20847ccbb40fd423f3f05b61273672e561fe"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -6892,7 +7643,7 @@ dependencies = [
  "serde_toon_format",
  "serde_yaml_ng",
  "simdutf8",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
@@ -6935,6 +7686,8 @@ dependencies = [
  "k8s-openapi",
  "kube-client",
  "kube-core",
+ "kube-derive",
+ "kube-runtime",
 ]
 
 [[package]]
@@ -6965,7 +7718,7 @@ dependencies = [
  "serde",
  "serde-saphyr 0.0.29",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tower",
@@ -6983,11 +7736,54 @@ dependencies = [
  "form_urlencoded",
  "http",
  "jiff",
+ "json-patch",
  "k8s-openapi",
+ "schemars 1.2.1",
  "serde",
  "serde-value",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "kube-derive"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92141c19e1fa83bf91633c1234c66b03375c29aa8ca5486331ddb47e3a3da9c0"
+dependencies = [
+ "darling 0.23.0",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "kube-runtime"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3eb064ef71c7bea55e934a443960da9e9ec31fbb2ba63e47e4aeca32603d5cc7"
+dependencies = [
+ "ahash 0.8.12",
+ "async-broadcast",
+ "async-stream",
+ "backon",
+ "educe",
+ "futures",
+ "hashbrown 0.16.1",
+ "hostname",
+ "json-patch",
+ "k8s-openapi",
+ "kube-client",
+ "parking_lot",
+ "pin-project",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -7140,9 +7936,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.30.1"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
+checksum = "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
 dependencies = [
  "cc",
  "pkg-config",
@@ -7232,7 +8028,7 @@ dependencies = [
  "rayon",
  "sha2 0.10.9",
  "stringprep",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "ttf-parser",
  "weezl",
@@ -7249,9 +8045,9 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.18.2"
+version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
+checksum = "ff9840bcc50b71349309900da0ce7279aa336ae71d73250b07998932c7d97c25"
 dependencies = [
  "hashbrown 0.17.0",
 ]
@@ -7261,6 +8057,12 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 
 [[package]]
 name = "mac_address"
@@ -7289,6 +8091,22 @@ dependencies = [
  "windows-registry",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "macro_rules_attribute"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65049d7923698040cd0b1ddcced9b0eb14dd22c5f86ae59c3740eab64a676520"
+dependencies = [
+ "macro_rules_attribute-proc_macro",
+ "paste",
+]
+
+[[package]]
+name = "macro_rules_attribute-proc_macro"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "670fdfda89751bc4a84ac13eaa63e205cf0fd22b4c9a5fbfa085b63c1f1d3a30"
 
 [[package]]
 name = "magika"
@@ -7467,9 +8285,9 @@ dependencies = [
 
 [[package]]
 name = "mockall"
-version = "0.13.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39a6bfcc6c8c7eed5ee98b9c3e33adc726054389233e201c95dab2d41a3839d2"
+checksum = "1a6ceddfe3ce334925e96bf420fdb2dcee5bed6c632a168ece622676dadeaf8a"
 dependencies = [
  "cfg-if",
  "downcast",
@@ -7481,11 +8299,33 @@ dependencies = [
 
 [[package]]
 name = "mockall_derive"
-version = "0.13.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25ca3004c2efe9011bd4e461bd8256445052b9615405b4f7ea43fc8ca5c20898"
+checksum = "9cfe16fbe8a314aeec0b861ac24e60b1e123e97634bab045475b9d6a18416fd8"
 dependencies = [
  "cfg-if",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "monostate"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3341a273f6c9d5bef1908f17b7267bbab0e95c9bf69a0d4dcf8e9e1b2c76ef67"
+dependencies = [
+ "monostate-impl",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
+name = "monostate-impl"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4db6d5580af57bf992f59068d4ea26fd518574ff48d7639b255a36f9de6e7e9"
+dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -7576,6 +8416,12 @@ dependencies = [
  "serde",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "never-say-never"
+version = "6.6.666"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf5a574dadd7941adeaa71823ecba5e28331b8313fb2e1c6a5c7e5981ea53ad6"
 
 [[package]]
 name = "new_debug_unreachable"
@@ -8008,7 +8854,7 @@ dependencies = [
  "futures-sink",
  "js-sys",
  "pin-project-lite",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -8038,7 +8884,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prost",
  "reqwest",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tonic",
  "tonic-types",
@@ -8070,7 +8916,7 @@ dependencies = [
  "percent-encoding",
  "portable-atomic",
  "rand 0.9.4",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
 ]
@@ -8395,11 +9241,12 @@ dependencies = [
 
 [[package]]
 name = "pgvector"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc58e2d255979a31caa7cabfa7aac654af0354220719ab7a68520ae7a91e8c0b"
+checksum = "3673cba5b9a124916096a423b806a9f29620972c6c97b08db5f2053e9428b481"
 dependencies = [
  "serde",
+ "sqlx",
 ]
 
 [[package]]
@@ -8647,7 +9494,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91bb5030596a3d442c0866ac68afe29c14ba558e77c726dcdf7016b0dbb359d9"
 dependencies = [
  "arrayvec",
- "hashbrown 0.12.3",
+ "hashbrown 0.17.0",
  "parking_lot",
  "rand 0.8.5",
 ]
@@ -8824,6 +9671,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "polonius-the-crab"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec242d7eccbb2fd8b3b5b6e3cf89f94a91a800f469005b44d154359609f8af72"
+dependencies = [
+ "higher-kinded-types",
+ "never-say-never",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8927,9 +9784,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.106"
+version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
+checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
@@ -9217,7 +10074,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2 0.5.10",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "web-time",
@@ -9240,7 +10097,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tinyvec",
  "tracing",
  "web-time",
@@ -9417,7 +10274,7 @@ dependencies = [
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "simd_helpers",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "v_frame",
  "wasm-bindgen",
 ]
@@ -9460,6 +10317,17 @@ checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
 dependencies = [
  "either",
  "rayon-core",
+]
+
+[[package]]
+name = "rayon-cond"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2964d0cf57a3e7a06e8183d14a8b527195c706b7983549cd5462d5aa3747438f"
+dependencies = [
+ "either",
+ "itertools 0.14.0",
+ "rayon",
 ]
 
 [[package]]
@@ -9526,7 +10394,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.17",
  "libredox",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -9752,6 +10620,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusqlite"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "165ca6e57b20e1351573e3729b958bc62f0e48025386970b6e4d29e7a7e71f3f"
+dependencies = [
+ "bitflags 2.11.1",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "hashlink 0.10.0",
+ "libsqlite3-sys",
+ "smallvec",
+]
+
+[[package]]
 name = "rust-embed"
 version = "8.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9843,7 +10725,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9940,7 +10822,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10054,7 +10936,7 @@ dependencies = [
  "std-next",
  "subtle",
  "sync_wrapper",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tower",
@@ -10085,7 +10967,7 @@ dependencies = [
  "serde",
  "serde_json",
  "std-next",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
@@ -10102,28 +10984,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "saphyr-parser-bw"
-version = "0.0.610"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d643f5e972f17219245b82f038c22cd3c74320bb17c6e8f7e8537de268b1bc6"
-dependencies = [
- "arraydeque",
- "smallvec",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "saphyr-parser-bw"
-version = "0.0.611"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67dec0c833db75dc98957956b303fe447ffc5eb13f2325ef4c2350f7f3aa69e3"
-dependencies = [
- "arraydeque",
- "smallvec",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -10221,7 +11081,7 @@ dependencies = [
  "sqlx",
  "sqlx-core",
  "strum 0.28.0",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tracing",
  "url",
@@ -10237,7 +11097,7 @@ checksum = "4c800d9db902534d7d01728faf98e33d13c1d57bb8c57d8e4c518309172bddda"
 dependencies = [
  "arrow",
  "sea-query",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -10296,6 +11156,7 @@ checksum = "546040c653a705e60ec65ecd3191a809603734bebbc225775916dea9ae409b31"
 dependencies = [
  "chrono",
  "ordered-float 4.6.0",
+ "pgvector",
  "rust_decimal",
  "sea-query-derive",
  "serde_json",
@@ -10314,7 +11175,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -10323,6 +11184,7 @@ version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4eaa419cdb9157da1361186b1959983eb2ea0dcb9a3c69dc45c449ecb2af8fef"
 dependencies = [
+ "pgvector",
  "sea-query",
  "sqlx",
 ]
@@ -10445,55 +11307,33 @@ dependencies = [
 
 [[package]]
 name = "serde-saphyr"
-version = "0.0.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "546b4da4f679832602a8f8ab8ddc10b6b1d2e1a13b4f9dddcaee499436fa06ad"
-dependencies = [
- "ahash 0.8.12",
- "annotate-snippets",
- "base64 0.21.7",
- "encoding_rs_io",
- "getrandom 0.3.4",
- "nohash-hasher",
- "num-traits",
- "regex",
- "saphyr-parser-bw 0.0.610",
- "serde",
- "smallvec",
- "zmij",
-]
-
-[[package]]
-name = "serde-saphyr"
-version = "0.0.24"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f83ad47c2f14654528a89495f8d0dbc64173176f8512c7c72386cbe81009f661"
-dependencies = [
- "ahash 0.8.12",
- "annotate-snippets",
- "base64 0.21.7",
- "encoding_rs_io",
- "getrandom 0.3.4",
- "nohash-hasher",
- "num-traits",
- "saphyr-parser-bw 0.0.611",
- "serde",
- "smallvec",
- "zmij",
-]
-
-[[package]]
-name = "serde-saphyr"
 version = "0.0.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bd22781911de0ca6debda95f073c8f18bec65d1a94f1fa9573f3102e514cea4"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "getrandom 0.3.4",
- "granit-parser",
+ "granit-parser 0.0.7",
+ "nohash-hasher",
+ "num-traits",
+ "serde_core",
+ "smallvec",
+ "zmij",
+]
+
+[[package]]
+name = "serde-saphyr"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8050abb251097357e24aff63ba2c52a6309ecb7d23a5474023df960a02694d8"
+dependencies = [
+ "annotate-snippets",
+ "base64 0.23.1",
+ "encoding_rs_io",
+ "granit-parser 1.3.0",
  "nohash-hasher",
  "num-traits",
  "serde_core",
@@ -10632,7 +11472,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "smol_str",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -10707,9 +11547,9 @@ dependencies = [
 
 [[package]]
 name = "serial_test"
-version = "3.5.0"
+version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "699f4197115b8a7e7ff19c9a315a4bd6fffec26cc4626ef45ecaea389e081c6d"
+checksum = "a6df5ed973ad8d834e09f824f9e9f449af6b9a3745f78dec7cc752770bd3bf11"
 dependencies = [
  "fslock",
  "futures-executor",
@@ -10722,13 +11562,13 @@ dependencies = [
 
 [[package]]
 name = "serial_test_derive"
-version = "3.5.0"
+version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94e153fc76e1c6a068703d6d29c508a0b15c061c4b7e43da59cc097bc342673c"
+checksum = "a22144e767da4ddd8416dbf383700542ffd8a5dc493dfecedfe1fe3ad03c98ae"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -10881,7 +11721,7 @@ checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
 dependencies = [
  "num-bigint",
  "num-traits",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
 ]
 
@@ -10992,6 +11832,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "spm_precompiled"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5851699c4033c63636f7ea4cf7b7c1f1bf06d0cc03cfb42e711de5a5c46cf326"
+dependencies = [
+ "base64 0.13.1",
+ "nom 7.1.3",
+ "serde",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "sqlx"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11024,7 +11876,7 @@ dependencies = [
  "futures-io",
  "futures-util",
  "hashbrown 0.16.1",
- "hashlink",
+ "hashlink 0.11.1",
  "indexmap 2.14.0",
  "log",
  "memchr",
@@ -11035,7 +11887,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-stream",
@@ -11079,7 +11931,7 @@ dependencies = [
  "sqlx-postgres",
  "sqlx-sqlite",
  "syn 2.0.119",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "url",
 ]
@@ -11109,7 +11961,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.0",
  "sqlx-core",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tracing",
  "uuid",
@@ -11149,7 +12001,7 @@ dependencies = [
  "smallvec",
  "sqlx-core",
  "stringprep",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tracing",
  "uuid",
@@ -11176,7 +12028,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "sqlx-core",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tracing",
  "url",
@@ -11221,7 +12073,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04082e93ed1a06debd9148c928234b46d2cf260bc65f44e1d1d3fa594c5beebc"
 dependencies = [
  "simdutf8",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -11487,7 +12339,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11539,7 +12391,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -11566,11 +12418,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.18"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
- "thiserror-impl 2.0.18",
+ "thiserror-impl 2.0.20",
 ]
 
 [[package]]
@@ -11586,13 +12438,13 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.18"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -11705,10 +12557,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
-name = "tokio"
-version = "1.52.3"
+name = "tokenizers"
+version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
+checksum = "7afbf6e88718afcc138bad01d6ccc3051dbbc3b2ce9793d8b8a3aeb610969cfc"
+dependencies = [
+ "ahash 0.8.12",
+ "compact_str",
+ "daachorse",
+ "dary_heap",
+ "derive_builder",
+ "esaxx-rs",
+ "fancy-regex",
+ "getrandom 0.3.4",
+ "itertools 0.14.0",
+ "log",
+ "macro_rules_attribute",
+ "monostate",
+ "paste",
+ "rand 0.9.4",
+ "rayon",
+ "rayon-cond",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "spm_precompiled",
+ "thiserror 2.0.20",
+ "unicode-normalization-alignments",
+ "unicode-segmentation",
+ "unicode_categories",
+]
+
+[[package]]
+name = "tokio"
+version = "1.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
  "bytes",
  "libc",
@@ -11799,6 +12684,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 
@@ -12050,7 +12936,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "786d480bce6247ab75f005b14ae1624ad978d3029d9113f0a22fa1ac773faeaf"
 dependencies = [
  "crossbeam-channel",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tracing-subscriber",
 ]
@@ -12244,7 +13130,7 @@ dependencies = [
  "log",
  "rand 0.9.4",
  "sha1 0.10.6",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -12320,10 +13206,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "unicode-normalization-alignments"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43f613e4fa046e69818dd287fdc4bc78175ff20331479dab6e1b0f98d57062de"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
 name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unicode-width"
@@ -12336,6 +13237,12 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unicode_categories"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
 
 [[package]]
 name = "unsafe-libyaml"
@@ -12446,7 +13353,7 @@ dependencies = [
  "sea-orm-migration",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
@@ -12871,7 +13778,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -13343,7 +14250,7 @@ dependencies = [
  "nom 7.1.3",
  "oid-registry 0.8.1",
  "rusticata-macros",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
  "time",
 ]
 
@@ -13374,9 +14281,9 @@ dependencies = [
 
 [[package]]
 name = "xxhash-rust"
-version = "0.8.15"
+version = "0.8.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "y4m"

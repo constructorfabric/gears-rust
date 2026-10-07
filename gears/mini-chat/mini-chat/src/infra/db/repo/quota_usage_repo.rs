@@ -172,6 +172,24 @@ impl crate::domain::repos::QuotaUsageRepository for QuotaUsageRepository {
             .await?)
     }
 
+    async fn find_bucket_rows_for_periods<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        period_types: &[PeriodType],
+        period_starts: &[time::Date],
+    ) -> Result<Vec<QuotaUsageModel>, DomainError> {
+        Ok(
+            periods_query(tenant_id, user_id, period_types, period_starts)
+                .secure()
+                .scope_with(scope)
+                .all(runner)
+                .await?,
+        )
+    }
+
     async fn find_bucket_rows_for_update<C: DBRunner>(
         &self,
         runner: &C,
@@ -181,18 +199,7 @@ impl crate::domain::repos::QuotaUsageRepository for QuotaUsageRepository {
         period_types: &[PeriodType],
         period_starts: &[time::Date],
     ) -> Result<Vec<QuotaUsageModel>, DomainError> {
-        let period_type_values: Vec<_> = period_types
-            .iter()
-            .map(|pt| pt.clone().into_value())
-            .collect();
-
-        let base_query = QuotaUsageEntity::find().filter(
-            Condition::all()
-                .add(Column::TenantId.eq(tenant_id))
-                .add(Column::UserId.eq(user_id))
-                .add(Column::PeriodType.is_in(period_type_values))
-                .add(Column::PeriodStart.is_in(period_starts.iter().copied())),
-        );
+        let base_query = periods_query(tenant_id, user_id, period_types, period_starts);
 
         // FOR UPDATE on Postgres for pessimistic locking.
         // SeaORM omits the FOR UPDATE clause for SQLite backend since it's not supported.
@@ -275,4 +282,24 @@ impl crate::domain::repos::QuotaUsageRepository for QuotaUsageRepository {
             }
         }))
     }
+}
+
+/// A user's `quota_usage` rows of the given period types and starts.
+fn periods_query(
+    tenant_id: Uuid,
+    user_id: Uuid,
+    period_types: &[PeriodType],
+    period_starts: &[time::Date],
+) -> sea_orm::Select<QuotaUsageEntity> {
+    let period_type_values: Vec<_> = period_types
+        .iter()
+        .map(|pt| pt.clone().into_value())
+        .collect();
+    QuotaUsageEntity::find().filter(
+        Condition::all()
+            .add(Column::TenantId.eq(tenant_id))
+            .add(Column::UserId.eq(user_id))
+            .add(Column::PeriodType.is_in(period_type_values))
+            .add(Column::PeriodStart.is_in(period_starts.iter().copied())),
+    )
 }

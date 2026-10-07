@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-db"
-version = "0.16.0"
+version = "0.16.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -146,6 +146,7 @@ harness = false
 required-features = ["_any-backend"]
 
 [dev-dependencies]
+strum = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
 toolkit-utils = { workspace = true, features = ["serde"] }

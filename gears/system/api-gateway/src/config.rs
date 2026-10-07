@@ -96,8 +96,8 @@ pub struct ApiGatewayConfig {
     #[serde(default)]
     pub gateway_proxy: GatewayProxyConfig,
 
-    /// Platform-plane credential for the embedded platform-host, serving **both
-    /// directions** from one block:
+    /// Platform-plane credential for the embedded flight-control host, serving
+    /// **both directions** from one block:
     ///
     /// - **Inbound** — `internal_auth_middleware`, installed ahead of the tenant
     ///   plane, validates the `X-ToolKit-Internal-Token` on co-hosted internal
@@ -155,7 +155,7 @@ pub struct GatewayProxyConfig {
     /// Enable the directory-driven reverse proxy.
     pub enabled: bool,
     /// gRPC endpoint of the `DirectoryService` (e.g. the grpc-hub endpoint,
-    /// `http://gear-orchestrator:50051`). Required when `enabled` is true.
+    /// `http://service-discovery:50051`). Required when `enabled` is true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub directory_endpoint: Option<String>,
     /// Interval (seconds) between directory polls that refresh the proxy route
@@ -194,7 +194,7 @@ impl GatewayProxyConfig {
             _ => Err(
                 "invalid gateway_proxy configuration: `gateway_proxy.enabled` is true but \
                  `gateway_proxy.directory_endpoint` is unset or empty; set it to the \
-                 DirectoryService gRPC endpoint (e.g. \"http://gear-orchestrator:50051\") \
+                 DirectoryService gRPC endpoint (e.g. \"http://service-discovery:50051\") \
                  or disable the reverse proxy"
                     .to_owned(),
             ),
@@ -670,7 +670,7 @@ mod tests {
     fn enabled_proxy_with_endpoint_is_accepted() {
         let cfg = GatewayProxyConfig {
             enabled: true,
-            directory_endpoint: Some("http://gear-orchestrator:50051".to_owned()),
+            directory_endpoint: Some("http://service-discovery:50051".to_owned()),
             ..GatewayProxyConfig::default()
         };
         assert!(cfg.validate().is_ok());

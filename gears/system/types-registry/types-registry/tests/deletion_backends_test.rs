@@ -1,4 +1,3 @@
-//! Deletion and dry-run checks on PostgreSQL and MySQL (T20).
 //! Cover dependant rechecks under the write-order claim, unchanged dry-run entity
 //! state and sequence, and publication accepted by `ck_tr_operation_item_state`.
 
@@ -21,7 +20,9 @@ use uuid::Uuid;
 
 use common::{allow_all, provider_for, stores};
 use types_registry::config::TypesRegistryConfig;
-use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
+use types_registry::domain::admission::acceptance::{
+    AcceptanceContext, AcceptanceError, accept_deletion,
+};
 use types_registry::domain::admission::worker::{ItemOutcome, Tuning, WorkerError, run_operation};
 use types_registry::domain::admission::{
     AdmissionFailureReason, Candidate, OperationDispatch, SubmitRequest,
@@ -45,8 +46,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -74,7 +79,8 @@ async fn pass(
 ) -> ItemOutcome {
     let config = TypesRegistryConfig::default();
     let provider = DBProvider::<AcceptanceError>::new(db.db());
-    let operation_id = accept(
+    let operation_id = common::accept_as(
+        kind,
         &stores(),
         &provider,
         &allow_all(),
@@ -84,9 +90,8 @@ async fn pass(
             metrics: &common::metrics(),
         },
         &(Arc::new(NoDispatch) as Arc<dyn OperationDispatch>),
-        &SubmitRequest {
-            idempotency_key: key.to_owned(),
-            kind,
+        SubmitRequest {
+            idempotency_key: Some(key.to_owned()),
             dry_run,
             candidates: vec![candidate],
         },
@@ -324,7 +329,7 @@ async fn assert_batch_order(db: &Arc<DBProvider<DbError>>, backend: &str) {
     // Submitted target-first, which is the order that fails without ordering.
     let config = TypesRegistryConfig::default();
     let provider = DBProvider::<AcceptanceError>::new(db.db());
-    let operation_id = accept(
+    let operation_id = accept_deletion(
         &stores(),
         &provider,
         &allow_all(),
@@ -334,12 +339,11 @@ async fn assert_batch_order(db: &Arc<DBProvider<DbError>>, backend: &str) {
             metrics: &common::metrics(),
         },
         &(Arc::new(NoDispatch) as Arc<dyn OperationDispatch>),
-        &SubmitRequest {
-            idempotency_key: "batch-del".to_owned(),
-            kind: OperationKind::Deletion,
+        &common::deletion_of(SubmitRequest {
+            idempotency_key: Some("batch-del".to_owned()),
             dry_run: false,
             candidates: vec![removal(BATCH_BASE, 1), removal(BATCH_HOLDER, 1)],
-        },
+        }),
         NOW,
     )
     .await

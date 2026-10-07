@@ -1,0 +1,441 @@
+// Created: 2026-09-07 by Virtuozzo International GmbH
+// @cpt-dod:cpt-cf-settings-service-dod-audit-store-transactional-sink:p1
+// @cpt-dod:cpt-cf-settings-service-dod-audit-store-retention:p1
+//! The R1 `AuditSink`: the gear's own `audit_records` table, written in the
+//! mutation's transaction, read back for the per-(setting, scope) history, and
+//! pruned by retention and nothing else.
+
+use async_trait::async_trait;
+use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+use time::{Duration, OffsetDateTime};
+use toolkit_db::odata::{FieldToColumn, LimitCfg, ODataFieldMapping, paginate_odata};
+use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
+use toolkit_odata::filter::{FieldKind, FilterField};
+use toolkit_odata::{ODataQuery, Page, SortDir};
+use toolkit_security::AccessScope;
+use uuid::Uuid;
+
+use crate::audit::{
+    ActorClassification, AuditOperation, AuditOutcome, AuditRecord, AuditSink, AuditValue,
+    StoredAuditRecord,
+};
+use crate::domain::error::DomainError;
+use crate::infra::storage::entity::audit_record::{self, Entity as AuditEntity};
+
+/// Page bounds of the history read.
+const HISTORY_LIMIT_CFG: LimitCfg = LimitCfg {
+    default: 50,
+    max: 200,
+};
+
+/// The store. Stateless: every operation takes its connection.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AuditStore;
+
+fn unavailable(err: impl std::fmt::Display) -> DomainError {
+    DomainError::dependency_unavailable("audit store", "complete the operation", err)
+}
+
+fn image_to_json(image: Option<&AuditValue>) -> Option<serde_json::Value> {
+    image.map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null))
+}
+
+/// The stored image back into the domain. An absent column is an absent
+/// image; a column that holds something the domain cannot read is an
+/// integrity fault of the record, reported as such — an image is evidence of
+/// what changed, and reading it as "no image" would erase that evidence
+/// without a sign, the same way an unknown operation is refused rather than
+/// guessed.
+fn image_from_json(
+    record: Uuid,
+    which: &str,
+    json: Option<serde_json::Value>,
+) -> Result<Option<AuditValue>, DomainError> {
+    json.map(|v| {
+        serde_json::from_value(v).map_err(|err| DomainError::Internal {
+            diagnostic: format!(
+                "audit record {record} carries a {which} that does not decode: {err}"
+            ),
+        })
+    })
+    .transpose()
+}
+
+fn to_domain(model: audit_record::Model) -> Result<StoredAuditRecord, DomainError> {
+    let corrupt = |what: &str, raw: &str| DomainError::Internal {
+        diagnostic: format!(
+            "audit record {} carries an unknown {what} `{raw}`",
+            model.id
+        ),
+    };
+    Ok(StoredAuditRecord {
+        id: model.id,
+        declaration_key: model.declaration_key,
+        tenant_id: model.tenant_id,
+        operation: AuditOperation::parse(&model.operation)
+            .ok_or_else(|| corrupt("operation", &model.operation))?,
+        actor: model.actor,
+        actor_classification: ActorClassification::parse(&model.actor_classification)
+            .ok_or_else(|| corrupt("actor classification", &model.actor_classification))?,
+        pre_image: image_from_json(model.id, "pre-image", model.pre_value)?,
+        post_image: image_from_json(model.id, "post-image", model.post_value)?,
+        outcome: AuditOutcome::parse(&model.outcome)
+            .ok_or_else(|| corrupt("outcome", &model.outcome))?,
+        request_id: model.request_id,
+        change_set_id: model.change_set_id,
+        occurred_at: model.occurred_at,
+        retain_until: model.retain_until,
+    })
+}
+
+/// The cursor binding of one history: the `(declaration_key, tenant)` pair.
+fn history_binding(declaration_key: &str, tenant_id: Uuid) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    declaration_key.hash(&mut hasher);
+    tenant_id.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// The orderable surface of the history read: newest first, ties broken by id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AuditFilterField {
+    /// When the record was written.
+    OccurredAt,
+    /// The row identity, as the tiebreaker.
+    Id,
+}
+
+impl FilterField for AuditFilterField {
+    const FIELDS: &'static [Self] = &[Self::OccurredAt, Self::Id];
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::OccurredAt => "occurred_at",
+            Self::Id => "id",
+        }
+    }
+
+    fn kind(&self) -> FieldKind {
+        match self {
+            Self::OccurredAt => FieldKind::DateTimeUtc,
+            Self::Id => FieldKind::Uuid,
+        }
+    }
+}
+
+/// Column mapping for the history page.
+pub struct AuditODataMapper;
+
+impl FieldToColumn<AuditFilterField> for AuditODataMapper {
+    type Column = audit_record::Column;
+
+    fn map_field(field: AuditFilterField) -> audit_record::Column {
+        match field {
+            AuditFilterField::OccurredAt => audit_record::Column::OccurredAt,
+            AuditFilterField::Id => audit_record::Column::Id,
+        }
+    }
+}
+
+impl ODataFieldMapping<AuditFilterField> for AuditODataMapper {
+    type Entity = AuditEntity;
+
+    fn extract_cursor_value(
+        model: &audit_record::Model,
+        field: AuditFilterField,
+    ) -> sea_orm::Value {
+        match field {
+            AuditFilterField::OccurredAt => model.occurred_at.into(),
+            AuditFilterField::Id => model.id.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl AuditSink for AuditStore {
+    async fn append<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        record: AuditRecord,
+    ) -> Result<(), DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-4
+        let active = audit_record::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            resource: Set(record.resource),
+            declaration_key: Set(record.declaration_key),
+            tenant_id: Set(record.tenant_id),
+            operation: Set(record.operation.as_str().to_owned()),
+            actor: Set(record.actor),
+            actor_classification: Set(record.actor_classification.as_str().to_owned()),
+            pre_value: Set(image_to_json(record.pre_image.as_ref())),
+            post_value: Set(image_to_json(record.post_image.as_ref())),
+            outcome: Set(record.outcome.as_str().to_owned()),
+            request_id: Set(record.request_id),
+            change_set_id: Set(record.change_set_id),
+            // The shared clock, aligned to what Postgres keeps: both backends
+            // then hold the same instant, as for every other timestamp column,
+            // and the history cursor minted from it means the same on either.
+            occurred_at: Set(crate::infra::storage::clock::now()),
+            retain_until: Set(record.retain_until),
+        };
+        // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-4
+        // @cpt-begin:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-5
+        // @cpt-begin:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-6
+        // @cpt-begin:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-7
+        // Inside the caller's transaction, on the scoped write path. A failure
+        // here is unavailability: the caller propagates it and the transaction
+        // rolls back, so the change it audits never commits without it. Nothing
+        // else is tracked — the record lives or dies with the mutation.
+        toolkit_db::secure::secure_insert::<AuditEntity>(active, scope, conn)
+            .await
+            .map(|_| ())
+            .map_err(unavailable)
+        // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-7
+        // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-6
+        // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-5
+    }
+}
+
+impl AuditStore {
+    /// The history of one setting at one scope, newest first, cursor-paginated.
+    ///
+    /// An index lookup on `(declaration_key, tenant_id)`; `query` contributes
+    /// only `limit` and `cursor`, the order being fixed.
+    ///
+    /// # Errors
+    /// [`DomainError::Validation`] on a malformed cursor; [`DomainError`] when
+    /// the read fails.
+    pub async fn history<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_key: &str,
+        tenant_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<StoredAuditRecord>, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-7
+        // The scope's own records, plus the setting's scopeless ones. A
+        // declaration event belongs to no tenant and would otherwise be
+        // invisible from every scope — including the one the reader is asking
+        // about — yet "who defined this setting, and when" is part of the same
+        // story as "who changed its value here". `tenant_id = $1` is never true
+        // for NULL, so the branch has to be explicit.
+        let base = AuditEntity::find()
+            .filter(audit_record::Column::DeclarationKey.eq(declaration_key))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(audit_record::Column::TenantId.eq(tenant_id))
+                    .add(audit_record::Column::TenantId.is_null()),
+            )
+            .secure()
+            .scope_with(scope);
+        let paged = ODataQuery {
+            filter: None,
+            order: toolkit_odata::ODataOrderBy(vec![toolkit_odata::OrderKey {
+                field: "occurred_at".to_owned(),
+                dir: SortDir::Desc,
+            }]),
+            limit: query.limit,
+            cursor: query.cursor.clone(),
+            // Bound to the pair this history pages: a cursor minted for another
+            // setting's or another scope's history carries another binding and
+            // is refused, instead of applying its boundary here.
+            filter_hash: Some(history_binding(declaration_key, tenant_id)),
+            select: None,
+        };
+        let page = paginate_odata::<AuditFilterField, AuditODataMapper, _, _, _, _>(
+            base,
+            conn,
+            &paged,
+            ("id", SortDir::Desc),
+            HISTORY_LIMIT_CFG,
+            |m: audit_record::Model| m,
+        )
+        .await
+        .map_err(|err| DomainError::Validation {
+            field: "query".to_owned(),
+            code: crate::field::ODATA_QUERY,
+            message: err.to_string(),
+        })?;
+        // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-7
+        let items = page
+            .items
+            .into_iter()
+            .map(to_domain)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Page {
+            items,
+            page_info: page.page_info,
+        })
+    }
+
+    /// Delete at most `limit` of the records past their retention horizon,
+    /// returning how many.
+    ///
+    /// The only delete the table ever sees: rows with an explicit `retain_until`
+    /// behind `now`, found through `idx_audit_retention`, and rows without one
+    /// whose `occurred_at` plus the configured default is behind `now`, found
+    /// through `idx_audit_default_horizon`. Bounded, so one call is one short
+    /// statement and a backlog is worked off over several, each its own commit;
+    /// fewer than `limit` deleted means nothing expired is left.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the delete fails.
+    pub async fn prune_expired<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        now: OffsetDateTime,
+        default_retention: Duration,
+        limit: u64,
+    ) -> Result<u64, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-algo-audit-store-retention:p1:inst-as-ret-3
+        let default_cutoff = now - default_retention;
+        let expired = sea_orm::Condition::any()
+            .add(
+                sea_orm::Condition::all()
+                    .add(audit_record::Column::RetainUntil.is_not_null())
+                    .add(audit_record::Column::RetainUntil.lt(now)),
+            )
+            .add(
+                sea_orm::Condition::all()
+                    .add(audit_record::Column::RetainUntil.is_null())
+                    .add(audit_record::Column::OccurredAt.lt(default_cutoff)),
+            );
+        // Two statements, each on its own index. The batch's ids first, through
+        // the two partial horizon indexes; unordered on purpose, since any
+        // expired record may go in any batch and a sort would make each one
+        // gather every expired row. Then the delete by that id list, through
+        // the primary key. One `DELETE … WHERE id IN (subquery)` is what
+        // PostgreSQL plans as a scan of the whole table joined to the batch —
+        // measured on three million rows at 145 ms a batch against 11 ms for
+        // the two statements, and growing with the table where these do not.
+        let ids: Vec<Uuid> = AuditEntity::find()
+            .filter(expired)
+            .secure()
+            .scope_with(scope)
+            .limit(limit)
+            .project_all(conn, |q| {
+                q.select_only()
+                    .column(audit_record::Column::Id)
+                    .into_model::<IdRow>()
+            })
+            .await
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // A concurrent pass may take some of these first; the count says so.
+        let outcome = AuditEntity::delete_many()
+            .filter(audit_record::Column::Id.is_in(ids))
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(unavailable)?;
+        Ok(outcome.rows_affected)
+        // @cpt-end:cpt-cf-settings-service-algo-audit-store-retention:p1:inst-as-ret-3
+    }
+
+    /// Write the configured retention where the database's trigger reads it,
+    /// so the trigger refuses deleting a record younger than it, not only one
+    /// younger than the platform minimum. Written before every retention pass,
+    /// which keeps it current with the configuration and retries a failed
+    /// write on the next pass.
+    ///
+    /// One statement: the row is seeded by a migration, so this only ever
+    /// updates it and two replicas' passes have nothing to race for. A row
+    /// that is not there is a schema the migrations did not produce.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the write fails, `days` does not fit the column, or
+    /// the seeded row is missing.
+    pub async fn record_retention<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        days: u32,
+    ) -> Result<(), DomainError> {
+        use crate::infra::storage::entity::audit_policy::{self, Entity as PolicyEntity};
+        let days = i32::try_from(days).map_err(|_| DomainError::Internal {
+            diagnostic: format!("an audit retention of {days} days does not fit the policy"),
+        })?;
+        let now = crate::infra::storage::clock::now();
+        let updated = PolicyEntity::update_many()
+            .col_expr(
+                audit_policy::Column::RetentionDays,
+                sea_orm::sea_query::Expr::value(days),
+            )
+            .col_expr(
+                audit_policy::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .filter(audit_policy::Column::Id.eq(1_i16))
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(unavailable)?;
+        if updated.rows_affected == 0 {
+            return Err(DomainError::Internal {
+                diagnostic: "the audit retention policy row the migrations seed is missing"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The retention the trigger currently reads, if the gear has written one.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    pub async fn recorded_retention<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+    ) -> Result<Option<u32>, DomainError> {
+        use crate::infra::storage::entity::audit_policy::Entity as PolicyEntity;
+        let row = PolicyEntity::find()
+            .secure()
+            .scope_with(scope)
+            .one(conn)
+            .await
+            .map_err(unavailable)?;
+        Ok(row.and_then(|r| u32::try_from(r.retention_days).ok()))
+    }
+
+    /// Every record of one change set, for callers that retrieve them together.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    pub async fn by_change_set<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        change_set_id: Uuid,
+    ) -> Result<Vec<StoredAuditRecord>, DomainError> {
+        let rows = AuditEntity::find()
+            .filter(audit_record::Column::ChangeSetId.eq(change_set_id))
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(unavailable)?;
+        rows.into_iter().map(to_domain).collect()
+    }
+}
+
+/// One record's id, the only column a retention batch selects.
+#[derive(sea_orm::FromQueryResult)]
+struct IdRow {
+    id: Uuid,
+}
+
+#[cfg(test)]
+#[path = "audit_store_tests.rs"]
+mod audit_store_tests;

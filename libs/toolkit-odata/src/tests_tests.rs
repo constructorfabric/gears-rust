@@ -390,3 +390,33 @@ fn test_parse_filter_string_error_contains_position() {
         "InvalidFilter should contain position and expectation info, got: {msg}"
     );
 }
+
+/// A cursor issued for a filter is bound to it: the continuation must send the
+/// same filter. The cursor carries only its hash, so a dropped filter cannot be
+/// restored and is a mismatch. A cursor without a hash is accepted under any
+/// filter (legacy cursors; an added filter only narrows the page).
+#[test]
+fn test_validate_cursor_against_requires_the_cursor_filter() {
+    let order = ODataOrderBy(vec![OrderKey {
+        field: "id".to_owned(),
+        dir: SortDir::Asc,
+    }]);
+    let cursor = |f: Option<&str>| CursorV1 {
+        k: vec!["1".to_owned()],
+        o: SortDir::Asc,
+        s: order.to_signed_tokens(),
+        f: f.map(str::to_owned),
+        d: "fwd".to_owned(),
+    };
+    let check = |c: &CursorV1, h: Option<&str>| crate::validate_cursor_against(c, &order, h);
+
+    assert!(check(&cursor(Some("h1")), Some("h1")).is_ok());
+    assert!(check(&cursor(None), None).is_ok());
+    assert!(check(&cursor(None), Some("h1")).is_ok());
+    for (cur, hash) in [(Some("h1"), Some("h2")), (Some("h1"), None)] {
+        assert!(
+            matches!(check(&cursor(cur), hash), Err(Error::FilterMismatch)),
+            "cursor filter {cur:?} with request filter {hash:?}"
+        );
+    }
+}

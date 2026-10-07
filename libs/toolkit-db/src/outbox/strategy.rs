@@ -1,8 +1,13 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
 
 use super::batch::Batch;
 use super::handler::{HandlerResult, LeasedHandler, OutboxMessage, TransactionalHandler};
 use super::store::OutboxStore;
+use super::subscription::TraceMailbox;
+use super::taskward::stop_deadline;
 use super::trace::TraceAdvance;
 use super::types::{LeaseConfig, OutboxError};
 use crate::Db;
@@ -14,8 +19,21 @@ pub struct ProcessContext<'a> {
     pub store: OutboxStore<'a>,
     pub partition_id: i64,
     /// Who this instance is, and who is waiting for a completion.
-    pub mailbox: &'a super::subscription::Mailbox,
+    pub trace_mailbox: &'a TraceMailbox,
+    /// Cancelled when the outbox shuts down.
+    pub cancel: &'a CancellationToken,
+    /// How long a handler may keep running after `cancel` fires before its
+    /// future is dropped (`WorkerTuning::stop_grace`).
+    pub stop_grace: Duration,
 }
+
+/// Outcome recorded for a batch whose handler was stopped by shutdown.
+const SHUTTING_DOWN: &str = "outbox shutting down";
+
+/// Time the worker allows a transactional pass to roll back after its handler
+/// was dropped at shutdown - the counterpart of the lease headroom a leased
+/// pass reserves for its ack.
+pub const ROLLBACK_ALLOWANCE: Duration = Duration::from_secs(2);
 
 /// Sealed trait for compile-time processing mode dispatch.
 ///
@@ -200,7 +218,7 @@ fn trace_progress(
 async fn apply_trace_progress(
     conn: &DatabaseExecutor<'_>,
     store: &OutboxStore<'_>,
-    mailbox: &super::subscription::Mailbox,
+    trace_mailbox: &TraceMailbox,
     progress: &[TraceCountdown],
 ) -> Result<Vec<super::trace::TraceOutcome>, OutboxError> {
     let mut claimed = Vec::new();
@@ -229,7 +247,7 @@ async fn apply_trace_progress(
         // to this instance. Another instance's mail is left for its owner's
         // poller, which is what makes delivery the submitter's alone.
         if let Some(outcome) = store
-            .exec_claim_trace_mail(conn, trace, mailbox.instance_id())
+            .exec_claim_trace_mail(conn, trace, trace_mailbox.instance_id())
             .await?
         {
             claimed.push(outcome);
@@ -243,13 +261,10 @@ async fn apply_trace_progress(
 /// Mail with nobody waiting was stamped delivered by the claim and is
 /// discarded here rather than retained: the guard was dropped, or this is not
 /// the process that asked.
-fn deliver_claimed(
-    mailbox: &super::subscription::Mailbox,
-    claimed: Vec<super::trace::TraceOutcome>,
-) {
+fn deliver_claimed(trace_mailbox: &TraceMailbox, claimed: Vec<super::trace::TraceOutcome>) {
     for outcome in claimed {
         let trace = outcome.trace.clone();
-        if !mailbox.subscriptions().deliver(outcome) {
+        if !trace_mailbox.registry().deliver(outcome) {
             tracing::debug!(trace = %trace, "trace completed with nobody waiting on it");
         }
     }
@@ -306,7 +321,7 @@ async fn ack(
     partition_id: i64,
     msgs: &[OutboxMessage],
     trace_ids: &TraceIds,
-    mailbox: &super::subscription::Mailbox,
+    trace_mailbox: &TraceMailbox,
     result: &HandlerResult,
 ) -> Result<Vec<super::trace::TraceOutcome>, OutboxError> {
     let last_seq = msgs.last().map_or(0, |m| m.seq);
@@ -328,7 +343,7 @@ async fn ack(
             .await?;
 
             let progress = trace_progress(msgs, trace_ids, last_seq, &HashSet::new());
-            claimed = apply_trace_progress(conn, store, mailbox, &progress).await?;
+            claimed = apply_trace_progress(conn, store, trace_mailbox, &progress).await?;
         }
         HandlerResult::Retry { reason } => {
             conn.execute_raw(Statement::from_sql_and_values(
@@ -381,7 +396,7 @@ async fn ack(
             // as little of the transaction as possible.
             let failed: HashSet<i64> = msgs.iter().map(|m| m.seq).collect();
             let progress = trace_progress(msgs, trace_ids, last_seq, &failed);
-            claimed = apply_trace_progress(conn, store, mailbox, &progress).await?;
+            claimed = apply_trace_progress(conn, store, trace_mailbox, &progress).await?;
         }
     }
 
@@ -462,10 +477,19 @@ impl ProcessingStrategy for TransactionalStrategy {
         #[allow(clippy::cast_possible_truncation)]
         let count = msgs.len() as u32;
 
-        let result = self
-            .handler
-            .handle(&DatabaseExecutor::Transaction(&txn), &msgs)
-            .await;
+        // No token reaches a transactional handler: at shutdown its future is
+        // dropped once the grace is spent, and the rollback undoes whatever it
+        // wrote, so the batch is simply redelivered.
+        let exec = DatabaseExecutor::Transaction(&txn);
+        let outcome = tokio::select! {
+            biased;
+            r = self.handler.handle(&exec, &msgs) => Some(r),
+            () = stop_deadline(ctx.cancel, ctx.stop_grace) => None,
+        };
+        let Some(result) = outcome else {
+            txn.rollback().await?;
+            return Ok(None);
+        };
         #[allow(clippy::cast_possible_truncation)]
         let pc = self.handler.processed_count().map(|n| n as u32);
 
@@ -482,7 +506,7 @@ impl ProcessingStrategy for TransactionalStrategy {
             ctx.partition_id,
             &msgs,
             &trace_ids,
-            ctx.mailbox,
+            ctx.trace_mailbox,
             &result,
         )
         .await?;
@@ -490,7 +514,7 @@ impl ProcessingStrategy for TransactionalStrategy {
         txn.commit().await?;
 
         // Committed, so the completion is now true and may be handed over.
-        deliver_claimed(ctx.mailbox, claimed);
+        deliver_claimed(ctx.trace_mailbox, claimed);
 
         Ok(Some(ProcessResult {
             count,
@@ -680,7 +704,8 @@ async fn lease_guarded_ack(
             if ok {
                 let progress = trace_progress(msgs, trace_ids, seq, &rejected);
                 claimed.extend(
-                    apply_trace_progress(&ack_exec, &ctx.store, ctx.mailbox, &progress).await?,
+                    apply_trace_progress(&ack_exec, &ctx.store, ctx.trace_mailbox, &progress)
+                        .await?,
                 );
             }
             ok
@@ -693,7 +718,8 @@ async fn lease_guarded_ack(
                 if ok {
                     let progress = trace_progress(msgs, trace_ids, advance_seq, &rejected);
                     claimed.extend(
-                        apply_trace_progress(&ack_exec, &ctx.store, ctx.mailbox, &progress).await?,
+                        apply_trace_progress(&ack_exec, &ctx.store, ctx.trace_mailbox, &progress)
+                            .await?,
                     );
                     // Only the traces still represented in the retried tail.
                     // A trace whose entities were all in the acked prefix is
@@ -724,7 +750,8 @@ async fn lease_guarded_ack(
             if ok {
                 let progress = trace_progress(msgs, trace_ids, last_seq, &failed);
                 claimed.extend(
-                    apply_trace_progress(&ack_exec, &ctx.store, ctx.mailbox, &progress).await?,
+                    apply_trace_progress(&ack_exec, &ctx.store, ctx.trace_mailbox, &progress)
+                        .await?,
                 );
             }
             ok
@@ -744,7 +771,7 @@ async fn lease_guarded_ack(
     }
 
     ack_txn.commit().await?;
-    deliver_claimed(ctx.mailbox, claimed);
+    deliver_claimed(ctx.trace_mailbox, claimed);
 
     Ok(Some(ProcessResult {
         count,
@@ -786,8 +813,9 @@ use std::sync::Arc;
 /// Processes messages under a time-limited lease using `LeasedHandler`.
 ///
 /// Three-phase pipeline: acquire lease + read, call handler with `timeout_at`,
-/// lease-guarded ack. Cancellation is graceful: `batch.remaining()` signals
-/// the handler to stop between messages; `timeout_at` is the hard backstop.
+/// lease-guarded ack. Cancellation is graceful: `batch.should_stop()` signals
+/// the handler to stop between messages; dropping the handler future at the
+/// lease deadline or `stop_grace` after shutdown is the hard backstop.
 pub struct LeasedStrategy {
     handler: Arc<dyn LeasedHandler>,
     worker_id: String,
@@ -821,6 +849,12 @@ impl ProcessingStrategy for LeasedStrategy {
         // NOW(), so our Rust deadline must track the same origin.
         let lease_start = tokio::time::Instant::now();
 
+        // A pass that starts after shutdown takes no lease, so the message
+        // keeps its full delivery budget for the next process.
+        if ctx.cancel.is_cancelled() {
+            return Ok(None);
+        }
+
         let Some((msgs, trace_ids)) =
             acquire_lease_and_read(ctx, &self.worker_id, lease_secs, msg_batch_size).await?
         else {
@@ -829,20 +863,28 @@ impl ProcessingStrategy for LeasedStrategy {
 
         // Phase 2: call handler with graceful two-phase cancellation.
         //
-        // Soft signal: batch.remaining() returns Duration::ZERO after the
-        // deadline. The blanket impl checks this between messages and stops
-        // starting new work.
+        // Soft signal: batch.should_stop() turns true once the lease budget is
+        // spent or the outbox is shutting down. The blanket impl checks it
+        // between messages and stops starting new work.
         //
-        // Hard drop: timeout_at drops the handler future if it didn't return
-        // before the deadline (catches handlers that ignore remaining()).
+        // Hard drop: the handler future is dropped at the lease deadline, or
+        // `stop_grace` after shutdown, whichever comes first (catches handlers
+        // that ignore should_stop()). Either way phase 3 still runs, and its
+        // ack is what hands the partition back.
         let deadline = lease_start + self.lease_config.handler_budget();
-        let mut batch = Batch::new(&msgs, deadline);
+        let mut batch = Batch::new(&msgs, deadline, ctx.cancel.clone());
 
-        let result = tokio::time::timeout_at(deadline, self.handler.handle(&mut batch))
-            .await
-            .unwrap_or_else(|_| HandlerResult::Retry {
-                reason: "lease expired".into(),
-            });
+        let result = tokio::select! {
+            biased;
+            r = tokio::time::timeout_at(deadline, self.handler.handle(&mut batch)) => {
+                r.unwrap_or_else(|_| HandlerResult::Retry {
+                    reason: "lease expired".into(),
+                })
+            }
+            () = stop_deadline(ctx.cancel, ctx.stop_grace) => HandlerResult::Retry {
+                reason: SHUTTING_DOWN.into(),
+            },
+        };
 
         // Phase 3: lease-guarded ack
         lease_guarded_ack(

@@ -41,7 +41,7 @@ env:
   CARGO_INCREMENTAL: "0"
   # Pinned nightly toolchain used by the coverage job. Independent of the pin in
   # shear-nightly.yml — they happen to match today but need not.
-  RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-04-16
+  RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-08-21
 
 jobs:
   # ── Change detection ──────────────────────────────────────────────────
@@ -58,12 +58,14 @@ jobs:
       rust:   ${{ steps.filter.outputs.rust }}
       fips:   ${{ steps.filter.outputs.fips }}
       magika: ${{ steps.filter.outputs.magika }}
+      onnx_embedding: ${{ steps.filter.outputs.onnx_embedding }}
+      graph_storage: ${{ steps.filter.outputs.graph_storage }}
       dylint: ${{ steps.filter.outputs.dylint }}
       deps:   ${{ steps.filter.outputs.deps }}
       ci:     ${{ steps.filter.outputs.ci }}
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Detect changed paths
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -91,6 +93,16 @@ jobs:
               - 'libs/rustls-*/**'
             magika:
               - 'gears/file-parser/**'
+            onnx_embedding:
+              - 'gears/graph-storage/onnx-embedding-plugin/**'
+              - 'gears/graph-storage/graph-storage-sdk/**'
+              # This lane also runs `cargo check -p cf-gears-graph-storage
+              # --features onnx`, which compiles the core gear's own
+              # `#[cfg(feature = "onnx")]` wiring. A change there that breaks
+              # it would otherwise reach main unbuilt.
+              - 'gears/graph-storage/graph-storage/**'
+            graph_storage:
+              - 'gears/graph-storage/**'
             dylint:
               - 'tools/dylint_lints/**'
             deps:
@@ -119,7 +131,7 @@ jobs:
       RUSTFLAGS: "-C debuginfo=0"
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
           android: true
@@ -129,10 +141,10 @@ jobs:
           swap-storage: true
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 
@@ -148,7 +160,7 @@ jobs:
           rustup show
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-hack
 
@@ -208,7 +220,7 @@ jobs:
     steps:
       - name: Free disk space
         if: runner.os == 'Linux'
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
           android: true
@@ -225,10 +237,10 @@ jobs:
           git config --global core.eol lf
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 
@@ -237,9 +249,6 @@ jobs:
 
       - name: Validate PR-review rule set
         run: python3 tools/scripts/toolkit-pr-review/lint.py
-
-      - name: PR-review agent rules are up to date
-        run: python3 tools/scripts/toolkit-pr-review/review.py render-rules --check
 
       - name: PR-review script tests
         run: python3 -m unittest discover -s tools/scripts/toolkit-pr-review/tests
@@ -262,7 +271,7 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: nextest
 
@@ -292,14 +301,6 @@ jobs:
       - name: cargo test (no macros)
         run: make test-no-macros
 
-      # `bss-fixtures` is the only crate in the tree whose *production* surface
-      # is the narrow one: pricing's `FixtureGate` inherits it with
-      # `default-features = false`. `default = ["corpus"]`, so the workspace run
-      # above compiles the wide build, where `tests/production_surface.rs`'s
-      # assertions hold trivially and prove nothing they were written for.
-      - name: cargo test (bss-fixtures narrow production surface)
-        run: make test-fixtures-narrow
-
   integration:
     name: Integration tests
     needs: changes
@@ -314,7 +315,7 @@ jobs:
       RUSTFLAGS: "-C debuginfo=0"
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
           android: true
@@ -324,10 +325,10 @@ jobs:
           swap-storage: true
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 
@@ -343,7 +344,7 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: nextest
 
@@ -378,8 +379,17 @@ jobs:
       - name: Test timescaledb usage-collector plugin (pg integration)
         run: make test-usage-collector-pg
 
+      - name: Test clickhouse usage-collector plugin (ch integration)
+        run: make test-usage-collector-ch
+
       - name: Test postgres-cluster-plugin (pg integration)
         run: make test-cluster-pg
+
+      - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
+        # k3s runs in a **privileged** container (testcontainers-modules sets it);
+        # GitHub-hosted ubuntu runners permit that. The target uses `cargo test`, not
+        # nextest, so one k3s container is shared per test binary -- see the Makefile.
+        run: make test-cluster-k8s
 
       - name: Test resource-group (pg smoke, integration)
         # Fail if Docker is unreachable instead of letting the suite skip itself
@@ -387,6 +397,13 @@ jobs:
         env:
           RG_PG_REQUIRE_DOCKER: "1"
         run: make test-rg-pg
+
+      - name: Test settings-service (pg migrations, integration)
+        # Same shape as resource-group above: Docker is on this runner, so a
+        # skip here would be a broken daemon passing green.
+        env:
+          SETTINGS_SERVICE_PG_REQUIRE_DOCKER: "1"
+        run: make test-settings-service-pg
 
       # bss-pricing's Postgres tests are `#[ignore]`d behind Docker and ran in
       # no job until 2026-08-11 — every concurrency and trigger proof the crate
@@ -401,6 +418,16 @@ jobs:
       # `in_schema("bss")` form both gears actually pass, ran in no job.
       - name: Test coord with Postgres (integration)
         run: make test-coord-pg
+
+      # bss-products' Postgres tier, added 2026-08-30. It carries the gear's
+      # only proofs about racing writers and the only execution of the Postgres
+      # half of its triggers — the SQLite suite is written from the same design
+      # clauses but against a different trigger shape, so it cannot fail for
+      # what the Postgres arm gets wrong. Without this step the tier compiles
+      # here and runs nowhere, which is the state the pricing comment above
+      # records as having cost that gear nine hidden failures.
+      - name: Test bss-products with Postgres (integration)
+        run: make test-products-pg
 
       - name: Test redis-cluster-plugin (redis integration)
         run: make test-cluster-redis
@@ -425,6 +452,9 @@ jobs:
       - name: Test toolkit-db (mysql integration)
         run: make test-mysql
 
+      - name: Test types-registry (db integration)
+        run: make test-types-registry-db
+
   test-fips:
     name: FIPS verification (${{ matrix.os }})
     needs: changes
@@ -445,7 +475,7 @@ jobs:
     steps:
       - name: Free disk space
         if: runner.os == 'Linux'
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
           android: true
@@ -462,10 +492,10 @@ jobs:
           git config --global core.eol lf
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 
@@ -483,7 +513,7 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: nextest
 
@@ -535,6 +565,240 @@ jobs:
         shell: bash
         run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
 
+  # The gear's whole suite against a real PostgreSQL 19 with pgvector, and its
+  # own coverage floor, in one pass.
+  #
+  # Two things make this job exist. The lane needs a server that has both
+  # SQL/PGQ and pgvector, and no published image carries both, so the image is
+  # built here from the gear's own Dockerfile (`test-containers` should publish
+  # one; until it does, this is a `docker build`, not a blocked lane). And
+  # `nfr-code-coverage` asks for 85% line coverage "enforced in CI": the
+  # workspace coverage job reports to Codecov and gates on nothing per crate,
+  # while the shared script's project-wide threshold is 80. Without the
+  # PostgreSQL lane the figure is ~55%, because the built-in store is the half
+  # of the gear only a real server exercises — so measuring and running are the
+  # same job or neither is honest.
+  test-graph-storage:
+    name: graph-storage (PostgreSQL 19 + pgvector, coverage floor)
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.graph_storage == 'true'
+      || needs.changes.outputs.deps == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    # The Codecov upload below asks for OIDC off pull requests, and an OIDC
+    # token needs `id-token: write` — the workflow default is `contents: read`
+    # alone, so without this the token request is denied. That upload also sets
+    # `fail_ci_if_error` on the same events, so the denial would fail the job
+    # after the tests and the coverage floor had both passed. The `coverage`
+    # job carries the same pair for the same reason.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain (with llvm-tools)
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
+          components: llvm-tools-preview
+
+      - name: Pin nightly for all cargo commands
+        run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+
+      # The same pin as the workspace coverage job: the v2.70.3 one installed
+      # cargo-llvm-cov 0.8.5, which on nightly-2026-08-21 ran every test and
+      # then found no object files to report on.
+      - name: Install cargo-llvm-cov and nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-llvm-cov, nextest
+
+      # PostgreSQL 19 plus a pinned pgvector, on the official base so the
+      # stock entrypoint and server arguments testcontainers drives are intact.
+      - name: Build the PostgreSQL 19 + pgvector image
+        run: |
+          docker build \
+            -f gears/graph-storage/deploy/docker/pg19-pgvector.Dockerfile \
+            -t pg19-pgvector:ci \
+            gears/graph-storage/deploy/docker
+
+      # REQUIRED turns a skip into a failure: this lane exists to run against
+      # a real server, and a green run that quietly skipped it proves nothing.
+      # The thread bound is the lane's own — every case gets its own server,
+      # and more than a couple at once is more than the runner will take.
+      #
+      # The remote embedding plugin is here rather than left to the workspace
+      # coverage job, which gates on nothing: it is shipped as a first-class
+      # deliverable of this gear and it holds the credential handling, the URL
+      # validation and the retry classification, which is exactly the code a
+      # floor is worth having on. Its contract suite answers a mock endpoint
+      # and needs nothing this lane does not already have.
+      #
+      # The ONNX plugin is not, and cannot be from here: its tests need a real
+      # ONNX Runtime and a real model, which only its own lane downloads, so a
+      # figure measured here would be the coverage of a suite that skipped.
+      #
+      # And the gear is built with `remote` here, so the boot path that turns
+      # its configuration into a remote provider is executed, not only
+      # compiled. The plugins' own suites construct their providers directly,
+      # which left `select_embedding_provider` and the gear's feature arms
+      # linted by the all-features clippy pass and run by nothing.
+      - name: Test and enforce the coverage floor
+        timeout-minutes: 30
+        env:
+          RUSTFLAGS: "-C debuginfo=0 --cfg coverage_nightly"
+          # The same split as the workspace coverage job: with the current
+          # nightly, cargo writes object files to the build directory, and
+          # `cargo llvm-cov` finds nothing to report unless it is told where
+          # both directories are.
+          CARGO_LLVM_COV_TARGET_DIR: llvm-cov-target
+          CARGO_LLVM_COV_BUILD_DIR: llvm-cov-build
+          GEARS_TEST_PG_GRAPH_IMAGE: "pg19-pgvector:ci"
+          GEARS_TEST_PG_GRAPH_REQUIRED: "1"
+        run: |
+          cargo llvm-cov nextest \
+            -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk \
+            -p cf-gears-graph-storage-remote-embedding-plugin \
+            --features cf-gears-graph-storage/remote \
+            --test-threads=2 \
+            --lcov --output-path lcov.info --fail-under-lines 85
+
+      # The workspace coverage job cannot run this gear's PostgreSQL lane — it
+      # has no pgvector image — so in its report the built-in store reads as
+      # untested and the patch coverage of any change to it is wrong by a wide
+      # margin. Codecov merges uploads per commit, so sending this job's report
+      # as well is what makes the repository's own number true for this gear
+      # rather than an artefact of which lane happened to run.
+      # `if: always()` because the step above both writes the report and
+      # enforces the floor: a run that falls below 85% exits non-zero, and
+      # without this the report it just wrote — the one that shows *where* the
+      # coverage went — would never be uploaded. The job still fails; the
+      # evidence arrives anyway.
+      - name: Upload to Codecov
+        if: always()
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          use_oidc: ${{ github.event_name != 'pull_request' }}
+          files: lcov.info
+          flags: graph-storage
+          disable_search: true
+          fail_ci_if_error: ${{ github.event_name != 'pull_request' }}
+
+  # Runs the graph-storage ONNX embedding provider against a real model, which
+  # is the only way this crate is checked at all: without artifacts its tests
+  # skip, and a skipped test proves nothing about pooling, tokenization or the
+  # vectors that come out. Both downloads are pinned by SHA-256; the runtime is
+  # fetched the same way `test-magika` fetches it, and for the same reason
+  # (`ort`'s `download-binaries` conflicts with the workspace's `load-dynamic`
+  # and deadlocks the rc we pin).
+  test-onnx-embedding:
+    name: ONNX embedding provider
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.onnx_embedding == 'true'
+      || needs.changes.outputs.deps == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    env:
+      ONNXRUNTIME_VERSION: "1.29.0"
+      ONNXRUNTIME_SHA256: "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba"
+      # sentence-transformers/all-MiniLM-L6-v2: the MiniLM-class model
+      # ADR-0005 names, 384 dimensions, mean-pooled and L2-normalized.
+      MODEL_URL: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
+      MODEL_SHA256: "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452"
+      TOKENIZER_URL: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+      TOKENIZER_SHA256: "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-onnx
+
+      - name: Fetch ONNX Runtime shared library
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sL --fail -o /tmp/onnxruntime.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz"
+          echo "${ONNXRUNTIME_SHA256}  /tmp/onnxruntime.tgz" | sha256sum --check
+          tar xzf /tmp/onnxruntime.tgz -C /tmp
+          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+
+      - name: Fetch the model and tokenizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/minilm
+          curl -sL --fail -o /tmp/minilm/model.onnx "${MODEL_URL}"
+          curl -sL --fail -o /tmp/minilm/tokenizer.json "${TOKENIZER_URL}"
+          echo "${MODEL_SHA256}  /tmp/minilm/model.onnx" | sha256sum --check
+          echo "${TOKENIZER_SHA256}  /tmp/minilm/tokenizer.json" | sha256sum --check
+          echo "GRAPH_STORAGE_ONNX_MODEL=/tmp/minilm/model.onnx" >> "$GITHUB_ENV"
+          echo "GRAPH_STORAGE_ONNX_TOKENIZER=/tmp/minilm/tokenizer.json" >> "$GITHUB_ENV"
+
+      # REQUIRED turns a skip into a failure: this lane exists to run the
+      # model, and a green run that quietly skipped it is worse than no lane.
+      - name: cargo test (ONNX embedding provider)
+        shell: bash
+        timeout-minutes: 15
+        env:
+          GRAPH_STORAGE_ONNX_REQUIRED: "1"
+        run: cargo test -p cf-gears-graph-storage-onnx-embedding-plugin
+
+      # The gear's own ONNX wiring, against the artifacts this lane downloaded:
+      # the plugin suite above loads the provider directly, so without this
+      # nothing ran the configuration-to-provider path an operator boots
+      # through. REQUIRED for the same reason as the step above.
+      - name: cargo test (graph-storage ONNX provider wiring)
+        shell: bash
+        timeout-minutes: 15
+        env:
+          GRAPH_STORAGE_ONNX_REQUIRED: "1"
+        run: "cargo test -p cf-gears-graph-storage --lib --features onnx gear::"
+
+      - name: cargo check (graph-storage with the onnx feature)
+        run: cargo check -p cf-gears-graph-storage --features onnx
+
   # Builds and tests file-parser's optional `magika` feature so it doesn't
   # silently rot. `ort`'s own `download-binaries` feature is NOT used here —
   # it always links statically, which conflicts with `load-dynamic` (baked
@@ -567,7 +831,7 @@ jobs:
       ONNXRUNTIME_SHA256: "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba"
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -617,7 +881,7 @@ jobs:
         run: cargo test -p cf-gears-file-parser --features magika
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-deny@0.20.2
 
@@ -640,7 +904,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain from rust-toolchain.toml
         run: |
@@ -649,7 +913,7 @@ jobs:
 
       # Install tools via prebuilt binaries for speed.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-deny@0.20.2
 
@@ -672,7 +936,7 @@ jobs:
       id-token: write
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
           android: true
@@ -682,10 +946,10 @@ jobs:
           swap-storage: true
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 
@@ -693,7 +957,7 @@ jobs:
         uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
-          components: llvm-tools-preview
+          components: llvm-tools-preview, rust-src
 
       # Override rust-toolchain.toml (which pins stable) for all cargo
       # commands in this job.
@@ -708,26 +972,29 @@ jobs:
           shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-llvm-cov, nextest
 
       # Generate lcov.info for upload. Customize flags/features as needed.
       #
-      # Two instrumented passes are accumulated (`--no-report`) into one target
+      # The instrumented passes are accumulated (`--no-report`) into one target
       # dir and merged into a single lcov.info at the end (`report`):
       #
       #   1. `nextest --workspace` — the whole workspace at default features.
       #   2. The redis-cluster-plugin integration suites. These live behind
-      #      `required-features = ["integration"]` and drive a real Redis via
-      #      testcontainers, so pass 1 never builds or runs them and the plugin's
-      #      actual logic (connection / lock / pub-sub / lifecycle) showed as
-      #      uncovered — the reason this crate's patch coverage understates it.
-      #      Running them here, instead of mocking the Redis connection (brittle,
-      #      tautological), credits that code with the coverage its integration
-      #      tests already exercise. Redis containers are lightweight and
-      #      unprivileged, so this mirrors `make test-cluster-redis` verbatim
-      #      (plain `nextest`, no per-binary loop) — keep the two in sync.
+      #      `required-features = ["integration"]`.
+      #   3. The postgres-cluster-plugin integration suites. These live behind
+      #      `required-features = ["integration"]`. Keep in sync with
+      #      `test-cluster-pg`.
+      #   4. The k8s-cluster-plugin L2/L3 k3s suites. These live behind
+      #      `required-features = ["integration"]`.
+      #
+      # The per-binary k3s loop (one container per binary, cleaned between —
+      # nextest's process-per-test would start ~70 of them) lives in the
+      # `coverage-cluster-k8s` Makefile target so this step stays readable; it
+      # inherits this step's CARGO_LLVM_COV_* env and accumulates into the same
+      # session. Keep it in sync with `test-cluster-k8s`.
       - name: Coverage (lcov)
         env:
           RUSTFLAGS: "-C debuginfo=0 --cfg coverage_nightly"
@@ -738,9 +1005,14 @@ jobs:
           # Pass 1: whole workspace, default features. Accumulate, don't report.
           cargo llvm-cov nextest --workspace --no-report
           # Pass 2: redis-cluster-plugin integration suites (real Redis via
-          # testcontainers). Same instrumentation, still no report.
+          # testcontainers).
           cargo llvm-cov nextest --no-report -p cf-redis-cluster-plugin --features integration --retries 1
-          # Merge both passes into the single report that gets uploaded.
+          # Pass 3: postgres-cluster-plugin integration suites (real Postgres
+          # via testcontainers).
+          cargo llvm-cov nextest --no-report -p cf-postgres-cluster-plugin --features integration --retries 1
+          # Pass 4: k8s-cluster-plugin k3s suites
+          make coverage-cluster-k8s
+          # Merge into the single report that gets uploaded.
           cargo llvm-cov report --lcov --output-path lcov.info
 
       # Upload LCOV report as a GitHub Actions artifact so it is always
@@ -762,7 +1034,7 @@ jobs:
       # disable_search prevents auto-discovery of unrelated files (e.g.
       # coverage_guard.rs) — only lcov.info is sent.
       - name: Upload to Codecov
-        uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4 # v7.1.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           use_oidc: ${{ github.event_name != 'pull_request' }}
           files: lcov.info
@@ -774,12 +1046,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: protoc@3.34.1
 

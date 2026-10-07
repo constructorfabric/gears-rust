@@ -34,8 +34,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -134,7 +138,8 @@ async fn submit(
 ) -> Result<Uuid, AcceptanceError> {
     let provider: DBProvider<AcceptanceError> = DBProvider::new(db.db());
     let dispatch: Arc<dyn OperationDispatch> = Arc::new(NoDispatch);
-    accept(
+    common::accept_as(
+        kind,
         &stores(),
         &provider,
         &allow_all(),
@@ -144,9 +149,8 @@ async fn submit(
             metrics: &common::metrics(),
         },
         &dispatch,
-        &SubmitRequest {
-            idempotency_key: key.to_owned(),
-            kind,
+        SubmitRequest {
+            idempotency_key: Some(key.to_owned()),
             dry_run,
             candidates,
         },
@@ -209,7 +213,7 @@ fn verdicts(items: &[ItemOutcome]) -> Vec<Verdict> {
     items
         .iter()
         .map(|item| Verdict {
-            gts_id: item.gts_id.clone(),
+            gts_id: item.key.to_string(),
             status: item.status,
             reason: item.failure.as_ref().map(|failure| failure.reason.clone()),
         })
@@ -250,7 +254,7 @@ fn assert_predicted_fields(items: &[ItemOutcome]) {
         // The Registry Reference is derived from the identifier, so a virtual
         // entity id can never reach it — and this is what says so.
         if let Some(gts_uuid) = item.gts_uuid {
-            let derived = gts::GtsId::try_new(&item.gts_id)
+            let derived = gts::GtsId::try_new(&item.key.to_string())
                 .expect("a stored identifier parses")
                 .to_uuid();
             assert_eq!(gts_uuid, derived, "{item:?}");
@@ -904,7 +908,7 @@ async fn assert_replay_matches_the_first_pass(dry_run: bool) {
             ),
             "this fixture admits both candidates: {item:?}",
         );
-        let derived = gts::GtsId::try_new(&item.gts_id)
+        let derived = gts::GtsId::try_new(&item.key.to_string())
             .expect("a stored identifier parses")
             .to_uuid();
         assert_eq!(
@@ -1001,8 +1005,7 @@ async fn run_batch_permitting_force(
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
-            kind: OperationKind::Registration,
+            idempotency_key: Some(key.to_owned()),
             dry_run,
             candidates,
         },
@@ -1114,8 +1117,7 @@ async fn a_dry_run_does_not_waive_where_the_deployment_refuses_force() {
         },
         &dispatch,
         &SubmitRequest {
-            idempotency_key: "forced".to_owned(),
-            kind: OperationKind::Registration,
+            idempotency_key: Some("forced".to_owned()),
             dry_run: true,
             candidates: vec![forced_creation(FORCED_ONE, open_schema(FORCED_ONE, true))],
         },

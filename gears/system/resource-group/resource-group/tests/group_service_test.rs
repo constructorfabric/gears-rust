@@ -2944,7 +2944,7 @@ async fn list_groups_rejects_an_unknown_type_in_the_filter() {
     let err = group_svc
         .list_groups(
             &ctx,
-            &filter_query("type eq 'gts.cf.core.rg.type.v1~x.test.absent.v1~'"),
+            &filter_query("type eq 'gts.cf.core.rg.type.v1~x.test._.absent.v1~'"),
         )
         .await
         .expect_err("an unresolvable type path must be refused");

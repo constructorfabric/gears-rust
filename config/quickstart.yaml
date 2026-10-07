@@ -157,9 +157,9 @@ gears:
             type: ip
           max_keys: 10000
 
-  gear-orchestrator:
+  service-discovery:
     config: {}
-    # No configuration needed for the gear orchestrator
+    # No configuration needed for the directory service
 
   grpc-hub:
     config:
@@ -211,6 +211,9 @@ gears:
       server: "sqlite_users"
       file: "account_management.db"
     config:
+      root_tenant_type:
+        gts_id: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        idp_provisioning: false
       bootstrap:
         # Matches static-tr-plugin's `e2e-root` so AM's tenants table
         # ends up holding the same root id the platform middleware
@@ -218,7 +221,6 @@ gears:
         # under it without a separate seeding step.
         root_id: "00000000-df51-5b42-9538-d2b56b7ee953"
         root_name: "e2e-root"
-        root_tenant_type: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
         idp_wait_timeout: "5m"
         idp_retry_backoff_initial: "2s"
         idp_retry_backoff_max: "30s"
@@ -270,9 +272,11 @@ gears:
       # ── Azure OpenAI example (uncomment and set your endpoint) ──────────
       #   azure_openai:
       #     kind: openai_responses
+      #     storage_kind: azure                             # required; azure needs api_version
       #     host: "<your-resource>.openai.azure.com"       # Azure endpoint
       #     # upstream_alias: "custom-alias"               # optional, defaults to host
       #     api_path: "/openai/v1/responses"
+      #     api_version: "2025-03-01-preview"             # required for storage_kind: azure
       #     auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
       #     auth_config:
       #       header: "api-key"
@@ -282,8 +286,10 @@ gears:
       # ── Per-tenant Azure example (each tenant has its own endpoint) ─────
       #   azure_openai_tenant_a:
       #     kind: openai_responses
+      #     storage_kind: azure                             # required; azure needs api_version
       #     host: "tenant-a.openai.azure.com"
       #     api_path: "/openai/v1/responses"
+      #     api_version: "2025-03-01-preview"             # required for storage_kind: azure
       #     auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
       #     auth_config:
       #       header: "api-key"
@@ -291,8 +297,10 @@ gears:
       #       secret_ref: "azure-openai-key-tenant-a"
       #   azure_openai_tenant_b:
       #     kind: openai_responses
+      #     storage_kind: azure                             # required; azure needs api_version
       #     host: "tenant-b.openai.azure.com"
       #     api_path: "/openai/v1/responses"
+      #     api_version: "2025-03-01-preview"             # required for storage_kind: azure
       #     auth_plugin_type: "gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1"
       #     auth_config:
       #       header: "api-key"
@@ -411,18 +419,6 @@ gears:
     database:
       server: "sqlite_users"
       file: "types_registry.db"
-    config:
-      entities:
-        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
-          $schema: "http://json-schema.org/draft-07/schema#"
-          description: "Platform-root tenant type (no parents)."
-          type: "object"
-          allOf:
-            - $ref: "gts://gts.cf.core.am.tenant_type.v1~"
-          x-gts-traits:
-            allowed_parent_types: []
-            idp_provisioning: false
-
   credstore:
     database:
       server: "sqlite_users"
@@ -432,6 +428,31 @@ gears:
       # must match static-credstore-plugin (default "constructorfabric").
       vendor: "constructorfabric"
 
+  settings-service:
+    database:
+      server: "sqlite_users"
+      file: "settings-service.db"
+    # The empty section is deliberate and required. The gear reads its
+    # configuration fail-closed, so an absent `config:` key aborts startup
+    # rather than defaulting: bootstrap values are deployment-owned and are
+    # never themselves managed settings, so there is nothing to fall back to.
+    #
+    # Nothing is required today -- the only field, `cache_ttl_seconds`, has a
+    # value fixed by the design (30s) rather than by the operator. The section
+    # exists so that the first genuinely required value fails loudly here
+    # instead of being silently invented.
+    config: {}
+
+  # The credstore gateway reads a secret's metadata from its own DB, so the
+  # values below are not readable on their own (issue #5094). Until that is
+  # fixed, set each secret through the API after every start (the first run
+  # needs POST instead of PUT); mini-chat retries the deferred provider.
+  # Read the key with -s so it never lands in shell history or `ps`, and
+  # pipe the body through -d @- so it never appears as a curl argument:
+  #   read -s -p 'openai key: ' KEY && printf '{"value":"%s","sharing":"tenant"}' "$KEY" \
+  #     | curl -X PUT http://localhost:8087/cf/credstore/v1/secrets/openai-key \
+  #         -H 'Authorization: Bearer dev' -H 'content-type: application/json' \
+  #         -H 'If-Match: *' -d @-
   static-credstore-plugin:
     config:
       secrets:
@@ -507,8 +528,8 @@ opentelemetry:
       record_headers: [ "user-agent", "x-forwarded-for" ]
 
     # Add top-level trace_id / span_id to JSON log records so a backend can
-    # link a log line to its span. Off by default: it costs a context lookup
-    # per event.
+    # link a log line to its span. On by default (it costs a context lookup
+    # per event); set to false to opt out.
     logs_correlation:
       inject_trace_ids_into_logs: true
 

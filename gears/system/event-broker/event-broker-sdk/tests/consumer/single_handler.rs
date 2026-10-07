@@ -3,13 +3,15 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use event_broker_sdk::{
     ConsumerBuilder, ConsumerError, ConsumerGroupRef, Fallback, HandlerOutcome,
-    InMemoryOffsetManager, RawEvent, SingleEventHandler,
+    InMemoryOffsetManager, RawEvent, SingleEventHandler, gts_id,
 };
 
-use super::common::{PublishJson, publish_json, topic_fixture, two_topic_fixture, wait_until};
+use super::common::{
+    PublishJson, publish_json, topic, topic_fixture, two_topic_fixture, wait_until,
+};
 
-const TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.single.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.single.v1~";
+const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.single.v1");
+const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.single.v1~");
 
 struct SingleEventProjector {
     offsets: Arc<Mutex<Vec<i64>>>,
@@ -24,7 +26,7 @@ impl SingleEventHandler for SingleEventProjector {
         _attempts: u16,
     ) -> Result<HandlerOutcome, ConsumerError> {
         self.partitions.lock().unwrap().push(event.partition);
-        self.offsets.lock().unwrap().push(event.offset);
+        self.offsets.lock().unwrap().push(event.offset.as_i64());
         Ok(HandlerOutcome::Success)
     }
 }
@@ -37,7 +39,7 @@ async fn if_i_want_a_simple_single_event_handler() {
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-single"))
-        .topics([TOPIC])
+        .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
         .handler(SingleEventProjector {
             offsets: offsets.clone(),
@@ -77,7 +79,7 @@ async fn if_i_publish_events_partitioned_by_a_payload_member_each_lands_on_its_p
         .group(ConsumerGroupRef::auto_anonymous(
             "showcase-single-partition-key",
         ))
-        .topics([TOPIC])
+        .topics([topic(TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
         .handler(SingleEventProjector {
             offsets: offsets.clone(),
@@ -108,10 +110,10 @@ async fn if_i_publish_events_partitioned_by_a_payload_member_each_lands_on_its_p
     assert_eq!(seen, vec![0, 1]);
 }
 
-const ORDERS_TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.orders.v1";
-const ORDERS_EVENT: &str = "gts.cf.core.events.event.v1~example.mock.showcase.orders.v1~";
-const AUDIT_TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.audit.v1";
-const AUDIT_EVENT: &str = "gts.cf.core.events.event.v1~example.mock.showcase.audit.v1~";
+const ORDERS_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.orders.v1");
+const ORDERS_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.orders.v1~");
+const AUDIT_TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.audit.v1");
+const AUDIT_EVENT: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.audit.v1~");
 
 /// The `(topic, partition)` each delivered event was attributed to.
 type Attributions = Arc<Mutex<Vec<(String, u32)>>>;
@@ -131,7 +133,7 @@ impl SingleEventHandler for AttributionProjector {
         self.seen
             .lock()
             .unwrap()
-            .push((event.topic.clone(), event.partition));
+            .push((event.topic.as_ref().to_owned(), event.partition));
         Ok(HandlerOutcome::Success)
     }
 }
@@ -148,7 +150,7 @@ async fn events_from_two_topics_are_each_attributed_to_their_own_topic() {
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-two-topics"))
-        .topics([ORDERS_TOPIC, AUDIT_TOPIC])
+        .topics([topic(ORDERS_TOPIC), topic(AUDIT_TOPIC)])
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
         .handler(AttributionProjector { seen: seen.clone() })
         .start()

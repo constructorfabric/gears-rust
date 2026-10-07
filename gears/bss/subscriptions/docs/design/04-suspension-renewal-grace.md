@@ -195,7 +195,7 @@ from `suspended`, or the firing itself voids the record.
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-storage-renewal-rnw`
+- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-datastore-renewal-rnw`
 
 Owned here: `renewal_evaluation` (evaluated fields, `graceEndsAt`), `grace_ladder_state`, and the
 `collection_pause_window` rows on the aggregate. Scheduled non-renewal rides the Foundation

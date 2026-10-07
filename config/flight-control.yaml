@@ -1,0 +1,62 @@
+# CF/Gears Flight Control configuration (static-authn default).
+#
+# Tailored to the minimal `apps/cf-gears-flight-control` composition: the control-plane
+# system gears (service-discovery, types-registry, api-gateway, grpc-hub) +
+# embedded authn-resolver, wired with the static/dev authn plugin so it boots
+# with zero external dependencies. The AuthZ plane (authz-resolver,
+# tenant-resolver, resource-group) runs as its own OoP unit and is configured
+# there, not here.
+#
+# For the production image build (`--no-default-features --features oidc-authn`)
+# supply a config selecting the OIDC authn vendor.
+
+server:
+  home_dir: "~/.cf-gears-flight-control"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/flight-control.log"
+    file_level: info
+    max_age_days: 28
+    max_backups: 3
+    max_size_mb: 10
+
+gears:
+  api-gateway:
+    config:
+      # Bind all interfaces so the gear is reachable inside a container.
+      bind_addr: "0.0.0.0:8087"
+      # A wildcard bind (0.0.0.0) is not itself a routable address, so the edge
+      # needs an explicit endpoint to advertise for directory registration.
+      # Without it, REST-host registration is skipped and boot stalls ~5s.
+      # Loopback is right for local/dev; in K8s set this to the pod's Service DNS.
+      advertise_uri: "http://127.0.0.1:8087"
+      enable_docs: true
+      cors_enabled: false
+      openapi:
+        title: "CF/Gears Flight Control API"
+        version: "0.1.0"
+        description: "CF/Gears Flight Control API Documentation"
+      defaults:
+        body_limit_bytes: 64000000
+      auth_disabled: false
+      require_auth_by_default: true
+
+  service-discovery:
+    config: {}
+
+  grpc-hub:
+    config:
+      listen_addr: "uds:///tmp/cf-gears-flight-control-grpc"
+
+  # --- AuthN (edge JWT validation, static/dev plugin) ---
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: accept_all

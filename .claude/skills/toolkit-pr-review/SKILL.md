@@ -48,23 +48,19 @@ Set:
 
 ### Local mode
 
-First argument is the literal word `local`. Review target is the local branch diffed against `main`; findings are written to a markdown file — **nothing is posted to GitHub**.
+First argument is the literal word `local`. Review target is a local branch diffed against the
+trunk; findings are written to a markdown file — **nothing is posted to GitHub**.
 
-Resolve:
-
-```bash
-BASE_BRANCH=main
-BRANCH_NAME=<branch-name argument, or `git symbolic-ref --quiet --short HEAD` if omitted>
-REPO_ROOT=$(git rev-parse --show-toplevel)
-HEAD_SHA=$(git rev-parse "$BRANCH_NAME")
-```
-
-If no branch argument was given and `git symbolic-ref` fails, HEAD is detached — print the error and stop.
-Verify the branch exists (`git rev-parse --verify "$BRANCH_NAME"`) and that `main` exists locally
-(`git rev-parse --verify main`; if it does not, fall back to `origin/main` and use that as `BASE_BRANCH`).
-If neither resolves, print the error and stop.
+`prepare --local` (Step 1) resolves the branch and the base; do not resolve them by hand. The branch
+is the argument, or the current branch when it is omitted, and a detached HEAD is an error. The base
+is the merge base with the first trunk that exists: `upstream`'s `HEAD`, `main` or `master`, then
+`origin`'s, then local `main` or `master`. `upstream` comes first because in a fork checkout `origin`
+is the fork, whose trunk lags, and a base taken from it pulls unsynced upstream commits into the
+review. Nothing is fetched, so the base is as fresh as the last `git fetch`. Pass `--base` to override.
 
 Set:
+- `BRANCH_NAME` = the branch argument, or `git symbolic-ref --quiet --short HEAD`
+- `REPO_ROOT` = `git rev-parse --show-toplevel`
 - `MODE=local`
 - `BRANCH_SLUG` = `BRANCH_NAME` with `/` replaced by `-`
 - `REVIEW_ID=local-$BRANCH_SLUG`
@@ -82,7 +78,7 @@ Store the result as `REPO` and pass `--repo $REPO` to all `gh pr` commands, and 
 ## Review guidelines
 
 The rules live in six **rule modules** under `docs/toolkit-pr-review/rules/`, organised by subject. They are
-not agents. Every review sub-agent reads every module.
+not agents. Each subject agent reads exactly one module.
 
 The work is split by **subject, not by file**. One agent per module — `toolkit-pr-review-errors`,
 `-security`, `-async`, `-design`, `-tests`, `-toolkit` — and each of them reads the whole diff. A
@@ -106,20 +102,19 @@ Two shared files every agent reads:
 - `docs/toolkit-pr-review/review-conventions.md` — severity, criterion markers, reporting discipline
 - `docs/toolkit-pr-review/comment-style.md` — comment wording
 
-A file is **ToolKit-owned** — which gates the `TOOLKIT-*` rules in `docs/toolkit-pr-review/rules/toolkit.md`
-— when **any** of these signals is present:
-
-1. **Cargo.toml signals** — the nearest `Cargo.toml` (same crate or workspace member) declares a `toolkit` dependency/feature, or the crate name starts with `toolkit`.
-2. **Path heuristics** — the file lives under a path that matches ToolKit gear conventions (e.g. `gears/*/src/`, `crates/toolkit-*/`, or similar namespace).
-3. **Source-level symbols** — the file imports from ToolKit crates (`use toolkit_*`, `use crate::` inside a toolkit crate) or references ToolKit-specific types/traits such as `OperationBuilder`, `SecureConn`, `SecureORM`, `ClientHub`, or `GearLifecycle`.
-
-A file that qualifies goes into `toolkit_files`, and that list **is** the file list the
-`toolkit` agent is given. When it is empty the agent is not spawned at all.
+The `toolkit` agent is spawned whenever the others are and is given every file, like the other
+five. Nearly all Rust in this repository is gear code built on ToolKit, and the path and symbol
+filter it replaced missed files that use it, such as integration tests importing `toolkit::`.
+Framework internals under `libs/toolkit*/` are excluded
+by the module's own scope section, not by `prepare`.
 
 `RUST-DEP-001` (dependency and advisory manifest hygiene) applies only to the manifest and config
 files `prepare` collects into `manifest_files`: `Cargo.toml`, `Cargo.lock`, `deny.toml`, `.cargo/audit.toml`,
 `.cargo/config.toml`, `clippy.toml`, `rust-toolchain.toml`. The `security` agent is given that list
 separately and applies the rule to nothing else.
+
+**A PR with no `.rs` file is not reviewed at all.** `prepare` leaves `agents` empty, so a
+manifest-only or docs-only change spawns nothing; see Step 2.
 
 **This review is Rust-only.** `prepare` keeps `.rs` files plus the seven manifest and lint/advisory
 config files, and records everything else in `skipped_files`. YAML, SQL migrations, `.proto`, Dockerfiles and CI
@@ -166,8 +161,8 @@ It prints `WORK_DIR=<path>` on the last line. Capture it; every later step reads
 <WORK_DIR>/out/            where agent output goes
 ```
 
-Exit code `2` means the run would cost more than `--max-total-tokens`; nothing was written and the
-message names the heaviest files. Raise the limit deliberately or narrow the review; do not work
+Exit code `2` means the run would cost more than `--max-total-tokens`: `context.json` is not
+written, so there is nothing to spawn, and the message names the heaviest files. Raise the limit deliberately or narrow the review; do not work
 around it by reviewing a subset by hand.
 
 **Why this is a script and not instructions.** Both harnesses used to carry their own prose version
@@ -182,11 +177,11 @@ fixture tests in `tools/scripts/toolkit-pr-review/tests/`.
 
 ### Step 2: Read context.json
 
-`context.json` (schema 3) is the contract between `prepare` and everything downstream:
+`context.json` (schema 4) is the contract between `prepare` and everything downstream:
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "mode": "pr | local",
   "repo": "owner/name",
   "pr_number": 4777,
@@ -197,7 +192,6 @@ fixture tests in `tools/scripts/toolkit-pr-review/tests/`.
     "<path>": {
       "status": "added | modified | deleted | renamed",
       "old_path": "<previous path, or null>",
-      "toolkit_owned": true,
       "manifest": false,
       "snapshot": "files/<path>",
       "snapshot_ref": "head | base",
@@ -206,10 +200,9 @@ fixture tests in `tools/scripts/toolkit-pr-review/tests/`.
   },
   "all_files": ["..."],
   "skipped_files": ["..."],
-  "toolkit_files": ["..."],
   "manifest_files": ["..."],
   "agents": [ { "name": "errors", "rules": "...", "files": ["..."], "manifest_files": [] } ],
-  "totals": { "files": 24, "skipped": 1, "agents": 6, "est_tokens": 436611 }
+  "totals": { "files": 24, "skipped": 1, "agents": 7, "est_tokens": 436611 }
 }
 ```
 
@@ -225,8 +218,8 @@ The parts that matter downstream:
   `line` at all — it posts as a file-level comment.
 - **`snapshot`** is a path under `files/` that mirrors the repo tree. `gears/foo/src/lib.rs` is at
   `<WORK_DIR>/files/gears/foo/src/lib.rs`. There is no filename escaping.
-- **`agents`** is the spawn list for Step 3, already scoped: `toolkit` carries only ToolKit-owned
-  files and is absent entirely when there are none, and only `security` carries `manifest_files`.
+- **`agents`** is the spawn list for Step 3. Every subject agent carries `all_files`, and only
+  `security` carries `manifest_files`.
 - **`skipped_files`** are files in the diff that no rule covers. Say so in the summary rather than
   implying they were reviewed.
 
@@ -234,6 +227,11 @@ The parts that matter downstream:
 everything `RUST-DEP-001` needs from it — a `source = "git+..."` entry, a non-crates.io registry —
 is visible in `diff.patch`, which every agent already has. It stays in `manifest_files` so a finding
 can still anchor on a changed line.
+
+**If `agents` is empty, stop here.** No `.rs` file changed, so nothing is reviewed. Print
+`No .rs files changed; nothing was reviewed.` with the `all_files` and `skipped_files` lists. In
+PR mode post **nothing** to GitHub: "No issues found." would claim a review that never ran. In
+local mode write the Step 5L header and that same line instead of findings.
 
 ### Step 3: Spawn parallel sub-agents
 
@@ -246,12 +244,11 @@ the `(file, line, id)` pass in Step 4 then silently swallows.
 
 Pass to every agent:
 - The review target identity from context (PR number + repo, or branch + base branch)
-- Paths to `context.json`, `diff.patch`, and the `files/` directory in /tmp
+- Paths to `context.json`, `diff.patch`, and the `files/` directory under `WORK_DIR`
 
 Pass to each subject agent additionally:
 - **Its file list, written out in the prompt.** Do not make the agent derive it from
-  `context.json`; give it the paths. For five of the six that list is `all_files`; for `toolkit`
-  it is `toolkit_files`.
+  `context.json`; give it the paths. For all six that list is `all_files`.
 - For `security` only, the `manifest_files` list as well.
 
 Subject agent prompt shape:
@@ -264,7 +261,7 @@ Diff:     <WORK_DIR>/diff.patch
 Sources:  <WORK_DIR>/files/<repo/path>   (the repo tree is mirrored)
 
 Your rule module, the only one you read:
-  docs/toolkit-pr-review/agent-rules/<module>.md
+  docs/toolkit-pr-review/rules/<module>.md
 
 The PR changes these <K> files:
   gears/mini-chat/src/lib.rs
@@ -285,10 +282,7 @@ two or more findings fell from 3 to 0 — the agent reverted to one finding per 
 in the spawn prompt is in context from the first turn; the same sentence inside a 6 KB document the
 agent opens with a tool call is not. Do not tidy it away as a repeat.
 
-Do **not** tell a subject agent to read the other five modules, and do not hand it the authored
-`rules/` corpus. `agent-rules/` is the generated, version-gated copy and is what the measurement
-was run against; `rules/` carries rationale the agent does not need and criteria the pinned
-toolchain cannot trigger.
+Do **not** tell a subject agent to read the other five modules.
 
 The architecture agent gets no file list: it owns the whole diff.
 
@@ -321,7 +315,7 @@ directions. Keep them, and keep the table between them, wherever this section mo
 <!-- /pr-review:routing-table -->
 
 The per-file scoping in each module's **Scope of this module** section still applies: the `toolkit`
-agent runs only on `toolkit_files`, and `RUST-DEP-001` only on `manifest_files`.
+agent skips framework internals under `libs/toolkit*/`, and `RUST-DEP-001` runs only on `manifest_files`.
 
 Each agent returns a JSON array of findings. See `docs/toolkit-pr-review/agents/subject.md`
 and `docs/toolkit-pr-review/agents/architecture.md` for the detailed prompts.
@@ -408,7 +402,6 @@ fold the other in by hand.
 Apply filter rules:
 - Drop any finding whose `id` is not in the emitting agent's row of the routing table. An agent
   reporting outside its module means its module list was not respected; log the count to terminal.
-- Drop any finding from the `toolkit` agent whose `file` is not in `toolkit_files`.
 - For a finding whose file has `status: "deleted"`: keep it regardless of `line` (it has none — it posts as a file-level comment in Step 5).
 - For a `RUST-ARCH-001` finding with no `line`: keep it, it posts as a file-level comment in Step 5.
 - For every other finding, validate against the side it claims:
@@ -427,8 +420,11 @@ Apply filter rules:
 
 Sort by severity: CRITICAL → HIGH → MEDIUM → LOW.
 
-**Drop every `LOW` finding. Post every `CRITICAL`, `HIGH` and `MEDIUM`, however many there are.**
-There is no total cap. Log the count dropped to terminal (e.g. "Dropped 3 LOW findings; posting 47").
+**PR mode: drop every `LOW` finding. Post every `CRITICAL`, `HIGH` and `MEDIUM`, however many there
+are.** There is no total cap. Log the count dropped to terminal (e.g. "Dropped 3 LOW findings; posting 47").
+
+**Local mode keeps `LOW`.** The report costs the author no inline-comment noise, and it is where the
+`### Low` section of Step 5L comes from.
 
 This replaces a flat cap of 30. The cap was measured against PR 4705, where the review produced 76
 findings: 30 were posted and 46 were cut, and because severity decides the order, everything posted
@@ -452,7 +448,7 @@ Local mode skips this step entirely — go to Step 5L.
 
 Split the merged findings into two groups:
 - **Line-anchored findings** — the finding has a `line`. Post together in one review (below).
-- **File-level findings** — the finding has **no** `line`. Two cases produce these: a file in
+- **File-level findings** — the finding has **no** `line`. Two cases produce these: a finding on
   a deleted file, which has no line on either side, and a `RUST-ARCH-001` finding that no single
   line represents. Neither can go in the batch review's `comments` array (which requires
   `line`+`side`). Post each individually via the single-comment endpoint with
@@ -491,7 +487,7 @@ MEDIUM or LOW     ->  "<comment>"
 ```
 
 Never post `issue` or `fix` as comment text — those two fields exist for the summary table and the
-local-mode report. The second example below shows a MEDIUM comment, with no header.
+local-mode report. The second and third examples below are MEDIUM comments, with no header.
 
 The payload goes **inside this review's work directory**, never at a bare `/tmp/` path. A fixed
 filename is shared by every concurrent review in the machine, including reviews of *different* PRs,
@@ -520,7 +516,7 @@ cat > "$WORK_DIR/review-payload.json" << 'REVIEW_EOF'
       "path": "gears/foo/src/domain/service_tests.rs",
       "line": 140,
       "side": "LEFT",
-      "body": "**MEDIUM**\n\nThis test is removed with no follow-up issue and no note saying why."
+      "body": "This test is removed with no follow-up issue and no note saying why."
     }
   ]
 }
@@ -655,7 +651,7 @@ only in the terminal summary table (Step 6) and — in local mode — in the mar
 
 Mechanical rules, which the style file does not cover:
 - One issue per comment. If a line has two problems, post two comments.
-- Line number must point to an added/modified line that exists in the diff. Do not comment on unchanged lines.
+- Line number must point to a changed line: an added line on the RIGHT side, or a removed line with `"side": "LEFT"`. Do not comment on unchanged lines.
 - If you cannot determine the exact line, do not guess — skip that finding. Exception: a finding with no line by design — one on a file whose `status` is `deleted`, or a `RUST-ARCH-001` that no single line represents — posts as a file-level comment (see Step 5). Don't skip it and don't force a line onto it.
 
 ---
@@ -670,5 +666,5 @@ not restated here. This list covers only what is specific to orchestrating the r
 - Do not post anything to GitHub in local mode — the markdown report is the only output artifact
 - Do not commit the generated `REVIEW_*.md` file
 - Do not post comments on lines outside the diff
-- Do not drop a `CRITICAL`, `HIGH` or `MEDIUM` finding to shorten the review. Only `LOW` is dropped.
-- If there are zero findings, post a single review comment: "No issues found." (PR mode) / write `No issues found.` into the report (local mode)
+- Do not drop a `CRITICAL`, `HIGH` or `MEDIUM` finding to shorten the review. Only `LOW` is dropped, and only in PR mode.
+- If the agents ran and there are zero findings, post a single review comment: "No issues found." (PR mode) / write `No issues found.` into the report (local mode)

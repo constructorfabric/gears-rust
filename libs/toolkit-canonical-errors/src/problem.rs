@@ -771,6 +771,15 @@ impl axum::response::IntoResponse for Problem {
     }
 }
 
+/// Lets a handler return `Result<_, Box<Problem>>`: a `Problem` is ~250 bytes,
+/// past `clippy::result_large_err`, and `?` boxes one through `From<T> for Box<T>`.
+#[cfg(feature = "axum")]
+impl axum::response::IntoResponse for Box<Problem> {
+    fn into_response(self) -> axum::response::Response {
+        (*self).into_response()
+    }
+}
+
 #[cfg(feature = "axum")]
 impl axum::response::IntoResponse for CanonicalError {
     fn into_response(self) -> axum::response::Response {

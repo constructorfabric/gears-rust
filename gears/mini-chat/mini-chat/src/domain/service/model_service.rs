@@ -33,13 +33,16 @@ impl ModelService {
         }
     }
 
-    /// Resolve a model ID + provider from the policy catalog.
-    pub(crate) async fn resolve_model(
+    /// Resolve the model an existing chat is locked to, including a model
+    /// that has since been disabled (the quota cascade downgrades it).
+    pub(crate) async fn resolve_chat_model(
         &self,
         user_id: Uuid,
-        model: Option<String>,
+        model_id: &str,
     ) -> Result<ResolvedModel, DomainError> {
-        self.model_resolver.resolve_model(user_id, model).await
+        self.model_resolver
+            .resolve_chat_model(user_id, model_id)
+            .await
     }
 
     /// List all globally enabled models visible to the authenticated user.
@@ -90,5 +93,6 @@ impl ModelService {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "model_service_test.rs"]
 mod tests;

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gts::{GtsIdPattern, GtsInstanceId};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -15,7 +16,7 @@ use super::{
     CommitOffset, ConsumerBatching, ConsumerBuffering, ConsumerCommitMode, ConsumerGroupRef,
     ConsumerHandler, ConsumerListenerSettings, ConsumerProfile, ConsumerRetry,
     ConsumerRuntimeListener, ConsumerSettings, ConsumerSettingsOverrides, ConsumerSlowDetection,
-    EventTypeRef, SingleEventHandler, SubscriptionFilterRef, SubscriptionInterest, TopicRef,
+    SingleEventHandler, SubscriptionFilterRef, SubscriptionInterest,
 };
 #[cfg(feature = "db")]
 use super::{CommitOffsetInTx, LocalDbOffsetManager, TxConsumerHandler, TxSingleEventHandler};
@@ -57,12 +58,12 @@ impl ConsumerOffsetManager for LocalDbOffsetManager {
 
 pub struct ConsumerBuilder<M = ()> {
     pub(crate) group: Option<ConsumerGroupRef>,
-    pub(crate) topics: Vec<String>,
+    pub(crate) topics: Vec<GtsInstanceId>,
     pub(crate) subscription_interests: Vec<SubscriptionInterest>,
     pub(crate) tenant_id: Option<Uuid>,
     pub(crate) tenant_depth: TenantTraversalDepth,
     pub(crate) barrier_mode: BarrierMode,
-    pub(crate) event_type_patterns: Vec<String>,
+    pub(crate) event_type_patterns: Vec<GtsIdPattern>,
     pub(crate) parallelism: u32,
     pub(crate) client_agent: String,
     pub(crate) session_timeout: Option<Duration>,
@@ -143,12 +144,11 @@ impl<M> ConsumerBuilder<M> {
         self.group = Some(group);
         self
     }
-    pub fn topics<I, S>(mut self, topics: I) -> Self
+    pub fn topics<I>(mut self, topics: I) -> Self
     where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
+        I: IntoIterator<Item = GtsInstanceId>,
     {
-        self.topics.extend(topics.into_iter().map(Into::into));
+        self.topics.extend(topics);
         self
     }
     pub fn subscription_interests<I>(mut self, interests: I) -> Self
@@ -159,7 +159,7 @@ impl<M> ConsumerBuilder<M> {
         self.topics = self
             .subscription_interests
             .iter()
-            .map(|interest| topic_ref_to_string(&interest.topic))
+            .map(|interest| interest.topic.clone())
             .collect();
         self
     }
@@ -182,13 +182,11 @@ impl<M> ConsumerBuilder<M> {
         self.barrier_mode = mode;
         self
     }
-    pub fn event_type_patterns<I, S>(mut self, pats: I) -> Self
+    pub fn event_type_patterns<I>(mut self, pats: I) -> Self
     where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
+        I: IntoIterator<Item = GtsIdPattern>,
     {
-        self.event_type_patterns
-            .extend(pats.into_iter().map(Into::into));
+        self.event_type_patterns.extend(pats);
         self
     }
     pub fn parallelism(mut self, n: u32) -> Self {
@@ -210,9 +208,9 @@ impl<M> ConsumerBuilder<M> {
         self.session_timeout = Some(d);
         self
     }
-    pub fn filter(mut self, engine: impl Into<String>, expr: impl Into<String>) -> Self {
+    pub fn filter(mut self, engine: GtsInstanceId, expr: impl Into<String>) -> Self {
         self.filter = Some(Filter {
-            engine: engine.into(),
+            engine,
             expression: expr.into(),
         });
         self
@@ -343,23 +341,23 @@ pub struct RouteHasTopic;
 
 pub struct ConsumerRouteBuilder<M, H, T = RouteMissingTopic> {
     ready: ConsumerRoutedReady<M, H>,
-    topic: Option<TopicRef>,
-    event_type: Option<EventTypeRef>,
+    topic: Option<GtsInstanceId>,
+    event_type: Option<GtsIdPattern>,
     _topic_state: std::marker::PhantomData<T>,
 }
 
 #[cfg(feature = "db")]
 pub struct TxConsumerRouteBuilder<M: CommitOffsetInTx + 'static, T = RouteMissingTopic> {
     ready: TxConsumerRoutedReady<M>,
-    topic: Option<TopicRef>,
-    event_type: Option<EventTypeRef>,
+    topic: Option<GtsInstanceId>,
+    event_type: Option<GtsIdPattern>,
     _topic_state: std::marker::PhantomData<T>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConsumerRoute {
-    pub topic: TopicRef,
-    pub event_type: Option<EventTypeRef>,
+    pub topic: GtsInstanceId,
+    pub event_type: Option<GtsIdPattern>,
     pub handler_kind: ConsumerRouteHandlerKind,
 }
 
@@ -483,7 +481,6 @@ impl<M, H> ConsumerRoutedReady<M, H> {
         if self.builder.topics.is_empty() {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "routed consumer requires at least one configured topic".to_owned(),
-                instance: String::new(),
             });
         }
 
@@ -495,34 +492,34 @@ impl<M, H> ConsumerRoutedReady<M, H> {
                         "route topic {:?} is not part of the configured subscription topics",
                         route.topic
                     ),
-                    instance: String::new(),
                 });
             }
 
-            let key = (route.topic.clone(), route.event_type.clone());
+            let key = (
+                route.topic.clone(),
+                route.event_type.as_ref().map(|p| p.pattern().to_owned()),
+            );
             if !seen.insert(key) {
                 return Err(EventBrokerError::InvalidConsumerOptions {
                     detail: format!(
                         "duplicate consumer route for topic {:?} and event type {:?}",
                         route.topic, route.event_type
                     ),
-                    instance: String::new(),
                 });
             }
         }
 
         if !self.has_default_handler {
             for configured in &self.builder.topics {
-                let has_topic_catch_all = self.routes.iter().any(|route| {
-                    route.event_type.is_none()
-                        && topic_ref_matches_configured(&route.topic, configured)
-                });
+                let has_topic_catch_all = self
+                    .routes
+                    .iter()
+                    .any(|route| route.event_type.is_none() && &route.topic == configured);
                 if !has_topic_catch_all {
                     return Err(EventBrokerError::InvalidConsumerOptions {
                         detail: format!(
                             "routed consumer without a default handler requires a topic catch-all route for configured topic {configured}"
                         ),
-                        instance: String::new(),
                     });
                 }
             }
@@ -531,11 +528,11 @@ impl<M, H> ConsumerRoutedReady<M, H> {
         Ok(())
     }
 
-    fn route_topic_is_configured(&self, route_topic: &TopicRef) -> bool {
+    fn route_topic_is_configured(&self, route_topic: &GtsInstanceId) -> bool {
         self.builder
             .topics
             .iter()
-            .any(|configured| topic_ref_matches_configured(route_topic, configured))
+            .any(|configured| route_topic == configured)
     }
 }
 
@@ -557,7 +554,6 @@ where
         if self.builder.topics.is_empty() {
             return Err(EventBrokerError::InvalidConsumerOptions {
                 detail: "routed consumer requires at least one configured topic".to_owned(),
-                instance: String::new(),
             });
         }
 
@@ -569,34 +565,34 @@ where
                         "route topic {:?} is not part of the configured subscription topics",
                         route.topic
                     ),
-                    instance: String::new(),
                 });
             }
 
-            let key = (route.topic.clone(), route.event_type.clone());
+            let key = (
+                route.topic.clone(),
+                route.event_type.as_ref().map(|p| p.pattern().to_owned()),
+            );
             if !seen.insert(key) {
                 return Err(EventBrokerError::InvalidConsumerOptions {
                     detail: format!(
                         "duplicate consumer route for topic {:?} and event type {:?}",
                         route.topic, route.event_type
                     ),
-                    instance: String::new(),
                 });
             }
         }
 
         if self.default_handler.is_none() {
             for configured in &self.builder.topics {
-                let has_topic_catch_all = self.routes.iter().any(|route| {
-                    route.event_type.is_none()
-                        && topic_ref_matches_configured(&route.topic, configured)
-                });
+                let has_topic_catch_all = self
+                    .routes
+                    .iter()
+                    .any(|route| route.event_type.is_none() && &route.topic == configured);
                 if !has_topic_catch_all {
                     return Err(EventBrokerError::InvalidConsumerOptions {
                         detail: format!(
                             "routed consumer without a default handler requires a topic catch-all route for configured topic {configured}"
                         ),
-                        instance: String::new(),
                     });
                 }
             }
@@ -605,50 +601,26 @@ where
         Ok(())
     }
 
-    fn route_topic_is_configured(&self, route_topic: &TopicRef) -> bool {
+    fn route_topic_is_configured(&self, route_topic: &GtsInstanceId) -> bool {
         self.builder
             .topics
             .iter()
-            .any(|configured| topic_ref_matches_configured(route_topic, configured))
-    }
-}
-
-fn topic_ref_matches_configured(route_topic: &TopicRef, configured: &str) -> bool {
-    match route_topic {
-        TopicRef::Gts(gts) => gts == configured,
-        TopicRef::Id(id) => *id == crate::ids::TopicId::from_gts(configured),
-    }
-}
-
-pub(crate) fn topic_ref_to_string(topic: &TopicRef) -> String {
-    match topic {
-        TopicRef::Gts(gts) => gts.clone(),
-        TopicRef::Id(id) => id.as_uuid().to_string(),
-    }
-}
-
-pub(crate) fn event_type_ref_to_string(event_type: &EventTypeRef) -> String {
-    match event_type {
-        EventTypeRef::Gts(gts) | EventTypeRef::GtsPattern(gts) => gts.clone(),
-        EventTypeRef::Id(id) => id.as_uuid().to_string(),
+            .any(|configured| route_topic == configured)
     }
 }
 
 pub(crate) fn subscription_filter_ref_to_filter(filter: &SubscriptionFilterRef) -> Filter {
     Filter {
-        engine: match &filter.engine {
-            super::FilterEngineRef::Gts(gts) => gts.clone(),
-            super::FilterEngineRef::Id(id) => id.to_string(),
-        },
+        engine: filter.engine.clone(),
         expression: filter.expression.clone(),
     }
 }
 
 impl<M, H> ConsumerRouteBuilder<M, H, RouteMissingTopic> {
-    pub fn topic(self, topic: impl Into<TopicRef>) -> ConsumerRouteBuilder<M, H, RouteHasTopic> {
+    pub fn topic(self, topic: GtsInstanceId) -> ConsumerRouteBuilder<M, H, RouteHasTopic> {
         ConsumerRouteBuilder {
             ready: self.ready,
-            topic: Some(topic.into()),
+            topic: Some(topic),
             event_type: self.event_type,
             _topic_state: std::marker::PhantomData,
         }
@@ -656,13 +628,13 @@ impl<M, H> ConsumerRouteBuilder<M, H, RouteMissingTopic> {
 }
 
 impl<M, H> ConsumerRouteBuilder<M, H, RouteHasTopic> {
-    pub fn topic(mut self, topic: impl Into<TopicRef>) -> Self {
-        self.topic = Some(topic.into());
+    pub fn topic(mut self, topic: GtsInstanceId) -> Self {
+        self.topic = Some(topic);
         self
     }
 
-    pub fn event_type(mut self, event_type: impl Into<EventTypeRef>) -> Self {
-        self.event_type = Some(event_type.into());
+    pub fn event_type(mut self, event_type: GtsIdPattern) -> Self {
+        self.event_type = Some(event_type);
         self
     }
 
@@ -689,10 +661,10 @@ impl<M> TxConsumerRouteBuilder<M, RouteMissingTopic>
 where
     M: CommitOffsetInTx + 'static,
 {
-    pub fn topic(self, topic: impl Into<TopicRef>) -> TxConsumerRouteBuilder<M, RouteHasTopic> {
+    pub fn topic(self, topic: GtsInstanceId) -> TxConsumerRouteBuilder<M, RouteHasTopic> {
         TxConsumerRouteBuilder {
             ready: self.ready,
-            topic: Some(topic.into()),
+            topic: Some(topic),
             event_type: self.event_type,
             _topic_state: std::marker::PhantomData,
         }
@@ -704,13 +676,13 @@ impl<M> TxConsumerRouteBuilder<M, RouteHasTopic>
 where
     M: CommitOffsetInTx + 'static,
 {
-    pub fn topic(mut self, topic: impl Into<TopicRef>) -> Self {
-        self.topic = Some(topic.into());
+    pub fn topic(mut self, topic: GtsInstanceId) -> Self {
+        self.topic = Some(topic);
         self
     }
 
-    pub fn event_type(mut self, event_type: impl Into<EventTypeRef>) -> Self {
-        self.event_type = Some(event_type.into());
+    pub fn event_type(mut self, event_type: GtsIdPattern) -> Self {
+        self.event_type = Some(event_type);
         self
     }
 

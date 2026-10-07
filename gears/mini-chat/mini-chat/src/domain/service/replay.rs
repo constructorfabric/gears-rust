@@ -62,18 +62,18 @@ pub async fn replay_turn<MR: MessageRepository>(
     });
 
     let delta = StreamEvent::Delta(DeltaData {
-        r#type: "text",
+        r#type: crate::domain::stream_events::DeltaKind::Text,
         content: message.content,
     });
 
     let done = StreamEvent::Done(Box::new(DoneData {
-        usage: Some(Usage {
+        usage: Usage {
             input_tokens: message.input_tokens,
             output_tokens: message.output_tokens,
             cache_read_input_tokens: message.cache_read_input_tokens,
             cache_write_input_tokens: message.cache_write_input_tokens,
             reasoning_tokens: message.reasoning_tokens,
-        }),
+        },
         effective_model: turn.effective_model.clone().unwrap_or_default(),
         selected_model: selected_model.to_owned(),
         quota_decision: reconstruct_quota_decision(turn, selected_model),
@@ -89,10 +89,14 @@ pub async fn replay_turn<MR: MessageRepository>(
     })
 }
 
-fn reconstruct_quota_decision(turn: &TurnModel, selected_model: &str) -> String {
+fn reconstruct_quota_decision(
+    turn: &TurnModel,
+    selected_model: &str,
+) -> crate::domain::stream_events::QuotaDecisionKind {
+    use crate::domain::stream_events::QuotaDecisionKind;
     match &turn.effective_model {
-        Some(effective) if effective != selected_model => "downgrade".to_owned(),
-        _ => "allow".to_owned(),
+        Some(effective) if effective != selected_model => QuotaDecisionKind::Downgrade,
+        _ => QuotaDecisionKind::Allow,
     }
 }
 
@@ -272,10 +276,11 @@ mod tests {
             Ok(None)
         }
 
-        async fn find_latest_message<C: DBRunner>(
+        async fn find_latest_message_before_turn<C: DBRunner>(
             &self,
             _: &C,
             _: &AccessScope,
+            _: Uuid,
             _: Uuid,
         ) -> Result<Option<crate::domain::repos::SummaryFrontier>, DomainError> {
             Ok(None)
@@ -400,7 +405,7 @@ mod tests {
         match &result.delta {
             StreamEvent::Delta(d) => {
                 assert_eq!(d.content, "Hello from assistant");
-                assert_eq!(d.r#type, "text");
+                assert_eq!(d.r#type, crate::domain::stream_events::DeltaKind::Text);
             }
             other => panic!("expected Delta, got {other:?}"),
         }
@@ -410,7 +415,7 @@ mod tests {
             StreamEvent::Done(d) => {
                 assert_eq!(d.effective_model, "gpt-5.2");
                 assert_eq!(d.selected_model, "gpt-5.2");
-                let usage = d.usage.as_ref().expect("usage should be present");
+                let usage = &d.usage;
                 assert_eq!(usage.input_tokens, 100);
                 assert_eq!(usage.output_tokens, 50);
             }
@@ -439,7 +444,10 @@ mod tests {
 
         match &result.done {
             StreamEvent::Done(d) => {
-                assert_eq!(d.quota_decision, "allow");
+                assert_eq!(
+                    d.quota_decision,
+                    crate::domain::stream_events::QuotaDecisionKind::Allow
+                );
                 assert!(d.downgrade_from.is_none());
             }
             other => panic!("expected Done, got {other:?}"),
@@ -468,7 +476,10 @@ mod tests {
 
         match &result.done {
             StreamEvent::Done(d) => {
-                assert_eq!(d.quota_decision, "downgrade");
+                assert_eq!(
+                    d.quota_decision,
+                    crate::domain::stream_events::QuotaDecisionKind::Downgrade
+                );
                 assert_eq!(d.downgrade_from.as_deref(), Some("gpt-5.2"));
                 assert_eq!(d.effective_model, "gpt-5-mini");
             }

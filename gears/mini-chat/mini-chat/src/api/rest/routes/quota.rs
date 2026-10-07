@@ -2,7 +2,7 @@ use axum::Router;
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::operation_builder::OperationBuilder;
 
-use super::AiChatLicense;
+use super::{AiChatLicense, retry_after_header};
 use crate::api::rest::handlers;
 use crate::api::rest::handlers::quota::QuotaStatusResponse;
 
@@ -26,7 +26,12 @@ pub(super) fn register_quota_routes(
             http::StatusCode::OK,
             "Quota status with remaining percentages and warning flags",
         )
-        .standard_errors(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        // The handler asks the PDP (`USER_QUOTA` read): a PDP outage is 503.
+        .error_503(openapi)
+        .response_header(retry_after_header())
         .register(router, openapi);
 
     router

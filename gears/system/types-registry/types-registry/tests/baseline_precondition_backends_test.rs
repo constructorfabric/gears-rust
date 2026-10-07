@@ -24,7 +24,7 @@ use types_registry::domain::admission::worker::{
 use types_registry::domain::admission::{
     AdmissionFailureReason, Candidate, OperationDispatch, SubmitRequest,
 };
-use types_registry::domain::enums::{OperationItemStatus, OperationKind};
+use types_registry::domain::enums::OperationItemStatus;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::ports::Stores;
 use types_registry::infra::storage::entity::{entity, type_schema, type_schema_revision};
@@ -37,8 +37,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -62,8 +66,7 @@ async fn submit(db: &Provider, key: &str, body: Value, expected: Option<i64>) ->
         },
         &(Arc::new(NoDispatch) as Arc<dyn OperationDispatch>),
         &SubmitRequest {
-            idempotency_key: key.to_owned(),
-            kind: OperationKind::Registration,
+            idempotency_key: Some(key.to_owned()),
             dry_run: false,
             candidates: vec![Candidate {
                 gts_id: ID.to_owned(),

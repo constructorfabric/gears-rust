@@ -2,15 +2,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use event_broker_sdk::gts_id;
 use event_broker_sdk::{
     BatchHandlerOutcome, ConsumerBatching, ConsumerBuilder, ConsumerError, ConsumerGroupRef,
     ConsumerHandler, EventBatch, Fallback, InMemoryOffsetManager,
 };
 
-use super::common::{publish_json, topic_fixture, wait_until};
+use super::common::{publish_json, topic, topic_fixture, wait_until};
 
-const TOPIC: &str = "gts.cf.core.events.topic.v1~example.mock.showcase.batch.v1";
-const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~example.mock.showcase.batch.v1~";
+const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.showcase.batch.v1");
+const EVENT_TYPE: &str = gts_id!("cf.core.events.event.v1~example.mock.showcase.batch.v1~");
 
 type RecordedBatch = (u32, Vec<i64>);
 type RecordedBatches = Arc<Mutex<Vec<RecordedBatch>>>;
@@ -29,7 +30,7 @@ impl ConsumerHandler for BatchProjector {
         let chunk = batch.next_chunk(batch.len());
         self.batches.lock().unwrap().push((
             chunk[0].partition,
-            chunk.iter().map(|event| event.offset).collect(),
+            chunk.iter().map(|event| event.offset.as_i64()).collect(),
         ));
         Ok(BatchHandlerOutcome::AdvanceThrough {
             offset: chunk.last().expect("showcase batch is not empty").offset,
@@ -44,7 +45,7 @@ async fn if_i_want_native_batches_they_stay_inside_one_partition() {
 
     let handle = ConsumerBuilder::new(fixture.broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("showcase-batch"))
-        .topics([TOPIC])
+        .topics([topic(TOPIC)])
         .batching(ConsumerBatching {
             max_events: 8,
             max_wait: Duration::from_millis(10),

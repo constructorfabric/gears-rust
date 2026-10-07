@@ -7,6 +7,7 @@ use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 
+use crate::domain::error::DomainError;
 use crate::domain::service::Service;
 
 #[domain_model]
@@ -45,8 +46,9 @@ impl GithubMirrorClientV1 for LocalClient {
         name: &str,
     ) -> Result<SyncSummary, CanonicalError> {
         self.service
-            .sync_repository(ctx, owner, name)
+            .spawn_sync_now(ctx.clone(), owner.to_owned(), name.to_owned())
             .await
+            .map_err(|e| DomainError::internal(format!("the sync task did not finish: {e}")))?
             .map_err(CanonicalError::from)
     }
 }

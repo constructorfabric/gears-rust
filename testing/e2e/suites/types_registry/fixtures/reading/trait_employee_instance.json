@@ -1,0 +1,9 @@
+{
+  "gts_id": "gts.cf.e2e.reading.record.v1~cf.e2e.reading.employee.v1~cf.e2e.reading.ernie.v1",
+  "content": {
+    "name": "Ernie",
+    "payload": {
+      "employee_id": "E101"
+    }
+  }
+}

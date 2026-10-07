@@ -1,10 +1,10 @@
 # E2E configuration for the usage-collector gear.
 #
-# Used only by `make e2e-usage-collector` (alias for `make e2e-local
-# GEAR=usage-collector`), which builds a dedicated binary and starts a
-# TimescaleDB container. NOT part of config/e2e-features.txt or the shared
-# `make e2e-local` run. Colocated with the suite (its conftest loads it) rather
-# than living under config/.
+# Used by `make e2e-usage-collector-timescaledb` (and so by the
+# `make e2e-usage-collector` aggregate), which builds a dedicated binary and
+# starts a TimescaleDB container. NOT part of config/e2e-features.txt or the
+# shared `make e2e-local` run. Colocated with the suite (its conftest loads it)
+# rather than living under config/.
 #
 # The two authz surfaces reach the PDP differently. usage-collector's
 # `usage_type` resource is platform-global per ADR-0012 and so declares no

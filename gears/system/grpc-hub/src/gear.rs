@@ -1517,7 +1517,7 @@ mod tests {
             "should be None before DirectoryClient is registered"
         );
 
-        // Simulate gear_orchestrator registering DirectoryClient after grpc-hub init
+        // Simulate service_discovery registering DirectoryClient after grpc-hub init
         let mock_dir: Arc<dyn DirectoryClientTrait> = Arc::new(MockDirectoryClient);
         client_hub.register::<dyn DirectoryClientTrait>(mock_dir);
 

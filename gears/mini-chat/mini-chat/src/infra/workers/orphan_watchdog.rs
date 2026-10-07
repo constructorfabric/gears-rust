@@ -12,7 +12,7 @@ use crate::config::OrphanWatchdogConfig;
 use mini_chat_sdk::RequesterType;
 
 use crate::domain::model::finalization::OrphanFinalizationInput;
-use crate::domain::ports::MiniChatMetricsPort;
+use crate::domain::ports::{MiniChatMetricsPort, metric_labels};
 use crate::domain::repos::{MessageRepository, TurnRepository};
 use crate::domain::service::DbProvider;
 use crate::domain::service::finalization_service::FinalizationService;
@@ -139,7 +139,8 @@ async fn scan_and_finalize<TR: TurnRepository + 'static, MR: MessageRepository +
             return Ok(true);
         }
 
-        deps.metrics.record_orphan_detected("stale_progress");
+        deps.metrics
+            .record_orphan_detected(metric_labels::reason::STALE_PROGRESS);
 
         let input = orphan_input_from_turn(turn);
         match deps
@@ -148,7 +149,8 @@ async fn scan_and_finalize<TR: TurnRepository + 'static, MR: MessageRepository +
             .await
         {
             Ok(true) => {
-                deps.metrics.record_orphan_finalized("stale_progress");
+                deps.metrics
+                    .record_orphan_finalized(metric_labels::reason::STALE_PROGRESS);
                 info!(
                     turn_id = %turn.id,
                     tenant_id = %turn.tenant_id,
@@ -222,6 +224,7 @@ fn orphan_input_from_turn(turn: &TurnModel) -> OrphanFinalizationInput {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use uuid::Uuid;
@@ -320,38 +323,37 @@ mod tests {
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: mini_chat_sdk::UsageEvent,
-        ) -> Result<(), crate::domain::error::DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            Ok(crate::domain::repos::Wake::empty())
         }
         async fn enqueue_attachment_cleanup(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::repos::AttachmentCleanupEvent,
-        ) -> Result<(), crate::domain::error::DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            Ok(crate::domain::repos::Wake::empty())
         }
         async fn enqueue_chat_cleanup(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::repos::ChatCleanupEvent,
-        ) -> Result<(), crate::domain::error::DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            Ok(crate::domain::repos::Wake::empty())
         }
         async fn enqueue_audit_event(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _event: crate::domain::model::audit_envelope::AuditEnvelope,
-        ) -> Result<(), crate::domain::error::DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            Ok(crate::domain::repos::Wake::empty())
         }
         async fn enqueue_thread_summary(
             &self,
             _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
             _payload: crate::domain::repos::ThreadSummaryTaskPayload,
-        ) -> Result<(), crate::domain::error::DomainError> {
-            Ok(())
+        ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+            Ok(crate::domain::repos::Wake::empty())
         }
-        fn flush(&self) {}
     }
 
     // ── orphan_input_from_turn ──

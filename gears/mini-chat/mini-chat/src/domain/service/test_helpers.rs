@@ -129,13 +129,21 @@ use mini_chat_sdk::ModelCatalogEntry;
 /// Default catalog: `gpt-5.2` (enabled, default) and `gpt-5-mini` (disabled).
 pub struct MockModelResolver {
     catalog: Mutex<Vec<ModelCatalogEntry>>,
+    kill_switches: mini_chat_sdk::KillSwitches,
 }
 
 impl MockModelResolver {
     pub fn new(catalog: Vec<ModelCatalogEntry>) -> Self {
         Self {
             catalog: Mutex::new(catalog),
+            kill_switches: mini_chat_sdk::KillSwitches::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_kill_switches(mut self, kill_switches: mini_chat_sdk::KillSwitches) -> Self {
+        self.kill_switches = kill_switches;
+        self
     }
 }
 
@@ -210,6 +218,19 @@ impl ModelResolver for MockModelResolver {
         }
     }
 
+    async fn resolve_chat_model(
+        &self,
+        _user_id: Uuid,
+        model_id: &str,
+    ) -> Result<ResolvedModel, DomainError> {
+        let catalog = self.catalog.lock().unwrap();
+        catalog
+            .iter()
+            .find(|m| m.id == model_id)
+            .map(ResolvedModel::from)
+            .ok_or_else(|| DomainError::invalid_model(model_id))
+    }
+
     async fn list_visible_models(&self, _user_id: Uuid) -> Result<Vec<ResolvedModel>, DomainError> {
         let catalog = self.catalog.lock().unwrap();
         Ok(catalog
@@ -236,7 +257,7 @@ impl ModelResolver for MockModelResolver {
         &self,
         _user_id: Uuid,
     ) -> Result<mini_chat_sdk::KillSwitches, DomainError> {
-        Ok(mini_chat_sdk::KillSwitches::default())
+        Ok(self.kill_switches.clone())
     }
 }
 
@@ -278,6 +299,44 @@ pub fn test_security_ctx_with_id(tenant_id: Uuid, subject_id: Uuid) -> SecurityC
 pub fn mock_enforcer() -> PolicyEnforcer {
     let authz: Arc<dyn AuthZResolverApi> = Arc::new(MockAuthZResolver);
     PolicyEnforcer::new(authz)
+}
+
+/// `MockAuthZResolver` that records the action of every evaluation and
+/// denies one action, if set.
+pub struct RecordingAuthZResolver {
+    pub actions: Mutex<Vec<String>>,
+    deny_action: Option<&'static str>,
+}
+
+#[async_trait]
+impl AuthZResolverApi for RecordingAuthZResolver {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let action = request.action.name.clone();
+        self.actions.lock().unwrap().push(action.clone());
+        if self.deny_action == Some(action.as_str()) {
+            return Ok(EvaluationResponse {
+                decision: false,
+                context: EvaluationResponseContext::default(),
+            });
+        }
+        MockAuthZResolver.evaluate(ctx, request).await
+    }
+}
+
+/// An enforcer backed by `RecordingAuthZResolver`, and the resolver.
+pub fn recording_enforcer(
+    deny_action: Option<&'static str>,
+) -> (PolicyEnforcer, Arc<RecordingAuthZResolver>) {
+    let resolver = Arc::new(RecordingAuthZResolver {
+        actions: Mutex::new(Vec::new()),
+        deny_action,
+    });
+    let authz: Arc<dyn AuthZResolverApi> = resolver.clone();
+    (PolicyEnforcer::new(authz), resolver)
 }
 
 /// Tenant-only `AuthZ` resolver for services that mix owned and `no_owner` entities.
@@ -392,6 +451,15 @@ impl ThreadSummaryRepository for MockThreadSummaryRepo {
     ) -> Result<u64, crate::domain::error::DomainError> {
         Ok(1)
     }
+
+    async fn delete_for_chat<C: toolkit_db::secure::DBRunner>(
+        &self,
+        _runner: &C,
+        _scope: &toolkit_security::AccessScope,
+        _chat_id: uuid::Uuid,
+    ) -> Result<u64, crate::domain::error::DomainError> {
+        Ok(0)
+    }
 }
 
 pub fn mock_thread_summary_repo() -> Arc<MockThreadSummaryRepo> {
@@ -470,10 +538,10 @@ pub fn test_catalog_entry(params: TestCatalogEntryParams) -> ModelCatalogEntry {
             available_from: OffsetDateTime::UNIX_EPOCH,
             max_file_size_mb: 25,
             api_params: ModelApiParams {
-                temperature: 0.7,
-                top_p: 1.0,
-                frequency_penalty: 0.0,
-                presence_penalty: 0.0,
+                temperature: Some(0.7),
+                top_p: Some(1.0),
+                frequency_penalty: Some(0.0),
+                presence_penalty: Some(0.0),
                 stop: vec![],
                 extra_body: None,
                 reasoning_effort: None,
@@ -484,7 +552,7 @@ pub fn test_catalog_entry(params: TestCatalogEntryParams) -> ModelCatalogEntry {
             },
             tool_support: ModelToolSupport {
                 web_search: false,
-                file_search: false,
+                file_search: true,
                 image_generation: false,
                 code_interpreter: false,
                 mcp: false,
@@ -822,8 +890,20 @@ impl crate::domain::ports::VectorStoreProvider for NoopVectorStoreProvider {
         _ctx: toolkit_security::SecurityContext,
         _provider_id: &str,
         _params: crate::domain::ports::AddFileToVectorStoreParams,
-    ) -> Result<(), crate::domain::ports::FileStorageError> {
-        Ok(())
+    ) -> Result<crate::domain::ports::VectorStoreFileStatus, crate::domain::ports::FileStorageError>
+    {
+        Ok(crate::domain::ports::VectorStoreFileStatus::Completed)
+    }
+
+    async fn get_vector_store_file_status(
+        &self,
+        _ctx: toolkit_security::SecurityContext,
+        _provider_id: &str,
+        _vector_store_id: &str,
+        _provider_file_id: &str,
+    ) -> Result<crate::domain::ports::VectorStoreFileStatus, crate::domain::ports::FileStorageError>
+    {
+        Ok(crate::domain::ports::VectorStoreFileStatus::Completed)
     }
 
     async fn delete_vector_store(
@@ -877,38 +957,37 @@ impl OutboxEnqueuer for NoopOutboxEnqueuer {
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: mini_chat_sdk::UsageEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+        Ok(crate::domain::repos::Wake::empty())
     }
     async fn enqueue_attachment_cleanup(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: AttachmentCleanupEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+        Ok(crate::domain::repos::Wake::empty())
     }
     async fn enqueue_chat_cleanup(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: ChatCleanupEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+        Ok(crate::domain::repos::Wake::empty())
     }
     async fn enqueue_audit_event(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: AuditEnvelope,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+        Ok(crate::domain::repos::Wake::empty())
     }
     async fn enqueue_thread_summary(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _payload: crate::domain::repos::ThreadSummaryTaskPayload,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+        Ok(crate::domain::repos::Wake::empty())
     }
-    fn flush(&self) {}
 }
 
 /// Recording outbox enqueuer that captures events for test assertions.
@@ -919,7 +998,7 @@ pub struct RecordingOutboxEnqueuer {
     pub chat_cleanup_events: Mutex<Vec<ChatCleanupEvent>>,
     pub thread_summary_payloads: Mutex<Vec<crate::domain::repos::ThreadSummaryTaskPayload>>,
     recorded_audit_events: Mutex<Vec<AuditEnvelope>>,
-    recorded_flush_count: AtomicU32,
+    recorded_enqueue_count: AtomicU32,
 }
 
 impl RecordingOutboxEnqueuer {
@@ -930,7 +1009,7 @@ impl RecordingOutboxEnqueuer {
             chat_cleanup_events: Mutex::new(Vec::new()),
             thread_summary_payloads: Mutex::new(Vec::new()),
             recorded_audit_events: Mutex::new(Vec::new()),
-            recorded_flush_count: AtomicU32::new(0),
+            recorded_enqueue_count: AtomicU32::new(0),
         }
     }
 
@@ -942,8 +1021,12 @@ impl RecordingOutboxEnqueuer {
         self.recorded_audit_events.lock().unwrap().clear();
     }
 
-    pub fn flush_count(&self) -> u32 {
-        self.recorded_flush_count.load(Ordering::SeqCst)
+    /// Total number of `enqueue_*` calls seen. Flush now happens on the
+    /// returned `Wake` (which this mock returns as `empty()` and so
+    /// cannot observe), so tests assert on enqueue activity instead: a CAS
+    /// winner enqueues, a CAS loser enqueues nothing.
+    pub fn enqueue_count(&self) -> u32 {
+        self.recorded_enqueue_count.load(Ordering::SeqCst)
     }
 }
 
@@ -953,44 +1036,46 @@ impl OutboxEnqueuer for RecordingOutboxEnqueuer {
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: mini_chat_sdk::UsageEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
         self.usage_events.lock().unwrap().push(event);
-        Ok(())
+        self.recorded_enqueue_count.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::domain::repos::Wake::empty())
     }
     async fn enqueue_attachment_cleanup(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: AttachmentCleanupEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
         self.cleanup_events.lock().unwrap().push(event);
-        Ok(())
+        self.recorded_enqueue_count.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::domain::repos::Wake::empty())
     }
     async fn enqueue_chat_cleanup(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: ChatCleanupEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
         self.chat_cleanup_events.lock().unwrap().push(event);
-        Ok(())
+        self.recorded_enqueue_count.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::domain::repos::Wake::empty())
     }
     async fn enqueue_audit_event(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         event: AuditEnvelope,
-    ) -> Result<(), crate::domain::error::DomainError> {
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
         self.recorded_audit_events.lock().unwrap().push(event);
-        Ok(())
+        self.recorded_enqueue_count.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::domain::repos::Wake::empty())
     }
     async fn enqueue_thread_summary(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         payload: crate::domain::repos::ThreadSummaryTaskPayload,
-    ) -> Result<(), crate::domain::error::DomainError> {
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
         self.thread_summary_payloads.lock().unwrap().push(payload);
-        Ok(())
-    }
-    fn flush(&self) {
-        self.recorded_flush_count.fetch_add(1, Ordering::SeqCst);
+        self.recorded_enqueue_count.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::domain::repos::Wake::empty())
     }
 }
 
@@ -1004,15 +1089,15 @@ impl OutboxEnqueuer for FailingOutboxEnqueuer {
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: mini_chat_sdk::UsageEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+        Ok(crate::domain::repos::Wake::empty())
     }
     async fn enqueue_attachment_cleanup(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: AttachmentCleanupEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Err(crate::domain::error::DomainError::database(
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+        Err(crate::domain::repos::OutboxError::enqueue(
             "simulated outbox enqueue failure".to_owned(),
         ))
     }
@@ -1020,8 +1105,8 @@ impl OutboxEnqueuer for FailingOutboxEnqueuer {
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: ChatCleanupEvent,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Err(crate::domain::error::DomainError::database(
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+        Err(crate::domain::repos::OutboxError::enqueue(
             "simulated outbox enqueue failure".to_owned(),
         ))
     }
@@ -1029,17 +1114,16 @@ impl OutboxEnqueuer for FailingOutboxEnqueuer {
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _event: AuditEnvelope,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+        Ok(crate::domain::repos::Wake::empty())
     }
     async fn enqueue_thread_summary(
         &self,
         _runner: &(dyn toolkit_db::secure::DBRunner + Sync),
         _payload: crate::domain::repos::ThreadSummaryTaskPayload,
-    ) -> Result<(), crate::domain::error::DomainError> {
-        Ok(())
+    ) -> Result<crate::domain::repos::Wake, crate::domain::repos::OutboxError> {
+        Ok(crate::domain::repos::Wake::empty())
     }
-    fn flush(&self) {}
 }
 
 // ── Mock OAGW Gateway ──
@@ -1216,9 +1300,14 @@ use std::sync::atomic::{AtomicI64, AtomicU64};
 /// and histogram observation counts via atomics. Used to verify that
 /// service code emits the expected metrics.
 pub struct TestMetrics {
+    pub thread_summary_trigger: Mutex<Vec<String>>,
     pub turn_mutation: AtomicU64,
     pub turn_mutation_latency_ms: AtomicU64,
     pub audit_emit: AtomicU64,
+    /// `result` label of every `record_audit_emit` call, in order.
+    pub audit_emit_results: Mutex<Vec<String>>,
+    /// `result` label of every `record_background_indexing` call, in order.
+    pub background_indexing: Mutex<Vec<String>>,
     pub finalization_latency_ms: AtomicU64,
     pub quota_commit: AtomicU64,
     pub quota_overshoot: AtomicU64,
@@ -1233,9 +1322,12 @@ pub struct TestMetrics {
 impl TestMetrics {
     pub fn new() -> Self {
         Self {
+            thread_summary_trigger: Mutex::new(Vec::new()),
             turn_mutation: AtomicU64::new(0),
             turn_mutation_latency_ms: AtomicU64::new(0),
             audit_emit: AtomicU64::new(0),
+            audit_emit_results: Mutex::new(Vec::new()),
+            background_indexing: Mutex::new(Vec::new()),
             finalization_latency_ms: AtomicU64::new(0),
             quota_commit: AtomicU64::new(0),
             quota_overshoot: AtomicU64::new(0),
@@ -1266,8 +1358,12 @@ impl crate::domain::ports::MiniChatMetricsPort for TestMetrics {
         self.turn_mutation_latency_ms
             .fetch_add(1, Ordering::Relaxed);
     }
-    fn record_audit_emit(&self, _: &str) {
+    fn record_audit_emit(&self, result: &str) {
         self.audit_emit.fetch_add(1, Ordering::Relaxed);
+        self.audit_emit_results
+            .lock()
+            .unwrap()
+            .push(result.to_owned());
     }
     fn record_finalization_latency_ms(&self, _: f64) {
         self.finalization_latency_ms.fetch_add(1, Ordering::Relaxed);
@@ -1316,7 +1412,20 @@ impl crate::domain::ports::MiniChatMetricsPort for TestMetrics {
     fn record_orphan_detected(&self, _: &str) {}
     fn record_orphan_finalized(&self, _: &str) {}
     fn record_orphan_scan_duration_seconds(&self, _: f64) {}
-    fn record_thread_summary_trigger(&self, _: &str) {}
+    fn record_upload_abandoned(&self, _: &str) {}
+    fn record_background_indexing(&self, result: &str) {
+        self.background_indexing
+            .lock()
+            .unwrap()
+            .push(result.to_owned());
+    }
+    fn record_upload_reaper_scan_duration_seconds(&self, _: f64) {}
+    fn record_thread_summary_trigger(&self, result: &str) {
+        self.thread_summary_trigger
+            .lock()
+            .unwrap()
+            .push(result.to_owned());
+    }
     fn record_thread_summary_execution(&self, _: &str) {}
     fn record_thread_summary_cas_conflict(&self) {}
     fn record_summary_fallback(&self) {}

@@ -12,6 +12,14 @@
 //!   (a parent's cascade may have eaten the descendant already).
 //! * RG unavailable during list → `Retryable`.
 //! * RG unavailable during cascade → `Retryable`.
+//! * Listed non-root groups → skipped (only roots are cascaded).
+//!
+//! The fake's `list_groups` runs the listed query through
+//! [`convert_expr_to_filter_node`] against RG's own
+//! [`GroupFilterField`] — the very call `GroupRepo::list_groups`
+//! makes before touching the database. A `$filter` the real RG API
+//! would reject therefore fails these tests instead of passing
+//! against a mock that ignores the query.
 
 #![allow(
     clippy::expect_used,
@@ -24,12 +32,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use resource_group_sdk::odata::GroupFilterField;
 use resource_group_sdk::{
     CreateGroupRequest, CreateTypeRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
     ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
     UpdateTypeRequest,
 };
 use toolkit_canonical_errors::{CanonicalError, resource_error};
+use toolkit_odata::filter::convert_expr_to_filter_node;
 use toolkit_odata::page::PageInfo;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
@@ -46,9 +56,19 @@ use crate::domain::tenant::hooks::HookError;
 #[resource_error(gts_id!("cf.core.resource_group.group.v1~"))]
 struct RgErr;
 
+/// Build the canonical `NotFound` the real RG ladder emits for `code`.
 fn rg_not_found(code: &str) -> CanonicalError {
     RgErr::not_found(format!("'{code}' not found"))
         .with_resource(code)
+        .create()
+}
+
+/// Mirror of the reject `GroupRepo::list_groups` emits when
+/// `convert_expr_to_filter_node` refuses the `$filter`
+/// (`DomainError::validation("invalid $filter: {e}")` → 400).
+fn rg_invalid_filter(detail: String) -> CanonicalError {
+    RgErr::invalid_argument()
+        .with_field_violation("$filter", detail, "VALIDATION")
         .create()
 }
 
@@ -75,11 +95,23 @@ impl FakeCascadeRgClient {
 
 #[async_trait]
 impl ResourceGroupClient for FakeCascadeRgClient {
+    /// Serve the canned page, but gate the query on RG's own `$filter`
+    /// contract first.
+    ///
+    /// RG types every `$filter` against `GroupFilterField` before it
+    /// reaches storage, so a term the grammar cannot express (a null
+    /// literal on the Uuid-kinded `hierarchy/parent_id`, say) is a 400
+    /// in production. Running the same validator here stops a mock from
+    /// blessing a filter the real API would reject.
     async fn list_groups(
         &self,
         _ctx: &SecurityContext,
-        _query: &ODataQuery,
+        query: &ODataQuery,
     ) -> Result<Page<ResourceGroup>, CanonicalError> {
+        if let Some(filter) = query.filter() {
+            convert_expr_to_filter_node::<GroupFilterField>(filter)
+                .map_err(|e| rg_invalid_filter(format!("invalid $filter: {e}")))?;
+        }
         (self.list_groups_fn)()
     }
 
@@ -198,6 +230,7 @@ impl ResourceGroupClient for FakeCascadeRgClient {
 
 const TENANT_ID: Uuid = Uuid::from_u128(0xAAAA_0001);
 
+/// A root user-group of [`TENANT_ID`]: right type, no parent.
 fn make_group(id: u128) -> ResourceGroup {
     ResourceGroup {
         id: Uuid::from_u128(id),
@@ -209,6 +242,15 @@ fn make_group(id: u128) -> ResourceGroup {
         },
         metadata: None,
     }
+}
+
+/// A non-root user-group: same tenant and type, but parented by
+/// `parent_id`. RG's cascade on the root already eats it, so the hook
+/// must not dispatch a second delete for it.
+fn make_child_group(id: u128, parent_id: Uuid) -> ResourceGroup {
+    let mut group = make_group(id);
+    group.hierarchy.parent_id = Some(parent_id);
+    group
 }
 
 fn groups_page(groups: Vec<ResourceGroup>) -> Page<ResourceGroup> {
@@ -255,18 +297,20 @@ async fn single_group_deletes_via_cascade() {
     );
 }
 
+/// Two sibling roots → each dispatched to cascade exactly once.
+///
+/// RG's `delete_group_cascade` is itself recursive on the RG side
+/// (force=true tears down the subtree atomically), so AM is
+/// single-pass: every group `list_groups` returns is dispatched once.
+/// There is no leaf-first retry loop -- the old AM-side multi-pass
+/// algorithm has moved to RG.
+///
+/// Both fixtures land as sibling roots (`make_group` builds rows with
+/// `parent_id: None`); production `fetch_tenant_groups` narrows the
+/// listing to roots client-side, so this matches the real shape.
+/// [`only_root_groups_are_cascaded`] covers a non-root in the page.
 #[tokio::test]
 async fn two_listed_groups_each_cascade_called_exactly_once() {
-    // RG's `delete_group_cascade` is itself recursive on the RG side
-    // (force=true tears down the subtree atomically). AM is therefore
-    // single-pass: each group returned by `list_groups` is dispatched
-    // to cascade exactly once. There is no leaf-first retry loop --
-    // the old AM-side multi-pass algorithm has moved to RG.
-    //
-    // Both fixtures land as sibling roots (`make_group` builds rows
-    // with `parent_id: None`); production `fetch_tenant_groups`
-    // filters to `parent_id IS NULL` so this matches the real shape.
-    //
     // Asserting only `cascade_calls == 2` is too weak -- it would pass
     // for any 2-call sequence including `[g1, g1]`. Record the exact
     // group_ids passed so a regression that called the same id twice
@@ -347,6 +391,9 @@ async fn list_groups_unavailable_returns_retryable() {
     assert!(matches!(result, Err(HookError::Retryable { .. })));
 }
 
+/// A non-`NotFound` failure from `delete_group_cascade` defers the
+/// tenant rather than dropping it: the hook returns `Retryable` so the
+/// next retention tick tries again.
 #[tokio::test]
 async fn cascade_error_returns_retryable() {
     let g = make_group(1);
@@ -364,4 +411,47 @@ async fn cascade_error_returns_retryable() {
     let hook = build_cascade_cleanup_hook(client);
     let result = hook(TENANT_ID).await;
     assert!(matches!(result, Err(HookError::Retryable { .. })));
+}
+
+/// A non-root in the listed page is skipped; only the root is cascaded.
+///
+/// Root-ness cannot be expressed in RG's `$filter`: `hierarchy/parent_id`
+/// is Uuid-kinded and the grammar carries no null literal and no `is null`
+/// operator, so the page comes back with the tenant's whole user-group set
+/// and the hook narrows it itself. Cascading the root already tears down
+/// its subtree on the RG side, so a delete for the child would be a
+/// redundant round-trip against `CASCADE_BUDGET`.
+#[tokio::test]
+async fn only_root_groups_are_cascaded() {
+    let root = make_group(1);
+    let child = make_child_group(2, root.id);
+    let root_id = root.id;
+
+    let called: Arc<parking_lot::Mutex<Vec<Uuid>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let called_clone = Arc::clone(&called);
+
+    let fake = FakeCascadeRgClient {
+        list_groups_fn: {
+            let root = root.clone();
+            let child = child.clone();
+            Box::new(move || Ok(groups_page(vec![root.clone(), child.clone()])))
+        },
+        delete_cascade_fn: Box::new(move |id| {
+            called_clone.lock().push(id);
+            Ok(())
+        }),
+        cascade_calls: AtomicUsize::new(0),
+    };
+
+    let client: Arc<FakeCascadeRgClient> = Arc::new(fake);
+    let client_dyn: Arc<dyn ResourceGroupClient + Send + Sync> = Arc::clone(&client) as _;
+    let hook = build_cascade_cleanup_hook(client_dyn);
+    let result = hook(TENANT_ID).await;
+
+    assert!(result.is_ok());
+    assert_eq!(
+        called.lock().as_slice(),
+        [root_id],
+        "only the root group is dispatched to delete_group_cascade"
+    );
 }

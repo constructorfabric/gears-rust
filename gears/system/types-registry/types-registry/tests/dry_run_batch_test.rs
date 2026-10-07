@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::AdmissionFailureReason;
-use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
+use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError};
 use types_registry::domain::admission::worker::{ItemOutcome, Tuning, WorkerError, run_operation};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums::{OperationItemStatus, OperationKind};
@@ -52,8 +52,12 @@ struct NoDispatch;
 
 #[async_trait::async_trait]
 impl OperationDispatch for NoDispatch {
-    async fn enqueue(&self, _tx: &DbTx<'_>, _operation_id: Uuid) -> anyhow::Result<()> {
-        Ok(())
+    async fn enqueue(
+        &self,
+        _tx: &DbTx<'_>,
+        _operation_id: Uuid,
+    ) -> Result<toolkit_db::outbox::Wake, types_registry::domain::admission::OutboxError> {
+        Ok(toolkit_db::outbox::Wake::empty())
     }
 }
 
@@ -124,7 +128,8 @@ async fn submit(
 ) -> Uuid {
     let provider: DBProvider<AcceptanceError> = DBProvider::new(db.db());
     let dispatch: Arc<dyn OperationDispatch> = Arc::new(NoDispatch);
-    accept(
+    common::accept_as(
+        kind,
         &stores(),
         &provider,
         &allow_all(),
@@ -134,9 +139,8 @@ async fn submit(
             metrics: &common::metrics(),
         },
         &dispatch,
-        &SubmitRequest {
-            idempotency_key: key.to_owned(),
-            kind,
+        SubmitRequest {
+            idempotency_key: Some(key.to_owned()),
             dry_run,
             candidates,
         },
@@ -192,7 +196,7 @@ fn verdicts(items: &[ItemOutcome]) -> Vec<Verdict> {
     items
         .iter()
         .map(|item| Verdict {
-            gts_id: item.gts_id.clone(),
+            gts_id: item.key.to_string(),
             status: item.status,
             reason: item.failure.as_ref().map(|failure| failure.reason.clone()),
         })

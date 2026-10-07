@@ -47,6 +47,7 @@ use fnv::FnvHasher;
 use uuid::Uuid;
 
 use crate::domain::error::{DomainError, UnsupportedResource};
+use crate::domain::service_account::SA_QUOTA_MESSAGE;
 
 /// Stable, non-secret correlation handle for a provider-supplied error
 /// detail. The raw text can carry vendor SDK strings, hostnames, or
@@ -568,6 +569,15 @@ fn log_service_account_failure(err: &IdpServiceAccountFailure, tenant_id: Uuid) 
             field_present = field.is_some(),
             "service-account provider rejected the request as invalid"
         ),
+        // Also caller-attributable (the tenant is full), so `debug!` like
+        // invalid input rather than the provider-trouble `warn!` stream.
+        IdpServiceAccountFailure::QuotaExceeded { .. } => tracing::debug!(
+            target: "am.idp",
+            tenant_id = %tenant_id,
+            failure,
+            detail_len,
+            "service-account provider refused the create: tenant quota reached"
+        ),
         // Routine and expected (it is how an idempotent revoke confirms
         // absence), so it earns no record of its own.
         IdpServiceAccountFailure::NotFound { .. } => {}
@@ -609,6 +619,9 @@ fn log_service_account_failure(err: &IdpServiceAccountFailure, tenant_id: Uuid) 
 ///   (HTTP 400). The provider retained no state; the violation is
 ///   attributed to the request as a whole, never to the adapter's own
 ///   field name.
+/// * `QuotaExceeded` → [`DomainError::ServiceAccountQuotaExceeded`]
+///   (HTTP 429, `service_accounts` subject). Uses the shared AM quota
+///   message; provider details and recovery advice are not forwarded.
 /// * `NotFound` → [`DomainError::ServiceAccountNotFound`] (HTTP 404)
 ///   carrying `resource` — see the parameter note below. `revoke` folds
 ///   the variant into success before reaching here.
@@ -660,6 +673,11 @@ impl ServiceAccountFailureExt for IdpServiceAccountFailure {
                 detail: SA_INVALID_INPUT_MESSAGE.to_owned(),
             },
             // @cpt-end:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-invalid-input-return
+            // @cpt-begin:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-quota-exceeded-return
+            Self::QuotaExceeded { .. } => DomainError::ServiceAccountQuotaExceeded {
+                detail: SA_QUOTA_MESSAGE.to_owned(),
+            },
+            // @cpt-end:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-quota-exceeded-return
             // @cpt-begin:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-not-found-return
             Self::NotFound { .. } => DomainError::ServiceAccountNotFound {
                 detail: format!("service account not found in tenant {tenant_id}"),

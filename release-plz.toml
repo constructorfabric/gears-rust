@@ -193,12 +193,22 @@ changelog_update = false
 git_release_enable = false
 
 [[package]]
+name = "cf-gears-toolkit-trace-context"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
 name = "cf-gears-toolkit-transport-grpc"
 changelog_update = false
 git_release_enable = false
 
 [[package]]
 name = "cf-gears-toolkit-utils"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "cf-gears-toolkit-onnx-runtime"
 changelog_update = false
 git_release_enable = false
 

@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use account_management_sdk::{
     CreateTenantRequest, IdpNewUser, IdpServiceAccountCredentials, IdpServiceAccountSummary,
-    IdpUser, IdpUserPatch, MetadataEntry, Tenant, TenantStatus, UpdateTenantRequest,
+    IdpUser, IdpUserPatch, MetadataEntry, Tenant, TenantNode, TenantStatus, UpdateTenantRequest,
 };
 use secrecy::ExposeSecret as _;
 use toolkit_security::SecurityContext;
@@ -500,6 +500,22 @@ impl From<TenantStatus> for TenantStatusDto {
     }
 }
 
+/// One node on the path from the listing's `tenant_id` down to a
+/// recursively listed descendant
+/// (`GET /tenants/{tenant_id}/children?recursive=true`).
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct TenantAncestorDto {
+    pub id: Uuid,
+    pub name: String,
+    /// Chained GTS tenant-type identifier; omitted on a transient
+    /// types-registry blip (same policy as `TenantDto.tenant_type`).
+    /// Absent or a string, never `null` — the schema says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub tenant_type: Option<String>,
+}
+
 /// AM-internal projection. Wider than `tenant_resolver_sdk::TenantInfo` for
 /// admin/UI consumers (carries lifecycle timestamps + depth).
 ///
@@ -538,6 +554,14 @@ pub struct TenantDto {
         skip_serializing_if = "Option::is_none"
     )]
     pub deleted_at: Option<OffsetDateTime>,
+    /// Ancestor chain relative to the listing's `tenant_id`, ordered
+    /// from the child of `tenant_id` down to this tenant's direct
+    /// parent; empty for a direct child. Present only on
+    /// `GET /tenants/{tenant_id}/children?recursive=true` -- omitted
+    /// from every other response (the key is absent, not `null`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub ancestors: Option<Vec<TenantAncestorDto>>,
 }
 
 impl TenantDto {
@@ -555,6 +579,25 @@ impl TenantDto {
             created_at: tenant.created_at,
             updated_at: tenant.updated_at,
             deleted_at: tenant.deleted_at,
+            ancestors: None,
+        }
+    }
+
+    /// Converts a recursive listing item while preserving ancestor order.
+    #[must_use]
+    pub(crate) fn from_sdk_node(node: TenantNode) -> Self {
+        let ancestors = node
+            .ancestors
+            .into_iter()
+            .map(|a| TenantAncestorDto {
+                id: a.id.0,
+                name: a.name,
+                tenant_type: a.tenant_type,
+            })
+            .collect();
+        Self {
+            ancestors: Some(ancestors),
+            ..Self::from_sdk_tenant(node.tenant)
         }
     }
 }

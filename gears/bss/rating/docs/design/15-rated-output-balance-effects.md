@@ -154,7 +154,7 @@ id; rounding and floor/cap execution are Billing's (core slice [`01`](./01-found
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-domain-model-rob`
 
-- **`RatedCharge`** — one charge line + unit: full-precision amount, rounding-policy id, sealed `pricingSnapshotRef`, `{skuId, planId, priceId}`, **`glCode`** (the accounting pass-through Finance/Billing post journal entries from — non-null at MVP, slice [`10`](./10-governance-asc606.md) §4.3; carried, never interpreted), discount/FX lineage, ASC refs (null@MVP), the provisional flag (invoice-period FX), the usage/period key; immutable.
+- **`RatedCharge`** — one charge line + unit: full-precision amount, rounding-policy id, sealed `pricingSnapshotRef`, `{skuId, planId, priceId}`, **`glCode`** (the accounting pass-through Finance/Billing post journal entries from — non-null at MVP, slice [`10`](./10-governance-asc606.md) §4.3; carried, never interpreted), discount/FX lineage, ASC refs (null@MVP), the provisional flag (invoice-period FX), the usage/period key; immutable. Its accounting pass-through is the `glCode` frozen on the row it rated (pricing D-373).
 - **`Adjustment`** — a correction delta: correction key `(unitKey[, slice], prior-rated-version, snapshot)`, signed full-precision amount, reversal effects, bitemporal stamps; immutable; references the `RatedCharge` version it corrects.
 - **`RatedOutputVersion`** — the `prior-rated-version` chain node: which version of a window/unit's rating this outcome is, for deterministic diffing (core slice [`08`](./08-retroactivity-corrections.md)).
 - **`CommitmentBalanceEffect`** — per-pool signed draw/refill deltas for one outcome, idempotent on the outcome key; published to Contracts (T-D-10).
@@ -162,7 +162,8 @@ id; rounding and floor/cap execution are Billing's (core slice [`01`](./01-found
 
 ### 3.2 Component Model
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-component-rated-output`
+Declared by [`../DESIGN.md`](../DESIGN.md) §3.2's component model as `cpt-cf-bss-rating-component-rated-output`.
+This slice details it; the component model is where it is defined.
 
 - **`OutcomeMapper`** — maps a `ResolvedPriceOutcome` to `RatedCharge`(s) / `Adjustment`(s) per the §4.1 table; obligations become envelope ride-alongs, never charges.
 - **`RatedOutputStore`** — persists outcomes + sealed ref + the `prior-rated-version` chain (§4.2).
@@ -219,7 +220,7 @@ Upstream: slice [`14`](./14-unit-synthesis-period-tick.md) (delivers core outcom
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-storage-rated-output-rob`
+- [ ] `p2` - **ID**: `cpt-cf-bss-rating-datastore-rated-output-rob`
 
 **Owned (partitioned by the pinned `orderingTenantId`, UTC):**
 

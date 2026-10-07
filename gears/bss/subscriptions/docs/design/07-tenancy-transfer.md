@@ -163,7 +163,7 @@ the attempt audited.
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-storage-tenancy-tnt`
+- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-datastore-tenancy-tnt`
 
 Owned here: `ownership_transfer` (flow state + new binding) using the Foundation `approval`; tenant
 axes + delegation-proof references ride the aggregate / transition record. Roll-up read models are
