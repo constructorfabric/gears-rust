@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "atlas_fixture_ids": [
+    "F07"
+  ],
+  "scenario": "frozen-acceptance",
+  "given": {
+    "commercial": {
+      "billing_cycle": "month",
+      "entry_period": null,
+      "rating_window": {
+        "kind": "billing_cycle"
+      },
+      "aggregation_scope": "subscription_line",
+      "reset": "rating_window_start",
+      "quantity_semantics": {
+        "usage_type_id": "vm-hours",
+        "usage_type_version": "v1",
+        "unit": "VM·hour",
+        "fold": "SUM",
+        "accrual_policy_version": "integrated-v1"
+      },
+      "partial_window": "actual_quantity_full_thresholds",
+      "model": "per_unit",
+      "rate": "10",
+      "minimum_fee": null
+    },
+    "descriptors": {
+      "sku_version": 3,
+      "code": "VM-2CPU-4GB",
+      "name": "VM 2 vCPU / 4 GB",
+      "gl_code": "USAGE_REVENUE",
+      "tax_category": "cloud-services",
+      "template": "Usage {sku}"
+    },
+    "successor_rate": "12"
+  },
+  "expected": {
+    "commercial": {
+      "billing_cycle": "month",
+      "entry_period": null,
+      "rating_window": {
+        "kind": "billing_cycle"
+      },
+      "aggregation_scope": "subscription_line",
+      "reset": "rating_window_start",
+      "quantity_semantics": {
+        "usage_type_id": "vm-hours",
+        "usage_type_version": "v1",
+        "unit": "VM·hour",
+        "fold": "SUM",
+        "accrual_policy_version": "integrated-v1"
+      },
+      "partial_window": "actual_quantity_full_thresholds",
+      "model": "per_unit",
+      "rate": "10",
+      "minimum_fee": null
+    },
+    "descriptors": {
+      "sku_version": 3,
+      "code": "VM-2CPU-4GB",
+      "name": "VM 2 vCPU / 4 GB",
+      "gl_code": "USAGE_REVENUE",
+      "tax_category": "cloud-services",
+      "template": "Usage {sku}"
+    },
+    "arithmetic": [],
+    "refusals": []
+  }
+}

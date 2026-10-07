@@ -26,6 +26,14 @@ reason = "Ignore 'coord' shared utility library (distributed-lease primitive; in
 patterns = ["gears/bss/libs/coord/*"]
 
 [[ignore]]
+reason = "Ignore 'approval' shared utility library (the BSS approval-unit engine; infrastructure crate used by products and pricing, documented in their design sets, not an SDLC-documented product module)."
+patterns = ["gears/bss/libs/approval/*"]
+
+[[ignore]]
+reason = "Ignore 'rest' shared utility library (weak ETag and If-None-Match for BSS list and reference reads; infrastructure crate used by products, pricing and approvals, documented in their design sets, not an SDLC-documented product module)."
+patterns = ["gears/bss/libs/rest/*"]
+
+[[ignore]]
 reason = "Ignore 'fixtures' joint golden conformance corpus (cf-gears-bss-fixtures + its conformance harness; test-support infrastructure crates consumed by the BSS gears, not an SDLC-documented product module — no PRD/DESIGN required, README-documented). Same class as 'coord' above."
 patterns = ["gears/bss/fixtures/*"]
 

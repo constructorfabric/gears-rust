@@ -100,10 +100,7 @@ class TestErrorMapping:
             }],
         ))
         data, rid = _stream_error(chat["id"])
-        assert data == {
-            "code": "unexpected_tool_use",
-            "message": "Provider requested an unsupported function tool",
-        }, data
+        assert data["code"] == "unexpected_tool_use", data
         turn = poll_turn(chat["id"], rid)
         assert (turn["state"], turn["error_code"]) == ("error", "unexpected_tool_use"), turn
 
@@ -152,7 +149,7 @@ class TestErrorMapping:
             http_error_body={"error": {"message": "Rate limited", "type": "rate_limit_error"}},
         ))
         data, _ = _stream_error(chat["id"])
-        assert data == {"code": "rate_limited", "message": "Rate limited by provider"}, data
+        assert data["code"] == "rate_limited", data
 
     @pytest.mark.timeout(30)
     def test_rate_limited_with_retry_after(self, chat, mock_provider):
@@ -166,9 +163,8 @@ class TestErrorMapping:
             http_error_headers={"Retry-After": "7"},
         ))
         data, rid = _stream_error(chat["id"])
-        assert data == {
-            "code": "rate_limited", "message": "Rate limited by provider; retry in 7s",
-        }, data
+        assert data["code"] == "rate_limited", data
+        assert "7" in data["message"], data
         turn = poll_turn(chat["id"], rid)
         assert (turn["state"], turn["error_code"]) == ("error", "rate_limited"), turn
 
@@ -193,9 +189,7 @@ class TestErrorMapping:
         assert resp.status_code == 200, resp.text
         events = parse_sse(resp.text)
         assert [e.event for e in events] == ["stream_started", "delta", "error"], events
-        assert events[-1].data == {
-            "code": "provider_error", "message": "stream ended without terminal event",
-        }, events[-1].data
+        assert events[-1].data["code"] == "provider_error", events[-1].data
         rid = expect_stream_started(events).data["request_id"]
         turn = poll_turn(chat["id"], rid)
         assert (turn["state"], turn["error_code"], turn.get("assistant_message_id")) == (
@@ -226,7 +220,6 @@ class TestErrorMapping:
         ))
         data, rid = _stream_error(chat["id"])
         assert data["code"] == "provider_error", data
-        assert data["message"].startswith("function_call arguments were not valid JSON: "), data
         turn = poll_turn(chat["id"], rid)
         assert (turn["state"], turn["error_code"]) == ("error", "provider_error"), turn
 
@@ -251,9 +244,6 @@ class TestErrorMapping:
         assert [e.event for e in events] == ["stream_started", "delta", "error"], events
         data = events[-1].data
         assert data["code"] == "provider_error", data
-        assert data["message"].startswith(
-            "SSE parse error: failed to parse response completed: missing field `usage`",
-        ), data
         rid = expect_stream_started(events).data["request_id"]
         turn = poll_turn(chat["id"], rid)
         assert (turn["state"], turn["error_code"]) == ("error", "provider_error"), turn

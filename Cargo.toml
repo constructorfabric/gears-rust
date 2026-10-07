@@ -169,13 +169,17 @@ members = [
     "gears/bss/ledger/ledger-sdk",
     "gears/bss/pricing/pricing",
     "gears/bss/pricing/pricing-sdk",
+    "gears/bss/products/products",
+    "gears/bss/products/products-sdk",
+    "gears/bss/approvals/approvals",
+    "gears/bss/approvals/approvals-sdk",
     "gears/bss/rate-provider/rate-provider-sdk",
     "gears/bss/rate-provider/rate-provider",
     "gears/bss/rate-provider/plugins/ecb-plugin",
     "gears/bss/rate-provider/plugins/http-json-plugin",
     "gears/bss/libs/coord",
-    "gears/bss/fixtures/bss-fixtures",
-    "gears/bss/fixtures/bss-fixtures-conformance",
+    "gears/bss/libs/approval",
+    "gears/bss/libs/rest",
     "gears/system/event-broker/event-broker-sdk",
     "gears/system/event-broker/event-broker",
     "gears/system/license-resolver/license-resolver-sdk",
@@ -413,19 +417,27 @@ bss-ledger-sdk = { package = "cf-gears-bss-ledger-sdk", version = "0.1.8", path 
 # must gain one in the same change or that gate turns red — which is the intended
 # coupling, not a latent trap.
 bss-pricing-sdk = { package = "cf-gears-bss-pricing-sdk", path = "gears/bss/pricing/pricing-sdk" }
+# Products' seam suite boots this gear beside `bss-products` on one hub.
+# Dev-only consumer; no `version` for the same WIP reason as the SDK above.
+bss-pricing = { package = "cf-gears-bss-pricing", path = "gears/bss/pricing/pricing" }
+# The products registry SDK. Same posture as pricing-sdk above: no `version`,
+# because neither crate is a release artifact and the gear that consumes it is
+# not published either.
+bss-products-sdk = { package = "cf-gears-bss-products-sdk", path = "gears/bss/products/products-sdk" }
+# The approvals inbox. Same WIP posture as pricing: no `version`, because neither
+# crate is a release artifact yet.
+bss-approvals-sdk = { package = "cf-gears-bss-approvals-sdk", path = "gears/bss/approvals/approvals-sdk" }
+bss-approvals = { package = "cf-gears-bss-approvals", path = "gears/bss/approvals/approvals" }
+# NFKC for the products registry's `normalized(name)`, the operand of its
+# uniqueness index. Already in the tree transitively; taken as a direct
+# dependency because the normalization must be identical on both engines and
+# std offers neither NFKC nor full casefold.
+unicode-normalization = "0.1"
 bss-rate-provider-sdk = { package = "cf-gears-bss-rate-provider-sdk", version = "0.1.10", path = "gears/bss/rate-provider/rate-provider-sdk" }
 coord = { package = "cf-gears-bss-coord", path = "gears/bss/libs/coord" }
-# The joint golden conformance fixture corpus. `bss-fixtures` carries no charge
-# arithmetic and is the only one a gear may depend on in production; the
-# conformance harness is a dev-dependency only.
-#
-# `default-features = false` here so a **gear** can inherit the narrow
-# production surface (`ModelKind` + `Registry` + `gate_open_for`): Cargo refuses
-# `default-features = false` on an inherited dependency unless the workspace
-# entry states it, so the default is set narrow and the corpus half is opted
-# into by name where it is actually wanted.
-bss-fixtures = { package = "cf-gears-bss-fixtures", path = "gears/bss/fixtures/bss-fixtures", default-features = false }
-bss-fixtures-conformance = { package = "cf-gears-bss-fixtures-conformance", path = "gears/bss/fixtures/bss-fixtures-conformance" }
+bss-approval = { package = "cf-gears-bss-approval", path = "gears/bss/libs/approval" }
+# Weak ETag and If-None-Match for the BSS list and reference reads.
+bss-rest = { package = "cf-gears-bss-rest", path = "gears/bss/libs/rest" }
 # FIPS-validated SHA-256 for the ledger idempotency payload fingerprint.
 aws-lc-rs = "1.17"
 
@@ -454,17 +466,7 @@ grpc_hub = { package = "cf-gears-grpc-hub", version = "0.3.2", path = "gears/sys
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# `toolkit-contract-protogen`'s, and it stays at the major upstream chose for it.
-#
-# **This is an add/add and not a disagreement**: `toml` was in neither side's
-# workspace table at the merge base. Upstream added `0.8` for the protogen tool
-# and this branch added `1` for the golden-fixture corpus
-# (`gears/bss/fixtures/corpus`), which is hand-authored and hand-reviewed as
-# normative text and was written against the 1.x API. Neither crate can be moved
-# onto the other's major by this rebase without a code change nobody has reviewed,
-# so `bss-fixtures` and `bss-fixtures-conformance` name `toml = "1"` directly
-# instead of inheriting. The lockfile already carries both — 0.8.23 and 1.1.2 —
-# so the duplication is upstream's own resolution and not something this adds.
+# `toolkit-contract-protogen`'s major; pricing's golden runner inherits it.
 toml = "0.8"
 serde-saphyr = "1.3.0"
 humantime-serde = "1.1"

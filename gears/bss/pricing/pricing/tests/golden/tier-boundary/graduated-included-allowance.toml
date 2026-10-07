@@ -1,0 +1,56 @@
+family     = "tier-boundary"
+id         = "graduated-included-allowance"
+kind       = "evaluation"
+provenance = ["inst-ac-band (backup)", "D-43 (backup)", "D-45 (backup)", "PRD §17.2 (backup)"]
+
+# The one arithmetic in the allowance primitive that two gears can disagree
+# about silently, and until 2026-08-18 the corpus had no evaluation case for
+# `includedAllowance` at all - the field appeared in exactly one file, a publish
+# pair, so no authored expected amount existed anywhere.
+#
+# The allowance is deducted from `q` before the ladder: a test-only translation
+# (reconciliation B), since no production allowance exists. For `graduated` the
+# deduct reading and an offset `[0, N) @ $0` band give the same charge: at
+# `q = 1200` both bill 1000 units at 5 and 100 at 3 = 5300.
+#
+# The four quantities are the boundary set: below the allowance, exactly at it,
+# one over, and past the first authored bound.
+
+[snapshot]
+model_kind              = "graduated"
+charge_kind             = "usage"
+currency                = "USD"
+meter                   = "api.calls"
+tier_aggregation_window = "invoice_period"
+billing_granularity     = "whole_unit"
+included_allowance      = { quantity = 100, rollover_policy = "none" }
+
+  [[snapshot.bands]]
+  from_qty = 0
+  to_qty   = 1000
+  unit_amount_minor = 5
+
+  [[snapshot.bands]]
+  from_qty = 1000
+  to_qty   = "open"
+  unit_amount_minor = 3
+
+[[assert]]
+given  = { q = 50 }
+expect = { charge_minor = 0 }
+why    = "inside the allowance: all 50 units are deducted before the ladder, so no band is reached and nothing is billable"
+
+[[assert]]
+given  = { q = 100 }
+expect = { charge_minor = 0 }
+why    = "exactly at the allowance; half-open [0,100) is consumed whole and the first paid band contributes nothing, the same boundary rule graduated-band-edge pins at 1000"
+
+[[assert]]
+given  = { q = 101 }
+expect = { charge_minor = 5 }
+why    = "the first billable unit, priced by the offset first authored band [100,1100) at 5"
+
+[[assert]]
+given  = { q = 1200 }
+expect = { charge_minor = 5300 }
+why    = "1100 billable units after the allowance: 1000 at 5 below the first bound plus 100 at 3 above it"

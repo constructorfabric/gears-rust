@@ -9,7 +9,7 @@ date: 2026-09-26
 
 ## Context and Problem Statement
 
-PRD §5.2 and DESIGN specify several document-related capabilities. Some were implemented differently and some were not implemented. This ADR records the P1 state so the documents, the code and the E2E suite agree.
+PRD §5.2 and DESIGN specify several document-related capabilities. Some were implemented differently and some were not implemented. This ADR records the P1 state so the documents, the running system and the E2E suite agree.
 
 ## Decision Drivers
 
@@ -44,8 +44,8 @@ Chosen option: "Record the implemented behaviour and mark the gaps".
 
 ### Confirmation
 
-* E2E: a document upload reaches `ready` (`testing/e2e/suites/mini_chat/test_attachments.py::TestUploadAndGet::test_upload_and_get_attachment`). `doc_summary` is asserted null/absent only for an XLSX (code interpreter) upload (`test_code_interpreter.py::TestXlsxUploadAccepted::test_xlsx_reaches_ready`); no test asserts it for a `file_search` document.
-* E2E: deleting a referenced attachment gives 409 `attachment_locked` (`test_attachments.py::TestDeleteReferencedAttachment::test_delete_referenced_attachment_409`).
+* E2E: a document upload reaches `ready`. `doc_summary` is asserted null/absent only for an XLSX (code interpreter) upload that reaches `ready`; no test asserts it for a `file_search` document.
+* E2E scenario 10-04: deleting a referenced attachment gives 409 `attachment_locked`.
 
 ## More Information
 

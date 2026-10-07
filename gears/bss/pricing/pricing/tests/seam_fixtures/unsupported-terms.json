@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "atlas_fixture_ids": [
+    "F22",
+    "F31"
+  ],
+  "scenario": "unsupported-terms",
+  "given": {
+    "commercial": {
+      "billing_cycle": "month",
+      "entry_period": null,
+      "rating_window": {
+        "kind": "calendar_hour",
+        "timezone": "UTC"
+      },
+      "aggregation_scope": "subscription_line",
+      "reset": "rating_window_start",
+      "quantity_semantics": {
+        "usage_type_id": "cloudlet-hours",
+        "usage_type_version": "v1",
+        "unit": "cloudlet·hour",
+        "fold": "SUM",
+        "accrual_policy_version": "integrated-v1"
+      },
+      "partial_window": "actual_quantity_full_thresholds",
+      "model": "volume",
+      "minimum_fee": null,
+      "tiers": [
+        {
+          "up_to": "10",
+          "rate": "0.02"
+        },
+        {
+          "up_to": null,
+          "rate": "0.015"
+        }
+      ]
+    },
+    "descriptors": {
+      "sku_version": 3,
+      "code": "CLOUDLET",
+      "name": "Integrated cloudlet usage",
+      "gl_code": "USAGE_REVENUE",
+      "tax_category": "cloud-services",
+      "template": "Usage {sku}"
+    }
+  },
+  "expected": {
+    "commercial": {
+      "billing_cycle": "month",
+      "entry_period": null,
+      "rating_window": {
+        "kind": "calendar_hour",
+        "timezone": "UTC"
+      },
+      "aggregation_scope": "subscription_line",
+      "reset": "rating_window_start",
+      "quantity_semantics": {
+        "usage_type_id": "cloudlet-hours",
+        "usage_type_version": "v1",
+        "unit": "cloudlet·hour",
+        "fold": "SUM",
+        "accrual_policy_version": "integrated-v1"
+      },
+      "partial_window": "actual_quantity_full_thresholds",
+      "model": "volume",
+      "minimum_fee": null,
+      "tiers": [
+        {
+          "up_to": "10",
+          "rate": "0.02"
+        },
+        {
+          "up_to": null,
+          "rate": "0.015"
+        }
+      ]
+    },
+    "descriptors": {
+      "sku_version": 3,
+      "code": "CLOUDLET",
+      "name": "Integrated cloudlet usage",
+      "gl_code": "USAGE_REVENUE",
+      "tax_category": "cloud-services",
+      "template": "Usage {sku}"
+    },
+    "arithmetic": [],
+    "refusals": [
+      "missing_policy",
+      "minimum_fee",
+      "unaligned_anchor",
+      "package",
+      "missing_billing_terms",
+      "quarterly",
+      "cross_line_pooling",
+      "included_quantity",
+      "phases",
+      "promotions",
+      "fx"
+    ]
+  }
+}

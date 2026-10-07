@@ -307,12 +307,7 @@ export PATH := $(HOME)/.local/bin:$(PATH)
 #
 # Use `make clippy-deep` for the full 182-run matrix (nightly / pre-release).
 CLIPPY_FLAGS := -- -D warnings -D clippy::perf
-# `bss-fixtures` is on the list because it is the one crate whose *production*
-# surface is the narrow one: pricing's `FixtureGate` inherits it with
-# `default-features = false`, while `default = ["corpus"]` means every ordinary
-# build compiles the wide one. A feature-combination pass is the only thing that
-# lints the surface a gear actually takes.
-CLIPPY_HACK_CRATES := -p cf-gears-toolkit -p cf-gears-toolkit-db -p cf-gears-toolkit-http -p cf-gears-bss-fixtures
+CLIPPY_HACK_CRATES := -p cf-gears-toolkit -p cf-gears-toolkit-db -p cf-gears-toolkit-http
 # `_any-backend` is toolkit-db's internal "some backend is on" marker (see its
 # [features] block); enabling it *alone* asserts a driver exists while none does,
 # which the outbox benchmarks reject with a compile_error!. Not a configuration
@@ -692,7 +687,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -943,18 +938,29 @@ test-pricing-pg: install-tools
 test-coord-pg: install-tools
 	cargo nextest run -p cf-gears-bss-coord --run-ignored ignored-only -E 'binary(/^postgres_/)'
 
-## Compile and run `bss-fixtures` on the surface a **gear** actually takes.
+## Run bss-products' Postgres tier (Docker required; testcontainers).
 ##
-## Pricing's `FixtureGate` inherits this crate with `default-features = false`
-## (`Cargo.toml`'s workspace entry) — `ModelKind` + `Registry` + `gate_open_for`
-## and nothing else. `default = ["corpus"]`, so every other build in the
-## workspace, `make test-no-macros` included, compiles the wide surface: the
-## test written to guard the narrow one (`tests/production_surface.rs`, whose
-## module doc names this invocation) ran only in the configuration it does not
-## guard, where its assertions hold trivially. The narrow build's only other
-## consumer is the example server's release build, which never runs a test.
-test-fixtures-narrow: install-tools
-	cargo nextest run -p cf-gears-bss-fixtures --no-default-features --test production_surface
+## Same `--run-ignored ignored-only` shape and the same reason as the two above:
+## the gate is an ignored-test attribute rather than a feature. This gear's tier was added on
+## 2026-08-30 and, until this target existed, repeated the donor's own 2026-08-11
+## failure exactly — 23 tests across six `postgres_*` binaries that compiled on
+## every run and executed on none, while the DoD they discharge
+## (`cpt-cf-bss-products-dod-concurrency`) had already been ticked on their
+## strength. Two review lenses found it independently.
+##
+## What lives here and nowhere else: every proof about two writers racing for one
+## reservation index, one head row or one idempotency key, and the **Postgres
+## half of every trigger in the gear**. Both engine arms are written from the
+## same design clauses but in different shapes — SQLite gets one trigger per
+## clause, Postgres one `plpgsql` function with sequential `IF` blocks — so the
+## in-crate SQLite suite cannot fail for anything the Postgres arm gets wrong.
+## That asymmetry is what let a `json`-column publish defect ship in Phase 6.
+##
+## `--no-fail-fast` for the donor's reason: a tier whose whole purpose is to be
+## the one place a Postgres-only defect surfaces must report every failure it
+## found, not the first.
+test-products-pg: install-tools
+	cargo nextest run -p cf-gears-bss-products --run-ignored ignored-only -E 'binary(/^postgres_/)' --no-fail-fast
 
 ## Run the Redis cluster plugin's conformance (Layer 2) and Layer 3 integration
 ## suites (Docker required; each spins up its own redis container via

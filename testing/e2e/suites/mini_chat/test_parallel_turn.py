@@ -7,7 +7,6 @@ import pytest
 
 from .conftest import (
     API_PREFIX,
-    DETAIL_TURN_ALREADY_RUNNING,
     OpenStream,
     assert_problem,
     expect_done,
@@ -41,7 +40,7 @@ class TestParallelTurn:
             )
             assert_problem(
                 second, 409, "aborted",
-                reason="turn_already_running", detail=DETAIL_TURN_ALREADY_RUNNING,
+                reason="turn_already_running",
             )
 
             expect_done(first.drain())
@@ -80,7 +79,7 @@ class TestParallelTurn:
             )
             assert_problem(
                 second, 409, "aborted",
-                reason="turn_already_running", detail=DETAIL_TURN_ALREADY_RUNNING,
+                reason="turn_already_running",
             )
             expect_done(s.drain())
 

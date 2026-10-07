@@ -37,7 +37,7 @@ Chosen option: "Record the implemented subset and mark the rest Not implemented"
 | Deleting a chat cancels its running turn | — | Future | A running generation continues and is finalized normally; its usage is billed. A second `DELETE` returns 404. |
 | Audit transport | `cpt-cf-mini-chat-fr-audit` | Accepted (different) | Audit events are enqueued in the finalization or mutation transaction to the outbox queue `mini-chat.audit`. They are delivered to the audit plugin selected through types-registry (`MiniChatAuditPluginClientV1`); the bundled `static_audit` plugin logs them. When no plugin is registered, events are acknowledged and dropped: audit is optional per deployment (the bundled `static_audit` plugin is on by default, so no plugin means a deployment choice or a misconfiguration), and blocking chat traffic on it would turn a missing plugin into an outage. Drops are counted in `mini_chat_audit_emit_total{result="dropped"}`. "No plugin" is not cached: every delivery looks the plugin up again (a plugin registered later is used), and the warning is logged once per period without a plugin. An instance that resolves in types-registry but has no client in ClientHub makes the outbox handler return `Retry`, not acknowledge. The handler deserializes the payload before it resolves the plugin, so a corrupt payload is dead-lettered (`Reject`) even when no plugin is available. |
 | Audit content: prompt, response, attachment metadata, license and quota-scope decisions, redaction and 8 KiB truncation | `cpt-cf-mini-chat-fr-audit` | Not implemented | Turn audit events carry identities, model, token usage, latency, tool-call counts and the quota decision. `prompt`, `response`, `attachments`, `license` and `quota_scope` are empty, so no redaction is needed. |
-| Turn audit event types | `cpt-cf-mini-chat-fr-audit` | Accepted (different) | A finalized turn emits `event_type` `turn_completed` (state `completed`) or `turn_failed` (any other terminal state). Cancelled turns and orphan-watchdog turns emit `turn_failed`; there is no separate cancelled type. Turn mutations emit `turn_retry`, `turn_edit` and `turn_delete`. A retry/edit turn that fails before the reserve (`fail_unstarted_turn`) emits no audit event. |
+| Turn audit event types | `cpt-cf-mini-chat-fr-audit` | Accepted (different) | A finalized turn emits `event_type` `turn_completed` (state `completed`) or `turn_failed` (any other terminal state). Cancelled turns and orphan-watchdog turns emit `turn_failed`; there is no separate cancelled type. Turn mutations emit `turn_retry`, `turn_edit` and `turn_delete`. A retry/edit turn that fails before the reserve emits no audit event. |
 | Audit event for chat deletion | UC-004 | Not implemented | Turn mutations (retry, edit, delete) and turn finalization are audited; chat deletion is not. |
 
 ### Consequences
@@ -47,8 +47,8 @@ Chosen option: "Record the implemented subset and mark the rest Not implemented"
 
 ### Confirmation
 
-* E2E: after `DELETE /chats/{id}`, the chat and its sub-resources return 404 and cleanup outbox rows are written (`testing/e2e/suites/mini_chat/test_cleanup.py`).
-* Unit tests in `mini-chat/src/domain/service/finalization_service.rs` pin the audit fields that are populated.
+* E2E cleanup scenarios: after `DELETE /chats/{id}`, the chat and its sub-resources return 404 and cleanup outbox rows are written.
+* Finalization unit tests pin the audit fields that are populated.
 
 ## More Information
 

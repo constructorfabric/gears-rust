@@ -32,7 +32,7 @@ pub use toolkit_contract_macros::{
     ContractError, ProtoBridge, QueryParams, consumes, contract, grpc_contract, provides,
     rest_contract,
 };
-pub use wiring::{ClientTuning, ClientWiring, ReconnectSettings, RetrySettings};
+pub use wiring::{ClientTuning, ClientWiring, ConsumerWiring, ReconnectSettings, RetrySettings};
 
 /// Re-export of `tracing` for macro-generated client code.
 ///

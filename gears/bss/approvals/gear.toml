@@ -1,0 +1,7 @@
+[gear]
+name = "BSS Approvals"
+description = "One approvals inbox over every BSS gear: a paged list, a count, a card and a vote, routed to the gear that owns the unit."
+category = "bss"
+is_plugin = false
+has_plugins = false
+has_extension_point = false
