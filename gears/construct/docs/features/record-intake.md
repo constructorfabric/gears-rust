@@ -138,7 +138,7 @@ The PRD requires Construct to take records one at a time, check each against its
 
 - [x] `p1` - **ID**: `cpt-cf-construct-algo-record-intake-hand-off`
 
-**Input**: A received record: the tenant, the connector, the envelope and the content, in memory only.
+**Input**: A received record: the tenant, the connector, the envelope and the content, in memory only. It carries no security context: the connector's token can expire before processing runs, so processing builds its own context and scope for the tenant (one Construct writer identity per tenant). The connector identity is there for the plan's origin and the audit events.
 
 **Output**: Taken, or refused with an unavailable error. The hand-off returns at once; the Planner's implementation puts the record on a bounded queue and refuses when it is full.
 
@@ -220,7 +220,7 @@ Intake **MUST** read whether a connector is on through one interface. Its first 
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-record-intake-hand-off`
 
-A received record **MUST** go to processing through one interface that returns at once and can refuse. Until the Planner exists, the wired-in hand-off **MUST** refuse every record, so intake answers `503` and keeps no identity.
+A received record **MUST** go to processing through one interface that returns at once and can refuse. It **MUST** carry the tenant, the connector identity and the record, and **MUST NOT** carry the caller's security context or scope; processing builds its own for the tenant. Until the Planner exists, the wired-in hand-off **MUST** refuse every record, so intake answers `503` and keeps no identity.
 
 **Implements**:
 - `cpt-cf-construct-algo-record-intake-hand-off`

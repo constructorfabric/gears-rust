@@ -213,6 +213,10 @@ pub enum IdInsert {
 
 /// A received record on its way to processing. Its content lives only in
 /// memory; nothing writes it to a store.
+///
+/// It carries no security context or scope: the connector's token can expire
+/// before processing runs, so processing builds its own for the tenant. The
+/// connector is kept for the plan's origin and the audit events.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct ReceivedRecord {
