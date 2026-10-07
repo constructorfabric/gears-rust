@@ -1,26 +1,17 @@
-use construct_sdk::models::{FoundationNote, NewFoundationNote};
-use uuid::Uuid;
-
-use super::dto::{CreateFoundationNoteRequest, FoundationNoteDto};
+use super::dto::{OutcomeDto, RecordOutcomeDto};
+use crate::domain::record_intake::IntakeOutcome;
 
 #[test]
-fn note_converts_to_dto_field_for_field() {
-    let note = FoundationNote::new(Uuid::new_v4(), Uuid::new_v4(), "hello".to_owned());
-
-    let dto = FoundationNoteDto::from(note.clone());
-
-    assert_eq!(dto.id, note.id);
-    assert_eq!(dto.tenant_id, note.tenant_id);
-    assert_eq!(dto.text, note.text);
-}
-
-#[test]
-fn create_request_converts_to_new_note() {
-    let req = CreateFoundationNoteRequest {
-        text: "hello".to_owned(),
-    };
-
-    let new = NewFoundationNote::from(req);
-
-    assert_eq!(new.text, "hello");
+fn each_outcome_has_its_wire_name() {
+    for (outcome, dto, wire) in [
+        (IntakeOutcome::Received, OutcomeDto::Received, "received"),
+        (IntakeOutcome::Repeat, OutcomeDto::Repeat, "repeat"),
+    ] {
+        let answer = RecordOutcomeDto::from(outcome);
+        assert_eq!(answer.outcome, dto);
+        assert_eq!(
+            serde_json::to_value(&answer).expect("serializes"),
+            serde_json::json!({ "outcome": wire })
+        );
+    }
 }

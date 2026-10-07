@@ -2,7 +2,7 @@
 //!
 //! The public API is defined in `construct_sdk` and re-exported here.
 
-pub use construct_sdk::{ConstructClientV1, FoundationNote, NewFoundationNote};
+pub use construct_sdk::{ConstructClientV1, RecordOutcome};
 
 pub mod gear;
 pub use gear::ConstructGear;

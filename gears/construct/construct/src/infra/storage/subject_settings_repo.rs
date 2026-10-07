@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::subject_settings::{SubjectSettings, SubjectSettingsRepository};
 
-use super::sea_orm_repo::map_scope_error;
+use super::scope_error::map_scope_error;
 use super::subject_settings_entity::{self as entity, Entity as SubjectSettingsEntity};
 
 /// `SeaORM`-backed [`SubjectSettingsRepository`]; every query goes through the
@@ -28,13 +28,18 @@ impl SubjectSettingsRepository for SeaOrmSubjectSettingsRepository {
         &self,
         conn: &C,
         scope: &AccessScope,
+        tenant_id: Uuid,
         subject_id: Uuid,
     ) -> Result<Option<SubjectSettings>, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-subject-settings-read:p1:inst-read-select
         let row = SubjectSettingsEntity::find()
             .secure()
             .scope_with(scope)
-            .filter(Condition::all().add(entity::Column::SubjectId.eq(subject_id)))
+            .filter(
+                Condition::all()
+                    .add(entity::Column::TenantId.eq(tenant_id))
+                    .add(entity::Column::SubjectId.eq(subject_id)),
+            )
             .one(conn)
             .await
             .map_err(map_scope_error)?;

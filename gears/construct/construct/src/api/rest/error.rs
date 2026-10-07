@@ -1,9 +1,51 @@
-use toolkit_canonical_errors::{CanonicalError, resource_error};
+use toolkit_canonical_errors::{CanonicalError, Http, resource_error};
 
 use crate::domain::error::DomainError;
+use crate::domain::record_intake::Refusal;
 
-#[resource_error(gts_id!("cf.construct.foundation.note.v1~"))]
-pub struct FoundationNoteError;
+/// Errors about connector records. The resource type is the record base type.
+#[resource_error(gts_id!("cf.connectors.core.record.v1~"))]
+pub struct RecordError;
+
+/// A refused record as an invalid-argument problem. The field violation names
+/// the place in the record, the broken rule and the reason code; the resource
+/// names the record's type. The refusal is logged here, once, at info level:
+/// it is the connector's error, not the gear's.
+/// On the REST route (`rest`) a refusal is `422`.
+fn refused(refusal: Refusal, rest: bool) -> CanonicalError {
+    // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-refused
+    let place = refusal.place.to_string();
+    let type_id = refusal.type_id.unwrap_or_else(|| "record".to_owned());
+    tracing::info!(
+        reason = refusal.reason.code(),
+        record_type = %type_id,
+        place = %place,
+        rule = %refusal.rule,
+        "record refused"
+    );
+    let error = RecordError::invalid_argument()
+        .with_field_violation(place, refusal.rule, refusal.reason.code())
+        .with_resource(type_id);
+    if rest {
+        error.with_override(Http::status_code(422)).create()
+    } else {
+        error.create()
+    }
+    // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-refused
+}
+
+/// The REST answer for a domain error. A refused record is `422`, a status
+/// only the REST route carries; the shared conversion below stays
+/// transport-agnostic for the in-process client.
+///
+/// @cpt-dod:cpt-cf-construct-dod-record-intake-route:p1
+#[must_use]
+pub fn for_rest(e: DomainError) -> CanonicalError {
+    match e {
+        DomainError::Refused(refusal) => refused(refusal, true),
+        other => other.into(),
+    }
+}
 
 /// @cpt-dod:cpt-cf-construct-dod-gear-foundation-error-mapping:p1
 impl From<DomainError> for CanonicalError {
@@ -13,25 +55,12 @@ impl From<DomainError> for CanonicalError {
     )]
     fn from(e: DomainError) -> Self {
         match e {
-            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-not-found
-            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-not-found-return
-            DomainError::NotFound => FoundationNoteError::not_found("Note not found")
-                .with_resource("note")
-                .create(),
-            // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-not-found-return
-            // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-not-found
-            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-validation
-            // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-validation-return
-            DomainError::Validation { field, message } => FoundationNoteError::invalid_argument()
-                .with_field_violation(field, message, "VALIDATION_ERROR")
-                .create(),
-            // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-validation-return
-            // @cpt-end:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-validation
+            DomainError::Refused(refusal) => refused(refusal, false),
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-forbidden
             // @cpt-begin:cpt-cf-construct-algo-gear-foundation-map-errors:p1:inst-map-forbidden-return
             DomainError::Forbidden(msg) => {
                 tracing::warn!(msg = %msg, "construct access forbidden");
-                FoundationNoteError::permission_denied()
+                RecordError::permission_denied()
                     .with_reason("ACCESS_DENIED")
                     .create()
             }

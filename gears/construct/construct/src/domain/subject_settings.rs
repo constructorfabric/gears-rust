@@ -44,11 +44,14 @@ impl SubjectSettings {
 
 #[async_trait]
 pub trait SubjectSettingsRepository: Send + Sync {
-    /// The stored settings of one subject, if they are inside the scope.
+    /// The stored settings of one subject in `tenant_id`, if they are inside
+    /// the scope. The tenant filters the row as well as the scope does, so a
+    /// scope that covers several tenants still reads only this tenant's row.
     async fn find<C: DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
+        tenant_id: Uuid,
         subject_id: Uuid,
     ) -> Result<Option<SubjectSettings>, DomainError>;
 }
@@ -111,9 +114,25 @@ impl<R: SubjectSettingsRepository> SubjectSettingsService<R> {
             .await?;
         // @cpt-end:cpt-cf-construct-algo-subject-settings-read:p1:inst-read-scope
 
+        self.settings_within(ctx, &scope, tenant_id, subject_id)
+            .await
+    }
+
+    /// The settings of one subject in `tenant_id`, read under a scope the
+    /// caller already holds from its own permission check. Record intake uses
+    /// it: its "send records" decision covers the read, so a connector needs no
+    /// second permission. The row is read only in `tenant_id`; a scope that
+    /// does not cover it finds nothing and gets the tenant's default.
+    pub(crate) async fn settings_within(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        subject_id: Uuid,
+    ) -> Result<SubjectSettings, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-subject-settings-read:p1:inst-read-select
         let conn = self.db.conn().map_err(DomainError::from)?;
-        let stored = self.repo.find(&conn, &scope, subject_id).await?;
+        let stored = self.repo.find(&conn, scope, tenant_id, subject_id).await?;
         // @cpt-end:cpt-cf-construct-algo-subject-settings-read:p1:inst-read-select
 
         // @cpt-begin:cpt-cf-construct-algo-subject-settings-read:p1:inst-read-stored

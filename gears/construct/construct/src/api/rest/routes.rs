@@ -1,4 +1,4 @@
-use crate::api::rest::types::ConcreteService;
+use crate::api::rest::types::ConcreteIntake;
 use crate::api::rest::{dto, handlers};
 use axum::http::StatusCode;
 use axum::{Extension, Router};
@@ -16,31 +16,43 @@ impl AsRef<str> for License {
 
 impl LicenseFeature for License {}
 
-/// @cpt-dod:cpt-cf-construct-dod-gear-foundation-create-route:p1
+/// @cpt-dod:cpt-cf-construct-dod-record-intake-route:p1
 pub fn register_routes(
     mut router: Router,
     openapi: &dyn OpenApiRegistry,
-    service: Arc<ConcreteService>,
+    intake: Arc<ConcreteIntake>,
 ) -> Router {
-    // @cpt-begin:cpt-cf-construct-flow-gear-foundation-create-note:p1:inst-create-send
-    router = OperationBuilder::post("/construct/v1/foundation-notes")
-        .operation_id("construct.create_foundation_note")
-        .summary("Create a foundation note")
-        .description("Create a note in the tenant of the authenticated subject")
-        .tag("Foundation")
+    // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-send
+    router = OperationBuilder::post("/construct/v1/records")
+        .operation_id("construct.submit_record")
+        .summary("Send one connector record")
+        .description(
+            "Take one connector record for the tenant named in `tenant`. The platform must \
+             authorize the calling connector for that tenant. Answers 202 when the record is \
+             received, 200 when it is a repeat, and 422 when it is refused; a refusal names the \
+             record's type, the place in the record and the broken rule.",
+        )
+        .tag("Records")
         .authenticated()
         .require_license_features::<License>([])
-        .json_request::<dto::CreateFoundationNoteRequest>(openapi, "Note to create")
-        .handler(handlers::create_note)
-        .json_response_with_schema::<dto::FoundationNoteDto>(
+        .query_param_typed("tenant", true, "Tenant the record is for", "string")
+        .json_request::<dto::RecordRequest>(openapi, "One connector record")
+        .handler(handlers::submit_record)
+        .json_response_with_schema::<dto::RecordOutcomeDto>(
             openapi,
-            StatusCode::CREATED,
-            "Note created",
+            StatusCode::ACCEPTED,
+            "Record received",
+        )
+        .json_response_with_schema::<dto::RecordOutcomeDto>(
+            openapi,
+            StatusCode::OK,
+            "Record is a repeat; nothing changes",
         )
         .standard_errors(openapi)
         .error_422(openapi)
+        .error_503(openapi)
         .register(router, openapi);
-    // @cpt-end:cpt-cf-construct-flow-gear-foundation-create-note:p1:inst-create-send
+    // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-send
 
-    router.layer(Extension(service))
+    router.layer(Extension(intake))
 }

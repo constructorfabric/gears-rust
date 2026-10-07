@@ -1,14 +1,17 @@
 # Construct - Quickstart
 
-The gear foundation of Construct: the base on which the Construct features are built. It has one route that creates a note in the caller's tenant, a client for other gears (`create_note` and `get_note`), and tenant-scoped storage. The note is a placeholder. It has no DESIGN id and is replaced by Construct's own model, starting with Record Intake.
+Record intake for connectors: a connector sends one record per request for one tenant, and Construct checks it against its GTS type and answers at once with received, repeat or refused. A received record is handed to background processing in the same transaction that keeps its identity.
+
+**Until the Planner exists (Story 5.2), no processing is wired in.** Every record that passes the checks is answered `503`, and nothing is stored, so a connector can send it again once processing exists. A refused record still answers `422`, so the checks can be tried now.
 
 **Features:**
-- One authenticated route, `POST /construct/v1/foundation-notes`, with a permission check per operation
-- Notes are tied to the caller's tenant, taken only from the security context
+- One authenticated route, `POST /construct/v1/records?tenant=<tenant id>`, with one permission check (`construct.record` / `send`) for the named tenant
+- The record is checked against its GTS type and every type it derives from, through the types registry. The connector record types ship in the SDK and are registered when the types registry starts
+- A repeat of a received record identity (tenant, connector, provenance, version) changes nothing; the identity is kept only once processing took the record
+- Records are refused when the connector is off, or when personalization is off or an erasure is under way for the record's subject
 - Errors are RFC 9457 Problem responses
-- The gear supplies its migration to the runtime, which runs it on boot
-
-There is no route to read a note. Reading exists only through the in-process client `ConstructClientV1`.
+- The gear supplies its migrations to the runtime, which runs them on boot
+- An in-process client, `ConstructClientV1::submit_record`, runs the same operation
 
 Full API documentation: <http://127.0.0.1:8087/cf/docs>
 
@@ -42,8 +45,6 @@ The gear is in this repository under `gears/construct`, and it is not built into
      database:
        server: "sqlite_users"
        file: "construct.db"
-     config:
-       max_text_length: 1000
    ```
 
 4. Start the server:
@@ -52,7 +53,7 @@ The gear is in this repository under `gears/construct`, and it is not built into
    cargo run --bin cf-gears-example-server --no-default-features --features construct,static-tenants,static-authn,static-authz -- --config config/quickstart.yaml run
    ```
 
-The log shows `Providing construct database migrations` and `Applying migration gear="construct" migration=initial_001`.
+The log shows `Applying migration gear="construct"` for `initial_001`, `m002_subject_settings` and `m003_record_ids`. The types registry is part of every example server, so the record types are there.
 
 ## Configuration
 
@@ -63,56 +64,66 @@ gears:
       server: "sqlite_users"
       file: "construct.db"
     config:
-      max_text_length: 1000  # Longest note text in bytes (default: 1000, allowed: 1 to 65535)
+      personalization_default: true  # personalization for a new subject while no settings service answers (default: true)
+      connectors_off: []             # connectors that are off, by the subject id (a UUID) of their login (default: none)
 ```
 
-An unknown key, or a `max_text_length` of 0 or above 65535, stops the gear from starting.
+An unknown key, or a value in `connectors_off` that is not a UUID, stops the gear from starting.
 
 ## Examples
 
-The example config runs with authentication off: every request gets the default tenant. In a real host the route needs a platform bearer token, and a request without one is refused with `401`.
+The example config runs with authentication off: every request gets the default caller, and the static AuthZ plugin allows every tenant. In a real host the route needs a connector's platform bearer token, a request without one is refused with `401`, and the platform must authorize the connector for the named tenant, or the answer is `403`.
 
-### Create a note
+### Send a record
 
 ```bash
-curl -s -X POST http://127.0.0.1:8087/cf/construct/v1/foundation-notes \
+curl -s -X POST "http://127.0.0.1:8087/cf/construct/v1/records?tenant=00000000-df51-5b42-9538-d2b56b7ee953" \
   -H "Content-Type: application/json" \
-  -d '{"text":"hello"}'
+  -d '{"type":"gts.cf.connectors.core.record.v1~cf.construct.chat.message.v1~","provenance":"chat_engine/thread-42/msg-7","version":"2026-09-10T09:13:00Z","observed_at":"2026-09-10T09:13:05Z","subject_id":"5d1f2c3a-8b4e-4c6d-9a1b-2c3d4e5f6a7b","payload":{"source":"chat_engine","message_id":"msg-7","thread_id":"thread-42","role":"user","text":"Which of these two papers contradict each other?"}}'
 ```
 
-Response `201`:
+Response `503`, because no processing is wired in yet:
 
 ```json
-{"id":"4b351a3a-bf2b-4361-bf76-9a71ff183159","tenant_id":"00000000-df51-5b42-9538-d2b56b7ee953","text":"hello"}
+{"type":"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~","title":"Service Unavailable","status":503,"detail":"Service temporarily unavailable","instance":"/construct/v1/records","context":{}}
 ```
+
+The log names the tenant and the connector:
+
+```text
+record_intake{tenant_id=00000000-df51-5b42-9538-d2b56b7ee953 connector=11111111-6a88-4768-9dfc-6bcd5187d9ed}: construct::api::rest::error: construct dependency unavailable msg=record processing is not available yet: no planner is wired in
+```
+
+The same request again answers `503` too: nothing was stored, so it is not a repeat. Once processing exists, a record that passes the checks answers `202` with `{"outcome":"received"}`, and the same identity again answers `200` with `{"outcome":"repeat"}`.
 
 ### Errors
 
-All errors are `application/problem+json`.
+All errors are `application/problem+json`. A refused record is `422`; its field violation names the place in the record (a JSON pointer, or `(record)` for the record as a whole), the broken rule and a reason code, and `resource_name` names the record's type.
 
 | Request | Status |
 |---|---|
-| `{"text":"   "}` (blank), a text with a NUL character, or a text longer than `max_text_length` | `400`, with the field and the reason `VALIDATION_ERROR` |
-| A body that is not valid JSON | `400`, reason `json_syntax_error` |
-| A body of the wrong shape, for example `{"text":5}` | `422`, reason `invalid_json_body` |
-| No `Content-Type: application/json` header | `415`, reason `missing_json_content_type` |
-| The caller has no permission | `403`, reason `ACCESS_DENIED` |
+| The record breaks its type, for example `"role":"system"` | `422`, reason `SCHEMA_VIOLATION` |
+| The record names a type the types registry does not know | `422`, reason `UNKNOWN_TYPE` |
+| The record carries an `id` | `422`, reason `ID_IN_PUSH` |
+| The connector is listed in `connectors_off` | `422`, reason `CONNECTOR_OFF` |
+| Personalization is off, or an erasure is under way, for the subject | `422`, reason `PERSONALIZATION_OFF` or `ERASURE_IN_PROGRESS` |
+| No `tenant` query parameter, or not a UUID | `400`, reason `invalid_query_string` |
+| A body that is not valid JSON | `400` |
+| No `Content-Type: application/json` header | `415` |
+| The connector has no permission for the tenant | `403`, reason `ACCESS_DENIED` |
+| No processing is wired in yet, or the types registry, the settings service or the policy service does not answer | `503` |
 
-```bash
-curl -s -X POST http://127.0.0.1:8087/cf/construct/v1/foundation-notes \
-  -H "Content-Type: application/json" \
-  -d '{"text":"   "}'
-```
-
-Response `400`:
+The same record with `"role":"system"` answers `422`:
 
 ```json
-{"type":"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~","title":"Invalid Argument","status":400,"detail":"Request validation failed","instance":"/construct/v1/foundation-notes","context":{"field_violations":[{"field":"text","description":"must not be empty","reason":"VALIDATION_ERROR"}],"resource_type":"gts.cf.construct.foundation.note.v1~"}}
+{"type":"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~","title":"Invalid Argument","status":422,"detail":"Request validation failed","instance":"/construct/v1/records","context":{"field_violations":[{"field":"/payload/role","description":"enum","reason":"SCHEMA_VIOLATION"}],"resource_type":"gts.cf.connectors.core.record.v1~","resource_name":"gts.cf.connectors.core.record.v1~cf.construct.chat.message.v1~"}}
 ```
 
 ## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
-| The gear does not start | Check `max_text_length` (1 to 65535) and that the config has no unknown key. |
+| The gear does not start | Check that the config has no unknown key and that every entry in `connectors_off` is a UUID. |
+| Every valid record is `503` | Expected until the Planner exists: no processing is wired in. |
 | `404` on `/cf/construct/...` | The example server was started without `--features construct`. |
+| Every record is `UNKNOWN_TYPE` | The record's `type` is not one of the registered connector record types; the SDK registers the base and four derived types. |

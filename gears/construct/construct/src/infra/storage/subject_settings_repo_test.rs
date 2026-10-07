@@ -21,7 +21,7 @@ async fn stored_settings_round_trip() {
     seed_subject_settings(&db, tenant, subject, ERASING).await;
 
     let found = SeaOrmSubjectSettingsRepository::new()
-        .find(&conn, &AccessScope::for_tenant(tenant), subject)
+        .find(&conn, &AccessScope::for_tenant(tenant), tenant, subject)
         .await
         .expect("find");
 
@@ -36,7 +36,12 @@ async fn subject_without_a_row_is_not_found() {
     seed_subject_settings(&db, tenant, Uuid::new_v4(), ERASING).await;
 
     let found = SeaOrmSubjectSettingsRepository::new()
-        .find(&conn, &AccessScope::for_tenant(tenant), Uuid::new_v4())
+        .find(
+            &conn,
+            &AccessScope::for_tenant(tenant),
+            tenant,
+            Uuid::new_v4(),
+        )
         .await
         .expect("find");
 
@@ -52,13 +57,13 @@ async fn row_of_another_tenant_is_not_found() {
     seed_subject_settings(&db, other, subject, ERASING).await;
 
     let from_own = repo
-        .find(&conn, &AccessScope::for_tenant(own), subject)
+        .find(&conn, &AccessScope::for_tenant(own), own, subject)
         .await
         .expect("find");
     assert_eq!(from_own, None, "a cross-tenant read returns nothing");
 
     let from_other = repo
-        .find(&conn, &AccessScope::for_tenant(other), subject)
+        .find(&conn, &AccessScope::for_tenant(other), other, subject)
         .await
         .expect("find");
     assert_eq!(
@@ -79,11 +84,11 @@ async fn same_subject_keeps_one_row_per_tenant() {
     seed_subject_settings(&db, second, subject, ERASING).await;
 
     let in_first = repo
-        .find(&conn, &AccessScope::for_tenant(first), subject)
+        .find(&conn, &AccessScope::for_tenant(first), first, subject)
         .await
         .expect("find");
     let in_second = repo
-        .find(&conn, &AccessScope::for_tenant(second), subject)
+        .find(&conn, &AccessScope::for_tenant(second), second, subject)
         .await
         .expect("find");
 
@@ -101,7 +106,7 @@ async fn erasure_flag_defaults_to_cleared_when_the_insert_leaves_it_out() {
         .expect("insert without the erasure flag");
 
     let found = SeaOrmSubjectSettingsRepository::new()
-        .find(&conn, &AccessScope::for_tenant(tenant), subject)
+        .find(&conn, &AccessScope::for_tenant(tenant), tenant, subject)
         .await
         .expect("find");
 
@@ -119,8 +124,24 @@ async fn second_row_for_the_same_tenant_and_subject_is_refused() {
 
     assert!(second.is_err(), "the primary key refuses a second row");
     let found = SeaOrmSubjectSettingsRepository::new()
-        .find(&conn, &AccessScope::for_tenant(tenant), subject)
+        .find(&conn, &AccessScope::for_tenant(tenant), tenant, subject)
         .await
         .expect("find");
     assert_eq!(found, Some(ERASING), "the first row is unchanged");
+}
+
+#[tokio::test]
+async fn a_scope_over_several_tenants_reads_only_the_named_tenants_row() {
+    let db = inmem_db().await;
+    let conn = db.conn().expect("connection");
+    let repo = SeaOrmSubjectSettingsRepository::new();
+    let (named, other, subject) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_subject_settings(&db, other, subject, ERASING).await;
+    let both = AccessScope::for_tenants(vec![named, other]);
+
+    let in_named = repo.find(&conn, &both, named, subject).await.expect("find");
+    let in_other = repo.find(&conn, &both, other, subject).await.expect("find");
+
+    assert_eq!(in_named, None, "the other tenant's row is not read");
+    assert_eq!(in_other, Some(ERASING));
 }

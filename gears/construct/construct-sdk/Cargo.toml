@@ -21,9 +21,12 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+serde_json = { workspace = true }
 uuid = { workspace = true }
 
 toolkit = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
+# Link-time registration of the connector record types
+toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }

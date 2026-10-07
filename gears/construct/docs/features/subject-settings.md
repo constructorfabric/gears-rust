@@ -85,10 +85,12 @@ This part has no public surface. The read is a domain service that Record Intake
 **Output**: The subject's settings: personalization on or off, and whether an erasure is under way. Or an error: forbidden, unavailable, internal or database.
 
 **Steps**:
-1. [x] - `p1` - Take the tenant from the subject tenant of the security context. Ask the AuthZ resolver, through the policy enforcer, to decide on the resource type `construct.subject_settings` with the action `get`, the subject id as the resource id, and the tenant as the owner-tenant property. A denial is a forbidden error; a failed evaluation is unavailable or internal, mapped as in the foundation (`cpt-cf-construct-algo-gear-foundation-scope-note-access`) - `inst-read-scope`
-2. [x] - `p1` - DB: acquire a connection and SELECT the row of the subject from `construct__subject_settings` through the secure ORM, filtered by the scope. A row of another tenant is outside the scope and is not read - `inst-read-select`
+1. [x] - `p1` - Take the tenant from the subject tenant of the security context. Ask the AuthZ resolver, through the policy enforcer, to decide on the resource type `construct.subject_settings` with the action `get`, the subject id as the resource id, and the tenant as the owner-tenant property. A denial is a forbidden error; a failed evaluation is unavailable or internal, mapped as in the foundation (`cpt-cf-construct-algo-gear-foundation-map-errors`) - `inst-read-scope`
+2. [x] - `p1` - DB: acquire a connection and SELECT the row of the subject from `construct__subject_settings` through the secure ORM, filtered by the scope and by the tenant, so a scope that covers several tenants still reads only this tenant's row - `inst-read-select`
 3. [x] - `p1` - **IF** the row exists, **RETURN** its two states - `inst-read-stored`
 4. [x] - `p1` - Otherwise run `cpt-cf-construct-algo-subject-settings-tenant-default` for the tenant. **RETURN** personalization as the default says and no erasure under way. Store nothing - `inst-read-default`
+
+Record Intake runs steps 2 to 4 directly (`settings_within`), under the scope of its own permission decision and for the tenant the connector named, so a connector needs no second permission.
 
 ### Read the Tenant's Personalization Default
 
@@ -120,7 +122,7 @@ None in this part. The two states are stored values, not a state machine: a subj
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-subject-settings-storage`
 
-The system **MUST** supply to the runtime a migration, `subject_settings_002`, that creates the table `construct__subject_settings` with the columns `tenant_id`, `subject_id`, `personalization_enabled` and `erasure_in_progress` (default false), and the primary key (`tenant_id`, `subject_id`). The primary key leads with the tenant, so it also serves the tenant filter of every scoped read. The migration **MUST** be safe to run twice and **MUST NOT** edit `initial_001`. The entity **MUST** be declared tenant-scoped for the secure ORM, with the tenant column `tenant_id` and the resource column `subject_id`.
+The system **MUST** supply to the runtime a migration, `m002_subject_settings`, that creates the table `construct__subject_settings` with the columns `tenant_id`, `subject_id`, `personalization_enabled` and `erasure_in_progress` (default false), and the primary key (`tenant_id`, `subject_id`). The primary key leads with the tenant, so it also serves the tenant filter of every scoped read. The migration **MUST** be safe to run twice and **MUST NOT** edit `initial_001`. The entity **MUST** be declared tenant-scoped for the secure ORM, with the tenant column `tenant_id` and the resource column `subject_id`.
 
 **Implements**:
 - `cpt-cf-construct-algo-subject-settings-read`
@@ -129,7 +131,7 @@ The system **MUST** supply to the runtime a migration, `subject_settings_002`, t
 - DB Table: `construct__subject_settings` (`cpt-cf-construct-dbtable-subject-settings`)
 - Entities: Subject Settings (`cpt-cf-construct-entity-subject-settings`)
 
-**Verified by**: `every_backend_keys_the_table_by_tenant_then_subject`, `every_backend_declares_the_erasure_default`, `mysql_ddl_uses_binary_uuid_columns`, `identifiers_are_namespaced_and_within_63_bytes` (migration), and `stored_settings_round_trip`, `subject_without_a_row_is_not_found`, `row_of_another_tenant_is_not_found`, `same_subject_keeps_one_row_per_tenant`, `erasure_flag_defaults_to_cleared_when_the_insert_leaves_it_out`, `second_row_for_the_same_tenant_and_subject_is_refused` (repository). The SQLite DDL runs in every repository and service test, so the default and the primary key are shown there by behavior. The MySQL and PostgreSQL DDL is only asserted as text. No test: the `down` step, and running the migration twice.
+**Verified by**: `every_backend_keys_the_table_by_tenant_then_subject`, `every_backend_declares_the_erasure_default`, `mysql_ddl_uses_binary_uuid_columns`, `identifiers_are_namespaced_and_within_63_bytes` (migration), and `stored_settings_round_trip`, `subject_without_a_row_is_not_found`, `row_of_another_tenant_is_not_found`, `same_subject_keeps_one_row_per_tenant`, `erasure_flag_defaults_to_cleared_when_the_insert_leaves_it_out`, `second_row_for_the_same_tenant_and_subject_is_refused`, `a_scope_over_several_tenants_reads_only_the_named_tenants_row` (repository). The SQLite DDL runs in every repository and service test, so the default and the primary key are shown there by behavior. The MySQL and PostgreSQL DDL is only asserted as text. No test: the `down` step, and running the migration twice.
 
 ### Settings Read
 

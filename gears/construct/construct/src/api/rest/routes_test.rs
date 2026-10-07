@@ -3,317 +3,259 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use authz_resolver_sdk::{
-    AuthZResolverApi, PolicyEnforcer,
-    constraints::{Constraint, InPredicate, Predicate},
-    models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
-};
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use axum::{Extension, Router};
+use serde_json::{Value, json};
 use toolkit::api::OpenApiRegistryImpl;
-use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::{ConnectOpts, DBProvider, Db, connect_db};
-use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
+use toolkit_security::SecurityContext;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use crate::api::rest::error::FoundationNoteError;
 use crate::api::rest::routes::register_routes;
-use crate::api::rest::types::ConcreteService;
-use crate::config::ConstructConfig;
-use crate::domain::service::{Service, ServiceConfig};
-use crate::infra::storage::migrations::Migrator;
-use crate::infra::storage::sea_orm_repo::SeaOrmNoteRepository;
+use crate::test_support::{DenyResolver, IntakeFixture, chat_record, inmem_db};
 
-const PATH: &str = "/construct/v1/foundation-notes";
+const PATH: &str = "/construct/v1/records";
 
-/// Allows every request, constrained to the subject's tenant.
-struct AllowResolver;
-
-#[async_trait]
-impl AuthZResolverApi for AllowResolver {
-    async fn evaluate(
-        &self,
-        _ctx: PlatformSecurityContext,
-        request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, CanonicalError> {
-        // The route creates a note, so the policy service must be asked for that.
-        assert_eq!(request.resource.resource_type, "construct.foundation_note");
-        assert_eq!(request.action.name, "create");
-        let root_id = request
-            .context
-            .tenant_context
-            .as_ref()
-            .and_then(|tc| tc.root_id)
-            .or_else(|| {
-                request
-                    .subject
-                    .properties
-                    .get("tenant_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| Uuid::parse_str(s).ok())
-            })
-            .ok_or_else(|| {
-                CanonicalError::internal("tenant context is required".to_owned()).create()
-            })?;
-        Ok(EvaluationResponse {
-            decision: true,
-            context: EvaluationResponseContext {
-                constraints: vec![Constraint {
-                    predicates: vec![Predicate::In(InPredicate::new(
-                        pep_properties::OWNER_TENANT_ID,
-                        [root_id],
-                    ))],
-                }],
-                ..Default::default()
-            },
-        })
-    }
-}
-
-/// Denies every request: a subject without permission.
-struct DenyResolver;
-
-#[async_trait]
-impl AuthZResolverApi for DenyResolver {
-    async fn evaluate(
-        &self,
-        _ctx: PlatformSecurityContext,
-        _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, CanonicalError> {
-        Ok(EvaluationResponse {
-            decision: false,
-            context: EvaluationResponseContext::default(),
-        })
-    }
-}
-
-/// The policy service answers with an error instead of a decision.
-struct ErroringResolver(fn() -> CanonicalError);
-
-#[async_trait]
-impl AuthZResolverApi for ErroringResolver {
-    async fn evaluate(
-        &self,
-        _ctx: PlatformSecurityContext,
-        _request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, CanonicalError> {
-        Err((self.0)())
-    }
-}
-
-async fn inmem_db() -> Db {
-    use sea_orm_migration::MigratorTrait;
-
-    let opts = ConnectOpts {
-        max_conns: Some(1),
-        min_conns: Some(1),
-        ..Default::default()
-    };
-    let db = connect_db("sqlite::memory:", opts)
-        .await
-        .expect("connect in-memory database");
-    run_migrations_for_testing(&db, Migrator::migrations())
-        .await
-        .expect("run migrations");
-    db
-}
-
-async fn router_with(resolver: Arc<dyn AuthZResolverApi>, tenant_id: Uuid) -> Router {
+async fn router_with(fixture: &IntakeFixture) -> Router {
     let db = inmem_db().await;
-    let config = ServiceConfig::try_from(&ConstructConfig::default()).expect("valid config");
-    let service: Arc<ConcreteService> = Arc::new(Service::new(
-        Arc::new(DBProvider::new(db)),
-        Arc::new(SeaOrmNoteRepository::new()),
-        PolicyEnforcer::new(resolver),
-        config,
-    ));
+    let intake = Arc::new(fixture.build(&db));
     let ctx = SecurityContext::builder()
         .subject_id(Uuid::new_v4())
-        .subject_tenant_id(tenant_id)
+        .subject_tenant_id(Uuid::new_v4())
         .build()
         .unwrap();
-    register_routes(Router::new(), &OpenApiRegistryImpl::new(), service).layer(Extension(ctx))
+    register_routes(Router::new(), &OpenApiRegistryImpl::new(), intake).layer(Extension(ctx))
 }
 
-/// Sends `body` with the given content type (none when `None`) and returns
-/// the status, the response content type and the response body.
-async fn post_raw(
-    router: Router,
-    body: &str,
-    content_type: Option<&str>,
-) -> (StatusCode, Option<String>, String) {
-    let mut builder = Request::builder().method(Method::POST).uri(PATH);
+struct Answer {
+    status: StatusCode,
+    content_type: Option<String>,
+    body: String,
+}
+
+impl Answer {
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.body).unwrap_or(Value::Null)
+    }
+
+    fn is_problem(&self) -> bool {
+        self.content_type
+            .as_deref()
+            .is_some_and(|v| v.starts_with("application/problem+json"))
+    }
+}
+
+async fn send(router: Router, uri: &str, body: &str, content_type: Option<&str>) -> Answer {
+    let mut builder = Request::builder().method(Method::POST).uri(uri);
     if let Some(content_type) = content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);
     }
-    let request = builder.body(Body::from(body.to_owned())).unwrap();
-    let response = router.oneshot(request).await.unwrap();
+    let response = router
+        .oneshot(builder.body(Body::from(body.to_owned())).unwrap())
+        .await
+        .unwrap();
     let status = response.status();
-    let response_type = response
+    let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    (
+    Answer {
         status,
-        response_type,
-        String::from_utf8_lossy(&bytes).into_owned(),
-    )
-}
-
-async fn post(router: Router, body: &str) -> (StatusCode, String) {
-    let (status, _, body) = post_raw(router, body, Some("application/json")).await;
-    (status, body)
-}
-
-fn is_problem_json(content_type: Option<&str>) -> bool {
-    content_type.is_some_and(|v| v.starts_with("application/problem+json"))
-}
-
-#[tokio::test]
-async fn permitted_subject_gets_201_with_the_created_note() {
-    let tenant_id = Uuid::new_v4();
-    let router = router_with(Arc::new(AllowResolver), tenant_id).await;
-
-    let (status, body) = post(router, r#"{"text":"hello"}"#).await;
-
-    assert_eq!(status, StatusCode::CREATED, "body: {body}");
-    assert!(body.contains("\"id\""), "body: {body}");
-    assert!(body.contains(&tenant_id.to_string()), "body: {body}");
-    assert!(body.contains("\"text\":\"hello\""), "body: {body}");
-}
-
-#[tokio::test]
-async fn blank_text_gets_400() {
-    let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
-
-    let (status, body) = post(router, r#"{"text":"   "}"#).await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-}
-
-#[tokio::test]
-async fn text_with_nul_character_gets_400() {
-    let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
-
-    let (status, body) = post(router, r#"{"text":"a\u0000b"}"#).await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-}
-
-#[tokio::test]
-async fn empty_body_gets_400() {
-    let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
-
-    let (status, body) = post(router, "").await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-}
-
-#[tokio::test]
-async fn malformed_json_gets_a_problem_body() {
-    let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
-
-    let (status, content_type, body) =
-        post_raw(router, r#"{"text":"#, Some("application/json")).await;
-
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
-    assert!(
-        is_problem_json(content_type.as_deref()),
-        "content type: {content_type:?}"
-    );
-}
-
-#[tokio::test]
-async fn json_of_the_wrong_shape_gets_a_problem_body() {
-    let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
-
-    let (status, content_type, body) =
-        post_raw(router, r#"{"text":5}"#, Some("application/json")).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
-    assert!(
-        is_problem_json(content_type.as_deref()),
-        "content type: {content_type:?}"
-    );
-}
-
-#[tokio::test]
-async fn unknown_field_in_the_body_gets_a_problem_body() {
-    let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
-    let body = format!(r#"{{"text":"hello","tenant_id":"{}"}}"#, Uuid::new_v4());
-
-    let (status, content_type, body) = post_raw(router, &body, Some("application/json")).await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
-    assert!(is_problem_json(content_type.as_deref()), "{content_type:?}");
-}
-
-#[tokio::test]
-async fn missing_content_type_gets_a_problem_body() {
-    let router = router_with(Arc::new(AllowResolver), Uuid::new_v4()).await;
-
-    let (status, content_type, body) = post_raw(router, r#"{"text":"hello"}"#, None).await;
-
-    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "body: {body}");
-    assert!(
-        is_problem_json(content_type.as_deref()),
-        "content type: {content_type:?}"
-    );
-}
-
-#[tokio::test]
-async fn retryable_policy_failures_get_503_without_internal_detail() {
-    let failures: [fn() -> CanonicalError; 3] = [
-        || {
-            CanonicalError::service_unavailable()
-                .with_detail("pdp at 10.0.0.7 is down")
-                .create()
-        },
-        || FoundationNoteError::deadline_exceeded("pdp at 10.0.0.7 is slow").create(),
-        || {
-            FoundationNoteError::resource_exhausted("pdp at 10.0.0.7 is busy")
-                .with_quota_violation("policy", "rate limit")
-                .create()
-        },
-    ];
-
-    for failure in failures {
-        let router = router_with(Arc::new(ErroringResolver(failure)), Uuid::new_v4()).await;
-
-        let (status, content_type, body) =
-            post_raw(router, r#"{"text":"hello"}"#, Some("application/json")).await;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
-        assert!(is_problem_json(content_type.as_deref()), "{content_type:?}");
-        assert!(!body.contains("10.0.0.7"), "body: {body}");
+        content_type,
+        body: String::from_utf8_lossy(&bytes).into_owned(),
     }
 }
 
-#[tokio::test]
-async fn broken_policy_service_gets_500_without_its_cause() {
-    let resolver =
-        ErroringResolver(|| CanonicalError::internal("client wiring secret".to_owned()).create());
-    let router = router_with(Arc::new(resolver), Uuid::new_v4()).await;
-
-    let (status, content_type, body) =
-        post_raw(router, r#"{"text":"hello"}"#, Some("application/json")).await;
-
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
-    assert!(is_problem_json(content_type.as_deref()), "{content_type:?}");
-    assert!(!body.contains("secret"), "body: {body}");
+async fn post(router: Router, tenant: Uuid, record: &Value) -> Answer {
+    send(
+        router,
+        &format!("{PATH}?tenant={tenant}"),
+        &record.to_string(),
+        Some("application/json"),
+    )
+    .await
 }
 
 #[tokio::test]
-async fn denied_subject_gets_403() {
-    let router = router_with(Arc::new(DenyResolver), Uuid::new_v4()).await;
+async fn a_received_record_gets_202() {
+    let router = router_with(&IntakeFixture::default()).await;
 
-    let (status, body) = post(router, r#"{"text":"hello"}"#).await;
+    let answer = post(
+        router,
+        Uuid::new_v4(),
+        &chat_record(Uuid::new_v4(), "p", "v"),
+    )
+    .await;
 
-    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_eq!(answer.status, StatusCode::ACCEPTED, "body: {}", answer.body);
+    assert_eq!(answer.json(), json!({ "outcome": "received" }));
+}
+
+#[tokio::test]
+async fn a_repeat_gets_200() {
+    let router = router_with(&IntakeFixture::default()).await;
+    let (tenant, record) = (Uuid::new_v4(), chat_record(Uuid::new_v4(), "p", "v"));
+    let first = post(router.clone(), tenant, &record).await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "body: {}", first.body);
+
+    let again = post(router, tenant, &record).await;
+
+    assert_eq!(again.status, StatusCode::OK, "body: {}", again.body);
+    assert_eq!(again.json(), json!({ "outcome": "repeat" }));
+}
+
+#[tokio::test]
+async fn a_refused_record_gets_422_naming_type_place_and_rule() {
+    let router = router_with(&IntakeFixture::default()).await;
+    let mut record = chat_record(Uuid::new_v4(), "p", "v");
+    record["payload"]["role"] = json!("system");
+
+    let answer = post(router, Uuid::new_v4(), &record).await;
+
+    assert_eq!(
+        answer.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {}",
+        answer.body
+    );
+    assert!(
+        answer.is_problem(),
+        "content type: {:?}",
+        answer.content_type
+    );
+    let body = answer.json();
+    let violation = &body["context"]["field_violations"][0];
+    assert_eq!(violation["field"], "/payload/role", "body: {body}");
+    assert_eq!(violation["description"], "enum");
+    assert_eq!(violation["reason"], "SCHEMA_VIOLATION");
+    assert!(
+        answer.body.contains(construct_sdk::gts::CHAT_MESSAGE_TYPE),
+        "the type is named: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_record_with_an_id_gets_422() {
+    let router = router_with(&IntakeFixture::default()).await;
+    let mut record = chat_record(Uuid::new_v4(), "p", "v");
+    record["id"] =
+        json!("gts.cf.connectors.core.record.v1~cf.construct.chat.message.v1~a.b.c.d.v1");
+
+    let answer = post(router, Uuid::new_v4(), &record).await;
+
+    assert_eq!(
+        answer.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {}",
+        answer.body
+    );
+    assert_eq!(
+        answer.json()["context"]["field_violations"][0]["reason"],
+        "ID_IN_PUSH"
+    );
+}
+
+#[tokio::test]
+async fn a_connector_without_permission_gets_403() {
+    let fixture = IntakeFixture {
+        resolver: Arc::new(DenyResolver),
+        ..IntakeFixture::default()
+    };
+    let router = router_with(&fixture).await;
+
+    let answer = post(
+        router,
+        Uuid::new_v4(),
+        &chat_record(Uuid::new_v4(), "p", "v"),
+    )
+    .await;
+
+    assert_eq!(
+        answer.status,
+        StatusCode::FORBIDDEN,
+        "body: {}",
+        answer.body
+    );
+    assert!(answer.is_problem());
+}
+
+#[tokio::test]
+async fn a_request_without_a_tenant_gets_a_problem_and_takes_nothing() {
+    let fixture = IntakeFixture::default();
+    let router = router_with(&fixture).await;
+    let record = chat_record(Uuid::new_v4(), "p", "v").to_string();
+
+    let missing = send(router.clone(), PATH, &record, Some("application/json")).await;
+    let malformed = send(
+        router,
+        &format!("{PATH}?tenant=not-a-uuid"),
+        &record,
+        Some("application/json"),
+    )
+    .await;
+
+    for answer in [missing, malformed] {
+        assert_eq!(
+            answer.status,
+            StatusCode::BAD_REQUEST,
+            "body: {}",
+            answer.body
+        );
+        assert!(
+            answer.is_problem(),
+            "content type: {:?}",
+            answer.content_type
+        );
+    }
+    assert!(fixture.received().is_empty());
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_json_gets_a_problem() {
+    let router = router_with(&IntakeFixture::default()).await;
+    let uri = format!("{PATH}?tenant={}", Uuid::new_v4());
+
+    let malformed = send(router.clone(), &uri, "{not json", Some("application/json")).await;
+    let untyped = send(router, &uri, "{}", None).await;
+
+    assert_eq!(
+        malformed.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        malformed.body
+    );
+    assert!(malformed.is_problem());
+    assert_eq!(
+        untyped.status,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "body: {}",
+        untyped.body
+    );
+    assert!(untyped.is_problem());
+}
+
+#[tokio::test]
+async fn without_processing_a_record_gets_503_and_can_be_sent_again() {
+    let fixture = IntakeFixture {
+        no_processing: true,
+        ..IntakeFixture::default()
+    };
+    let router = router_with(&fixture).await;
+    let (tenant, record) = (Uuid::new_v4(), chat_record(Uuid::new_v4(), "p", "v"));
+
+    let first = post(router.clone(), tenant, &record).await;
+    let again = post(router, tenant, &record).await;
+
+    for answer in [first, again] {
+        assert_eq!(
+            answer.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "body: {}",
+            answer.body
+        );
+        assert!(answer.is_problem());
+    }
 }

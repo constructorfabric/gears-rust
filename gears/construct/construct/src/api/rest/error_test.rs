@@ -1,9 +1,12 @@
+use crate::api::rest::error::for_rest;
 use crate::domain::error::DomainError;
+use crate::domain::record_intake::{Place, Refusal, RefusalReason};
 use toolkit_canonical_errors::{CanonicalError, Problem};
 use toolkit_db::DbError;
 use toolkit_gts::gts_id;
 
-const NOTE_RESOURCE_TYPE: &str = gts_id!("cf.construct.foundation.note.v1~");
+const RECORD_RESOURCE_TYPE: &str = gts_id!("cf.connectors.core.record.v1~");
+const CHAT: &str = "gts.cf.connectors.core.record.v1~cf.construct.chat.message.v1~";
 
 fn wire(err: DomainError) -> Problem {
     Problem::from(CanonicalError::from(err))
@@ -17,34 +20,100 @@ fn visible_text(problem: &Problem) -> String {
     )
 }
 
-#[test]
-fn not_found_maps_to_404_with_resource_type() {
-    let problem = wire(DomainError::NotFound);
+fn first_violation(problem: &Problem) -> &serde_json::Value {
+    problem
+        .context
+        .get("field_violations")
+        .and_then(|v| v.get(0))
+        .expect("expected a field violation")
+}
 
-    assert_eq!(problem.status, Some(404));
+fn rest(err: DomainError) -> Problem {
+    Problem::from(for_rest(err))
+}
+
+fn schema_violation() -> DomainError {
+    DomainError::Refused(Refusal::new(
+        RefusalReason::SchemaViolation,
+        Some(CHAT),
+        Place::pointer("/payload/role"),
+        "enum",
+    ))
+}
+
+#[test]
+fn refused_on_the_route_is_422_naming_the_type_the_place_and_the_rule() {
+    let problem = rest(schema_violation());
+
+    assert_eq!(problem.status, Some(422));
+    let violation = first_violation(&problem);
+    assert_eq!(violation["field"], "/payload/role");
+    assert_eq!(violation["description"], "enum");
+    assert_eq!(violation["reason"], construct_sdk::reason::SCHEMA_VIOLATION);
     assert_eq!(
         problem
             .context
             .get("resource_type")
             .and_then(|v| v.as_str()),
-        Some(NOTE_RESOURCE_TYPE),
+        Some(RECORD_RESOURCE_TYPE),
+    );
+    assert_eq!(
+        problem
+            .context
+            .get("resource_name")
+            .and_then(|v| v.as_str()),
+        Some(CHAT),
     );
 }
 
 #[test]
-fn validation_maps_to_400_with_field_violation() {
-    let problem = wire(DomainError::validation("text", "must not be empty"));
+fn refused_for_an_in_process_caller_carries_no_http_status() {
+    let error = CanonicalError::from(schema_violation());
 
-    assert_eq!(problem.status, Some(400));
-    let violation = problem
-        .context
-        .get("field_violations")
-        .and_then(|v| v.get(0))
-        .expect("expected a field violation");
-    assert_eq!(
-        violation.get("field").and_then(|v| v.as_str()),
-        Some("text")
+    assert!(
+        matches!(error, CanonicalError::InvalidArgument { .. }),
+        "{error:?}"
     );
+    // Without the REST override, the category's own status applies.
+    assert_eq!(Problem::from(error).status, Some(400));
+}
+
+#[test]
+fn a_refusal_of_the_whole_record_names_the_record_as_the_place() {
+    let problem = rest(DomainError::Refused(Refusal::new(
+        RefusalReason::ConnectorOff,
+        None,
+        Place::Whole,
+        "the connector is off for the tenant",
+    )));
+
+    assert_eq!(problem.status, Some(422));
+    let violation = first_violation(&problem);
+    assert_eq!(violation["field"], "(record)");
+    assert_eq!(violation["reason"], construct_sdk::reason::CONNECTOR_OFF);
+    assert_eq!(
+        problem
+            .context
+            .get("resource_name")
+            .and_then(|v| v.as_str()),
+        Some("record"),
+    );
+}
+
+#[test]
+fn other_errors_map_the_same_on_the_route_and_in_process() {
+    for (on_route, in_process) in [
+        (
+            rest(DomainError::forbidden("x")),
+            wire(DomainError::forbidden("x")),
+        ),
+        (
+            rest(DomainError::Unavailable("x".to_owned())),
+            wire(DomainError::Unavailable("x".to_owned())),
+        ),
+    ] {
+        assert_eq!(on_route.status, in_process.status);
+    }
 }
 
 #[test]

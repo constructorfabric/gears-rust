@@ -11,11 +11,10 @@ pub(crate) type DbProvider = toolkit_db::DBProvider<toolkit_db::DbError>;
 
 pub mod error;
 pub mod local_client;
-pub mod repo;
-pub mod service;
+pub mod record_intake;
 pub mod subject_settings;
 
 #[cfg(test)]
-mod service_test;
+mod record_intake_test;
 #[cfg(test)]
 mod subject_settings_test;

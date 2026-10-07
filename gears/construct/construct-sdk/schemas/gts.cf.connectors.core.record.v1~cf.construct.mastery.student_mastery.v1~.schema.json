@@ -1,0 +1,80 @@
+{
+  "$id": "gts://gts.cf.connectors.core.record.v1~cf.construct.mastery.student_mastery.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "One student's computed concept mastery for one course under one model: the finished result the Mastery connector pushes. subject_id is always set (the record is about the student, its value the student's platform user uuid). The payload carries scores keyed by concept_index only; the concept name and description are joined on read from avatar's own concepts table, which stays user-facing and is kept populated by the connector's separate course_catalog record, not by this per-student push. provenance = the (course, model, student) locator, stable across re-pushes; version = a digest of the concept scores, so an identical recompute dedupes to one record and a changed recompute is a new version the receiving side upserts onto the same provenance. observed_at = the connector-side timestamp when the compute finished, not a watermark over the events read. The result is authoritative: the receiving side validates it against this type and stores it as-is, with no retain-or-drop decision.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.connectors.core.record.v1~"
+    },
+    {
+      "type": "object",
+      "required": [
+        "subject_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "gts.cf.connectors.core.record.v1~cf.construct.mastery.student_mastery.v1~"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "course_id": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The external course identifier, stable across both databases (avatar keeps the user-facing course row, the connector its internal one). Not either database's internal UUID."
+            },
+            "model_name": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The evaluation model that produced these scores. A student may have mastery under more than one model, and every read endpoint takes a model name."
+            },
+            "model_version": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "The model's version. Optional."
+            },
+            "concepts": {
+              "type": "array",
+              "minItems": 1,
+              "description": "Per-concept mastery, keyed by the concept's stable within-course index. Each concept_index appears at most once; draft-07 cannot express that, so the producer must guarantee it. Name and description are not carried; they are joined on read from avatar's concepts table.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "concept_index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The concept's stable index within the course."
+                  },
+                  "score": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "The mastery estimate, a probability in [0, 1]."
+                  },
+                  "signal_count": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "How many observations the estimate rests on."
+                  }
+                },
+                "required": [
+                  "concept_index",
+                  "score",
+                  "signal_count"
+                ]
+              }
+            }
+          },
+          "required": [
+            "course_id",
+            "model_name",
+            "concepts"
+          ]
+        }
+      }
+    }
+  ]
+}

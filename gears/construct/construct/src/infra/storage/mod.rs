@@ -1,9 +1,12 @@
-pub mod entity;
 pub mod mapper;
 pub mod migrations;
-pub mod sea_orm_repo;
+pub mod record_ids_entity;
+pub mod record_ids_repo;
 #[cfg(test)]
-mod sea_orm_repo_test;
+mod record_ids_repo_test;
+pub mod scope_error;
+#[cfg(test)]
+mod scope_error_test;
 pub mod subject_settings_entity;
 pub mod subject_settings_repo;
 #[cfg(test)]
