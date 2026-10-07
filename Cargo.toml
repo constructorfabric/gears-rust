@@ -50,6 +50,8 @@ debug = true
 
 [workspace]
 members = [
+    "gears/system/durable-execution/durable-execution",
+    "gears/system/durable-execution/durable-execution-sdk",
     "apps/cf-gears-example-server",
     "apps/cf-gears-flight-control",
     "tools/gts-analyze",
@@ -316,6 +318,13 @@ string_lit_as_bytes = "deny"
 verbose_file_reads = "deny"
 
 [workspace.dependencies]
+durable-execution = { package = "cf-gears-durable-execution", version = "0.1.0", path = "gears/system/durable-execution/durable-execution" }
+durable-execution-sdk = { package = "cf-gears-durable-execution-sdk", version = "0.1.0", path = "gears/system/durable-execution/durable-execution-sdk" }
+apalis = { version = "=1.0.0-rc.10", default-features = false, features = ["tracing", "limit"] }
+apalis-core = "=1.0.0-rc.10"
+# Keep SQLx runtime/TLS settings in the workspace. The adapter's default
+# tokio-comp feature enables rustls/ring alongside our aws-lc-rs provider.
+apalis-postgres = { version = "=1.0.0-rc.9", default-features = false, features = ["migrate"] }
 # libs
 toolkit = { package = "cf-gears-toolkit", version = "0.10.0", path = "libs/toolkit" }
 toolkit-http = { package = "cf-gears-toolkit-http", version = "0.6.18", path = "libs/toolkit-http" }

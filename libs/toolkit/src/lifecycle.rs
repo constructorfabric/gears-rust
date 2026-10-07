@@ -482,6 +482,7 @@ pub struct WithLifecycle<T: Runnable> {
     inner: Arc<T>,
     lc: Arc<Lifecycle>,
     pub(crate) stop_timeout: Duration,
+    stop_timeout_fn: Option<fn(&T) -> Duration>,
     // lifecycle start mode configuration
     await_ready: bool,
     has_ready_handler: bool,
@@ -494,6 +495,7 @@ impl<T: Runnable> WithLifecycle<T> {
             inner: Arc::new(inner),
             lc: Arc::new(Lifecycle::new_named(std::any::type_name::<T>())),
             stop_timeout: Duration::from_secs(30),
+            stop_timeout_fn: None,
             await_ready: false,
             has_ready_handler: false,
             run_ready_fn: None,
@@ -505,6 +507,7 @@ impl<T: Runnable> WithLifecycle<T> {
             inner,
             lc: Arc::new(Lifecycle::new_named(std::any::type_name::<T>())),
             stop_timeout: Duration::from_secs(30),
+            stop_timeout_fn: None,
             await_ready: false,
             has_ready_handler: false,
             run_ready_fn: None,
@@ -516,6 +519,7 @@ impl<T: Runnable> WithLifecycle<T> {
             inner: Arc::new(inner),
             lc: Arc::new(Lifecycle::new_named(name)),
             stop_timeout: Duration::from_secs(30),
+            stop_timeout_fn: None,
             await_ready: false,
             has_ready_handler: false,
             run_ready_fn: None,
@@ -527,6 +531,7 @@ impl<T: Runnable> WithLifecycle<T> {
             inner,
             lc: Arc::new(Lifecycle::new_named(name)),
             stop_timeout: Duration::from_secs(30),
+            stop_timeout_fn: None,
             await_ready: false,
             has_ready_handler: false,
             run_ready_fn: None,
@@ -552,6 +557,14 @@ impl<T: Runnable> WithLifecycle<T> {
     /// Example: `stop_timeout = 30s`, `shutdown_deadline = 35s`
     pub fn with_stop_timeout(mut self, d: Duration) -> Self {
         self.stop_timeout = d;
+        self.stop_timeout_fn = None;
+        self
+    }
+
+    /// Compute the stop timeout from the initialized runnable at each stop.
+    /// The host's deadline token still takes precedence.
+    pub fn with_stop_timeout_fn(mut self, provider: fn(&T) -> Duration) -> Self {
+        self.stop_timeout_fn = Some(provider);
         self
     }
 
@@ -626,7 +639,7 @@ impl<T: Runnable> crate::contracts::RunnableCapability for WithLifecycle<T> {
     /// Stop the lifecycle-managed task.
     ///
     /// Implements the two-phase shutdown contract:
-    /// 1. Attempts graceful stop using `self.stop_timeout` (default 30s)
+    /// 1. Attempts graceful stop using the configured duration or timeout provider
     /// 2. If `deadline_token` is cancelled before graceful stop completes,
     ///    immediately aborts with zero timeout
     ///
@@ -634,8 +647,11 @@ impl<T: Runnable> crate::contracts::RunnableCapability for WithLifecycle<T> {
     /// allowing real graceful shutdown to occur.
     #[tracing::instrument(skip(self, deadline_token), level = "debug")]
     async fn stop(&self, deadline_token: CancellationToken) -> TaskResult<()> {
+        let timeout = self
+            .stop_timeout_fn
+            .map_or(self.stop_timeout, |provider| provider(&self.inner));
         tokio::select! {
-            res = self.lc.stop(self.stop_timeout) => {
+            res = self.lc.stop(timeout) => {
                 _ = res.map_err(anyhow::Error::from)?;
                 Ok(())
             }

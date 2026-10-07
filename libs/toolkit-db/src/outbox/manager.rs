@@ -734,7 +734,7 @@ impl OutboxBuilder {
 /// [`stop()`](Self::stop) method for graceful shutdown.
 ///
 /// Drop safety: if `stop()` is never called, `TaskSet::Drop` cancels the
-/// cancellation token, signaling all workers to exit, and this handle's own
+/// cancellation token and aborts owned tasks, and this handle's own
 /// `Drop` closes the subscription registry.
 ///
 /// `tasks` is an `Option` only so `stop()` can take the `TaskSet` out and
@@ -766,7 +766,7 @@ impl OutboxHandle {
 impl Drop for OutboxHandle {
     fn drop(&mut self) {
         // Dropping the handle is a supported shutdown path - `TaskSet`'s own
-        // drop cancels every worker token - so it must give the same guarantee
+        // drop cancels every worker token and aborts tasks - so it must give the same guarantee
         // `stop` does. Closing the registry drops its senders, which makes an
         // awaiting subscription yield `None`: the documented signal that this
         // process can no longer answer. Without it the caller waits for ever,

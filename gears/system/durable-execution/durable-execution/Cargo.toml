@@ -1,0 +1,58 @@
+[package]
+name = "cf-gears-durable-execution"
+description = "Persistent staged Gear activities with parallel groups and checkpoint recovery"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+[features]
+default = []
+integration = []
+
+[dependencies]
+authz-resolver-sdk.workspace = true
+authz-resolver.workspace = true
+authn-resolver.workspace = true
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.37", path = "../../authn-resolver/authn-resolver-sdk" }
+secrecy.workspace = true
+durable-execution-sdk.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+aws-lc-rs.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "time", "rt", "sync"] }
+tokio-util.workspace = true
+toolkit.workspace = true
+toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
+toolkit-db-macros.workspace = true
+toolkit-security.workspace = true
+toolkit-canonical-errors.workspace = true
+toolkit-macros.workspace = true
+sea-orm.workspace = true
+sea-orm-migration.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+parking_lot.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+apalis.workspace = true
+apalis-core.workspace = true
+apalis-postgres.workspace = true
+sqlx.workspace = true
+[dev-dependencies]
+test-containers.workspace = true
+testcontainers.workspace = true
+testcontainers-modules.workspace = true
+temp-env.workspace = true
+proptest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true

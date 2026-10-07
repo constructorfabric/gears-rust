@@ -1,0 +1,32 @@
+[package]
+name = "cf-gears-durable-execution-sdk"
+description = "Code-defined durable execution contracts for gears-rust"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+aws-lc-rs.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+toolkit.workspace = true
+toolkit-canonical-errors.workspace = true
+toolkit-gts.workspace = true
+toolkit-security.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+[dev-dependencies]
+trybuild.workspace = true
+proptest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
