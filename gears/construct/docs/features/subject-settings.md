@@ -101,14 +101,14 @@ This part has no public surface. The read is a domain service that Record Intake
 The setting key is `gts.cf.core.settings.setting_type.v1~cf.construct.personalization.default_enabled.v1~`, read for the scope `/tenants/{tenant_id}`. Its value is a boolean.
 
 **Steps**:
-Each time the configured fallback is used, the reason is logged with the tenant id and the key: at warn level the first time for each reason (no client, not declared, retired), at debug level after that. So a host that ignores the tenant setting shows in the log without flooding it.
+Errors are not logged here: as in the foundation, every domain error is logged once, where it is mapped to a response, and its message names the setting key. Each time the configured fallback is used, which is not an error, the reason is logged with the tenant id and the key: at warn level the first time for each reason (no client, not declared, retired), at debug level after that. So a host that ignores the tenant setting shows in the log without flooding it.
 
 1. [x] - `p1` - Resolve the settings client (`SettingsReaderClient`) from ClientHub on each read, so the order in which gears start does not matter. **IF** no settings client is registered, **RETURN** the configured fallback - `inst-default-client`
 2. [x] - `p1` - Read the effective value of the setting for the tenant scope, with the caller's security context. **IF** no answer comes within the read timeout (5 seconds by default), **RETURN** an unavailable error - `inst-default-read`
 3. [x] - `p1` - **IF** the read succeeds, **RETURN** the value. A value that is not a boolean is an internal error - `inst-default-value`
 4. [x] - `p1` - **IF** the settings service answers not found for the setting's declaration, or says the setting was retired, **RETURN** the configured fallback. A not found for anything else, such as the tenant scope, is not a missing declaration and goes to the last step - `inst-default-undeclared`
-5. [x] - `p1` - **IF** the settings service is unavailable, or the failure is one a retry may cure (deadline exceeded, resource exhausted: the categories the foundation also treats as retryable), **RETURN** an unavailable error (logged at warn level). The settings service's retry delay is not passed on, because the unavailable error carries none, as on the policy-service path. The fallback is not used: a guess could turn personalization on for a tenant whose default is off - `inst-default-unavailable`
-6. [x] - `p1` - **IF** the read fails for any other reason, such as a denied read or a not found that is not the declaration's, **RETURN** an internal error (logged at error level) - `inst-default-failed`
+5. [x] - `p1` - **IF** the settings service is unavailable, or the failure is one a retry may cure (deadline exceeded, resource exhausted: the categories the foundation also treats as retryable), **RETURN** an unavailable error. The settings service's retry delay is not passed on, because the unavailable error carries none, as on the policy-service path. The fallback is not used: a guess could turn personalization on for a tenant whose default is off - `inst-default-unavailable`
+6. [x] - `p1` - **IF** the read fails for any other reason, such as a denied read or a not found that is not the declaration's, **RETURN** an internal error - `inst-default-failed`
 
 ## 4. States (CDSL)
 
@@ -176,6 +176,6 @@ The system **MUST** read the personalization default from the settings service t
 - **Security**: The tenant comes only from the security context. Each read asks the AuthZ resolver for its own permission, and the scope it returns filters the select, so another tenant's row is never read. The settings service is read with the caller's security context.
 - **Data integrity**: One row per tenant and subject, enforced by the primary key. Reading never writes. The erasure flag starts cleared.
 - **Reliability**: An unavailable, slow or throttling settings service is an error, not a silent default, because personalization is a privacy setting. Each read is bounded by a timeout (5 seconds by default). The settings client is resolved on each read, so a settings service that starts after Construct is picked up.
-- **Observability**: The read carries a tracing span with the tenant id and the subject id. The first use of the fallback for each reason is logged at warn level with the tenant id, the key and the reason, later uses at debug level. An unavailable settings service is logged at warn level, any other failure at error level.
+- **Observability**: The read carries a tracing span with the tenant id and the subject id. The first use of the fallback for each reason is logged at warn level with the tenant id, the key and the reason, later uses at debug level. Errors are logged once, where they are mapped to a response, as in the foundation; their message names the setting key.
 - **Rollback**: The migration has a `down` step that drops the table. It has no test.
 - **Not done in this part**: see the out-of-scope list in 1.2.

@@ -124,9 +124,14 @@ impl SettingsServiceDefaults {
         self.fallback
     }
 
-    fn unavailable(&self, tenant_id: Uuid, detail: &str) -> DomainError {
-        tracing::warn!(%tenant_id, key = %self.key, error = %detail, "settings service unavailable");
-        DomainError::Unavailable(format!("settings service unavailable: {detail}"))
+    /// The error is not logged here: every domain error is logged once, where
+    /// it is mapped to a response. The key goes into the message so that line
+    /// names the setting.
+    fn unavailable(&self, detail: &str) -> DomainError {
+        DomainError::Unavailable(format!(
+            "settings service unavailable reading {}: {detail}",
+            self.key
+        ))
     }
 
     /// Decide what a failed read means.
@@ -149,23 +154,16 @@ impl SettingsServiceDefaults {
             SettingsError::Unavailable {
                 detail,
                 retry_after_secs: _,
-            } => Err(self.unavailable(tenant_id, &detail)),
+            } => Err(self.unavailable(&detail)),
             SettingsError::Other { canonical } if retryable => {
-                Err(self.unavailable(tenant_id, &canonical.to_string()))
+                Err(self.unavailable(&canonical.to_string()))
             }
             // @cpt-end:cpt-cf-construct-algo-subject-settings-tenant-default:p1:inst-default-unavailable
             // @cpt-begin:cpt-cf-construct-algo-subject-settings-tenant-default:p1:inst-default-failed
-            other => {
-                tracing::error!(
-                    %tenant_id,
-                    key = %self.key,
-                    error = %other,
-                    "personalization default read failed"
-                );
-                Err(DomainError::internal(format!(
-                    "personalization default read failed: {other}"
-                )))
-            } // @cpt-end:cpt-cf-construct-algo-subject-settings-tenant-default:p1:inst-default-failed
+            other => Err(DomainError::internal(format!(
+                "personalization default read failed for {}: {other}",
+                self.key
+            ))), // @cpt-end:cpt-cf-construct-algo-subject-settings-tenant-default:p1:inst-default-failed
         }
     }
 }
@@ -191,10 +189,7 @@ impl TenantDefaults for SettingsServiceDefaults {
         let Ok(resolved) =
             tokio::time::timeout(self.read_timeout, reader.get_effective(ctx, request)).await
         else {
-            return Err(self.unavailable(
-                tenant_id,
-                &format!("no answer within {:?}", self.read_timeout),
-            ));
+            return Err(self.unavailable(&format!("no answer within {:?}", self.read_timeout)));
         };
         // @cpt-end:cpt-cf-construct-algo-subject-settings-tenant-default:p1:inst-default-read
 
