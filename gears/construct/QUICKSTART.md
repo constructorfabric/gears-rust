@@ -16,7 +16,7 @@ The example server uses the gateway prefix `/cf`. This comes from `gears.api-gat
 
 ## Run it locally
 
-The example server does not include Construct. Construct is hosted in its own repository (`rolos/construct-core`). To try the gear on your machine, link it into the example server for a local run, without committing the change.
+The gear is in this repository under `gears/construct`, and it is not built into the example server. To try it on your machine, link it into the example server for a local run, without committing the change.
 
 1. In `apps/cf-gears-example-server/Cargo.toml`, add the dependency and the feature:
 
@@ -114,6 +114,5 @@ Response `400`:
 
 | Issue | Solution |
 |-------|----------|
-| `no such table: construct__foundation_notes` | The SQLite file comes from an older build that used another table name. Delete the file, or point `database.file` to a new one. |
 | The gear does not start | Check `max_text_length` (1 to 65535) and that the config has no unknown key. |
 | `404` on `/cf/construct/...` | The example server was started without `--features construct`. |
