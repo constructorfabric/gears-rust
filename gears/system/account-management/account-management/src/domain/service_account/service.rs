@@ -228,8 +228,9 @@ impl ServiceAccountService {
     ///   too many scopes, oversized scope).
     /// * [`DomainError::ServiceAccountInvalidInput`] — the provider
     ///   rejected the request with nothing retained (name already live
-    ///   in the tenant, charset violation, scope outside the allowlist,
-    ///   provider quota).
+    ///   in the tenant, charset violation, scope outside the allowlist).
+    /// * [`DomainError::ServiceAccountQuotaExceeded`] — the tenant
+    ///   reached its service-account limit; nothing retained.
     /// * [`DomainError::ServiceAccountAmbiguous`] — transport
     ///   uncertainty; the provider may hold a half-created account, so
     ///   the caller reconciles via [`Self::list`] rather than retrying.

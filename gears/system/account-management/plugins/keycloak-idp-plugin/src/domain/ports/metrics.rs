@@ -228,6 +228,7 @@ impl FailureVariant {
     pub const USER_OP_UNSUPPORTED: Self = Self("user_op_unsupported");
     pub const SA_INVALID_INPUT: Self = Self("sa_invalid_input");
     pub const SA_NOT_FOUND: Self = Self("sa_not_found");
+    pub const SA_QUOTA_EXCEEDED: Self = Self("sa_quota_exceeded");
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {

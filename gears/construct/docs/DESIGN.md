@@ -81,6 +81,7 @@ This table maps non-functional requirements from PRD to specific design/architec
 | `cpt-cf-construct-adr-construct-is-a-gear` | Construct is a gear that owns its state and the rules around the model step |
 | `cpt-cf-construct-adr-graph-storage-as-is` | Construct uses graph storage as it is, including its compare-and-set on writes and its soft delete |
 | `cpt-cf-construct-adr-one-model-interface` | Construct calls models through one small interface. The chat completions adapter comes first; the LLM gateway adapter follows when the gateway runs |
+| `cpt-cf-construct-adr-no-weights` | Construct stores no weight and does not rank facts. The Profile reader returns a subject's readable facts in no order of importance |
 
 ### 1.3 Architecture Layers
 

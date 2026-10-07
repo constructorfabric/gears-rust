@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use super::{
     ActorDirectory, ActorFields, ActorName, ActorNames, LOOKUP_BATCH_SIZE, LOOKUP_BUDGET,
-    LOOKUP_CONCURRENCY, SYSTEM_LABEL, label, project_name, queried_ids,
+    LOOKUP_CONCURRENCY, NAME_CACHE_CAPACITY, NAME_TTL, NameCache, Names, SYSTEM_LABEL, label,
+    project_name, queried_ids,
 };
 
 /// The AM user resource, for the errors a fake directory answers with.
@@ -142,8 +143,9 @@ fn only_a_resolved_name_and_the_system_label_reach_the_wire() {
     }
 }
 
+/// An anonymous caller keeps no name, so a rename shows on its next read.
 #[tokio::test]
-async fn duplicate_ids_make_one_lookup_and_a_rename_shows_on_the_next_read() {
+async fn duplicate_ids_make_one_lookup_and_an_anonymous_caller_keeps_no_name() {
     let directory = Arc::new(Directory::default());
     let id = Uuid::from_u128(1);
     directory
@@ -964,4 +966,197 @@ async fn the_am_adapter_reads_with_the_callers_own_context_and_tenant() {
     let resolved = service.resolve(&ctx, [id]).await;
     assert_eq!(resolved[&id], ActorName::Resolved("from am".into()));
     assert_eq!(am.reads(), [(subject, tenant, tenant)]);
+}
+
+/// An authenticated caller: `subject` in `tenant`.
+fn caller(tenant: u128, subject: u128) -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::from_u128(subject))
+        .subject_tenant_id(Uuid::from_u128(tenant))
+        .subject_type("gts.cf.core.security.subject_user.v1~")
+        .token_scopes(vec!["*".to_owned()])
+        .build()
+        .expect("an authenticated context builds")
+}
+
+/// A resolved name is reused for the caller it was resolved for, until it expires: a rename
+/// shows on the first read after `NAME_TTL`, not before.
+#[tokio::test(start_paused = true)]
+async fn a_resolved_name_is_reused_for_its_caller_until_it_expires() {
+    let directory = Arc::new(Directory::default());
+    let id = Uuid::from_u128(7);
+    directory
+        .users
+        .lock()
+        .unwrap()
+        .insert(id, IdpUser::new(id, "before"));
+    let service = names(directory.clone()).caching_for(NAME_TTL);
+    let ctx = caller(1, 2);
+
+    assert_eq!(
+        service.resolve(&ctx, [id]).await[&id],
+        ActorName::Resolved("before".into())
+    );
+    directory
+        .users
+        .lock()
+        .unwrap()
+        .insert(id, IdpUser::new(id, "after"));
+    assert_eq!(
+        service.resolve(&ctx, [id]).await[&id],
+        ActorName::Resolved("before".into())
+    );
+    assert_eq!(
+        directory.calls(),
+        [vec![id]],
+        "the second read is answered from the cache"
+    );
+
+    tokio::time::advance(NAME_TTL + std::time::Duration::from_secs(1)).await;
+    assert_eq!(
+        service.resolve(&ctx, [id]).await[&id],
+        ActorName::Resolved("after".into())
+    );
+    assert_eq!(
+        directory.calls(),
+        [vec![id], vec![id]],
+        "an expired name is read again"
+    );
+}
+
+/// A name is never reused for another caller: AM decides per caller what it may see, so a second
+/// subject of the same tenant reads the directory itself, and so does a clone made for a facade.
+#[tokio::test]
+async fn another_caller_reads_the_directory_itself() {
+    let directory = Arc::new(Directory::default());
+    let id = Uuid::from_u128(7);
+    directory
+        .users
+        .lock()
+        .unwrap()
+        .insert(id, IdpUser::new(id, "Ann"));
+    let service = names(directory.clone()).caching_for(NAME_TTL);
+
+    service.resolve(&caller(1, 2), [id]).await;
+    service.resolve(&caller(1, 3), [id]).await;
+    assert_eq!(directory.calls(), [vec![id], vec![id]]);
+
+    // The clone shares the cache: the first caller's name is still kept for it alone.
+    service
+        .with_system_ids([])
+        .resolve(&caller(1, 2), [id])
+        .await;
+    assert_eq!(directory.calls(), [vec![id], vec![id]]);
+}
+
+/// Only a resolved name is kept: an id AM does not return is asked again on the next read, so a
+/// user created a moment later shows at once.
+#[tokio::test]
+async fn an_absent_name_is_not_kept() {
+    let directory = Arc::new(Directory::default());
+    let id = Uuid::from_u128(9);
+    let service = names(directory.clone()).caching_for(NAME_TTL);
+    let ctx = caller(1, 2);
+
+    assert_eq!(service.resolve(&ctx, [id]).await[&id], ActorName::NotFound);
+    directory
+        .users
+        .lock()
+        .unwrap()
+        .insert(id, IdpUser::new(id, "New"));
+    assert_eq!(
+        service.resolve(&ctx, [id]).await[&id],
+        ActorName::Resolved("New".into())
+    );
+    assert_eq!(directory.calls(), [vec![id], vec![id]]);
+}
+
+/// A directory given without `caching_for` keeps nothing: every read of the same caller asks.
+#[tokio::test]
+async fn a_directory_without_caching_keeps_nothing() {
+    let directory = Arc::new(Directory::default());
+    let id = Uuid::from_u128(7);
+    directory
+        .users
+        .lock()
+        .unwrap()
+        .insert(id, IdpUser::new(id, "Ann"));
+    let service = names(directory.clone());
+    let ctx = caller(1, 2);
+    service.resolve(&ctx, [id]).await;
+    service.resolve(&ctx, [id]).await;
+    assert_eq!(directory.calls(), [vec![id], vec![id]]);
+}
+
+/// The cache never holds more than `NAME_CACHE_CAPACITY` names: a full cache drops its expired
+/// names first and keeps the fresh ones, then drops all, and one answer with more resolved names
+/// than the cache keeps only that many.
+#[test]
+fn the_cache_never_holds_more_than_its_capacity() {
+    let resolved = |ids: std::ops::Range<usize>| -> Names {
+        ids.map(|n| {
+            (
+                Uuid::from_u128(n as u128),
+                ActorName::Resolved(format!("user {n}")),
+            )
+        })
+        .collect()
+    };
+    let len = |cache: &NameCache| cache.entries.lock().unwrap().len();
+    let caller = (Uuid::from_u128(1), Uuid::from_u128(2));
+    let start = tokio::time::Instant::now();
+    let later = start + std::time::Duration::from_secs(2);
+    let cache = NameCache::default();
+
+    // A full cache: the first `expired` names are gone by `later`, the rest are still fresh.
+    let expired = 4_000;
+    let full = NAME_CACHE_CAPACITY;
+    cache.keep(
+        caller,
+        &resolved(0..expired),
+        start,
+        std::time::Duration::from_secs(1),
+    );
+    cache.keep(caller, &resolved(expired..full), start, NAME_TTL);
+    cache.keep(caller, &resolved(full..full + 1), later, NAME_TTL);
+    assert_eq!(
+        len(&cache),
+        full - expired + 1,
+        "the expired names went, the fresh ones stayed"
+    );
+    assert_eq!(
+        cache
+            .fresh(caller, &[Uuid::from_u128(expired as u128)], later)
+            .len(),
+        1
+    );
+
+    // Full again, of fresh names only: one more drops them all.
+    let room = expired - 1;
+    cache.keep(
+        caller,
+        &resolved(full + 1..full + 1 + room),
+        later,
+        NAME_TTL,
+    );
+    assert_eq!(len(&cache), full);
+    cache.keep(
+        caller,
+        &resolved(full + 1 + room..full + 2 + room),
+        later,
+        NAME_TTL,
+    );
+    assert_eq!(len(&cache), 1, "a cache full of fresh names drops them all");
+
+    cache.keep(
+        caller,
+        &resolved(0..NAME_CACHE_CAPACITY + 1),
+        later,
+        NAME_TTL,
+    );
+    assert_eq!(
+        len(&cache),
+        NAME_CACHE_CAPACITY,
+        "one oversized answer keeps only the capacity"
+    );
 }

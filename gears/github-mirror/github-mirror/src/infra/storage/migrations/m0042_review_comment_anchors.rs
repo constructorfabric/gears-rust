@@ -8,14 +8,11 @@ pub struct Migration;
 
 /// Adds GitHub's multi-line diff anchors to `gm_review_comments`.
 ///
-/// `position`/`original_position` (migration `review_comments_diff_anchors_029`)
+/// `position`/`original_position` (migration `m0029_review_comments_diff_anchors`)
 /// are the deprecated single-line anchors; GitHub's own UI has positioned
 /// inline comments with `line`/`side` — and `start_line`/`start_side` for a
 /// multi-line selection — since 2022. Both sets are kept: the old one still
 /// resolves comments mirrored before this column existed.
-///
-/// Named with a `z_` prefix because the migration runner applies migrations in
-/// **name** order and this one alters a table created by `review_comments_006`.
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {

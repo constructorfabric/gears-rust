@@ -193,6 +193,16 @@ fn integrity_check_in_progress_maps_to_429() {
 }
 
 #[test]
+fn service_account_quota_exceeded_maps_to_429() {
+    assert_eq!(
+        status_of(DomainError::ServiceAccountQuotaExceeded {
+            detail: crate::domain::service_account::SA_QUOTA_MESSAGE.to_owned(),
+        }),
+        429
+    );
+}
+
+#[test]
 fn internal_maps_to_500() {
     assert_eq!(status_of(DomainError::internal("unexpected")), 500);
 }
@@ -342,6 +352,7 @@ impl DomainError {
             Self::UnsupportedOperation { .. } => "unsupported_operation",
             Self::IntegrityCheckInProgress => "integrity_check_in_progress",
             Self::IntegrityCheckLeaseLost => "integrity_check_lease_lost",
+            Self::ServiceAccountQuotaExceeded { .. } => "service_account_quota_exceeded",
             Self::RootBindingMismatch { .. } => "root_binding_mismatch",
             Self::Internal { .. } => "internal",
         }
@@ -393,7 +404,9 @@ impl DomainError {
             Self::CrossTenantDenied { .. } => 403,
             Self::ServiceUnavailable { .. } | Self::IdpUnavailable { .. } => 503,
             Self::UnsupportedOperation { .. } => 501,
-            Self::IntegrityCheckInProgress | Self::IntegrityCheckLeaseLost => 429,
+            Self::IntegrityCheckInProgress
+            | Self::IntegrityCheckLeaseLost
+            | Self::ServiceAccountQuotaExceeded { .. } => 429,
             Self::RootBindingMismatch { .. } | Self::Internal { .. } => 500,
         }
     }

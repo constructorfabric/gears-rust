@@ -451,6 +451,17 @@ impl From<DomainError> for CanonicalError {
                     )
                     .create()
             }
+            // Source-independent quota refusal on a service-account create.
+            // Unlike the integrity gate this one IS part of the inter-gear
+            // contract: a caller provisioning machine identities learns from
+            // the 429 and the `service_accounts` subject that the tenant is
+            // full, distinct from a 400 that no retry will fix. `detail` is
+            // the fixed message from `domain::service_account`.
+            DomainError::ServiceAccountQuotaExceeded { detail } => {
+                ServiceAccountResource::resource_exhausted("service-account quota reached")
+                    .with_quota_violation(quota::SERVICE_ACCOUNTS, detail)
+                    .create()
+            }
 
             // ---- ServiceUnavailable (HTTP 503) ----
             //

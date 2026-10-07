@@ -254,7 +254,7 @@ pub enum PluginError {
     },
 
     /// Service-account request rejected before any KC call
-    /// (name/scope/quota/conflict). Permanent client error.
+    /// (name/scope/conflict). Permanent client error.
     /// Boundary maps this to service-account-sdk's `InvalidInput`.
     #[error("sa invalid input: {detail}")]
     SaInvalidInput {
@@ -266,6 +266,12 @@ pub enum PluginError {
     /// Boundary maps this to service-account-sdk's `NotFound`.
     #[error("sa not found: {detail}")]
     SaNotFound { detail: String },
+    /// Service-account create refused before any KC mutation because the
+    /// tenant already owns `per_tenant_quota` clients. Not permanent: it
+    /// clears once the tenant revokes one. Boundary maps this to
+    /// service-account-sdk's `QuotaExceeded` (AM: 429).
+    #[error("sa quota exceeded: {detail}")]
+    SaQuotaExceeded { detail: String },
 }
 
 /// Stable `failure_variant` label string for the `keycloak_idp_plugin_failure_total`
@@ -296,6 +302,7 @@ pub fn failure_variant_label(e: &PluginError) -> &'static str {
         PluginError::UserOpFieldNotWritable { .. } => "user_op_field_not_writable",
         PluginError::SaInvalidInput { .. } => "sa_invalid_input",
         PluginError::SaNotFound { .. } => "sa_not_found",
+        PluginError::SaQuotaExceeded { .. } => "sa_quota_exceeded",
     }
 }
 

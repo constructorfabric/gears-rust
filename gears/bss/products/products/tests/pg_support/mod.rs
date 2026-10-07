@@ -118,18 +118,55 @@
 //! through "does it answer", and removing the former is how one lost race
 //! becomes a cascade. The prune still skips every database whose run is alive.
 //!
-//! # The `docker` CLI has to reach the daemon testcontainers reaches, and
-//! nothing here checks that
+//! # There is **one** Docker channel, because two cannot be kept in agreement
 //!
-//! [`published_port`] and the force-remove shell out to `docker`, while
-//! [`start_named`] goes through the testcontainers client. Where the two resolve
-//! to **different** daemons — a `DOCKER_HOST` the CLI reads and the client does
-//! not, two contexts, a rootless daemon beside a system one — the first run
-//! starts a container the CLI cannot see, and every later run finds no published
-//! port, force-removes nothing, and fails to start under a name that is already
-//! taken. It is reported rather than closed: the check would be a third way of
-//! asking the same question, and the failure is loud and repeatable rather than
-//! silent.
+//! The port first carried over the donor's hazard along with its design: the
+//! published port, the liveness question and the force-remove shelled out to the
+//! `docker` CLI while [`start_named`] went through the testcontainers client. The
+//! donor closed that hazard after this port was taken, and the case that cost it
+//! is the one this tier then hit for itself: a downstream CI step runs the
+//! Postgres tiers in a plain `rust:*-bookworm` image with a Docker *service*,
+//! where bollard reaches the daemon over `DOCKER_HOST` and there is no `docker`
+//! binary on the path at all.
+//!
+//! **This one this gear measured for itself.** Every shellout came back as
+//! "nothing there", so the first test process created the container and passed,
+//! and every later one saw no port and no `running` state, removed nothing, and
+//! sat in [`start_named`] on `409 Conflict` for the whole of [`BOOT_BUDGET`]
+//! before panicking about Postgres: ninety seconds per test, every `postgres_*`
+//! binary after the first red, and the step that runs them grew from minutes to
+//! over an hour while saying nothing about any schema.
+//!
+//! So the liveness question, the published port and the force-remove all go
+//! through [`docker_client_instance`] now, the very client `.start()` creates the
+//! container with, exactly as the donor's do. "The CLI and the client must agree"
+//! is no longer a property that has to hold, because there is no CLI: `ps` is the
+//! only subprocess left here and it is asked about processes, not about Docker.
+//! `pg_harness.rs` holds that census.
+//!
+//! One inspect answers *both* halves of the reuse decision — is it running, and
+//! on which port — where two invocations answered one each. Two answers read a
+//! moment apart can disagree, and this harness's whole reuse decision rests on
+//! them agreeing.
+//!
+//! What a daemon that cannot be **asked** licenses is nothing: [`Named::Unknown`]
+//! is a fact about the daemon and not about the container, so it never reaches
+//! the force-remove. Neither does a wait that simply runs out of budget: that a
+//! container has not answered in ninety seconds is not the same answer as the
+//! daemon saying nothing is there, which is why the wait reports
+//! [`Awaited::Undecided`] rather than folding both into one "no". Conflating
+//! either with "not running" is how a transient error under a dozen concurrent
+//! processes would remove a sibling's booting container.
+//!
+//! **The force-remove names the container, never the name.** Deciding that a
+//! container is a corpse and removing it are two calls, and a sibling can take
+//! the name between them: it removes the corpse and starts its own container.
+//! A removal by name would then destroy that sibling's new server. So a corpse
+//! is [`Named::Corpse`] carrying the id its inspect returned, and only that id
+//! is removed; a container created since has another id and is untouched. A
+//! name the daemon does not know is [`Named::Absent`] and removes nothing: two
+//! processes that both see it absent both go on to start, and the one that
+//! loses the name waits for the winner's container.
 //!
 //! # What a suite must still do for itself
 //!
@@ -172,6 +209,16 @@ use bss_products::infra::storage::migrations::Migrator;
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::bollard::Docker;
+use testcontainers_modules::testcontainers::bollard::errors::Error as BollardError;
+use testcontainers_modules::testcontainers::bollard::models::{
+    ContainerStateStatusEnum, NetworkSettings,
+};
+use testcontainers_modules::testcontainers::bollard::query_parameters::{
+    InspectContainerOptionsBuilder, RemoveContainerOptionsBuilder,
+};
+use testcontainers_modules::testcontainers::core::client::docker_client_instance;
+use testcontainers_modules::testcontainers::core::ports::Ports;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use toolkit_db::migration_runner::run_migrations_for_testing;
@@ -232,36 +279,42 @@ pub fn server_port() -> u16 {
 /// remove it out from under a sibling — and `Some` when it did, in which case
 /// the parked thread is what keeps it alive.
 async fn resolve_server() -> (u16, Option<ContainerAsync<Postgres>>) {
-    if let Some(port) = published_port(HARNESS_CONTAINER)
+    let docker = daemon().await;
+    if let Named::Running(Some(port)) = inspect_named(&docker, HARNESS_CONTAINER).await
         && answers(port).await
     {
         return (port, None);
     }
-    // Something under our name is not answering *yet*. **Three** cases, not two,
-    // and conflating any of them is what turns one lost race into a cascade: a
-    // container a killed run left behind, a sibling's container still coming up,
-    // and a daemon that could not be asked at all. Ask which, rather than
-    // inferring it from the silence.
-    match container_verdict(HARNESS_CONTAINER) {
-        // Up, or on its way up. Wait for it rather than fight it.
-        Some(Verdict::Live) => {
-            if let Some(port) = await_answer(HARNESS_CONTAINER).await {
-                return (port, None);
-            }
-            // Live for the whole budget and never answered: a corpse after all.
-            let _ = docker(&["rm", "-f", HARNESS_CONTAINER]);
-        }
-        // Gone, or dead beyond recovery. Clearing the name is safe - the name is
-        // this harness's own.
-        Some(Verdict::Corpse) => {
-            let _ = docker(&["rm", "-f", HARNESS_CONTAINER]);
-        }
-        // **The daemon could not be asked. Destroy nothing.** Falling through to
-        // `start_named` is the safe move: its name-conflict path waits for
-        // whoever holds the name instead of removing them.
-        None => {}
+    // Nothing under our name is answering *yet*. Three cases, and conflating
+    // them is what turns one lost race into a cascade: a container a killed run
+    // left half-started, a sibling's container still booting Postgres, and a
+    // daemon that could not be asked which of those it is. Only the first
+    // licenses a force-remove, so wait before reaching for one: `await_answer`
+    // returns at once on a corpse or an absent name and keeps asking on the
+    // other two.
+    match await_answer(&docker, HARNESS_CONTAINER).await {
+        Awaited::Answered(port) => return (port, None),
+        // Nothing holds the name: start one. A sibling that starts first makes
+        // this process's start lose the name, and `start_named` waits for it.
+        Awaited::Absent => {}
+        // A stopped container holds the name. Remove *that* container, by the id
+        // the inspect returned: a sibling may have replaced it since, and its new
+        // container has another id.
+        Awaited::Corpse(id) => remove_corpse(&docker, &id).await,
+        // The budget ran out on something that is *not* a corpse: a sibling
+        // still booting past ninety seconds, or a daemon that could not be
+        // asked which. Neither licenses a removal — removing the sibling is the
+        // cascade this whole path exists to avoid — so give up loudly and name
+        // what a human has to go and look at. One red that says Docker beats a
+        // green run whose server somebody else was still starting.
+        Awaited::Undecided => panic!(
+            "the container named {HARNESS_CONTAINER} neither answered within \
+             {BOOT_BUDGET:?} nor is a corpse, so it may be a sibling's and is \
+             not this process's to remove; if it is wedged, clear it by hand \
+             with `docker rm -fv {HARNESS_CONTAINER}`"
+        ),
     }
-    if let Some(container) = start_named().await {
+    if let Some(container) = start_named(&docker).await {
         let port = container
             .get_host_port_ipv4(5432)
             .await
@@ -270,19 +323,12 @@ async fn resolve_server() -> (u16, Option<ContainerAsync<Postgres>>) {
     }
     // A sibling binary won the race and started it under our name. It may still
     // be booting, so wait rather than read a port it has not published yet.
-    //
-    // **This is the second `await_answer` on one compound path, and it is not a
-    // duplicate.** Reaching here from `Verdict::Live` means the first call
-    // spent its whole budget on a container that was then `rm -f`'d as a
-    // corpse; this call waits on a *different* container, the sibling's, which
-    // did not exist when the first one gave up. Collapsing them would make the
-    // harness read a port belonging to the thing it had just removed. The cost
-    // is a second `BOOT_BUDGET` on the rarest path — Live, then silent for the
-    // full budget, then out-raced — and that is the price of not destroying a
-    // sibling's container.
-    let port = await_answer(HARNESS_CONTAINER)
-        .await
-        .expect("the sibling's container must come up and publish a port");
+    let Awaited::Answered(port) = await_answer(&docker, HARNESS_CONTAINER).await else {
+        panic!(
+            "the sibling that won the name {HARNESS_CONTAINER} must bring its \
+             container up and publish a port"
+        )
+    };
     (port, None)
 }
 
@@ -295,53 +341,165 @@ async fn resolve_server() -> (u16, Option<ContainerAsync<Postgres>>) {
 /// initialising a cluster while a dozen sibling processes watch.
 const BOOT_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// What the daemon says about a container under this name.
+/// The Docker client this harness shares with testcontainers, so that every
+/// question it asks reaches the daemon its containers are started on. See the
+/// module doc on why there is only one channel.
 ///
-/// **`None` means the question could not be asked** — no `docker` on the path,
-/// a socket that refused, a daemon under load — and it is a distinct value from
-/// [`Verdict::Corpse`] for exactly the reason [`process_is_running`] returns an
-/// `Option`: the module doc promises that every failure mode of a liveness
-/// question lands on *keep*, and the only caller of this function destroys
-/// things. An earlier revision returned a bare `bool` and merged the two, so a
-/// single transient `docker inspect` failure force-removed a healthy container
-/// out from under every sibling process — the precise "reds that said nothing
-/// about any schema" cascade this file exists to eliminate.
-///
-/// `created` and `restarting` are **not** corpses. A container holds its name in
-/// `created` for the moments between `docker create` and `docker start`, so a
-/// sibling entering [`resolve_server`] in that window would otherwise read the
-/// winner's brand-new container as dead and remove it.
-pub fn container_verdict(name: &str) -> Option<Verdict> {
-    let status = docker(&["inspect", "-f", "{{.State.Status}}", name])?;
-    Some(match status.trim() {
-        "running" | "created" | "restarting" => Verdict::Live,
-        _ => Verdict::Corpse,
+/// # Panics
+/// When no client can be configured at all — a `DOCKER_HOST` that will not parse,
+/// a socket that is not there. That is deterministic and the same for every
+/// process of the run, so there is nothing to retry; the panic says Docker, which
+/// is the one thing the shellouts this replaced could not.
+pub async fn daemon() -> Docker {
+    docker_client_instance().await.unwrap_or_else(|e| {
+        panic!("configure the docker client testcontainers starts containers with: {e}")
     })
 }
 
-/// The daemon's answer about the harness container, once the "could not ask"
-/// case has been lifted into the surrounding `Option`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    /// Running, or on its way there. Wait for it; never remove it.
-    Live,
-    /// Absent, exited, dead or removing. The name may be cleared.
-    Corpse,
+/// What the daemon says about a container carrying this harness's name.
+///
+/// "The daemon could not be asked" is a fact about the daemon, not about the
+/// container: see [`Named::Unknown`]. "No such container" and "a stopped one"
+/// are kept apart too, because only the second has anything to remove.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Named {
+    /// Running or on its way there — `created`, `restarting` — carrying the host
+    /// port it publishes for 5432, or `None` while it has published none yet.
+    Running(Option<u16>),
+    /// No container of that name. Nothing to remove: the start that follows
+    /// takes the name, or loses it to a sibling and waits for that sibling.
+    Absent,
+    /// A container of that name that has stopped — `exited`, `dead`,
+    /// `removing`, `paused` — carrying its id. The only answer that licenses a
+    /// force-remove, and only of this id: see [`remove_corpse`].
+    Corpse(String),
+    /// The daemon did not answer the question. It licenses **nothing** — reading
+    /// it as "not running" is how one transient error under a dozen concurrent
+    /// processes removes a sibling's booting container, and reading it as
+    /// "running" would park every process on a container that is not there.
+    Unknown,
+}
+
+/// Ask the daemon about a container by name, through the client [`start_named`]
+/// creates it with.
+///
+/// Both halves of the reuse decision come out of **one** inspect: whether the
+/// container runs, and the port it publishes. Two invocations answering one each
+/// is what the CLI shellouts did, and their answers could differ by a moment.
+///
+/// `created` and `restarting` are **not** corpses. A container holds its name in
+/// `created` for the moments between create and start, so a sibling entering
+/// [`resolve_server`] in that window would otherwise read the winner's
+/// brand-new container as dead and remove it. A state the daemon did not report
+/// is not an answer about the container, so it is [`Named::Unknown`].
+pub async fn inspect_named(docker: &Docker, name: &str) -> Named {
+    let inspected = docker
+        .inspect_container(
+            name,
+            Some(InspectContainerOptionsBuilder::new().size(false).build()),
+        )
+        .await;
+    let info = match inspected {
+        Ok(info) => info,
+        // A 404 *is* an answer: there is no container under that name.
+        Err(BollardError::DockerResponseServerError {
+            status_code: 404, ..
+        }) => return Named::Absent,
+        Err(_) => return Named::Unknown,
+    };
+    match info.state.and_then(|state| state.status) {
+        Some(
+            ContainerStateStatusEnum::RUNNING
+            | ContainerStateStatusEnum::CREATED
+            | ContainerStateStatusEnum::RESTARTING,
+        ) => Named::Running(host_port(info.network_settings)),
+        None | Some(ContainerStateStatusEnum::EMPTY) => Named::Unknown,
+        // A stopped container the daemon gave no id for cannot be removed by
+        // id, and a removal by name is what this harness refuses.
+        Some(
+            ContainerStateStatusEnum::PAUSED
+            | ContainerStateStatusEnum::REMOVING
+            | ContainerStateStatusEnum::EXITED
+            | ContainerStateStatusEnum::DEAD,
+        ) => info.id.map_or(Named::Unknown, Named::Corpse),
+    }
+}
+
+/// Force-remove the corpse with this container id, its anonymous volume with it.
+///
+/// By the id [`inspect_named`] returned and never by the name: a sibling may have
+/// removed the corpse and started its own container under the name since that
+/// inspect, and a removal by name would destroy the sibling's new server. That
+/// container has another id, so this removes nothing of it.
+///
+/// The volume too because the leak this harness exists to bound is a disk: a
+/// `postgres` image declares one per container, and a force-remove that leaves
+/// it behind bounds the containers at one and nothing else. Failure is nothing to
+/// act on — a 404 means a sibling removed the corpse first, and the `start` that
+/// follows reports whether the name came free.
+async fn remove_corpse(docker: &Docker, id: &str) {
+    drop(
+        docker
+            .remove_container(
+                id,
+                Some(
+                    RemoveContainerOptionsBuilder::new()
+                        .force(true)
+                        .v(true)
+                        .build(),
+                ),
+            )
+            .await,
+    );
+}
+
+/// What a wait for the named container came to.
+///
+/// More than an `Option`, for the same reason [`Named`] has more than two
+/// values: "the wait ended" and "there is nothing there" are different facts,
+/// and only a stopped container licenses a force-remove. An `Option` here made
+/// them one value, and the caller read a budget that had run out on a sibling
+/// still booting as licence to remove that sibling's container.
+#[derive(Clone, Debug)]
+enum Awaited {
+    /// The container published a port and answered on it.
+    Answered(u16),
+    /// The daemon knows no container of that name. Nothing to remove.
+    Absent,
+    /// A stopped container holds the name; its id. The only outcome that
+    /// licenses a force-remove, and only of this id.
+    Corpse(String),
+    /// The budget ran out with the container neither answering nor a corpse: a
+    /// sibling still booting, or a daemon that could not be asked. It licenses
+    /// **nothing**.
+    Undecided,
 }
 
 /// Wait for the named container to publish a port and answer on it, up to
-/// [`BOOT_BUDGET`]; `None` if it stopped running or the budget ran out.
-async fn await_answer(name: &str) -> Option<u16> {
+/// [`BOOT_BUDGET`].
+///
+/// [`Awaited::Absent`] or [`Awaited::Corpse`] as soon as the daemon says nothing
+/// is running under the name — the outcomes the caller may act on — and
+/// [`Awaited::Undecided`] when the budget runs out on anything else.
+///
+/// A [`Named::Unknown`] keeps the wait going rather than ending it, and when the
+/// budget does run out it comes back as `Undecided`: a daemon that could not be
+/// asked is exactly the answer that must not license a removal, and letting the
+/// deadline turn it into one would have been the same conflation one layer along.
+async fn await_answer(docker: &Docker, name: &str) -> Awaited {
     let deadline = std::time::Instant::now() + BOOT_BUDGET;
     loop {
-        if let Some(port) = published_port(name)
-            && answers(port).await
-        {
-            return Some(port);
+        let state = inspect_named(docker, name).await;
+        match state {
+            Named::Running(Some(port)) if answers(port).await => {
+                return Awaited::Answered(port);
+            }
+            Named::Absent => return Awaited::Absent,
+            Named::Corpse(id) => return Awaited::Corpse(id),
+            Named::Running(_) | Named::Unknown => {}
         }
-        if std::time::Instant::now() >= deadline || container_verdict(name) == Some(Verdict::Corpse)
-        {
-            return None;
+        if std::time::Instant::now() >= deadline {
+            return Awaited::Undecided;
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
@@ -350,15 +508,15 @@ async fn await_answer(name: &str) -> Option<u16> {
 /// Start the one container under [`HARNESS_CONTAINER`], retrying; `None` if a
 /// sibling started it first.
 ///
-/// Retried rather than tolerated in an assertion: this is the only `docker run`
-/// a run issues, so a failure here is a failure of the whole suite and must not
-/// be reported as a schema defect.
+/// Retried rather than tolerated in an assertion: this is the only container a
+/// run creates, so a failure here is a failure of the whole suite and must not be
+/// reported as a schema defect.
 ///
 /// Bounded by [`BOOT_BUDGET`] rather than by an attempt count. A name conflict
-/// is not an error here — it is the expected outcome for every process but one
-/// on a per-test-process runner — so losing it hands control to [`await_answer`],
-/// which waits for the winner instead of racing it again.
-async fn start_named() -> Option<ContainerAsync<Postgres>> {
+/// is not an error here — it is the expected outcome for every process but one,
+/// on every nextest run — so losing it hands control to [`await_answer`], which
+/// waits for the winner instead of racing it again.
+async fn start_named(docker: &Docker) -> Option<ContainerAsync<Postgres>> {
     let deadline = std::time::Instant::now() + BOOT_BUDGET;
     loop {
         // Bound per iteration rather than carried across them: the sibling check
@@ -373,13 +531,14 @@ async fn start_named() -> Option<ContainerAsync<Postgres>> {
             Err(e) => e.to_string(),
         };
         // Somebody else got the name. Wait for theirs to come up rather than
-        // fight for it; only when it never does do we go round again. A daemon
-        // that cannot be asked is treated as "somebody is coming up", which is
-        // the non-destructive reading and the one the retry loop can recover
-        // from.
-        if container_verdict(HARNESS_CONTAINER) != Some(Verdict::Corpse)
-            && await_answer(HARNESS_CONTAINER).await.is_some()
-        {
+        // fight for it; only when it never does do we go round again. No
+        // `is it running` pre-check: `await_answer` returns on the first inspect
+        // when the name belongs to a corpse, which is the same question asked
+        // once instead of twice.
+        if matches!(
+            await_answer(docker, HARNESS_CONTAINER).await,
+            Awaited::Answered(_)
+        ) {
             return None;
         }
         assert!(
@@ -390,18 +549,21 @@ async fn start_named() -> Option<ContainerAsync<Postgres>> {
     }
 }
 
-/// The host port a named container publishes for 5432, if it is running.
+/// The host port a container publishes for 5432, off its inspect response.
 ///
-/// Read through the `docker` CLI rather than the client library, and that is the
-/// point: this is the one question that has to be answerable **without** owning
-/// a `ContainerAsync`, because owning one is exactly what would remove the
-/// container on drop.
-fn published_port(name: &str) -> Option<u16> {
-    let out = docker(&["port", name, "5432/tcp"])?;
-    // `0.0.0.0:32768` or `[::]:32768`, one line per binding.
-    out.lines()
-        .filter_map(|line| line.rsplit(':').next())
-        .find_map(|port| port.trim().parse().ok())
+/// Read from an inspect rather than by owning a `ContainerAsync`, because owning
+/// one is exactly what would remove the container on drop — that is why this
+/// question exists apart from `get_host_port_ipv4` at all.
+///
+/// IPv4 and not "whichever binding the daemon listed first", which is what
+/// parsing `docker port` came to: [`url`] dials `127.0.0.1`, so the IPv6 binding
+/// is the wrong answer whenever the two differ. Through testcontainers' own
+/// [`Ports`], so the adopted port and the created one are resolved by one piece
+/// of code.
+fn host_port(settings: Option<NetworkSettings>) -> Option<u16> {
+    Ports::try_from(settings?.ports?)
+        .ok()?
+        .map_to_host_port_ipv4(5432_u16)
 }
 
 /// Does a Postgres on this port accept a connection and answer?
@@ -415,20 +577,6 @@ async fn answers(port: u16) -> bool {
     ))
     .await
     .is_ok()
-}
-
-/// One `docker` invocation; `None` on any failure.
-///
-/// Deliberately silent: every caller treats "docker could not tell us" the same
-/// as "there is nothing there", and falls through to starting one.
-fn docker(args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("docker")
-        .args(args)
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// The process id a per-test database name carries, when it is one this harness

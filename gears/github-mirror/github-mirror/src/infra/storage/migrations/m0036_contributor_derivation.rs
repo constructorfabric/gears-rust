@@ -10,10 +10,6 @@ pub struct Migration;
 /// a derived contributor: the association roles the person was seen in
 /// (`roles`, comma-separated) and the window they were seen across
 /// (`first_seen_at`/`last_seen_at`).
-///
-/// Named with a `z_` prefix because the migration runner applies migrations
-/// in **name** order and this one alters a table created by
-/// `contributors_012`.
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
