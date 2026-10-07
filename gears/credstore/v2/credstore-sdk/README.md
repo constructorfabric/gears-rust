@@ -31,7 +31,7 @@ and its optional secret (ADR-0004, ADR-0007):
 
 - `get_record` — point read of one credential's metadata (`Credential`, never the
   secret; `read`); the source of the validator a secret-blind writer needs.
-  Named `get_record`, not `get`: before 0.3 `get` returned the secret value,
+  Named `get_record`, not `get`: in the v1 API `get` returned the secret value,
   so the rename makes every stale call site fail to compile instead of
   silently returning `Some` for a value-less (`declared`) record
 - `get_secret` — the secret with its usage envelope (`Secret`: reference,
@@ -61,7 +61,7 @@ no separate bulk-read method (`list` with `secret` selected returns the secrets 
 
 Rotating only the secret is a `patch` with only `secret`. `put` is a whole
 replace: an omitted expiry is cleared and `fallback` resets to `inherit` (the
-pre-0.3 `put` preserved the expiry), so use `patch` to change one field.
+v1 `put` preserved the expiry), so use `patch` to change one field.
 
 ## Plugin SPI
 

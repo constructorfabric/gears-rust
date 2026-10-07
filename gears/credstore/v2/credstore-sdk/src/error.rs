@@ -14,7 +14,13 @@ pub enum CredStoreError {
     AccessDenied,
     #[error("secret not found")]
     NotFound,
-    #[error("secret already exists")]
+    /// A write precondition failed, or a concurrent write won. Returned by
+    /// `put`, `patch` and `delete` for: a create-only `put` over an existing
+    /// record (an expired own record included); a replace (`Exists` or
+    /// `Matches`) whose target is absent; a `Matches` validator that no longer
+    /// holds (lost compare-and-set). The SDK does not distinguish "already
+    /// exists" from "version mismatch"; re-read the record to tell which.
+    #[error("write conflict")]
     Conflict,
     /// The record resolved and the caller may read its secret, but the
     /// decisive `active` record's `expires_at` has passed: the secret is never
@@ -47,11 +53,11 @@ pub enum CredStoreError {
     /// `reason` is a stable machine-readable code.
     #[error("secret type violation ({reason}): {detail}")]
     TypeViolation { reason: String, detail: String },
-    /// A request is malformed independently of any secret type — an empty
-    /// merge patch (`EMPTY_PATCH`), a required `secret` missing from a `PUT`
-    /// (`SECRET_REQUIRED`), a merge-patch `null` on a non-nullable field
-    /// (`NULL_NOT_ALLOWED`), or a missing/conflicting write precondition
-    /// (`PRECONDITION_REQUIRED`). `reason` is a stable machine-readable code.
+    /// A request is malformed independently of any secret type: an empty
+    /// merge patch (`EMPTY_PATCH`), a create naming no type (`TYPE_REQUIRED`),
+    /// or an unsupported `list` filter, order or selection. `reason` is a
+    /// stable machine-readable code. (`SECRET_REQUIRED`, `NULL_NOT_ALLOWED` and
+    /// `PRECONDITION_REQUIRED` are REST-only; the typed API cannot express them.)
     #[error("invalid request ({reason}): {detail}")]
     InvalidRequest { reason: String, detail: String },
     #[error("internal error: {0}")]
@@ -139,13 +145,13 @@ impl CredStoreError {
         )
     }
 
-    /// `true` for state-precondition failures (unsupported sharing transition).
+    /// `true` only for [`Self::UnsupportedTransition`] (a sharing change across the private / tenant-shared boundary). A failed write precondition is [`Self::Conflict`].
     #[must_use]
     pub fn is_precondition_failed(&self) -> bool {
         matches!(self, Self::UnsupportedTransition { .. })
     }
 
-    /// `true` for duplicate-on-create failures.
+    /// `true` for [`Self::Conflict`]: a failed write precondition (duplicate on create-only, absent replace target, or lost compare-and-set), not only a duplicate on create.
     #[must_use]
     pub fn is_already_exists(&self) -> bool {
         matches!(self, Self::Conflict)
@@ -205,10 +211,7 @@ mod error_tests {
         assert_eq!(CredStoreError::NotFound.to_string(), "secret not found");
         assert_eq!(CredStoreError::AccessDenied.to_string(), "access denied");
         assert_eq!(CredStoreError::SecretExpired.to_string(), "secret expired");
-        assert_eq!(
-            CredStoreError::Conflict.to_string(),
-            "secret already exists"
-        );
+        assert_eq!(CredStoreError::Conflict.to_string(), "write conflict");
     }
 
     #[test]

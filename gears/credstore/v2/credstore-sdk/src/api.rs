@@ -30,12 +30,12 @@ pub trait CredStoreClientV1: Send + Sync {
     /// Returns `Ok(Some(_))` for an accessible record — including one whose
     /// caller-tenant row is `declared` (no value) — `Ok(None)` when the
     /// reference resolves to nothing the caller may see (a single 404
-    /// surface that prevents enumeration), and `Err(AccessDenied)` only when
-    /// the PDP evaluation itself cannot be completed.
+    /// surface that prevents enumeration; a PDP denial is the same miss), and
+    /// `Err(ServiceUnavailable)` when the PDP or the registry cannot be reached.
     ///
     /// Requires the `read` action.
     ///
-    /// Named `get_record`, not `get`: before 0.3 `get` returned the secret
+    /// Named `get_record`, not `get`: in the v1 API `get` returned the secret
     /// value. The record read never does, so the rename makes every stale
     /// `get` call site fail to compile instead of silently returning `Some`
     /// for a value-less (`declared`) record.
@@ -55,6 +55,15 @@ pub trait CredStoreClientV1: Send + Sync {
     /// ancestor's value, and `fallback` does not apply to expired records.
     ///
     /// Requires the `read_secret` action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredStoreError::SecretExpired`] as described above.
+    /// Returns [`CredStoreError::ServiceUnavailable`] if the backend still has
+    /// no value for the record's current version after one re-read, or is
+    /// unreachable.
+    /// Returns [`CredStoreError::Internal`] for a stored version that can never
+    /// be read.
     async fn get_secret(
         &self,
         ctx: &SecurityContext,
@@ -85,16 +94,23 @@ pub trait CredStoreClientV1: Send + Sync {
     ///
     /// # Errors
     ///
+    /// Returns [`CredStoreError::InvalidRequest`] (`TYPE_REQUIRED`) when a
+    /// create names no `secret_type`.
     /// Returns [`CredStoreError::Conflict`] on a failed precondition (create
     /// found an existing row — an expired own record included, renew or
-    /// delete it; or replace found none) or a lost CAS.
+    /// delete it; or replace found none, or one of a type the caller may not
+    /// write, which is indistinguishable from an absent one) or a lost CAS.
     /// Returns [`CredStoreError::TypeViolation`] on a trait violation, an
     /// unresolvable type, or an attempted type change (`TYPE_IMMUTABLE`) —
     /// including creating over a reference that currently resolves, for the
     /// creating caller (its tenant, owner and ancestor chain), to a record of
     /// a different type (`TYPE_MISMATCH_WITH_INHERITED`): an ancestor's
-    /// `shared` record. Creating a `private` record is exempt from the
-    /// type-consistency checks.
+    /// `shared` record — or over a reference a descendant tenant already
+    /// holds as a non-private record of a different type
+    /// (`TYPE_MISMATCH_WITH_DESCENDANT`). Creating a `private` record is
+    /// exempt from the type-consistency checks.
+    /// Returns [`CredStoreError::AccessDenied`] if the caller lacks `write` or
+    /// a required `write_secret`.
     async fn put(
         &self,
         ctx: &SecurityContext,
@@ -124,11 +140,16 @@ pub trait CredStoreClientV1: Send + Sync {
     /// # Errors
     ///
     /// Returns [`CredStoreError::NotFound`] if the caller holds no own
-    /// record under the reference.
+    /// record under the reference, or one of a type the caller may not write.
     /// Returns [`CredStoreError::Conflict`] on a failed precondition.
-    /// Returns [`CredStoreError::TypeViolation`] on an empty patch
-    /// (`EMPTY_PATCH`), a trait violation, or a `secret_type` differing from
-    /// the stored one (`TYPE_IMMUTABLE`).
+    /// Returns [`CredStoreError::InvalidRequest`] on an empty patch
+    /// (`EMPTY_PATCH`).
+    /// Returns [`CredStoreError::TypeViolation`] on a trait violation or a
+    /// `secret_type` differing from the stored one (`TYPE_IMMUTABLE`).
+    /// Returns [`CredStoreError::UnsupportedTransition`] if `sharing` would
+    /// move the record between private and tenant/shared.
+    /// Returns [`CredStoreError::AccessDenied`] if the caller lacks a required
+    /// action.
     async fn patch(
         &self,
         ctx: &SecurityContext,
@@ -145,8 +166,11 @@ pub trait CredStoreClientV1: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`CredStoreError::NotFound`] if no own-tenant record exists.
-    /// Returns [`CredStoreError::Conflict`] on a failed precondition.
+    /// Returns [`CredStoreError::NotFound`] if no own-tenant record exists or
+    /// its type is one the caller may not delete.
+    /// Returns [`CredStoreError::Conflict`] on a failed precondition,
+    /// including a record that vanishes concurrently under `Matches`.
+    /// Returns [`CredStoreError::AccessDenied`] if the caller lacks `delete`.
     async fn delete(
         &self,
         ctx: &SecurityContext,
@@ -157,7 +181,7 @@ pub trait CredStoreClientV1: Send + Sync {
     /// Lists the credentials visible to the caller's tenant, rooted at that
     /// tenant and walking upward through its ancestor chain only — never
     /// downward (ADR-0005, "Upward-rooted collection read"). One item per
-    /// reference: the same reduction a point read (`Self::get`) of that
+    /// reference: the same reduction a point read ([`Self::get_record`]) of that
     /// reference would apply, so the catalogue and the point read never
     /// disagree.
     ///
@@ -191,6 +215,9 @@ pub trait CredStoreClientV1: Send + Sync {
     /// Returns [`CredStoreError::InvalidRequest`] if `query` names an
     /// unsupported filter/order field, an out-of-range `limit`, a malformed
     /// cursor, or a cursor minted under a different filter/order.
+    /// Returns [`CredStoreError::ServiceUnavailable`] if the PDP, the registry
+    /// or the backend is unreachable.
+    /// Returns [`CredStoreError::Internal`] if a stored version cannot be read.
     async fn list(
         &self,
         ctx: &SecurityContext,

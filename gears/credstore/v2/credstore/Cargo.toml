@@ -16,6 +16,7 @@ name = "credstore_v2"
 workspace = true
 
 [dependencies]
+# Aliased so the v2 sources keep `use credstore_sdk::…` while depending on the v2 SDK package (the v1 `credstore-sdk` is a separate crate).
 credstore-sdk = { package = "cf-gears-credstore-v2-sdk", version = "0.1.0", path = "../credstore-sdk" }
 toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
