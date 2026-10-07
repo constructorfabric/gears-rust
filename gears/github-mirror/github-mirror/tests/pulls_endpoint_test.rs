@@ -8,9 +8,11 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use github_mirror::api::rest::routes::{ConcreteService, register_routes};
-use github_mirror::domain::repo::{PullRequestRecord, RepoRecord};
+use github_mirror::domain::repo::{PullRequestRecord, PullRequestRepository, RepoRecord};
+use github_mirror::infra::storage::sea_orm_repo::SeaOrmPullRequestRepository;
 use toolkit::api::OpenApiRegistryImpl;
-use toolkit_security::SecurityContext;
+use toolkit_db::{DBProvider, DbError};
+use toolkit_security::{AccessScope, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -248,4 +250,43 @@ async fn pull_requests_honor_sort_and_direction() {
         .map(|p| p["number"].as_i64().expect("number"))
         .collect();
     assert_eq!(numbers, vec![1, 2], "created ascending on request");
+}
+
+#[tokio::test]
+async fn open_head_shas_are_the_open_pulls_of_the_callers_tenant_only() {
+    let tenant = Uuid::new_v4();
+    let db = common::inmem_db().await;
+    let service = common::service_over(db.clone(), "https://api.github.com");
+    let ctx = common::caller_in(tenant);
+    let other = common::caller_in(Uuid::new_v4());
+    service.upsert_repo(&ctx, repo_record()).await.unwrap();
+    service.upsert_repo(&other, repo_record()).await.unwrap();
+
+    let mut open = pr_record(1, 7, "open");
+    open.head_sha = Some("open-head".to_owned());
+    let mut closed = pr_record(2, 8, "closed");
+    closed.state = "closed".to_owned();
+    closed.head_sha = Some("closed-head".to_owned());
+    let mut headless = pr_record(3, 9, "no head");
+    headless.head_sha = None;
+    for record in [open, closed, headless] {
+        service
+            .upsert_pull_request(&ctx, "acme", "widget", record)
+            .await
+            .unwrap();
+    }
+    let mut foreign = pr_record(1, 7, "another tenant's open pull");
+    foreign.head_sha = Some("foreign-head".to_owned());
+    service
+        .upsert_pull_request(&other, "acme", "widget", foreign)
+        .await
+        .unwrap();
+
+    let pulls = SeaOrmPullRequestRepository::new(Arc::new(DBProvider::<DbError>::new(db)));
+    let heads = pulls
+        .open_head_shas(&AccessScope::for_tenant(tenant), repo_record().id)
+        .await
+        .unwrap();
+
+    assert_eq!(heads, ["open-head"]);
 }

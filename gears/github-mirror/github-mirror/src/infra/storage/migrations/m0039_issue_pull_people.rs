@@ -13,10 +13,6 @@ pub struct Migration;
 /// Assignees and labels are stored as JSON arrays rather than join tables: the
 /// mirror only ever hands them back with their issue, and a join table would
 /// mean another write path per sync plus another family in reconciliation.
-///
-/// Named with a `z_` prefix because the migration runner applies migrations in
-/// **name** order and this one alters tables created by `issues_002` and
-/// `pull_requests_003`.
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {

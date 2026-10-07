@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::models::{
-    EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+    EvaluationRequest, EvaluationResponse, EvaluationResponseContext, TenantMode,
 };
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use toolkit::api::canonical_prelude::CanonicalError;
@@ -329,4 +329,70 @@ async fn uncompilable_constraints_deny_with_a_fixed_reason() {
         }
         other => panic!("uncompilable constraints must deny, got {other:?}"),
     }
+}
+
+/// Allows under `In([tenant])` and records the tenant mode of every request it is asked.
+struct RecordingResolver {
+    tenant: Uuid,
+    modes: std::sync::Mutex<Vec<Option<TenantMode>>>,
+}
+
+#[async_trait]
+impl AuthZResolverApi for RecordingResolver {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        self.modes
+            .lock()
+            .unwrap()
+            .push(request.context.tenant_context.map(|tc| tc.mode));
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![authz_resolver_sdk::Constraint {
+                    predicates: vec![authz_resolver_sdk::Predicate::In(
+                        authz_resolver_sdk::InPredicate::new(
+                            pep_properties::OWNER_TENANT_ID,
+                            vec![self.tenant],
+                        ),
+                    )],
+                }],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+/// P-D-265: a read and a write each ask for `RootOnly`, so the PDP never expands the subject's
+/// subtree into an `IN` list of its descendant tenants.
+#[tokio::test]
+async fn every_request_asks_for_the_callers_tenant_only() {
+    let tenant = Uuid::now_v7();
+    let resolver = Arc::new(RecordingResolver {
+        tenant,
+        modes: std::sync::Mutex::new(Vec::new()),
+    });
+    let enforcer = PolicyEnforcer::new(resolver.clone());
+    let ctx = ctx_for(tenant);
+
+    access_scope(&enforcer, &ctx, &resource_types::SKU, actions::READ, None)
+        .await
+        .expect("the read is allowed");
+    access_scope(
+        &enforcer,
+        &ctx,
+        &resource_types::SKU,
+        actions::AUTHOR,
+        Some(tenant),
+    )
+    .await
+    .expect("the write into the caller's tenant is allowed");
+
+    assert_eq!(
+        *resolver.modes.lock().unwrap(),
+        vec![Some(TenantMode::RootOnly); 2],
+        "every PDP request names the caller's tenant only"
+    );
 }

@@ -11,11 +11,12 @@
 //! two concurrent `cargo test` invocations could drop each other's databases
 //! mid-run.
 //!
-//! One case asks the daemon about a name it does not know, on a thread of its
-//! own and bounded (RT-07): a wedged daemon is an unanswered question, which is
-//! the answer the case expects, and never hangs the default gate. The check that
-//! the harness's own container is live depends on this host's Docker state, not
-//! on code, so it is `#[ignore]`d like the rest of the tier that needs Docker.
+//! The Docker half is guarded twice without a daemon: the harness's source may
+//! execute no program but `ps` and must reach Docker through testcontainers' own
+//! client, and a client that cannot reach any daemon must leave the liveness
+//! question unanswered rather than judge a corpse. The positive half, that a
+//! daemon which answers "no such container" is read as absent, needs a daemon,
+//! so it is `#[ignore]`d like the rest of the tier that needs Docker.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -23,7 +24,8 @@ mod pg_support;
 
 use std::process::Command;
 
-use pg_support::{owning_pid, process_is_running, prunable};
+use pg_support::{Named, owning_pid, process_is_running, prunable};
+use testcontainers_modules::testcontainers::bollard::{self, Docker};
 
 /// Only a name this harness minted names a run, and only a named run can be
 /// judged finished.
@@ -105,63 +107,98 @@ fn a_running_runs_database_is_left_alone_and_a_finished_ones_is_not() {
     assert!(!prunable(&format!("t_{}_0", std::process::id())));
 }
 
-/// **A name the daemon knows nothing about is not a corpse.**
+/// **The guard for the channel defect**, which no green run on a developer
+/// machine can see.
 ///
-/// This is the guard on the fix for a fail-open in the destructive direction.
-/// `container_verdict` used to be a `bool`, so "the daemon could not be asked"
-/// and "the container is not running" were one answer — and the only caller of
-/// that answer issues `docker rm -f`. One transient `docker inspect` failure
-/// therefore removed a healthy, shared container out from under every sibling
-/// test process.
+/// The defect was never a wrong answer — it was a *second* way of asking. The
+/// adoption, liveness and force-remove questions shelled out to a `docker` CLI
+/// while the container was created through bollard, and where the two do not
+/// resolve to one daemon they can never agree. In a downstream CI image there is
+/// no `docker` binary at all: the first test process created the container and
+/// every later one burned the whole boot budget on `409 Conflict`, ninety seconds
+/// per test.
 ///
-/// Asserting on an **absent** name is what makes this runnable with no Docker
-/// and no container: `docker inspect` exits non-zero for a name it does not
-/// know, exactly as it does when the daemon is unreachable, and a host with no
-/// `docker` binary at all takes the same path. All three land on `None`, and
-/// `None` is the value that removes nothing.
+/// Every machine that runs this suite by hand has a `docker` on its path, which
+/// is why no run this repository performs is able to fail on it. What *can* see
+/// it is the text. The harness asks Docker exactly one way, through the client
+/// `.start()` builds the container with, and a subprocess is the shape the
+/// defect takes.
 ///
-/// The case that must NOT hold is the interesting one: if this ever answers
-/// `Some(Verdict::Corpse)`, the harness has gone back to force-removing on a
-/// question it could not answer.
+/// So the assertion is over the whole census rather than a denylist: `ps` is the
+/// one program this harness may execute, which also refuses
+/// `Command::new("/usr/local/bin/docker")` and every other spelling a denylist
+/// would let through. `ps` is sanctioned because it is asked about processes and
+/// not about Docker — see the prune guards above, which are what it serves.
 #[test]
-fn a_container_the_daemon_cannot_speak_for_is_never_judged_a_corpse() {
-    let unknown = format!("bss-products-pg-harness-absent-{}", std::process::id());
-    // A daemon that does not answer within the bound left the question unanswered, as `None`.
-    if let Ok(verdict) = verdict_within(&unknown, std::time::Duration::from_secs(10)) {
-        assert_eq!(
-            verdict, None,
-            "an unanswerable question must stay unanswered, never resolve to a corpse"
-        );
-    }
+fn the_harness_executes_no_program_but_ps_and_reaches_docker_one_way() {
+    let harness = include_str!("pg_support/mod.rs");
+
+    let executed: Vec<&str> = harness
+        .split("Command::new(")
+        .skip(1)
+        .map(|rest| rest.split(')').next().unwrap_or(rest).trim())
+        .collect();
+    assert_eq!(
+        executed,
+        vec!["\"ps\""],
+        "the harness must execute nothing but `ps`: a `docker` subprocess is a \
+         second channel, and two channels cannot be kept in agreement"
+    );
+
+    // The positive half: a refusal alone would pass just as well on a harness
+    // that had stopped asking Docker anything.
+    assert!(
+        harness.contains("docker_client_instance()"),
+        "the harness must reach Docker through testcontainers' own client"
+    );
 }
 
-/// The live case, so the case above is not one that would pass with `container_verdict`
-/// hard-wired to `None`: this harness's own container is running whenever the Postgres tier has
-/// been used on this host. Skipped rather than asserted when it is absent, because a developer
-/// who has never run the tier is not a failure. It reads this host's Docker state, so it is not
-/// in the ordinary suite (RT-07).
-#[test]
-#[ignore = "requires Docker: reads the state of the Postgres tier's harness container"]
-fn the_harness_container_is_live_when_the_tier_has_run() {
-    if let Some(verdict) = pg_support::container_verdict(pg_support::HARNESS_CONTAINER) {
-        assert_eq!(
-            verdict,
-            pg_support::Verdict::Live,
-            "the harness container exists and is not live; the tier's own runs left a corpse"
-        );
-    }
+/// **A daemon that cannot be asked is never judged a corpse.**
+///
+/// The only caller of this answer force-removes the container, so the one value
+/// it must never produce on an unanswered question is [`Named::Corpse`]: one
+/// transient error under a dozen concurrent test processes would remove a
+/// sibling's booting container, and every red after it would say nothing about
+/// any schema.
+///
+/// Runnable with no Docker at all, because no daemon is involved: the client
+/// points at a loopback port this test has just released, so the inspect fails
+/// on the connection, which is exactly what an unreachable or wedged daemon looks
+/// like to the harness.
+#[tokio::test]
+async fn a_daemon_that_cannot_be_asked_is_never_judged_a_corpse() {
+    let silent = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("find a loopback port nothing listens on");
+    let unreachable =
+        Docker::connect_with_http(&format!("http://{silent}"), 4, bollard::API_DEFAULT_VERSION)
+            .expect("build a client for an address nothing serves");
+
+    assert_eq!(
+        pg_support::inspect_named(&unreachable, pg_support::HARNESS_CONTAINER).await,
+        Named::Unknown,
+        "an unanswerable question must stay unanswered, never resolve to a corpse"
+    );
 }
 
-/// `container_verdict` of `name`, asked on a thread of its own: an error when the daemon did not
-/// answer within `bound`. The thread is left behind on a timeout; the test process ends with it.
-fn verdict_within(
-    name: &str,
-    bound: std::time::Duration,
-) -> Result<Option<pg_support::Verdict>, std::sync::mpsc::RecvTimeoutError> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let name = name.to_owned();
-    std::thread::spawn(move || {
-        tx.send(pg_support::container_verdict(&name)).ok();
-    });
-    rx.recv_timeout(bound)
+/// The positive half, so the case above is not one that would pass with
+/// `inspect_named` hard-wired to [`Named::Unknown`]: a daemon that answers "no
+/// such container" has answered. The name is absent, which removes nothing — a
+/// removal on it would race a sibling that starts the container under the name
+/// first.
+#[tokio::test]
+#[ignore = "requires Docker: asks the daemon about a name it has never seen"]
+async fn a_name_the_daemon_does_not_know_is_absent() {
+    let docker = pg_support::daemon().await;
+    let absent = format!(
+        "{}-absent-{}",
+        pg_support::HARNESS_CONTAINER,
+        std::process::id()
+    );
+
+    assert_eq!(
+        pg_support::inspect_named(&docker, &absent).await,
+        Named::Absent,
+        "a 404 from the daemon is an answer: there is nothing under that name"
+    );
 }
