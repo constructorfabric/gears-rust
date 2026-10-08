@@ -9,7 +9,9 @@
 //! - [`TypesRegistryApi`] — the tenant toolkit contract, entity reads only;
 //!   [`TypesRegistryApiExt`] — the same read helpers over it
 //! - [`ext`] says which contract a client resolves and which helpers it imports
-//! - [`models`] — the serde-free request, snapshot and operation models
+//! - [`models`] — the serde-free request, entity and operation models: [`Entity`] as the
+//!   contract carries it, and the kind-typed [`TypeSchema`] / [`Instance`] the read helpers
+//!   return
 //! - [`publication`] — per-gear publication: [`publish_gts`], [`reconcile()`], the
 //!   publication status and its supervised task
 //!
@@ -17,7 +19,8 @@
 //! - `TypesRegistryClient` trait for inter-gear communication. Per
 //!   [ADR 0005][adr] every fallible method (and every per-item `Result` it
 //!   returns) carries [`toolkit_canonical_errors::CanonicalError`].
-//! - `GtsTypeSchema` / `GtsInstance` typed entity models
+//! - `GtsTypeSchema` / `GtsInstance` typed entity models; their new-surface counterparts are
+//!   [`TypeSchema`] / [`Instance`]
 //! - `TypeSchemaQuery` / `InstanceQuery` for filtering
 //!
 //! **Shared:**
@@ -71,12 +74,12 @@ pub use gts::{OPERATION_RESOURCE_TYPE, TYPE_RESOURCE_TYPE};
 pub use item_failure::AdmissionFailure;
 pub use models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, CandidateStatus, Cursor,
-    DeleteEntitiesRequest, DeleteItem, DeletionItemResult, DeletionOperation, EntityField,
-    EntityFilter, EntityKey, EntityKind, EntityLookup, EntitySnapshot, FieldSelection,
-    IdempotencyKey, JsonDocument, LifecycleFilter, LifecycleStatus, ListEntitiesRequest,
-    ListEntitiesResponse, Operation, OperationStatus, Origin, PageRequest, Projection, Provenance,
-    PublisherContext, PublisherVersion, RegisterEntitiesRequest, RegisterItem,
-    RegistrationItemResult, RegistrationOperation, Validator,
+    DeleteEntitiesRequest, DeleteItem, DeletionItemResult, DeletionOperation, Entity, EntityField,
+    EntityFilter, EntityKey, EntityKind, EntityLookup, FieldSelection, IdempotencyKey, Instance,
+    JsonDocument, LifecycleFilter, LifecycleStatus, ListEntitiesRequest, ListEntitiesResponse,
+    Operation, OperationStatus, Origin, PageRequest, Projection, Provenance, PublisherContext,
+    PublisherVersion, RegisterEntitiesRequest, RegisterItem, RegistrationItemResult,
+    RegistrationOperation, TypeSchema, Validator,
 };
 pub use publication::publish::{PublishOptions, publish_gts, publish_gts_with};
 pub use publication::reconcile::{

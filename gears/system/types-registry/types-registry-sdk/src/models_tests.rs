@@ -134,3 +134,86 @@ fn generated_keys_are_valid_and_distinct() {
     assert_ne!(a, b);
     assert!(IdempotencyKey::new(a.as_str()).is_ok());
 }
+
+// ---- kind-narrowed read models -------------------------------------------------
+
+mod narrowed {
+    use gts::{GtsId, GtsInstanceId, GtsTypeId};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use crate::models::{Entity, EntityKind, Instance, LifecycleStatus, TypeSchema};
+
+    const TYPE: &str = "gts.cf.test.pkg.thing.v1~";
+    const INSTANCE: &str = "gts.cf.test.pkg.thing.v1~cf.test.pkg.one.v1";
+
+    fn snapshot(gts_id: &str, kind: EntityKind) -> Entity {
+        Entity {
+            gts_id: GtsId::try_new(gts_id).expect("valid"),
+            gts_uuid: Uuid::from_u128(7),
+            kind,
+            lifecycle_status: LifecycleStatus::Active,
+            origin: None,
+            content: Some(json!({ "n": 1 })),
+            resolved_schema: None,
+            effective_traits: None,
+            effective_traits_schema: None,
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn a_type_schema_snapshot_becomes_a_type_schema_with_every_field() {
+        let mut from = snapshot(TYPE, EntityKind::TypeSchema);
+        from.resolved_schema = Some(serde_json::Value::Null);
+        let schema = TypeSchema::try_from(from).expect("a Type Schema");
+
+        assert_eq!(schema.type_id, GtsTypeId::try_new(TYPE).expect("valid"));
+        assert_eq!(schema.type_uuid, Uuid::from_u128(7));
+        assert_eq!(schema.content, Some(json!({ "n": 1 })));
+        assert_eq!(
+            schema.resolved_schema,
+            Some(serde_json::Value::Null),
+            "a selected null stays selected"
+        );
+        assert_eq!(
+            schema.effective_traits, None,
+            "an unselected one stays unselected"
+        );
+    }
+
+    #[test]
+    fn an_instance_snapshot_names_the_type_it_conforms_to() {
+        let instance =
+            Instance::try_from(snapshot(INSTANCE, EntityKind::Instance)).expect("an Instance");
+
+        assert_eq!(
+            instance.id,
+            GtsInstanceId::try_new(INSTANCE).expect("valid")
+        );
+        assert_eq!(instance.type_id, GtsTypeId::try_new(TYPE).expect("valid"));
+        assert_eq!(instance.content, Some(json!({ "n": 1 })));
+    }
+
+    #[test]
+    fn the_other_kind_is_handed_back_unchanged() {
+        let instance = snapshot(INSTANCE, EntityKind::Instance);
+        assert_eq!(TypeSchema::try_from(instance.clone()), Err(instance));
+        let schema = snapshot(TYPE, EntityKind::TypeSchema);
+        assert_eq!(Instance::try_from(schema.clone()), Err(schema));
+    }
+
+    #[test]
+    fn inconsistent_kind_data_is_refused() {
+        // The kind field and the identifier disagree.
+        let mislabeled = snapshot(TYPE, EntityKind::Instance);
+        assert_eq!(Instance::try_from(mislabeled.clone()), Err(mislabeled));
+        let mislabeled = snapshot(INSTANCE, EntityKind::TypeSchema);
+        assert_eq!(TypeSchema::try_from(mislabeled.clone()), Err(mislabeled));
+
+        // An Instance has no derived form to carry.
+        let mut materialized = snapshot(INSTANCE, EntityKind::Instance);
+        materialized.effective_traits = Some(json!({}));
+        assert_eq!(Instance::try_from(materialized.clone()), Err(materialized));
+    }
+}

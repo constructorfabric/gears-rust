@@ -931,7 +931,7 @@ What P0 builds is DESIGN's cache minus what needs inputs P0 does not have:
 | No invalidated result accepted as current after the mutation is observed | ✅ — per-key generation advances on observed terminal outcomes or `fresh` validator changes; reads started earlier cannot refill the cache (P23) |
 
 The cache is not carried over as-is: it is typed on `GtsTypeSchema` / `GtsInstance`, which
-D6 deletes, so it is ported onto `EntitySnapshot` when the new trait lands. It also moves out
+D6 deletes, so it is ported onto `Entity` when the new trait lands. It also moves out
 of the registry's local client into the SDK, as a decorator over any `dyn PlatformTypesRegistryApi`:
 a gear in another process reads through the REST client, and DESIGN's cache is per client,
 not per registry (D15). Until then the existing cache keeps serving the old trait untouched.
@@ -941,7 +941,7 @@ Ceiling C7 records what is still fixed rather than derived: visibility and Conte
 The byte bound measures canonical payload bytes of the cached documents, not the process's
 retained heap. The cache is in memory: a restart starts empty, and nothing survives an
 unreachable registry beyond the window (C13). The publisher stamp of D18 is not part of
-`EntitySnapshot` in P0, so a metadata-only confirmation changes no cached representation.
+`Entity` in P0, so a metadata-only confirmation changes no cached representation.
 
 ---
 
@@ -1505,11 +1505,16 @@ one. Gear names in diagnostics are not identity or authority.
 `list_entities`, keeping the contract minimal and object-safe while preserving the call shapes
 consumers already use: `get_type_schema`, `get_instance`, `get_type_schemas`, `get_instances`, their
 `_by_uuid` variants, `list_type_schemas`, `list_instances`. Kind narrowing costs no round
-trip, since the kind is the trailing `~` of the identifier. One change to those shapes: the
-plural reads answer `Result<HashMap<key, Result<EntitySnapshot, _>>, CanonicalError>`. Each key
-is answered on its own — absence or a refused identifier is that key's error — while a batch
-read that fails fails the call, so an outage is never spread across the keys as if each had
-been answered. `EntitySnapshot` likewise exposes the
+trip, since the kind is the trailing `~` of the identifier. Two changes to those shapes. Identifiers are
+typed — `&GtsTypeId` / `&GtsInstanceId`, validated by `try_new`, by `Deserialize` or at compile
+time — so a kind mismatch is no longer a per-key answer. And the plural reads answer
+`Result<HashMap<key, Option<_>>, CanonicalError>`: every asked key is in the map,
+`None` is absence (or, by UUID, the other kind), and a batch read that fails, an unanswered key
+or an identifier that does not parse as its kind fails the call, before any read in the last
+case. The kind-narrowed helpers answer `TypeSchema` and `Instance` — `Entity` with the kind in the
+type: a typed identifier, an Instance's `type_id` taken from its own identifier, documents as
+the projection selected them and nothing computed. The contract, and every consumer generic over
+kinds, keep `Entity`. `Entity` likewise exposes the
 materialized documents as **plain fields** — `content`, `resolved_schema`,
 `effective_traits`, `effective_traits_schema` — plus a small `segments` accessor, so a
 consumer that previously called the old models' computed methods reads a field instead.
@@ -1561,19 +1566,22 @@ plane arrives as a separate trait, `TypesRegistryApi`, not a new parameter: `Sec
 first, the three entity reads only, served by its own routes (D17, plan P25, T27).
 
 Models: `EntityKey`, `EntityLookup` (`Found` / `Unchanged` / `NotFound`; no `Failed`
-without federation), `EntitySnapshot`, `EntityKind`, `LifecycleStatus`,
+without federation), `Entity`, `EntityKind`, `LifecycleStatus`,
 `Origin::Managed`, `Provenance`, `Projection`, `FieldSelection`,
 `ListEntitiesRequest`, `ListEntitiesResponse`, `BatchGetEntitiesRequest`, `BatchGetItem`,
 `RegisterEntitiesRequest`, `RegisterItem`, `DeleteEntitiesRequest`, `DeleteItem`,
 `Operation`, `RegistrationOperation`, `RegistrationItemResult`,
 `DeletionOperation`, `DeletionItemResult`,
 `OperationStatus`, `CandidateStatus`. Field-for-field the DESIGN §3.3 shapes with the
-out-of-scope fields absent — never renamed, so P1 adds rather than rewrites. P23 adds, without
+out-of-scope fields absent — never renamed, so P1 adds rather than rewrites. The one
+exception is DESIGN's `EntitySnapshot`: the SDK calls it `Entity`, beside the kind-typed
+`TypeSchema` and `Instance`, and `EntityLookup::Found` carries it as `entity`; its fields are
+DESIGN's. P23 adds, without
 renaming any of them: `PublisherContext { name, version }` with a typed SemVer `version`;
 `RegisterEntitiesRequest::publisher` and `DeleteEntitiesRequest::publisher`, both a **required**
 `PublisherContext` at request level, with no per-item field — in the models from T24, sent
 by the adapters from T39. `CandidateStatus` is unchanged: a superseded or mismatched
-candidate is `Failed` with reason `superseded` or `publisher_mismatch`. The publisher stamp is not a field of `EntitySnapshot` in P0: it is
+candidate is `Failed` with reason `superseded` or `publisher_mismatch`. The publisher stamp is not a field of `Entity` in P0: it is
 reported through operation outcomes, which are never cached.
 
 **Semantic models and wire types are separate.** The models above carry no serde, no utoipa

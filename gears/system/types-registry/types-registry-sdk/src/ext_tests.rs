@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gts::GtsId;
+use gts::{GtsId, GtsInstanceId, GtsTypeId};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use toolkit_canonical_errors::CanonicalError;
@@ -26,6 +26,14 @@ fn ctx() -> PlatformSecurityContext {
 
 fn id(s: &str) -> GtsId {
     GtsId::try_new(s).expect("valid identifier")
+}
+
+fn type_id(s: &str) -> GtsTypeId {
+    GtsTypeId::try_new(s).expect("a Type Schema identifier")
+}
+
+fn instance_id(s: &str) -> GtsInstanceId {
+    GtsInstanceId::try_new(s).expect("an Instance identifier")
 }
 
 fn publisher() -> PublisherContext {
@@ -73,7 +81,7 @@ async fn a_consumer_round_trips_submit_poll_and_read_through_the_trait() {
     let snapshot = api
         .get_type_schema(
             &ctx(),
-            TYPE,
+            &type_id(TYPE),
             Projection::Select(FieldSelection::with(&[crate::EntityField::Content])),
         )
         .await
@@ -161,16 +169,16 @@ async fn cancellation_stops_waiting_without_cancelling_the_write() {
 }
 
 #[tokio::test]
-async fn kind_narrowing_fails_locally_without_a_round_trip() {
+async fn an_unchecked_id_of_the_other_kind_is_refused_without_a_round_trip() {
     let fake = FakePlatformRegistry::new();
 
     let error = fake
-        .get_type_schema(&ctx(), INSTANCE, Projection::Default)
+        .get_type_schema(&ctx(), &GtsTypeId::new(INSTANCE), Projection::Default)
         .await
         .expect_err("an Instance identifier");
     assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
     let error = fake
-        .get_instance(&ctx(), TYPE, Projection::Default)
+        .get_instance(&ctx(), &GtsInstanceId::new(TYPE, ""), Projection::Default)
         .await
         .expect_err("a Type Schema identifier");
     assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
@@ -182,9 +190,10 @@ async fn kind_narrowing_fails_locally_without_a_round_trip() {
 async fn a_reference_to_the_other_kind_is_not_found() {
     let fake = FakePlatformRegistry::new();
     fake.seed(INSTANCE, json!({}));
+    let uuid = id(INSTANCE).to_uuid();
 
     let error = fake
-        .get_type_schema_by_uuid(&ctx(), id(INSTANCE).to_uuid(), Projection::Default)
+        .get_type_schema_by_uuid(&ctx(), uuid, Projection::Default)
         .await
         .expect_err("an Instance");
     assert!(
@@ -192,10 +201,16 @@ async fn a_reference_to_the_other_kind_is_not_found() {
         "{error:?}"
     );
     assert!(
-        fake.get_instance_by_uuid(&ctx(), id(INSTANCE).to_uuid(), Projection::Default)
+        fake.get_instance_by_uuid(&ctx(), uuid, Projection::Default)
             .await
             .is_ok()
     );
+
+    let answers = fake
+        .get_type_schemas_by_uuid(&ctx(), &[uuid], Projection::Default)
+        .await
+        .expect("the read succeeds");
+    assert_eq!(answers.get(&uuid), Some(&None), "absent among Type Schemas");
 }
 
 #[tokio::test]
@@ -204,64 +219,131 @@ async fn a_key_named_twice_gets_the_one_answer_under_each_spelling() {
     fake.seed(TYPE, json!({}));
 
     let by_id = fake
-        .get_type_schemas(
-            &ctx(),
-            vec![TYPE.to_owned(), TYPE.to_owned()],
-            Projection::Default,
-        )
+        .get_type_schemas(&ctx(), &[type_id(TYPE), type_id(TYPE)], Projection::Default)
         .await
         .expect("the reads succeed");
     assert_eq!(by_id.len(), 1);
-    assert!(by_id[TYPE].is_ok(), "{:?}", by_id[TYPE]);
+    assert!(by_id[&type_id(TYPE)].is_some());
 
     let uuid = id(TYPE).to_uuid();
     let by_uuid = fake
-        .get_type_schemas_by_uuid(&ctx(), vec![uuid, uuid], Projection::Default)
+        .get_type_schemas_by_uuid(&ctx(), &[uuid, uuid], Projection::Default)
         .await
         .expect("the reads succeed");
     assert_eq!(by_uuid.len(), 1);
-    assert!(by_uuid[&uuid].is_ok(), "{:?}", by_uuid[&uuid]);
+    assert!(by_uuid[&uuid].is_some());
+}
+
+#[tokio::test]
+async fn every_asked_key_is_answered_and_absence_is_none() {
+    let fake = FakePlatformRegistry::new();
+    fake.seed(TYPE, json!({}));
+    let absent = type_id("gts.cf.test.pkg.absent.v1~");
+
+    let answers = fake
+        .get_type_schemas(
+            &ctx(),
+            &[type_id(TYPE), absent.clone()],
+            Projection::Default,
+        )
+        .await
+        .expect("the read succeeds");
+
+    assert_eq!(answers.len(), 2);
+    assert!(answers[&type_id(TYPE)].is_some());
+    assert_eq!(answers.get(&absent), Some(&None));
 }
 
 #[tokio::test]
 async fn a_large_read_is_split_into_bounded_batches_and_answers_every_key() {
     let fake = FakePlatformRegistry::new();
-    let ids: Vec<String> = (0..150)
-        .map(|n| format!("gts.cf.test.pkg.thing{n}.v1~"))
+    let ids: Vec<GtsTypeId> = (0..150)
+        .map(|n| type_id(&format!("gts.cf.test.pkg.thing{n}.v1~")))
         .collect();
-    for raw in &ids {
-        fake.seed(raw, json!({}));
+    for id in &ids {
+        fake.seed(id.as_ref(), json!({}));
     }
 
     let answers = fake
-        .get_type_schemas(&ctx(), ids.clone(), Projection::Default)
+        .get_type_schemas(&ctx(), &ids, Projection::Default)
         .await
         .expect("the reads succeed");
 
     assert_eq!(fake.batch_reads(), 2);
     assert_eq!(answers.len(), 150);
-    assert!(answers.values().all(Result::is_ok));
+    assert!(answers.values().all(Option::is_some));
 }
 
 #[tokio::test]
-async fn a_malformed_identifier_fails_only_its_own_entry() {
+async fn one_malformed_identifier_fails_the_call_before_any_read() {
+    let fake = FakePlatformRegistry::new();
+    let mut ids: Vec<GtsTypeId> = (0..150)
+        .map(|n| type_id(&format!("gts.cf.test.pkg.thing{n}.v1~")))
+        .collect();
+    ids.push(GtsTypeId::new("not-an-id"));
+
+    let error = fake
+        .get_type_schemas(&ctx(), &ids, Projection::Default)
+        .await
+        .expect_err("an id that does not parse");
+
+    assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
+    assert_eq!(
+        fake.batch_reads(),
+        0,
+        "not even the valid first batch is read"
+    );
+}
+
+#[tokio::test]
+async fn a_mislabeled_kind_is_a_protocol_fault_not_absence() {
     let fake = FakePlatformRegistry::new();
     fake.seed(TYPE, json!({}));
+    fake.fault_reads(ReadFault::MislabelKind);
+    let uuid = id(TYPE).to_uuid();
 
-    let answers = fake
-        .get_type_schemas(
-            &ctx(),
-            vec![TYPE.to_owned(), "not-an-id".to_owned()],
-            Projection::Default,
-        )
+    // By UUID the kind is not known up front, so a mislabel could pass as "the other kind".
+    let single = fake
+        .get_instance_by_uuid(&ctx(), uuid, Projection::Default)
         .await
-        .expect("the reads succeed");
+        .expect_err("a Type Schema labeled Instance");
+    assert!(
+        matches!(single, CanonicalError::Internal { .. }),
+        "{single:?}"
+    );
+    let plural = fake
+        .get_type_schemas_by_uuid(&ctx(), &[uuid], Projection::Default)
+        .await
+        .expect_err("a Type Schema labeled Instance");
+    assert!(
+        matches!(plural, CanonicalError::Internal { .. }),
+        "{plural:?}"
+    );
+    let by_id = fake
+        .get_type_schemas(&ctx(), &[type_id(TYPE)], Projection::Default)
+        .await
+        .expect_err("a Type Schema labeled Instance");
+    assert!(
+        matches!(by_id, CanonicalError::Internal { .. }),
+        "{by_id:?}"
+    );
+}
 
-    assert!(answers[TYPE].is_ok());
-    assert!(matches!(
-        answers["not-an-id"],
-        Err(CanonicalError::InvalidArgument { .. })
-    ));
+#[tokio::test]
+async fn an_unanswered_key_fails_the_call_rather_than_reading_as_absent() {
+    let fake = FakePlatformRegistry::new();
+    fake.seed(TYPE, json!({}));
+    fake.fault_reads(ReadFault::DropAnswers);
+
+    let error = fake
+        .get_type_schemas(&ctx(), &[type_id(TYPE)], Projection::Default)
+        .await
+        .expect_err("the registry left the key unanswered");
+
+    assert!(
+        matches!(error, CanonicalError::Internal { .. }),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -288,7 +370,10 @@ async fn list_helpers_select_their_documents_by_default_and_follow_every_page() 
         .expect("lists");
 
     assert_eq!(instances.len(), 3, "every page is followed");
-    assert!(instances.iter().all(|s| s.kind == EntityKind::Instance));
+    assert!(
+        instances.iter().all(|s| s.type_id == type_id(TYPE)),
+        "each names the Type Schema it conforms to"
+    );
     assert!(
         instances.iter().all(|s| s.content.is_some()),
         "content is selected"
@@ -384,16 +469,16 @@ async fn a_list_helper_stops_after_its_page_bound() {
 #[tokio::test]
 async fn a_failed_batch_fails_the_whole_call_and_reads_no_further() {
     let fake = FakePlatformRegistry::new();
-    let ids: Vec<String> = (0..250)
-        .map(|n| format!("gts.cf.test.pkg.t{n:03}.v1~"))
+    let ids: Vec<GtsTypeId> = (0..250)
+        .map(|n| type_id(&format!("gts.cf.test.pkg.t{n:03}.v1~")))
         .collect();
     for id in &ids {
-        fake.seed(id, json!({}));
+        fake.seed(id.as_ref(), json!({}));
     }
     fake.fault_reads(ReadFault::FailOnly(2));
 
     let error = fake
-        .get_type_schemas(&ctx(), ids, Projection::Default)
+        .get_type_schemas(&ctx(), &ids, Projection::Default)
         .await
         .expect_err("the second batch failed");
 
@@ -405,20 +490,16 @@ async fn a_failed_batch_fails_the_whole_call_and_reads_no_further() {
 }
 
 #[tokio::test]
-async fn a_locally_refused_key_or_an_empty_read_needs_no_transport() {
+async fn an_empty_read_needs_no_transport() {
     let fake = FakePlatformRegistry::new();
 
-    let answers = fake
-        .get_type_schemas(&ctx(), vec!["not-an-id".to_owned()], Projection::Default)
-        .await
-        .expect("nothing was read, so nothing failed");
-
-    assert!(matches!(
-        answers["not-an-id"],
-        Err(CanonicalError::InvalidArgument { .. })
-    ));
     let none = fake
-        .get_instances_by_uuid(&ctx(), Vec::new(), Projection::Default)
+        .get_instances_by_uuid(&ctx(), &[], Projection::Default)
+        .await
+        .expect("an empty read reads nothing");
+    assert!(none.is_empty());
+    let none = fake
+        .get_type_schemas(&ctx(), &[], Projection::Default)
         .await
         .expect("an empty read reads nothing");
     assert!(none.is_empty());
@@ -630,7 +711,9 @@ mod tenant {
     use toolkit_canonical_errors::CanonicalError;
     use toolkit_security::SecurityContext;
 
-    use super::{FakePlatformRegistry, INSTANCE, TYPE, id};
+    use gts::{GtsInstanceId, GtsTypeId};
+
+    use super::{FakePlatformRegistry, INSTANCE, TYPE, id, instance_id, type_id};
     use crate::TypesRegistryApiExt;
     use crate::contract::TypesRegistryApi;
     use crate::models::{
@@ -642,28 +725,24 @@ mod tenant {
     }
 
     #[tokio::test]
-    async fn kind_narrowing_fails_locally_without_a_round_trip() {
+    async fn an_unchecked_id_of_the_other_kind_is_refused_without_a_round_trip() {
         let fake = FakePlatformRegistry::new();
         let api: &dyn TypesRegistryApi = &fake;
 
         let error = api
-            .get_type_schema(&tenant(), INSTANCE, Projection::Default)
+            .get_type_schema(&tenant(), &GtsTypeId::new(INSTANCE), Projection::Default)
             .await
             .expect_err("an Instance identifier");
         assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
         let error = api
-            .get_instance(&tenant(), TYPE, Projection::Default)
+            .get_instances(
+                &tenant(),
+                &[GtsInstanceId::new(TYPE, "")],
+                Projection::Default,
+            )
             .await
             .expect_err("a Type Schema identifier");
         assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
-        let many = api
-            .get_instances(&tenant(), vec![TYPE.to_owned()], Projection::Default)
-            .await
-            .expect("the reads succeed");
-        assert!(matches!(
-            many.get(TYPE),
-            Some(Err(CanonicalError::InvalidArgument { .. }))
-        ));
 
         assert_eq!(fake.batch_reads(), 0);
     }
@@ -674,18 +753,19 @@ mod tenant {
         fake.seed(TYPE, json!({ "type": "object" }));
         fake.seed(INSTANCE, json!({ "n": 1 }));
         let api: &dyn TypesRegistryApi = &fake;
-        let absent = "gts.cf.test.pkg.absent.v1~";
+        let absent = type_id("gts.cf.test.pkg.absent.v1~");
 
         let schema = api
-            .get_type_schema(&tenant(), TYPE, Projection::Default)
+            .get_type_schema(&tenant(), &type_id(TYPE), Projection::Default)
             .await
             .expect("present");
-        assert_eq!(schema.kind, EntityKind::TypeSchema);
+        assert_eq!(schema.type_id, type_id(TYPE));
         let instance = api
             .get_instance_by_uuid(&tenant(), id(INSTANCE).to_uuid(), Projection::Default)
             .await
             .expect("present");
-        assert_eq!(instance.gts_id, id(INSTANCE));
+        assert_eq!(instance.id, instance_id(INSTANCE));
+        assert_eq!(instance.type_id, type_id(TYPE));
         let other_kind = api
             .get_type_schema_by_uuid(&tenant(), id(INSTANCE).to_uuid(), Projection::Default)
             .await
@@ -695,21 +775,18 @@ mod tenant {
         let schemas = api
             .get_type_schemas(
                 &tenant(),
-                vec![TYPE.to_owned(), absent.to_owned()],
+                &[type_id(TYPE), absent.clone()],
                 Projection::Default,
             )
             .await
             .expect("the reads succeed");
-        assert!(schemas[TYPE].is_ok());
-        assert!(matches!(
-            schemas[absent],
-            Err(CanonicalError::NotFound { .. })
-        ));
+        assert!(schemas[&type_id(TYPE)].is_some());
+        assert_eq!(schemas.get(&absent), Some(&None));
         let instances = api
-            .get_instances_by_uuid(&tenant(), vec![id(INSTANCE).to_uuid()], Projection::Default)
+            .get_instances_by_uuid(&tenant(), &[id(INSTANCE).to_uuid()], Projection::Default)
             .await
             .expect("the reads succeed");
-        assert!(instances[&id(INSTANCE).to_uuid()].is_ok());
+        assert!(instances[&id(INSTANCE).to_uuid()].is_some());
         assert_eq!(fake.batch_reads(), 5, "the two-key read is one batch");
     }
 
@@ -722,7 +799,7 @@ mod tenant {
         let light = api
             .get_instance(
                 &tenant(),
-                INSTANCE,
+                &instance_id(INSTANCE),
                 Projection::Select(FieldSelection::light()),
             )
             .await
@@ -731,7 +808,7 @@ mod tenant {
         let with_content = api
             .get_instance(
                 &tenant(),
-                INSTANCE,
+                &instance_id(INSTANCE),
                 Projection::Select(FieldSelection::with(&[EntityField::Content])),
             )
             .await

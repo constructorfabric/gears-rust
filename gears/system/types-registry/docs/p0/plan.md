@@ -292,7 +292,7 @@ Two things this changes beyond the decision:
   same argument and picks 64 MB; adopted. This is a live bug in the current defaults, not a
   new requirement.
 - **The cache cannot be carried over as-is.** It is typed on `GtsTypeSchema` / `GtsInstance`,
-  which P5 deletes, so it is ported onto `EntitySnapshot`.
+  which P5 deletes, so it is ported onto `Entity`.
 
 **Ordering.** T30 lands last, after the cutover rather than with it, and that is deliberate:
 the cache is an optimization over a read path that must be correct first, and T26 is already

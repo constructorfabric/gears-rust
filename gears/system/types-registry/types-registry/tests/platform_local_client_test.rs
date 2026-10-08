@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use gts::{GtsId, GtsIdPattern};
+use gts::{GtsId, GtsIdPattern, GtsTypeId};
 use serde_json::json;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::gts_id;
@@ -91,6 +91,10 @@ fn ctx() -> PlatformSecurityContext {
 
 fn id(s: &str) -> GtsId {
     GtsId::try_new(s).expect("valid identifier")
+}
+
+fn type_id(s: &str) -> GtsTypeId {
+    GtsTypeId::try_new(s).expect("a Type Schema identifier")
 }
 
 fn publisher() -> PublisherContext {
@@ -253,7 +257,10 @@ async fn an_instance_document_without_an_id_registers_under_the_item_identifier(
         )
         .await
         .expect("reads");
-    let EntityLookup::Found { snapshot, .. } = &lookups.0[&EntityKey::from(id(CF_INSTANCE))] else {
+    let EntityLookup::Found {
+        entity: snapshot, ..
+    } = &lookups.0[&EntityKey::from(id(CF_INSTANCE))]
+    else {
         panic!("the Instance is found");
     };
     assert_eq!(snapshot.kind, EntityKind::Instance);
@@ -297,7 +304,11 @@ async fn a_read_carries_the_domain_validator_byte_for_byte_and_answers_unchanged
         .batch_get_entities(&ctx(), batch(vec![key.clone().into()], projection.clone()))
         .await
         .expect("reads");
-    let EntityLookup::Found { snapshot, etag } = &first.0[&key] else {
+    let EntityLookup::Found {
+        entity: snapshot,
+        etag,
+    } = &first.0[&key]
+    else {
         panic!("found");
     };
     assert_eq!(snapshot.content, Some(schema(CF_TYPE)));
@@ -525,7 +536,10 @@ async fn deletion_round_trips_and_a_failed_item_carries_its_reason() {
         )
         .await
         .expect("reads");
-    let EntityLookup::Found { snapshot, .. } = &lookups.0[&EntityKey::from(id(CF_TYPE))] else {
+    let EntityLookup::Found {
+        entity: snapshot, ..
+    } = &lookups.0[&EntityKey::from(id(CF_TYPE))]
+    else {
         panic!("a tombstone stays exact-readable");
     };
     assert_eq!(snapshot.lifecycle_status, LifecycleStatus::Deleted);
@@ -647,10 +661,10 @@ async fn register_and_await_completes_through_the_local_client_and_the_outbox() 
     assert_eq!(operation.status, OperationStatus::Completed);
     assert_eq!(operation.items[0].status, CandidateStatus::Succeeded);
     let snapshot = api
-        .get_type_schema(&ctx(), CF_TYPE, Projection::Default)
+        .get_type_schema(&ctx(), &type_id(CF_TYPE), Projection::Default)
         .await
         .expect("reads back");
-    assert_eq!(snapshot.kind, EntityKind::TypeSchema);
+    assert_eq!(snapshot.type_id, type_id(CF_TYPE));
 }
 
 #[tokio::test]
@@ -717,7 +731,10 @@ async fn a_full_read_carries_every_materialized_document_and_the_provenance() {
         )
         .await
         .expect("reads");
-    let EntityLookup::Found { snapshot, .. } = &read.0[&key] else {
+    let EntityLookup::Found {
+        entity: snapshot, ..
+    } = &read.0[&key]
+    else {
         panic!("found");
     };
 

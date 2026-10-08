@@ -467,7 +467,7 @@ fn sdk_validator(validator: Validator) -> sdk::Validator {
 fn lookup_from(lookup: EntityLookup) -> Result<sdk::EntityLookup, CanonicalError> {
     Ok(match lookup {
         EntityLookup::Found { record, etag } => sdk::EntityLookup::Found {
-            snapshot: Box::new(snapshot_from(record)?),
+            entity: Box::new(snapshot_from(record)?),
             etag: sdk_validator(etag),
         },
         EntityLookup::Unchanged { etag } => sdk::EntityLookup::Unchanged {
@@ -495,9 +495,9 @@ fn document(
     .transpose()
 }
 
-fn snapshot_from(record: EntityRecord) -> Result<sdk::EntitySnapshot, CanonicalError> {
+fn snapshot_from(record: EntityRecord) -> Result<sdk::Entity, CanonicalError> {
     let id = record.gts_id.as_str();
-    Ok(sdk::EntitySnapshot {
+    Ok(sdk::Entity {
         gts_id: gts_id(&record.gts_id)?,
         gts_uuid: record.gts_uuid,
         kind: sdk_kind(record.kind),

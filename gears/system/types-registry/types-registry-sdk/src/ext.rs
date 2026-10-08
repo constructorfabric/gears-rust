@@ -16,7 +16,7 @@
 //!
 //! let registry = hub.get::<dyn PlatformTypesRegistryApi>()?;
 //! let schema = registry
-//!     .get_type_schema(&PlatformSecurityContext::outbound_marker(), type_id, Projection::Default)
+//!     .get_type_schema(&PlatformSecurityContext::outbound_marker(), &type_id, Projection::Default)
 //!     .await?;
 //! ```
 //!
@@ -28,10 +28,11 @@
 //! Identifier kind checks are local; a UUID of the other kind is `NotFound`.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use gts::GtsId;
+use gts::{GtsId, GtsInstanceId, GtsTypeId};
 use tokio_util::sync::CancellationToken;
 use toolkit::tokio::time::{Instant, sleep_until};
 use toolkit_canonical_errors::CanonicalError;
@@ -44,9 +45,10 @@ use crate::field;
 use crate::gts::{OperationResource, TypeResource};
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, DeleteEntitiesRequest,
-    DeleteItem, DeletionOperation, EntityField, EntityKey, EntityKind, EntityLookup,
-    EntitySnapshot, FieldSelection, IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse,
+    DeleteItem, DeletionOperation, Entity, EntityField, EntityKey, EntityKind, EntityLookup,
+    FieldSelection, IdempotencyKey, Instance, ListEntitiesRequest, ListEntitiesResponse,
     OperationStatus, Projection, PublisherContext, RegisterEntitiesRequest, RegistrationOperation,
+    TypeSchema,
 };
 
 /// Batch-read key ceiling (SPEC C10); larger reads are split.
@@ -113,18 +115,18 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     /// Projected Type Schema by identifier.
     ///
     /// # Errors
-    /// `InvalidArgument` for the wrong identifier kind, without transport; `NotFound` if absent.
+    /// `NotFound` if absent. `InvalidArgument`, without transport, for an identifier that is
+    /// not a Type Schema's, which only an unchecked `GtsTypeId::new` can build.
     async fn get_type_schema(
         &self,
         ctx: &PlatformSecurityContext,
-        type_id: &str,
+        type_id: &GtsTypeId,
         projection: Projection,
-    ) -> Result<EntitySnapshot, CanonicalError> {
-        let id = parse_kind(type_id, EntityKind::TypeSchema)?;
+    ) -> Result<TypeSchema, CanonicalError> {
+        let id = parse_kind(type_id.as_ref(), EntityKind::TypeSchema)?;
         get_one(
             &PlatformReads { api: self, ctx },
             EntityKey::GtsId(id),
-            EntityKind::TypeSchema,
             projection,
         )
         .await
@@ -137,14 +139,13 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     async fn get_instance(
         &self,
         ctx: &PlatformSecurityContext,
-        id: &str,
+        id: &GtsInstanceId,
         projection: Projection,
-    ) -> Result<EntitySnapshot, CanonicalError> {
-        let id = parse_kind(id, EntityKind::Instance)?;
+    ) -> Result<Instance, CanonicalError> {
+        let id = parse_kind(id.as_ref(), EntityKind::Instance)?;
         get_one(
             &PlatformReads { api: self, ctx },
             EntityKey::GtsId(id),
-            EntityKind::Instance,
             projection,
         )
         .await
@@ -159,11 +160,10 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         ctx: &PlatformSecurityContext,
         type_uuid: Uuid,
         projection: Projection,
-    ) -> Result<EntitySnapshot, CanonicalError> {
+    ) -> Result<TypeSchema, CanonicalError> {
         get_one(
             &PlatformReads { api: self, ctx },
             EntityKey::GtsUuid(type_uuid),
-            EntityKind::TypeSchema,
             projection,
         )
         .await
@@ -178,35 +178,28 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         ctx: &PlatformSecurityContext,
         uuid: Uuid,
         projection: Projection,
-    ) -> Result<EntitySnapshot, CanonicalError> {
+    ) -> Result<Instance, CanonicalError> {
         get_one(
             &PlatformReads { api: self, ctx },
             EntityKey::GtsUuid(uuid),
-            EntityKind::Instance,
             projection,
         )
         .await
     }
 
-    /// Type Schemas by identifier, read in batches of [`MAX_BATCH_GET_KEYS`]. Each key is
-    /// answered on its own: absence is that key's `NotFound`, and an identifier of the
-    /// wrong kind is that key's `InvalidArgument`, refused without transport.
+    /// Type Schemas by identifier, read in batches of [`MAX_BATCH_GET_KEYS`]. Every asked
+    /// identifier is a key of the answer; `None` means no such Type Schema.
     ///
     /// # Errors
     /// The error of a batch read that failed; the call then reads no further batch.
+    /// `InvalidArgument`, before any read, for an identifier that is not a Type Schema's.
     async fn get_type_schemas(
         &self,
         ctx: &PlatformSecurityContext,
-        type_ids: Vec<String>,
+        type_ids: &[GtsTypeId],
         projection: Projection,
-    ) -> Result<HashMap<String, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
-        get_many_by_id(
-            &PlatformReads { api: self, ctx },
-            type_ids,
-            EntityKind::TypeSchema,
-            projection,
-        )
-        .await
+    ) -> Result<HashMap<GtsTypeId, Option<TypeSchema>>, CanonicalError> {
+        get_many_by_id(&PlatformReads { api: self, ctx }, type_ids, projection).await
     }
 
     /// Instances by identifier, as [`Self::get_type_schemas`].
@@ -216,36 +209,24 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     async fn get_instances(
         &self,
         ctx: &PlatformSecurityContext,
-        ids: Vec<String>,
+        ids: &[GtsInstanceId],
         projection: Projection,
-    ) -> Result<HashMap<String, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
-        get_many_by_id(
-            &PlatformReads { api: self, ctx },
-            ids,
-            EntityKind::Instance,
-            projection,
-        )
-        .await
+    ) -> Result<HashMap<GtsInstanceId, Option<Instance>>, CanonicalError> {
+        get_many_by_id(&PlatformReads { api: self, ctx }, ids, projection).await
     }
 
-    /// Type Schemas by Registry Reference, each answered on its own; a reference to an
-    /// Instance is that key's `NotFound`.
+    /// Type Schemas by Registry Reference, every asked reference a key of the answer;
+    /// `None` when absent or when the reference names an Instance.
     ///
     /// # Errors
     /// As [`Self::get_type_schemas`].
     async fn get_type_schemas_by_uuid(
         &self,
         ctx: &PlatformSecurityContext,
-        type_uuids: Vec<Uuid>,
+        type_uuids: &[Uuid],
         projection: Projection,
-    ) -> Result<HashMap<Uuid, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
-        get_many_by_uuid(
-            &PlatformReads { api: self, ctx },
-            type_uuids,
-            EntityKind::TypeSchema,
-            projection,
-        )
-        .await
+    ) -> Result<HashMap<Uuid, Option<TypeSchema>>, CanonicalError> {
+        get_many_by_uuid(&PlatformReads { api: self, ctx }, type_uuids, projection).await
     }
 
     /// Instances by Registry Reference, as [`Self::get_type_schemas_by_uuid`].
@@ -255,16 +236,10 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     async fn get_instances_by_uuid(
         &self,
         ctx: &PlatformSecurityContext,
-        uuids: Vec<Uuid>,
+        uuids: &[Uuid],
         projection: Projection,
-    ) -> Result<HashMap<Uuid, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
-        get_many_by_uuid(
-            &PlatformReads { api: self, ctx },
-            uuids,
-            EntityKind::Instance,
-            projection,
-        )
-        .await
+    ) -> Result<HashMap<Uuid, Option<Instance>>, CanonicalError> {
+        get_many_by_uuid(&PlatformReads { api: self, ctx }, uuids, projection).await
     }
 
     /// Traverse Type Schemas from `query.page.cursor`, preserving filters and page size.
@@ -277,13 +252,8 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         &self,
         ctx: &PlatformSecurityContext,
         query: ListEntitiesRequest,
-    ) -> Result<Vec<EntitySnapshot>, CanonicalError> {
-        list_kind(
-            &PlatformReads { api: self, ctx },
-            query,
-            EntityKind::TypeSchema,
-        )
-        .await
+    ) -> Result<Vec<TypeSchema>, CanonicalError> {
+        list_kind(&PlatformReads { api: self, ctx }, query).await
     }
 
     /// Traverse Instances as [`Self::list_type_schemas`], selecting content by default.
@@ -294,13 +264,8 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         &self,
         ctx: &PlatformSecurityContext,
         query: ListEntitiesRequest,
-    ) -> Result<Vec<EntitySnapshot>, CanonicalError> {
-        list_kind(
-            &PlatformReads { api: self, ctx },
-            query,
-            EntityKind::Instance,
-        )
-        .await
+    ) -> Result<Vec<Instance>, CanonicalError> {
+        list_kind(&PlatformReads { api: self, ctx }, query).await
     }
 }
 
@@ -319,18 +284,12 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
     async fn get_type_schema(
         &self,
         ctx: &SecurityContext,
-        type_id: &str,
+        type_id: &GtsTypeId,
         projection: Projection,
-    ) -> Result<EntitySnapshot, CanonicalError> {
-        let id = parse_kind(type_id, EntityKind::TypeSchema)?;
+    ) -> Result<TypeSchema, CanonicalError> {
+        let id = parse_kind(type_id.as_ref(), EntityKind::TypeSchema)?;
         let reads = TenantReads { api: self, ctx };
-        get_one(
-            &reads,
-            EntityKey::GtsId(id),
-            EntityKind::TypeSchema,
-            projection,
-        )
-        .await
+        get_one(&reads, EntityKey::GtsId(id), projection).await
     }
 
     /// As [`PlatformTypesRegistryApiExt::get_instance`].
@@ -340,18 +299,12 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
     async fn get_instance(
         &self,
         ctx: &SecurityContext,
-        id: &str,
+        id: &GtsInstanceId,
         projection: Projection,
-    ) -> Result<EntitySnapshot, CanonicalError> {
-        let id = parse_kind(id, EntityKind::Instance)?;
+    ) -> Result<Instance, CanonicalError> {
+        let id = parse_kind(id.as_ref(), EntityKind::Instance)?;
         let reads = TenantReads { api: self, ctx };
-        get_one(
-            &reads,
-            EntityKey::GtsId(id),
-            EntityKind::Instance,
-            projection,
-        )
-        .await
+        get_one(&reads, EntityKey::GtsId(id), projection).await
     }
 
     /// As [`PlatformTypesRegistryApiExt::get_type_schema_by_uuid`].
@@ -363,15 +316,9 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         ctx: &SecurityContext,
         type_uuid: Uuid,
         projection: Projection,
-    ) -> Result<EntitySnapshot, CanonicalError> {
+    ) -> Result<TypeSchema, CanonicalError> {
         let reads = TenantReads { api: self, ctx };
-        get_one(
-            &reads,
-            EntityKey::GtsUuid(type_uuid),
-            EntityKind::TypeSchema,
-            projection,
-        )
-        .await
+        get_one(&reads, EntityKey::GtsUuid(type_uuid), projection).await
     }
 
     /// As [`PlatformTypesRegistryApiExt::get_instance_by_uuid`].
@@ -383,15 +330,9 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         ctx: &SecurityContext,
         uuid: Uuid,
         projection: Projection,
-    ) -> Result<EntitySnapshot, CanonicalError> {
+    ) -> Result<Instance, CanonicalError> {
         let reads = TenantReads { api: self, ctx };
-        get_one(
-            &reads,
-            EntityKey::GtsUuid(uuid),
-            EntityKind::Instance,
-            projection,
-        )
-        .await
+        get_one(&reads, EntityKey::GtsUuid(uuid), projection).await
     }
 
     /// As [`PlatformTypesRegistryApiExt::get_type_schemas`].
@@ -401,11 +342,11 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
     async fn get_type_schemas(
         &self,
         ctx: &SecurityContext,
-        type_ids: Vec<String>,
+        type_ids: &[GtsTypeId],
         projection: Projection,
-    ) -> Result<HashMap<String, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
+    ) -> Result<HashMap<GtsTypeId, Option<TypeSchema>>, CanonicalError> {
         let reads = TenantReads { api: self, ctx };
-        get_many_by_id(&reads, type_ids, EntityKind::TypeSchema, projection).await
+        get_many_by_id(&reads, type_ids, projection).await
     }
 
     /// As [`PlatformTypesRegistryApiExt::get_instances`].
@@ -415,11 +356,11 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
     async fn get_instances(
         &self,
         ctx: &SecurityContext,
-        ids: Vec<String>,
+        ids: &[GtsInstanceId],
         projection: Projection,
-    ) -> Result<HashMap<String, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
+    ) -> Result<HashMap<GtsInstanceId, Option<Instance>>, CanonicalError> {
         let reads = TenantReads { api: self, ctx };
-        get_many_by_id(&reads, ids, EntityKind::Instance, projection).await
+        get_many_by_id(&reads, ids, projection).await
     }
 
     /// As [`PlatformTypesRegistryApiExt::get_type_schemas_by_uuid`].
@@ -429,11 +370,11 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
     async fn get_type_schemas_by_uuid(
         &self,
         ctx: &SecurityContext,
-        type_uuids: Vec<Uuid>,
+        type_uuids: &[Uuid],
         projection: Projection,
-    ) -> Result<HashMap<Uuid, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
+    ) -> Result<HashMap<Uuid, Option<TypeSchema>>, CanonicalError> {
         let reads = TenantReads { api: self, ctx };
-        get_many_by_uuid(&reads, type_uuids, EntityKind::TypeSchema, projection).await
+        get_many_by_uuid(&reads, type_uuids, projection).await
     }
 
     /// As [`PlatformTypesRegistryApiExt::get_instances_by_uuid`].
@@ -443,11 +384,11 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
     async fn get_instances_by_uuid(
         &self,
         ctx: &SecurityContext,
-        uuids: Vec<Uuid>,
+        uuids: &[Uuid],
         projection: Projection,
-    ) -> Result<HashMap<Uuid, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
+    ) -> Result<HashMap<Uuid, Option<Instance>>, CanonicalError> {
         let reads = TenantReads { api: self, ctx };
-        get_many_by_uuid(&reads, uuids, EntityKind::Instance, projection).await
+        get_many_by_uuid(&reads, uuids, projection).await
     }
 
     /// As [`PlatformTypesRegistryApiExt::list_type_schemas`].
@@ -458,13 +399,8 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         &self,
         ctx: &SecurityContext,
         query: ListEntitiesRequest,
-    ) -> Result<Vec<EntitySnapshot>, CanonicalError> {
-        list_kind(
-            &TenantReads { api: self, ctx },
-            query,
-            EntityKind::TypeSchema,
-        )
-        .await
+    ) -> Result<Vec<TypeSchema>, CanonicalError> {
+        list_kind(&TenantReads { api: self, ctx }, query).await
     }
 
     /// As [`PlatformTypesRegistryApiExt::list_instances`].
@@ -475,8 +411,8 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         &self,
         ctx: &SecurityContext,
         query: ListEntitiesRequest,
-    ) -> Result<Vec<EntitySnapshot>, CanonicalError> {
-        list_kind(&TenantReads { api: self, ctx }, query, EntityKind::Instance).await
+    ) -> Result<Vec<Instance>, CanonicalError> {
+        list_kind(&TenantReads { api: self, ctx }, query).await
     }
 }
 
@@ -543,12 +479,11 @@ impl<A: TypesRegistryApi + ?Sized> EntityReads for TenantReads<'_, A> {
     }
 }
 
-async fn get_one<R: EntityReads + ?Sized>(
+async fn get_one<R: EntityReads + ?Sized, T: Kinded>(
     reads: &R,
     key: EntityKey,
-    kind: EntityKind,
     projection: Projection,
-) -> Result<EntitySnapshot, CanonicalError> {
+) -> Result<T, CanonicalError> {
     let mut lookups = reads
         .batch_get(BatchGetEntitiesRequest {
             items: vec![BatchGetItem::from(key.clone())],
@@ -556,42 +491,41 @@ async fn get_one<R: EntityReads + ?Sized>(
             fresh: false,
         })
         .await?;
-    answer(&key, kind, lookups.0.remove(&key))
+    narrow(answer(&key, T::KIND, lookups.0.remove(&key))?)
 }
 
-async fn get_many_by_id<R: EntityReads + ?Sized>(
+async fn get_many_by_id<R: EntityReads + ?Sized, K: AsRef<str> + Clone + Eq + Hash, T: Kinded>(
     reads: &R,
-    ids: Vec<String>,
-    kind: EntityKind,
+    ids: &[K],
     projection: Projection,
-) -> Result<HashMap<String, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
-    let mut out = HashMap::with_capacity(ids.len());
-    let mut keys = Vec::with_capacity(ids.len());
-    for raw in ids {
-        match parse_kind(&raw, kind) {
-            Ok(id) => keys.push((raw, EntityKey::GtsId(id))),
-            Err(e) => {
-                out.insert(raw, Err(e));
-            }
-        }
-    }
-    for (raw, result) in get_many(reads, keys, kind, projection).await? {
-        out.insert(raw, result);
-    }
-    Ok(out)
-}
-
-async fn get_many_by_uuid<R: EntityReads + ?Sized>(
-    reads: &R,
-    uuids: Vec<Uuid>,
-    kind: EntityKind,
-    projection: Projection,
-) -> Result<HashMap<Uuid, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
-    let keys = uuids
+) -> Result<HashMap<K, Option<T>>, CanonicalError> {
+    // Checked before any read: a typed id built unchecked is the caller's bug, and the
+    // whole call is refused rather than answered around it.
+    let keys = ids
+        .iter()
+        .map(|id| {
+            Ok((
+                id.clone(),
+                EntityKey::GtsId(parse_kind(id.as_ref(), T::KIND)?),
+            ))
+        })
+        .collect::<Result<Vec<_>, CanonicalError>>()?;
+    Ok(get_many(reads, keys, projection)
+        .await?
         .into_iter()
-        .map(|uuid| (uuid, EntityKey::GtsUuid(uuid)))
+        .collect())
+}
+
+async fn get_many_by_uuid<R: EntityReads + ?Sized, T: Kinded>(
+    reads: &R,
+    uuids: &[Uuid],
+    projection: Projection,
+) -> Result<HashMap<Uuid, Option<T>>, CanonicalError> {
+    let keys = uuids
+        .iter()
+        .map(|&uuid| (uuid, EntityKey::GtsUuid(uuid)))
         .collect();
-    Ok(get_many(reads, keys, kind, projection)
+    Ok(get_many(reads, keys, projection)
         .await?
         .into_iter()
         .collect())
@@ -599,12 +533,11 @@ async fn get_many_by_uuid<R: EntityReads + ?Sized>(
 
 /// Reads `keys` in bounded batches. A failed batch fails the call: no later batch is
 /// read, and no partial answer is returned beside the error.
-async fn get_many<R: EntityReads + ?Sized, K>(
+async fn get_many<R: EntityReads + ?Sized, K, T: Kinded>(
     reads: &R,
     keys: Vec<(K, EntityKey)>,
-    kind: EntityKind,
     projection: Projection,
-) -> Result<Vec<(K, Result<EntitySnapshot, CanonicalError>)>, CanonicalError> {
+) -> Result<Vec<(K, Option<T>)>, CanonicalError> {
     let mut out = Vec::with_capacity(keys.len());
     let mut keys = keys.into_iter().peekable();
     while keys.peek().is_some() {
@@ -633,17 +566,20 @@ async fn get_many<R: EntityReads + ?Sized, K>(
             } else {
                 lookups.0.get(&key).cloned()
             };
-            out.push((asked, answer(&key, kind, lookup)));
+            out.push((
+                asked,
+                found(&key, T::KIND, lookup)?.map(narrow).transpose()?,
+            ));
         }
     }
     Ok(out)
 }
 
-async fn list_kind<R: EntityReads + ?Sized>(
+async fn list_kind<R: EntityReads + ?Sized, T: Kinded>(
     reads: &R,
     mut query: ListEntitiesRequest,
-    kind: EntityKind,
-) -> Result<Vec<EntitySnapshot>, CanonicalError> {
+) -> Result<Vec<T>, CanonicalError> {
+    let kind = T::KIND;
     if query.filter.kind.is_some_and(|asked| asked != kind) {
         return Err(TypeResource::invalid_argument()
             .with_field_violation(
@@ -660,7 +596,9 @@ async fn list_kind<R: EntityReads + ?Sized>(
     let mut items = Vec::new();
     for _ in 0..MAX_LIST_PAGES {
         let page = reads.list(query.clone()).await?;
-        items.extend(page.items);
+        for item in page.items {
+            items.push(narrow(item)?);
+        }
         match page.next {
             Some(next) if query.page.cursor.as_ref() == Some(&next) => {
                 return Err(CanonicalError::internal(
@@ -830,20 +768,72 @@ fn invalid_id(message: String) -> CanonicalError {
         .create()
 }
 
-/// One key's lookup as a snapshot of `kind`, or why there is none.
-fn answer(
+/// One key's lookup as a snapshot of `kind`; `None` when absent or of the other kind.
+/// A snapshot whose kind its own data contradicts is a protocol fault, never absence.
+fn found(
     key: &EntityKey,
     kind: EntityKind,
     lookup: Option<EntityLookup>,
-) -> Result<EntitySnapshot, CanonicalError> {
+) -> Result<Option<Entity>, CanonicalError> {
     match lookup {
-        Some(EntityLookup::Found { snapshot, .. }) if snapshot.kind == kind => Ok(*snapshot),
-        Some(EntityLookup::Found { .. } | EntityLookup::NotFound) => Err(not_found(key, kind)),
+        Some(EntityLookup::Found { entity, .. }) if !consistent(&entity) => {
+            Err(CanonicalError::internal(format!(
+                "the registry answered {key} with a snapshot whose kind its data contradicts"
+            ))
+            .create())
+        }
+        Some(EntityLookup::Found { entity, .. }) if entity.kind == kind => Ok(Some(*entity)),
+        Some(EntityLookup::Found { .. } | EntityLookup::NotFound) => Ok(None),
         Some(EntityLookup::Unchanged { .. }) | None => Err(CanonicalError::internal(format!(
             "the registry did not answer an unconditional read of {key}"
         ))
         .create()),
     }
+}
+
+/// A kind-narrowed read's result type and the kind it carries.
+trait Kinded: TryFrom<Entity, Error = Entity> + Send {
+    const KIND: EntityKind;
+}
+
+impl Kinded for TypeSchema {
+    const KIND: EntityKind = EntityKind::TypeSchema;
+}
+
+impl Kinded for Instance {
+    const KIND: EntityKind = EntityKind::Instance;
+}
+
+/// A snapshot the registry answered for a kind-narrowed read, as that kind. One that does
+/// not convert — the other kind, or inconsistent kind data — is a protocol fault, and fails
+/// the whole call.
+fn narrow<T: Kinded>(snapshot: Entity) -> Result<T, CanonicalError> {
+    T::try_from(snapshot).map_err(|snapshot| {
+        CanonicalError::internal(format!(
+            "the registry answered a {:?} read with {} of another kind or inconsistent data",
+            T::KIND,
+            snapshot.gts_id
+        ))
+        .create()
+    })
+}
+
+/// The kind field agrees with the identifier, and an Instance carries no derived form.
+fn consistent(snapshot: &Entity) -> bool {
+    snapshot.kind == EntityKind::of(&snapshot.gts_id)
+        && (snapshot.kind == EntityKind::TypeSchema
+            || (snapshot.resolved_schema.is_none()
+                && snapshot.effective_traits.is_none()
+                && snapshot.effective_traits_schema.is_none()))
+}
+
+/// A single read's answer: absence is the caller's `NotFound`.
+fn answer(
+    key: &EntityKey,
+    kind: EntityKind,
+    lookup: Option<EntityLookup>,
+) -> Result<Entity, CanonicalError> {
+    found(key, kind, lookup)?.ok_or_else(|| not_found(key, kind))
 }
 
 fn not_found(key: &EntityKey, kind: EntityKind) -> CanonicalError {

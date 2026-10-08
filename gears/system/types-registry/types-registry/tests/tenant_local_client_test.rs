@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use gts::{GtsId, GtsIdPattern};
+use gts::{GtsId, GtsIdPattern, GtsTypeId};
 use serde_json::json;
 use toolkit_canonical_errors::{CanonicalError, Problem};
 use toolkit_gts::gts_id;
@@ -73,6 +73,10 @@ fn tenant() -> SecurityContext {
 
 fn id(s: &str) -> GtsId {
     GtsId::try_new(s).expect("valid identifier")
+}
+
+fn type_id(s: &str) -> GtsTypeId {
+    GtsTypeId::try_new(s).expect("a Type Schema identifier")
 }
 
 fn schema(gts_id: &str) -> serde_json::Value {
@@ -147,17 +151,21 @@ async fn an_exact_read_through_the_tenant_helper_is_the_platform_read() {
     .await;
     let projection = Projection::Select(FieldSelection::with(&[EntityField::Content]));
 
-    let schema_read =
-        TypesRegistryApiExt::get_type_schema(&h.client, &tenant(), CF_TYPE, projection.clone())
-            .await
-            .expect("present");
+    let schema_read = TypesRegistryApiExt::get_type_schema(
+        &h.client,
+        &tenant(),
+        &type_id(CF_TYPE),
+        projection.clone(),
+    )
+    .await
+    .expect("present");
     assert_eq!(schema_read.content, Some(schema(CF_TYPE)));
     assert_eq!(
         schema_read,
         PlatformTypesRegistryApiExt::get_type_schema(
             &h.client,
             &platform(),
-            CF_TYPE,
+            &type_id(CF_TYPE),
             projection.clone()
         )
         .await
@@ -204,7 +212,11 @@ async fn a_batch_read_is_found_then_unchanged_under_the_same_select() {
     let first = TypesRegistryApi::batch_get_entities(&h.client, &tenant(), first_request.clone())
         .await
         .expect("reads");
-    let EntityLookup::Found { snapshot, etag } = &first.0[&key] else {
+    let EntityLookup::Found {
+        entity: snapshot,
+        etag,
+    } = &first.0[&key]
+    else {
         panic!("found");
     };
     assert_eq!(snapshot.content, Some(schema(CF_TYPE)));

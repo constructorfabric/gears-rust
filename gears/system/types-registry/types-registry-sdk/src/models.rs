@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::num::NonZeroU8;
 
-use gts::{GtsId, GtsIdPattern, GtsIdSegment};
+use gts::{GtsId, GtsIdPattern, GtsIdSegment, GtsInstanceId, GtsTypeId};
 use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
 use uuid::Uuid;
@@ -249,7 +249,7 @@ pub struct BatchGetEntitiesResponse(pub HashMap<EntityKey, EntityLookup>);
 pub enum EntityLookup {
     /// `etag` is scoped to the normalized projection, so it changes with it.
     Found {
-        snapshot: Box<EntitySnapshot>,
+        entity: Box<Entity>,
         etag: Validator,
     },
     /// Matching validator: no snapshot transferred; every non-`NotFound` answer carries an etag.
@@ -261,7 +261,7 @@ pub enum EntityLookup {
 /// Projected entity with mandatory identity, kind and lifecycle. Documents are stored
 /// materializations (D3): `None` is unselected/inapplicable; `Some(Null)` is selected null.
 #[derive(Debug, Clone, PartialEq)]
-pub struct EntitySnapshot {
+pub struct Entity {
     pub gts_id: GtsId,
     pub gts_uuid: Uuid,
     pub kind: EntityKind,
@@ -278,11 +278,104 @@ pub struct EntitySnapshot {
     pub provenance: Option<Provenance>,
 }
 
-impl EntitySnapshot {
+impl Entity {
     /// The identifier's segments, base first.
     #[must_use]
     pub fn segments(&self) -> &[GtsIdSegment] {
         self.gts_id.segments()
+    }
+}
+
+/// A Type Schema as a kind-narrowed read returns it: [`Entity`] with the kind in the
+/// type. Documents follow the read's projection — `None` is unselected, `Some(Null)` a
+/// selected null — and are the server's materializations (D3); nothing is computed here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeSchema {
+    pub type_id: GtsTypeId,
+    pub type_uuid: Uuid,
+    pub lifecycle_status: LifecycleStatus,
+    pub origin: Option<Origin>,
+    /// The authored schema.
+    pub content: Option<JsonDocument>,
+    pub resolved_schema: Option<JsonDocument>,
+    pub effective_traits: Option<JsonDocument>,
+    pub effective_traits_schema: Option<JsonDocument>,
+    pub provenance: Option<Provenance>,
+}
+
+/// An Instance as a kind-narrowed read returns it; see [`TypeSchema`]. `type_id` is the
+/// Type Schema it conforms to, named by its own identifier; read that schema with
+/// `get_type_schema`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Instance {
+    pub id: GtsInstanceId,
+    pub uuid: Uuid,
+    pub type_id: GtsTypeId,
+    pub lifecycle_status: LifecycleStatus,
+    pub origin: Option<Origin>,
+    /// The authored document.
+    pub content: Option<JsonDocument>,
+    pub provenance: Option<Provenance>,
+}
+
+impl TryFrom<Entity> for TypeSchema {
+    /// A snapshot of the other kind, handed back unchanged.
+    type Error = Entity;
+
+    fn try_from(snapshot: Entity) -> Result<Self, Self::Error> {
+        if snapshot.kind != EntityKind::TypeSchema || !snapshot.gts_id.is_type() {
+            return Err(snapshot);
+        }
+        let Ok(type_id) = GtsTypeId::try_new(snapshot.gts_id.as_ref()) else {
+            return Err(snapshot);
+        };
+        Ok(Self {
+            type_id,
+            type_uuid: snapshot.gts_uuid,
+            lifecycle_status: snapshot.lifecycle_status,
+            origin: snapshot.origin,
+            content: snapshot.content,
+            resolved_schema: snapshot.resolved_schema,
+            effective_traits: snapshot.effective_traits,
+            effective_traits_schema: snapshot.effective_traits_schema,
+            provenance: snapshot.provenance,
+        })
+    }
+}
+
+impl TryFrom<Entity> for Instance {
+    /// A snapshot of the other kind, handed back unchanged.
+    type Error = Entity;
+
+    fn try_from(snapshot: Entity) -> Result<Self, Self::Error> {
+        // An Instance has no derived form: a materialization on one is inconsistent data,
+        // refused rather than dropped.
+        if snapshot.kind != EntityKind::Instance
+            || snapshot.gts_id.is_type()
+            || snapshot.resolved_schema.is_some()
+            || snapshot.effective_traits.is_some()
+            || snapshot.effective_traits_schema.is_some()
+        {
+            return Err(snapshot);
+        }
+        let ids = GtsInstanceId::try_new(snapshot.gts_id.as_ref()).ok().zip(
+            snapshot
+                .gts_id
+                .get_type_id()
+                .and_then(|type_id| GtsTypeId::try_new(&type_id).ok()),
+        );
+        let Some((id, type_id)) = ids else {
+            return Err(snapshot);
+        };
+        Ok(Self {
+            id,
+            uuid: snapshot.gts_uuid,
+            type_id,
+            lifecycle_status: snapshot.lifecycle_status,
+            origin: snapshot.origin,
+            content: snapshot.content,
+            provenance: snapshot.provenance,
+        })
     }
 }
 
@@ -387,7 +480,7 @@ pub struct ListEntitiesRequest {
 /// One bounded page; `next` is absent on the last one (D12).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListEntitiesResponse {
-    pub items: Vec<EntitySnapshot>,
+    pub items: Vec<Entity>,
     pub next: Option<Cursor>,
 }
 

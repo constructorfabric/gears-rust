@@ -162,9 +162,16 @@ async fn the_client_hub_resolves_the_tenant_trait_object_and_its_helpers() {
         .get::<dyn super::TypesRegistryApi>()
         .expect("the registered client resolves");
     let snapshot = api
-        .get_type_schema(&SecurityContext::anonymous(), TYPE, Projection::Default)
+        .get_type_schema(
+            &SecurityContext::anonymous(),
+            &gts::GtsTypeId::try_new(TYPE).expect("valid"),
+            Projection::Default,
+        )
         .await
         .expect("an extension helper answers through the trait object");
 
-    assert_eq!(snapshot.gts_id, gts::GtsId::try_new(TYPE).expect("valid"));
+    assert_eq!(
+        snapshot.type_id,
+        gts::GtsTypeId::try_new(TYPE).expect("valid")
+    );
 }

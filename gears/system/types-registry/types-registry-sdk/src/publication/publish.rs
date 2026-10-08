@@ -342,13 +342,13 @@ fn liveness_of(
     lookup: Option<&EntityLookup>,
 ) -> Option<SupersededEntity> {
     match lookup {
-        Some(EntityLookup::Found { snapshot, .. }) => {
-            Some(if snapshot.lifecycle_status == LifecycleStatus::Deleted {
-                SupersededEntity::Deleted
-            } else {
-                SupersededEntity::Live
-            })
-        }
+        Some(EntityLookup::Found {
+            entity: snapshot, ..
+        }) => Some(if snapshot.lifecycle_status == LifecycleStatus::Deleted {
+            SupersededEntity::Deleted
+        } else {
+            SupersededEntity::Live
+        }),
         Some(EntityLookup::NotFound) => Some(SupersededEntity::Deleted),
         Some(EntityLookup::Unchanged { .. }) | None => {
             tracing::warn!(

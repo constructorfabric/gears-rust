@@ -417,7 +417,9 @@ impl<A: PlatformTypesRegistryApi + ?Sized> Call<'_, A> {
                 let key = EntityKey::GtsId((*id).clone());
                 match lookups.0.remove(&key) {
                     Some(EntityLookup::NotFound) => {}
-                    Some(EntityLookup::Found { snapshot, .. }) => {
+                    Some(EntityLookup::Found {
+                        entity: snapshot, ..
+                    }) => {
                         let (
                             Some(Origin::Managed {
                                 resource_version, ..

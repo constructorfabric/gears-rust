@@ -22,8 +22,8 @@ use crate::gts::{OperationResource, TypeResource};
 use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason, context};
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, CandidateStatus, DeleteEntitiesRequest,
-    DeletionItemResult, DeletionOperation, EntityField, EntityKey, EntityKind, EntityLookup,
-    EntitySnapshot, IdempotencyKey, LifecycleStatus, ListEntitiesRequest, ListEntitiesResponse,
+    DeletionItemResult, DeletionOperation, Entity, EntityField, EntityKey, EntityKind,
+    EntityLookup, IdempotencyKey, LifecycleStatus, ListEntitiesRequest, ListEntitiesResponse,
     Operation, OperationStatus, Origin, RegisterEntitiesRequest, RegistrationItemResult,
     RegistrationOperation, Validator,
 };
@@ -101,6 +101,8 @@ pub enum ReadFault {
     DropAnswers,
     /// Answers `Found` without the selected `origin`.
     StripOrigin,
+    /// Answers `Found` with the opposite `kind` from what the identifier names.
+    MislabelKind,
     /// Fails as unavailable from the `n`th read on (1-based).
     FailFrom(u32),
     /// Fails as unavailable on the `n`th read only (1-based).
@@ -499,12 +501,12 @@ fn render(operation_id: Uuid, op: &FakeOperation) -> Operation {
     }
 }
 
-fn snapshot(gts_id: &str, stored: &Stored, fields: &crate::FieldSelection) -> EntitySnapshot {
+fn snapshot(gts_id: &str, stored: &Stored, fields: &crate::FieldSelection) -> Entity {
     let id = gts::GtsId::try_new(gts_id).expect("the fake stores valid identifiers");
     let (gts_uuid, kind) = (id.to_uuid(), EntityKind::of(&id));
     let is_type = kind == EntityKind::TypeSchema;
     let has = |f| fields.contains(f);
-    EntitySnapshot {
+    Entity {
         gts_id: id,
         gts_uuid,
         kind,
@@ -573,11 +575,17 @@ impl FakePlatformRegistry {
                         EntityLookup::Unchanged { etag }
                     } else {
                         let mut snapshot = snapshot(id, stored, &fields);
+                        if fault == ReadFault::MislabelKind {
+                            snapshot.kind = match snapshot.kind {
+                                EntityKind::TypeSchema => EntityKind::Instance,
+                                EntityKind::Instance => EntityKind::TypeSchema,
+                            };
+                        }
                         if fault == ReadFault::StripOrigin {
                             snapshot.origin = None;
                         }
                         EntityLookup::Found {
-                            snapshot: Box::new(snapshot),
+                            entity: Box::new(snapshot),
                             etag,
                         }
                     }
