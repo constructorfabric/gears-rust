@@ -40,8 +40,15 @@ Rules with no exception are in
 
 A read establishes a fact ("this cat has no kittens"), the code decides, then writes; a concurrent commit in between
 invalidates the fact. One `READ COMMITTED` transaction around both does not help, since each statement takes its own
-snapshot; even a single `DELETE .. WHERE NOT EXISTS (..)` re-checks only the parent row after a lock wait and misses a
-new child. `REPEATABLE READ` still allows write skew.
+snapshot.
+
+Folding the check into the write does not help either.
+`DELETE FROM cat WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM kitten WHERE cat_id = $1)` evaluates its subquery against
+the statement's snapshot, so it does not see a kitten whose transaction commits after that snapshot was taken. The
+PostgreSQL manual states the general case: in `READ COMMITTED` an updating command sees concurrent changes to the rows
+it updates, but not to other rows. Without an FK such a kitten is left without its cat; with an FK the delete fails on
+the FK check, so the constraint keeps the invariant, not the `NOT EXISTS`. `REPEATABLE READ` does not close the gap
+either: it allows write skew, where two transactions each read a state the other is about to change.
 
 **Database constraint.** A unique index, an FK with `ON DELETE RESTRICT`, or a `CHECK` makes the write fail when the
 invariant would break, and the violation is mapped to a domain error. It is correct for every invariant a constraint
@@ -73,8 +80,10 @@ aborts grow with contention and transaction length, and a writer that can break 
 runs `SERIALIZABLE` too.
 
 **Advisory lock.** The toolkit `LockManager` gives mutual exclusion per key, such as one sweep or job at a time, not
-per row. One session per process holds all keys, so a lost connection drops them; a writer that skips the lock is not
-stopped; on SQLite it coordinates processes on one host only.
+per row. It takes session-level locks that never wait (`pg_try_advisory_lock` on PostgreSQL, `GET_LOCK(name, 0)` on
+MySQL) on one pinned connection per process; if that connection dies, every key it held is released at once. A writer
+that skips the lock is not stopped. On SQLite the locks are marker files in the OS cache directory, so they coordinate
+only processes on one host.
 
 **Accept the race.** The pre-check stays with nothing behind it: violations happen under concurrency and need
 detection and repair. The cost is whatever a violation breaks, from nothing for a UX hint to money, authorization or
@@ -121,8 +130,11 @@ possible on both.
 
 **`SERIALIZABLE`.** PostgreSQL prevents write skew with serializable snapshot isolation, aborting with `40001`, at
 the price of retries and predicate-tracking memory; longer transactions fail more, and at large load the abort rate
-becomes a capacity limit. InnoDB turns every read into a shared lock instead, so conflicts block or deadlock. At
-small load the level hardly matters, since anomalies need overlapping transactions.
+becomes a capacity limit. InnoDB instead turns plain reads inside a transaction into shared-lock reads, so a
+conflicting writer waits, and two transactions waiting on each other deadlock (MySQL error `1213`), which the
+toolkit's retry classifier treats as retryable.
+
+Anomalies need overlapping transactions, so with little concurrency all levels give the same results.
 
 ## Retrying aborted transactions
 
@@ -135,7 +147,7 @@ work, extra load exactly when contention is high, and the closure has to satisfy
 
 ```rust
 // the body is FnMut and runs again on retry, so clone captures per attempt;
-// as_db_err is the gear's extractor, fn(&DomainError) -> Option<&DbErr>
+// as_db_err is the gear's extractor, Fn(&DomainError) -> Option<&DbErr>
 db.transaction_with_retry(TxConfig::default(), as_db_err, |tx| {
     let (repo, scope) = (repo.clone(), scope.clone());
     Box::pin(async move { repo.swap_kittens(tx, &scope, cat_a, cat_b).await })
@@ -154,22 +166,25 @@ sees the error; a caller that owns a wider operation can retry all of it.
   usable lock types are in
   [R9](../../toolkit_unified_system/14_db_behavior_testing.md#r9-on-mysql-only-update-and-share-locks).
 - **SQLite** has no row locks
-  ([T4](../../toolkit_unified_system/14_db_behavior_testing.md#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-server-engine));
-  writers are serialized per database, and a read-then-write transaction fails with `SQLITE_BUSY`
-  (`SQLITE_BUSY_SNAPSHOT` in WAL mode) instead of waiting; both are retryable.
+  ([T4](../../toolkit_unified_system/14_db_behavior_testing.md#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-server-engine))
+  and allows one writer per database at a time. A writer that finds the database locked waits up to the busy timeout
+  and then fails with `SQLITE_BUSY`. In WAL mode a transaction that read first and tries to write after another
+  writer committed fails at once with `SQLITE_BUSY_SNAPSHOT`: its snapshot is already stale, so waiting cannot help.
+  The toolkit's retry classifier treats both as retryable.
 - **`NOWAIT` / `SKIP LOCKED`** do not wait: the statement fails or skips the locked rows. A queue-style dequeue gets
   rows nobody else holds (the toolkit outbox dead-letter reclaim uses `SKIP LOCKED`); a check-then-act gets no view of
   the locked writer's result.
 - **Deadlocks** in loops are
   [R3](../../toolkit_unified_system/14_db_behavior_testing.md#r3-rows-locked-one-at-a-time-are-locked-in-key-order).
-  For multi-row statements, FK checks and cascades the options are locking first with
-  `SELECT .. ORDER BY id FOR UPDATE` (an extra round trip, locks held longer), a retry, or accepting the abort.
+  A single statement over several rows (`UPDATE .. WHERE id IN (..)`, a `DELETE` with a cascade) locks them in the
+  order its plan visits them, which the code does not control; two statements whose plans visit the same rows in
+  different orders (an index scan in one, a sequential scan in the other) can deadlock. The options are locking the
+  rows first with `SELECT .. ORDER BY id FOR UPDATE`, which fixes the order at the cost of an extra round trip and
+  locks held longer; a retry; or accepting the abort.
 
 ## JSON columns
 
-PostgreSQL has two JSON types. MySQL's `JSON` (8.0.3+) normalizes like `jsonb` and compares as JSON; MariaDB's `JSON` is
-`LONGTEXT` with a validity check, kept as written and compared as text. SQLite has no JSON column type: the value is
-text (or a `jsonb()` blob since 3.45), and `=` compares bytes.
+PostgreSQL has two JSON types.
 
 **`json`.** Keeps the text as written: key order, whitespace and duplicate keys survive; PostgreSQL has no equality
 operator for it, so it cannot be compared or deduplicated directly.
@@ -177,22 +192,37 @@ operator for it, so it cannot be compared or deduplicated directly.
 **`jsonb`.** Supports equality and GIN indexes; it stores a normalized form that drops key order and whitespace and
 keeps only the last of duplicate keys.
 
+The other backends have one type each, so the choice does not arise there. MySQL 8.0.3 and later normalizes its `JSON`
+type like `jsonb` (keys reordered, whitespace dropped, the last duplicate key wins) and compares values as JSON.
+MariaDB's `JSON` is an alias for `LONGTEXT` with a validity check: stored as written and compared as text. SQLite has
+no JSON column type: it stores JSON as text (or, from 3.45, as a binary blob produced by `jsonb()`), and `=` compares
+the stored bytes.
+
 ## Indexes
 
 **Index on an FK column.** An index led by the FK column lets a parent delete or key update find the children
-without a scan. A partial index serves that check only if the check's `WHERE fk = $1` implies its predicate (as with
-`fk IS NOT NULL`). It costs a write on every child change and storage, and adding it to a populated table has a lock
+without a scan. It costs a write on every child change and storage, and adding it to a populated table has a lock
 cost ([Migrations on populated tables](#migrations-on-populated-tables)). Without parent deletes, key updates or
 lookups by the FK, only the cost remains.
 
+A partial index can serve that lookup only under one condition. The FK check finds children with `WHERE fk = $1`, and
+PostgreSQL uses a partial index only when it can prove that the query's condition implies the index's predicate. An
+index with `WHERE fk IS NOT NULL` qualifies, because `fk = $1` holds only for a non-null `fk`; an index with
+`WHERE deleted_at IS NULL` does not, so the check scans the table.
+
 **No FK index.** No write tax; every parent delete or key update scans the whole child table under locks.
 
-Other index facts: a composite index serves an equality filter plus a sort only with the equality columns first (for
-pagination see the cost of
-[R5](../../toolkit_unified_system/14_db_behavior_testing.md#r5-a-paginated-query-has-a-total-order)); PostgreSQL uses
-a partial index only when the query's `WHERE` implies its predicate; every index taxes writes with bloat and vacuum
-work; plans change with data size, so a plan seen on SQLite or a small development database says little about
-production, while `EXPLAIN (ANALYZE, BUFFERS)` on production-scale data shows the real one.
+Other index facts:
+
+- A composite index serves an equality filter plus a sort only with the equality columns first; for pagination see
+  the cost of
+  [R5](../../toolkit_unified_system/14_db_behavior_testing.md#r5-a-paginated-query-has-a-total-order).
+- An index serves `ORDER BY a DESC, b ASC` only if its keys have those directions or exactly the opposite ones, which
+  a backward scan reads; otherwise the database sorts. MySQL before 8.0 ignores `DESC` in an index definition, so a
+  mixed-direction `ORDER BY` always sorts there.
+- Every index taxes writes with bloat and vacuum work.
+- Plans change with data size and statistics, so a plan seen on SQLite or a small development database says little
+  about the plan on production-scale data.
 
 ## Pagination
 
@@ -204,9 +234,14 @@ these costs stay small.
 key and a cursor encoding and cannot jump to page N. The OData layer uses it and refuses `$skip`.
 
 Both need a total order
-([R5](../../toolkit_unified_system/14_db_behavior_testing.md#r5-a-paginated-query-has-a-total-order)). A read with no
-bound costs memory and latency that grow with the data; a bound enforced by validation or a constraint caps them
-without paging, and paging caps them at the price of a different API for callers.
+([R5](../../toolkit_unified_system/14_db_behavior_testing.md#r5-a-paginated-query-has-a-total-order)), because rows
+equal on the sort key come back in an order the database does not promise. The PostgreSQL manual warns that different
+`LIMIT` and `OFFSET` values can yield different row orders unless `ORDER BY` fixes one, which is how a page repeats or
+skips a row. SQLite stores the rowid as the last key of every index entry, so when an index serves the sort, ties come
+back in rowid order every time; paging through ties on SQLite therefore does not show the defect.
+
+A read with no bound costs memory and latency that grow with the data; a bound enforced by validation or a
+constraint caps them without paging, and paging caps them at the price of a different API for callers.
 
 ## Counting and existence
 
@@ -219,8 +254,9 @@ needed:
 **Exact `COUNT(*)`** reads every matching row, so its cost grows with the matching set, and the number can change
 before the caller uses it.
 
-**Capped count**, `SELECT COUNT(*) FROM (SELECT 1 .. LIMIT k + 1) AS t`, reads at most `k + 1` rows and is exact only up
-to `k`: a result of `k + 1` means "more than `k`".
+**Capped count**, `SELECT COUNT(*) FROM (SELECT 1 .. LIMIT k + 1) AS t`, counts at most `k + 1` matching rows (the
+scan may still read non-matching rows to find them) and is exact only up to `k`: a result of `k + 1` means "more than
+`k`".
 
 **Planner estimate** (`pg_class.reltuples` or `EXPLAIN` on PostgreSQL, `TABLE_ROWS` or `EXPLAIN` on InnoDB) is
 cheap and stale, and can be far off for a filtered set.
@@ -234,21 +270,24 @@ contends on the counter row: the same hot-row cost as a parent lock.
 unmeasurable, and the code is simpler.
 
 **One batched statement** (`INSERT .. VALUES`, `WHERE id IN (..)`) is one round trip, but it spends the bind budget
-([R4](../../toolkit_unified_system/14_db_behavior_testing.md#r4-no-statement-binds-a-list-that-can-outgrow-the-bind-limit));
-an `UPDATE`, `DELETE` or locking `SELECT` over an `IN` list locks its rows in plan order rather than list order, so two
-overlapping batches can deadlock (the loop case is
-[R3](../../toolkit_unified_system/14_db_behavior_testing.md#r3-rows-locked-one-at-a-time-are-locked-in-key-order));
-and a large `IN` list can change the plan.
+([R4](../../toolkit_unified_system/14_db_behavior_testing.md#r4-no-statement-binds-a-list-that-can-outgrow-the-bind-limit)).
+The planner chooses between index lookups and a full scan by the list's size and the statistics, so a growing `IN`
+list can switch the plan to a scan. An `UPDATE` or `DELETE` over the list locks rows in plan order
+([Row locks and dialects](#row-locks-and-dialects)).
 
-**Ways to stay under the cap.** A validated input limit keeps one statement but becomes part of the API. Chunking
-against `max_bind_params_for(runner)` with headroom handles any size with several statements; they see one snapshot only
-inside one transaction at `REPEATABLE READ` or above, while at `READ COMMITTED` each chunk sees its own. On PostgreSQL
-an array parameter (`= ANY($1)`) avoids the cap. A temporary table works on every backend, but it is filled by inserts
-under the same cap (PostgreSQL `COPY` excepted) and lives on one connection, so only inside one transaction; both need
-dialect-specific code and tests.
+**Ways to stay under the cap.**
+
+- A validated input limit keeps one statement but becomes part of the API.
+- Chunking against `max_bind_params_for(runner)` with headroom handles any size with several statements. They see one
+  snapshot only inside one transaction at `REPEATABLE READ` or above; at `READ COMMITTED` each chunk sees its own.
+- On PostgreSQL an array parameter (`= ANY($1)`) binds the whole list as one parameter, with dialect-specific code
+  and tests.
+- A temporary table works on every backend: insert the list into it and join. Filling it is itself a multi-row
+  `INSERT` under the same cap (PostgreSQL `COPY` excepted), and the table belongs to the connection that created it,
+  so the fill and the query run in one transaction, which keeps them on one connection.
 
 ```rust
-const RESERVED: usize = 2; // binds used by the other predicates, including the scope's tenant filter
+const RESERVED: usize = 2; // illustrative: the binds of the other predicates, including the scope's tenant filter
 let step = max_bind_params_for(runner) - RESERVED;
 for chunk in ids.chunks(step) {
     rows.extend(CatEntity::find().filter(cat::Column::Id.is_in(chunk.iter().copied()))
@@ -275,10 +314,11 @@ something retries it. The outbox ([Event delivery](#event-delivery)) closes that
 **Direct publish after `COMMIT`.** Simple, no extra table; a crash between `COMMIT` and the publish loses the event,
 and publishing before `COMMIT` can announce a change that rolls back.
 
-**Transactional outbox.** `outbox::in_transaction` commits the event row with the state change; the `Wake` fires only
-after `COMMIT`, and a lost wake waits for the reconciler (about once a minute by default) or the next start. Ordering
-holds only within the partition the producer names, never across partitions, and every instance runs background
-workers that poll the database. The handler is one of two kinds:
+**Transactional outbox.** `outbox::in_transaction` commits the event row with the state change, and the `Wake` fires
+only after `COMMIT`. If the wake is lost (a crash right after `COMMIT`), the row waits for the reconciler, which the
+default profile runs every minute, or for the next start, which reconciles before the workers begin. Ordering holds
+only within the partition the producer names, never across partitions. Every instance runs background workers that
+poll the database (a sequencer, a processor per partition, the reconciler, vacuum). The handler is one of two kinds:
 
 ```rust
 // the closure's error type implements From<DbError>, From<OutboxError> and From<the repository's error>
@@ -291,14 +331,21 @@ toolkit_db::outbox::in_transaction(&db, |tx| Box::pin(async move {
 })).await?;
 ```
 
-- **Leased handler:** at-least-once. A lease expiry or a crash redelivers what was not acknowledged and a `Retry`
-  redelivers the unprocessed rest of the batch, so a non-idempotent handler repeats its effect (a key from the partition
-  id and sequence number identifies duplicates). A `Retry` holds the whole partition, with backoff from 1 s to 60 s by
-  default and no built-in attempt limit; a `Reject` dead-letters the message (from a batch handler, the unprocessed rest
-  of the batch) and the partition moves on, and a replay does not restore its place in the order.
-- **Transactional handler:** its database writes and the acknowledgement commit together in the outbox's database, so on
-  success they happen exactly once. A `Retry` commits the writes made so far and redelivers the whole batch, so those
-  writes run again; a `Reject` dead-letters the whole batch; effects outside that database can repeat.
+- **Leased handler:** at-least-once. A message is delivered again after a lease expiry or a crash before its
+  acknowledgement, and after a `Retry`: a per-message handler that returns `Retry` has the messages before it
+  acknowledged and that message and the rest redelivered; a batch handler's `Retry` applies to the messages it has not
+  processed. A non-idempotent handler therefore repeats its effect; the outbox README builds an idempotency key from
+  the partition id and sequence number. A `Retry` holds the partition, with exponential backoff (the default profile
+  starts at 1 s and caps at 60 s) and no built-in attempt limit: the handler sees the attempt count and decides when to
+  `Reject`. A `Reject` moves the message (from a batch handler, the unprocessed rest) to the dead-letter table, and the
+  partition moves on. Replay hands dead-lettered messages back to the caller; enqueueing them again gives them new
+  sequence numbers after the messages already delivered, so they lose their original place in the order.
+- **Transactional handler:** the handler's database writes and the acknowledgement commit in one transaction on the
+  outbox's database, so a successful run applies them exactly once, and a crash before the commit rolls them back with
+  the attempt. The commit also happens on `Retry` and `Reject`: on `Retry` the writes the handler made before returning
+  are committed with the retry record and the whole batch is delivered again, so those writes run a second time; on
+  `Reject` they are committed and the whole batch is dead-lettered. Effects outside that database (HTTP, other
+  databases) can repeat on any redelivery.
 
 ## Migrations on populated tables
 
@@ -309,10 +356,13 @@ existing row in that one step, failing on a violating row and holding its lock w
 `ADD CONSTRAINT .. NOT VALID`, then `VALIDATE CONSTRAINT`). Locks stay short and old and new code can run together,
 at the cost of more migrations and deploy steps.
 
-Many `ALTER TABLE` forms take an exclusive lock, and whether they rewrite the table depends on dialect and version:
-the same statement is short on a small table and an outage on a large one. On PostgreSQL a plain `CREATE INDEX` blocks
-writes for the whole build, and `CREATE INDEX CONCURRENTLY` cannot run through the toolkit runner, which wraps `up()`
-in a transaction. SQLite rebuilds and `down()` are rules:
+How long one step locks depends on the statement. On PostgreSQL most `ALTER TABLE` forms take an `ACCESS EXCLUSIVE`
+lock, which blocks reads and writes: some only change the catalog and finish at once (adding a nullable column, or from
+PostgreSQL 11 a column with a constant default), others rewrite the table under that lock (most column type changes).
+MySQL decides per operation whether it runs instantly, in place, or by copying the table. A statement that rewrites or
+scans is short on a small table and an outage on a large one. On PostgreSQL a plain `CREATE INDEX` blocks writes for
+the whole build, and `CREATE INDEX CONCURRENTLY` cannot run through the toolkit runner, which wraps `up()` in a
+transaction. SQLite rebuilds and `down()` are rules:
 [R11](../../toolkit_unified_system/14_db_behavior_testing.md#r11-a-sqlite-table-rebuild-keeps-its-child-rows) and
 [R12](../../toolkit_unified_system/14_db_behavior_testing.md#r12-down-says-what-it-does).
 

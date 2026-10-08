@@ -113,9 +113,9 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
   only on production-sized data.
 - **Cost.** The rule itself costs nothing; each way of staying under the cap has its own cost, see
   [Batching and bind budgets](../arch/database/TRADEOFFS.md#batching-and-bind-budgets).
-- **How to find it.** `is_in(..)` or `.insert_many(..).secure()…exec(..)` (the `SecureInsertMany` builder, which does
-  not split) fed by a collection loaded from the database or from an unbounded request field; the toolkit's
-  `secure_insert_many` function splits its rows by itself and is exempt.
+- **How to find it.** `is_in(..)` or `.insert_many(..).secure()…exec(..)` (the `SecureInsertMany` builder, which
+  sends all rows in one statement) fed by a collection loaded from the database or from an unbounded request field;
+  the toolkit's `secure_insert_many` function splits its rows by itself and is exempt.
 - **How to test it.** Run the operation with a list above the chunk size (or make the chunk size a parameter the test
   can lower) and assert each `param_count` in `rec.events()` is at most `max_bind_params_for`.
 
@@ -130,18 +130,17 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
   CatEntity::find().order_by_desc(cat::Column::CreatedAt).limit(n).offset(m)
       .secure().scope_with(&scope).all(runner).await?;
 
-  // GOOD: unique tie-breaker, same direction
+  // GOOD: unique tie-breaker
   CatEntity::find().order_by_desc(cat::Column::CreatedAt).order_by_desc(cat::Column::Id).limit(n).offset(m)
       .secure().scope_with(&scope).all(runner).await?;
   ```
 - **Why.** Rows equal on the sort key can swap order between page queries: duplicates or skips, no error.
-- **Cost.** The index that serves the sort carries the unique column as its trailing key, each key in the direction the
-  `ORDER BY` uses (or all reversed, which a backward scan serves), or the database adds a sort step; MySQL before 8.0
-  sorts for mixed directions.
+- **Cost.** The index that serves the sort carries the unique column as its trailing key, or the database adds a sort
+  step; how key directions affect that is in [Indexes](../arch/database/TRADEOFFS.md#indexes).
 - **How to find it.** Every `.offset(` or hand-written cursor: the last `order_by` is a unique column.
 - **How to test it.** In the operation's trace, assert that the statement's `ORDER BY` (the `sql` of its event in
-  `rec.events()`) ends with the unique column. Paging through tied rows on SQLite passes with the defect present,
-  since an index-served sort on SQLite returns ties in rowid order, deterministically.
+  `rec.events()`) ends with the unique column. Paging through tied rows does not show the defect on every backend;
+  why is in [Pagination](../arch/database/TRADEOFFS.md#pagination).
 
 #### R6. Existence is checked with LIMIT 1
 - **Rule.** A yes/no question uses `.one(..)` (a `LIMIT 1` query), never `COUNT(*) > 0`. Whether a list page carries a
@@ -159,7 +158,7 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
       .secure().scope_with(&scope).one(runner).await?.is_some();
   ```
 - **Why.** `COUNT` reads every match; `LIMIT 1` stops at the first.
-- **Cost.** `.one()` reads one whole row where `COUNT` returns a number; for a single row this is negligible.
+- **Cost.** `.one()` returns one row's columns instead of a number.
 - **How to find it.** `.count(` compared with zero.
 - **How to test it.** A static scan for `.count(` compared with zero, or assert the operation's trace has `LIMIT` and
   no `COUNT(*)`.
@@ -177,8 +176,8 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
 
 #### R8. UUIDs are bound as Uuid
 - **Rule.** A UUID column is compared with a `Uuid` value, never a string.
-- **Why.** SQLite compares a UUID with `TEXT` silently, often matching nothing; PostgreSQL raises
-  `operator does not exist: uuid = text`.
+- **Why.** SQLite compares a UUID with `TEXT` without an error, and whether rows match depends on how the column
+  stores the UUID; PostgreSQL raises `operator does not exist: uuid = text`.
 - **Cost.** None.
 - **How to find it.** A UUID column filtered with a `String`/`&str`.
 - **How to test it.** Run the predicate on a real PostgreSQL
@@ -212,8 +211,8 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
   migration.
 - **How to find it.** A `DROP TABLE` of a referenced table on the SQLite path.
 - **How to test it.** Seed a parent with children, run `up()`, assert the children are intact; reproduce the rebuild
-  in a `sqlite3` session: `PRAGMA foreign_keys = ON;` before `BEGIN` (the CLI default is off and the pragma is ignored
-  inside a transaction), then the rebuild inside `BEGIN`/`COMMIT` as the runner runs it.
+  in a `sqlite3` session: `PRAGMA foreign_keys = ON;` before `BEGIN` (the pragma is ignored inside a transaction, and
+  the shell's default depends on how it was built), then the rebuild inside `BEGIN`/`COMMIT` as the runner runs it.
 
 #### R12. down() says what it does
 - **Rule.** `down()` undoes `up()`, or returns `Err(DbErr::Migration(..))` stating why it cannot; a documented
@@ -283,8 +282,8 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
 #### T4. Lock- and type-dependent behaviour is tested on a real server engine
 - **Rule.** Behaviour that depends on a lock or a column type is tested on a real server engine the gear runs on
   (PostgreSQL, and MySQL where supported), not only on SQLite.
-- **Why.** SQLite renders no lock at all and serializes writers per database, and it compares a UUID with `TEXT`
-  silently, so a SQLite run proves nothing about a lock or a typed predicate; only a real engine tells "no rows
+- **Why.** SQLite has no row locks and allows one writer at a time, and it compares a UUID with `TEXT` without an
+  error, so a SQLite run proves nothing about a lock or a typed predicate; only a real engine tells "no rows
   matched" from "the query would not run"
   ([`16_defect_class_to_control_map.md`](16_defect_class_to_control_map.md#wire--storage-type-mismatch)).
 - **Cost.** Docker in CI and a slower suite.
