@@ -40,7 +40,7 @@ tests ([`13_e2e_testing.md`](13_e2e_testing.md)), and a method for auditing a ge
 and E2E tests ask whether the result is correct; this layer asks how the code talked to the database and whether that
 survives a second concurrent caller. A check-then-insert with no unique constraint behind it is correct on every
 sequential call and corrupts data only when two callers overlap. Unit tests call one thing at a time and E2E tests are
-stability-first (13), so both are blind to it by design.
+stability-first ([`13_e2e_testing.md`](13_e2e_testing.md)), so both are blind to it by design.
 
 The document has two parts: (1) **Rules**: only what holds in every gear with no exception, each with its cost; (2) the
 testing and audit method. Everything that depends on load, data shape or the guarantees a gear chooses is in
@@ -76,7 +76,7 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
 - **How to find it.** An injected client (`Arc<dyn Client>`), a `producer.publish(..)`, or a write to captured shared
   state inside the closure.
 - **How to test it.** A static `#[test]` over `include_str!`'d source matching the client type inside the closure,
-  with a negative control (audit step 8).
+  with a negative control ([How to run an audit](#how-to-run-an-audit), step 8).
 
 #### R2. The retry can fire
 - **Rule.** For a contention failure, `as_db_err` returns a `DbErr` the classifier recognizes after every `map_err`.
@@ -117,8 +117,9 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
 
 #### R5. A paginated query has a total order
 - **Rule.** The `ORDER BY` of every hand-written paginated query, offset or keyset, ends with a unique column in the
-  same direction. The OData layer refuses `$skip` ([07](07_odata_pagination_select_filter.md)); this is about
-  hand-written `.offset()` and cursors. Offset versus keyset is a choice, see
+  same direction. The OData layer refuses `$skip`
+  ([`07_odata_pagination_select_filter.md`, Unsupported system query options](07_odata_pagination_select_filter.md#unsupported-system-query-options));
+  this is about hand-written `.offset()` and cursors. Offset versus keyset is a choice, see
   [Pagination](../arch/database/TRADEOFFS.md#pagination).
   ```rust
   // BAD: equal created_at values may swap order between pages
@@ -137,8 +138,10 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
 
 #### R6. Existence is checked with LIMIT 1
 - **Rule.** A yes/no question uses `.one(..)` (a `LIMIT 1` query), never `COUNT(*) > 0`. Whether a list page carries a
-  total is decided in [07](07_odata_pagination_select_filter.md) (it does not); what to do when a number is really
-  needed is in [Counting and existence](../arch/database/TRADEOFFS.md#counting-and-existence).
+  total is decided in
+  [`07_odata_pagination_select_filter.md`, Unsupported system query options](07_odata_pagination_select_filter.md#unsupported-system-query-options)
+  (it does not); what to do when a number is really needed is in
+  [Counting and existence](../arch/database/TRADEOFFS.md#counting-and-existence).
   ```rust
   // BAD: counts every match to answer a yes/no question
   let exists = CatEntity::find().filter(cat::Column::Name.eq(name))
@@ -171,7 +174,8 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
   `operator does not exist: uuid = text`.
 - **Cost.** None.
 - **How to find it.** A UUID column filtered with a `String`/`&str`.
-- **How to test it.** Run the predicate on a real PostgreSQL (T4).
+- **How to test it.** Run the predicate on a real PostgreSQL
+  ([T4](#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-postgresql)).
 
 #### R9. On MySQL only Update and Share locks
 - **Rule.** A gear that runs on MySQL uses only `LockType::Update` and `LockType::Share`.
@@ -367,15 +371,16 @@ the plain barrier for likely races, the hook to reproduce one deterministically.
 
 | Test kind | What it can show | Dialect | Used for |
 |---|---|---|---|
-| SQLite unit test (setup from [`12_unit_testing.md`](12_unit_testing.md)) | Sequential behaviour, error mapping, page order | SQLite | R5, R6, R7, T2, and pinned choices that do not depend on concurrency |
-| Query-recorder trace test | Statement shape, transaction boundaries, statement and bind counts | SQLite suffices | R4, audit steps 6-7 |
-| Static source rule with a negative control | What SQL cannot show | N/A | R1, R6, R7 |
-| Barrier test, looped where needed (can fail, cannot prove) | Races and deadlocks | PostgreSQL only | R3, T3, check-then-act and conditional-write choices |
-| Feature-gated real-engine suite (`testcontainers`, in-process, no HTTP) | Locks, types, backend errors | PostgreSQL (and MySQL where supported) | R8, R9, T4; [`13_e2e_testing.md`](13_e2e_testing.md#coverage-goal-one-call-per-api-method) says which PostgreSQL suite to use |
-| Migration test on both backends | `up`/`down`/`up`, rebuilds, constraints on populated data | Both; a SQLite rebuild also in a raw `sqlite3` session | R10-R12, T5; [`11_database_patterns.md`](11_database_patterns.md#database-migrations) |
+| SQLite unit test (setup from [`12_unit_testing.md`](12_unit_testing.md)) | Sequential behaviour, error mapping, page order | SQLite | [R5](#r5-a-paginated-query-has-a-total-order), [R6](#r6-existence-is-checked-with-limit-1), [R7](#r7-constraint-violations-are-recognized-by-code), [T2](#t2-assertions-check-the-outcome), and pinned choices that do not depend on concurrency |
+| Query-recorder trace test | Statement shape, transaction boundaries, statement and bind counts | SQLite suffices | [R4](#r4-no-statement-binds-a-list-that-can-outgrow-the-bind-limit), [audit steps 6-7](#how-to-run-an-audit) |
+| Static source rule with a negative control | What SQL cannot show | N/A | [R1](#r1-a-retried-closure-is-safe-to-run-again), [R6](#r6-existence-is-checked-with-limit-1), [R7](#r7-constraint-violations-are-recognized-by-code) |
+| Barrier test, looped where needed (can fail, cannot prove) | Races and deadlocks | PostgreSQL only | [R3](#r3-rows-locked-one-at-a-time-are-locked-in-key-order), [T3](#t3-concurrent-callers-start-on-a-barrier), check-then-act and conditional-write choices |
+| Feature-gated real-engine suite (`testcontainers`, in-process, no HTTP) | Locks, types, backend errors | PostgreSQL (and MySQL where supported) | [R8](#r8-uuids-are-bound-as-uuid), [R9](#r9-on-mysql-only-update-and-share-locks), [T4](#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-postgresql); [`13_e2e_testing.md`](13_e2e_testing.md#coverage-goal-one-call-per-api-method) says which PostgreSQL suite to use |
+| Migration test on both backends | `up`/`down`/`up`, rebuilds, constraints on populated data | Both; a SQLite rebuild also in a raw `sqlite3` session | [R10](#r10-a-shipped-migration-is-never-edited), [R11](#r11-a-sqlite-table-rebuild-keeps-its-child-rows), [R12](#r12-down-says-what-it-does), [T5](#t5-a-migration-that-adds-a-constraint-meets-a-violating-row); [`11_database_patterns.md`](11_database_patterns.md#database-migrations) |
 
-Needs HTTP and a real database: E2E (13). Needs real PostgreSQL/MySQL but no HTTP: a feature-gated Rust suite
-inside the gear, outside the 12/13 split; name it in the gear's testing doc. Anything else: SQLite unit test (12).
+Needs HTTP and a real database: E2E ([`13_e2e_testing.md`](13_e2e_testing.md)). Needs real PostgreSQL/MySQL but no
+HTTP: a feature-gated Rust suite inside the gear, outside the unit/E2E split; name it in the gear's testing doc.
+Anything else: SQLite unit test ([`12_unit_testing.md`](12_unit_testing.md)).
 
 ## Related documents
 

@@ -27,10 +27,14 @@ This is not an instruction. It lists approaches with what they give and what the
 people who own the code and know its numbers. Load is one axis; data distribution, contention pattern, dialect, how
 bad a violation is and whether a populated table must migrate without downtime all change the answer.
 
-Each topic gives one paragraph per option and ends with **Pin it**: how to pin the chosen option in a test with the
-tools in [`14_db_behavior_testing.md`](../../toolkit_unified_system/14_db_behavior_testing.md). Record the choice at
+Each topic gives one paragraph per option and ends with **Test recommended**: a test that fails if the chosen option
+is later changed, built with the tools in
+[`14_db_behavior_testing.md`](../../toolkit_unified_system/14_db_behavior_testing.md). Record the choice at
 the call site, in the gear's design doc, or in an ADR when callers or consumers depend on the guarantee. Rules with no
-exception are in 14 and are not repeated here. Examples use the fictional `Cat` / `Kitten` entities.
+exception are in
+[`14_db_behavior_testing.md`, Rules](../../toolkit_unified_system/14_db_behavior_testing.md#rules)
+(the R1-R12 and T1-T5 links below point there) and are not repeated here. Examples use the fictional `Cat` /
+`Kitten` entities.
 
 ## Check-then-act invariants
 
@@ -75,7 +79,7 @@ SQLite it works per host only. For jobs, not rows.
 **Accept the race.** Keep the pre-check alone: violations will happen and need detection and repair. Fine for an
 advisory check (a UX hint), not for money, authorization or identity.
 
-**Pin it** with a SQLite test (deleting a cat with kittens returns `Conflict`, a missing cat `NotFound`) and a
+**Test recommended:** a SQLite test (deleting a cat with kittens returns `Conflict`, a missing cat `NotFound`) and a
 PostgreSQL [barrier test](../../toolkit_unified_system/14_db_behavior_testing.md#barrier-test-template) on the
 post-state invariant; a `SERIALIZABLE` path also asserts `rec.all_in_serializable_transaction()` on itself and its
 sibling writers. An accepted race goes into the gear's design doc.
@@ -106,8 +110,9 @@ the version, and users see the conflicts.
 
 **Row lock.** The parent row lock above, applied to the row itself: writers of that row queue.
 
-**Pin it** by calling the transition twice with the same precondition; for lost updates, write two copies that change
-different fields and check both with a direct entity query ("Direct DB assertions" in 12).
+**Test recommended:** call the transition twice with the same precondition; for lost updates, write two copies that
+change different fields and check both with a direct entity query
+([`12_unit_testing.md`, Table State](../../toolkit_unified_system/12_unit_testing.md#table-state-direct-db-queries)).
 
 ## Isolation levels
 
@@ -119,7 +124,8 @@ skew by aborting with `40001`, at the price of retries and tracking memory; long
 At small load the level hardly matters; at large load the abort rate becomes a capacity limit. The same code runs at
 different levels on different dialects; SQLite is always serializable, with one writer.
 
-**Pin it** with `rec.all_in_serializable_transaction()` on a path that requests `SERIALIZABLE` (14 audit step 6).
+**Test recommended:** `rec.all_in_serializable_transaction()` on a path that requests `SERIALIZABLE`
+([`14_db_behavior_testing.md`, How to run an audit, step 6](../../toolkit_unified_system/14_db_behavior_testing.md#how-to-run-an-audit)).
 
 ## Retrying aborted transactions
 
@@ -141,7 +147,9 @@ db.transaction_with_retry(TxConfig::default(), as_db_err, |tx| {
 **Report the abort.** Return a retryable error: no hidden repeated work, but every caller must retry and sees the
 error. Better when the caller owns a wider operation.
 
-**Pin it** with a unit round-trip for R2 and a looped barrier test for the abort path.
+**Test recommended:** a unit round-trip for
+[R2](../../toolkit_unified_system/14_db_behavior_testing.md#r2-the-retry-can-fire)
+and a looped barrier test for the abort path.
 
 ## Row locks and dialects
 
@@ -164,7 +172,8 @@ error. Better when the caller owns a wider operation.
 - **JSON.** Plain `json` has no equality operator on PostgreSQL; `jsonb` has one but drops key order and whitespace
   and keeps only the last of duplicate keys.
 
-**Pin it** with a PostgreSQL barrier test on the lock-dependent path; note the lock strength and why at the call site.
+**Test recommended:** a PostgreSQL barrier test on the lock-dependent path; note the lock strength and why at the
+call site.
 
 ## Indexes
 
@@ -183,7 +192,7 @@ a partial index only when the query's `WHERE` implies its predicate; every index
 work; plans change with data size, so check `EXPLAIN (ANALYZE, BUFFERS)` on production-scale data, not on SQLite or a
 small development database.
 
-**Pin it** in migration review; a statement recorder cannot see a missing index.
+**Test recommended:** none fits, since a statement recorder cannot see a missing index; check it in migration review.
 
 ## Pagination
 
@@ -199,11 +208,15 @@ Both need a total order
 read that grows with data either pages or has a `LIMIT`; reading everything is acceptable only when an enforced rule
 (validation, a constraint) bounds the set, and its memory and latency grow with data.
 
-**Pin it** with the R5 test; for an unpaged read, a test or constraint that shows the bound.
+**Test recommended:** the test of
+[R5](../../toolkit_unified_system/14_db_behavior_testing.md#r5-a-paginated-query-has-a-total-order);
+for an unpaged read, a test or constraint that shows the bound.
 
 ## Counting and existence
 
-Pages carry no total ([07](../../toolkit_unified_system/07_odata_pagination_select_filter.md)); existence is
+Pages carry no total
+([`07_odata_pagination_select_filter.md`, Unsupported system query options](../../toolkit_unified_system/07_odata_pagination_select_filter.md#unsupported-system-query-options));
+existence is
 [R6](../../toolkit_unified_system/14_db_behavior_testing.md#r6-existence-is-checked-with-limit-1). When a number is
 truly needed:
 
@@ -218,7 +231,9 @@ for "more than k" checks and badges.
 **Maintained counter**, updated in the same transaction as the change, is exact and cheap to read, but every writer
 contends on the counter row: the same hot-row problem as a parent lock.
 
-**Pin it** with the recorder trace of the operation (14 audit step 6), plus a barrier test for a counter.
+**Test recommended:** assert the operation's statements with the query recorder
+([`14_db_behavior_testing.md`, How to run an audit, step 6](../../toolkit_unified_system/14_db_behavior_testing.md#how-to-run-an-audit)),
+plus a barrier test for a counter.
 
 ## Batching and bind budgets
 
@@ -244,7 +259,8 @@ for chunk in ids.chunks(step) {
 }
 ```
 
-**Pin it** with the statement count of 14 audit step 7.
+**Test recommended:** the statement-count test of
+[`14_db_behavior_testing.md`, How to run an audit, step 7](../../toolkit_unified_system/14_db_behavior_testing.md#how-to-run-an-audit).
 
 ## Transactions and external work
 
@@ -260,7 +276,9 @@ stays. For read-only, independent or compensable calls.
 **After `COMMIT`.** Runs only for a durable change, but a crash or failure after `COMMIT` loses it unless something
 retries it. An effect that must not be lost goes through the outbox ([Event delivery](#event-delivery)).
 
-**Pin it** with a static rule over the transaction body (14 audit step 8).
+**Test recommended:** for the before-`BEGIN` and after-`COMMIT` options, a `#[test]` that reads the source with
+`include_str!` and fails if the call appears inside the transaction closure
+([`14_db_behavior_testing.md`, How to run an audit, step 8](../../toolkit_unified_system/14_db_behavior_testing.md#how-to-run-an-audit)).
 
 ## Event delivery
 
@@ -288,8 +306,9 @@ toolkit_db::outbox::in_transaction(&db, |tx| Box::pin(async move {
   so they happen exactly once on success. Effects outside that database can repeat, a `Retry` commits the handler's
   writes and redelivers the message, and a `Reject` dead-letters the whole batch.
 
-**Pin it** on the write-plus-event trace: `rec.all_in_one_transaction()`, an empty `rec.writes_outside_tx()`, and
-the outbox `INSERT` in `rec.stats()`. Record the delivery guarantee in an ADR: consumers depend on it.
+**Test recommended:** on the write-plus-event trace, `rec.all_in_one_transaction()`, an empty
+`rec.writes_outside_tx()`, and the outbox `INSERT` in `rec.stats()`. Record the delivery guarantee in an ADR:
+consumers depend on it.
 
 ## Migrations on populated tables
 
@@ -307,7 +326,7 @@ SQLite rebuilds and `down()` are rules:
 [R11](../../toolkit_unified_system/14_db_behavior_testing.md#r11-a-sqlite-table-rebuild-keeps-its-child-rows) and
 [R12](../../toolkit_unified_system/14_db_behavior_testing.md#r12-down-says-what-it-does).
 
-**Pin it** with a violating row
+**Test recommended:** a migration test with a violating row
 ([T5](../../toolkit_unified_system/14_db_behavior_testing.md#t5-a-migration-that-adds-a-constraint-meets-a-violating-row)).
 
 ## Unreadable stored values
@@ -335,4 +354,4 @@ must never grant access or ownership.
 **Silent default** (`unwrap_or_default`). Reads never fail, but corrupt or newer data turns into a valid-looking value
 that may decide authorization or ownership. Only for a cosmetic field, with a log line.
 
-**Pin it** with a SQLite test that inserts a garbage value directly.
+**Test recommended:** a SQLite test that inserts a garbage value directly and asserts the chosen outcome.
