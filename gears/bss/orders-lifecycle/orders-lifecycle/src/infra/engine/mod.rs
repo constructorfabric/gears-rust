@@ -833,7 +833,9 @@ impl Engine {
                     };
                     let owned = match reg::resolve(GateTarget::Order(&locked), &p, &request).await?
                     {
-                        Gate::Replay(replay) => return Ok(DurableOutcome::Replay(replay)),
+                        Gate::Replay(replay) => {
+                            return Ok(DurableOutcome::Replay(Box::new(replay)));
+                        }
                         gate @ (Gate::Mismatch | Gate::StillProcessing) => {
                             // Resolved evidence on the locked order; the winner is untouched.
                             let reason = if matches!(gate, Gate::Mismatch) {
@@ -887,9 +889,9 @@ impl Engine {
         match outcome {
             Ok(DurableOutcome::Execution(execution)) => Ok(PreparedExecution::Execution(execution)),
             Ok(DurableOutcome::Replay(replay)) => self
-                .disclose(caller, action, Some(&prefetch), replay)
+                .disclose(caller, action, Some(&prefetch), *replay)
                 .await
-                .map(PreparedExecution::Settled),
+                .map(|outcome| PreparedExecution::Settled(Box::new(outcome))),
             Ok(DurableOutcome::Refused(reason)) => Err(EngineError::Refused(reason)),
             Ok(DurableOutcome::Conflict(reason)) => Err(self
                 .record_late_conflict(caller, &actor, request, &key, reason)
@@ -1209,7 +1211,7 @@ impl Engine {
 #[derive(Debug)]
 pub enum PreparedExecution {
     Execution(Box<(DurableExecution, Frozen)>),
-    Settled(EngineOutcome),
+    Settled(Box<EngineOutcome>),
 }
 
 enum DurableStart {
@@ -1218,7 +1220,7 @@ enum DurableStart {
 }
 enum DurableOutcome {
     Execution(Box<(DurableExecution, Frozen)>),
-    Replay(Replay),
+    Replay(Box<Replay>),
     Refused(Reason),
     /// A late fact conflict (`version-conflict`/`authorization-context-changed`) or lost access
     /// (`order-not-found`) at the lock: unresolved evidence only, never a settlement.
