@@ -16,6 +16,7 @@ use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use uuid::Uuid;
 
 use crate::contract::PlatformTypesRegistryApi;
+use crate::contract::TypesRegistryApi;
 use crate::field;
 use crate::gts::{OperationResource, TypeResource};
 use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason, context};
@@ -27,7 +28,6 @@ use crate::models::{
     RegistrationOperation, Validator,
 };
 use crate::reason::aborted;
-use crate::tenant_contract::TypesRegistryApi;
 
 #[derive(Debug, Clone)]
 struct Stored {

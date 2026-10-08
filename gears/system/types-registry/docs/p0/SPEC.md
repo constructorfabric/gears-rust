@@ -1883,12 +1883,14 @@ gears/system/types-registry/
 ├── docs/p0/{SPEC,plan,todo}.md           ← this spec, its plan and task list
 ├── types-registry-sdk/src/
 │   ├── legacy/                           the old trait, its models and its mock; DELETED at T31 (D6)
-│   ├── contract.rs                       NEW  PlatformTypesRegistryApi (#[toolkit::contract])
-│   ├── ext.rs                            NEW  PlatformTypesRegistryApiExt: helpers composed from the contract
-│   ├── tenant_contract.rs                NEW  TypesRegistryApi: tenant-plane entity reads (D17, T24a)
+│   ├── contract.rs                       NEW  both #[toolkit::contract] traits: PlatformTypesRegistryApi and
+│   │                                          TypesRegistryApi, the tenant-plane entity reads (D17, T24a)
+│   ├── ext.rs                            NEW  PlatformTypesRegistryApiExt and TypesRegistryApiExt: helpers
+│   │                                          composed from the contracts
 │   ├── models.rs                         NEW  P0 models per §10.1 — no serde
-│   ├── publish.rs, reconcile.rs          NEW  `publish_gts` and reconciliation, returning the SDK's
-│   ├── publication.rs, supervised.rs          publication status; the supervised publisher task
+│   ├── publication/                      NEW  per-gear publication: `mod.rs` the publication status,
+│   │                                          `publish.rs` `publish_gts`, `reconcile.rs` reconciliation,
+│   │                                          `supervised.rs` the supervised publisher task
 │   ├── error.rs                          TypesRegistryError, the opt-in projection of CanonicalError (ADR 0005)
 │   ├── field.rs, reason.rs, gts.rs,      its wire vocabulary; `item_failure.rs` is the per-item failure
 │   │   precondition.rs, item_failure.rs       (`AdmissionFailure`) inside an operation

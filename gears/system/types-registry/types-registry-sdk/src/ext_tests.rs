@@ -632,10 +632,10 @@ mod tenant {
 
     use super::{FakePlatformRegistry, INSTANCE, TYPE, id};
     use crate::TypesRegistryApiExt;
+    use crate::contract::TypesRegistryApi;
     use crate::models::{
         EntityField, EntityKind, FieldSelection, ListEntitiesRequest, PageRequest, Projection,
     };
-    use crate::tenant_contract::TypesRegistryApi;
 
     fn tenant() -> SecurityContext {
         SecurityContext::anonymous()

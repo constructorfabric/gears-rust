@@ -1,5 +1,31 @@
-//! Helpers outside contract IR, including dyn clients (SPEC §10.1), for both contracts.
-//! Identifier kind checks are local; UUID kind mismatches return `NotFound`.
+//! Helper methods over the two contracts (SPEC §10.1). They are not part of either
+//! contract's IR and need no registration: each trait is blanket-implemented, so
+//! importing it adds its methods to the client.
+//!
+//! # Which one a client uses
+//!
+//! Pick the contract by whose request the call serves, then import its helpers:
+//!
+//! | Calling for | Resolve from `ClientHub` | Import | Context |
+//! |---|---|---|---|
+//! | the gear itself: publishing, reading types for its own logic | `dyn PlatformTypesRegistryApi` | [`PlatformTypesRegistryApiExt`] | `PlatformSecurityContext::outbound_marker()` |
+//! | a tenant's request, with the tenant's credentials; reads only | `dyn TypesRegistryApi` | [`TypesRegistryApiExt`] | the request's `SecurityContext` |
+//!
+//! ```ignore
+//! use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection};
+//!
+//! let registry = hub.get::<dyn PlatformTypesRegistryApi>()?;
+//! let schema = registry
+//!     .get_type_schema(&PlatformSecurityContext::outbound_marker(), type_id, Projection::Default)
+//!     .await?;
+//! ```
+//!
+//! A client that implements both contracts (the local client, the test fake) has each
+//! helper name twice once both traits are imported: call it through a typed trait object
+//! or with UFCS (`TypesRegistryApiExt::get_type_schema(&client, …)`). A `dyn` client
+//! implements one contract, so it never meets that ambiguity.
+//!
+//! Identifier kind checks are local; a UUID of the other kind is `NotFound`.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -13,6 +39,7 @@ use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use uuid::Uuid;
 
 use crate::contract::PlatformTypesRegistryApi;
+use crate::contract::TypesRegistryApi;
 use crate::field;
 use crate::gts::{OperationResource, TypeResource};
 use crate::models::{
@@ -21,7 +48,6 @@ use crate::models::{
     EntitySnapshot, FieldSelection, IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse,
     OperationStatus, Projection, PublisherContext, RegisterEntitiesRequest, RegistrationOperation,
 };
-use crate::tenant_contract::TypesRegistryApi;
 
 /// Batch-read key ceiling (SPEC C10); larger reads are split.
 pub const MAX_BATCH_GET_KEYS: usize = 100;

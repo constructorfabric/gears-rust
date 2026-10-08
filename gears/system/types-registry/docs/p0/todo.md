@@ -2613,7 +2613,7 @@ status, `PublisherVersion`, supervision helper)
 **Files likely touched:**
 - `TR-SDK/src/contract.rs`
 - `TR-SDK/src/models.rs`
-- `TR-SDK/src/reconcile.rs`
+- `TR-SDK/src/publication/reconcile.rs`
 - `TR-SDK/src/lib.rs`
 - `TR/src/domain/local_client.rs`
 **Scope:** M
@@ -3542,7 +3542,7 @@ Every P0 mutation is global and platform-plane, so after this task no write bypa
 - [ ] `make e2e-local` green with every request carrying a publisher
 
 **Dependencies:** T40
-**Files likely touched:** `TR-SDK/src/{reconcile,publication,publish}.rs`, `TR/src/domain/seeding.rs`, `TR/src/api/rest/{dto,routes,handlers}.rs`, `TR/src/api/local_client.rs`, `TR/src/domain/admission/publication.rs`, SDK and API tests, e2e helpers, operator docs
+**Files likely touched:** `TR-SDK/src/publication/{reconcile,mod,publish}.rs`, `TR/src/domain/seeding.rs`, `TR/src/api/rest/{dto,routes,handlers}.rs`, `TR/src/api/local_client.rs`, `TR/src/domain/admission/publication.rs`, SDK and API tests, e2e helpers, operator docs
 **Scope:** L — writers first, then the requirement as its own commit
 
 ---

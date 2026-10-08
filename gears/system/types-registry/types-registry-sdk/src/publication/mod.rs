@@ -1,4 +1,10 @@
-//! Per-identifier publication/readiness status (SPEC D16, D18, D21); T33 wires `publish_gts`.
+//! Per-gear publication (SPEC §10.1, D16, D18, D21): [`publish`] runs [`reconcile`] in a
+//! [`supervised`] background task; this module holds the per-identifier status it reports.
+//! T33 wires `publish_gts`.
+
+pub mod publish;
+pub mod reconcile;
+pub mod supervised;
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;

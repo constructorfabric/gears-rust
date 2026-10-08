@@ -12,7 +12,7 @@ use toolkit::ClientHub;
 
 use super::{PublishOptions, publish_gts, publish_gts_with};
 use crate::contract::PlatformTypesRegistryApi;
-use crate::supervised::TaskExit;
+use crate::publication::supervised::TaskExit;
 use crate::testing_platform::{FakePlatformRegistry, ReadFault};
 
 const A: &str = "gts.cf.test.pkg.a.v1~";

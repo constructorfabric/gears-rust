@@ -8,9 +8,10 @@
 //!   — helpers composed from it
 //! - [`TypesRegistryApi`] — the tenant toolkit contract, entity reads only;
 //!   [`TypesRegistryApiExt`] — the same read helpers over it
+//! - [`ext`] says which contract a client resolves and which helpers it imports
 //! - [`models`] — the serde-free request, snapshot and operation models
-//! - [`publish`], [`reconcile`](mod@reconcile), [`publication`], [`supervised`] — per-gear
-//!   publication
+//! - [`publication`] — per-gear publication: [`publish_gts`], [`reconcile()`], the
+//!   publication status and its supervised task
 //!
 //! **Old surface** (`legacy`, deleted in T31 with no shim; re-exported at the crate root):
 //! - `TypesRegistryClient` trait for inter-gear communication. Per
@@ -53,11 +54,7 @@ pub mod item_failure;
 pub mod models;
 pub mod precondition;
 pub mod publication;
-pub mod publish;
 pub mod reason;
-pub mod reconcile;
-pub mod supervised;
-pub mod tenant_contract;
 
 /// An in-memory `PlatformTypesRegistryApi` for consumer and SDK tests.
 #[cfg(any(test, feature = "test-util"))]
@@ -67,7 +64,7 @@ pub mod tenant_contract;
 )]
 pub mod testing_platform;
 
-pub use contract::PlatformTypesRegistryApi;
+pub use contract::{PlatformTypesRegistryApi, TypesRegistryApi};
 pub use error::{FieldIssue, TypesRegistryError};
 pub use ext::{PlatformTypesRegistryApiExt, TypesRegistryApiExt};
 pub use gts::{OPERATION_RESOURCE_TYPE, TYPE_RESOURCE_TYPE};
@@ -81,14 +78,15 @@ pub use models::{
     PublisherContext, PublisherVersion, RegisterEntitiesRequest, RegisterItem,
     RegistrationItemResult, RegistrationOperation, Validator,
 };
+pub use publication::publish::{PublishOptions, publish_gts, publish_gts_with};
+pub use publication::reconcile::{
+    Liveness, Outcome, PendingCause, ReconcileOptions, Reconciliation, reconcile,
+};
+pub use publication::supervised::{Supervised, SupervisedStatus, TaskExit};
 pub use publication::{
     GtsDeclaration, PendingReason, PublicationState, PublicationStatus, PublisherVersionError,
     RejectionReason, SupersededEntity,
 };
-pub use publish::{PublishOptions, publish_gts, publish_gts_with};
-pub use reconcile::{Liveness, Outcome, PendingCause, ReconcileOptions, Reconciliation, reconcile};
-pub use supervised::{Supervised, SupervisedStatus, TaskExit};
-pub use tenant_contract::TypesRegistryApi;
 
 // The old surface, deleted in T31 (see `legacy`). Re-exported at the crate root and, for
 // its mock, at `testing`.

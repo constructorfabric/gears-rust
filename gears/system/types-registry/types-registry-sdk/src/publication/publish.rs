@@ -26,10 +26,10 @@ use crate::models::{
     BatchGetEntitiesRequest, BatchGetItem, EntityKey, EntityLookup, FieldSelection,
     LifecycleStatus, Projection,
 };
-use crate::reconcile::{
+use crate::publication::reconcile::{
     Liveness, Outcome, PendingCause, ReconcileOptions, Reconciliation, reconcile,
 };
-use crate::supervised::{StatusReporter, Supervised, spawn_supervised};
+use crate::publication::supervised::{StatusReporter, Supervised, spawn_supervised};
 
 /// Minimum cycle pause, including jitter, prevents instant failures from spinning.
 pub const MIN_CYCLE_BACKOFF: Duration = Duration::from_millis(50);
