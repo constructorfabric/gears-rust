@@ -63,7 +63,7 @@ tokio-util = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
-# Paused-clock tests of `register_and_await`'s deadline and polling.
+# Paused-clock tests of `register_entities_and_await`'s deadline and polling.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 # Round-trip and consistency properties of the SDK's codecs and orderings.
 proptest = { workspace = true }

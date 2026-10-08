@@ -1368,7 +1368,7 @@ change, so the two never serve existing embedded consumers side by side and no s
 is written (plan P23/P26). The early T30 pilot uses an isolated registry composition
 and database with the new APIs only; it does not migrate an existing embedded consumer.
 Registrations stay synchronous inside `init` through the local client — the reconciliation
-helper, not bare `register_and_await`, so a changed configuration-built Instance updates rather
+helper, not bare `register_entities_and_await`, so a changed configuration-built Instance updates rather
 than collides — until T35–T37 move them after wiring. Consumers keep `deps = [types_registry]`
 until then, because the init order is built from `deps` and `#[consumes]` wiring runs after
 every `init`.
@@ -1436,11 +1436,11 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     /// Submits, polls to terminality at the pace the receipt's `Retry-After` sets,
     /// and returns per-identifier outcomes. The async contract made ergonomic; not
     /// a second protocol.
-    async fn register_and_await(&self, ctx: &PlatformSecurityContext, key: IdempotencyKey,
+    async fn register_entities_and_await(&self, ctx: &PlatformSecurityContext, key: IdempotencyKey,
         request: RegisterEntitiesRequest, deadline: Duration)
         -> Result<RegistrationOperation, CanonicalError>;
 
-    // get_type_schema, get_instance, get_type_schemas, get_instances, their
+    // get_type_schema, get_instance, batch_get_type_schemas, batch_get_instances, their
     // _by_uuid variants, list_type_schemas, list_instances — see below.
 }
 ```
@@ -1452,8 +1452,8 @@ submits, then calls `get_operation` and returns its result. The receipt — `ope
 with no items, so no adapter ever builds `RegistrationOperation { items: [] }` from it. If
 the read fails after an accepted submit, the error carries the `operation_id` and the caller
 retries under the same key, which replays. The REST adapter keeps `Retry-After` as its own
-polling hint for `register_and_await` and publication, falling back to an SDK default; the
-semantic models carry neither it nor `replayed`. `register_and_await` holds one monotonic
+polling hint for `register_entities_and_await` and publication, falling back to an SDK default; the
+semantic models carry neither it nor `replayed`. `register_entities_and_await` holds one monotonic
 deadline across submit and polling, honours cancellation, and on timeout names the
 `operation_id` — a timeout never cancels the accepted write. `IdempotencyKey` is a trait parameter, not a
 transport detail: the REST client sends it as the `Idempotency-Key` header, which the v2 route
@@ -1481,7 +1481,7 @@ and a deadline. One idempotency key covers retries of an identical submission an
 a new cycle — a re-read that changes candidates or preconditions — takes a new key (ADR-0012).
 `already_exists` and `precondition_failed` caused by a concurrent publisher of the same content
 lead to a re-read, not a failure. It never discovers inventory or deletes records absent from
-the supplied set. `register_and_await` is the submit/poll primitive; reconciliation adds
+the supplied set. `register_entities_and_await` is the submit/poll primitive; reconciliation adds
 read/compare above it.
 
 **Publication is reconciliation run for a gear (D16).** `publish_gts` matches the publisher
@@ -1503,8 +1503,9 @@ one. Gear names in diagnostics are not identity or authority.
 
 **Convenience read helpers are `PlatformTypesRegistryApiExt` methods** over `batch_get_entities` and
 `list_entities`, keeping the contract minimal and object-safe while preserving the call shapes
-consumers already use: `get_type_schema`, `get_instance`, `get_type_schemas`, `get_instances`, their
-`_by_uuid` variants, `list_type_schemas`, `list_instances`. Kind narrowing costs no round
+consumers already use: `get_type_schema`, `get_instance`, their `_by_uuid` variants,
+`list_type_schemas`, `list_instances`. The plural reads follow the contract's `batch_get_entities`:
+`batch_get_type_schemas`, `batch_get_instances` and their `_by_uuid` variants. Kind narrowing costs no round
 trip, since the kind is the trailing `~` of the identifier. Two changes to those shapes. Identifiers are
 typed — `&GtsTypeId` / `&GtsInstanceId`, validated by `try_new`, by `Deserialize` or at compile
 time — so a kind mismatch is no longer a per-key answer. And the plural reads answer

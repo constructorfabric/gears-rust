@@ -1420,7 +1420,7 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
 }
 
 /// The platform counterpart, blanket-implemented the same way; it adds
-/// `register_and_await`, the reconciliation helper and `publish_gts`.
+/// `register_entities_and_await`, the reconciliation helper and `publish_gts`.
 #[async_trait]
 pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi { /* … */ }
 ```

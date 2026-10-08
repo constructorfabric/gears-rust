@@ -26,7 +26,7 @@
 //! | one item of an operation refused (inspect [`AdmissionFailure::reason`]) | [`TypesRegistryError::Admission`] | — (operation item) |
 //! | a registration policy refused the candidate | [`TypesRegistryError::PolicyRefused`] | 400 |
 //! | accepted, but the operation could not be read back — replay the same key (SPEC D19) | [`TypesRegistryError::ReadBackFailed`] | — (client) |
-//! | `register_and_await` ran out of time | [`TypesRegistryError::DeadlineExceeded`] | — (client) |
+//! | `register_entities_and_await` ran out of time | [`TypesRegistryError::DeadlineExceeded`] | — (client) |
 //! | the caller cancelled | [`TypesRegistryError::Cancelled`] | — (client) |
 //! | registry not available | [`TypesRegistryError::Unavailable`] | 503 |
 //! | internal failure | [`TypesRegistryError::Internal`] | 500 |

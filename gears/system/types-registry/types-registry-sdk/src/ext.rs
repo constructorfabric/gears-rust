@@ -100,7 +100,7 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     /// # Errors
     /// `InvalidArgument` for an unrepresentable deadline; submit/poll errors; `DeadlineExceeded`
     /// or `Cancelled`.
-    async fn register_and_await(
+    async fn register_entities_and_await(
         &self,
         ctx: &PlatformSecurityContext,
         key: IdempotencyKey,
@@ -193,7 +193,7 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     /// # Errors
     /// The error of a batch read that failed; the call then reads no further batch.
     /// `InvalidArgument`, before any read, for an identifier that is not a Type Schema's.
-    async fn get_type_schemas(
+    async fn batch_get_type_schemas(
         &self,
         ctx: &PlatformSecurityContext,
         type_ids: &[GtsTypeId],
@@ -202,11 +202,11 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         get_many_by_id(&PlatformReads { api: self, ctx }, type_ids, projection).await
     }
 
-    /// Instances by identifier, as [`Self::get_type_schemas`].
+    /// Instances by identifier, as [`Self::batch_get_type_schemas`].
     ///
     /// # Errors
-    /// As [`Self::get_type_schemas`].
-    async fn get_instances(
+    /// As [`Self::batch_get_type_schemas`].
+    async fn batch_get_instances(
         &self,
         ctx: &PlatformSecurityContext,
         ids: &[GtsInstanceId],
@@ -219,8 +219,8 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     /// `None` when absent or when the reference names an Instance.
     ///
     /// # Errors
-    /// As [`Self::get_type_schemas`].
-    async fn get_type_schemas_by_uuid(
+    /// As [`Self::batch_get_type_schemas`].
+    async fn batch_get_type_schemas_by_uuid(
         &self,
         ctx: &PlatformSecurityContext,
         type_uuids: &[Uuid],
@@ -229,11 +229,11 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         get_many_by_uuid(&PlatformReads { api: self, ctx }, type_uuids, projection).await
     }
 
-    /// Instances by Registry Reference, as [`Self::get_type_schemas_by_uuid`].
+    /// Instances by Registry Reference, as [`Self::batch_get_type_schemas_by_uuid`].
     ///
     /// # Errors
-    /// As [`Self::get_type_schemas`].
-    async fn get_instances_by_uuid(
+    /// As [`Self::batch_get_type_schemas`].
+    async fn batch_get_instances_by_uuid(
         &self,
         ctx: &PlatformSecurityContext,
         uuids: &[Uuid],
@@ -335,11 +335,11 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         get_one(&reads, EntityKey::GtsUuid(uuid), projection).await
     }
 
-    /// As [`PlatformTypesRegistryApiExt::get_type_schemas`].
+    /// As [`PlatformTypesRegistryApiExt::batch_get_type_schemas`].
     ///
     /// # Errors
-    /// As [`PlatformTypesRegistryApiExt::get_type_schemas`].
-    async fn get_type_schemas(
+    /// As [`PlatformTypesRegistryApiExt::batch_get_type_schemas`].
+    async fn batch_get_type_schemas(
         &self,
         ctx: &SecurityContext,
         type_ids: &[GtsTypeId],
@@ -349,11 +349,11 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         get_many_by_id(&reads, type_ids, projection).await
     }
 
-    /// As [`PlatformTypesRegistryApiExt::get_instances`].
+    /// As [`PlatformTypesRegistryApiExt::batch_get_instances`].
     ///
     /// # Errors
-    /// As [`PlatformTypesRegistryApiExt::get_type_schemas`].
-    async fn get_instances(
+    /// As [`PlatformTypesRegistryApiExt::batch_get_type_schemas`].
+    async fn batch_get_instances(
         &self,
         ctx: &SecurityContext,
         ids: &[GtsInstanceId],
@@ -363,11 +363,11 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         get_many_by_id(&reads, ids, projection).await
     }
 
-    /// As [`PlatformTypesRegistryApiExt::get_type_schemas_by_uuid`].
+    /// As [`PlatformTypesRegistryApiExt::batch_get_type_schemas_by_uuid`].
     ///
     /// # Errors
-    /// As [`PlatformTypesRegistryApiExt::get_type_schemas`].
-    async fn get_type_schemas_by_uuid(
+    /// As [`PlatformTypesRegistryApiExt::batch_get_type_schemas`].
+    async fn batch_get_type_schemas_by_uuid(
         &self,
         ctx: &SecurityContext,
         type_uuids: &[Uuid],
@@ -377,11 +377,11 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         get_many_by_uuid(&reads, type_uuids, projection).await
     }
 
-    /// As [`PlatformTypesRegistryApiExt::get_instances_by_uuid`].
+    /// As [`PlatformTypesRegistryApiExt::batch_get_instances_by_uuid`].
     ///
     /// # Errors
-    /// As [`PlatformTypesRegistryApiExt::get_type_schemas`].
-    async fn get_instances_by_uuid(
+    /// As [`PlatformTypesRegistryApiExt::batch_get_type_schemas`].
+    async fn batch_get_instances_by_uuid(
         &self,
         ctx: &SecurityContext,
         uuids: &[Uuid],
@@ -636,7 +636,7 @@ fn list_default(kind: EntityKind) -> FieldSelection {
     }
 }
 
-/// Submit and poll under one deadline; shared by `register_and_await` and reconciliation.
+/// Submit and poll under one deadline; shared by `register_entities_and_await` and reconciliation.
 pub(crate) async fn await_registration<A: PlatformTypesRegistryApi + ?Sized>(
     api: &A,
     ctx: &PlatformSecurityContext,

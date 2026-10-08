@@ -646,14 +646,14 @@ async fn a_failed_deletion_read_back_is_recovered_by_the_same_key() {
 }
 
 #[tokio::test]
-async fn register_and_await_completes_through_the_local_client_and_the_outbox() {
+async fn register_entities_and_await_completes_through_the_local_client_and_the_outbox() {
     use types_registry_sdk::PlatformTypesRegistryApiExt;
 
     let h = harness().await;
     let api: Arc<dyn PlatformTypesRegistryApi> = Arc::new(LocalClient::new(Arc::clone(&h.service)));
 
     let operation = api
-        .register_and_await(
+        .register_entities_and_await(
             &ctx(),
             IdempotencyKey::new("k-await").unwrap(),
             register(vec![create(CF_TYPE, schema(CF_TYPE))]),
