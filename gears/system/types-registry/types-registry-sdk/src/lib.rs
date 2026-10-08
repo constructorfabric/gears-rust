@@ -1,16 +1,16 @@
 //! Types Registry SDK
 //!
 //! This crate provides the public API for the `types-registry` gear. It carries two surfaces
-//! until T29 moves every consumer onto the new one.
+//! until T31 moves every consumer onto the new one.
 //!
 //! **New surface** (SPEC §10.1, D15):
 //! - [`PlatformTypesRegistryApi`] — the toolkit contract; [`PlatformTypesRegistryApiExt`] —
 //!   helpers composed from it
-//! - [`entity_models`] — the serde-free request, snapshot and operation models
+//! - [`models`] — the serde-free request, snapshot and operation models
 //! - [`publish`], [`reconcile`](mod@reconcile), [`publication`], [`supervised`] — per-gear
 //!   publication
 //!
-//! **Old surface** (`legacy`, deleted in T29 with no shim):
+//! **Old surface** (`legacy`, deleted in T31 with no shim; re-exported at the crate root):
 //! - `TypesRegistryClient` trait for inter-gear communication. Per
 //!   [ADR 0005][adr] every fallible method (and every per-item `Result` it
 //!   returns) carries [`toolkit_canonical_errors::CanonicalError`].
@@ -43,12 +43,12 @@
 #![deny(rust_2018_idioms)]
 
 pub mod contract;
-pub mod entity_models;
 pub mod error;
 pub mod ext;
 pub mod field;
 pub mod gts;
 pub mod item_failure;
+pub mod models;
 pub mod precondition;
 pub mod publication;
 pub mod publish;
@@ -65,7 +65,7 @@ pub mod supervised;
 pub mod testing_platform;
 
 pub use contract::PlatformTypesRegistryApi;
-pub use entity_models::{
+pub use models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, CandidateStatus, Cursor,
     DeleteEntitiesRequest, DeleteItem, DeletionItemResult, DeletionOperation, EntityField,
     EntityFilter, EntityKey, EntityKind, EntityLookup, EntitySnapshot, FieldSelection,
@@ -86,15 +86,15 @@ pub use publish::{PublishOptions, publish_gts, publish_gts_with};
 pub use reconcile::{Liveness, Outcome, PendingCause, ReconcileOptions, Reconciliation, reconcile};
 pub use supervised::{Supervised, SupervisedStatus, TaskExit};
 
-// The old surface, deleted in T29 (see `legacy`). Re-exported at its original paths.
+// The old surface, deleted in T31 (see `legacy`). Re-exported at the crate root and, for
+// its mock, at `testing`.
 mod legacy;
 
 #[cfg(feature = "test-util")]
 pub use legacy::testing;
-pub use legacy::{api, models};
 
-pub use api::TypesRegistryClient;
-pub use models::{
+pub use legacy::api::TypesRegistryClient;
+pub use legacy::models::{
     GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, RegisterSummary, TypeSchemaQuery,
     is_type_schema_id,
 };

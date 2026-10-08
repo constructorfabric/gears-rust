@@ -562,5 +562,5 @@ impl CandidateStatus {
 }
 
 #[cfg(test)]
-#[path = "entity_models_tests.rs"]
-mod entity_models_tests;
+#[path = "models_tests.rs"]
+mod models_tests;

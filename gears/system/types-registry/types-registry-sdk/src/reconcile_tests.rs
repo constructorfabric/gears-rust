@@ -9,8 +9,8 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 
 use super::{Liveness, Outcome, PendingCause, ReconcileOptions, Reconciliation, reconcile};
-use crate::entity_models::{IdempotencyKey, PublisherContext, RegisterEntitiesRequest};
 use crate::item_failure::AdmissionFailure;
+use crate::models::{IdempotencyKey, PublisherContext, RegisterEntitiesRequest};
 use crate::testing_platform::{FakePlatformRegistry, ReadFault};
 
 const A: &str = "gts.cf.test.pkg.a.v1~";
@@ -760,8 +760,8 @@ async fn a_refusal_of_the_call_is_submitted_once_and_stays_pending_as_refused() 
 #[test]
 fn every_exact_reason_maps_to_its_outcome() {
     use super::classify;
-    use crate::entity_models::CandidateStatus;
     use crate::item_failure::reason;
+    use crate::models::CandidateStatus;
 
     let failed = |r: &str| {
         classify(
@@ -815,7 +815,7 @@ fn every_exact_reason_maps_to_its_outcome() {
 #[test]
 fn malformed_or_undecided_items_map_to_their_outcome() {
     use super::classify;
-    use crate::entity_models::CandidateStatus;
+    use crate::models::CandidateStatus;
 
     assert!(matches!(
         classify(CandidateStatus::Failed, None),

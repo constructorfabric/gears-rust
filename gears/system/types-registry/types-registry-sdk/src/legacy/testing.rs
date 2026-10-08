@@ -24,13 +24,13 @@ use serde_json::Value;
 use toolkit_canonical_errors::CanonicalError;
 use uuid::Uuid;
 
-use crate::api::TypesRegistryClient;
-use crate::field;
-use crate::gts::TypeResource;
-use crate::models::{
+use super::api::TypesRegistryClient;
+use super::models::{
     GtsInstance, GtsTypeId, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
     is_type_schema_id,
 };
+use crate::field;
+use crate::gts::TypeResource;
 use gts::{GtsId, GtsInstanceId};
 
 /// Builds the `InvalidArgument` canonical error the registry returns for a

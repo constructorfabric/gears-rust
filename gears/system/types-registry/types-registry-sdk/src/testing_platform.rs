@@ -16,7 +16,7 @@ use toolkit_security::PlatformSecurityContext;
 use uuid::Uuid;
 
 use crate::contract::PlatformTypesRegistryApi;
-use crate::entity_models::{
+use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, CandidateStatus, DeleteEntitiesRequest,
     DeletionItemResult, DeletionOperation, EntityField, EntityKey, EntityKind, EntityLookup,
     EntitySnapshot, IdempotencyKey, LifecycleStatus, ListEntitiesRequest, ListEntitiesResponse,

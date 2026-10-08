@@ -59,7 +59,7 @@ fn every_method_takes_exactly_one_security_context_first() {
 async fn an_implementation_registered_in_the_client_hub_answers_through_the_trait_object() {
     use std::sync::Arc;
 
-    use crate::entity_models::{BatchGetEntitiesRequest, BatchGetItem, EntityKey, EntityLookup};
+    use crate::models::{BatchGetEntitiesRequest, BatchGetItem, EntityKey, EntityLookup};
 
     const TYPE: &str = "gts.cf.test.pkg.thing.v1~";
     let fake = crate::testing_platform::FakePlatformRegistry::new();
@@ -78,7 +78,7 @@ async fn an_implementation_registered_in_the_client_hub_answers_through_the_trai
             &toolkit_security::PlatformSecurityContext::outbound_marker(),
             BatchGetEntitiesRequest {
                 items: vec![BatchGetItem::from(key.clone())],
-                projection: crate::entity_models::Projection::Default,
+                projection: crate::models::Projection::Default,
                 fresh: false,
             },
         )

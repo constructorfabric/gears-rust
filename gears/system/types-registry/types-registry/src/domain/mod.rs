@@ -47,7 +47,7 @@ pub mod validator;
 pub mod enums;
 pub mod error;
 
-// Legacy: repo/service retire at T26; model retires with the old client/cache at T29/T30.
+// Legacy: repo, service and model retire with the old client and its cache at T31.
 // New callers use ports and registry_service.
 
 pub mod model;

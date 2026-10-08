@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::PlatformTypesRegistryApiExt;
 use crate::contract::PlatformTypesRegistryApi;
-use crate::entity_models::{
+use crate::models::{
     CandidateStatus, DeleteItem, EntityKey, EntityKind, FieldSelection, IdempotencyKey,
     ListEntitiesRequest, OperationStatus, PageRequest, Projection, PublisherContext,
     RegisterEntitiesRequest, RegisterItem,
@@ -484,7 +484,7 @@ async fn delete_entity_is_a_one_item_deletion_forwarding_its_arguments() {
         assert!(
             matches!(
                 completed,
-                crate::entity_models::Operation::Deletion(ref op)
+                crate::models::Operation::Deletion(ref op)
                     if op.status == OperationStatus::Completed
                         && op.items[0].status == CandidateStatus::Succeeded
             ),

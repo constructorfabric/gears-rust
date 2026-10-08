@@ -15,14 +15,14 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 
 use crate::contract::PlatformTypesRegistryApi;
-use crate::entity_models::{
+use crate::ext::{MAX_BATCH_GET_KEYS, await_registration, bounded, deadline_from_now, jittered};
+use crate::gts::TypeResource;
+use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason};
+use crate::models::{
     BatchGetEntitiesRequest, BatchGetItem, CandidateStatus, EntityField, EntityKey, EntityLookup,
     FieldSelection, IdempotencyKey, JsonDocument, LifecycleStatus, Origin, Projection,
     PublisherContext, RegisterEntitiesRequest, RegisterItem,
 };
-use crate::ext::{MAX_BATCH_GET_KEYS, await_registration, bounded, deadline_from_now, jittered};
-use crate::gts::TypeResource;
-use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason};
 
 /// How a submitted batch is retried at the transport level, key and request unchanged.
 const TRANSPORT_ATTEMPTS: u32 = 3;
@@ -603,7 +603,7 @@ enum Submitted {
 /// ignored.
 fn cover(
     submitted: &[RegisterItem],
-    items: Vec<crate::entity_models::RegistrationItemResult>,
+    items: Vec<crate::models::RegistrationItemResult>,
 ) -> Vec<(GtsId, Outcome)> {
     let mut reported: HashMap<String, Vec<Outcome>> = HashMap::new();
     for item in items {

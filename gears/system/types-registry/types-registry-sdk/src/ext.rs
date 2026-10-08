@@ -13,7 +13,7 @@ use toolkit_security::PlatformSecurityContext;
 use uuid::Uuid;
 
 use crate::contract::PlatformTypesRegistryApi;
-use crate::entity_models::{
+use crate::models::{
     BatchGetEntitiesRequest, BatchGetItem, DeleteEntitiesRequest, DeleteItem, DeletionOperation,
     EntityField, EntityKey, EntityKind, EntityLookup, EntitySnapshot, FieldSelection,
     IdempotencyKey, ListEntitiesRequest, OperationStatus, Projection, PublisherContext,
@@ -434,7 +434,7 @@ pub(crate) async fn await_registration<A: PlatformTypesRegistryApi + ?Sized>(
             api.get_operation(ctx, operation_id),
         )
         .await??;
-        let crate::entity_models::Operation::Registration(polled) = polled else {
+        let crate::models::Operation::Registration(polled) = polled else {
             return Err(OperationResource::unknown(format!(
                 "the registry answered a poll of registration operation {operation_id} \
                  with a deletion"

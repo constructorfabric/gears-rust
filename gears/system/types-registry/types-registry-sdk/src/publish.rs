@@ -19,13 +19,13 @@ use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
 use toolkit_security::PlatformSecurityContext;
 
 use crate::contract::PlatformTypesRegistryApi;
-use crate::entity_models::{
-    BatchGetEntitiesRequest, BatchGetItem, EntityKey, EntityLookup, FieldSelection,
-    LifecycleStatus, Projection,
-};
 use crate::ext::jittered;
 use crate::ext::{MAX_BATCH_GET_KEYS, bounded, deadline_from_now};
 use crate::item_failure::{AdmissionFailure, context, reason};
+use crate::models::{
+    BatchGetEntitiesRequest, BatchGetItem, EntityKey, EntityLookup, FieldSelection,
+    LifecycleStatus, Projection,
+};
 use crate::reconcile::{
     Liveness, Outcome, PendingCause, ReconcileOptions, Reconciliation, reconcile,
 };

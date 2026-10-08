@@ -2612,7 +2612,7 @@ T47 for the always-submit change below, now T41.)*
 status, `PublisherVersion`, supervision helper)
 **Files likely touched:**
 - `TR-SDK/src/contract.rs`
-- `TR-SDK/src/entity_models.rs`
+- `TR-SDK/src/models.rs`
 - `TR-SDK/src/reconcile.rs`
 - `TR-SDK/src/lib.rs`
 - `TR/src/domain/local_client.rs`
@@ -3053,6 +3053,7 @@ removed — it remains the deployment-time escape hatch for identities no gear c
 - [ ] Every `register(...)` site becomes **synchronous reconciliation** through the local client — T24's helper: batch-read, compare, `expected_resource_version` for differing entities, submit, wait — still inside `init`, under one bounded deadline. Plain `register_and_await` is not enough: after a configuration-built Instance changes, the next start would submit a creation for an existing entity. Every item outcome is handled; `RegisterResult::ensure_all_ok` is gone and no site treats `pending` as success. Each site passes its gear's own `PublisherContext`; nothing sends it before T39. `rate-provider-sdk`'s shared `register_rate_provider_plugin` moves with it
 - [ ] Where a materialized `effective_*` field differs from what the deleted client-side method returned, the **materialized value is accepted** — the difference is the old approximation being wrong (unresolved non-parent `$ref`, trait-default order), and `gts-rust` is authoritative. A failing assertion is updated to the new value, never "fixed" back
 - [ ] `TypesRegistryClient`, its models (`RegisterResult`, `RegisterSummary`, `TypeSchemaQuery`, `InstanceQuery`, `GtsTypeSchema`, `GtsInstance`) and `testing::MockTypesRegistryClient` are deleted — the whole `TR-SDK/src/legacy/` directory and the legacy block in `TR-SDK/src/lib.rs`; `types-registry-sdk` exports only the new surface. `GtsTypeId` / `GtsInstanceId` stay as root re-exports of `gts`. `precondition.rs` and `TypesRegistryError::ParentNotRegistered` are checked: if only the old `register` pre-check emits them, they go too, and crate docs and comments stop naming the old trait
+- [ ] With the legacy `testing` module gone, `TR-SDK/src/testing_platform.rs` becomes `testing.rs`, so the in-memory `PlatformTypesRegistryApi` is `types_registry_sdk::testing` like every other SDK's test support; consumers' test imports move with it
 - [ ] Every registration the audit lists as depending on a later registrant is resolved here — reordered, folded into the linked inventory, or moved to the registrant that owns the dependency
 - [ ] Ready mode and the in-memory repository are gone; `ready_mode_tests.rs` deleted. The four `local_client.cache.{type_schemas,instances}.{capacity,ttl}` keys become accepted-and-ignored with a warning naming their T28 replacements, and the production host wraps its clients in the T28 cache
 - [ ] `owning_gear = "types-registry"` remains a compatibility placeholder until T39 renames the column to `publisher_name` and the first publication carrying a publisher claims the row (T40); binding it to the authenticated workload stays P1 (C3). Its source comment describes incomplete attribution and that path. Keep the column and its NOT NULL constraint; no read returns the placeholder

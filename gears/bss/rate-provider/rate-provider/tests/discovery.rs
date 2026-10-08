@@ -20,8 +20,8 @@ use time::OffsetDateTime;
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::gts::PluginV1;
 use toolkit_security::SecurityContext;
+use types_registry_sdk::GtsInstance;
 use types_registry_sdk::TypesRegistryClient;
-use types_registry_sdk::models::GtsInstance;
 use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
 
 /// The core gear's own configured id (what `provider_id()` reports).
