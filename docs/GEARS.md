@@ -812,9 +812,9 @@ Own the subscription as the primary commercial aggregate for recurring revenue: 
 - [ ] p1 - subscription lifecycle state machine (create, activate, suspend, cancel, expire)
 - [ ] p1 - versioning and effective-dated plan/add-on composition
 - [ ] p1 - multi-tenant ownership (resource, payer, seller tenants)
-- [ ] p2 - plan changes (upgrade/downgrade) with proration triggers
+- [ ] p2 - quantity increases and component additions on an active subscription (base-plan changes deferred)
 - [ ] p2 - renewal semantics, grace periods, and failed-renewal handling
-- [ ] p2 - entitlement lifecycle (issue, revoke, point-of-use check)
+- [ ] p2 - commercial posture published to Entitlements, which applies it to providers and reports readiness
 - [ ] p3 - trial runtime and conversion
 - [ ] p3 - event model and billing alignment
 #### More details

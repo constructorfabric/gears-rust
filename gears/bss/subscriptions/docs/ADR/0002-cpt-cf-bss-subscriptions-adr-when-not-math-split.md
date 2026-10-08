@@ -1,4 +1,5 @@
 ---
+description: "Decision separating subscription commercial boundaries from Rating monetary calculation and Billing accounting."
 status: proposed
 date: 2026-07-15
 decision-makers: "BSS Subscriptions team"
@@ -28,85 +29,69 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 
 **ID**: `cpt-cf-bss-subscriptions-adr-when-not-math-split`
 
-> **Status: proposed / flagged for veto.** Records the rationale for the WHEN/MATH split asserted in
-> [`../PRD.md`](../PRD.md) §6.3 and seam SUB-R1; ratified when Product/Architecture confirms. Note:
-> the sibling pricing gear's working tree previously carried "proration math owned by Subscriptions"
-> wording in ~11 places — corrected to this split on 2026-07-15.
-
 ## Context and Problem Statement
 
-A plan change, add-on change, or seat change splits a billing period at an instant and prorates the
-recurring component across the two sub-intervals. Two questions must have **one owner each**: *when*
-does the change take effect (`changeEffectiveAt`, `changeMode`), and *how much* is the prorated
-amount (day-count basis, tier-`Q` carry-vs-reset, override resolution, FX). If both live in one gear,
-or if the boundary and the math are owned by different gears that each re-derive the other's input,
-replay and cross-gear reconciliation drift: the same change can rate differently depending on which
-gear's clock or basis is consulted.
-
-Where does the boundary live, and where does the arithmetic live, so that a change replays
-byte-identically?
+A supported component addition or quantity increase changes the commercial composition at one applied instant. Financial consumers need both that boundary and the frozen accepted terms to reproduce the resulting charge. If Subscriptions and Rating each calculate money or independently infer the boundary, retries and corrections can produce different obligations.
 
 ## Decision Drivers
 
-* Determinism: rating replays posted and open periods from a frozen snapshot; the proration math must be a pure function of frozen inputs + **one** authoritative boundary instant.
-* Single SoR per fact: the change boundary is subscription lifecycle state; the proration basis (`prorationBasis`, `billingAnchorPolicy`) is catalog-published and rating-evaluated.
-* No double math: if Subscriptions and rating both compute proration, the two must agree forever — a standing reconciliation liability.
-* Posted-invoice immutability: proration must surface as new/adjusting artifacts (Billing), never an edited posted line — which only works if one gear owns the boundary the artifacts hang off.
+- One authoritative commercial boundary for all downstream consumers.
+- Deterministic valuation from frozen accepted terms and truthful served intervals.
+- No monetary calculation in Subscriptions.
+- Immutable posted invoices and recoverable corrections owned by Billing.
 
 ## Considered Options
 
-1. Subscriptions computes proration itself (self-contained lifecycle + billing math).
-2. Subscriptions owns only the boundary/mode; rating owns all proration math (chosen).
-3. Extract a third, shared proration service both gears call.
+1. Calculate proration and tariff values in Subscriptions.
+2. Publish commercial boundaries and amount-less facts; let Rating calculate tariff values.
+3. Add a separate shared proration service.
 
 ## Decision Outcome
 
-Chosen option: **Subscriptions owns the WHEN, rating owns the MATH.** Subscriptions sets
-`changeEffectiveAt` + `changeMode` (incl. the up/down asymmetry) and emits them on
-`SubscriptionPlanChanged` / the composition-changing quantity event; the **rating gear** rates
-`planA` over `[periodStart, changeEffectiveAt)` and `planB` over `[changeEffectiveAt, periodEnd)`
-(half-open UTC), prorates the recurring component on the frozen `prorationBasis`, applies tier-`Q` /
-commitment carry-vs-reset per the snapshot, and slices usage at the **same** boundary. Subscriptions
-specifies no day-count math and no override resolution; it fixes only the trigger, the `effectiveFrom`
-semantics, and the "no posted-invoice mutation" invariant.
+Subscriptions owns the actual commercial change boundary, composition and served/posture intervals. Pricing owns accepted prices and tariff rules. Subscriptions freezes the accepted bindings and publishes versioned amount-less facts with complete temporal slices and purchase-lot allocations. Rating values those facts, including recurring proration, supported minima, usage windows and separately agreed one-time actions. Billing owns invoice accounting/posting, allocated-prepayment application, final invoice rounding and posted corrections. Taxes and payment execution retain their respective owners.
+
+For an immediate quantity increase at T, the same obligation's successor fact describes the prior quantity over `[periodStart, T)` and the complete accepted lot allocation over `[T, periodEnd)`. Existing lots retain their accepted terms. A delta purchase does not reprice them. Subscriptions does not calculate a day-count amount, aggregate usage or resolve monetary overrides. Differing-binding increases remain gated until the versioned lot-aware consumer contract is available.
+
+An independently agreed chargeable action has one durable occurrence identity. A lifecycle transition, transport retry, price change or rebuilt attempt cannot create a fee by itself. The fact retains qualifying-action evidence and the accepted flat or unit basis. Rating determines its value.
+
+Every commercial replacement retains the original economic identity and publishes a successor seal naming exact fact versions and digests. Billing accepts the complete required Rating results for that seal and applies a draft replacement or supported posted correction. Publication alone proves neither payment nor refund completion.
 
 ### Consequences
 
-* One boundary owner + one math owner ⇒ a change replays deterministically; there is no second clock or basis to disagree.
-* Subscriptions stays free of monetary computation (constraint `no-money`), keeping the lifecycle gear auditable and the math gear the single arithmetic authority.
-* Proration always materialises as new billable / credit-debit artifacts keyed off the shared boundary — posted lines are never edited.
-* Subscriptions must expose the boundary + composition read model on the shared ordering key `(orderingTenantId, subscriptionId)` — the tenant pinned at creation, immutable across transfers (SUB-D-06); rating consumes it (SUB-R1 counterpart already written in rating PRD §9.2).
+- One boundary and one tariff evaluator govern replay.
+- Subscriptions retains commercial evidence without taking over monetary calculation or raw-usage storage.
+- Rating calculation revisions and Billing financial targets remain separate from commercial fact and seal versions.
+- Owner SDK contracts, supported valuation profiles and executed S-U08/S-U13 fixtures gate use of the capability.
 
 ### Confirmation
 
-* A joint proration fixture: an immediate mid-cycle upgrade with a posted invoice for the partial period yields a rating-computed adjustment off the Subscriptions boundary, with no edit to the posted line, and replays identically.
-* The Subscriptions-emitted `(changeEffectiveAt, changeMode)` and the rating slice boundary are byte-identical in the shared fixtures; Subscriptions contains no day-count code path.
+- A mid-cycle increase preserves original terms and quantities before T and the full lot allocation afterward.
+- Rating computes the expected adjustment from frozen inputs; Subscriptions contains no independent proration evaluator.
+- Duplicate or reordered facts cannot create another obligation or override a newer head.
+- A posted correction retains original invoice history and recovers uncertain financial execution by the same identity.
 
 ## Pros and Cons of the Options
 
 ### Subscriptions computes proration (self-contained)
 
-* Good: one gear to trace for a change.
-* Bad: duplicates rating's evaluation engine + `prorationBasis`/`billingAnchorPolicy` frozen state; two arithmetic authorities to reconcile forever; contradicts rating being the math SoR.
+- Keeps one call path for lifecycle and arithmetic.
+- Duplicates Rating's tariff engine and creates two authorities for monetary replay.
 
 ### Subscriptions owns only the boundary; rating owns the math (chosen)
 
-* Good: deterministic replay; single arithmetic authority; lifecycle gear stays money-free; posted-immutability holds naturally.
-* Bad: requires a tight boundary contract + shared ordering key across two gears (already frozen as SUB-R1).
+- Keeps commercial and financial authority explicit and allows independent deterministic replay.
+- Requires complete immutable input, replacement and recovery contracts across owners.
 
 ### A third proration service
 
-* Good: neither gear owns the math.
-* Bad: a new deployable + contract for a computation rating already performs; more moving parts, weaker determinism ownership; no product driver.
+- Centralizes a shared calculation.
+- Adds another contract for work already owned by Rating, without simplifying commercial evidence or Billing corrections.
 
 ## More Information
 
-Cross-gear seam SUB-R1 (WHEN/MATH split + shared boundary) and SUB-R3 (seat boundary) in
-[`../SEAMS.md`](../SEAMS.md); rating side in [rating PRD](../../../rating/docs/PRD.md) §6.11, §9.2 and
-rating design slice `09-period-plan-change`.
+[Composition changes](../features/03-changes.md), [commercial facts](../features/08-commercial-facts.md), [Rating contract](../DESIGN.md#rating-result-contract) and [financial consumer boundary](../DESIGN.md#financial-consumer-boundary) define the boundary and recovery requirements.
 
 ## Traceability
 
-- **PRD**: [`../PRD.md`](../PRD.md) §6.3 (`fr-plan-change-boundary`, `fr-proration-ownership`, `fr-proration-triggers`, `fr-update-quantity`), §6.8 (no-retro).
-- **Seams**: [`../SEAMS.md`](../SEAMS.md) SUB-R1, SUB-R3.
-- **Design**: [`../design/03-plan-changes.md`](../design/03-plan-changes.md) §4.1–§4.2.
+- **PRD:** [PRD.md](../PRD.md), `fr-proration-ownership`, `fr-proration-triggers`, `fr-update-quantity`, `fr-versioned-billable-facts`, `fr-one-time-occurrence`.
+- **Design:** [DESIGN.md](../DESIGN.md).
