@@ -31,6 +31,9 @@ mod wire_vocabulary_round_trip {
     #[resource_error(gts_id!("cf.core.am.user.v1~"))]
     struct UserScope;
 
+    #[resource_error(gts_id!("cf.core.am.service_account.v1~"))]
+    struct ServiceAccountScope;
+
     #[resource_error(gts_id!("cf.core.am.tenant_metadata.v1~"))]
     struct MetadataScope;
 
@@ -187,6 +190,23 @@ mod wire_vocabulary_round_trip {
         assert_eq!(
             json["context"]["violations"][0]["subject"],
             quota::INTEGRITY_CHECK,
+        );
+    }
+
+    #[test]
+    fn service_account_quota_subject_round_trips_to_violations() {
+        let err = ServiceAccountScope::resource_exhausted("service-account quota reached")
+            .with_quota_violation(quota::SERVICE_ACCOUNTS, "tenant holds its maximum")
+            .create();
+        let json = problem(err);
+        assert_eq!(
+            json["context"]["violations"][0]["subject"],
+            quota::SERVICE_ACCOUNTS,
+        );
+        assert_eq!(json["status"], 429);
+        assert_eq!(
+            json["context"]["resource_type"],
+            gts::SERVICE_ACCOUNT_RESOURCE_TYPE,
         );
     }
 }

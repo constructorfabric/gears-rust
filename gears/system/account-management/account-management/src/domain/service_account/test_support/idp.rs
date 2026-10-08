@@ -71,6 +71,8 @@ pub enum FakeServiceAccountOutcome {
     /// what the SDK default impls produce for an adapter that ships no
     /// service-account support.
     Unsupported,
+    /// Returns `Err(IdpServiceAccountFailure::QuotaExceeded)`.
+    QuotaExceeded,
 }
 
 /// In-memory provider implementing the service-account methods of
@@ -241,6 +243,9 @@ fn failure_for(oc: &FakeServiceAccountOutcome) -> Option<IdpServiceAccountFailur
                 detail: ADAPTER_DETAIL.to_owned(),
             })
         }
+        FakeServiceAccountOutcome::QuotaExceeded => Some(IdpServiceAccountFailure::QuotaExceeded {
+            detail: ADAPTER_DETAIL.to_owned(),
+        }),
     }
 }
 

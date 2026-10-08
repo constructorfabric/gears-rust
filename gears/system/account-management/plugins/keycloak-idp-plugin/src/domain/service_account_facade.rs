@@ -458,18 +458,19 @@ impl ServiceAccountFacade {
         Ok(owned)
     }
 
-    /// Count `svc-<tenant>-` clients; reject at the configured quota.
+    /// Count `svc-<tenant>-` clients; reject at the configured quota with
+    /// `SaQuotaExceeded`, which AM answers 429 so the caller can tell
+    /// "tenant full" from a permanent invalid input.
     /// Best-effort cap: no cross-replica serialization, concurrent
     /// creates may briefly overshoot.
     async fn enforce_quota(&self, tenant_id: Uuid) -> Result<(), PluginError> {
         let count = self.list_owned_reps(tenant_id).await?.len();
         if count >= self.cfg.per_tenant_quota as usize {
-            return Err(PluginError::SaInvalidInput {
+            return Err(PluginError::SaQuotaExceeded {
                 detail: format!(
                     "tenant {tenant_id} already has {count} service accounts (quota {})",
                     self.cfg.per_tenant_quota,
                 ),
-                field: Some("tenant_id".into()),
             });
         }
         Ok(())

@@ -29,7 +29,7 @@
 //! | cross-tenant denied — inspect `reason` ([`reason::permission`]) | [`AccountManagementError::PermissionDenied`] | 403 |
 //! | `IdP` operation unsupported | [`AccountManagementError::Unimplemented`] | 501 |
 //! | transient outage (infra / `IdP` transport), retry hint | [`AccountManagementError::Unavailable`] | 503 |
-//! | integrity-check single-flight gate held — inspect `subject` ([`quota`]) | [`AccountManagementError::ResourceExhausted`] | 429 |
+//! | integrity-check single-flight gate held, or the tenant service-account limit reached — inspect `subject` ([`quota`]) | [`AccountManagementError::ResourceExhausted`] | 429 |
 //! | internal error | [`AccountManagementError::Internal`] | 500 |
 //! | anything else (forward-compat) | [`AccountManagementError::Other`] | — |
 //!
@@ -163,9 +163,10 @@ pub enum AccountManagementError {
         detail: String,
     },
 
-    /// A bounded resource is exhausted (HTTP 429) — today only the
-    /// hierarchy-integrity single-flight gate. `subject` is one of the
-    /// [`quota`](crate::quota) constants (`integrity_check`).
+    /// A bounded resource is exhausted (HTTP 429): the hierarchy-integrity
+    /// single-flight gate, or the tenant service-account limit. `subject`
+    /// is one of the [`quota`](crate::quota) constants
+    /// (`integrity_check`, `service_accounts`).
     #[error("resource exhausted [{subject}]: {detail}")]
     ResourceExhausted { subject: String, detail: String },
 
