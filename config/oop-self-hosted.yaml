@@ -1,0 +1,79 @@
+# Self-hosted (Profile 2) host: flight-control (control plane in-process)
+# spawning a `hello` OoP worker as a REST-first child process.
+#
+# Run:
+#   make oop-example
+#
+# Or manually:
+#   cargo build -p cf-gears-flight-control --bin flight-control
+#   cargo build -p hello --features oop_module --bin hello-oop
+#   cargo run -p cf-gears-flight-control -- --config config/oop-self-hosted.yaml run
+#
+# The host spawns `./target/debug/hello-oop` after grpc-hub binds, passing
+# `TOOLKIT_DIRECTORY_ENDPOINT` automatically. The host also renders `hello`'s
+# gear config into `TOOLKIT_MODULE_CONFIG` as a base; the worker's own
+# `--config config/oop-hello.yaml` overrides it. The worker registers with the
+# directory, and its routes appear through the edge once route sync runs.
+#
+# Then:
+#   curl http://127.0.0.1:8087/hello/v1/ping   # proxied through the edge
+#   curl http://127.0.0.1:9091/hello/v1/ping   # direct to the OoP process
+
+server:
+  home_dir: "~/.cf-gears-flight-control"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/oop-self-hosted.log"
+    file_level: info
+
+gears:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8087"
+      enable_docs: true
+      cors_enabled: false
+      openapi:
+        title: "CF/Gears Flight Control API"
+        version: "0.1.0"
+        description: "CF/Gears Flight Control API Documentation"
+      defaults:
+        body_limit_bytes: 64000000
+      auth_disabled: false
+      require_auth_by_default: true
+      gateway_proxy:
+        enabled: true
+        directory_endpoint: "http://127.0.0.1:50051"
+        sync_interval_secs: 1
+
+  service-discovery:
+    config: {}
+
+  grpc-hub:
+    config:
+      listen_addr: "127.0.0.1:50051"
+
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: accept_all
+
+  types-registry:
+    config: {}
+
+  # Spawned OoP worker: the host does not link `hello`; it runs the separate
+  # `hello-oop` binary as a child process.
+  hello:
+    runtime:
+      type: oop
+      execution:
+        executable_path: "./target/debug/hello-oop"
+        args: ["--config", "config/oop-hello.yaml"]
+        working_directory: "."
+        environment: {}

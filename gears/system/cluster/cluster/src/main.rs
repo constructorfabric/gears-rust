@@ -31,10 +31,11 @@
 //! # Configuration
 //!
 //! Resolved by the bootstrap, not here: `--config` if given, else the
-//! `MODULE_CONFIG_PATH` environment variable (`OopRunOptions::default`), merged
-//! under any `TOOLKIT_MODULE_CONFIG` rendered config a master host supplied. The
-//! probes come up only when the config carries an `oop_http` section - without one
-//! the bootstrap takes its legacy gRPC-only path and serves no HTTP at all.
+//! `TOOLKIT_CONFIG_PATH` environment variable (`OopRunOptions::default`), merged
+//! over any `TOOLKIT_MODULE_CONFIG` rendered config a spawning host supplied.
+//! The probes come up only when the config carries an `oop_http` section -
+//! without one the bootstrap takes its legacy gRPC-only path and serves no
+//! HTTP at all.
 
 mod registered_gears;
 
@@ -49,7 +50,7 @@ mod registered_gears;
 // comments, and that is a workspace-lint constraint rather than a style choice.
 // clap's derive turns doc comments into `--help` output *and* re-emits them as
 // string literals, so a doc comment here has to satisfy `clippy::doc_markdown`
-// (which wants `MODULE_CONFIG_PATH` in backticks) and `clippy::non_ascii_literal`
+// (which wants `TOOLKIT_CONFIG_PATH` in backticks) and `clippy::non_ascii_literal`
 // (which forbids `§`) while also reading well to an operator - and backticks in a
 // terminal help pane read as noise. Splitting the two audiences settles it: these
 // `//` comments are for a reader of the source, the `help = "..."` strings are for
@@ -68,7 +69,7 @@ struct Cli {
     #[arg(
         short,
         long,
-        help = "Path to the configuration file. Falls back to MODULE_CONFIG_PATH"
+        help = "Path to the configuration file. Falls back to TOOLKIT_CONFIG_PATH"
     )]
     config: Option<std::path::PathBuf>,
 
