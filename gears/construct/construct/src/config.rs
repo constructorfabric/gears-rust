@@ -8,6 +8,28 @@ pub const DEFAULT_PERSONALIZATION: bool = true;
 
 pub const DEFAULT_MODEL_TIMEOUT_MS: u64 = 30_000;
 
+pub const DEFAULT_PLANNER_MAX_ROUNDS: u32 = 10;
+
+pub const DEFAULT_PLANNER_MAX_TOKENS: u64 = 50_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerConfig {
+    #[serde(default = "default_planner_max_rounds")]
+    pub max_rounds: u32,
+    #[serde(default = "default_planner_max_tokens")]
+    pub max_tokens: u64,
+}
+
+impl Default for PlannerConfig {
+    fn default() -> Self {
+        Self {
+            max_rounds: DEFAULT_PLANNER_MAX_ROUNDS,
+            max_tokens: DEFAULT_PLANNER_MAX_TOKENS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "adapter", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelConfig {
@@ -40,6 +62,8 @@ pub struct ConstructConfig {
     pub connectors_off: Vec<Uuid>,
     #[serde(default)]
     pub model: Option<ModelConfig>,
+    #[serde(default)]
+    pub planner: PlannerConfig,
 }
 
 impl Default for ConstructConfig {
@@ -48,12 +72,21 @@ impl Default for ConstructConfig {
             personalization_default: DEFAULT_PERSONALIZATION,
             connectors_off: Vec::new(),
             model: None,
+            planner: PlannerConfig::default(),
         }
     }
 }
 
 fn default_personalization() -> bool {
     DEFAULT_PERSONALIZATION
+}
+
+fn default_planner_max_rounds() -> u32 {
+    DEFAULT_PLANNER_MAX_ROUNDS
+}
+
+fn default_planner_max_tokens() -> u64 {
+    DEFAULT_PLANNER_MAX_TOKENS
 }
 
 fn default_model_timeout_ms() -> u64 {
@@ -78,6 +111,20 @@ mod tests {
         assert!(config.personalization_default);
         assert!(config.connectors_off.is_empty());
         assert!(config.model.is_none());
+        assert_eq!(config.planner, PlannerConfig::default());
+    }
+
+    #[test]
+    fn the_planner_caps_are_read_and_a_typo_is_rejected() {
+        let config = parse(serde_json::json!({ "planner": { "max_rounds": 4 } })).expect("caps");
+        assert_eq!(
+            config.planner,
+            PlannerConfig {
+                max_rounds: 4,
+                max_tokens: DEFAULT_PLANNER_MAX_TOKENS,
+            }
+        );
+        assert!(parse(serde_json::json!({ "planner": { "max_round": 4 } })).is_err());
     }
 
     #[test]

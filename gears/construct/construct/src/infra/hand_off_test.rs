@@ -51,6 +51,24 @@ fn a_drop_event_names_the_record_and_its_cause() {
 
 #[tracing_test::traced_test]
 #[test]
+fn each_planner_cause_is_logged_by_its_name() {
+    let record = received(Some(Uuid::new_v4()));
+
+    for cause in [
+        DropCause::RoundCap,
+        DropCause::TokenCap,
+        DropCause::ModelFailed,
+    ] {
+        LogIntakeEvents.dropped(DropEvent::for_record(&record, cause));
+    }
+
+    for name in ["round_cap", "token_cap", "model_failed"] {
+        assert!(logs_contain(&format!("cause=\"{name}\"")), "{name}");
+    }
+}
+
+#[tracing_test::traced_test]
+#[test]
 fn the_drop_event_is_logged_without_record_content() {
     let subject = Uuid::new_v4();
     let record = received(Some(subject));

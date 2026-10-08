@@ -233,6 +233,9 @@ pub struct ReceivedRecord {
 pub enum DropCause {
     /// Processing could not finish.
     ProcessingFailed,
+    RoundCap,
+    TokenCap,
+    ModelFailed,
 }
 
 /// A content-free event for a dropped record: who sent it, for which tenant

@@ -11,6 +11,9 @@ pub struct LogIntakeEvents;
 fn cause(cause: DropCause) -> &'static str {
     match cause {
         DropCause::ProcessingFailed => "processing_failed",
+        DropCause::RoundCap => "round_cap",
+        DropCause::TokenCap => "token_cap",
+        DropCause::ModelFailed => "model_failed",
     }
 }
 
