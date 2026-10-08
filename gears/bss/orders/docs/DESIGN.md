@@ -6150,12 +6150,12 @@ that another customer under the same payer had an order in flight. Adding the re
 closes both: different customers never collide, and the conflicting order a refusal names always
 belongs to the caller's own resource tenant, so it is one the caller could already read under
 [08 §4.4](DESIGN.md#contract-08-4-4). The refusal **MUST NOT** name an order the caller cannot read. This
-follows the extra-dimension form Subscriptions already permits for its own key
-(`subscriptions/docs/design/03-plan-changes.md` §4.4: active subscriptions may coexist "when they
-differ on `overlapScopeKey` (extra dimensions)"), and the resource tenant is an immutable order
+follows the key Subscriptions defines for its own occupancy
+([Subscriptions PRD §6.3](../../subscriptions/docs/PRD.md#overlap-occupancy-and-cardinality): `(payerTenantId, resourceTenantId, overlapScopeKey)`,
+with the business scope key supplied by versioned policy), and the resource tenant is an immutable order
 axis after submit, not something Orders derives. The key is the one Subscriptions
 already defines and keys its own cardinality rule on: the registry-owned
-`catalogSubscriptionProductKey` of SUB-G1, "bound to a published SKU/product key" (D-163). Products
+versioned-policy `overlapScopeKey` of Subscriptions PRD §6.3 (historically SUB-G1's `catalogSubscriptionProductKey`, D-163). Products
 no longer has a Product entity but still has SKUs, and resolve names each item's `sku_id` and
 `charge_kind`, so the derivation proposed to Subscriptions is the SKU of the line's paid `recurring`
 item(s); `plan_id` is not proposed, because two plans selling the same family would stop colliding.
@@ -11944,7 +11944,7 @@ Primary engineering basis: [PostgreSQL row locking](https://www.postgresql.org/d
 and [serializable isolation](https://www.postgresql.org/docs/current/transaction-iso.html) provide local
 transaction boundaries; [sagas](https://microservices.io/patterns/data/saga.html) require explicit
 compensation/isolation controls. Local precedents are [ADR-0007](ADR/0007-cpt-cf-bss-orders-adr-in-transaction-concurrency.md),
-[Subscriptions async foundation](../../subscriptions/docs/design/01-foundation-lifecycle.md),
+[Subscriptions foundation](../../subscriptions/docs/features/01-foundation.md),
 and [coord's external-effect limitations](../../libs/coord/README.md). These support the design,
 not a claim that missing peer runtime has been implemented.
 
