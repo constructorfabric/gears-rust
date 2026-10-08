@@ -1497,7 +1497,11 @@ one. Gear names in diagnostics are not identity or authority.
 `list_entities`, keeping the contract minimal and object-safe while preserving the call shapes
 consumers already use: `get_type_schema`, `get_instance`, `get_type_schemas`, `get_instances`, their
 `_by_uuid` variants, `list_type_schemas`, `list_instances`. Kind narrowing costs no round
-trip, since the kind is the trailing `~` of the identifier. `EntitySnapshot` likewise exposes the
+trip, since the kind is the trailing `~` of the identifier. One change to those shapes: the
+plural reads answer `Result<HashMap<key, Result<EntitySnapshot, _>>, CanonicalError>`. Each key
+is answered on its own — absence or a refused identifier is that key's error — while a batch
+read that fails fails the call, so an outage is never spread across the keys as if each had
+been answered. `EntitySnapshot` likewise exposes the
 materialized documents as **plain fields** — `content`, `resolved_schema`,
 `effective_traits`, `effective_traits_schema` — plus a small `segments` accessor, so a
 consumer that previously called the old models' computed methods reads a field instead.

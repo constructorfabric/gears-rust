@@ -162,13 +162,18 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         .await
     }
 
-    /// Type Schemas by identifier; per-key results in batches of [`MAX_BATCH_GET_KEYS`].
+    /// Type Schemas by identifier, read in batches of [`MAX_BATCH_GET_KEYS`]. Each key is
+    /// answered on its own: absence is that key's `NotFound`, and an identifier of the
+    /// wrong kind is that key's `InvalidArgument`, refused without transport.
+    ///
+    /// # Errors
+    /// The error of a batch read that failed; the call then reads no further batch.
     async fn get_type_schemas(
         &self,
         ctx: &PlatformSecurityContext,
         type_ids: Vec<String>,
         projection: Projection,
-    ) -> HashMap<String, Result<EntitySnapshot, CanonicalError>> {
+    ) -> Result<HashMap<String, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
         get_many_by_id(
             &PlatformReads { api: self, ctx },
             type_ids,
@@ -178,13 +183,16 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         .await
     }
 
-    /// Instances by identifier, each answered on its own.
+    /// Instances by identifier, as [`Self::get_type_schemas`].
+    ///
+    /// # Errors
+    /// As [`Self::get_type_schemas`].
     async fn get_instances(
         &self,
         ctx: &PlatformSecurityContext,
         ids: Vec<String>,
         projection: Projection,
-    ) -> HashMap<String, Result<EntitySnapshot, CanonicalError>> {
+    ) -> Result<HashMap<String, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
         get_many_by_id(
             &PlatformReads { api: self, ctx },
             ids,
@@ -194,13 +202,17 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         .await
     }
 
-    /// Type Schemas by Registry Reference, each answered on its own.
+    /// Type Schemas by Registry Reference, each answered on its own; a reference to an
+    /// Instance is that key's `NotFound`.
+    ///
+    /// # Errors
+    /// As [`Self::get_type_schemas`].
     async fn get_type_schemas_by_uuid(
         &self,
         ctx: &PlatformSecurityContext,
         type_uuids: Vec<Uuid>,
         projection: Projection,
-    ) -> HashMap<Uuid, Result<EntitySnapshot, CanonicalError>> {
+    ) -> Result<HashMap<Uuid, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
         get_many_by_uuid(
             &PlatformReads { api: self, ctx },
             type_uuids,
@@ -210,13 +222,16 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         .await
     }
 
-    /// Instances by Registry Reference, each answered on its own.
+    /// Instances by Registry Reference, as [`Self::get_type_schemas_by_uuid`].
+    ///
+    /// # Errors
+    /// As [`Self::get_type_schemas`].
     async fn get_instances_by_uuid(
         &self,
         ctx: &PlatformSecurityContext,
         uuids: Vec<Uuid>,
         projection: Projection,
-    ) -> HashMap<Uuid, Result<EntitySnapshot, CanonicalError>> {
+    ) -> Result<HashMap<Uuid, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
         get_many_by_uuid(
             &PlatformReads { api: self, ctx },
             uuids,
@@ -354,45 +369,57 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
     }
 
     /// As [`PlatformTypesRegistryApiExt::get_type_schemas`].
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApiExt::get_type_schemas`].
     async fn get_type_schemas(
         &self,
         ctx: &SecurityContext,
         type_ids: Vec<String>,
         projection: Projection,
-    ) -> HashMap<String, Result<EntitySnapshot, CanonicalError>> {
+    ) -> Result<HashMap<String, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
         let reads = TenantReads { api: self, ctx };
         get_many_by_id(&reads, type_ids, EntityKind::TypeSchema, projection).await
     }
 
     /// As [`PlatformTypesRegistryApiExt::get_instances`].
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApiExt::get_type_schemas`].
     async fn get_instances(
         &self,
         ctx: &SecurityContext,
         ids: Vec<String>,
         projection: Projection,
-    ) -> HashMap<String, Result<EntitySnapshot, CanonicalError>> {
+    ) -> Result<HashMap<String, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
         let reads = TenantReads { api: self, ctx };
         get_many_by_id(&reads, ids, EntityKind::Instance, projection).await
     }
 
     /// As [`PlatformTypesRegistryApiExt::get_type_schemas_by_uuid`].
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApiExt::get_type_schemas`].
     async fn get_type_schemas_by_uuid(
         &self,
         ctx: &SecurityContext,
         type_uuids: Vec<Uuid>,
         projection: Projection,
-    ) -> HashMap<Uuid, Result<EntitySnapshot, CanonicalError>> {
+    ) -> Result<HashMap<Uuid, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
         let reads = TenantReads { api: self, ctx };
         get_many_by_uuid(&reads, type_uuids, EntityKind::TypeSchema, projection).await
     }
 
     /// As [`PlatformTypesRegistryApiExt::get_instances_by_uuid`].
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApiExt::get_type_schemas`].
     async fn get_instances_by_uuid(
         &self,
         ctx: &SecurityContext,
         uuids: Vec<Uuid>,
         projection: Projection,
-    ) -> HashMap<Uuid, Result<EntitySnapshot, CanonicalError>> {
+    ) -> Result<HashMap<Uuid, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
         let reads = TenantReads { api: self, ctx };
         get_many_by_uuid(&reads, uuids, EntityKind::Instance, projection).await
     }
@@ -511,7 +538,7 @@ async fn get_many_by_id<R: EntityReads + ?Sized>(
     ids: Vec<String>,
     kind: EntityKind,
     projection: Projection,
-) -> HashMap<String, Result<EntitySnapshot, CanonicalError>> {
+) -> Result<HashMap<String, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
     let mut out = HashMap::with_capacity(ids.len());
     let mut keys = Vec::with_capacity(ids.len());
     for raw in ids {
@@ -522,10 +549,10 @@ async fn get_many_by_id<R: EntityReads + ?Sized>(
             }
         }
     }
-    for (raw, result) in get_many(reads, keys, kind, projection).await {
+    for (raw, result) in get_many(reads, keys, kind, projection).await? {
         out.insert(raw, result);
     }
-    out
+    Ok(out)
 }
 
 async fn get_many_by_uuid<R: EntityReads + ?Sized>(
@@ -533,24 +560,25 @@ async fn get_many_by_uuid<R: EntityReads + ?Sized>(
     uuids: Vec<Uuid>,
     kind: EntityKind,
     projection: Projection,
-) -> HashMap<Uuid, Result<EntitySnapshot, CanonicalError>> {
+) -> Result<HashMap<Uuid, Result<EntitySnapshot, CanonicalError>>, CanonicalError> {
     let keys = uuids
         .into_iter()
         .map(|uuid| (uuid, EntityKey::GtsUuid(uuid)))
         .collect();
-    get_many(reads, keys, kind, projection)
-        .await
+    Ok(get_many(reads, keys, kind, projection)
+        .await?
         .into_iter()
-        .collect()
+        .collect())
 }
 
-/// Reads `keys` in bounded batches; a failed batch fails each of its keys.
+/// Reads `keys` in bounded batches. A failed batch fails the call: no later batch is
+/// read, and no partial answer is returned beside the error.
 async fn get_many<R: EntityReads + ?Sized, K>(
     reads: &R,
     keys: Vec<(K, EntityKey)>,
     kind: EntityKind,
     projection: Projection,
-) -> Vec<(K, Result<EntitySnapshot, CanonicalError>)> {
+) -> Result<Vec<(K, Result<EntitySnapshot, CanonicalError>)>, CanonicalError> {
     let mut out = Vec::with_capacity(keys.len());
     let mut keys = keys.into_iter().peekable();
     while keys.peek().is_some() {
@@ -563,30 +591,26 @@ async fn get_many<R: EntityReads + ?Sized, K>(
             projection: projection.clone(),
             fresh: false,
         };
-        match reads.batch_get(request).await {
-            Ok(mut lookups) => {
-                // Move the lookup on its last use; earlier duplicate keys need clones.
-                let mut left: HashMap<EntityKey, usize> = HashMap::with_capacity(chunk.len());
-                for (_, key) in &chunk {
-                    *left.entry(key.clone()).or_default() += 1;
-                }
-                for (asked, key) in chunk {
-                    let last = left.get_mut(&key).is_none_or(|n| {
-                        *n -= 1;
-                        *n == 0
-                    });
-                    let lookup = if last {
-                        lookups.0.remove(&key)
-                    } else {
-                        lookups.0.get(&key).cloned()
-                    };
-                    out.push((asked, answer(&key, kind, lookup)));
-                }
-            }
-            Err(e) => out.extend(chunk.into_iter().map(|(asked, _)| (asked, Err(e.clone())))),
+        let mut lookups = reads.batch_get(request).await?;
+        // Move the lookup on its last use; earlier duplicate keys need clones.
+        let mut left: HashMap<EntityKey, usize> = HashMap::with_capacity(chunk.len());
+        for (_, key) in &chunk {
+            *left.entry(key.clone()).or_default() += 1;
+        }
+        for (asked, key) in chunk {
+            let last = left.get_mut(&key).is_none_or(|n| {
+                *n -= 1;
+                *n == 0
+            });
+            let lookup = if last {
+                lookups.0.remove(&key)
+            } else {
+                lookups.0.get(&key).cloned()
+            };
+            out.push((asked, answer(&key, kind, lookup)));
         }
     }
-    out
+    Ok(out)
 }
 
 async fn list_kind<R: EntityReads + ?Sized>(

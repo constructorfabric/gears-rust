@@ -209,14 +209,16 @@ async fn a_key_named_twice_gets_the_one_answer_under_each_spelling() {
             vec![TYPE.to_owned(), TYPE.to_owned()],
             Projection::Default,
         )
-        .await;
+        .await
+        .expect("the reads succeed");
     assert_eq!(by_id.len(), 1);
     assert!(by_id[TYPE].is_ok(), "{:?}", by_id[TYPE]);
 
     let uuid = id(TYPE).to_uuid();
     let by_uuid = fake
         .get_type_schemas_by_uuid(&ctx(), vec![uuid, uuid], Projection::Default)
-        .await;
+        .await
+        .expect("the reads succeed");
     assert_eq!(by_uuid.len(), 1);
     assert!(by_uuid[&uuid].is_ok(), "{:?}", by_uuid[&uuid]);
 }
@@ -233,7 +235,8 @@ async fn a_large_read_is_split_into_bounded_batches_and_answers_every_key() {
 
     let answers = fake
         .get_type_schemas(&ctx(), ids.clone(), Projection::Default)
-        .await;
+        .await
+        .expect("the reads succeed");
 
     assert_eq!(fake.batch_reads(), 2);
     assert_eq!(answers.len(), 150);
@@ -251,7 +254,8 @@ async fn a_malformed_identifier_fails_only_its_own_entry() {
             vec![TYPE.to_owned(), "not-an-id".to_owned()],
             Projection::Default,
         )
-        .await;
+        .await
+        .expect("the reads succeed");
 
     assert!(answers[TYPE].is_ok());
     assert!(matches!(
@@ -378,9 +382,9 @@ async fn a_list_helper_stops_after_its_page_bound() {
 }
 
 #[tokio::test]
-async fn a_failed_batch_fails_only_its_own_keys() {
+async fn a_failed_batch_fails_the_whole_call_and_reads_no_further() {
     let fake = FakePlatformRegistry::new();
-    let ids: Vec<String> = (0..150)
+    let ids: Vec<String> = (0..250)
         .map(|n| format!("gts.cf.test.pkg.t{n:03}.v1~"))
         .collect();
     for id in &ids {
@@ -388,22 +392,37 @@ async fn a_failed_batch_fails_only_its_own_keys() {
     }
     fake.fault_reads(ReadFault::FailOnly(2));
 
-    let answers = fake
-        .get_type_schemas(&ctx(), ids.clone(), Projection::Default)
-        .await;
+    let error = fake
+        .get_type_schemas(&ctx(), ids, Projection::Default)
+        .await
+        .expect_err("the second batch failed");
 
-    assert_eq!(answers.len(), 150);
-    let (first, second) = ids.split_at(crate::ext::MAX_BATCH_GET_KEYS);
     assert!(
-        first.iter().all(|id| answers[id].is_ok()),
-        "the first batch answers"
+        matches!(error, CanonicalError::ServiceUnavailable { .. }),
+        "the call fails with the read's own error, once: {error:?}"
     );
-    assert!(
-        second
-            .iter()
-            .all(|id| matches!(answers[id], Err(CanonicalError::ServiceUnavailable { .. }))),
-        "every key of the failed batch carries its error"
-    );
+    assert_eq!(fake.batch_reads(), 2, "no batch is read after the failure");
+}
+
+#[tokio::test]
+async fn a_locally_refused_key_or_an_empty_read_needs_no_transport() {
+    let fake = FakePlatformRegistry::new();
+
+    let answers = fake
+        .get_type_schemas(&ctx(), vec!["not-an-id".to_owned()], Projection::Default)
+        .await
+        .expect("nothing was read, so nothing failed");
+
+    assert!(matches!(
+        answers["not-an-id"],
+        Err(CanonicalError::InvalidArgument { .. })
+    ));
+    let none = fake
+        .get_instances_by_uuid(&ctx(), Vec::new(), Projection::Default)
+        .await
+        .expect("an empty read reads nothing");
+    assert!(none.is_empty());
+    assert_eq!(fake.batch_reads(), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -639,7 +658,8 @@ mod tenant {
         assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
         let many = api
             .get_instances(&tenant(), vec![TYPE.to_owned()], Projection::Default)
-            .await;
+            .await
+            .expect("the reads succeed");
         assert!(matches!(
             many.get(TYPE),
             Some(Err(CanonicalError::InvalidArgument { .. }))
@@ -678,7 +698,8 @@ mod tenant {
                 vec![TYPE.to_owned(), absent.to_owned()],
                 Projection::Default,
             )
-            .await;
+            .await
+            .expect("the reads succeed");
         assert!(schemas[TYPE].is_ok());
         assert!(matches!(
             schemas[absent],
@@ -686,7 +707,8 @@ mod tenant {
         ));
         let instances = api
             .get_instances_by_uuid(&tenant(), vec![id(INSTANCE).to_uuid()], Projection::Default)
-            .await;
+            .await
+            .expect("the reads succeed");
         assert!(instances[&id(INSTANCE).to_uuid()].is_ok());
         assert_eq!(fake.batch_reads(), 5, "the two-key read is one batch");
     }
