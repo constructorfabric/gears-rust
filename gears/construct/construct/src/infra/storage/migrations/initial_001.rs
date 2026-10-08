@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS construct__foundation_notes (
     tenant_id BINARY(16) NOT NULL,
     text TEXT NOT NULL,
     INDEX idx_construct__foundation_notes__tenant (tenant_id)
-);
+) DEFAULT CHARACTER SET utf8mb4;
                 "
         }
         sea_orm::DatabaseBackend::Sqlite => {
