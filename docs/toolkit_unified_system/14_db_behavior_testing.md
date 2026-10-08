@@ -19,14 +19,14 @@
     - [R8. UUIDs are bound as Uuid](#r8-uuids-are-bound-as-uuid)
     - [R9. On MySQL only Update and Share locks](#r9-on-mysql-only-update-and-share-locks)
   - [Migrations](#migrations)
-    - [R10. A shipped migration is never edited](#r10-a-shipped-migration-is-never-edited)
+    - [R10. A shipped migration's up() is never edited](#r10-a-shipped-migrations-up-is-never-edited)
     - [R11. A SQLite table rebuild keeps its child rows](#r11-a-sqlite-table-rebuild-keeps-its-child-rows)
     - [R12. down() says what it does](#r12-down-says-what-it-does)
   - [Tests](#tests)
     - [T1. A suite CI relies on fails instead of skipping](#t1-a-suite-ci-relies-on-fails-instead-of-skipping)
     - [T2. Assertions check the outcome](#t2-assertions-check-the-outcome)
     - [T3. Concurrent callers start on a barrier](#t3-concurrent-callers-start-on-a-barrier)
-    - [T4. Lock- and type-dependent behaviour is tested on a real PostgreSQL](#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-postgresql)
+    - [T4. Lock- and type-dependent behaviour is tested on a real server engine](#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-server-engine)
     - [T5. A migration that adds a constraint meets a violating row](#t5-a-migration-that-adds-a-constraint-meets-a-violating-row)
 - [How to run an audit](#how-to-run-an-audit)
   - [Barrier-test template](#barrier-test-template)
@@ -79,7 +79,9 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
   with a negative control ([How to run an audit](#how-to-run-an-audit), step 8).
 
 #### R2. The retry can fire
-- **Rule.** For a contention failure, `as_db_err` returns a `DbErr` the classifier recognizes after every `map_err`.
+- **Rule.** For a contention failure, the extractor passed to `transaction_with_retry` (the gear's own
+  `Fn(&E) -> Option<&DbErr>`, called `as_db_err` in the examples) returns a `DbErr` the classifier recognizes after
+  every `map_err`.
 - **Why.** The backend-dispatched classifier matches the SQLSTATE or error code, or the message text, including the
   text of a `DbErr::Custom`. If the error was flattened into a `String` that `as_db_err` cannot return as a `DbErr`, or
   a conversion drops that text, the loop never retries and the wrapper is dead code. A `.to_string()` used only for a
@@ -98,7 +100,9 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
   those deadlocks is a choice, see [Row locks and dialects](../arch/database/TRADEOFFS.md#row-locks-and-dialects).
 - **Cost.** Sorting the keys before the loop.
 - **How to find it.** A loop of `update`/`delete`/locking `select` inside a transaction over an unsorted collection.
-- **How to test it.** A looped PostgreSQL barrier test running two opposite-order inputs and asserting both complete.
+- **How to test it.** A looped PostgreSQL barrier test running two opposite-order inputs without retry
+  (`transaction_with_retry_max` with `max_attempts` 1, or a plain transaction, so a `40P01` surfaces) and asserting
+  both complete.
 
 ### Queries
 
@@ -107,34 +111,37 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
   unbounded.
 - **Why.** Every backend caps bind parameters per statement; above the cap the statement fails at run time, usually
   only on production-sized data.
-- **Cost.** The rule itself costs nothing; each way of staying under the cap (bounding the input, chunking against
-  `max_bind_params_for` with headroom for the other predicates including the scope's tenant filter, a PostgreSQL array
-  parameter) has its own cost, see [Batching and bind budgets](../arch/database/TRADEOFFS.md#batching-and-bind-budgets).
-- **How to find it.** `is_in(..)` or `insert_many(..)` fed by a collection loaded from the database or from an
-  unbounded request field.
+- **Cost.** The rule itself costs nothing; each way of staying under the cap has its own cost, see
+  [Batching and bind budgets](../arch/database/TRADEOFFS.md#batching-and-bind-budgets).
+- **How to find it.** `is_in(..)` or `.insert_many(..).secure()…exec(..)` (the `SecureInsertMany` builder, which does
+  not split) fed by a collection loaded from the database or from an unbounded request field; the toolkit's
+  `secure_insert_many` function splits its rows by itself and is exempt.
 - **How to test it.** Run the operation with a list above the chunk size (or make the chunk size a parameter the test
   can lower) and assert each `param_count` in `rec.events()` is at most `max_bind_params_for`.
 
 #### R5. A paginated query has a total order
-- **Rule.** The `ORDER BY` of every hand-written paginated query, offset or keyset, ends with a unique column in the
-  same direction. The OData layer refuses `$skip`
+- **Rule.** The `ORDER BY` of every hand-written paginated query, offset or keyset, ends with a unique column. The
+  OData layer refuses `$skip`
   ([`07_odata_pagination_select_filter.md`, Unsupported system query options](07_odata_pagination_select_filter.md#unsupported-system-query-options));
   this is about hand-written `.offset()` and cursors. Offset versus keyset is a choice, see
   [Pagination](../arch/database/TRADEOFFS.md#pagination).
   ```rust
   // BAD: equal created_at values may swap order between pages
   CatEntity::find().order_by_desc(cat::Column::CreatedAt).limit(n).offset(m)
+      .secure().scope_with(&scope).all(runner).await?;
 
   // GOOD: unique tie-breaker, same direction
-  CatEntity::find().order_by_desc(cat::Column::CreatedAt)
-      .order_by_desc(cat::Column::Id).limit(n).offset(m)
+  CatEntity::find().order_by_desc(cat::Column::CreatedAt).order_by_desc(cat::Column::Id).limit(n).offset(m)
+      .secure().scope_with(&scope).all(runner).await?;
   ```
 - **Why.** Rows equal on the sort key can swap order between page queries: duplicates or skips, no error.
-- **Cost.** The index that serves the sort carries the unique column as its trailing key, or the database adds a sort
-  step.
+- **Cost.** The index that serves the sort carries the unique column as its trailing key, each key in the direction the
+  `ORDER BY` uses (or all reversed, which a backward scan serves), or the database adds a sort step; MySQL before 8.0
+  sorts for mixed directions.
 - **How to find it.** Every `.offset(` or hand-written cursor: the last `order_by` is a unique column.
-- **How to test it.** On SQLite insert rows sharing one sort value, page through, assert the ids across pages equal the
-  inserted set, with no duplicates or omissions.
+- **How to test it.** In the operation's trace, assert that the statement's `ORDER BY` (the `sql` of its event in
+  `rec.events()`) ends with the unique column. Paging through tied rows on SQLite passes with the defect present,
+  since an index-served sort on SQLite returns ties in rowid order, deterministically.
 
 #### R6. Existence is checked with LIMIT 1
 - **Rule.** A yes/no question uses `.one(..)` (a `LIMIT 1` query), never `COUNT(*) > 0`. Whether a list page carries a
@@ -152,7 +159,7 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
       .secure().scope_with(&scope).one(runner).await?.is_some();
   ```
 - **Why.** `COUNT` reads every match; `LIMIT 1` stops at the first.
-- **Cost.** None; `LIMIT 1` is never slower.
+- **Cost.** `.one()` reads one whole row where `COUNT` returns a number; for a single row this is negligible.
 - **How to find it.** `.count(` compared with zero.
 - **How to test it.** A static scan for `.count(` compared with zero, or assert the operation's trace has `LIMIT` and
   no `COUNT(*)`.
@@ -175,7 +182,7 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
 - **Cost.** None.
 - **How to find it.** A UUID column filtered with a `String`/`&str`.
 - **How to test it.** Run the predicate on a real PostgreSQL
-  ([T4](#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-postgresql)).
+  ([T4](#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-server-engine)).
 
 #### R9. On MySQL only Update and Share locks
 - **Rule.** A gear that runs on MySQL uses only `LockType::Update` and `LockType::Share`.
@@ -187,12 +194,13 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
 
 ### Migrations
 
-#### R10. A shipped migration is never edited
-- **Rule.** A change to the schema is a new migration; a migration that has shipped is never edited.
+#### R10. A shipped migration's up() is never edited
+- **Rule.** A change to the schema is a new migration; the `up()` of a migration that has run anywhere beyond
+  the author's own machine is never edited.
 - **Why.** Databases that already ran it keep the old schema while new ones get the edited one, and nothing records
   the difference.
 - **Cost.** Every change, however small, is a new migration.
-- **How to find it.** The diff modifies an existing migration file instead of adding one.
+- **How to find it.** The diff modifies the `up()` of an existing migration instead of adding a migration.
 - **How to test it.** Review only.
 
 #### R11. A SQLite table rebuild keeps its child rows
@@ -203,8 +211,9 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
 - **Cost.** The migration copies child rows out and back, or rebuilds the children as well: more code, a longer
   migration.
 - **How to find it.** A `DROP TABLE` of a referenced table on the SQLite path.
-- **How to test it.** Seed a parent with children, run `up()`, assert the children are intact; check the rebuild in a
-  real `sqlite3` session with the pragma set explicitly.
+- **How to test it.** Seed a parent with children, run `up()`, assert the children are intact; reproduce the rebuild
+  in a `sqlite3` session: `PRAGMA foreign_keys = ON;` before `BEGIN` (the CLI default is off and the pragma is ignored
+  inside a transaction), then the rebuild inside `BEGIN`/`COMMIT` as the runner runs it.
 
 #### R12. down() says what it does
 - **Rule.** `down()` undoes `up()`, or returns `Err(DbErr::Migration(..))` stating why it cannot; a documented
@@ -247,9 +256,8 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
   defect has a named assertion; an `#[ignore]`d one names the defect in its reason string.
 
 #### T3. Concurrent callers start on a barrier
-- **Rule.** A concurrency test releases its callers with a barrier, never a `sleep`, and asserts the table state. A
-  barrier only starts the calls together; a passing run does not rule out a race, only a failed post-state assertion
-  demonstrates it (see the [template](#barrier-test-template)).
+- **Rule.** A concurrency test releases its callers with a barrier, never a `sleep`, and asserts the table state. What a
+  passing run proves is explained under the [template](#barrier-test-template).
   ```rust
   // BAD: sleep is a timing guess; the assertion ignores table state
   let t1 = tokio::spawn(async move { svc1.create(a).await });
@@ -272,8 +280,9 @@ present; "None." is written only where a rule really costs nothing. `rec` is the
 - **How to find it.** `tokio::time::sleep` between the spawns of a concurrency test.
 - **How to test it.** The test itself; revert the fix and confirm the post-state assertion fails.
 
-#### T4. Lock- and type-dependent behaviour is tested on a real PostgreSQL
-- **Rule.** Behaviour that depends on a lock or a column type is tested on a real PostgreSQL, not only on SQLite.
+#### T4. Lock- and type-dependent behaviour is tested on a real server engine
+- **Rule.** Behaviour that depends on a lock or a column type is tested on a real server engine the gear runs on
+  (PostgreSQL, and MySQL where supported), not only on SQLite.
 - **Why.** SQLite renders no lock at all and serializes writers per database, and it compares a UUID with `TEXT`
   silently, so a SQLite run proves nothing about a lock or a typed predicate; only a real engine tells "no rows
   matched" from "the query would not run"
@@ -371,12 +380,12 @@ the plain barrier for likely races, the hook to reproduce one deterministically.
 
 | Test kind | What it can show | Dialect | Used for |
 |---|---|---|---|
-| SQLite unit test (setup from [`12_unit_testing.md`](12_unit_testing.md)) | Sequential behaviour, error mapping, page order | SQLite | [R5](#r5-a-paginated-query-has-a-total-order), [R6](#r6-existence-is-checked-with-limit-1), [R7](#r7-constraint-violations-are-recognized-by-code), [T2](#t2-assertions-check-the-outcome), and pinned choices that do not depend on concurrency |
-| Query-recorder trace test | Statement shape, transaction boundaries, statement and bind counts | SQLite suffices | [R4](#r4-no-statement-binds-a-list-that-can-outgrow-the-bind-limit), [audit steps 6-7](#how-to-run-an-audit) |
+| SQLite unit test (setup from [`12_unit_testing.md`](12_unit_testing.md)) | Sequential behaviour, error mapping | SQLite | [R6](#r6-existence-is-checked-with-limit-1), [R7](#r7-constraint-violations-are-recognized-by-code), [T2](#t2-assertions-check-the-outcome), and pinned choices that do not depend on concurrency |
+| Query-recorder trace test | Statement shape, `ORDER BY`, transaction boundaries, statement and bind counts | SQLite suffices | [R4](#r4-no-statement-binds-a-list-that-can-outgrow-the-bind-limit), [R5](#r5-a-paginated-query-has-a-total-order), [audit steps 6-7](#how-to-run-an-audit) |
 | Static source rule with a negative control | What SQL cannot show | N/A | [R1](#r1-a-retried-closure-is-safe-to-run-again), [R6](#r6-existence-is-checked-with-limit-1), [R7](#r7-constraint-violations-are-recognized-by-code) |
 | Barrier test, looped where needed (can fail, cannot prove) | Races and deadlocks | PostgreSQL only | [R3](#r3-rows-locked-one-at-a-time-are-locked-in-key-order), [T3](#t3-concurrent-callers-start-on-a-barrier), check-then-act and conditional-write choices |
-| Feature-gated real-engine suite (`testcontainers`, in-process, no HTTP) | Locks, types, backend errors | PostgreSQL (and MySQL where supported) | [R8](#r8-uuids-are-bound-as-uuid), [R9](#r9-on-mysql-only-update-and-share-locks), [T4](#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-postgresql); [`13_e2e_testing.md`](13_e2e_testing.md#coverage-goal-one-call-per-api-method) says which PostgreSQL suite to use |
-| Migration test on both backends | `up`/`down`/`up`, rebuilds, constraints on populated data | Both; a SQLite rebuild also in a raw `sqlite3` session | [R10](#r10-a-shipped-migration-is-never-edited), [R11](#r11-a-sqlite-table-rebuild-keeps-its-child-rows), [R12](#r12-down-says-what-it-does), [T5](#t5-a-migration-that-adds-a-constraint-meets-a-violating-row); [`11_database_patterns.md`](11_database_patterns.md#database-migrations) |
+| Feature-gated real-engine suite (`testcontainers`, in-process, no HTTP) | Locks, types, backend errors | PostgreSQL (and MySQL where supported) | [R8](#r8-uuids-are-bound-as-uuid), [R9](#r9-on-mysql-only-update-and-share-locks), [T4](#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-server-engine); [`13_e2e_testing.md`](13_e2e_testing.md#coverage-goal-one-call-per-api-method) says which PostgreSQL suite to use |
+| Migration test on both backends | `up`/`down`/`up`, rebuilds, constraints on populated data | Both; a SQLite rebuild also in a raw `sqlite3` session | [R10](#r10-a-shipped-migrations-up-is-never-edited), [R11](#r11-a-sqlite-table-rebuild-keeps-its-child-rows), [R12](#r12-down-says-what-it-does), [T5](#t5-a-migration-that-adds-a-constraint-meets-a-violating-row); [`11_database_patterns.md`](11_database_patterns.md#database-migrations) |
 
 Needs HTTP and a real database: E2E ([`13_e2e_testing.md`](13_e2e_testing.md)). Needs real PostgreSQL/MySQL but no
 HTTP: a feature-gated Rust suite inside the gear, outside the unit/E2E split; name it in the gear's testing doc.

@@ -10,6 +10,7 @@
 - [Isolation levels](#isolation-levels)
 - [Retrying aborted transactions](#retrying-aborted-transactions)
 - [Row locks and dialects](#row-locks-and-dialects)
+- [JSON columns](#json-columns)
 - [Indexes](#indexes)
 - [Pagination](#pagination)
 - [Counting and existence](#counting-and-existence)
@@ -23,15 +24,14 @@
 
 ## How to read this
 
-This is not an instruction. It lists approaches with what they give and what they cost; each case is decided by the
-people who own the code and know its numbers. Load is one axis; data distribution, contention pattern, dialect, how
-bad a violation is and whether a populated table must migrate without downtime all change the answer.
+This is not an instruction and gives no recommendations. Each topic lists the options with what each one gives and
+what it costs. Which cost to accept is decided per case by the people who own the code and know its numbers: load,
+data distribution, contention pattern, dialect, how bad a violation is and whether a populated table must migrate
+without downtime all change the answer.
 
-Each topic gives one paragraph per option and ends with **Test recommended**: a test that fails if the chosen option
-is later changed, built with the tools in
-[`14_db_behavior_testing.md`](../../toolkit_unified_system/14_db_behavior_testing.md). Record the choice at
-the call site, in the gear's design doc, or in an ADR when callers or consumers depend on the guarantee. Rules with no
-exception are in
+How a chosen option is recorded and pinned by a test is described in
+[`14_db_behavior_testing.md`, How to run an audit](../../toolkit_unified_system/14_db_behavior_testing.md#how-to-run-an-audit).
+Rules with no exception are in
 [`14_db_behavior_testing.md`, Rules](../../toolkit_unified_system/14_db_behavior_testing.md#rules)
 (the R1-R12 and T1-T5 links below point there) and are not repeated here. Examples use the fictional `Cat` /
 `Kitten` entities.
@@ -44,11 +44,11 @@ snapshot; even a single `DELETE .. WHERE NOT EXISTS (..)` re-checks only the par
 new child. `REPEATABLE READ` still allows write skew.
 
 **Database constraint.** A unique index, an FK with `ON DELETE RESTRICT`, or a `CHECK` makes the write fail when the
-invariant would break; the violation is mapped to a domain error. Always correct and the default whenever the
-invariant fits, but it cannot express "at most N kittens" or "no cycles". The caller gets a new error to handle; on
-PostgreSQL a unique violation aborts the transaction, so insert-or-keep is `INSERT .. ON CONFLICT DO NOTHING`; an FK
-check on a child insert takes `FOR KEY SHARE` on the parent; parent deletes stay cheap only with an index on the
-child's FK column ([Indexes](#indexes)).
+invariant would break, and the violation is mapped to a domain error. It is correct for every invariant a constraint
+can express, and cannot express "at most N kittens" or "no cycles". The caller gets a new error to handle. On
+PostgreSQL a unique violation aborts the whole transaction, which `INSERT .. ON CONFLICT DO NOTHING` avoids. An FK check
+on a child insert takes `FOR KEY SHARE` on the parent, and parent deletes scan the child table unless its FK column is
+indexed ([Indexes](#indexes)).
 
 ```rust
 // the FK (kitten.cat_id REFERENCES cat ON DELETE RESTRICT) decides; no pre-check, no extra isolation
@@ -61,42 +61,38 @@ match res {
 }
 ```
 
-**Parent row lock.** Lock the parent first (`.lock(LockType::Update)` before `.secure()`), then check and write. Cheap
-while contention is rare; a hot parent becomes a queue and a deadlock source. It holds only if every writer takes the
-same lock in the same order, nothing external runs under it, and the child has an FK to the parent (`NoKeyUpdate`
-would let child inserts through); a writer that does not lock is delayed, not made to re-check. SQLite has no row
-locks.
+**Parent row lock.** The transaction locks the parent first (`.lock(LockType::Update)` before `.secure()`), then
+checks and writes. It costs little while contention is rare; a hot parent becomes a queue and a deadlock source. It
+holds only if every writer takes the same lock in the same order, nothing external runs under it, and the child has
+an FK to the parent (`NoKeyUpdate` would let child inserts through); a writer that does not lock is delayed, not made
+to re-check. SQLite has no row locks.
 
 **`SERIALIZABLE` with retry.** The database aborts one of two conflicting transactions with `40001` and
-`transaction_with_retry` re-runs it. No lock design, and it covers set-shaped predicates such as a cycle check, but
-aborts grow with contention and transaction length, and every writer that can break the predicate must run
-`SERIALIZABLE` too.
+`transaction_with_retry` re-runs it. It needs no lock design and covers set-shaped predicates such as a cycle check;
+aborts grow with contention and transaction length, and a writer that can break the predicate is covered only if it
+runs `SERIALIZABLE` too.
 
-**Advisory lock.** The toolkit `LockManager` gives mutual exclusion per key, such as one sweep or job at a time. One
-session per process holds all keys, so a lost connection drops them; a writer that skips the lock is not stopped; on
-SQLite it works per host only. For jobs, not rows.
+**Advisory lock.** The toolkit `LockManager` gives mutual exclusion per key, such as one sweep or job at a time, not
+per row. One session per process holds all keys, so a lost connection drops them; a writer that skips the lock is not
+stopped; on SQLite it coordinates processes on one host only.
 
-**Accept the race.** Keep the pre-check alone: violations will happen and need detection and repair. Fine for an
-advisory check (a UX hint), not for money, authorization or identity.
-
-**Test recommended:** a SQLite test (deleting a cat with kittens returns `Conflict`, a missing cat `NotFound`) and a
-PostgreSQL [barrier test](../../toolkit_unified_system/14_db_behavior_testing.md#barrier-test-template) on the
-post-state invariant; a `SERIALIZABLE` path also asserts `rec.all_in_serializable_transaction()` on itself and its
-sibling writers. An accepted race goes into the gear's design doc.
+**Accept the race.** The pre-check stays with nothing behind it: violations happen under concurrency and need
+detection and repair. The cost is whatever a violation breaks, from nothing for a UX hint to money, authorization or
+identity.
 
 ## Conditional writes and lost updates
 
 Two writers update the same row; what survives depends on how the write is phrased.
 
-**Whole-row write.** A whole-`ActiveModel` `.update()` is simple, but the last writer wins and silently overwrites
-another writer's change to a different field. Fine when one writer owns the row.
+**Whole-row write.** A whole-`ActiveModel` `.update()` is simple; the last writer wins and silently overwrites
+another writer's change to a different field. Nothing is lost while a single writer owns the row.
 
 **Changed columns only.** Changes to different columns survive; the same column is still last-writer-wins, with no
 signal.
 
 **Guarded transition.** `UPDATE .. WHERE state = <expected>` with `rows_affected` checked: zero rows is the only sign
-that the guard rejected the write. The gear decides whether zero is an error the caller must handle (`Conflict`,
-`StaleVersion`) or an idempotent success.
+that the guard rejected the write. Zero can mean an error the caller has to handle (`Conflict`, `StaleVersion`) or an
+idempotent success.
 
 ```rust
 let res = CatEntity::update_many().col_expr(cat::Column::State, Expr::value("active"))
@@ -105,51 +101,49 @@ let res = CatEntity::update_many().col_expr(cat::Column::State, Expr::value("act
 if res.rows_affected == 0 { return Err(DomainError::conflict("cat is not pending")); }
 ```
 
-**Version column.** An optimistic-concurrency column in the `WHERE` rejects any stale write; the client must carry
+**Version column.** An optimistic-concurrency column in the `WHERE` rejects any stale write; the client has to carry
 the version, and users see the conflicts.
 
 **Row lock.** The parent row lock above, applied to the row itself: writers of that row queue.
 
-**Test recommended:** call the transition twice with the same precondition; for lost updates, write two copies that
-change different fields and check both with a direct entity query
-([`12_unit_testing.md`, Table State](../../toolkit_unified_system/12_unit_testing.md#table-state-direct-db-queries)).
-
 ## Isolation levels
 
-`READ COMMITTED` is the PostgreSQL default and what the toolkit gets, since it passes no level: each statement sees a
-new snapshot, so invariants need a constraint or a lock. `REPEATABLE READ` is the MySQL/InnoDB default: one snapshot
-per transaction, serialization failures on write conflicts, write skew still possible. `SERIALIZABLE` prevents write
-skew by aborting with `40001`, at the price of retries and tracking memory; longer transactions fail more.
+By default (`TxConfig::default()`) the toolkit passes no level, so each backend's default applies: `READ COMMITTED` on
+PostgreSQL, `REPEATABLE READ` on MySQL/InnoDB, serializable on SQLite, which has one writer. The same code therefore
+runs at different levels on different dialects.
 
-At small load the level hardly matters; at large load the abort rate becomes a capacity limit. The same code runs at
-different levels on different dialects; SQLite is always serializable, with one writer.
+**`READ COMMITTED`.** Each statement sees a new snapshot, so an invariant across statements needs a constraint or a
+lock.
 
-**Test recommended:** `rec.all_in_serializable_transaction()` on a path that requests `SERIALIZABLE`
-([`14_db_behavior_testing.md`, How to run an audit, step 6](../../toolkit_unified_system/14_db_behavior_testing.md#how-to-run-an-audit)).
+**`REPEATABLE READ`.** One snapshot per transaction. On PostgreSQL a concurrent update of a row this transaction
+then writes aborts it with `40001`; on InnoDB the writer waits for the row lock and then overwrites. Write skew is
+possible on both.
+
+**`SERIALIZABLE`.** PostgreSQL prevents write skew with serializable snapshot isolation, aborting with `40001`, at
+the price of retries and predicate-tracking memory; longer transactions fail more, and at large load the abort rate
+becomes a capacity limit. InnoDB turns every read into a shared lock instead, so conflicts block or deadlock. At
+small load the level hardly matters, since anomalies need overlapping transactions.
 
 ## Retrying aborted transactions
 
 A transaction that can abort (a deadlock, `40001` under `SERIALIZABLE`) either retries or reports the abort.
 
 **Retry.** `transaction_with_retry` absorbs the abort by re-running the whole closure: more latency and repeated
-work, extra load exactly when contention is high, and the closure must satisfy
+work, extra load exactly when contention is high, and the closure has to satisfy
 [R1](../../toolkit_unified_system/14_db_behavior_testing.md#r1-a-retried-closure-is-safe-to-run-again) and
 [R2](../../toolkit_unified_system/14_db_behavior_testing.md#r2-the-retry-can-fire).
 
 ```rust
-// the body is FnMut and runs again on retry, so clone captures per attempt
+// the body is FnMut and runs again on retry, so clone captures per attempt;
+// as_db_err is the gear's extractor, fn(&DomainError) -> Option<&DbErr>
 db.transaction_with_retry(TxConfig::default(), as_db_err, |tx| {
     let (repo, scope) = (repo.clone(), scope.clone());
     Box::pin(async move { repo.swap_kittens(tx, &scope, cat_a, cat_b).await })
 }).await
 ```
 
-**Report the abort.** Return a retryable error: no hidden repeated work, but every caller must retry and sees the
-error. Better when the caller owns a wider operation.
-
-**Test recommended:** a unit round-trip for
-[R2](../../toolkit_unified_system/14_db_behavior_testing.md#r2-the-retry-can-fire)
-and a looped barrier test for the abort path.
+**Report the abort.** A retryable error goes to the caller: no hidden repeated work, but every caller has to retry and
+sees the error; a caller that owns a wider operation can retry all of it.
 
 ## Row locks and dialects
 
@@ -160,57 +154,59 @@ and a looped barrier test for the abort path.
   usable lock types are in
   [R9](../../toolkit_unified_system/14_db_behavior_testing.md#r9-on-mysql-only-update-and-share-locks).
 - **SQLite** has no row locks
-  ([T4](../../toolkit_unified_system/14_db_behavior_testing.md#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-postgresql));
+  ([T4](../../toolkit_unified_system/14_db_behavior_testing.md#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-server-engine));
   writers are serialized per database, and a read-then-write transaction fails with `SQLITE_BUSY`
   (`SQLITE_BUSY_SNAPSHOT` in WAL mode) instead of waiting; both are retryable.
-- **`NOWAIT` / `SKIP LOCKED`** suit queues (the toolkit outbox dead-letter reclaim uses `SKIP LOCKED`), not
-  check-then-act, where waiting is the point.
+- **`NOWAIT` / `SKIP LOCKED`** do not wait: the statement fails or skips the locked rows. A queue-style dequeue gets
+  rows nobody else holds (the toolkit outbox dead-letter reclaim uses `SKIP LOCKED`); a check-then-act gets no view of
+  the locked writer's result.
 - **Deadlocks** in loops are
   [R3](../../toolkit_unified_system/14_db_behavior_testing.md#r3-rows-locked-one-at-a-time-are-locked-in-key-order).
-  For multi-row statements, FK checks and cascades: lock first with `SELECT .. ORDER BY id FOR UPDATE` (an extra
-  round trip, locks held longer), retry, or accept the abort.
-- **JSON.** Plain `json` has no equality operator on PostgreSQL; `jsonb` has one but drops key order and whitespace
-  and keeps only the last of duplicate keys.
+  For multi-row statements, FK checks and cascades the options are locking first with
+  `SELECT .. ORDER BY id FOR UPDATE` (an extra round trip, locks held longer), a retry, or accepting the abort.
 
-**Test recommended:** a PostgreSQL barrier test on the lock-dependent path; note the lock strength and why at the
-call site.
+## JSON columns
+
+PostgreSQL has two JSON types. MySQL's `JSON` (8.0.3+) normalizes like `jsonb` and compares as JSON; MariaDB's `JSON` is
+`LONGTEXT` with a validity check, kept as written and compared as text. SQLite has no JSON column type: the value is
+text (or a `jsonb()` blob since 3.45), and `=` compares bytes.
+
+**`json`.** Keeps the text as written: key order, whitespace and duplicate keys survive; PostgreSQL has no equality
+operator for it, so it cannot be compared or deduplicated directly.
+
+**`jsonb`.** Supports equality and GIN indexes; it stores a normalized form that drops key order and whitespace and
+keeps only the last of duplicate keys.
 
 ## Indexes
 
 **Index on an FK column.** An index led by the FK column lets a parent delete or key update find the children
-without a scan; a partial index helps only if its predicate covers every referencing row. It costs a write on every
-child change and storage, and adding it to a populated table has a lock cost
-([Migrations on populated tables](#migrations-on-populated-tables)). Worth it when parents are deleted or re-keyed and
-the child table grows.
+without a scan. A partial index serves that check only if the check's `WHERE fk = $1` implies its predicate (as with
+`fk IS NOT NULL`). It costs a write on every child change and storage, and adding it to a populated table has a lock
+cost ([Migrations on populated tables](#migrations-on-populated-tables)). Without parent deletes, key updates or
+lookups by the FK, only the cost remains.
 
-**No FK index.** No write tax, but every parent delete or key update scans the whole child table under locks. Fine
-when parents are never deleted or re-keyed and nothing looks children up by the FK.
+**No FK index.** No write tax; every parent delete or key update scans the whole child table under locks.
 
-Other index questions: equality columns go before the sort column (for pagination see the cost of
+Other index facts: a composite index serves an equality filter plus a sort only with the equality columns first (for
+pagination see the cost of
 [R5](../../toolkit_unified_system/14_db_behavior_testing.md#r5-a-paginated-query-has-a-total-order)); PostgreSQL uses
 a partial index only when the query's `WHERE` implies its predicate; every index taxes writes with bloat and vacuum
-work; plans change with data size, so check `EXPLAIN (ANALYZE, BUFFERS)` on production-scale data, not on SQLite or a
-small development database.
-
-**Test recommended:** none fits, since a statement recorder cannot see a missing index; check it in migration review.
+work; plans change with data size, so a plan seen on SQLite or a small development database says little about
+production, while `EXPLAIN (ANALYZE, BUFFERS)` on production-scale data shows the real one.
 
 ## Pagination
 
-**Offset.** `LIMIT .. OFFSET` gives random access to page N with simple code, but the database reads and discards the
-skipped rows, so deep pages slow down, and writes between requests shift pages (duplicates, skips). For small,
-bounded lists and admin tools.
+**Offset.** `LIMIT .. OFFSET` gives random access to page N with simple code; the database reads and discards the
+skipped rows, so deep pages slow down, and writes between requests shift pages (duplicates, skips). On short lists
+these costs stay small.
 
 **Keyset.** "Rows after this key" costs the same on every page and is stable under writes; it needs a unique stable
 key and a cursor encoding and cannot jump to page N. The OData layer uses it and refuses `$skip`.
 
 Both need a total order
-([R5](../../toolkit_unified_system/14_db_behavior_testing.md#r5-a-paginated-query-has-a-total-order)). A request-path
-read that grows with data either pages or has a `LIMIT`; reading everything is acceptable only when an enforced rule
-(validation, a constraint) bounds the set, and its memory and latency grow with data.
-
-**Test recommended:** the test of
-[R5](../../toolkit_unified_system/14_db_behavior_testing.md#r5-a-paginated-query-has-a-total-order);
-for an unpaged read, a test or constraint that shows the bound.
+([R5](../../toolkit_unified_system/14_db_behavior_testing.md#r5-a-paginated-query-has-a-total-order)). A read with no
+bound costs memory and latency that grow with the data; a bound enforced by validation or a constraint caps them
+without paging, and paging caps them at the price of a different API for callers.
 
 ## Counting and existence
 
@@ -218,37 +214,38 @@ Pages carry no total
 ([`07_odata_pagination_select_filter.md`, Unsupported system query options](../../toolkit_unified_system/07_odata_pagination_select_filter.md#unsupported-system-query-options));
 existence is
 [R6](../../toolkit_unified_system/14_db_behavior_testing.md#r6-existence-is-checked-with-limit-1). When a number is
-truly needed:
+needed:
 
-**Exact `COUNT(*)`** scans every match and is not stable under writes; only when the exact number is part of the
-contract and the set is small or bounded by a selective indexed predicate.
+**Exact `COUNT(*)`** reads every matching row, so its cost grows with the matching set, and the number can change
+before the caller uses it.
 
-**Capped count**, `SELECT COUNT(*) FROM (SELECT 1 .. LIMIT k)`, is exact up to `k` and reads at most `k` rows: enough
-for "more than k" checks and badges.
+**Capped count**, `SELECT COUNT(*) FROM (SELECT 1 .. LIMIT k + 1) AS t`, reads at most `k + 1` rows and is exact only up
+to `k`: a result of `k + 1` means "more than `k`".
 
-**Planner estimate** is cheap, stale and PostgreSQL-only.
+**Planner estimate** (`pg_class.reltuples` or `EXPLAIN` on PostgreSQL, `TABLE_ROWS` or `EXPLAIN` on InnoDB) is
+cheap and stale, and can be far off for a filtered set.
 
 **Maintained counter**, updated in the same transaction as the change, is exact and cheap to read, but every writer
-contends on the counter row: the same hot-row problem as a parent lock.
-
-**Test recommended:** assert the operation's statements with the query recorder
-([`14_db_behavior_testing.md`, How to run an audit, step 6](../../toolkit_unified_system/14_db_behavior_testing.md#how-to-run-an-audit)),
-plus a barrier test for a counter.
+contends on the counter row: the same hot-row cost as a parent lock.
 
 ## Batching and bind budgets
 
-**Per-row queries** cost a round trip each and grow with data size; for a few indexed lookups they can be the simpler
-code at no measurable cost.
+**Per-row queries** cost a round trip each and grow with data size; for a few indexed lookups the difference can be
+unmeasurable, and the code is simpler.
 
 **One batched statement** (`INSERT .. VALUES`, `WHERE id IN (..)`) is one round trip, but it spends the bind budget
-([R4](../../toolkit_unified_system/14_db_behavior_testing.md#r4-no-statement-binds-a-list-that-can-outgrow-the-bind-limit)),
-holds its row locks longer inside a transaction (blocking writers, raising deadlock odds), and a large `IN` list can
-change the plan.
+([R4](../../toolkit_unified_system/14_db_behavior_testing.md#r4-no-statement-binds-a-list-that-can-outgrow-the-bind-limit));
+an `UPDATE`, `DELETE` or locking `SELECT` over an `IN` list locks its rows in plan order rather than list order, so two
+overlapping batches can deadlock (the loop case is
+[R3](../../toolkit_unified_system/14_db_behavior_testing.md#r3-rows-locked-one-at-a-time-are-locked-in-key-order));
+and a large `IN` list can change the plan.
 
-**Staying under the cap.** Bound the input with a validated limit, which becomes part of the API; chunk against
-`max_bind_params_for(runner)` with headroom (several statements, consistent with each other only inside one
-transaction); or, on PostgreSQL only, use an array parameter (`= ANY($1)`) or a temporary table, which need their own
-tests.
+**Ways to stay under the cap.** A validated input limit keeps one statement but becomes part of the API. Chunking
+against `max_bind_params_for(runner)` with headroom handles any size with several statements; they see one snapshot only
+inside one transaction at `REPEATABLE READ` or above, while at `READ COMMITTED` each chunk sees its own. On PostgreSQL
+an array parameter (`= ANY($1)`) avoids the cap. A temporary table works on every backend, but it is filled by inserts
+under the same cap (PostgreSQL `COPY` excepted) and lives on one connection, so only inside one transaction; both need
+dialect-specific code and tests.
 
 ```rust
 const RESERVED: usize = 2; // binds used by the other predicates, including the scope's tenant filter
@@ -259,26 +256,19 @@ for chunk in ids.chunks(step) {
 }
 ```
 
-**Test recommended:** the statement-count test of
-[`14_db_behavior_testing.md`, How to run an audit, step 7](../../toolkit_unified_system/14_db_behavior_testing.md#how-to-run-an-audit).
-
 ## Transactions and external work
 
-An external call (network, another service) never runs inside a `transaction_with_retry` closure
-([R1](../../toolkit_unified_system/14_db_behavior_testing.md#r1-a-retried-closure-is-safe-to-run-again)). Otherwise:
+An external call (network, another service) inside a `transaction_with_retry` closure is excluded by
+[R1](../../toolkit_unified_system/14_db_behavior_testing.md#r1-a-retried-closure-is-safe-to-run-again). Otherwise:
 
-**Inside the transaction.** The call's result and the write act on rows already locked, but the locks are held for
-the whole call and a slow dependency stalls writers. Only for a fast call with a timeout.
+**Inside the transaction.** The call's result and the write act on rows already locked; the locks are held for the
+whole call, so a slow dependency stalls writers, and only a timeout bounds that.
 
-**Before `BEGIN`.** No locks held, but the result can be stale by `COMMIT`, and if the transaction fails the effect
-stays. For read-only, independent or compensable calls.
+**Before `BEGIN`.** No locks are held; the result can be stale by `COMMIT`, and if the transaction fails the effect
+stays, which matters unless the call is read-only, independent of the change, or compensated.
 
-**After `COMMIT`.** Runs only for a durable change, but a crash or failure after `COMMIT` loses it unless something
-retries it. An effect that must not be lost goes through the outbox ([Event delivery](#event-delivery)).
-
-**Test recommended:** for the before-`BEGIN` and after-`COMMIT` options, a `#[test]` that reads the source with
-`include_str!` and fails if the call appears inside the transaction closure
-([`14_db_behavior_testing.md`, How to run an audit, step 8](../../toolkit_unified_system/14_db_behavior_testing.md#how-to-run-an-audit)).
+**After `COMMIT`.** The call runs only for a durable change; a crash or failure after `COMMIT` loses it unless
+something retries it. The outbox ([Event delivery](#event-delivery)) closes that window.
 
 ## Event delivery
 
@@ -291,52 +281,48 @@ holds only within the partition the producer names, never across partitions, and
 workers that poll the database. The handler is one of two kinds:
 
 ```rust
+// the closure's error type implements From<DbError>, From<OutboxError> and From<the repository's error>
 toolkit_db::outbox::in_transaction(&db, |tx| Box::pin(async move {
     repo.insert(tx, &scope, &cat).await?;
-    let wake = producer.enqueue(tx, CatCreated { id }).await?;
+    let wake = outbox.enqueue(tx, Record::to("cats", partition)
+        .payload(payload, "application/json")
+        .build()?).await?;
     Ok(((), wake))
 })).await?;
 ```
 
-- **Leased handler:** at-least-once. A lease expiry, a crash or a `Retry` redelivers, so handlers must be idempotent
-  (a key from the partition id and sequence number). A `Retry` holds the whole partition, with backoff from 1 s to
-  60 s and no built-in attempt limit; a `Reject` dead-letters the message and the partition moves on, and a replay
-  does not restore its place in the order.
-- **Transactional handler:** its database writes and the acknowledgement commit together in the outbox's database,
-  so they happen exactly once on success. Effects outside that database can repeat, a `Retry` commits the handler's
-  writes and redelivers the message, and a `Reject` dead-letters the whole batch.
-
-**Test recommended:** on the write-plus-event trace, `rec.all_in_one_transaction()`, an empty
-`rec.writes_outside_tx()`, and the outbox `INSERT` in `rec.stats()`. Record the delivery guarantee in an ADR:
-consumers depend on it.
+- **Leased handler:** at-least-once. A lease expiry or a crash redelivers what was not acknowledged and a `Retry`
+  redelivers the unprocessed rest of the batch, so a non-idempotent handler repeats its effect (a key from the partition
+  id and sequence number identifies duplicates). A `Retry` holds the whole partition, with backoff from 1 s to 60 s by
+  default and no built-in attempt limit; a `Reject` dead-letters the message (from a batch handler, the unprocessed rest
+  of the batch) and the partition moves on, and a replay does not restore its place in the order.
+- **Transactional handler:** its database writes and the acknowledgement commit together in the outbox's database, so on
+  success they happen exactly once. A `Retry` commits the writes made so far and redelivers the whole batch, so those
+  writes run again; a `Reject` dead-letters the whole batch; effects outside that database can repeat.
 
 ## Migrations on populated tables
 
-**Single step.** Simple, but its locks last as long as the statement, and a constraint added in one step passes on an
-empty test database and fails or blocks on a populated one. For small tables where a short lock is fine.
+**Single step.** Simple; its locks last as long as the statement, and a new constraint is checked against every
+existing row in that one step, failing on a violating row and holding its lock while it scans.
 
 **Expand / contract.** Add the column nullable, backfill in batches, validate, then tighten (on PostgreSQL
 `ADD CONSTRAINT .. NOT VALID`, then `VALIDATE CONSTRAINT`). Locks stay short and old and new code can run together,
 at the cost of more migrations and deploy steps.
 
 Many `ALTER TABLE` forms take an exclusive lock, and whether they rewrite the table depends on dialect and version:
-fine in development, an outage on a large table. On PostgreSQL a plain `CREATE INDEX` blocks writes for the whole
-build, and `CREATE INDEX CONCURRENTLY` cannot run through the toolkit runner, which wraps `up()` in a transaction.
-SQLite rebuilds and `down()` are rules:
+the same statement is short on a small table and an outage on a large one. On PostgreSQL a plain `CREATE INDEX` blocks
+writes for the whole build, and `CREATE INDEX CONCURRENTLY` cannot run through the toolkit runner, which wraps `up()`
+in a transaction. SQLite rebuilds and `down()` are rules:
 [R11](../../toolkit_unified_system/14_db_behavior_testing.md#r11-a-sqlite-table-rebuild-keeps-its-child-rows) and
 [R12](../../toolkit_unified_system/14_db_behavior_testing.md#r12-down-says-what-it-does).
-
-**Test recommended:** a migration test with a violating row
-([T5](../../toolkit_unified_system/14_db_behavior_testing.md#t5-a-migration-that-adds-a-constraint-meets-a-violating-row)).
 
 ## Unreadable stored values
 
 A mapper meets a value that does not parse: a migration gap, a manual fix, or a value written by a newer version
 during a rolling deploy.
 
-**Fail the read.** `TryFrom` makes corruption visible, but one bad row fails the whole read, a list page included,
-and an older instance fails on values a newer one writes. Right when a wrong value is worse than an error
-(authorization, ownership, money).
+**Fail the read.** `TryFrom` makes corruption visible and keeps a wrong value out of every decision; one bad row fails
+the whole read, a list page included, and an older instance fails on values a newer one writes.
 
 ```rust
 impl TryFrom<cat::Model> for Cat {
@@ -348,10 +334,8 @@ impl TryFrom<cat::Model> for Cat {
 }
 ```
 
-**Explicit `Unknown`.** Reads keep working and stay forward-compatible; every consumer must handle `Unknown`, and it
-must never grant access or ownership.
+**Explicit `Unknown`.** Reads keep working and stay forward-compatible; every consumer has to handle `Unknown`, and
+one that treats it as a grant leaks access or ownership.
 
-**Silent default** (`unwrap_or_default`). Reads never fail, but corrupt or newer data turns into a valid-looking value
-that may decide authorization or ownership. Only for a cosmetic field, with a log line.
-
-**Test recommended:** a SQLite test that inserts a garbage value directly and asserts the chosen outcome.
+**Silent default** (`unwrap_or_default`). Reads never fail; corrupt or newer data turns into a valid-looking value,
+which decides whatever the field decides, authorization or ownership included.
