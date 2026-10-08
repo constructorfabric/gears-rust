@@ -2,7 +2,7 @@
 //! Read unsettled content, settle active matches, submit differences with observed preconditions.
 //! Transport retries reuse key/request; new passes re-read and use new keys (ADR-0012).
 //! Dependencies, conflicts and call refusals stay pending; item refusals are terminal.
-//! Until T47, equal content cannot confirm a newer publisher version (D18).
+//! Until T41, equal content cannot confirm a newer publisher version (D18).
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::{NonZeroU32, NonZeroUsize};

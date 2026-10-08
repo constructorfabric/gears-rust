@@ -104,7 +104,7 @@ impl From<EntityKey> for BatchGetItem {
 pub struct BatchGetEntitiesRequest {
     pub items: Vec<BatchGetItem>,
     pub projection: Projection,
-    /// Bypass cache freshness and revalidate (§8.3, T27); transports ignore this SDK-only flag.
+    /// Bypass cache freshness and revalidate (§8.3, T28); transports ignore this SDK-only flag.
     pub fresh: bool,
 }
 

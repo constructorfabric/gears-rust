@@ -11,7 +11,7 @@ This crate defines the transport-agnostic interface for the Types Registry gear:
 - **`ListQuery`** - Query builder for filtering entity listings
 - **`TypesRegistryError`** - Error types for all operations
 
-### `PlatformTypesRegistryApi` (P0, replaces `TypesRegistryClient` at T29)
+### `PlatformTypesRegistryApi` (P0, replaces `TypesRegistryClient` at T31)
 
 - **`PlatformTypesRegistryApi`** — platform contract: batch reads, discovery, registration, deletion and operation reads. Mutations return read-back operations.
 - **`PlatformTypesRegistryApiExt`** — kind-narrowed reads, paginated lists, single deletion and cancellable submit/poll under one deadline.

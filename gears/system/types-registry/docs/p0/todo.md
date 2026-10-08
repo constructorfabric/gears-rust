@@ -3,7 +3,8 @@
 Plan: [`plan.md`](./plan.md) · Spec: [`SPEC.md`](./SPEC.md)
 
 Completed tasks keep their historical IDs and evidence. The remaining executable
-queue is **T26–T42**, consolidated and renumbered by accepted plan P26; its mapping table
+queue is **T24a, T25 and T26–T42**, consolidated and renumbered by accepted plan P26 and
+regrouped by P27 (T24a and T27a added; T25 lands as its own toolkit pull request); P26's mapping table
 translates both the P23/P25 numbering and the earlier P26 draft (T26–T64). Retired T29
 became T22d (P21). T22 remains a transfer note to
 [#4827](https://github.com/constructorfabric/gears-rust/issues/4827). Task references in
@@ -11,9 +12,11 @@ completed evidence use the numbering current when recorded.
 
 **Execution is sequential, in numeric order:**
 - **Phase 7 — both clients, an isolated handoff, every gear on the persistent registry:**
-  T26 → T32. Both APIs over local and REST, the platform cache, the post-wiring lifecycle
-  and an isolated pilot (Checkpoint 7A, the client handoff); then the atomic cutover and one
-  REST version (Checkpoint 7).
+  T24a → T32. Every trait and local client first (T24 + T24a, one pull request), then both
+  APIs over REST, the platform cache, the post-wiring lifecycle and an isolated pilot
+  (Checkpoint 7A, the client handoff); then the atomic cutover and one REST version
+  (Checkpoint 7). T25 is implemented on its own toolkit branch and must reach `main` before
+  T26's route move.
 - **Phase 8 — publication after wiring and out-of-process operation:** T33 → T38. Collectors,
   ownership and selection; Account Management as the first real gear (Checkpoint 8A); the
   remaining fleet and the end of the pull; the out-of-process run (Checkpoint 8).
@@ -2437,7 +2440,7 @@ this task computes, not the reverse (P21)
       honours `If-None-Match` with a `304` that carries its `ETag`; `batchGet` reports
       `unchanged` per key with its `etag`; discovery carries none (T22d, P21)
 - [x] The P0 REST contract is complete; the server work left is the cutover (T26) and the
-      path promotion (T27), both in Phase 8 (Phase 7 under P21; split by P22; under P23 they are T29 and T30 in Phase 7)
+      path promotion (T27), both in Phase 8 (Phase 7 under P21; split by P22; under P23 they are T29 and T30 in Phase 7; under P26 they are T31 and T32 in Phase 7)
 - [x] `make e2e-local` remains green with no e2e file edited; gear tests and `make lychee` pass
 - [x] Nothing is cut over yet — consumers still on the old path, and the new SDK trait is not
       written yet (T23 opens Phase 7; under P23 the contract is T24, after T23's publisher signature); T22 is deferred to P1 (P18)
@@ -2448,9 +2451,12 @@ this task computes, not the reverse (P21)
 
 ## Phase 7 — Both clients, an isolated handoff, and every gear on the persistent registry
 
-Plan P26. T23–T25 are complete; the next task is **T26**. The remaining sequence is
-**T26 → T27 → T28 → T29 → T30 → T31 → T32**.
+Plans P26 and P27. T23 and T24 are complete; the next task is **T24a**. T25 is implemented
+on branch `toolkit-platform-route-auth` and is checked off only once merged into `main`.
+The remaining sequence is **T24a → T25 → T26 → T27 → T27a → T28 → T29 → T30 → T31 → T32**.
 
+- **Traits and local clients (T24, T24a).** Both contracts, the platform and tenant
+  extension helpers and both local clients land together, in one pull request.
 - **Client handoff (T26–T30, Checkpoint 7A).** Both APIs work through local and resolving
   REST clients, the platform cache and the generic post-wiring lifecycle are in place, and
   an isolated pilot proves a gear in another process can publish, become ready and read
@@ -2506,13 +2512,16 @@ idempotency or retry:
 - the reconciliation workflow of DESIGN §3.3 over explicitly supplied desired documents;
 - `publish_gts`, which runs that reconciliation for a gear in the background and reports a status handle (D16).
 
-The REST client is T26; the per-crate collectors that feed `publish_gts` are T32. The old trait
-is **not** kept — T29 moves every consumer and deletes it.
+The REST clients are T26 (platform) and T27 (tenant); the per-crate collectors that feed
+`publish_gts` are T33. The old trait is **not** kept — T31 moves every consumer and deletes it.
 
-**Placement.** T23 supplies the data/supervision types; T24 precedes T29’s consumer
-cutover. Local reconciliation stays synchronous in `init` until T37/T38. The complete
+**Placement.** T23 supplies the data/supervision types; T24 precedes T31’s consumer
+cutover. Local reconciliation stays synchronous in `init` until T37. The complete
 read/validator contract and required publisher model land now to avoid another
-consumer API migration; adapters send publisher only from T45.
+consumer API migration; adapters send publisher only from T39.
+
+*(Task numbers in T24 follow P26; before P26 they were T26, T32, T29, T37/T38 and T45, and
+T47 for the always-submit change below, now T41.)*
 
 **Acceptance criteria:**
 - [x] `PlatformTypesRegistryApi` is declared with `#[toolkit::contract(gear = "types-registry", version = "v1")]` and compiles: the `Api` suffix, `Result<_, CanonicalError>` on every method, `#[idempotency(..)]` per SPEC §10.1
@@ -2554,7 +2563,7 @@ consumer API migration; adapters send publisher only from T45.
   - bounded retries per cycle for a dependency not yet registered, with backoff continuing across cycles;
   - a pace set by `Retry-After`.
 - [x] It returns a status handle — *pending*, *admitted*, *rejected* or *superseded*, with per-identifier reasons. A permanently rejected or superseded candidate stops retrying, and failure names the gear and identifier. A task that panics or exits is observed and never leaves the status *pending*
-- [x] Reconciliation keeps the `UpToDate`/no-`POST` contract until T47 makes it always submit, once the server confirms a higher version (SPEC D18). Every caller supplies a `PublisherContext`, because the models require it, but until T45 neither adapter sends it to the server
+- [x] Reconciliation keeps the `UpToDate`/no-`POST` contract until T41 makes it always submit, once the server confirms a higher version (SPEC D18). Every caller supplies a `PublisherContext`, because the models require it, but until T39 neither adapter sends it to the server
 - [x] `publish_gts` and every remote use are never called from `init()`: remote clients are wired after every `init` (SPEC §8.4), so publication belongs to the post-wiring hook (T33). The doc comments say so. The one transitional exception is T29–T38: synchronous reconciliation through the **local** client inside `init`, which T37/T38 remove
 
 **Verification:**
@@ -2611,7 +2620,40 @@ status, `PublisherVersion`, supervision helper)
 
 ---
 
-### - [x] T25: Toolkit — a platform-authenticated auth axis; one plane per route
+### - [ ] T24a: `TypesRegistryApi` tenant contract, its extension helpers and local client
+
+**Description:** The read-only tenant-plane `TypesRegistryApi` — `SecurityContext` first;
+exact read, `batchGet` and discovery — with `TypesRegistryApiExt` convenience reads and a
+local adapter over the same domain service. With T24 this completes every P0 trait and
+local client, landing in one pull request. Moved out of T27 (its former commit 1) by plan
+P27, which also adds the tenant extension helpers. The REST transports remain T26 and T27;
+resolving wrappers and `#[provides]` are T27a.
+
+Commits inside the task: (1) tenant contract and extension helpers; (2) tenant local client.
+
+**Acceptance criteria:**
+- [ ] `TypesRegistryApi` is declared with `#[toolkit::contract(gear = "types-registry", version = "v1")]` and compiles: `&SecurityContext` first on every method, `Result<_, CanonicalError>`, `#[idempotency(SafeRead)]`, no default methods. Object-safe: `hub.get::<dyn TypesRegistryApi>()` compiles and the extension methods are callable on it
+- [ ] The tenant contract shares the platform's semantic models, projection and validators; it has no mutation and no operation access
+- [ ] `TypesRegistryApiExt`, blanket-implemented for `T: TypesRegistryApi + ?Sized`, offers the read conveniences of `PlatformTypesRegistryApiExt` — `get_type_schema`, `get_instance`, their plural and `_by_uuid` variants, `list_type_schemas`, `list_instances` — with the same local kind narrowing and explicit document selection. One implementation of the helper logic serves both extension traits; no copy, and no mutation helper
+- [ ] Its local client reuses the platform lookups, encodings and errors — no second domain implementation — and returns what the platform local client returns for the same request, `unchanged` and cursors included
+- [ ] The local client applies no tenant scope and records no principal from the `SecurityContext` in P0; the C2/C6 source comments say so. It is verified in fixture hosts only — the existing embedded consumers stay on the legacy client until T31
+
+**Verification:**
+- [ ] `cargo test -p cf-gears-types-registry-sdk`: extension helpers over a fake tenant API — kind mismatch refused locally without a call, explicit selection preserved, list helpers select the documents their callers read
+- [ ] `cargo nextest run -p cf-gears-types-registry --test tenant_local_client_test` (new target): exact read, `batchGet` `found` then `unchanged` under the same `$select`, discovery cursor, and parity with the platform local client
+- [ ] Gear tests; `make fmt`, `make clippy`
+
+**Dependencies:** T24
+**Files likely touched:** `TR-SDK/src/{tenant_contract,ext,lib}.rs` and their tests, `TR/src/api/local_client.rs`, `TR/tests/tenant_local_client_test.rs`
+**Scope:** M — two commits as listed
+
+---
+
+### - [ ] T25: Toolkit — a platform-authenticated auth axis; one plane per route
+
+**Status:** implemented on branch `toolkit-platform-route-auth` (`af5517c38`) as its own
+toolkit pull request. The criteria below are unchecked until it merges into `main`; the
+evidence recorded beside them is the branch's and is re-run at merge.
 
 **Description:** `OperationBuilder` has tenant (`.authenticated()`) and anonymous axes only.
 toolkit's own codegen registers platform-plane routes `.anonymous()` *"until `OperationBuilder`
@@ -2622,21 +2664,21 @@ needs that axis for the registry's platform routes (SPEC D17, D20).
 either-plane axis before use. The final API has distinct platform and tenant routes.
 
 **Acceptance criteria:**
-- [x] `.platform_authenticated()` on `OperationBuilder`, recorded in `OperationSpec` as `auth_plane: AuthPlane { Tenant, Platform }` beside `authenticated`, which it sets to `true`. `.authenticated()` and `.anonymous()` keep `AuthPlane::Tenant`. No route accepts either plane (P25)
-- [x] `compose_oop_router` derives exact method/template `RouteAuthPolicy` from specs; a router layer outside both planes inserts RouteAuth/AnonymousRoute before auth. MethodRouter layers are too late. Undeclared HEAD inherits GET. The inner gate requires a validated non-marker platform context and validates all presented credentials, including a non-anonymous tenant context for a bearer. Missing authenticators and inconsistent specs fail closed
-- [x] Gateway resolves Platform policy under `prefix_path`, validates any bearer and requires its inbound internal authenticator through the shared gate in both auth modes. Exact templates, no synthetic tenant context, no tenant scope checks; identity-keyed throttling is refused at startup. OpenAPI uses `internalToken`; discovery excludes operations requiring it in every alternative. Gateway HEAD inherits GET unless explicitly declared, fixing anonymous fallback when default auth is disabled
-- [x] Handlers read `Extension<PlatformSecurityContext>`; behind the gate it is always present, and a refusal is a canonical `401`, never `500`
-- [x] Generated REST methods with owned/borrowed `PlatformSecurityContext` use `.platform_authenticated().no_license_required()` and reject `#[anonymous]` at compile time. `authz-resolver::evaluate` now requires a validated internal token on every host
+- [ ] `.platform_authenticated()` on `OperationBuilder`, recorded in `OperationSpec` as `auth_plane: AuthPlane { Tenant, Platform }` beside `authenticated`, which it sets to `true`. `.authenticated()` and `.anonymous()` keep `AuthPlane::Tenant`. No route accepts either plane (P25)
+- [ ] `compose_oop_router` derives exact method/template `RouteAuthPolicy` from specs; a router layer outside both planes inserts RouteAuth/AnonymousRoute before auth. MethodRouter layers are too late. Undeclared HEAD inherits GET. The inner gate requires a validated non-marker platform context and validates all presented credentials, including a non-anonymous tenant context for a bearer. Missing authenticators and inconsistent specs fail closed
+- [ ] Gateway resolves Platform policy under `prefix_path`, validates any bearer and requires its inbound internal authenticator through the shared gate in both auth modes. Exact templates, no synthetic tenant context, no tenant scope checks; identity-keyed throttling is refused at startup. OpenAPI uses `internalToken`; discovery excludes operations requiring it in every alternative. Gateway HEAD inherits GET unless explicitly declared, fixing anonymous fallback when default auth is disabled
+- [ ] Handlers read `Extension<PlatformSecurityContext>`; behind the gate it is always present, and a refusal is a canonical `401`, never `500`
+- [ ] Generated REST methods with owned/borrowed `PlatformSecurityContext` use `.platform_authenticated().no_license_required()` and reject `#[anonymous]` at compile time. `authz-resolver::evaluate` now requires a validated internal token on every host
 
 **Verification:**
-- [x] Toolkit tests on both middleware stacks, including mixed credentials:
+- [ ] Toolkit tests on both middleware stacks, including mixed credentials:
       - `toolkit-http-middleware` `auth_tests.rs`: platform-route matrix (neither, bearer alone, token alone, both, a forged bearer or token beside a valid one, a non-bearer scheme), each refusal's reason, `HEAD` via `GET`, each plane unconfigured, an anonymous tenant context beside a valid token, the outbound marker injected behind a context-free handler
       - `toolkit` `oop_serve_tests.rs`: the matrix through the real assembly — `OperationBuilder` specs → `route_auth_policy` → `layer_gear_router`, every plane combination; anonymous and authenticated routes keep their behaviour; an inconsistent spec fails closed
       - `toolkit-contract` `tests/rest_server_platform_plane.rs`: generated routes for owned and borrowed contexts declare `internalToken`; behind the real stack a validated token reaches the service, and a missing or forged one is refused before dispatch (`401`); turning the codegen back to `.anonymous()` fails all three. trybuild `fail/rest_anonymous_platform_method.rs`
       - `api-gateway` `tests/auth_middleware.rs`, embedded gateway with `require_auth_by_default: false`: tenant `GET`/`HEAD` on an internal token alone or nothing is a gateway `401` (pinned by its `WWW-Authenticate` challenge); platform `POST`, `GET` and inherited `HEAD` across valid/forged token × valid/forged/absent bearer; refused without a gateway internal authenticator; under `prefix_path: /cf`; with `auth_disabled: true`; against a matching tenant scope rule (skipped for platform, still `403` on the tenant route); a presented token is validated on tenant routes when the authenticator is configured and ignored when not. Profile 3: through `ToolKitGatewayProvider` the tenant route arrives bearer-required, `HEAD` included, and a platform path is not published
       - Unit: `GatewayRoutePolicy` (platform wins, exact template, `HEAD` inheritance with explicit-`HEAD` precedence), identity-keyed rate and in-flight zones refused on platform operations, OpenAPI security per axis, discovery's AND/OR/inherited `security` cases
       - Mutations removing the gate, the marker filter, the policy layer, the gateway gate or `HEAD` fallback, re-adding the synthetic tenant context, dropping the scope skip, or keying the policy on the prefixed path each fail tests
-- [x] `make fmt`, `make clippy`; `cf-gears-toolkit-http-middleware` (44), `cf-gears-toolkit` (651, all features), `cf-gears-toolkit-contract`, `cf-gears-toolkit-contract-macros-tests`, `cf-gears-api-gateway` + `cf-gears-toolkit-gateway` (307), `cf-gears-authz-resolver{,-sdk}` (98) green
+- [ ] `make fmt`, `make clippy`; `cf-gears-toolkit-http-middleware` (44), `cf-gears-toolkit` (651, all features), `cf-gears-toolkit-contract`, `cf-gears-toolkit-contract-macros-tests`, `cf-gears-api-gateway` + `cf-gears-toolkit-gateway` (307), `cf-gears-authz-resolver{,-sdk}` (98) green
 
 **Follow-ups, not T25:**
 - Method-aware proxy routing: `ProxyRegistry` routes by path, so any method on a published path is forwarded — including an `exposed = false` method sharing the path. Deny unpublished methods, with `GET` → `HEAD`.
@@ -2654,9 +2696,11 @@ tests and `OperationSpec` literals beside them, `docs/toolkit_unified_system/06_
 
 ---
 
-### REST contract — binding on T26 and T27
+### REST contract — binding on T24a, T26, T27 and T27a
 
-T26 delivers the platform half of this contract and T27 the tenant half; T27 closes it.
+A normative reference, not a task: its items carry no checkboxes. Each names its owning
+task in brackets, and that task's acceptance criteria track it. T24a supplies the tenant
+local client, T26 the platform half, T27 the tenant half, and T27a closes the contract (P27).
 The semantic models stay transport-free. `rest-client` gates the wire DTOs and both
 resolving clients; `rest-server` supplies the descriptors `provides` requires. One client
 instance carries no request-specific publisher or tenant context. Local adapter
@@ -2668,43 +2712,43 @@ runtime helpers (`build_request_url`, `attach_internal_token`, `map_http_error`,
 this transport is hand-written.
 
 **Client:**
-- [ ] `TR-SDK` gains `rest-client` (and, for `#[provides]`, `rest-server`) features. The client, its wire DTOs and the resolving wrapper compile only under `rest-client`
-- [ ] Wire DTOs derive serde only, convert to and from the §10.1 models, and are not referenced by the models
-- [ ] The platform client implements `PlatformTypesRegistryApi` over the `/types-registry/platform/v1/` wire exactly as the handlers serve it:
+- **[`rest-client` T26; `rest-server` T27a]** `TR-SDK` gains `rest-client` (and, for `#[provides]`, `rest-server`) features. The client, its wire DTOs and the resolving wrapper compile only under `rest-client`
+- **[T26; tenant DTOs T27]** Wire DTOs derive serde only, convert to and from the §10.1 models, and are not referenced by the models
+- **[T26]** The platform client implements `PlatformTypesRegistryApi` over the `/types-registry/platform/v1/` wire exactly as the handlers serve it:
   - submission sends `Idempotency-Key` as a header;
   - it reads `Location` / `Retry-After` and tells a replay's `200` from `202`, then reads the operation through `get_operation` (SPEC D19);
   - it maps the exact read's `ETag` / `304`;
   - `batchGet` is `POST …/entities:batchGet`;
   - discovery sends `pattern`, `depth`, `kind`, `lifecycle_status`, `limit`, `cursor` and `$select`.
-- [ ] Every platform method attaches the process's `X-ToolKit-Internal-Token` through `attach_internal_token`, resolved on every attempt, and never `Authorization`. The `PlatformSecurityContext` argument is never serialized
-- [ ] `TypesRegistryApi` — exact read, `batchGet` and discovery, with the platform models and the same projection, validators and `304` / `unchanged` semantics — gets a local client over the domain service and a REST client that sends the caller's bearer from its `SecurityContext` and never the internal token. Its base path is `/types-registry/v2/` until T32, held as an adapter-internal constant
-- [ ] Submission and the exact read do not use `runtime::client::send_unary`, which discards success headers and status and treats `304` as an error. They read status and headers themselves and reuse `runtime::http::map_http_error` for Problems
-- [ ] Per-method client spans and RED metrics match what a generated client emits. Retry is enabled only for safe reads and for submissions carrying a key, under bounded deadlines and cancellation
-- [ ] Problem responses map to `CanonicalError` without loss: category, `resource_type` / `resource_name`, field violations
-- [ ] types-registry declares `#[provides(transports = [local, rest], rest_client = …)]` for both APIs — local and remote resolution proven in fixture hosts; existing consumers cut over together in T31; the SDK exposes each resolving client at the path `#[consumes(resolving_client = …)]` expects
+- **[T26]** Every platform method attaches the process's `X-ToolKit-Internal-Token` through `attach_internal_token`, resolved on every attempt, and never `Authorization`. The `PlatformSecurityContext` argument is never serialized
+- **[local client T24a; REST client T27]** `TypesRegistryApi` — exact read, `batchGet` and discovery, with the platform models and the same projection, validators and `304` / `unchanged` semantics — gets a local client over the domain service and a REST client that sends the caller's bearer from its `SecurityContext` and never the internal token. Its base path is `/types-registry/v2/` until T32, held as an adapter-internal constant
+- **[T26; the tenant exact read T27]** Submission and the exact read do not use `runtime::client::send_unary`, which discards success headers and status and treats `304` as an error. They read status and headers themselves and reuse `runtime::http::map_http_error` for Problems
+- **[T26, T27]** Per-method client spans and RED metrics match what a generated client emits. Retry is enabled only for safe reads and for submissions carrying a key, under bounded deadlines and cancellation
+- **[T26, T27]** Problem responses map to `CanonicalError` without loss: category, `resource_type` / `resource_name`, field violations
+- **[T27a]** types-registry declares `#[provides(transports = [local, rest], rest_client = …)]` for both APIs — local and remote resolution proven in fixture hosts; existing consumers cut over together in T31; the SDK exposes each resolving client at the path `#[consumes(resolving_client = …)]` expects
 
 **Server:**
-- [ ] The seven platform routes move to `/types-registry/platform/v1/` with `.platform_authenticated()`; no `/v2/` platform route remains. On `oop_serve` and through api-gateway they serve a valid internal token and refuse a bearer alone; through the gateway the token is validated by its inbound authenticator, and with none configured the routes are refused
-- [ ] The tenant routes — `GET /entities/{entity_key}`, `POST /entities:batchGet`, `GET /entities` on `/types-registry/v2/` — use `.authenticated()` and share their handlers' domain calls with the platform twins; they serve a valid bearer and refuse an internal token alone on both hosts. `get_operation` has no tenant route
-- [ ] Every refusal is a canonical `401` Problem, never `500`: with no credential, and with an invalid credential beside a valid one wherever that stack validates it — the registry's listener validates both, api-gateway an internal token only when its authenticator is configured
-- [ ] The standalone registry binary installs a tenant authenticator — `AuthNResolverBearerAuthenticator` over an `AuthNResolverClient` in its `ClientHub`, from a linked or a remote authn-resolver. T27 decides the production linked/remote topology and records it in SPEC §8.4; T30 documents the independent development-fixture authenticator. **Without one, a tenant route answers a canonical `401`** — not `500` from the handler's extractor and not a served request: `oop_serve` installs no tenant plane then, so the registry (or toolkit) adds a gate for it
-- [ ] Mutation routes keep `exposed = false`; tenant routes may be exposed. C8's source comment states what `exposed = false` does not bound in Profile 1
-- [ ] Platform handlers read `Extension<PlatformSecurityContext>`, tenant handlers `Extension<SecurityContext>` — one plane per handler
-- [ ] No principal is recorded: `P0_PRINCIPAL_ID` stays nil, and C2's source comment names T26 as where the identity became available but unrecorded
-- [ ] SPEC C6/C8 source comments are updated to the D17 wording
+- **[T26, once T25 is in `main`]** The seven platform routes move to `/types-registry/platform/v1/` with `.platform_authenticated()`; no `/v2/` platform route remains. On `oop_serve` and through api-gateway they serve a valid internal token and refuse a bearer alone; through the gateway the token is validated by its inbound authenticator, and with none configured the routes are refused
+- **[T27]** The tenant routes — `GET /entities/{entity_key}`, `POST /entities:batchGet`, `GET /entities` on `/types-registry/v2/` — use `.authenticated()` and share their handlers' domain calls with the platform twins; they serve a valid bearer and refuse an internal token alone on both hosts. `get_operation` has no tenant route
+- **[platform T26; tenant T27]** Every refusal is a canonical `401` Problem, never `500`: with no credential, and with an invalid credential beside a valid one wherever that stack validates it — the registry's listener validates both, api-gateway an internal token only when its authenticator is configured
+- **[T27]** The standalone registry binary installs a tenant authenticator — `AuthNResolverBearerAuthenticator` over an `AuthNResolverClient` in its `ClientHub`, from a linked or a remote authn-resolver. T27 decides the production linked/remote topology and records it in SPEC §8.4; T30 documents the independent development-fixture authenticator. **Without one, a tenant route answers a canonical `401`** — not `500` from the handler's extractor and not a served request: `oop_serve` installs no tenant plane then, so the registry (or toolkit) adds a gate for it
+- **[T26]** Mutation routes keep `exposed = false`; tenant routes may be exposed. C8's source comment states what `exposed = false` does not bound in Profile 1
+- **[T26, T27]** Platform handlers read `Extension<PlatformSecurityContext>`, tenant handlers `Extension<SecurityContext>` — one plane per handler
+- **[T26]** No principal is recorded: `P0_PRINCIPAL_ID` stays nil, and C2's source comment names T26 as where the identity became available but unrecorded
+- **[T26]** SPEC C6/C8 source comments are updated to the D17 wording
 
-**Verification shared by T26 and T27:**
-- [ ] `TR/tests/rest_client_contract_test.rs`: the real platform client against the real platform routes over TCP, with the platform middleware installed — submit → poll → exact read → `batchGet` (`found`, then `unchanged` under the same `$select`) → discovery; replay with the same key → `replayed`; a different request under the same key → `AlreadyExists`; `404` / `400` mapping
-- [ ] The tenant client against the real tenant routes: exact read with `ETag`/`304`, `batchGet` `unchanged`, discovery cursor, the forwarded bearer re-validated by the listener
-- [ ] Auth matrix through the **real** api-gateway middleware and through `oop_serve`'s middleware stack:
+**Verification shared by T26, T27 and T27a:**
+- **[T26]** `TR/tests/rest_client_contract_test.rs`: the real platform client against the real platform routes over TCP, with the platform middleware installed — submit → poll → exact read → `batchGet` (`found`, then `unchanged` under the same `$select`) → discovery; replay with the same key → `replayed`; a different request under the same key → `AlreadyExists`; `404` / `400` mapping
+- **[T27]** The tenant client against the real tenant routes: exact read with `ETag`/`304`, `batchGet` `unchanged`, discovery cursor, the forwarded bearer re-validated by the listener
+- **[platform rows T26; tenant rows T27; the full matrix on both hosts T27a]** Auth matrix through the **real** api-gateway middleware and through `oop_serve`'s middleware stack:
   - no credential → `401` on both route sets;
   - platform: a valid token → served (at the gateway when its internal authenticator is configured, refused otherwise); a valid bearer alone → `401`; a forged token, or a forged bearer beside a valid token → `401`;
   - tenant: a valid bearer → served; a valid token alone → `401`; an invalid bearer → `401`; a forged token beside a valid bearer → rejected on `oop_serve`, and at the gateway when its internal authenticator is configured (otherwise the header is ignored).
-- [ ] Bootstrap test: the registry started out of process **without** a tenant authenticator answers a canonical `401` on tenant routes and still serves platform routes; with one, it serves a valid bearer
-- [ ] `make e2e-local` green after each task. **Platform calls need a platform token:** `config/e2e-local.yaml` (and the launcher's base config) configures the gateway's `internal_auth: shared_secret`, the root `conftest.py` gains a `platform_headers` fixture beside `auth_headers` reading the secret from the environment, and the `types_registry` suite's v2 calls split by plane — submissions, deletions and operation polling move to `/types-registry/platform/v1/` with `platform_headers`; the entity reads stay on `/types-registry/v2/` with their bearer. The legacy v1 writers (`account_management/conftest.py`, `oagw/helpers.py`, `types_registry/legacy/`) are untouched until T32 moves them
-- [ ] `QUICKSTART.md`: the platform examples use `/types-registry/platform/v1/` and send `X-ToolKit-Internal-Token`, with the `internal_auth` config they need; the tenant read examples use a bearer
-- [ ] The spike test and the spike `Cargo.toml` changes are removed or folded into the contract test
-- [ ] `make dylint` clean for the SDK crate
+- **[T27]** Bootstrap test: the registry started out of process **without** a tenant authenticator answers a canonical `401` on tenant routes and still serves platform routes; with one, it serves a valid bearer
+- **[T26, T27, T27a]** `make e2e-local` green after each task. **Platform calls need a platform token:** `config/e2e-local.yaml` (and the launcher's base config) configures the gateway's `internal_auth: shared_secret`, the root `conftest.py` gains a `platform_headers` fixture beside `auth_headers` reading the secret from the environment, and the `types_registry` suite's v2 calls split by plane — submissions, deletions and operation polling move to `/types-registry/platform/v1/` with `platform_headers`; the entity reads stay on `/types-registry/v2/` with their bearer. The legacy v1 writers (`account_management/conftest.py`, `oagw/helpers.py`, `types_registry/legacy/`) are untouched until T32 moves them
+- **[platform examples T26; tenant flows and the final pass T27a]** `QUICKSTART.md`: the platform examples use `/types-registry/platform/v1/` and send `X-ToolKit-Internal-Token`, with the `internal_auth` config they need; the tenant read examples use a bearer
+- **[T26]** The spike test and the spike `Cargo.toml` changes are removed or folded into the contract test
+- **[T26, T27; closed by T27a]** `make dylint` clean for the SDK crate
 
 ---
 
@@ -2736,42 +2780,69 @@ QUICKSTART examples, as one commit.
 - [ ] The platform rows of the auth matrix through the real api-gateway and `oop_serve` stacks; `api_rest_test.rs` updated in the route commit
 - [ ] `make e2e-local` green; gear tests
 
-**Dependencies:** T24, T25 (complete)
+**Dependencies:** T24a, T25. Commits 1–3 (DTOs and the client) need only T24 and the
+`attach_internal_token` helper already in `main`; commit 4 (the route move to
+`.platform_authenticated()`) and the TCP contract test need T25 merged into `main`
 **Files likely touched:** `TR-SDK/Cargo.toml`, `TR-SDK/src/{lib,rest_client/mod,rest_client/dto,rest_client/platform}.rs` and their tests, `TR/src/api/rest/{paths,routes,handlers}.rs`, `TR/tests/{rest_client_contract_test,api_rest_test}.rs`, `config/e2e-local.yaml`, launcher base config, `testing/e2e/conftest.py`, `testing/e2e/suites/types_registry/{helpers,test_*}.py` (async surface), `QUICKSTART.md`
 **Scope:** L — four commits as listed; the route move and its e2e callers are one commit
 
 ---
 
-### - [ ] T27: Tenant API over local and REST; both clients resolvable
+### - [ ] T27: Tenant API over REST; the standalone tenant authenticator
 
-**Description:** Add the read-only `TypesRegistryApi` — `SecurityContext` first; exact
-read, `batchGet` and discovery — with a local adapter over the same domain service and a
-bearer-forwarding REST client on the `/v2/` reads. Give the standalone registry a tenant
-authenticator and a canonical-`401` gate, expose `DirectoryResolvingClient` wrappers and
-`#[provides]` descriptors for both APIs, and close the REST contract with its documentation.
-After this task another developer can consume either API in either transport.
+**Description:** Serve T24a's `TypesRegistryApi` to a gear in another process through a
+bearer-forwarding REST client on the `/v2/` reads, and give the standalone registry a tenant
+authenticator and a canonical-`401` gate. The contract, its extension helpers and its local
+client moved to T24a; resolving wrappers, `#[provides]` and the contract's closure moved to
+T27a (P27).
 
-Commits inside the task: (1) tenant contract and local client; (2) tenant routes, REST client
-and the authenticator bootstrap/gate; (3) resolving wrappers and `provides`; (4) QUICKSTART
-and SPEC §8.4.
+Commits inside the task: (1) tenant routes on shared domain calls and the tenant REST client;
+(2) the authenticator bootstrap/gate and SPEC §8.4.
 
 **Acceptance criteria:**
-- [ ] The tenant contract shares the platform's semantic models, projection and validators; it has no mutation and no operation access. Its local client reuses the platform lookups and errors — no second domain implementation
-- [ ] Real TCP tenant reads match local results, `ETag`/`304`, `unchanged` and cursor semantics; each call forwards its own `SecurityContext` bearer and never the internal token; tenant handlers read `Extension<SecurityContext>` only
+- [ ] Real TCP tenant reads match the T24a local client: `ETag`/`304`, `unchanged` and cursor semantics; each call forwards its own `SecurityContext` bearer and never the internal token; tenant handlers read `Extension<SecurityContext>` only
+- [ ] The tenant routes share their handlers' domain calls with the platform twins; `get_operation` has no tenant route
 - [ ] The standalone registry installs `AuthNResolverBearerAuthenticator`; the production linked/remote authn-resolver topology is decided and recorded in SPEC §8.4; without an authenticator a tenant route answers a canonical `401` before handler dispatch while platform routes are served
-- [ ] Both resolving wrappers sit where `#[consumes(resolving_client = …)]` expects them; local wins in a local host, a remote host has no local fallback, an unavailable target is a canonical error, and resolution rebuilds after a target moves. The existing embedded consumers still use the legacy catalogue until T31
-- [ ] Every item of the REST contract is met for both APIs; the interim tenant path is adapter-internal, so callers see the semantic API only
+- [ ] Every REST-contract item owned by T27 is met; the interim tenant path is adapter-internal, so callers see the semantic API only
 
 **Verification:**
-- [ ] `cargo nextest run -p cf-gears-types-registry --test tenant_local_client_test` (new target) and the tenant cases of `rest_client_contract_test`
-- [ ] The full auth matrix and the bootstrap test of the shared verification, on both hosts
+- [ ] The tenant cases of `rest_client_contract_test`
+- [ ] The tenant rows of the auth matrix and the bootstrap test of the shared verification, on both hosts
+- [ ] `cargo test -p cf-gears-types-registry-sdk --features rest-client`; `cargo check -p cf-gears-types-registry-sdk --all-targets --all-features`
+- [ ] `make e2e-local` green; gear tests
+
+**Dependencies:** T24a, T26
+**Files likely touched:** `TR-SDK/src/rest_client/tenant.rs` and its tests, `TR/src/api/rest/{routes,handlers}.rs`, `TR/src/gear.rs`, the standalone authenticator bootstrap/gate site, `TR/tests/rest_client_contract_test.rs`, `docs/p0/SPEC.md` §8.4
+**Scope:** M — two commits as listed; a toolkit gate fix, if needed, is its own commit
+
+---
+
+### - [ ] T27a: Both clients resolvable; the REST contract closed
+
+**Description:** Expose `DirectoryResolvingClient` wrappers and `#[provides]` descriptors for
+both APIs, run the full auth matrix on both hosts, and close the REST contract with its
+documentation. After this task another developer can consume either API in either transport.
+Split out of T27 by plan P27; it owns every REST-contract item tagged T27a.
+
+Commits inside the task: (1) resolving wrappers, `rest-server` and `provides` with their
+fixture hosts; (2) the full auth matrix on both hosts; (3) QUICKSTART tenant flows and the
+contract's closing pass.
+
+**Acceptance criteria:**
+- [ ] Both resolving wrappers sit where `#[consumes(resolving_client = …)]` expects them; local wins in a local host, a remote host has no local fallback, an unavailable target is a canonical error, and resolution rebuilds after a target moves. The existing embedded consumers still use the legacy catalogue until T31
+- [ ] types-registry declares `#[provides(transports = [local, rest], rest_client = …)]` for both APIs; local and remote resolution are proven in fixture hosts
+- [ ] The full auth matrix of the shared verification passes for both route sets through the real api-gateway and `oop_serve` stacks
+- [ ] Every item of the REST contract is met for both APIs
+
+**Verification:**
 - [ ] A `consumes`/`provides` fixture compiles for each API with `local` and `rest` features; focused resolving tests move a directory target
+- [ ] The full auth matrix of the shared verification, on both hosts
 - [ ] `cargo test -p cf-gears-types-registry-sdk --features rest-client`; `cargo check -p cf-gears-types-registry-sdk --all-targets --all-features`; `make dylint` for the SDK crate
 - [ ] `make e2e-local` green; both authenticated QUICKSTART flows run as written
 
-**Dependencies:** T26
-**Files likely touched:** `TR-SDK/src/{contract,lib}.rs`, `TR-SDK/src/rest_client/{tenant,resolving}.rs` and their tests, `TR/src/api/local_client.rs`, `TR/src/api/rest/{routes,handlers}.rs`, `TR/src/gear.rs`, the standalone authenticator bootstrap/gate site, `TR/tests/{tenant_local_client_test,rest_client_contract_test}.rs`, `QUICKSTART.md`, `docs/p0/SPEC.md` §8.4
-**Scope:** L — four commits as listed; a toolkit gate fix, if needed, is its own commit
+**Dependencies:** T27
+**Files likely touched:** `TR-SDK/Cargo.toml`, `TR-SDK/src/{lib,rest_client/resolving}.rs` and their tests, `TR/src/gear.rs`, consumes/provides fixture hosts, `TR/tests/rest_client_contract_test.rs` (auth matrix), `QUICKSTART.md`
+**Scope:** M — three commits as listed
 
 ---
 
@@ -2819,7 +2890,7 @@ in P0; visibility and Context-Tenant dimensions remain fixed until P1 tenancy.
 - [ ] Test: `read(old)` starts, a terminal outcome invalidates, `read(old)` completes — the entry stays empty and the next read fetches the new snapshot
 - [ ] Gear test through the real local client and the REST client: register → poll → read shows no stale entry after the terminal outcome
 
-**Dependencies:** T27, T24, T22d
+**Dependencies:** T27a, T24, T22d
 **Files likely touched:** `TR-SDK/src/cache/` (moved from `TR/src/infra/cache/`), `TR/src/api/local_client.rs`, `TR/src/gear.rs`, `TR/src/config.rs`, `TR-SDK/tests/client_cache_test.rs`
 **Scope:** M
 
@@ -2906,14 +2977,14 @@ registration are explicit configuration.
 - [ ] `cargo build -p cf-gears-types-registry-pilot` without the feature builds no pilot target; `cargo check --workspace --all-targets --all-features` stays green
 - [ ] Gear tests on SQLite/PostgreSQL/MySQL; both SDK feature builds
 
-**Dependencies:** T29, T28, T27
+**Dependencies:** T29, T28, T27a
 **Files likely touched:** `testing/fixtures/types-registry-pilot/{Cargo.toml,src/bin/pilot_registry.rs,src/bin/pilot_consumer.rs,src/lib.rs,tests/remote_client_pilot_test.rs}`, directory/host config, the root `Cargo.toml` workspace members and `Cargo.lock`, `Makefile`, `.github/workflows/ci.yml`, handoff instructions
 **Scope:** L — commits: manifest/workspace/make/CI; fixture composition; cold-start scenarios; handoff instructions
 
 ---
 
 ### Checkpoint 7A — clients available for development and integration
-- [ ] `PlatformTypesRegistryApi` and `TypesRegistryApi` work through real local and resolving REST clients over one database-backed service; both auth planes pass the real-host refusal matrices (T26, T27)
+- [ ] `PlatformTypesRegistryApi` and `TypesRegistryApi` work through real local and resolving REST clients over one database-backed service; both auth planes pass the real-host refusal matrices (T24, T24a, T26, T27, T27a)
 - [ ] The platform cache holds its contract over the platform local and REST adapters; `post_wiring`, supervision and `Required` readiness are generic toolkit features (T28, T29)
 - [ ] Cold start in either order, a late cross-process dependency, an invalid declaration, readiness, conditional and cached reads, restart and shutdown pass on the pilot, and `make test-types-registry-pilot` runs inside `make ci` (T30)
 - [ ] Another developer can run the documented pilot and integrate without waiting for collectors or the fleet cutover; no host offers old and new catalogues side by side
@@ -3489,7 +3560,7 @@ TCP client, real outbox and controlled delays; the out-of-process e2e configurat
 - [ ] The publisher-version guard is active and `publisher` is required on every mutation: rows written before the migration were claimed by their first publication, and an older restart leaves newer content and stamps (T39–T42)
 - [ ] The REST clients pass their contract tests on the final paths (T26, T27, T32)
 - [ ] No process-global GTS inventory remains; the registry seeds only its own types, the base types and `cfg.entities`; the coverage test is green (T37)
-- [ ] Every route refuses a caller without the credential it needs with `401`; mutations on the registry's listener serve the platform plane only (T26, T27, T25)
+- [ ] Every route refuses a caller without the credential it needs with `401`; mutations on the registry's listener serve the platform plane only (T25, T26, T27, T27a)
 - [ ] No registry call remains inside any `init()`, and no startup phase fails on an unpublished or unreachable registry (T31's audit, T35–T37)
 - [ ] `make ci` (including the pilot), gear tests on three backends, `make e2e-local`, `make e2e-docker`, `make dylint`, `make lychee` green
 - [ ] Every ceiling in SPEC §9 has a comment at the point it binds

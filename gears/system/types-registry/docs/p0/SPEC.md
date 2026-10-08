@@ -997,7 +997,7 @@ The standalone binary needs `DynBearerAuthenticator` in ClientHub, via
 without it tenant routes must return canonical `401` before dispatch.
 Authentication grants no authorization (C2, C6, C8).
 
-**Early client handoff (P26).** T26/T27 provide both API transports and their resolving
+**Early client handoff (P26, P27).** T24a–T27a provide both API transports and their resolving
 clients, T28 the specified platform cache and T29 the generic post-wiring, supervision and
 readiness prerequisites. T30 runs isolated registry and consumer application processes, plus
 the master host's `DirectoryService` as an explicit prerequisite process, using real
@@ -1880,7 +1880,7 @@ gears/system/types-registry/
 ├── types-registry-sdk/src/
 │   ├── api.rs                            DELETED once consumers migrate (D6)
 │   ├── contract.rs                       NEW  PlatformTypesRegistryApi (#[toolkit::contract]) + PlatformTypesRegistryApiExt
-│   ├── tenant_contract.rs                NEW  TypesRegistryApi: tenant-plane entity reads (D17, T27)
+│   ├── tenant_contract.rs                NEW  TypesRegistryApi: tenant-plane entity reads (D17, T24a)
 │   ├── models.rs                         shrinks: the old models go with the old trait (D6)
 │   ├── entity_models.rs                  NEW  P0 models per §10.1 — no serde
 │   ├── reconcile.rs                      NEW  reconciliation + `publish_gts`, returning the SDK's publication status
@@ -2426,14 +2426,15 @@ other documents cite it.
     after wiring, reports not ready until they are admitted, and reads them back through the
     same trait. Declarations whose dependencies are published by another process converge
     without a startup barrier (D15, D16).
-18. Every route refuses a caller with neither a valid bearer nor a valid
-    `X-ToolKit-Internal-Token` with `401`. The registry's own listener serves either one on
-    reads and a valid internal token only on mutations (D20), and api-gateway serves a valid
-    bearer only. An invalid credential beside a valid one is refused
-    wherever that stack validates it: the registry's listener validates both, while api-gateway
-    ignores an internal token unless its internal authenticator is configured. The registry
-    seeds only its
-    own types, the `toolkit-gts` base types and `cfg.entities`. No process-global GTS inventory
+18. Every route serves exactly one plane, on the registry's own listener and on api-gateway
+    alike (D17, D20). Platform routes (`/types-registry/platform/v1/`) serve only a validated
+    `X-ToolKit-Internal-Token`; a valid bearer alone gets `401`, and a host without an internal
+    authenticator refuses every platform call with `401`. Tenant read routes
+    (`/types-registry/v1/`, `/v2/` until T32) serve only a validated bearer; a valid internal
+    token alone gets `401`. A caller with neither credential gets `401`. An invalid credential
+    beside a valid one is refused wherever that stack validates it: the registry's listener
+    validates both, while api-gateway ignores an internal token on a tenant route unless its
+    internal authenticator is configured. The registry seeds only its own types, the `toolkit-gts` base types and `cfg.entities`. No process-global GTS inventory
     remains (D11, D17).
 19. Every mutation carries a `publisher`, and one with a lower `publisher_version` never
     changes a claimed entity: a rolled-back or delayed older publication reports

@@ -43,8 +43,8 @@ pub fn register_routes(
 ) -> Router {
     // C8 remains open: v2 accepts tenant bearers; exposed=false only controls proxy discovery.
     // T26 moves routes, credentials, fixtures and e2e callers to platform auth atomically.
-    // Platform bypasses the tenant PDP (ADR-0006/0008). Routes remain in OpenAPI; T27 promotes
-    // their path to V1 and keeps mutations unexposed while C8 remains open.
+    // Platform bypasses the tenant PDP (ADR-0006/0008). Routes remain in OpenAPI; T32 promotes
+    // the tenant reads to V1 and keeps mutations unexposed while C8 remains open.
 
     router = register_v1(router, openapi);
     router = register_submit(router, openapi);
@@ -155,7 +155,7 @@ fn register_v1(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     router
 }
 
-// Database-backed v2 (T9), promoted to v1 at T27. No .exposed(): gateway discovery
+// Database-backed v2 (T9); T32 promotes the tenant reads to v1. No .exposed(): gateway discovery
 // excludes it, including mutations after promotion (see C8 above).
 
 /// `POST {V2}/entities` (D10).

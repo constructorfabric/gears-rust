@@ -42,8 +42,8 @@ reference. The queue is Phase 7 (both clients, an isolated handoff, every gear o
 persistent registry), Phase 8 (publication after wiring: Account Management first, then
 every gear out of process) and Phase 9 (mixed-version rollout, last). Task references in
 historical decisions P1–P25 and completed evidence retain the numbering current when
-recorded; P26's mapping and the active graph/index/queue below are the execution
-authority. No future-task renumbering is implicit.
+recorded; P26's mapping, as regrouped by P27 (T24a and T27a added), and the active
+graph/index/queue below are the execution authority. No future-task renumbering is implicit.
 
 ## Decisions taken during planning
 
@@ -960,7 +960,7 @@ Open tasks were renumbered; completed task IDs remain evidence references:
 | — | T24 REST path for gears in other processes (new) |
 | — | T25 toolkit collectors, post-wiring, readiness (new) |
 | T24 cutover | T26 |
-| T24a retire v1, promote v2 | T27 |
+| T24a (retired) retire v1, promote v2 | T27 |
 | T25 system gears | T28 |
 | T26 domain gears, delete the old trait | T29, plus the end of the pull |
 | T30 client cache | T30, as an SDK decorator |
@@ -1275,6 +1275,42 @@ each with the full gate.
 **Planning horizon.** Later tasks keep full acceptance criteria now. Change the queue only for
 a demonstrated correctness, security or compatibility blocker, recording the invariant and the
 smallest affected task. Convenience refactors and new features do not expand a gate.
+*Amended by P27:* the queue may also be regrouped for review packaging when no criterion is
+dropped and no checkpoint gate moves, and an additive feature may enter a task's acceptance
+criteria only through a numbered plan decision that names it and leaves every checkpoint gate
+unchanged.
+
+### P27. Every trait and local client in one pull request; T25 lands on its own
+
+**Accepted 2026-10-08.** A regrouping for review, not a correctness change: no acceptance
+criterion of P26 is dropped, and no checkpoint gate moves. It amends P26's planning horizon,
+which allowed queue changes only for a correctness, security or compatibility blocker and
+barred new features: P27 is neither, so the horizon now also admits review regrouping, and
+an additive feature named by a plan decision. This decision names exactly one —
+`TypesRegistryApiExt` in T24a. It extends T24a's acceptance criteria, not Checkpoint 7A or
+any later gate.
+
+- **T25 is its own toolkit pull request.** The platform-authenticated axis touches only
+  toolkit and api-gateway, and nothing before T26's route move uses it, so it is reviewed by
+  its owners on branch `toolkit-platform-route-auth`. Its criteria stay unchecked in the task
+  list until it merges into `main`. T26's DTO and client commits need only T24; its route move
+  and TCP contract test need T25 in `main`.
+- **T24a — the tenant contract, its extension helpers and its local client** move out of T27
+  (its former commit 1), so T24 + T24a deliver every P0 trait and local client in one pull
+  request. T24a adds `TypesRegistryApiExt`, the platform's read conveniences over the tenant
+  API, sharing one implementation of the helper logic; it is additive and changes no platform
+  shape.
+- **T27a — resolving clients and the contract's closure** split out of T27: both
+  `DirectoryResolvingClient` wrappers, `rest-server` and `#[provides]`, the full auth matrix on
+  both hosts, and the QUICKSTART tenant flows. T27 keeps the tenant REST client, the tenant
+  routes and the standalone authenticator with its SPEC §8.4 topology decision.
+- **The REST contract becomes a normative reference.** Its items lose their checkboxes and
+  name their owning task (T24a, T26, T27 or T27a), so no item is tracked twice.
+
+T24a reuses a number retired before P22 (*"T24a retire v1, promote v2"*, now T32); that
+historical reference is marked "(retired)". The sequence becomes
+T24a → T25 → T26 → T27 → T27a → T28 → … ; Checkpoint 7A and every later task are unchanged
+except that T28 and T30 depend on T27a instead of T27.
 
 ## Dependency graph
 
@@ -1341,11 +1377,15 @@ T6 config ───────────────────────�
                    ▼
         T24 platform contract + local + reconciliation/publication (complete)
                    ▼
-        T25 platform-authenticated axis (complete)
+        T24a tenant contract + TypesRegistryApiExt + tenant local client (P27)
+                   ▼
+        T25 platform-authenticated axis (own toolkit PR; merged before T26's route move)
                    ▼
         T26 platform API over REST + platform routes + their e2e callers
                    ▼
-        T27 tenant API (local + REST) + resolving clients; REST contract closed
+        T27 tenant API over REST + standalone tenant authenticator
+                   ▼
+        T27a resolving clients + provides for both APIs; REST contract closed
                    ▼
         T28 platform SDK cache ──► T29 post_wiring + supervision + Required readiness
                    ▼
@@ -1447,16 +1487,18 @@ exists. From T7 onward the graph is vertical.
 - T22a: REST batchGet and discovery — complete OpenAPI and quickstart (P17)
 - T22b: Field projection on all three read routes — document-free default (P19)
 - T22c: Discovery `depth`, `kind` and `lifecycle_status` filters — cursor-bound and composed with `pattern` (P20)
-- T22d: Freshness validators and conditional reads (`ETag` / `304`, batch validators) — **moved here from Phase 7, formerly T38 (retired)** (P21)
+- T22d: Freshness validators and conditional reads (`ETag` / `304`, batch validators) — **moved here from Phase 7, formerly T29 (retired)** (P21)
 
 **Checkpoint 6**
 
 ### Phase 7 — Both clients, an isolated handoff, and every gear on the persistent registry
 - T23: Toolkit — publisher signature and publication status (complete)
 - T24: `PlatformTypesRegistryApi` contract, models, local client, reconciliation and publication (complete)
-- T25: Toolkit — a platform-authenticated auth axis; one plane per route (complete)
+- T24a: `TypesRegistryApi` tenant contract, its extension helpers and local client
+- T25: Toolkit — a platform-authenticated auth axis; one plane per route (own pull request; open until merged)
 - T26: Platform API over REST
-- T27: Tenant API over local and REST; both clients resolvable
+- T27: Tenant API over REST; the standalone tenant authenticator
+- T27a: Both clients resolvable; the REST contract closed
 - T28: SDK client cache — freshness window, byte bound, `fresh` bypass
 - T29: Toolkit post-wiring lifecycle — hook, supervision and `Required` readiness
 - T30: Isolated pilot harness and cold-start client handoff
@@ -1616,9 +1658,10 @@ survives (T32, P12).** All 20 success criteria of SPEC §16; `make ci`,
 | The out-of-process design is first exercised at the end | **High** — late discovery after twenty gears moved | T30 runs the isolated pilot at Checkpoint 7A before existing consumers migrate, inside `make ci`; T33 reruns it with automatic declarations, T36 with real Account Management, and T42 for the guard in Phase 9 |
 | A feature-gated pilot test is silently skipped by the checkpoint gate | Medium — the out-of-process handoff looks proven while nothing ran | T30 puts the bins and test in a `publish = false` harness package with `required-features`, and adds `make test-types-registry-pilot` to `make ci` and the CI workflow |
 | The development authenticator hides a production authentication gap | **High** — the remote tenant plane could pass without the real authn-resolver | T30 records the development authenticator as development-only; T36 requires `AuthNResolverBearerAuthenticator` over the real authn-resolver for Checkpoint 8A, and T38 covers a linked topology after the pull ends |
-| The hand-written REST client drifts from the hand-written handlers | **High** — silent wire mismatch across processes | T26/T27 use the real routes over TCP and close both API contracts. Platform paths are final from the start; tenant paths promote in T32 and the contract test reruns |
+| The hand-written REST client drifts from the hand-written handlers | **High** — silent wire mismatch across processes | T26/T27 use the real routes over TCP and T27a closes both API contracts. Platform paths are final from the start; tenant paths promote in T32 and the contract test reruns |
 | A declaring crate is owned by no gear, or its owner is enabled but does not publish it | Medium — its types never reach the database, found only on first read | T37's ownership coverage: an independent expected set (cargo metadata plus a `declare_gts_inventory!()` scan) is checked against the gears' `gts(crates = …)` metadata, and per binary each enabled gear's publication is registered. Linking a crate whose owner runs elsewhere is not an omission (P22) |
 | Per-crate collectors lose entries under LTO or in a crate reached only through `gts_declarations()` | Medium | T33 carries a release+LTO fixture binary that asserts per-crate counts (P22) |
+| T25's toolkit pull request waits on other owners' review | Medium — schedule: T26's route move and contract test are blocked | P27 lands it on its own branch; T24a and T26's DTO and client commits proceed on `main` meanwhile |
 | Toolkit changes (`post_wiring`, readiness, macro collectors) need other owners' review | Medium — schedule, not correctness | T29 lands the generic lifecycle before the pilot and cutover; T33 adds collectors and the attribute later. Each lands as separate focused toolkit commits, reviewable alone. T26/T27 use hand-written clients without changing toolkit-contract codegen |
 | Two pods of one release with different configuration publish different content | Low — last writer wins until the rollout ends | Accepted (C11); only a newer release orders them |
 | An older pod serves against a newer contract after a restart or rollback | Medium — the same exposure every rolling update already has | Superseded is ready with a warning and a metric (D21); the release's N−1 obligation and mixed-version tests (T42) carry compatibility; a stricter opt-in is deferred to P1 (O6) |
@@ -1644,9 +1687,10 @@ survives (T32, P12).** All 20 success criteria of SPEC §16; `make ci`,
 ## Sequence
 
 **Accepted queue (P26): sequential, in numeric order.** Completed phases and IDs stay
-as recorded; the next implementation task is **T26**.
+as recorded; the next implementation task is **T24a** (P27).
 
-1. Phase 7: T26 → T27 → T28 → T29 → T30 (Checkpoint 7A) → T31 → T32 (Checkpoint 7).
+1. Phase 7: T24a → T25 → T26 → T27 → T27a → T28 → T29 → T30 (Checkpoint 7A) → T31 → T32
+   (Checkpoint 7). T24 and T24a ship as one pull request; T25 as its own toolkit pull request.
 2. Phase 8: T33 → T34 → T35 → T36 (Checkpoint 8A) → T37 → T38 (Checkpoint 8).
 3. Phase 9: T39 → T40 → T41 → T42 (Checkpoint 9).
 
