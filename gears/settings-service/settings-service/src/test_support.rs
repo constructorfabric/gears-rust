@@ -735,6 +735,31 @@ impl ResolutionHarness {
             .expect("metadata");
     }
 
+    /// Tag a declaration `advanced`, the rest of its metadata as `declare`
+    /// leaves it.
+    pub async fn tag_advanced(&self, declaration_id: Uuid) {
+        let conn = self.db.conn().expect("connection");
+        DeclarationRepo
+            .update_metadata(
+                &conn,
+                &AccessScope::allow_all(),
+                declaration_id,
+                crate::domain::declaration::DeclarationMetadata {
+                    mode: "advanced".to_owned(),
+                    description: None,
+                    domain_affinity: None,
+                    licence_feature: None,
+                    data_classification: "public".to_owned(),
+                    requires_step_up: true,
+                    anonymous_exposable: false,
+                },
+                None,
+                false,
+            )
+            .await
+            .expect("metadata");
+    }
+
     pub async fn retire(&self, declaration_id: Uuid) {
         let conn = self.db.conn().expect("connection");
         DeclarationRepo
@@ -1119,6 +1144,32 @@ impl authz_resolver_sdk::AuthZResolverApi for AllowButMasked {
     }
 }
 
+/// A policy decision point that allows every action but reading values.
+///
+/// The caller it stands for holds the category right and not the settings
+/// one — a taxonomy author, say — and so may list the rail but not open any
+/// table under it. What such a caller must not receive is a count of what it
+/// could not open.
+struct AllowButValues;
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for AllowButValues {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        let values = request.resource.resource_type == settings_service_sdk::gts::VALUE_SCHEMA;
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: !(values && request.action.name == "read"),
+            context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
+        })
+    }
+}
+
 /// A policy decision point that denies everything.
 struct DenyAll;
 
@@ -1191,6 +1242,12 @@ impl RestHarness {
         Self::build(Arc::new(AllowButMasked), Arc::new(FixedStepUp::verified())).await
     }
 
+    /// The same surface for a caller that may read categories and
+    /// declarations but not values.
+    pub async fn without_value_read() -> Self {
+        Self::build(Arc::new(AllowButValues), Arc::new(FixedStepUp::verified())).await
+    }
+
     /// The same surface where the caller's last re-authentication is too old,
     /// for the tests that assert the second gate.
     pub async fn stale_step_up() -> Self {
@@ -1221,6 +1278,7 @@ impl RestHarness {
             axum::Router::new(),
             &openapi,
             categories,
+            Arc::clone(&inner.resolver),
             Arc::clone(&inner.db),
             Arc::clone(&enforcer),
         );

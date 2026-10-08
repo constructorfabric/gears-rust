@@ -8,19 +8,21 @@ use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdat
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use toolkit_db::odata::{LimitCfg, paginate_odata};
-use toolkit_odata::{ODataQuery, Page, SortDir};
+use toolkit_db::odata::LimitCfg;
+use toolkit_odata::{ODataQuery, SortDir};
 
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::category::{
     Category, CategoryDraft, CategoryKey, CategoryPatch, CategoryRepository, Patch,
 };
 use crate::domain::error::DomainError;
+use crate::domain::odata::Listing;
 use crate::domain::precondition;
 use crate::domain::precondition::ETag;
 use crate::infra::storage::clock::{now, stamp_after};
 use crate::infra::storage::entity::category::{self, Entity as CategoryEntity};
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
+use crate::infra::storage::listing::list_counted;
 use crate::infra::storage::odata_mapper::CategoryODataMapper;
 use settings_service_sdk::odata::CategoryFilterField;
 
@@ -297,7 +299,7 @@ impl CategoryRepository for CategoryRepo {
         scope: &AccessScope,
         visibility: &DomainVisibility,
         query: &ODataQuery,
-    ) -> Result<Page<Category>, DomainError> {
+    ) -> Result<Listing<Category>, DomainError> {
         let mut select = CategoryEntity::find();
 
         // @cpt-begin:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-4
@@ -316,8 +318,6 @@ impl CategoryRepository for CategoryRepo {
             );
         }
         // @cpt-end:cpt-cf-settings-service-algo-category-management-visibility-filter:p1:inst-cat-visfilter-4
-
-        let base = select.secure().scope_with(scope);
 
         // Tiebreaker is `name`, which is unique, so a page boundary can neither
         // repeat nor skip a row.
@@ -338,8 +338,11 @@ impl CategoryRepository for CategoryRepo {
         // surface here as a validation failure rather than as an empty page.
         // Reporting any of them as "no results" would let an administrator
         // read a broken query as an empty catalogue.
-        let page = paginate_odata::<CategoryFilterField, CategoryODataMapper, _, _, _, _>(
-            base,
+        // The page and, beside it, how many categories the walk holds under
+        // the same predicate — the rail's scrollbar and its heading count.
+        let page = list_counted::<CategoryFilterField, CategoryODataMapper, _, _, _, _>(
+            select,
+            scope,
             conn,
             query,
             ("name", SortDir::Asc),
@@ -361,9 +364,10 @@ impl CategoryRepository for CategoryRepo {
             .into_iter()
             .map(to_domain)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Page {
+        Ok(Listing {
             items,
             page_info: page.page_info,
+            total_count: page.total_count,
         })
     }
 

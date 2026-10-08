@@ -665,10 +665,32 @@ where
         scope: &AccessScope,
         hidden_for: &[Uuid],
         query: &toolkit_odata::ODataQuery,
-    ) -> Result<toolkit_odata::Page<Declaration>, DomainError> {
+    ) -> Result<crate::domain::odata::Listing<Declaration>, DomainError> {
         let visible = crate::domain::category::visibility::domain_visibility(scope);
         self.declarations
             .list(conn, scope, &visible, hidden_for, query)
+            .await
+    }
+
+    /// How many settings each of `category_ids` holds for the caller, split
+    /// by mode and status — counted under exactly what [`Self::list_declarations`]
+    /// pages: the caller's scope constraints, its administrative-domain
+    /// visibility and the settings `hidden` for it, so a category's count
+    /// agrees with the browse of it. A category with nothing to count is
+    /// absent from the answer.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    pub async fn tally_declarations<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        hidden_for: &[Uuid],
+        category_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, crate::domain::declaration::CategoryTally>, DomainError> {
+        let visible = crate::domain::category::visibility::domain_visibility(scope);
+        self.declarations
+            .tally_by_category(conn, scope, &visible, hidden_for, category_ids)
             .await
     }
 

@@ -1,5 +1,5 @@
 Created:  2026-07-20 by Virtuozzo International GmbH
-Updated:  2026-08-30 by Virtuozzo International GmbH
+Updated:  2026-10-08 by Virtuozzo International GmbH
 
 # PRD — Settings Service
 
@@ -883,7 +883,7 @@ Each criterion validates the referenced FR/NFR; the full normative statement liv
 - [ ] PII in setting values remains governed by the platform retention/anonymization policy (`cpt-cf-settings-service-fr-typed-value-validation`)
 - [ ] A GTS type change that invalidates an existing override marks it `needs-review` and blocks setting it until corrected and revalidated (`cpt-cf-settings-service-fr-typed-value-validation`)
 - [ ] Standard-mode reads exclude Advanced-only settings and categories; mode preference persists per user, not per session (`cpt-cf-settings-service-fr-standard-advanced-mode`)
-- [ ] Reads expose the count of hidden Advanced-only settings per category rather than silently omitting them (`cpt-cf-settings-service-fr-standard-advanced-mode`)
+- [x] Reads expose the count of hidden Advanced-only settings per category rather than silently omitting them (`cpt-cf-settings-service-fr-standard-advanced-mode`)
 - [x] Cross-field search (key/description/value/category) returns a flat list with category breadcrumbs and matched-field indication; respects scope/mode/visibility filters (`cpt-cf-settings-service-fr-search-discoverability`)
 - [x] Value search covers only defaults/overrides the caller may read in scope; `secret` values are never indexed or matched (no leakage via match existence, count, snippet, or timing); PII authorization is applied before matching so unauthorized callers cannot match PII content; structured-value search matches leaf values under the same rules (`cpt-cf-settings-service-fr-search-discoverability`)
 - [ ] Tenant-scope revert clears the local override and falls back to the nearest ancestor's override or the platform default; the resulting fallback is communicated before commit (`cpt-cf-settings-service-fr-defaults-revert`)

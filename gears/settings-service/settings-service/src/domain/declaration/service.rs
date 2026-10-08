@@ -12,7 +12,7 @@ use toolkit_macros::domain_model;
 
 use serde_json::Value;
 use toolkit_db::secure::DBRunner;
-use toolkit_odata::{ODataQuery, Page};
+use toolkit_odata::ODataQuery;
 use toolkit_security::AccessScope;
 use types_registry_sdk::TypesRegistryClient;
 use uuid::Uuid;
@@ -20,6 +20,7 @@ use uuid::Uuid;
 use super::{Declaration, DeclarationRepository};
 use crate::domain::category::visibility;
 use crate::domain::error::DomainError;
+use crate::domain::odata::Listing;
 
 /// A declaration together with the trait set a client renders it by.
 #[domain_model]
@@ -144,7 +145,7 @@ impl<R: DeclarationRepository> DeclarationService<R> {
         conn: &C,
         scope: &AccessScope,
         query: &ODataQuery,
-    ) -> Result<Page<RenderedDeclaration>, DomainError> {
+    ) -> Result<Listing<RenderedDeclaration>, DomainError> {
         crate::domain::odata::reject_unsupported_options(query, "declarations")?;
         crate::domain::odata::reject_unsortable::<crate::domain::odata::DeclarationOrderField>(
             query,
@@ -154,9 +155,10 @@ impl<R: DeclarationRepository> DeclarationService<R> {
         // The declaration surface is the platform administrator's; no tenant
         // restriction hides a declaration from it, only the domain visibility.
         let page = self.repo.list(conn, scope, &visible, &[], query).await?;
-        Ok(Page {
+        Ok(Listing {
             items: self.render(page.items).await,
             page_info: page.page_info,
+            total_count: page.total_count,
         })
     }
 }

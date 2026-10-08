@@ -112,7 +112,7 @@ async fn page_of(
     corpus: Corpus,
     tenants: &[Uuid],
     query: &ODataQuery,
-) -> Result<toolkit_odata::Page<crate::domain::declaration::Declaration>, DomainError> {
+) -> Result<crate::domain::odata::Listing<crate::domain::declaration::Declaration>, DomainError> {
     let conn = h.db.conn().expect("connection");
     let n = needle(raw);
     let mut q = query.clone();

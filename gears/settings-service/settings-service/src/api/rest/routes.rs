@@ -20,7 +20,9 @@ use toolkit_db::{DBProvider, DbError};
 
 use crate::api::rest::dto::CategoryDto;
 use crate::api::rest::handlers;
+use crate::api::rest::page_dto::PageDto;
 use crate::domain::category::CategoryService;
+use crate::gear::ConcreteResolver;
 use crate::infra::storage::audit_store::AuditStore;
 use crate::infra::storage::category_repo::CategoryRepo;
 use settings_service_sdk::odata::CategoryFilterField;
@@ -30,14 +32,16 @@ const TAG: &str = "settings-categories";
 
 /// Register the category routes.
 ///
-/// The service, the database handle and the enforcement point travel as
-/// extensions so a handler receives them as ordinary arguments -- in particular
-/// the enforcer, which is what makes obtaining an `AccessScope` the only way to
-/// reach the service.
+/// The service, the resolver, the database handle and the enforcement point
+/// travel as extensions so a handler receives them as ordinary arguments --
+/// in particular the enforcer, which is what makes obtaining an `AccessScope`
+/// the only way to reach the service. The resolver is what counts a
+/// category's settings the way the caller's browse would list them.
 pub fn register_routes(
     router: Router,
     openapi: &dyn OpenApiRegistry,
     service: Arc<CategoryService<CategoryRepo, AuditStore>>,
+    resolver: Arc<ConcreteResolver>,
     db: Arc<DBProvider<DbError>>,
     enforcer: Arc<authz_resolver_sdk::PolicyEnforcer>,
 ) -> Router {
@@ -48,9 +52,14 @@ pub fn register_routes(
         .description(
             "List categories visible to the caller, ordered by sort order then name. \
              Supports OData `$filter` over `key`, `name` and `domain_affinity`, and \
-             `$orderby` over `key` and `name`, with cursor pagination. `$orderby` over \
+             `$orderby` over `key` and `name`, with cursor pagination; `page_info.total_count` \
+             is how many categories the whole listing holds. `$orderby` over \
              `domain_affinity` is refused: it may be empty, and a page cursor cannot carry \
-             an empty value. `$select` is not supported and is rejected rather than ignored.",
+             an empty value. `$select` is not supported and is rejected rather than ignored. \
+             Each category carries `setting_count`, `advanced_count` and `retired_count` -- \
+             the settings the caller's browse of the category would list, every status, and \
+             of those the `advanced` and the `retired` ones -- when the caller may read \
+             values; a caller without that read gets the categories and no counts.",
         )
         .tag(TAG)
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-1
@@ -62,10 +71,10 @@ pub fn register_routes(
         .query_param_typed("limit", false, "Page size", "integer")
         .query_param("cursor", false, "Cursor for pagination")
         .handler(handlers::list_categories::<CategoryRepo, AuditStore>)
-        .json_response_with_schema::<toolkit_odata::Page<CategoryDto>>(
+        .json_response_with_schema::<PageDto<CategoryDto>>(
             openapi,
             StatusCode::OK,
-            "A page of categories with its pagination cursors",
+            "A page of categories with its pagination cursors and the total",
         )
         // The declared surface is the rejection rule made visible: a field
         // absent from `x-odata-filter` is refused with 400, never ignored.
@@ -87,7 +96,8 @@ pub fn register_routes(
             "Fetch one category by id. A category outside the caller's administrative \
              domain answers 404 rather than 403, so a hidden category's existence is \
              not disclosed. The response carries the category's ETag, which a later \
-             PATCH or DELETE must echo in `If-Match`.",
+             PATCH or DELETE must echo in `If-Match`, and the same setting counts the \
+             listing carries, when the caller may read values.",
         )
         .tag(TAG)
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-1
@@ -242,6 +252,7 @@ pub fn register_routes(
 
     router
         .layer(axum::Extension(service))
+        .layer(axum::Extension(resolver))
         .layer(axum::Extension(db))
         .layer(axum::Extension(enforcer))
 }

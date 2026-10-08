@@ -1,5 +1,5 @@
 <!-- Created: 2026-09-06 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-24 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-08 by Virtuozzo International GmbH -->
 
 # Feature: Tenant Access Restrictions
 
@@ -173,7 +173,7 @@ The standalone seam lives here too, because it is the same boundary drawn from t
 2. [x] - `p1` - Authorize `read` on the setting's key; **IF** deny or cannot be obtained → **RETURN** `403` - `inst-ta-list-2`
 3. [x] - `p1` - DB: SELECT the declaration by key; **IF** none, **OR** outside the caller's administrative domain, **OR** hidden from the caller → **RETURN** `404` - `inst-ta-list-3`
 4. [x] - `p1` - DB: SELECT tenant_permissions for the declaration where the tenant lies inside the caller's subtree, as the `AccessScope` constrains it, excluding standalone descendants, through `idx_tenant_permission_tenant`; the subtree is obtained under the shared subtree budget, and **IF** the budget cuts it → **RETURN** `400` naming the bound rather than a partial listing - `inst-ta-list-4`
-5. [x] - `p1` - **RETURN** `200` with every row in one page, each carrying its tag and its setter, masked for a caller not authorized for unmasked PII, in the shared `Page` envelope with `next_cursor` never set: the list is bounded by the subtree budget of step 4, not paginated - `inst-ta-list-5`
+5. [x] - `p1` - **RETURN** `200` with every row in one page, each carrying its tag and its setter, masked for a caller not authorized for unmasked PII, in the page envelope with `next_cursor` never set and `total_count` the list's length: the list is bounded by the subtree budget of step 4, not paginated - `inst-ta-list-5`
 
 ## 3. Processes / Business Logic (CDSL)
 

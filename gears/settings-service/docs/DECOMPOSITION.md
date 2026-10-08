@@ -167,6 +167,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - No-orphan deletion returning `409 CategoryNotEmpty` while any declaration references the category, including `retired` declarations
   - `If-Match` and ETag optimistic concurrency on `PATCH` and `DELETE`
   - Domain-filtered, visibility-gated, paginated list ordered by `sort_order` then `name`
+  - Per-category setting counts (`setting_count`, `advanced_count`, `retired_count`) on the list and the single read, counted under the caller's own browse predicate and gated by the value `read`; `total_count` on every listing of the gear (DESIGN §4.3)
   - Category mutations audited at platform scope — the root tenant's id — through the emitter of 2.1
   - `idx_categories_name_trgm` GIN trigram index on `name`, supporting search in a later wave
 

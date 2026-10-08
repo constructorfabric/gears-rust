@@ -1518,6 +1518,15 @@
       "CategoryDto": {
         "description": "A category as returned to a caller.\n\nField naming is `snake_case`, applied by `#[toolkit_macros::api_dto]` rather\nthan chosen here: every gear's DTOs serialize the same way, so a client does\nnot have to know which service produced a payload.",
         "properties": {
+          "advanced_count": {
+            "description": "Of those, the settings tagged `advanced` — what a console shows apart\nfrom the standard ones, folded away by default, and must still account\nfor rather than omit silently.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "description": {
             "description": "Optional long-form description.",
             "type": [
@@ -1551,6 +1560,24 @@
           "name": {
             "description": "Display name.",
             "type": "string"
+          },
+          "retired_count": {
+            "description": "Of those, the settings `retired`: still filed under the category and\nlisted by its browse under their own outcome.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "setting_count": {
+            "description": "How many settings the category holds for the caller: every declaration\na browse of the category would list for it, whatever the status, so the\nnumber beside the category agrees with the table under it. Present when\nthe caller may read values; absent, with the two below, when it may not\n— as the settings themselves would be.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "sort_order": {
             "description": "Ordering weight; lower sorts first.",
@@ -2670,6 +2697,152 @@
           "expected",
           "stored",
           "passes"
+        ],
+        "type": "object"
+      },
+      "CountedPageInfoDto": {
+        "description": "The cursors, the page size, and the size of the set the page was cut from.\n\nAliased to `CountedPageInfoDto` in the `OpenAPI` schema: types-registry\nalso exposes a `PageInfoDto`, of another shape, and every gear registers\ninto the one `OpenAPI` registry of the server, where the bare ident would\ncollide in `components.schemas`.",
+        "properties": {
+          "limit": {
+            "description": "The page size applied, which is the default when the caller named none.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "next_cursor": {
+            "description": "The cursor of the next page; `null` on the last one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prev_cursor": {
+            "description": "The cursor of the previous page; `null` on the first one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "total_count": {
+            "description": "How many rows the walk holds in all, counted under the page's own\npredicate — the caller's scope, the visibility rules and the `$filter`,\nnever the cursor — at the time of the read, so every page of one walk\nreports the same total. Absent on the one listing whose items are not\nthe set it pages: the needs-review browse, which pages declarations\nand lists their flagged rows.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "limit"
+        ],
+        "type": "object"
+      },
+      "CountedPage_AuditRecordDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AuditRecordDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/CountedPageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "CountedPage_CategoryDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CategoryDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/CountedPageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "CountedPage_DeclarationDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DeclarationDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/CountedPageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "CountedPage_RestrictionDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RestrictionDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/CountedPageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "CountedPage_SearchHitDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SearchHitDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/CountedPageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
+        ],
+        "type": "object"
+      },
+      "CountedPage_SettingItemDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SettingItemDto"
+            },
+            "type": "array"
+          },
+          "page_info": {
+            "$ref": "#/components/schemas/CountedPageInfoDto"
+          }
+        },
+        "required": [
+          "items",
+          "page_info"
         ],
         "type": "object"
       },
@@ -9013,47 +9186,11 @@
         ],
         "type": "object"
       },
-      "Page_AuditRecordDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/AuditRecordDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
       "Page_BalanceDto": {
         "properties": {
           "items": {
             "items": {
               "$ref": "#/components/schemas/BalanceDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
-      "Page_CategoryDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/CategoryDto"
             },
             "type": "array"
           },
@@ -9162,24 +9299,6 @@
           "items": {
             "items": {
               "$ref": "#/components/schemas/DebitNoteView"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
-      "Page_DeclarationDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/DeclarationDto"
             },
             "type": "array"
           },
@@ -9499,65 +9618,11 @@
         ],
         "type": "object"
       },
-      "Page_RestrictionDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/RestrictionDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
       "Page_ReviewThreadDto": {
         "properties": {
           "items": {
             "items": {
               "$ref": "#/components/schemas/ReviewThreadDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
-      "Page_SearchHitDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/SearchHitDto"
-            },
-            "type": "array"
-          },
-          "page_info": {
-            "$ref": "#/components/schemas/PageInfo"
-          }
-        },
-        "required": [
-          "items",
-          "page_info"
-        ],
-        "type": "object"
-      },
-      "Page_SettingItemDto": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/SettingItemDto"
             },
             "type": "array"
           },
@@ -60998,7 +61063,7 @@
     },
     "/settings-service/v1/categories": {
       "get": {
-        "description": "List categories visible to the caller, ordered by sort order then name. Supports OData `$filter` over `key`, `name` and `domain_affinity`, and `$orderby` over `key` and `name`, with cursor pagination. `$orderby` over `domain_affinity` is refused: it may be empty, and a page cursor cannot carry an empty value. `$select` is not supported and is rejected rather than ignored.",
+        "description": "List categories visible to the caller, ordered by sort order then name. Supports OData `$filter` over `key`, `name` and `domain_affinity`, and `$orderby` over `key` and `name`, with cursor pagination; `page_info.total_count` is how many categories the whole listing holds. `$orderby` over `domain_affinity` is refused: it may be empty, and a page cursor cannot carry an empty value. `$select` is not supported and is rejected rather than ignored. Each category carries `setting_count`, `advanced_count` and `retired_count` -- the settings the caller's browse of the category would list, every status, and of those the `advanced` and the `retired` ones -- when the caller may read values; a caller without that read gets the categories and no counts.",
         "operationId": "settings_service.list_categories",
         "parameters": [
           {
@@ -61043,11 +61108,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_CategoryDto"
+                  "$ref": "#/components/schemas/CountedPage_CategoryDto"
                 }
               }
             },
-            "description": "A page of categories with its pagination cursors"
+            "description": "A page of categories with its pagination cursors and the total"
           },
           "400": {
             "content": {
@@ -61377,7 +61442,7 @@
         ]
       },
       "get": {
-        "description": "Fetch one category by id. A category outside the caller's administrative domain answers 404 rather than 403, so a hidden category's existence is not disclosed. The response carries the category's ETag, which a later PATCH or DELETE must echo in `If-Match`.",
+        "description": "Fetch one category by id. A category outside the caller's administrative domain answers 404 rather than 403, so a hidden category's existence is not disclosed. The response carries the category's ETag, which a later PATCH or DELETE must echo in `If-Match`, and the same setting counts the listing carries, when the caller may read values.",
         "operationId": "settings_service.get_category",
         "parameters": [
           {
@@ -61672,11 +61737,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_DeclarationDto"
+                  "$ref": "#/components/schemas/CountedPage_DeclarationDto"
                 }
               }
             },
-            "description": "A page of declarations with its pagination cursors"
+            "description": "A page of declarations with its pagination cursors and the total"
           },
           "400": {
             "content": {
@@ -62423,11 +62488,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_SearchHitDto"
+                  "$ref": "#/components/schemas/CountedPage_SearchHitDto"
                 }
               }
             },
-            "description": "A page of hits, ordered by key, with its pagination cursors"
+            "description": "A page of hits, ordered by key, with its pagination cursors and the total of matching settings"
           },
           "400": {
             "content": {
@@ -62568,11 +62633,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_SettingItemDto"
+                  "$ref": "#/components/schemas/CountedPage_SettingItemDto"
                 }
               }
             },
-            "description": "A page of per-key outcomes with its pagination cursors"
+            "description": "A page of per-key outcomes with its pagination cursors and, except under `needs_review`, the total of settings the listing holds"
           },
           "400": {
             "content": {
@@ -62936,11 +63001,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_AuditRecordDto"
+                  "$ref": "#/components/schemas/CountedPage_AuditRecordDto"
                 }
               }
             },
-            "description": "A page of audit records, newest first, with its pagination cursors"
+            "description": "A page of audit records, newest first, with its pagination cursors and the total"
           },
           "400": {
             "content": {
@@ -63592,7 +63657,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_RestrictionDto"
+                  "$ref": "#/components/schemas/CountedPage_RestrictionDto"
                 }
               }
             },

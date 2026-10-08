@@ -664,3 +664,47 @@ async fn a_default_that_does_not_survive_a_round_trip_is_refused_as_a_value_writ
         answer.body
     );
 }
+
+#[tokio::test]
+async fn the_declaration_listing_reports_its_total_beside_the_page() {
+    let h = RestHarness::new().await;
+    for name in ["alpha", "beta", "gamma"] {
+        create(&h, name).await;
+    }
+
+    let (status, body) = h
+        .get(&format!("{DECLARATIONS}?limit=2"), h.inner.tree.root)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(slugs(&body).len(), 2);
+    assert_eq!(body["page_info"]["total_count"], json!(3), "{body}");
+
+    // Under a filter, the total is of the filtered set: one more declaration
+    // in another category leaves the harness category's total at three.
+    let other = h.inner.add_category("other").await;
+    h.inner
+        .declare_in(other, "delta", "cascading", json!(true), BOOL, "public")
+        .await;
+    let (status, body) = h
+        .get(
+            &format!(
+                "{DECLARATIONS}?$filter=category_id%20eq%20{}",
+                h.inner.category_id()
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(3),
+        "under the filter: {body}"
+    );
+    let (status, body) = h.get(DECLARATIONS, h.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(4),
+        "unfiltered: {body}"
+    );
+}

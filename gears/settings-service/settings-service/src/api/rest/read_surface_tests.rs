@@ -1625,3 +1625,155 @@ async fn setter_identity_is_masked_for_a_reader_without_the_pii_entitlement() {
         );
     }
 }
+
+// ── The total beside the cursors ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_browse_total_counts_the_settings_after_the_hidden_exclusion() {
+    // The same four settings as the page-cut test, one hidden from `a`. The
+    // total is of what the walk holds for the caller — three for `a`, four
+    // for the root — counted under the filter and never under the cursor, so
+    // a short page and a later page report the same number.
+    let h = RestHarness::new().await;
+    for name in ["px_alpha", "px_gamma", "px_delta"] {
+        h.inner.declare(name, "cascading", json!(true)).await;
+    }
+    let concealed = h.inner.declare("px_beta", "cascading", json!(true)).await;
+    h.restrict(concealed, h.inner.tree.a, TenantAccess::Hidden)
+        .await;
+
+    let (status, body) = h
+        .get("/settings-service/v1/settings?limit=2", h.inner.tree.a)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(2));
+    assert_eq!(body["page_info"]["total_count"], json!(3), "{body}");
+    let cursor = body["page_info"]["next_cursor"]
+        .as_str()
+        .expect("a third page")
+        .to_owned();
+    let (status, body) = h
+        .get(
+            &format!("/settings-service/v1/settings?limit=2&cursor={cursor}"),
+            h.inner.tree.a,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(3),
+        "same walk, same total"
+    );
+
+    let (status, body) = h
+        .get("/settings-service/v1/settings?limit=2", h.inner.tree.root)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(4),
+        "nothing hidden from the root"
+    );
+
+    // By category, the total is the category's count.
+    let (status, body) = h
+        .get(
+            &format!(
+                "/settings-service/v1/settings?$filter=category_id%20eq%20{}",
+                h.inner.category_id()
+            ),
+            h.inner.tree.a,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["page_info"]["total_count"], json!(3), "{body}");
+}
+
+#[tokio::test]
+async fn the_review_listing_claims_no_total() {
+    // Under `needs_review` the page is of declarations and the items are the
+    // flagged rows under them — two sets, and a total of either would be the
+    // wrong number for the other. None is reported rather than a wrong one.
+    let h = RestHarness::new().await;
+    let flagged = h.inner.declare("flagged", "cascading", json!(true)).await;
+    h.inner
+        .set_flagged(flagged, h.inner.tree.a, json!(false))
+        .await;
+
+    let (status, body) = h
+        .get(
+            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(1));
+    assert!(
+        body["page_info"].get("total_count").is_none(),
+        "no total under needs_review: {body}"
+    );
+    assert!(body["page_info"]["limit"].is_number(), "{body}");
+}
+
+#[tokio::test]
+async fn search_reports_how_many_settings_match_beyond_the_page() {
+    let h = RestHarness::new().await;
+    for name in ["px_alpha", "px_gamma", "px_delta"] {
+        h.inner.declare(name, "cascading", json!(true)).await;
+    }
+    let concealed = h.inner.declare("px_beta", "cascading", json!(true)).await;
+    h.restrict(concealed, h.inner.tree.a, TenantAccess::Hidden)
+        .await;
+
+    let (status, body) = h
+        .get("/settings-service/v1/search?q=px_&limit=2", h.inner.tree.a)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(3),
+        "the hidden setting matches nothing for this caller: {body}"
+    );
+}
+
+#[tokio::test]
+async fn history_reports_how_many_records_the_pair_holds() {
+    let h = RestHarness::new().await;
+    h.inner.declare("proxy", "cascading", json!(true)).await;
+    let value = format!(
+        "/settings-service/v1/settings/{}/value",
+        encoded(&h, "proxy")
+    );
+    let first = h
+        .send(
+            "PUT",
+            &value,
+            Some(json!({ "value": false })),
+            Some("absent"),
+            h.inner.tree.root,
+        )
+        .await;
+    let tag = first.body["etag"].as_str().expect("a tag").to_owned();
+    h.send(
+        "PUT",
+        &value,
+        Some(json!({ "value": true })),
+        Some(&tag),
+        h.inner.tree.root,
+    )
+    .await;
+
+    let (status, body) = h
+        .get(
+            &format!(
+                "/settings-service/v1/settings/{}/history?limit=1",
+                encoded(&h, "proxy")
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["page_info"]["total_count"], json!(2), "{body}");
+}

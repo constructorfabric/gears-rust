@@ -5,15 +5,18 @@
 //! lifecycle mutations arrive with the flows that own them. Declaring only what
 //! exists keeps the trait honest about what an implementor must supply today.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use toolkit_db::secure::DBRunner;
 use toolkit_macros::domain_model;
-use toolkit_odata::{ODataQuery, Page};
+use toolkit_odata::ODataQuery;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::category::DomainVisibility;
 use crate::domain::error::DomainError;
+use crate::domain::odata::Listing;
 
 /// A declaration as the domain sees it.
 ///
@@ -180,6 +183,24 @@ impl DeclarationMetadata {
     }
 }
 
+/// How many settings a category holds for one reader, and how they split.
+///
+/// The three are counted over one set — the declarations the reader's browse
+/// of the category would list, whatever their status — so `settings` is the
+/// rail's number and the other two are subsets of it: the settings tagged
+/// `advanced`, which a console groups apart and may fold away, and the ones
+/// `retired`, which browse still lists under their own outcome.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CategoryTally {
+    /// Every declaration the reader can see in the category.
+    pub settings: u64,
+    /// Of those, the ones tagged `advanced`.
+    pub advanced: u64,
+    /// Of those, the ones `retired`.
+    pub retired: u64,
+}
+
 /// Operations on declarations.
 #[async_trait]
 pub trait DeclarationRepository: Send + Sync {
@@ -327,7 +348,7 @@ pub trait DeclarationRepository: Send + Sync {
     /// List declarations for the caller, leaving out those `hidden` for the
     /// tenant whose root-to-self chain is `hidden_for` — in the query, so the
     /// page is cut and counted after the exclusion. An empty chain excludes
-    /// nothing.
+    /// nothing. The listing carries the size of the whole filtered set.
     ///
     /// # Errors
     /// [`DomainError::Validation`] when the query names an unmapped field, uses
@@ -339,5 +360,23 @@ pub trait DeclarationRepository: Send + Sync {
         visibility: &DomainVisibility,
         hidden_for: &[Uuid],
         query: &ODataQuery,
-    ) -> Result<Page<Declaration>, DomainError>;
+    ) -> Result<Listing<Declaration>, DomainError>;
+
+    /// Count the declarations of each of `category_ids` as [`Self::list`]
+    /// would list them for the same caller — the same scope, visibility and
+    /// `hidden` exclusion, every status — split by mode and status.
+    ///
+    /// A category with nothing to count is absent from the answer; the
+    /// caller reads that as an empty tally.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn tally_by_category<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
+        category_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, CategoryTally>, DomainError>;
 }

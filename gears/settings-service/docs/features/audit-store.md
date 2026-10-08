@@ -1,5 +1,5 @@
 <!-- Created: 2026-09-06 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-24 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-08 by Virtuozzo International GmbH -->
 
 # Feature: Audit Store and History
 
@@ -94,7 +94,7 @@ Two things about the record itself are fixed before it is written. Masking happe
 6. [x] - `p1` - Evaluate the caller's effective tenant access for the setting; **IF** `hidden` → **RETURN** `404` rather than `403`, so a hidden setting's existence is not disclosed through its history - `inst-as-hist-6`
 7. [x] - `p1` - Compose the canonical audit resource id for the key and the target tenant with the shared formatter, and DB: SELECT audit_records WHERE declaration_key = {key} AND (tenant_id = {tenant} OR tenant_id IS NULL) ORDER BY occurred_at DESC through `idx_audit_scoped`, cursor-paginated and bound to the pair, on the caller's `AccessScope` — the scope's own records and the setting's definition records, which belong to no tenant and explain changes no scope made - `inst-as-hist-7`
 8. [x] - `p1` - **FOR EACH** record → **IF** its actor classification is `pii` **AND** the caller is not authorized for unmasked PII → mask the actor; **IF** a recorded value carries the `pii` class, or the setting is `pii` now, under the same condition → mask it — a value recorded while its setting was `pii` stays masked after the setting is declassified, and one recorded before it became `pii` is masked once it is; a `secret` value needs no decision here, since it was never recorded in plaintext - `inst-as-hist-8`
-9. [x] - `p1` - **RETURN** `200` with the page of records — `tenant_id` (`null` for a definition record), `operation`, `actor`, `pre_value`, `post_value`, `outcome`, `request_id`, `change_set_id`, `occurred_at` — and its pagination cursors; an empty page is `200` with no items, never an error - `inst-as-hist-9`
+9. [x] - `p1` - **RETURN** `200` with the page of records — `tenant_id` (`null` for a definition record), `operation`, `actor`, `pre_value`, `post_value`, `outcome`, `request_id`, `change_set_id`, `occurred_at` — its pagination cursors, and `page_info.total_count`, the records the pair holds in all; an empty page is `200` with no items and a total of zero, never an error - `inst-as-hist-9`
 
 ## 3. Processes / Business Logic (CDSL)
 

@@ -331,6 +331,11 @@ async fn the_listing_carries_the_rows_recorded_for_the_setting() {
         "the listing is not paginated: {body}"
     );
     assert_eq!(body["page_info"]["limit"], json!(2), "{body}");
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(2),
+        "the whole list, so the total is its length: {body}"
+    );
 }
 
 // ── What the surface refuses ─────────────────────────────────────────────────

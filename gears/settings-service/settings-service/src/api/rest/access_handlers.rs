@@ -248,17 +248,10 @@ pub async fn list_access(
         .collect();
     // The whole list in one page, by design: at most one row per descendant
     // tenant, the subtree walked under the shared budget and refused past it,
-    // so there is nothing to continue from. The `Page` envelope is the
-    // published contract; its cursor is never set here.
-    let limit = u64::try_from(items.len()).unwrap_or(u64::MAX).max(1);
-    Ok(Json(toolkit_odata::Page {
-        items,
-        page_info: toolkit_odata::PageInfo {
-            next_cursor: None,
-            prev_cursor: None,
-            limit,
-        },
-    }))
+    // so there is nothing to continue from. The page envelope is the
+    // published contract; its cursor is never set here and its total is the
+    // list's length.
+    Ok(Json(crate::api::rest::page_dto::PageDto::whole(items)))
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-5
 }
 
