@@ -1308,7 +1308,7 @@ The D-198 internal durable pause/revoke coordination port narrowly amends the fo
 
 ### Receiver contract reconciliation (Lifecycle D-201)
 
-Use the [semantic operation and historical alias matrix](../../orders-lifecycle/docs/implementation/RECEIVER_CONTRACTS.md).
+Use the semantic operation and historical alias matrix.
 The matrix preserves SUB-O IDs as provenance, never as ambiguous callable API names. Internal
 rebuild is a guarded engine continuation; normal worker restart reuses its existing attempt.
 For activation clocks and failure mapping use the [normative receiver clock contract](../../orders-lifecycle/docs/DESIGN.md#contract-06-activation-clocks)

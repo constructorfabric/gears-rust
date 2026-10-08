@@ -3440,7 +3440,7 @@ unknown or incompatible receiver/Rating geometry fails closed without rewriting 
 [Normative rebuild](DESIGN.md#contract-06-replace-fulfillment-grant),
 [audit storage/encoding](DESIGN.md#contract-01-table-orders_transition_audit),
 [clock boundary](DESIGN.md#contract-06-activation-clocks), and
-[implementation evidence/operation matrix](implementation/RECEIVER_CONTRACTS.md).
+implementation evidence/operation matrix.
 S2-02 owns migrations, S2-06 the production audit encoder, S5-02 SDK/contribution registration,
 S5-08 rebuild execution and S5-15 full forced-exit integration. This contract-only package
 implements none of those runtime paths and is not peer production sign-off.
@@ -3462,8 +3462,8 @@ the audit or access-log column (08 §4.4). Proof verification and the deny codes
 policy under `cpt-cf-bss-orders-lifecycle-upreq-pdp-policy-integration` (UPSTREAM_REQS §2.9).
 
 [REST carrier](DESIGN.md#contract-08-4-4), [SDK/REST metadata](DESIGN.md#33-api-contracts),
-[boundary fixtures B44–B52](implementation/contracts/CONTRACTS.md),
-[implementation evidence](implementation/AUTHZ.md).
+boundary fixtures B44–B52,
+implementation evidence.
 
 ## D-203 — `replace-fulfillment-grant` receipts use the workflow retention class (S2-05)
 
@@ -3505,7 +3505,7 @@ one replaceable function. No conformance vector changes: the admin-edit vectors 
 verbatim `external_reference`.
 
 [Minimization contract](DESIGN.md#43-data-protection-residency-and-retention),
-[audit column](DESIGN.md#contract-01-3-7), [implementation evidence](implementation/AUDIT.md).
+[audit column](DESIGN.md#contract-01-3-7), implementation evidence.
 
 ## D-205 — The broker partition count is a required declaration; broker equality is a deployment gate (amends DESIGN §3.7; S2-08)
 
@@ -3525,7 +3525,7 @@ under a mismatch is a **deferred escalation** recorded in UPSTREAM_REQS §2.7 an
 with the owner.
 
 [Producer persistence contract](DESIGN.md#contract-01-platform-managed-producer-persistence),
-[upstream requirement](UPSTREAM_REQS.md#27-event-broker), [implementation evidence](implementation/EVENTS.md).
+[upstream requirement](UPSTREAM_REQS.md#27-event-broker), implementation evidence.
 
 ## D-206 — Authoring wire bindings: `snake_case` bodies, typed create/line results, removal body, unauthored draft cycle (S2-09)
 
@@ -3578,7 +3578,7 @@ gap review on 2026-10-07. Pending design review. Event payloads are unchanged.
    arrangement; the engine refuses any other proposal as an integration defect before
    authorization, a read or a write (DESIGN 02 §2.2 *One order, one payer*, §4.3).
 
-[Capture implementation evidence](implementation/CAPTURE.md), [field classification](DESIGN.md#contract-02-4-3).
+Capture implementation evidence, [field classification](DESIGN.md#contract-02-4-3).
 
 ## D-207 — The date-policy channel is a startup promotion; the date basis is strict and frozen (S2-10)
 
@@ -3637,7 +3637,7 @@ gap review on 2026-10-07. Pending design review. Event payloads are unchanged.
    that already holds a carried value is satisfied (02 §4.2: "carried-forward resolved dates remain
    values unless changed by the amendment").
 
-[Date implementation evidence](implementation/DATES.md), [date cascade](features/02-capture.md#contract-02-4-2).
+Date implementation evidence, [date cascade](features/02-capture.md#contract-02-4-2).
 
 ## D-208 — Admitted-line dates are never NULL; the stale-basis refusal carries no context data (S2-10 gap review)
 
@@ -3675,7 +3675,7 @@ gap review on 2026-10-07. Pending design review. Event payloads are unchanged.
    - **If a wire field is wanted.** Adding one requires registering it here first. It then
      applies to the REST body, the SDK and the stored replay together.
 
-[Date implementation evidence](implementation/DATES.md), [gap review](../../../../artifacts/orders-lifecycle-s2-20261006/S2-10-gap-review.md).
+Date implementation evidence, [gap review](../../../../artifacts/orders-lifecycle-s2-20261006/S2-10-gap-review.md).
 
 ## D-209 — Worker class connections, the conditional sweep lock and streamed checkpoint publication (S2-11)
 
@@ -3693,7 +3693,7 @@ gap review on 2026-10-07. Pending design review. Event payloads are unchanged.
 
 **Amended text (S2-FINAL cleanup, 2026-10-07).** Items 2 and 9 diverged from the DESIGN roster cell "recheck expiry and settlement under row lock" ([Foundation contract §3.8](DESIGN.md#contract-01-3-8)) and from the Foundation feature text that selected cleanup and purge batches "under `SKIP LOCKED`" (01 §3.1 item 6, §3.5 item 2). The implementation is kept: every PostgreSQL row-locking clause requires the UPDATE privilege, the migration-08 maintenance and retention roles deliberately hold SELECT and DELETE only (CAPABILITIES "separate credentials"; attested at startup), the conditional DELETE's predicates are re-evaluated on the current row version under the row's lock, and the two-replica lock-session-loss test proves no double or live deletion. DESIGN §3.8 (roster), the D-184 discovery text and 01 §3.1/§3.5 now state the conditional-delete mechanism and cite this decision.
 
-[Maintenance implementation evidence](implementation/MAINTENANCE.md), [implementation report](../../../../artifacts/orders-lifecycle-s2-20261006/S2-11-implementation.md), [gap review](../../../../artifacts/orders-lifecycle-s2-20261006/S2-11-gap-review.md).
+Maintenance implementation evidence, [implementation report](../../../../artifacts/orders-lifecycle-s2-20261006/S2-11-implementation.md), [gap review](../../../../artifacts/orders-lifecycle-s2-20261006/S2-11-gap-review.md).
 
 ## D-210 — Draft read wire bindings, the cursor token, and the snapshot/access-log transactions (early S6-01/S6-04)
 
@@ -3708,7 +3708,7 @@ gap review on 2026-10-07. Pending design review. Event payloads are unchanged.
 7. **Undelivered compositions fail closed.** An order outside `draft` has committed versions whose pins, totals, fulfillment projection, acceptance and administrative values are later packages: the point and line reads refuse it **unavailable** (503) after authorization and disclose nothing; the list still summarizes it (header, current version, no draft revision).
 8. **Readiness.** The read service binds its database, PEP and identities when `serve` binds the engine and drops them on stop, so no read answers before readiness or after shutdown (consistent with S2-09's writes); boundary validation still answers first.
 
-[Read implementation evidence](implementation/READS.md), [implementation report](../../../../artifacts/orders-lifecycle-s2-20261006/S6-01-draft-S6-04-implementation.md).
+Read implementation evidence, [implementation report](../../../../artifacts/orders-lifecycle-s2-20261006/S6-01-draft-S6-04-implementation.md).
 
 ## D-211 — The foundation integration milestone: pre-engine throttling bindings, the delivered-route census, real readiness and the live E2E host (S2-12)
 
@@ -3723,4 +3723,4 @@ gap review on 2026-10-07. Pending design review. Event payloads are unchanged.
 
 7. **Canonical path parameters (gap review 2026-10-07).** Every mounted route extracts `orderId`/`lineId` with the toolkit's `toolkit::api::rest::extract::Path`, the platform precedent (mini-chat), so a malformed identifier is the canonical `invalid_argument` Problem with a `path` field violation, answered before the edge limiter, authorization and any store or log access; axum's plain-text rejection is never on the wire.
 
-[Milestone evidence](implementation/MILESTONE.md), [implementation report](../../../../artifacts/orders-lifecycle-s2-20261006/S2-12-implementation.md), [gap review](../../../../artifacts/orders-lifecycle-s2-20261006/S2-12-gap-review.md).
+Milestone evidence, [implementation report](../../../../artifacts/orders-lifecycle-s2-20261006/S2-12-implementation.md), [gap review](../../../../artifacts/orders-lifecycle-s2-20261006/S2-12-gap-review.md).

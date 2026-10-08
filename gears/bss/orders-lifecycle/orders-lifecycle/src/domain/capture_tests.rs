@@ -154,7 +154,7 @@ fn every_patch_wire_field_is_classified_once_in_the_shared_declaration() {
     }
     // The S1-02 machine catalog lists exactly these PATCH names.
     let models: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../docs/implementation/contracts/models.json"
+        "../../../orders-lifecycle-sdk/contracts/models.json"
     ))
     .unwrap();
     for (scope, named) in [

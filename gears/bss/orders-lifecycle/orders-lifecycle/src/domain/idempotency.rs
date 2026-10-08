@@ -223,7 +223,7 @@ pub struct FingerprintInput<'a> {
 }
 
 /// Request fingerprint profile v1 domain tag (adopted byte-for-byte from the S1-06 frozen
-/// request profile; see `docs/implementation/CONFORMANCE.md`).
+/// request profile; see the conformance vectors in `tests/fixtures`).
 const REQUEST_TAG: &str = "VHP-BSS-ORDERS-REQUEST-FIXTURE-v1";
 /// Stored fingerprint prefix; a future profile must use a different one.
 const FINGERPRINT_PREFIX: &str = "rf1:";

@@ -3,7 +3,7 @@ use super::*;
 use serde_json::Value;
 
 /// The reviewed S1-02 catalog: an independent expectation of the rows and expanded keys.
-const CATALOG: &str = include_str!("../../../docs/implementation/contracts/catalog.json");
+const CATALOG: &str = include_str!("../../../orders-lifecycle-sdk/contracts/catalog.json");
 
 fn catalog() -> Value {
     serde_json::from_str(CATALOG).unwrap()

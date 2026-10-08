@@ -7,10 +7,7 @@ use bss_orders_lifecycle_sdk::{
 use serde_json::{Value, json};
 
 fn catalog() -> Value {
-    serde_json::from_str(include_str!(
-        "../../docs/implementation/contracts/catalog.json"
-    ))
-    .unwrap()
+    serde_json::from_str(include_str!("../contracts/catalog.json")).unwrap()
 }
 
 #[test]
@@ -95,10 +92,8 @@ fn typed_values_cannot_bypass_wire_bounds() {
 
 #[test]
 fn grant_golden_round_trip_preserves_version_generation_and_microseconds() {
-    let fixtures: Value = serde_json::from_str(include_str!(
-        "../../docs/implementation/contracts/boundary-fixtures.json"
-    ))
-    .unwrap();
+    let fixtures: Value =
+        serde_json::from_str(include_str!("../contracts/boundary-fixtures.json")).unwrap();
     let value = &fixtures["golden_envelopes"]
         .as_array()
         .unwrap()
