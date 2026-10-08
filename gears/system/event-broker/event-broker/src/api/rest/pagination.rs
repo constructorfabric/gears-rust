@@ -84,12 +84,7 @@ pub fn paginate_by_key<T: Clone>(
         _ => None,
     };
     let prev_cursor = match page_items.first() {
-        Some(first) if start > 0 => Some(build_cursor(
-            &key_of(first),
-            &order,
-            filter_hash,
-            "bwd",
-        )?),
+        Some(first) if start > 0 => Some(build_cursor(&key_of(first), &order, filter_hash, "bwd")?),
         _ => None,
     };
 
