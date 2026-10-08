@@ -1,5 +1,28 @@
 # ADR-0003: Universal Lazy Typed REST Clients for OoP Gears
 
+> **Status: Superseded in part, proposed in part.**
+>
+> - **Phase 1 (implemented):** REST is the default OoP transport (`oop_http`);
+>   `resolve_rest_service` is on `DirectoryClient` and gRPC is opt-in (see
+>   `docs/toolkit_unified_system/09_oop_grpc_sdk_pattern.md`).
+> - **Phases 3–6 (implemented under a different design):** lazy client registration,
+>   endpoint caching, and non-blocking OoP dependencies landed via the contract-
+>   binding machinery instead — `#[toolkit::consumes]` emits
+>   `ConsumerRegistration`s wired by the runtime into `DirectoryResolvingClient`
+>   proxies (`libs/toolkit/src/discovery.rs`, `ClientHub::register_remote_proxy`),
+>   with unresolved remote deps gating `/readyz` (ADR-0004, ADR-0007).
+> - **Phases 2–6 as written (not implemented):** the `ClientDescriptor` trait,
+>   `ClientConfig`, `RestClientProvider`/`GrpcClientProvider`, `LazyClientError`,
+>   and the `clients = [...]` argument on `#[toolkit::gear]` exist only in this
+>   document — the shipped equivalents live in `toolkit-contract`/`#[toolkit::consumes]`.
+>
+> **Historical example names:** this ADR was written against the `calculator` /
+> `calculator-gateway` example gears. Those were superseded by the REST-first
+> `hello` / `api-contracts` examples (`examples/toolkit/`), runnable via
+> `config/oop-self-hosted.yaml` / `make oop-example`. Wherever the ADR says
+> `calculator_sdk`, `wire_client`, or `CalculatorClientDescriptor`, substitute the
+> corresponding `hello`/`api-contracts` SDK identifiers — the pattern is unchanged.
+
 ## Executive Summary
 
 This proposal outlines a migration from gRPC to REST as the default transport for out-of-process (OoP) gears and introduces a **universal lazy typed client layer** for OoP gear communication in ToolKit. The implementation is structured in phases:

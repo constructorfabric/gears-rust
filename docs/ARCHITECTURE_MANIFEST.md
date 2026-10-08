@@ -379,12 +379,15 @@ The default mode is in-process composition: gears share one runtime, communicate
 
 ### 9.2. Out-of-process execution
 
-Gears can also run as separate processes communicating via gRPC.
+Gears can also run as separate processes. The default OoP transport is REST (each gear runs its own HTTP server and
+registers its endpoints with the directory service); gRPC remains available as an opt-in transport for specific contracts.
 
 - [x] `HostRuntime` contains explicit OoP orchestration hooks.
-- [x] `toolkit-transport-grpc` exists as a transport library.
-- [x] `docs/toolkit_unified_system/09_oop_grpc_sdk_pattern.md` documents the pattern.
-- [x] `examples/oop-gears/` demonstrates the model with calculator examples.
+- [x] `toolkit` supports REST-first standalone OoP worker bootstrap (`run_oop_with_options`, `oop_http`).
+- [x] `toolkit-gateway` and `api-gateway` provide directory-driven reverse-proxy and route registration.
+- [x] `toolkit-transport-grpc` exists as an opt-in transport library.
+- [x] `docs/toolkit_unified_system/09_oop_grpc_sdk_pattern.md` documents the gRPC SDK pattern as an opt-in transport.
+- [x] `HostRuntime` spawns `runtime.type: oop` gears as REST-first worker processes (`config/oop-self-hosted.yaml`, `make oop-example`).
 
 ## 10. Security architecture
 

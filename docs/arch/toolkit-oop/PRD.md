@@ -32,16 +32,12 @@ application gears run as their own out-of-process units.
 
 ### 1.2 Background / Problem Statement
 
-Today all ToolKit gears run in a single process managed by `HostRuntime`. While this "embedded" model is simple and
-performant, it creates hard limits: a single gear crash can take down the entire platform, horizontal scaling requires
-replicating the full process, and language-locked gears cannot participate.
+Originally, all ToolKit gears ran in one `HostRuntime` process. This limited fault isolation, independent scaling, and
+support for non-Rust gears.
 
-The existing OoP bootstrap (`libs/toolkit/src/bootstrap/oop.rs`) provides a starting point — it connects to
-`DirectoryService`, sends heartbeats, and runs the gear lifecycle. However, several critical capabilities are missing:
-OoP gears have no HTTP server of their own, `DirectoryService` has no REST endpoint resolution, `api-gateway` cannot
-reverse-proxy to remote gears, and there is no mechanism to auto-generate typed REST clients for cross-process calls.
-SecurityContext propagation also breaks across process boundaries because the `bearer_token` field is explicitly skipped
-during serialization.
+The initial OoP bootstrap handled discovery, heartbeats, and lifecycle but lacked HTTP serving, REST resolution and
+proxying, generated clients, and cross-process security propagation. This design adds those capabilities while retaining
+the embedded model as Profile 1.
 
 Industry platforms (Dapr, Spring Cloud, Quarkus, Akka) solve these problems through a combination of service discovery,
 sidecar or client-based communication, and gateway integration — all hidden behind framework abstractions so that
@@ -161,7 +157,8 @@ application code remains deployment-agnostic. ToolKit Distributed Gears bring th
 **Priority 2:**
 
 - Deployment Profile 2 (Host + Workers): single-node on-premise (OoP Workers over UDS/pipes, bootstrap-token platform
-  auth) and multi-node on-premise (mTLS). Deferred from P1 — the platform-plane `BootstrapToken` / `MtlsIdentity`
+  auth) and multi-node on-premise (mTLS). Note: the current implementation uses TCP for the directory endpoint
+  (`127.0.0.1:50051`); UDS is a future single-node option. Deferred from P1 — the platform-plane `BootstrapToken` / `MtlsIdentity`
   credential variants are defined for forward-compatibility but are not validated/wired in P1 (which targets Profile 1 +
   Profile 3)
 - Multi-gear OoP Workers (bundled binaries running several gears in one process)

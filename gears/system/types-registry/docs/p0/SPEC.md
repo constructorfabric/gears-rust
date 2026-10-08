@@ -934,11 +934,12 @@ change tied to OoP rather than only to tenancy.
 
 **Platform REST is not the out-of-process path.** A gear that moves out of process stays a
 gear: it resolves the SDK trait from `ClientHub` and the transport beneath it changes from a
-direct call to gRPC. Platform REST exists for callers that are not gears — humans, jobs, CI,
-external workloads authenticated by `X-ToolKit-Internal-Token` or mTLS SPIFFE. The repository
-shows the split: `examples/oop-gears/calculator` carries `proto/`, `client.rs` and `wiring.rs`
-in its SDK plus `api/grpc/server.rs` in the gear, and has no REST surface at all, while
-`service-discovery` declares `capabilities = [grpc, system, rest]` and carries both.
+direct call to REST (with gRPC opt-in). Platform REST exists for callers that are not gears —
+humans, jobs, CI, external workloads authenticated by `X-ToolKit-Internal-Token` or mTLS
+SPIFFE. The repository shows the split: `examples/toolkit/api-contracts/` carries
+`api-contracts-sdk::grpc` (proto-generated client) plus `api/grpc.rs` in the gear as its
+opt-in gRPC surface, served alongside its REST routes, while `service-discovery` declares
+`capabilities = [grpc, system, rest]` and carries both.
 
 Two P0 properties make the later gRPC surface cheap rather than a redesign. The async protocol
 is transport-neutral by construction — submit, get an id, poll — with no streaming or

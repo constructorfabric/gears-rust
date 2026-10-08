@@ -44,9 +44,16 @@ calls are in-process via ClientHub.
 
 ### Profile 2: Host + Workers
 
-Flight Control spawns OoP Worker processes on the same host (or across hosts for the multi-node P2 variant). Workers
-communicate with it via UDS (single-node) or TCP+mTLS (multi-node). Flight Control runs the DirectoryService
-(service-discovery) and the control-plane system gears; Workers run the AuthZ plane and application gears.
+A `HostRuntime` binary runs some gears in-process and spawns selected application gears as separate out-of-process
+(OoP) worker processes. OoP workers are REST-first, start their own HTTP server, and self-register with the host's
+DirectoryService. The host's edge gateway reverse-proxies the workers' public routes. gRPC remains available as an
+opt-in transport per gear or contract.
+
+`flight-control` is the **minimal** control-plane-only composition of this host: it links only directory, transport,
+edge, GTS catalogue, and edge JWT validation gears. For density, a deployment may instead run a `HostRuntime` binary
+that links both control-plane gears and application gears, and spawns only the selected gears that need process
+isolation. In all cases the spawning mechanism is a generic `HostRuntime` capability driven by `runtime.type: oop`
+configuration, not a `flight-control`-specific feature.
 
 ### Profile 3: K8s Native
 

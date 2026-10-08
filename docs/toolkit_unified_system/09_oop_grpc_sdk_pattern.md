@@ -1,10 +1,25 @@
-# Out-of-Process Gears and gRPC SDK Pattern
+# gRPC SDK Pattern for Out-of-Process Gears (Opt-in Transport)
 
-ToolKit supports running gears as separate processes with gRPC-based inter-process communication. This enables process isolation, language flexibility, and independent scaling.
+ToolKit's default out-of-process transport is REST: an OoP gear serves HTTP and registers with the directory.
+`#[toolkit::rest_contract]` and `#[toolkit::consumes]` provide a generated, directory-resolving client behind the base
+SDK trait. gRPC remains **opt-in** for contracts that need its performance or streaming.
+
+This document describes the gRPC SDK pattern for gears that choose to expose a gRPC surface. It does **not** describe
+the default OoP deployment model; for that, see the REST-first OoP documentation and the `hello` / `api-contracts`
+examples.
+
+## When to use gRPC
+
+- Low-latency, high-throughput internal contracts where HTTP/2 + binary payloads matter.
+- Streaming / server-side events over a framed gRPC stream.
+- Integration with existing gRPC services where the contract is already defined in `.proto`.
+
+For most gears, REST is the simpler and preferred default: it is debuggable with standard HTTP tools, generates an
+OpenAPI spec, and does not require proto compilation for consumers.
 
 ## Core invariants
 
-- **Rule**: For OoP gears, use the SDK pattern with a single `*-sdk` crate containing API trait, types, gRPC client, and wiring helpers.
+- **Rule**: For gRPC OoP gears, use the SDK pattern with a single `*-sdk` crate containing API trait, types, gRPC client, and wiring helpers.
 - **Rule**: For gRPC: server implementations live in the gear itself; the SDK crate provides only the client.
 - **Rule**: For gRPC clients: always use `toolkit_transport_grpc::client` utilities (`connect_with_stack`, `connect_with_retry`).
 - **Rule**: Use `CancellationToken` for coordinated shutdown across the entire process tree.
@@ -23,17 +38,20 @@ pub enum RuntimeKind {
 }
 ```
 
+In either mode, a gear may expose REST, gRPC, or both. The `Oop` runtime kind simply means the gear runs as a
+separate process; the transports it serves are declared by its capabilities and contracts.
+
 ## OoP Gear Configuration
 
 ### YAML configuration
 
 ```yaml
 gears:
-  calculator:
+  my-grpc-gear:
     runtime:
       type: oop
       execution:
-        executable_path: "~/.cf-gears/bin/calculator-oop.exe"
+        executable_path: "~/.cf-gears/bin/my-grpc-gear-oop.exe"
         args: [ ]
         working_directory: null
         environment:
@@ -91,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
 
 ### Startup sequence
 
-1. **Configuration loading** — loads config from file or `TOOLKIT_MODULE_CONFIG` env var
+1. **Configuration loading** — loads config from file
 2. **Logging initialization** — sets up tracing with optional OTEL
 3. **DirectoryService connection** — connects to the master host's directory service
 4. **Instance registration** — registers with DirectoryService for discovery
@@ -108,7 +126,7 @@ Shutdown is driven by a single root `CancellationToken` per process:
 - Background tasks (like heartbeat) use child tokens derived from the root
 - On shutdown, the gear deregisters itself from DirectoryService before exiting
 
-## SDK Pattern for OoP
+## SDK Pattern for gRPC OoP
 
 ### Gear structure with SDK
 
@@ -407,7 +425,7 @@ async fn register_clients(&self, ctx: &GearCtx) -> anyhow::Result<()> {
 }
 ```
 
-## Testing OoP gears
+## Testing gRPC OoP gears
 
 ### Test with mock server
 
@@ -433,6 +451,11 @@ async fn test_grpc_client() {
 ```
 
 ## Quick checklist
+
+- [ ] Decide whether REST or gRPC is the right transport for this contract. REST is the default; continue here
+      only if you chose gRPC.
+
+**If gRPC:**
 
 - [ ] Create `*-sdk` crate with API trait, types, gRPC client, and wiring helpers.
 - [ ] Define `.proto` file and generate gRPC stubs in SDK.
