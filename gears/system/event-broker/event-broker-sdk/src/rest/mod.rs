@@ -5,7 +5,6 @@
 //! transport-free, and everything that speaks the wire lives here.
 
 mod client;
-mod error;
 mod stream;
 mod wire;
 

@@ -43,6 +43,9 @@ async def _read_request(reader: asyncio.StreamReader) -> tuple[str, str, dict, b
             k, _, v = line.partition(":")
             headers[k.strip().lower()] = v.strip()
 
+    if "chunked" in headers.get("transfer-encoding", "").lower():
+        return method, path, headers, await _read_chunked(reader, body_start)
+
     content_length = int(headers.get("content-length", "0"))
     body = body_start
     while len(body) < content_length:
@@ -54,10 +57,50 @@ async def _read_request(reader: asyncio.StreamReader) -> tuple[str, str, dict, b
     return method, path, headers, body
 
 
+class MalformedRequest(Exception):
+    """The request the proxy sent upstream is not valid HTTP/1.1."""
+
+
+async def _read_chunked(reader: asyncio.StreamReader, buffered: bytes) -> bytes:
+    """Decode a chunked request body; ``buffered`` is what followed the headers."""
+    buf = bytearray(buffered)
+
+    async def fill(n: int) -> None:
+        while len(buf) < n:
+            more = await reader.read(4096)
+            if not more:
+                raise asyncio.IncompleteReadError(bytes(buf), n)
+            buf.extend(more)
+
+    body = bytearray()
+    while True:
+        while b"\r\n" not in buf:
+            await fill(len(buf) + 1)
+        line, _, rest = bytes(buf).partition(b"\r\n")
+        try:
+            size = int(line.split(b";", 1)[0], 16)
+        except ValueError:
+            raise MalformedRequest(f"bad chunk size line {line[:40]!r}") from None
+        buf[:] = rest
+        if size == 0:
+            # Skip trailers up to the final empty line.
+            while not (buf.startswith(b"\r\n") or b"\r\n\r\n" in buf):
+                await fill(len(buf) + 1)
+            return bytes(body)
+        await fill(size + 2)
+        # Strict on purpose: a lenient parser would let a proxy that breaks
+        # chunk framing still produce the expected echo.
+        if buf[size:size + 2] != b"\r\n":
+            raise MalformedRequest("chunk data not followed by CRLF")
+        body.extend(buf[:size])
+        del buf[:size + 2]
+
+
 _HTTP_REASONS: dict[int, str] = {
     200: "OK", 201: "Created", 204: "No Content",
     400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
     404: "Not Found", 405: "Method Not Allowed", 409: "Conflict",
+    429: "Too Many Requests",
     500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable",
 }
 
@@ -86,7 +129,12 @@ def _sse_header() -> bytes:
 
 
 def _sse_chunk(data: str) -> bytes:
-    payload = f"data: {data}\n\n".encode()
+    return _sse_raw(f"data: {data}\n\n")
+
+
+def _sse_raw(event: str) -> bytes:
+    """Wrap one already-framed SSE event in an HTTP chunk."""
+    payload = event.encode()
     return f"{len(payload):x}\r\n".encode() + payload + b"\r\n"
 
 
@@ -99,6 +147,12 @@ def _sse_end() -> bytes:
 # ---------------------------------------------------------------------------
 
 _endpoint_call_counts: dict[str, int] = {}
+
+# Credentials /oauth2/token accepts; they match the secrets conftest provisions.
+_OAUTH2_CLIENT = ("test-client-id", "test-client-secret")
+
+# Gap between /sse/events events: wide enough that buffering is visible.
+SSE_EVENT_GAP_SECS = 0.2
 
 
 def _bump_count(key: str) -> int:
@@ -120,19 +174,22 @@ def _ws_accept_key(key: str) -> str:
     return base64.b64encode(digest).decode()
 
 
-def _ws_upgrade_response(accept_key: str) -> bytes:
+def _ws_upgrade_response(accept_key: str, subprotocol: str | None = None) -> bytes:
+    proto = f"Sec-WebSocket-Protocol: {subprotocol}\r\n" if subprotocol else ""
     return (
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Accept: {accept_key}\r\n"
+        f"{proto}"
         "\r\n"
     ).encode()
 
 
-async def _ws_read_frame(reader: asyncio.StreamReader) -> tuple[int, bytes] | None:
-    """Read a single WebSocket frame. Returns (opcode, payload) or None on EOF."""
+async def _ws_read_frame(reader: asyncio.StreamReader) -> tuple[bool, int, bytes] | None:
+    """Read a single WebSocket frame. Returns (fin, opcode, payload) or None on EOF."""
     hdr = await reader.readexactly(2)
+    fin = bool(hdr[0] & 0x80)
     opcode = hdr[0] & 0x0F
     masked = bool(hdr[1] & 0x80)
     length = hdr[1] & 0x7F
@@ -150,7 +207,7 @@ async def _ws_read_frame(reader: asyncio.StreamReader) -> tuple[int, bytes] | No
         for i in range(length):
             payload[i] ^= mask_key[i % 4]
 
-    return opcode, bytes(payload)
+    return fin, opcode, bytes(payload)
 
 
 def _ws_write_frame(opcode: int, payload: bytes) -> bytes:
@@ -171,13 +228,38 @@ def _ws_write_frame(opcode: int, payload: bytes) -> bytes:
 
 
 async def _ws_echo_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    """WebSocket echo loop: read frames from client, echo text/binary back."""
+    """WebSocket echo loop: read frames from client, echo text/binary back.
+
+    A fragmented message (non-FIN data frame plus continuation frames) is
+    reassembled and echoed as one frame with the first fragment's opcode.
+    Control frames may arrive between fragments. A data frame while a message
+    is open, or a continuation with none open, breaks message boundaries
+    (RFC 6455 §5.4): the connection is closed with 1002 instead of guessing,
+    so a proxy that re-frames messages can't pass the echo tests.
+    """
+    fragments: list[bytes] = []
+    fragment_opcode = 0
     try:
         while True:
             result = await _ws_read_frame(reader)
             if result is None:
                 break
-            opcode, payload = result
+            fin, opcode, payload = result
+
+            stray_continuation = opcode == 0x0 and not fragments
+            interleaved_message = opcode in (0x1, 0x2) and bool(fragments)
+            if stray_continuation or interleaved_message:
+                writer.write(_ws_write_frame(0x8, struct.pack("!H", 1002) + b"fragmentation error"))
+                await writer.drain()
+                break
+            if opcode in (0x0, 0x1, 0x2) and (fragments or not fin):
+                if opcode != 0x0:
+                    fragment_opcode = opcode
+                fragments.append(payload)
+                if not fin:
+                    continue
+                opcode, payload = fragment_opcode, b"".join(fragments)
+                fragments = []
 
             if opcode == 0x8:  # Close
                 # Echo the close frame back and exit.
@@ -198,7 +280,8 @@ async def _ws_echo_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 # Route handlers
 # ---------------------------------------------------------------------------
 
-async def _handle(method: str, path: str, headers: dict, body: bytes, writer: asyncio.StreamWriter, reader: asyncio.StreamReader | None = None) -> None:
+async def _handle(method: str, target: str, headers: dict, body: bytes, writer: asyncio.StreamWriter, reader: asyncio.StreamReader | None = None) -> None:
+    path, _, query = target.partition("?")
     # POST /reset-counters — reset all stateful endpoint call counts
     if method == "POST" and path == "/reset-counters":
         _endpoint_call_counts.clear()
@@ -211,16 +294,37 @@ async def _handle(method: str, path: str, headers: dict, body: bytes, writer: as
     # POST /oauth2/token — mock OAuth2 token endpoint
     elif method == "POST" and path == "/oauth2/token":
         # Parse URL-encoded form body and validate grant_type=client_credentials.
+        # The issued token names the client-authentication mode, so a test can
+        # tell a Basic-auth client (RFC 6749 §2.3.1 header) from a form one.
         parsed = parse_qs(body.decode("utf-8", errors="replace"))
         form_params = {k: v[0] for k, v in parsed.items() if v}
+        basic = headers.get("authorization", "")
+        if basic.startswith("Basic ") and "client_id" not in form_params:
+            mode = "basic"
+            try:
+                client_id, _, secret = base64.b64decode(basic[6:]).decode().partition(":")
+            except ValueError:
+                client_id, secret = "", ""
+        elif not basic and "client_id" in form_params:
+            mode = "form"
+            client_id = form_params.get("client_id", "")
+            secret = form_params.get("client_secret", "")
+        else:
+            mode = None
+            client_id, secret = "", ""
         if form_params.get("grant_type") != "client_credentials":
             writer.write(_json_response(
                 {"error": "unsupported_grant_type", "error_description": "grant_type must be client_credentials"},
                 status=400,
             ))
+        elif mode is None or (client_id, secret) != _OAUTH2_CLIENT:
+            writer.write(_json_response(
+                {"error": "invalid_client", "error_description": "client authentication failed"},
+                status=401,
+            ))
         else:
             writer.write(_json_response({
-                "access_token": "mock-e2e-token",
+                "access_token": f"mock-e2e-token-{mode}",
                 "expires_in": 3600,
                 "token_type": "Bearer",
             }))
@@ -228,9 +332,23 @@ async def _handle(method: str, path: str, headers: dict, body: bytes, writer: as
     # POST /echo
     elif method == "POST" and path == "/echo":
         writer.write(_json_response({
+            "method": method,
+            "path": path,
+            "query": query,
             "headers": headers,
             "body": body.decode("utf-8", errors="replace"),
         }))
+
+    # POST /sse/events — spaced events carrying every SSE field
+    elif method == "POST" and path == "/sse/events":
+        writer.write(_sse_header())
+        writer.write(_sse_raw("retry: 1500\n\n"))
+        for i in range(1, 4):
+            writer.write(_sse_raw(f"event: tick\nid: {i}\ndata: {{\"n\": {i}}}\n\n"))
+            await writer.drain()
+            await asyncio.sleep(SSE_EVENT_GAP_SECS)
+        writer.write(_sse_raw("event: done\nid: 4\ndata: bye\n\n"))
+        writer.write(_sse_end())
 
     # POST /v1/chat/completions/stream
     elif method == "POST" and path == "/v1/chat/completions/stream":
@@ -292,8 +410,8 @@ async def _handle(method: str, path: str, headers: dict, body: bytes, writer: as
         await asyncio.sleep(30)
         writer.write(_json_response({"error": "timeout"}, status=200))
 
-    # GET /error/{code}
-    elif method == "GET" and (m := re.fullmatch(r"/error/(\d+)", path)):
+    # GET|POST /error/{code}
+    elif method in ("GET", "POST") and (m := re.fullmatch(r"/error/(\d+)", path)):
         code = int(m.group(1))
         writer.write(_json_response(
             {"error": {"message": f"Simulated error {code}", "type": "server_error", "code": f"error_{code}"}},
@@ -322,7 +440,9 @@ async def _handle(method: str, path: str, headers: dict, body: bytes, writer: as
             }))
 
     # GET /ws/echo — WebSocket echo endpoint
-    elif method == "GET" and path == "/ws/echo" and "upgrade" in headers.get("connection", "").lower():
+    # GET /ws/handshake — same, but first sends the handshake request headers
+    # as a JSON text frame
+    elif method == "GET" and path in ("/ws/echo", "/ws/handshake") and "upgrade" in headers.get("connection", "").lower():
         upgrade_val = headers.get("upgrade", "").lower()
         ws_key = headers.get("sec-websocket-key", "")
         ws_version = headers.get("sec-websocket-version", "")
@@ -334,7 +454,10 @@ async def _handle(method: str, path: str, headers: dict, body: bytes, writer: as
             await writer.drain()
             return
         accept = _ws_accept_key(ws_key)
-        writer.write(_ws_upgrade_response(accept))
+        offered = [p.strip() for p in headers.get("sec-websocket-protocol", "").split(",") if p.strip()]
+        writer.write(_ws_upgrade_response(accept, offered[0] if offered else None))
+        if path == "/ws/handshake":
+            writer.write(_ws_write_frame(0x1, json.dumps({"headers": headers}).encode()))
         await writer.drain()
         # Run the echo loop; the caller must keep the connection open.
         await _ws_echo_loop(reader, writer)
@@ -360,7 +483,12 @@ class MockUpstreamServer:
     async def start(self) -> None:
         async def _client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             try:
-                method, path, headers, body = await _read_request(reader)
+                try:
+                    method, path, headers, body = await _read_request(reader)
+                except MalformedRequest as exc:
+                    writer.write(_json_response({"error": f"malformed request: {exc}"}, status=400))
+                    await writer.drain()
+                    return
                 await _handle(method, path, headers, body, writer, reader)
                 await writer.drain()
             except (asyncio.CancelledError, GeneratorExit):

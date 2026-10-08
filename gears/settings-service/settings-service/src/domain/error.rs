@@ -1,0 +1,227 @@
+// Created: 2026-08-12 by Virtuozzo International GmbH
+//! The gear's internal error type.
+//!
+//! # Where this sits
+//!
+//! `DomainError` is in-process only. It never crosses a trait boundary and is
+//! never serialized: the impl side converts it once, with
+//! `.map_err(CanonicalError::from)`, and the platform renders the resulting
+//! `CanonicalError` as an RFC-9457 problem document. Keeping it internal is what
+//! lets a variant be added here without it becoming a breaking change for any
+//! consuming gear.
+//!
+//! # Why these variants and not the DESIGN catalogue
+//!
+//! DESIGN.md §4.3 names concrete failures — `CategoryNotEmpty`,
+//! `DeclarationKeyConflict`, `ValueTooLarge`. Those belong to the features that
+//! raise them. What lives here is the set of **shapes** every feature reuses:
+//! the 400 with field-level detail, the 412 that guards a conditional write, the
+//! 409 for a state conflict, and the denial that must not disclose existence.
+//!
+//! A feature adds its own variant, or supplies its own `code` to
+//! [`DomainError::Validation`]; it does not restate the mapping.
+
+use crate::field;
+
+/// A failure raised inside the gear.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DomainError {
+    /// A request field failed validation. Renders as `400` with a field-level
+    /// entry carrying `field`, `code`, and `message`.
+    #[error("validation failed on `{field}`: {message}")]
+    Validation {
+        /// The offending field, or [`field::REQUEST_FIELD`] when it cannot be
+        /// pinned to one.
+        field: String,
+        /// A stable code from [`crate::field`]; tooling matches on this, never
+        /// on `message`.
+        code: &'static str,
+        /// Human-readable explanation.
+        message: String,
+    },
+
+    /// A mutating request arrived with no `If-Match` at all. Renders as `428`.
+    ///
+    /// Distinct from [`DomainError::PreconditionFailed`] on purpose: a stale tag
+    /// means re-read and retry, an absent one means the client must change.
+    /// Telling a broken client to retry would have it retry forever.
+    #[error("precondition required: {detail}")]
+    PreconditionRequired {
+        /// What the request must carry.
+        detail: String,
+    },
+
+    /// A conditional write lost its `If-Match` check. Renders as `412`.
+    #[error("precondition failed: {detail}")]
+    PreconditionFailed {
+        /// What no longer holds.
+        detail: String,
+    },
+
+    /// The request conflicts with current state. Renders as `409`.
+    #[error("conflict: {detail}")]
+    Conflict {
+        /// What conflicts.
+        detail: String,
+    },
+
+    /// The caller is not entitled to the target. Renders as `403`.
+    ///
+    /// Deliberately carries **no** identifier of the target and no indication of
+    /// whether it exists: a denial that differed between "no such setting" and
+    /// "exists but forbidden" would let an unauthorized caller enumerate the
+    /// settings tree by reading status codes.
+    #[error("not authorized")]
+    Unauthorized {
+        /// The kind of resource the decision was made against — never the
+        /// caller's identifier for it. Two denials for different categories are
+        /// still byte-identical; only the resource *type* differs, and the URL
+        /// already reveals that.
+        resource: &'static str,
+    },
+
+    /// No such resource. Renders as `404`.
+    /// The declaration exists and is retired: a positive fact, distinct from
+    /// not-found, so a consumer still reading the key during its own upgrade
+    /// window can drop the dependency rather than retry a transient miss.
+    #[error("setting `{key}` is retired")]
+    Retired {
+        /// The retired setting's key.
+        key: String,
+    },
+
+    /// The write needs a person's fresh re-authentication and did not get one.
+    /// Carries the challenge the response must present.
+    #[error("step-up required: {reason}")]
+    StepUpRequired {
+        /// Why the presented proof did not do: a short stable code.
+        reason: &'static str,
+        /// The freshness window the deployment requires.
+        max_age_seconds: u64,
+        /// The assurance levels that satisfy it, if any.
+        acr_values: Vec<String>,
+    },
+
+    #[error("{resource} not found")]
+    NotFound {
+        /// The kind of thing that was not found — never the caller's identifier
+        /// for it, which may itself be sensitive.
+        resource: &'static str,
+    },
+
+    /// A dependency this service needs is unreachable. Renders as `503`.
+    ///
+    /// `detail` reaches the problem body verbatim, so it names the dependency
+    /// and the operation and nothing else — never the dependency's own error
+    /// text, which can carry hostnames, driver messages or DSN fragments. Build
+    /// it from such an error with [`Self::dependency_unavailable`], which logs
+    /// that text instead.
+    #[error("settings unavailable: {detail}")]
+    Unavailable {
+        /// What could not be reached, safe for the wire.
+        detail: String,
+    },
+
+    /// Anything unrecognized. Renders as `500` with a generic body.
+    ///
+    /// `diagnostic` stays in process: the platform keeps it out of the wire
+    /// representation, so a stack detail or a connection string put here does
+    /// not reach the caller.
+    #[error("internal error: {diagnostic}")]
+    Internal {
+        /// In-process diagnostic. Never serialized.
+        diagnostic: String,
+    },
+}
+
+impl DomainError {
+    /// The error as text that may leave the process.
+    ///
+    /// Every variant renders its own message, except [`Self::Internal`], whose
+    /// `diagnostic` is in-process only: the top-level problem-details path
+    /// strips it, and anything that puts an error into a wire body, an event
+    /// or a log line by hand must strip it too, so it goes through here. The
+    /// diagnostic itself is available to the process via
+    /// [`Self::internal_diagnostic`], to be logged where the error is handled.
+    #[must_use]
+    pub fn wire_message(&self) -> String {
+        match self {
+            Self::Internal { .. } => "internal error".to_owned(),
+            other => other.to_string(),
+        }
+    }
+
+    /// The error as a rejection event carries it: [`Self::wire_message`],
+    /// except that a validation failure is reduced to its field and code.
+    ///
+    /// A validation message answers the caller who submitted the value, and
+    /// some name part of it — an enum member, a reference, a number. The event
+    /// goes further than that answer: into the log, and in R2 onto a broker,
+    /// where the value's classification is not the reader's to see. Where and
+    /// why the change failed is what the event needs; the caller has the rest.
+    #[must_use]
+    pub fn event_reason(&self) -> String {
+        match self {
+            Self::Validation { field, code, .. } => {
+                format!("validation failed on `{field}`: {code}")
+            }
+            other => other.wire_message(),
+        }
+    }
+
+    /// The in-process diagnostic of an internal fault, for the log line the
+    /// handling site writes; `None` for every other variant.
+    #[must_use]
+    pub fn internal_diagnostic(&self) -> Option<&str> {
+        match self {
+            Self::Internal { diagnostic } => Some(diagnostic),
+            _ => None,
+        }
+    }
+
+    /// A dependency outage, from the dependency's own error.
+    ///
+    /// The error's text is logged here, escaped, where the process can read
+    /// it; the returned detail — which a 503 body carries verbatim — says only
+    /// which dependency could not do what. The platform's problem-details
+    /// contract forbids raw vendor or driver text in that body.
+    #[must_use]
+    pub fn dependency_unavailable(
+        dependency: &'static str,
+        operation: &str,
+        err: impl std::fmt::Display,
+    ) -> Self {
+        tracing::warn!(
+            dependency,
+            operation,
+            error = %crate::log_text::LogSafe(&err),
+            "dependency unavailable"
+        );
+        Self::Unavailable {
+            detail: format!("the {dependency} could not {operation}"),
+        }
+    }
+
+    /// A validation failure that could not be pinned to a single field.
+    #[must_use]
+    pub fn validation(message: impl Into<String>) -> Self {
+        Self::Validation {
+            field: field::REQUEST_FIELD.to_owned(),
+            code: field::VALIDATION,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<toolkit_db::DbError> for DomainError {
+    /// A transaction that could not begin or commit.
+    ///
+    /// Needed so a domain error can travel through `Db::transaction_ref_mapped`,
+    /// which maps begin/commit failures into the closure's error type.
+    fn from(err: toolkit_db::DbError) -> Self {
+        Self::Internal {
+            diagnostic: format!("database transaction: {err}"),
+        }
+    }
+}

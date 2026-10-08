@@ -82,7 +82,8 @@ async fn submit(
     let policy = RegistrationPolicy::default();
     let config = TypesRegistryConfig::default();
     let dispatch: Arc<dyn OperationDispatch> = Arc::new(NoDispatch);
-    accept(
+    common::accept_as(
+        kind,
         &stores(),
         &provider,
         &allow_all(),
@@ -92,9 +93,8 @@ async fn submit(
             metrics: &common::metrics(),
         },
         &dispatch,
-        &SubmitRequest {
+        SubmitRequest {
             idempotency_key: Some(key.to_owned()),
-            kind,
             dry_run,
             candidates,
         },
@@ -508,7 +508,6 @@ async fn forced_dry_run(db: &Provider, key: &str, gts_id: &str, content: Value) 
         &dispatch,
         &SubmitRequest {
             idempotency_key: Some(key.to_owned()),
-            kind: OperationKind::Registration,
             dry_run: true,
             candidates: vec![Candidate {
                 gts_id: gts_id.to_owned(),

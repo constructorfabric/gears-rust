@@ -45,7 +45,7 @@ fips = [
     "dep:rustls-cng-crypto",
 ]
 # OpenTelemetry integration for distributed tracing
-otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry", "toolkit-trace-context/otel"]
 
 [dependencies]
 # Core dependencies
@@ -63,6 +63,10 @@ serde_json = { workspace = true }
 # gear/bootstrap layer instead.
 toolkit-security = { workspace = true }
 secrecy = { workspace = true }
+
+# Shared W3C Trace Context propagation (parse, seed span parent, inject) —
+# single source of truth with `cf-gears-toolkit`, which depends on the same crate.
+toolkit-trace-context = { workspace = true }
 
 # HTTP stack
 hyper = { workspace = true, features = ["client", "http1", "http2"] }

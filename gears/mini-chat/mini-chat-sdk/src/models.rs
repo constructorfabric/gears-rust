@@ -21,7 +21,9 @@ pub struct PolicySnapshot {
     pub kill_switches: KillSwitches,
 }
 
-/// Tenant-level kill switches from the policy snapshot.
+/// Tenant-level kill switches from the policy snapshot. Every field is
+/// required when deserializing: a missing or renamed key is an error, not a
+/// silent `false` that would turn the switch off.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KillSwitches {
@@ -46,10 +48,10 @@ pub struct ModelCatalogEntry {
     /// Short description of the model.
     #[serde(default)]
     pub description: String,
-    /// LLM provider CTI identifier.
+    /// Routing key for provider resolution: a key of
+    /// `MiniChatConfig.providers` (e.g. `"openai"`, `"azure_openai"`).
     pub provider_id: String,
-    /// Routing identifier for provider resolution. Maps to a key in
-    /// `MiniChatConfig.providers`. Values: `"openai"`, `"azure_openai"`.
+    /// Provider name for display. Not read by the gear.
     pub provider_display_name: String,
     /// URL to model icon.
     #[serde(default)]
@@ -67,9 +69,9 @@ pub struct ModelCatalogEntry {
     pub max_output_tokens: u32,
     /// Maximum input tokens per request.
     pub max_input_tokens: u32,
-    /// Credit multiplier for input tokens (micro-credits per 1000 tokens).
+    /// Credit multiplier for input tokens (micro-credits per 1,000,000 tokens).
     pub input_tokens_credit_multiplier_micro: u64,
-    /// Credit multiplier for output tokens (micro-credits per 1000 tokens).
+    /// Credit multiplier for output tokens (micro-credits per 1,000,000 tokens).
     pub output_tokens_credit_multiplier_micro: u64,
     /// Human-readable multiplier display string (e.g. "1x", "3x").
     #[serde(default)]
@@ -93,8 +95,9 @@ pub struct ModelCatalogEntry {
     /// Empty string = no system instructions.
     #[serde(default)]
     pub system_prompt: String,
-    /// Prompt template used when generating thread summaries for this model.
-    /// Plumbed through the stack for future use by the summary generation job.
+    /// System prompt for the thread-summary call when this model is the
+    /// summary model (`thread_summary_worker.summary_model_id`). Empty = use
+    /// `thread_summary_worker.summary_system_prompt`, then the built-in default.
     #[serde(default)]
     pub thread_summary_prompt: String,
 }
@@ -142,14 +145,26 @@ fn default_max_tool_calls() -> u32 {
 /// LLM API inference parameters (API: `PolicyModelApiParams`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelApiParams {
-    pub temperature: f64,
-    pub top_p: f64,
-    pub frequency_penalty: f64,
-    pub presence_penalty: f64,
+    /// Sampling parameters. Each one is sent only when set; leave them unset
+    /// for reasoning models, which reject them ("Unsupported parameter:
+    /// 'temperature' is not supported with this model").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
     pub stop: Vec<String>,
     /// Provider-specific extra body parameters (e.g. vLLM `top_k`,
-    /// `chat_template_kwargs`). Providers that support it will place this
-    /// value under the `"extra_body"` key in the request payload.
+    /// `chat_template_kwargs`). Must be a JSON object; its keys are merged
+    /// into the top level of the request body (overwriting typed sampling
+    /// fields) by the Responses, Chat Completions and vLLM adapters. Keys the
+    /// request itself controls (`model`, `input`, `messages`, `instructions`,
+    /// `stream`, the output and tool-call caps, `tools`, `user`, `metadata`)
+    /// are ignored with a warning. The Anthropic adapter ignores the field.
+    /// A non-object value is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_body: Option<serde_json::Value>,
     /// Reasoning effort for o-series models (low/medium/high).
@@ -318,6 +333,7 @@ fn default_requester_type() -> String {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -334,6 +350,20 @@ mod tests {
         assert!(!ks.disable_file_search);
         assert!(!ks.disable_images);
         assert!(!ks.disable_code_interpreter);
+    }
+
+    #[test]
+    fn kill_switches_missing_field_is_an_error() {
+        let err = serde_json::from_value::<KillSwitches>(serde_json::json!({
+            "disable_premium_tier": false,
+            "force_standard_tier": false,
+            "disable_web_search": false,
+            "disable_file_search": false,
+            "disable_image": true,
+            "disable_code_interpreter": false,
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("disable_images"), "{err}");
     }
 
     // ── EstimationBudgets::default spec values ──
@@ -396,10 +426,10 @@ mod tests {
             available_from: OffsetDateTime::UNIX_EPOCH,
             max_file_size_mb: 25,
             api_params: ModelApiParams {
-                temperature: 0.7,
-                top_p: 1.0,
-                frequency_penalty: 0.0,
-                presence_penalty: 0.0,
+                temperature: Some(0.7),
+                top_p: Some(1.0),
+                frequency_penalty: Some(0.0),
+                presence_penalty: Some(0.0),
                 stop: vec![],
                 extra_body: None,
                 reasoning_effort: None,

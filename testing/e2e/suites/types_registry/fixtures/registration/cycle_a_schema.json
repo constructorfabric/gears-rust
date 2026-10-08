@@ -1,0 +1,16 @@
+{
+  "gts_id": "gts.cf.e2e.registration.cycle_a.v1~",
+  "content": {
+    "$id": "gts://gts.cf.e2e.registration.cycle_a.v1~",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "allOf": [
+      {"$ref": "gts://gts.cf.e2e.registration.cycle_b.v1~"}
+    ],
+    "type": "object",
+    "properties": {
+      "payload": {"type": "object", "additionalProperties": true}
+    },
+    "required": ["payload"],
+    "additionalProperties": false
+  }
+}

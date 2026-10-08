@@ -1,9 +1,10 @@
 use axum::Router;
 use toolkit::api::OpenApiRegistry;
-use toolkit::api::operation_builder::OperationBuilder;
+use toolkit::api::operation_builder::{OperationBuilder, OperationBuilderODataExt};
 
-use super::AiChatLicense;
+use super::{AiChatLicense, retry_after_header};
 use crate::api::rest::{dto, handlers};
+use crate::infra::db::odata_mapper::MessageField;
 
 const API_TAG: &str = "Mini Chat Messages";
 
@@ -33,7 +34,15 @@ pub(super) fn register_message_routes(
             http::StatusCode::OK,
             "Paginated list of messages",
         )
-        .standard_errors(openapi)
+        .with_odata_filter::<MessageField>()
+        .with_odata_orderby::<MessageField>()
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
         .register(router, openapi);
 
     // POST {prefix}/v1/chats/{id}/messages:stream
@@ -46,11 +55,20 @@ pub(super) fn register_message_routes(
         .path_param("id", "Chat UUID")
         .json_request::<dto::StreamMessageRequest>(openapi, "Message to send")
         .handler(handlers::messages::stream_message)
-        .sse_json::<crate::domain::stream_events::StreamEvent>(
+        .sse_json::<crate::api::rest::sse::MiniChatSseEvent>(
             openapi,
             "SSE stream of chat response events",
         )
-        .standard_errors(openapi)
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_409(openapi)
+        .error_429(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
+        .error_422(openapi)
         .register(router, openapi);
 
     router

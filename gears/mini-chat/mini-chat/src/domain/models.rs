@@ -176,6 +176,11 @@ pub struct ResolvedModel {
     pub thread_summary_prompt: String,
     /// Maximum output tokens for this model.
     pub max_output_tokens: u32,
+    /// Maximum input tokens for this model; 0 means no limit beyond the
+    /// context window.
+    pub max_input_tokens: u32,
+    /// Conservative bytes per token of the catalog estimation budgets.
+    pub bytes_per_token_conservative: u32,
 }
 
 impl From<&mini_chat_sdk::ModelCatalogEntry> for ResolvedModel {
@@ -202,6 +207,8 @@ impl From<&mini_chat_sdk::ModelCatalogEntry> for ResolvedModel {
             tool_support: e.general_config.tool_support.clone(),
             thread_summary_prompt: e.thread_summary_prompt.clone(),
             max_output_tokens: e.max_output_tokens,
+            max_input_tokens: e.max_input_tokens,
+            bytes_per_token_conservative: e.estimation_budgets.bytes_per_token_conservative,
         }
     }
 }

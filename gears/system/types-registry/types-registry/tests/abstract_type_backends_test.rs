@@ -21,7 +21,7 @@ use types_registry::domain::admission::worker::{
 use types_registry::domain::admission::{
     AdmissionFailureReason, Candidate, OperationDispatch, SubmitRequest,
 };
-use types_registry::domain::enums::{LifecycleStatus, OperationItemStatus, OperationKind};
+use types_registry::domain::enums::{LifecycleStatus, OperationItemStatus};
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::ports::{CurrentTypeSchemaRow, EntityRow, Stores};
 use types_registry::infra::storage::repo::{EntityRepo, TypeSchemaRepo};
@@ -68,7 +68,6 @@ async fn submit(db: &Provider, id: &str, content: Value, version: Option<i64>) -
         &(Arc::new(NoDispatch) as Arc<dyn OperationDispatch>),
         &SubmitRequest {
             idempotency_key: Some(Uuid::new_v4().to_string()),
-            kind: OperationKind::Registration,
             dry_run: false,
             candidates: vec![Candidate {
                 gts_id: id.to_owned(),

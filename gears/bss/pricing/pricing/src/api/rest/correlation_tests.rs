@@ -5,9 +5,11 @@
 //! [`require_correlation`] refusing to mint — so it is asserted directly here
 //! rather than only through a route. A test that merely drove a mounted route and
 //! found a non-NULL correlation would pass just as well against the per-handler
-//! mint D-178 clause (2) forbids; that property is
-//! `tests/rest_plans.rs::two_records_of_one_patch_carry_one_correlation_id`, and
-//! it needs a database.
+//! mint D-431 forbids; that every audit row carries one is
+//! `tests/approval_doors.rs::every_act_is_audited_with_its_actor_subject_and_correlation`,
+//! and it needs a database.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use axum::Router;
 use axum::body::Body;
@@ -53,8 +55,7 @@ async fn probe(router: Router) -> (StatusCode, String) {
 
 #[tokio::test]
 async fn a_request_carrying_nothing_is_given_a_correlation() {
-    // D-178 clause (1)'s fallback: minted at the edge when the platform supplies
-    // none, so the field is always satisfiable.
+    // D-431: minted at the edge, so the field is always satisfiable.
     let (status, body) = probe(app()).await;
     assert_eq!(status, StatusCode::OK);
     let minted: uuid::Uuid = body.parse().expect("a uuid");

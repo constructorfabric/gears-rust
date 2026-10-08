@@ -101,4 +101,34 @@ mod tests {
         assert_eq!(problem.status, Some(500));
         assert!(!problem.detail.contains("db pool exhausted"));
     }
+
+    #[test]
+    fn test_named_key_validation_is_400_with_the_key_field() {
+        let problem = wire(DomainError::validation(
+            "key",
+            "must be 1-128 characters from A-Z a-z 0-9 . _ - :",
+        ));
+
+        assert_eq!(problem.status, Some(400));
+        let violation = problem
+            .context
+            .get("field_violations")
+            .and_then(|v| v.get(0))
+            .expect("a field violation");
+        assert_eq!(violation.get("field").and_then(|v| v.as_str()), Some("key"));
+    }
+
+    #[test]
+    fn test_limit_reached_is_429_with_a_quota_code() {
+        let problem = wire(DomainError::LimitReached(
+            "at most 256 named settings per user; delete one first".to_owned(),
+        ));
+
+        assert_eq!(problem.status, Some(429));
+        let body = serde_json::to_string(&problem.context).unwrap();
+        assert!(
+            body.contains("NAMED_SETTINGS_PER_USER"),
+            "quota code on the wire: {body}"
+        );
+    }
 }

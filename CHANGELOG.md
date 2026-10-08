@@ -9,6 +9,14 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+### Fixed
+
+- Resource-group filters accept quoted UUIDs and resolve membership GTS type paths
+  to storage IDs while preserving exact registered identifiers, including legacy
+  codes accepted by type creation outside the stricter GTS grammar. Invalid
+  query parameters return HTTP 400 instead of 500. GTS filters support `eq`, `ne`,
+  and `in`; operators without meaningful surrogate-ID semantics are rejected.
+
 ## [0.2.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-event-broker-v0.2.7...cf-gears-event-broker-v0.2.8) - 2026-09-23
 
 ### Other

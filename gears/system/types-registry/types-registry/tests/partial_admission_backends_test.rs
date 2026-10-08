@@ -26,7 +26,7 @@ use types_registry::domain::admission::worker::{
 use types_registry::domain::admission::{
     AdmissionFailureReason, Candidate, OperationDispatch, SubmitRequest,
 };
-use types_registry::domain::enums::{OperationItemStatus, OperationKind};
+use types_registry::domain::enums::OperationItemStatus;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::infra::storage::repo::EntityRepo;
 
@@ -105,7 +105,6 @@ async fn admit_batch(
         &(Arc::new(NoDispatch) as Arc<dyn OperationDispatch>),
         &SubmitRequest {
             idempotency_key: Some(key.to_owned()),
-            kind: OperationKind::Registration,
             dry_run: false,
             candidates,
         },
@@ -136,7 +135,7 @@ fn assert_succeeded(outcome: &OperationOutcome, gts_id: &str, backend: &str) {
     let item = outcome
         .items
         .iter()
-        .find(|item| item.gts_id == gts_id)
+        .find(|item| item.key.gts_id() == Some(gts_id))
         .unwrap_or_else(|| panic!("{gts_id} is owed an outcome on {backend}"));
     assert_eq!(
         item.status,
@@ -155,7 +154,7 @@ fn assert_refused(
     let item = outcome
         .items
         .iter()
-        .find(|item| item.gts_id == gts_id)
+        .find(|item| item.key.gts_id() == Some(gts_id))
         .unwrap_or_else(|| panic!("{gts_id} is owed an outcome on {backend}"));
     assert_eq!(
         (item.status, item.failure.as_ref().map(|f| &f.reason)),

@@ -1191,6 +1191,27 @@ where
         }
     }
 
+    /// Execute the update and return the rows it wrote, as written (`UPDATE … RETURNING`, on the
+    /// backends that support it: Postgres and `SQLite`). The scope and the tenant-immutability
+    /// rule apply exactly as in [`exec`](Self::exec).
+    ///
+    /// # Errors
+    /// Returns `ScopeError::Denied` if the update attempts to change `tenant_id`, and
+    /// `ScopeError::Db` if the database operation fails (a backend without `RETURNING` included).
+    #[allow(clippy::disallowed_methods)]
+    pub async fn exec_with_returning(
+        self,
+        runner: &impl DBRunner,
+    ) -> Result<Vec<E::Model>, ScopeError> {
+        if self.tenant_update_attempted {
+            return Err(ScopeError::Denied("tenant_id is immutable"));
+        }
+        match DBRunnerInternal::as_seaorm(runner) {
+            SeaOrmRunner::Conn(db) => Ok(self.inner.exec_with_returning(db).await?),
+            SeaOrmRunner::Tx(tx) => Ok(self.inner.exec_with_returning(tx).await?),
+        }
+    }
+
     /// Unwrap the inner `SeaORM` `UpdateMany` for advanced use cases.
     ///
     /// # Safety

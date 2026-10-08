@@ -29,7 +29,17 @@ pub async fn proxy_handler(
     Extension(state): Extension<AppState>,
     Extension(ctx): Extension<SecurityContext>,
     req: Request,
-) -> Result<Response, Response> {
+) -> Response {
+    proxy(state, ctx, req).await.unwrap_or_else(error_response)
+}
+
+/// The body of [`proxy_handler`]. A failure stays a [`DomainError`] until the
+/// handler renders it, so this `Result` does not carry a 128-byte `Response`.
+async fn proxy(
+    state: AppState,
+    ctx: SecurityContext,
+    req: Request,
+) -> Result<Response, DomainError> {
     // Short-circuit CORS preflight — return permissive 204 without upstream resolution.
     // The actual request validates the origin against the upstream's CORS config.
     if req.method() == http::Method::OPTIONS
@@ -83,22 +93,22 @@ pub async fn proxy_handler(
     if is_upgrade {
         let path = parts.uri.path().to_string();
         if parts.method != http::Method::GET {
-            return Err(error_response(DomainError::Validation {
+            return Err(DomainError::Validation {
                 field: "method",
                 reason: field::WS_UPGRADE_REQUIRES_GET,
                 detail: "WebSocket upgrade requires GET method".into(),
                 instance: path,
-            }));
+            });
         }
         if parts.headers.contains_key(http::header::CONTENT_LENGTH)
             || parts.headers.contains_key(http::header::TRANSFER_ENCODING)
         {
-            return Err(error_response(DomainError::Validation {
+            return Err(DomainError::Validation {
                 field: "body",
                 reason: field::WS_UPGRADE_BODY_FORBIDDEN,
                 detail: "WebSocket upgrade request must not contain a body".into(),
                 instance: path,
-            }));
+            });
         }
     }
 
@@ -111,51 +121,47 @@ pub async fn proxy_handler(
     // Parse alias from the URI to validate it's present.
     let path = parts.uri.path();
     let prefix = "/oagw/v1/proxy/";
-    let remaining = path.strip_prefix(prefix).ok_or_else(|| {
-        error_response(DomainError::Validation {
+    let remaining = path
+        .strip_prefix(prefix)
+        .ok_or_else(|| DomainError::Validation {
             field: "path",
             reason: field::INVALID_PROXY_PATH,
             detail: "invalid proxy path".into(),
             instance: path.to_string(),
-        })
-    })?;
+        })?;
 
     // Validate alias is not empty.
     let alias_end = remaining.find('/').unwrap_or(remaining.len());
     if alias_end == 0 {
-        return Err(error_response(DomainError::Validation {
+        return Err(DomainError::Validation {
             field: "path",
             reason: field::MISSING_ALIAS,
             detail: "missing alias in proxy path".into(),
             instance: path.to_string(),
-        }));
+        });
     }
 
     // Validate Content-Length if present (skip for WebSocket — no body).
     if !is_upgrade && let Some(cl) = parts.headers.get(http::header::CONTENT_LENGTH) {
-        let cl_str = cl.to_str().map_err(|_| {
-            error_response(DomainError::Validation {
-                field: "content-length",
-                reason: field::INVALID_CONTENT_LENGTH,
-                detail: "invalid Content-Length header".into(),
-                instance: path.to_string(),
-            })
+        let cl_str = cl.to_str().map_err(|_| DomainError::Validation {
+            field: "content-length",
+            reason: field::INVALID_CONTENT_LENGTH,
+            detail: "invalid Content-Length header".into(),
+            instance: path.to_string(),
         })?;
-        let cl_val: usize = cl_str.parse().map_err(|_| {
-            error_response(DomainError::Validation {
-                field: "content-length",
-                reason: field::INVALID_CONTENT_LENGTH,
-                detail: format!("Content-Length is not a valid integer: '{cl_str}'"),
-                instance: path.to_string(),
-            })
+        let cl_val: usize = cl_str.parse().map_err(|_| DomainError::Validation {
+            field: "content-length",
+            reason: field::INVALID_CONTENT_LENGTH,
+            detail: format!("Content-Length is not a valid integer: '{cl_str}'"),
+            instance: path.to_string(),
         })?;
         if cl_val > max_body_size {
-            return Err(error_response(DomainError::PayloadTooLarge {
+            return Err(DomainError::PayloadTooLarge {
                 detail: format!(
                     "request body of {cl_val} bytes exceeds maximum of {max_body_size} bytes"
                 ),
                 instance: path.to_string(),
-            }));
+            });
         }
     }
 
@@ -166,11 +172,9 @@ pub async fn proxy_handler(
     } else {
         axum::body::to_bytes(body, max_body_size)
             .await
-            .map_err(|_| {
-                error_response(DomainError::PayloadTooLarge {
-                    detail: format!("request body exceeds maximum of {max_body_size} bytes"),
-                    instance: path.to_string(),
-                })
+            .map_err(|_| DomainError::PayloadTooLarge {
+                detail: format!("request body exceeds maximum of {max_body_size} bytes"),
+                instance: path.to_string(),
             })?
     };
 
@@ -180,13 +184,11 @@ pub async fn proxy_handler(
     } else {
         format!("/{remaining}")
     };
-    parts.uri = new_uri_str.parse().map_err(|_| {
-        error_response(DomainError::Validation {
-            field: "path",
-            reason: field::INVALID_REWRITTEN_URI,
-            detail: "failed to parse proxy URI".into(),
-            instance: path.to_string(),
-        })
+    parts.uri = new_uri_str.parse().map_err(|_| DomainError::Validation {
+        field: "path",
+        reason: field::INVALID_REWRITTEN_URI,
+        detail: "failed to parse proxy URI".into(),
+        instance: path.to_string(),
     })?;
 
     // Build http::Request<Body> for the DP service.
@@ -194,11 +196,7 @@ pub async fn proxy_handler(
     let proxy_req = http::Request::from_parts(parts, sdk_body);
 
     // Execute proxy pipeline.
-    let proxy_resp = state
-        .dp
-        .proxy_request(ctx, proxy_req)
-        .await
-        .map_err(error_response)?;
+    let proxy_resp = state.dp.proxy_request(ctx, proxy_req).await?;
 
     // Convert http::Response<oagw_sdk::Body> to axum Response.
     let (mut resp_parts, sdk_body) = proxy_resp.into_parts();
@@ -209,18 +207,12 @@ pub async fn proxy_handler(
             .extensions
             .remove::<WebSocketBridgeHandle>()
             .and_then(|h| h.take())
-            .ok_or_else(|| {
-                error_response(DomainError::Internal {
-                    message: "101 Switching Protocols but WebSocket bridge handle is missing"
-                        .into(),
-                })
+            .ok_or_else(|| DomainError::Internal {
+                message: "101 Switching Protocols but WebSocket bridge handle is missing".into(),
             })?;
-        let on_upgrade = on_upgrade.ok_or_else(|| {
-            error_response(DomainError::ProtocolError {
-                detail: "WebSocket upgrade requested but connection does not support upgrades"
-                    .into(),
-                instance: String::new(),
-            })
+        let on_upgrade = on_upgrade.ok_or_else(|| DomainError::ProtocolError {
+            detail: "WebSocket upgrade requested but connection does not support upgrades".into(),
+            instance: String::new(),
         })?;
 
         // Build the 101 response to return to hyper (triggers the upgrade).
@@ -230,11 +222,11 @@ pub async fn proxy_handler(
         }
         // Data now originates from upstream — consistent with the non-upgrade path.
         builder = builder.header("x-oagw-error-source", ErrorSource::Upstream.as_str());
-        let response = builder.body(Body::empty()).map_err(|e| {
-            error_response(DomainError::Internal {
+        let response = builder
+            .body(Body::empty())
+            .map_err(|e| DomainError::Internal {
                 message: format!("failed to build WebSocket upgrade response: {e}"),
-            })
-        })?;
+            })?;
 
         // Spawn the bidirectional bridge task. It awaits the upgrade
         // (which completes after hyper sends the 101 to the client),
@@ -277,12 +269,12 @@ pub async fn proxy_handler(
     // Stream the response body.
     let body = Body::from_stream(sdk_body.into_stream());
 
-    let mut response = builder.body(body).map_err(|e| {
-        error_response(DomainError::DownstreamError {
+    let mut response = builder
+        .body(body)
+        .map_err(|e| DomainError::DownstreamError {
             detail: format!("failed to build response: {e}"),
             instance: String::new(),
-        })
-    })?;
+        })?;
 
     // This is the Data Plane's own response (relayed from the real upstream,
     // or synthesized by pingora itself) - never constructed via

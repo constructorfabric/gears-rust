@@ -32,13 +32,24 @@ use super::{DbProvider, actions, resources};
 #[domain_model]
 #[derive(Debug)]
 pub enum MutationError {
-    ChatNotFound { chat_id: Uuid },
-    TurnNotFound { chat_id: Uuid, request_id: Uuid },
+    ChatNotFound {
+        chat_id: Uuid,
+    },
+    TurnNotFound {
+        chat_id: Uuid,
+        request_id: Uuid,
+    },
     Forbidden,
-    InvalidTurnState { state: TurnState },
+    /// The PDP could not be evaluated (see `DomainError::AuthzUnavailable`).
+    AuthzUnavailable,
+    InvalidTurnState {
+        state: TurnState,
+    },
     NotLatestTurn,
     GenerationInProgress,
-    Internal { message: String },
+    Internal {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for MutationError {
@@ -52,6 +63,7 @@ impl std::fmt::Display for MutationError {
                 write!(f, "Turn {request_id} not found in chat {chat_id}")
             }
             Self::Forbidden => write!(f, "Access denied"),
+            Self::AuthzUnavailable => write!(f, "Authorization service unavailable"),
             Self::InvalidTurnState { state } => {
                 let label = match state {
                     TurnState::Running => "running",
@@ -88,11 +100,10 @@ impl From<EnforcerError> for MutationError {
                 tracing::warn!(error = %err, "AuthZ constraint compile failed - access denied");
                 Self::Forbidden
             }
+            // Fail closed, but as 503: the PDP could not decide.
             EnforcerError::EvaluationFailed(ref err) => {
-                tracing::error!(error = %err, "AuthZ evaluation failed (internal error)");
-                Self::Internal {
-                    message: err.to_string(),
-                }
+                tracing::error!(error = %err, "AuthZ evaluation failed - request refused");
+                Self::AuthzUnavailable
             }
         }
     }
@@ -101,6 +112,20 @@ impl From<EnforcerError> for MutationError {
 // ════════════════════════════════════════════════════════════════════════════
 // Results
 // ════════════════════════════════════════════════════════════════════════════
+
+/// Inputs for the quota preflight of a retry/edit, read before it commits.
+#[domain_model]
+#[derive(Debug)]
+pub struct MutationPreview {
+    /// Scope authorized for this retry/edit; `retry_in_scope` and
+    /// `edit_in_scope` reuse it so the PDP is asked once.
+    pub chat_scope: AccessScope,
+    /// The turn's original user message; its attachments are carried over.
+    pub source_message_id: Uuid,
+    pub user_content: String,
+    pub chat_model: String,
+    pub web_search_enabled: bool,
+}
 
 /// Returned from retry/edit. Contains everything the handler needs to
 /// set up streaming via `StreamService::run_stream_for_mutation()`.
@@ -113,9 +138,6 @@ pub struct MutationResult {
     /// Snapshot boundary computed before the new user message was persisted.
     /// Ensures deterministic context assembly (DESIGN `§ContextPlan` Determinism P1).
     pub snapshot_boundary: Option<crate::domain::repos::SnapshotBoundary>,
-    /// Chat model carried from the mutation transaction so the handler can
-    /// resolve the provider without a redundant DB round-trip.
-    pub chat_model: String,
     /// Whether web search was enabled on the original turn.
     pub web_search_enabled: bool,
 }
@@ -200,12 +222,15 @@ impl<
 
         let scope = chat_scope.tenant_only();
 
+        // Soft-deleted turns (replaced by retry/edit, or deleted) are gone
+        // from the client's point of view.
         self.turn_repo
             .find_by_chat_and_request_id(&conn, &scope, chat_id, request_id)
             .await
             .map_err(|e| MutationError::Internal {
                 message: e.to_string(),
             })?
+            .filter(|turn| turn.deleted_at.is_none())
             .ok_or(MutationError::TurnNotFound {
                 chat_id,
                 request_id,
@@ -256,6 +281,11 @@ impl<
                     .await
                     .map_err(mutation_to_db_err)?;
 
+                    let user_msg = message_repo
+                        .find_user_message_by_request_id(tx, &scope, chat_id, request_id)
+                        .await
+                        .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
+
                     turn_repo
                         .soft_delete(tx, &scope, target.id, None)
                         .await
@@ -264,6 +294,10 @@ impl<
                         .soft_delete_by_request_id(tx, &scope, chat_id, request_id)
                         .await
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
+
+                    if let Some(user_msg) = &user_msg {
+                        drop_summary_covering_turn(tx, &scope, chat_id, user_msg).await?;
+                    }
 
                     // Enqueue audit event atomically within the same transaction.
                     let audit_event = AuditEnvelope::Delete(TurnDeleteAuditEvent {
@@ -302,19 +336,34 @@ impl<
 
     // ── Retry ───────────────────────────────────────────────────────────
 
+    /// Authorizes and runs the retry in one call. Test convenience: the
+    /// handler uses `preview_mutation` and `retry_in_scope`.
+    #[cfg(test)]
     pub async fn retry(
         &self,
         ctx: &SecurityContext,
         chat_id: Uuid,
         request_id: Uuid,
     ) -> Result<MutationResult, MutationError> {
-        info!(%chat_id, %request_id, "turn retry");
-
         let chat_scope = self
             .enforcer
             .access_scope(ctx, &resources::CHAT, actions::RETRY_TURN, Some(chat_id))
             .await?
             .ensure_owner(ctx.subject_id());
+        self.retry_in_scope(ctx, chat_scope, chat_id, request_id)
+            .await
+    }
+
+    /// Retry with a scope already authorized for `retry_turn` on this chat
+    /// (from `preview_mutation`).
+    pub async fn retry_in_scope(
+        &self,
+        ctx: &SecurityContext,
+        chat_scope: AccessScope,
+        chat_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<MutationResult, MutationError> {
+        info!(%chat_id, %request_id, "turn retry");
 
         let start = std::time::Instant::now();
         // Capture trace_id before the transaction closure.
@@ -337,6 +386,9 @@ impl<
 
     // ── Edit ────────────────────────────────────────────────────────────
 
+    /// Authorizes and runs the edit in one call. Test convenience: the
+    /// handler uses `preview_mutation` and `edit_in_scope`.
+    #[cfg(test)]
     pub async fn edit(
         &self,
         ctx: &SecurityContext,
@@ -344,13 +396,26 @@ impl<
         request_id: Uuid,
         new_content: String,
     ) -> Result<MutationResult, MutationError> {
-        info!(%chat_id, %request_id, "turn edit");
-
         let chat_scope = self
             .enforcer
             .access_scope(ctx, &resources::CHAT, actions::EDIT_TURN, Some(chat_id))
             .await?
             .ensure_owner(ctx.subject_id());
+        self.edit_in_scope(ctx, chat_scope, chat_id, request_id, new_content)
+            .await
+    }
+
+    /// Edit with a scope already authorized for `edit_turn` on this chat
+    /// (from `preview_mutation`).
+    pub async fn edit_in_scope(
+        &self,
+        ctx: &SecurityContext,
+        chat_scope: AccessScope,
+        chat_id: Uuid,
+        request_id: Uuid,
+        new_content: String,
+    ) -> Result<MutationResult, MutationError> {
+        info!(%chat_id, %request_id, "turn edit");
 
         let start = std::time::Instant::now();
         // Capture trace_id before the transaction closure.
@@ -378,6 +443,63 @@ impl<
         Ok(result)
     }
 
+    // ── Mutation preview ────────────────────────────────────────────────
+
+    /// Validates a retry (`new_content = None`) or edit without mutating
+    /// anything and returns the inputs the quota preflight needs. The same
+    /// checks run again inside the mutation transaction.
+    pub async fn preview_mutation(
+        &self,
+        ctx: &SecurityContext,
+        chat_id: Uuid,
+        request_id: Uuid,
+        new_content: Option<&str>,
+    ) -> Result<MutationPreview, MutationError> {
+        let action = if new_content.is_some() {
+            actions::EDIT_TURN
+        } else {
+            actions::RETRY_TURN
+        };
+        let chat_scope = self
+            .enforcer
+            .access_scope(ctx, &resources::CHAT, action, Some(chat_id))
+            .await?
+            .ensure_owner(ctx.subject_id());
+
+        let conn = self.db.conn().map_err(|e| MutationError::Internal {
+            message: e.to_string(),
+        })?;
+        let (scope, target, chat_model) = validate_mutation(
+            &*self.chat_repo,
+            &*self.turn_repo,
+            &chat_scope,
+            ctx,
+            &conn,
+            chat_id,
+            request_id,
+        )
+        .await?;
+
+        let original_msg = self
+            .message_repo
+            .find_user_message_by_request_id(&conn, &scope, chat_id, request_id)
+            .await
+            .map_err(|e| MutationError::Internal {
+                message: e.to_string(),
+            })?
+            .ok_or_else(|| MutationError::Internal {
+                message: format!("User message not found for turn {request_id}"),
+            })?;
+
+        Ok(MutationPreview {
+            chat_scope,
+            source_message_id: original_msg.id,
+            user_content: new_content.map_or(original_msg.content, str::to_owned),
+            chat_model,
+            web_search_enabled: target.web_search_enabled,
+        })
+    }
+
     // ── Shared retry/edit transaction ────────────────────────────────────
 
     async fn mutate_for_stream(
@@ -400,11 +522,11 @@ impl<
         let scope_tx = chat_scope.clone();
         let ctx_clone = ctx.clone();
 
-        let (user_content, snapshot_boundary, chat_model, web_search_enabled, wake) = self
+        let (user_content, snapshot_boundary, web_search_enabled, wake) = self
             .db
             .transaction(|tx| {
                 Box::pin(async move {
-                    let (scope, target, chat_model) = validate_mutation(
+                    let (scope, target, _chat_model) = validate_mutation(
                         &*chat_repo,
                         &*turn_repo,
                         &scope_tx,
@@ -432,7 +554,8 @@ impl<
 
                     // Determine event type before consuming override_content.
                     let is_edit = override_content.is_some();
-                    let user_content = override_content.unwrap_or(original_msg.content);
+                    let user_content =
+                        override_content.unwrap_or_else(|| original_msg.content.clone());
 
                     // Soft-delete old turn and its messages
                     turn_repo
@@ -443,10 +566,15 @@ impl<
                         .soft_delete_by_request_id(tx, &scope, chat_id, request_id)
                         .await
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
+                    drop_summary_covering_turn(tx, &scope, chat_id, &original_msg).await?;
 
                     // Insert new running turn
                     let tenant_id = ctx_clone.subject_tenant_id();
-                    let requester_type = ctx_clone.subject_type().unwrap_or("user").to_owned();
+                    let requester_type =
+                        crate::domain::service::stream_service::requester_type_column(
+                            ctx_clone.subject_type(),
+                        )
+                        .to_owned();
 
                     turn_repo
                         .create_turn(
@@ -485,6 +613,14 @@ impl<
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
 
                     // Insert user message for the new turn
+                    // `false`: the chat was deleted after the checks above.
+                    let touched = chat_repo
+                        .touch_activity(tx, &scope, chat_id)
+                        .await
+                        .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
+                    if !touched {
+                        return Err(mutation_to_db_err(MutationError::ChatNotFound { chat_id }));
+                    }
                     let new_msg_id = Uuid::new_v4();
                     message_repo
                         .insert_user_message(
@@ -540,7 +676,7 @@ impl<
                         .await
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
 
-                    Ok((user_content, boundary, chat_model, web_search_enabled, wake))
+                    Ok((user_content, boundary, web_search_enabled, wake))
                 })
             })
             .await
@@ -552,7 +688,6 @@ impl<
                 new_turn_id,
                 user_content,
                 snapshot_boundary,
-                chat_model,
                 web_search_enabled,
             },
             wake,
@@ -625,6 +760,44 @@ async fn validate_mutation<CR: ChatRepository, TR: TurnRepository>(
     Ok((scope, target, chat_model))
 }
 
+/// Delete the chat's thread summary when it covers the target turn.
+///
+/// The summary frontier is the last message before the turn whose completion
+/// triggered it. After a DELETE of the latest turn the previous turn becomes
+/// the latest and can be retried, edited or deleted while the summary still
+/// holds its old content. Such a summary is dropped; the next trigger builds a
+/// full one. Runs in the mutation transaction after the messages are
+/// soft-deleted: those row locks order it after a summary worker commit that
+/// locked the same frontier message (see `thread_summary_worker`).
+async fn drop_summary_covering_turn(
+    tx: &impl toolkit_db::secure::DBRunner,
+    scope: &AccessScope,
+    chat_id: Uuid,
+    user_msg: &crate::infra::db::entity::message::Model,
+) -> Result<(), toolkit_db::DbError> {
+    use crate::domain::repos::ThreadSummaryRepository as _;
+    use crate::infra::db::repo::thread_summary_repo::ThreadSummaryRepository;
+
+    let to_db =
+        |e: crate::domain::error::DomainError| toolkit_db::DbError::Other(anyhow::Error::new(e));
+    let Some(summary) = ThreadSummaryRepository
+        .get_latest(tx, scope, chat_id)
+        .await
+        .map_err(to_db)?
+    else {
+        return Ok(());
+    };
+    let frontier = (summary.frontier.created_at, summary.frontier.message_id);
+    if frontier >= (user_msg.created_at, user_msg.id) {
+        let deleted = ThreadSummaryRepository
+            .delete_for_chat(tx, scope, chat_id)
+            .await
+            .map_err(to_db)?;
+        info!(%chat_id, request_id = ?user_msg.request_id, deleted, "thread summary covered the mutated turn; dropped");
+    }
+    Ok(())
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Error helpers for transaction boundary crossing
 // ════════════════════════════════════════════════════════════════════════════
@@ -667,5 +840,6 @@ fn unwrap_mutation_err(e: toolkit_db::DbError) -> MutationError {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "turn_service_test.rs"]
 mod tests;

@@ -80,8 +80,8 @@ after conversion; a missing FX record where one is required fails closed, never 
 
 | ADR ID | Decision Summary |
 |--------|------------------|
-| `cpt-cf-bss-rating-adr-scope-key-adoption` | `currency` is an axis of the adopted 8-axis key: each market is its own catalog row selected at step 2 — step 8 never fabricates a missing market row via FX derivation. |
-| `cpt-cf-bss-pricing-adr-canonical-scope-key` (adopted) | The key definition carrying the `currency`/`region` axes; per-`(currency, region)` rows are authored independently in the pricing gear ([`../../../pricing/docs/design/04-currency-tax.md`](../../../pricing/docs/design/04-currency-tax.md)). |
+| `cpt-cf-bss-rating-adr-scope-key-adoption` | `currency` is an axis of the adopted ten-axis key: each market is its own catalog row selected at step 2 — step 8 never fabricates a missing market row via FX derivation. |
+| Canonical scope key (superseded by the PriceBook model, see T-D-37 in rating DECISIONS) (adopted) | The key definition carrying the `currency`/`region` axes; per-`(currency, region)` rows are authored independently in the pricing gear (`../../../pricing/docs/design/04-currency-tax.md` (former pricing design, removed; superseded by the PriceBook model — see T-D-37)). |
 
 ### 1.3 Architecture Layers
 
@@ -213,7 +213,7 @@ slice's recorded policy identity. [`11-consumer-contracts.md`](./11-consumer-con
 | Dependency | What arrives frozen | Contract |
 |------------|--------------------|----------|
 | Finance | FX tables + lock policy, `fxTableVersion` / locked-rate ids | PRD §9.2 Finance FX; [`11-consumer-contracts.md`](./11-consumer-contracts.md) |
-| Pricing (Product Catalog) | per-`(currency, region)` price rows (first-class, never FX-derived), ISO 4217 minor-unit amounts | PRD §9.2 read-model contract; pricing [`design/04`](../../../pricing/docs/design/04-currency-tax.md) |
+| Pricing (Product Catalog) | per-`(currency, region)` price rows (first-class, never FX-derived), ISO 4217 minor-unit amounts | PRD §9.2 read-model contract; pricing `design/04` (former pricing design, removed; superseded by the PriceBook model — see T-D-37) |
 | Subscriptions | `(currency, region)` binding frozen at activation | SEAMS S1; PRD §9.2 Subscriptions input |
 | Promotions | frozen coupon snapshots incl. `settlementCurrency` | PRD §9.2 Promotions; [`06-coupons.md`](./06-coupons.md) |
 | Billing | rounds in billing currency after conversion; period close fixes the authoritative close-time `fxTableVersion` | PRD §9.2 Billing; §17.1 rating-core/Billing boundary |
@@ -241,7 +241,7 @@ slice's recorded policy identity. [`11-consumer-contracts.md`](./11-consumer-con
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-storage-none-fx`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-datastore-none-fx`
 
 **None owned.** FX tables and lock policies live in Finance; the recorded `fxTableVersion` /
 locked-rate id and the FX-lock segment ride the emitted outcome (Rating persistence). The only local
@@ -262,7 +262,7 @@ there is no shared mutable rate state and no cross-partition coordination.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-normative-currency-roles-fx`
 
-- **Price currency** — the currency of the `Price.amount` row selected at step 2. Per-market rows are first-class catalog rows authored per `(currency, region)` in the pricing gear; **no FX derivation ever** — a missing market row is absent, not derivable (pricing [`design/04`](../../../pricing/docs/design/04-currency-tax.md); `currencyFallbackPolicy` is a pricing Future).
+- **Price currency** — the currency of the `Price.amount` row selected at step 2. Per-market rows are first-class catalog rows authored per `(currency, region)` in the pricing gear; **no FX derivation ever** — a missing market row is absent, not derivable (pricing `design/04` (former pricing design, removed; superseded by the PriceBook model — see T-D-37); `currencyFallbackPolicy` is a pricing Future).
 - **Billing currency** — the invoice currency per payer account/contract, delivered via the Subscriptions-frozen `(currency, region)` binding (S1).
 - **Presentment currency** — portal display FX; non-authoritative, outside rating-core, labelled estimates.
 - Conversion applies **iff** billing ≠ price; equal currencies skip step 8 (native multi-currency, §17.1 step 2).
@@ -303,4 +303,4 @@ there is no shared mutable rate state and no cross-partition coordination.
 - **Seams**: S1 (fx-lock segment — the Rating-written segment owned by this slice), W2 (the close delta replays the pinned snapshot) — [`../SEAMS.md`](../SEAMS.md).
 - **Decisions**: T-D-03 (snapshot composition), T-D-04 (snapshot-only replay for the close delta) — [`../DECISIONS.md`](../DECISIONS.md).
 - **Slices**: [`01-foundation.md`](./01-foundation.md) (pipeline slot, determinism tuple, emission guards), [`06-coupons.md`](./06-coupons.md) (coupon ordering across the FX boundary), [`08-retroactivity-corrections.md`](./08-retroactivity-corrections.md) (close-time delta path), [`09-period-plan-change.md`](./09-period-plan-change.md) (floor/cap conversion), [`11-consumer-contracts.md`](./11-consumer-contracts.md) (Finance/Billing contracts).
-- **Pricing design set**: [`04-currency-tax.md`](../../../pricing/docs/design/04-currency-tax.md) (per-market rows, no FX derivation, currency binding), [`06-consumer-contracts.md`](../../../pricing/docs/design/06-consumer-contracts.md) (frozen read-model consumer contract).
+- **Pricing design set**: `04-currency-tax.md` (former pricing design, removed; superseded by the PriceBook model — see T-D-37) (per-market rows, no FX derivation, currency binding), `06-consumer-contracts.md` (former pricing design, removed; superseded by the PriceBook model — see T-D-37) (frozen read-model consumer contract).

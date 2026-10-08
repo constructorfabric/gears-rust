@@ -52,7 +52,7 @@ k8s = ["dep:cf-k8s-cluster-plugin"]
 # validator so the cluster pod can enforce `X-ToolKit-Internal-Token` on its
 # grpc-hub (coordination plane + DirectoryService registration) in Profile 3.
 # Must propagate to grpc-hub: the hub's TokenReview validator is gated behind its
-# own `k8s-auth` feature (mirrors platform-host's `k8s` feature), otherwise
+# own `k8s-auth` feature (mirrors flight-control's `k8s` feature), otherwise
 # `internal_auth: { provider: kube }` fails init with "requires the k8s-auth
 # feature".
 k8s-auth = ["toolkit/k8s-auth", "grpc_hub/k8s-auth"]
@@ -73,7 +73,6 @@ tokio-stream = { workspace = true }
 # `PlatformSecurityContext` (§4.6).
 toolkit-transport-grpc = { workspace = true }
 toolkit-security = { workspace = true }
-secrecy = { workspace = true }
 # `bootstrap` is what carries `toolkit::bootstrap::oop::run_oop_with_options` -
 # the whole of `src/main.rs`. The feature is unconditional because the `[[bin]]`
 # is; it pulls the OoP bootstrap's own deps (serde-saphyr, the directory gRPC
@@ -146,6 +145,8 @@ testcontainers-modules = { workspace = true, optional = true }
 
 [dev-dependencies]
 test-containers = { workspace = true }
+# `SecretString` for the platform credential in tests/grpc_services.rs.
+secrecy = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 # An in-memory metric reader, so the sweep's instruments are read back rather
 # than asserted about — including the label set, which invariant I15 makes a

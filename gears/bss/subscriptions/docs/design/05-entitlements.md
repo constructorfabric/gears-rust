@@ -183,7 +183,7 @@ events.
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-storage-entitlement-ent`
+- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-datastore-entitlement-ent`
 
 Owned here: `entitlement` (state + effective dates + grant-set source), **`seat_binding`**
 (2026-07-28 billing-pass review #7 — the guard's `COUNT(active)` is transactionally consistent

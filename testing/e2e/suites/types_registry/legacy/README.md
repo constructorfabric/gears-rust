@@ -9,7 +9,7 @@ and every assertion reads that response body directly.
 They are kept here, unchanged in behaviour, while the async admission API
 (`202` + `GET /operations/{id}`) is built out next to them. The new
 submit-then-poll tests live one level up, in the suite root
-(`test_registration.py`, `scenarios/registration.md` and the JSON inputs
+(`test_registration_*.py`, `scenarios/registration.md` and the JSON inputs
 under `fixtures/`).
 
 The directory is named `legacy`, not `v1`, on purpose: the async API is served

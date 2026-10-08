@@ -75,12 +75,12 @@ As an alternative, you can fork the repository to your own GitHub account.
 
 Constructor Fabric Gears follows a spec-driven development (SDD) approach for large features. Gear development starts with specifications that live alongside the code. When you add features, make design decisions, or introduce upstream requirements, you must use the following templates and keep them aligned with the implementation:
 
-- **[Overview & Guide](./docs/spec-templates/README.md)** — Template system overview, governance, FDD ID conventions, and document placement rules
-- **[PRD.md](./docs/spec-templates/gears-sdlc/PRD/template.md)** — Product Requirements Document: vision, actors, capabilities, use cases, FR/NFR
-- **[DESIGN.md](./docs/spec-templates/gears-sdlc/DESIGN/template.md)** — Technical Design: architecture, principles, constraints, domain model, API contracts
-- **[ADR.md](./docs/spec-templates/gears-sdlc/ADR/template.md)** — Architecture Decision Record: decisions, options, trade-offs, consequences
-- **[FEATURE.md](./docs/spec-templates/gears-sdlc/FEATURE/template.md)** — Feature Specification: flows, algorithms, states, requirements
-- **[UPSTREAM_REQS.md](./docs/spec-templates/gears-sdlc/UPSTREAM_REQS/template.md)** — Upstream Requirements: technical requirements from other gears to this gear
+- **[Overview & Guide](./studio-kit-gears/artifacts/README.md)** — Template system overview, governance, FDD ID conventions, and document placement rules
+- **[PRD.md](./studio-kit-gears/artifacts/PRD/template.md)** — Product Requirements Document: vision, actors, capabilities, use cases, FR/NFR
+- **[DESIGN.md](./studio-kit-gears/artifacts/DESIGN/template.md)** — Technical Design: architecture, principles, constraints, domain model, API contracts
+- **[ADR.md](./studio-kit-gears/artifacts/ADR/template.md)** — Architecture Decision Record: decisions, options, trade-offs, consequences
+- **[FEATURE.md](./studio-kit-gears/artifacts/FEATURE/template.md)** — Feature Specification: flows, algorithms, states, requirements
+- **[UPSTREAM_REQS.md](./studio-kit-gears/artifacts/UPSTREAM_REQS/template.md)** — Upstream Requirements: technical requirements from other gears to this gear
 
 ### 2.3. Make Your Changes
 
@@ -361,39 +361,7 @@ Then create a Pull Request on GitHub with:
 - Test coverage information
 - Breaking changes (if any)
 
-Use the following PR Description Template
-
-```markdown
-## Description
-Brief description of the changes made.
-
-## Type of Change
-- [ ] Bug fix (non-breaking change which fixes an issue)
-- [ ] New feature (non-breaking change which adds functionality)
-- [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
-- [ ] Documentation update
-
-## Testing
-- [ ] Unit tests pass
-- [ ] Integration tests pass
-- [ ] Manual testing completed
-- [ ] New tests added for new functionality
-
-## Documentation
-- [ ] Code is documented with rustdoc comments
-- [ ] README updated (if applicable)
-- [ ] API documentation updated (if applicable)
-
-## Checklist
-- [ ] Code follows project style guidelines
-- [ ] Self-review completed
-- [ ] No linting errors (`cargo clippy`)
-- [ ] Code is properly formatted (`cargo fmt`)
-- [ ] Tests pass (`cargo test`)
-
-## Related Issues
-Closes #issue_number
-```
+Use the [PR template](./.github/pull_request_template.md) for the description.
 
 ### 2.10. Review Process
 

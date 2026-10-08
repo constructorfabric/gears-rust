@@ -2,9 +2,10 @@
 
 Plan: [`plan.md`](./plan.md) · Spec: [`SPEC.md`](./SPEC.md)
 
-34 P0 implementation tasks; existing IDs retained. T22 is deferred to P1 as
+34 P0 implementation tasks; existing IDs retained, except T29, renamed T22d by plan P21. T22 is deferred to P1 as
 [#4827](https://github.com/constructorfabric/gears-rust/issues/4827) under #4628 (plan P18),
-not marked complete. Phase 6 executes T22a → T22b → T22c → T23.
+not marked complete. Phase 6 executes T22a → T22b → T22c → T22d; Phase 7 opens with T23
+(plan P21).
 
 Standing bar for every task, on top of its own acceptance criteria: `make fmt`, `make clippy` and
 gear tests green, no regression in other gears, behaviour verified at runtime, docs updated.
@@ -72,11 +73,11 @@ published crate — so it is a genuine RED→GREEN.
 ---
 
 ### Checkpoint 0
-- [ ] `make ci` green — **partial, see T1**: everything that does not need Docker is green
+- [x] `make ci` green — **partial, see T1**: everything that does not need Docker is green
 - [x] `make dylint` — full workspace, once for the phase (P13). Satisfied by the workspace-wide run recorded at Checkpoint 1: Phase 0 is one task and that run included its changes
 - [x] Every declared GTS identifier admits under 0.12.0
 - [x] Generated-schema diff reviewed and accounted for — one class of change in 9 of 118 documents
-- [ ] **Human review before any registry code is written**
+- [x] **Human review before any registry code is written**
 
 ---
 
@@ -714,7 +715,7 @@ premature half of this decision rather than the tidy half.
 
 The grouping axis is **the concept** — which is also its table in `database.sql` — and the
 tasks below are where three of them acquire a second file. Take the directory then, not before
-and not later; moving three files at T12 is cheaper than moving seven at T29, and leaving them
+and not later; moving three files at T12 is cheaper than moving seven at T22d, and leaving them
 flat is how the root reaches 25 files.
 
 | Concept | Directory at | Contents then |
@@ -1606,7 +1607,7 @@ MySQL's integer boolean, and the SQLite insert chunk accounts for all 15 columns
 - [~] `make dylint` — the local run is blocked before project linting by stable/nightly artifacts
       being mixed in Dylint's target directory (`E0514`); the gear's all-target/all-feature Clippy
       run with `--no-deps -D warnings` is clean
-- [ ] Human review
+- [x] Human review
 
 ---
 
@@ -1922,7 +1923,7 @@ task so the REST-to-outbox flow can be verified before Checkpoint 5
 
 ---
 
-## Phase 6 — Read API and the new contract
+## Phase 6 — Read API and conditional reads
 
 ### T22: Deferred to P1 — inventory ownership metadata and per-gear push
 
@@ -2036,10 +2037,10 @@ and quickstart, for the seven-route completeness check)
   must not silently widen read fan-out. Two tests hold it — one pins the literal `100` so the
   value cannot move unnoticed, one drives the boundary off the constant so exactly-at-ceiling
   is served and one past it is refused.
-- **`if_none_match` is declared and not consulted.** No read emits a validator until T29, so
+- **`if_none_match` is declared and not consulted.** No read emits a validator until T22d, so
   nothing a caller could hold can be compared against; the field exists now so the wire shape
   does not change under the callers T23 migrates. `EntityLookupStatusDto` is `found` /
-  `not_found` only — declaring `unchanged` before T29 emits one would publish a vocabulary
+  `not_found` only — declaring `unchanged` before T22d emits one would publish a vocabulary
   value this gear never produces.
 - **Discovery filters by `pattern`, `limit` and `cursor` only.** DESIGN's `depth`, `origin`,
   `availability`, `scope` and `tenant_id` are each out of P0 (SPEC §2). `kind` is *not* named
@@ -2070,7 +2071,7 @@ and quickstart, for the seven-route completeness check)
 ### - [x] T22b: Field projection on all three read routes
 
 **Description:** Implement DESIGN §3.3's `$select` on exact read, `:batchGet` and discovery
-before T23 publishes the SDK models and T29 computes validators (plan P19). An absent
+before T23 publishes the SDK models and T22d computes validators (plan P19). An absent
 `$select` returns P0's document-free metadata set; callers explicitly request `content`,
 `resolved_schema`, `effective_traits`, `effective_traits_schema` or `provenance`. The
 default includes managed `origin`, as fixed in SPEC §10.2. P0 has no
@@ -2085,7 +2086,7 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
   retain C7 only for absent tenant/visibility dimensions and revise C10's full-response
   rationale without silently raising the 100-key ceiling. Done in the P19 contract revision;
   implementation and verification criteria below remain open
-- [x] Define one transport-neutral normalized field set for all three routes and T23/T29:
+- [x] Define one transport-neutral normalized field set for all three routes and T23/T22d:
   field names follow ToolKit OData's case-insensitive, whitespace-trimming rules; order
   does not change identity, and absent `$select` equals an explicit default selection.
   Reject duplicates, empty, unknown, unavailable, malformed or excessive selections with
@@ -2095,7 +2096,7 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
   fields are absent on Instances
 - [x] Exact and batch reads accept the same selection and produce the same projected
   entity for one key. Batch `"$select"` is a top-level body field applied to every key;
-  per-item `if_none_match` remains declared for T29. `key`, lookup status and future `etag`
+  per-item `if_none_match` remains declared for T22d. `key`, lookup status and future `etag`
   stay outside projection; `kind` and `lifecycle_status` are mandatory even when omitted
   from the selected set, so a projected entity says which documents apply and a projected
   tombstone is distinguishable from `not_found`
@@ -2113,7 +2114,7 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
   document fields of DESIGN and declare optional fields accurately in OpenAPI. Specify
   the matching transport-neutral SDK request/result shape for T23: its reconciliation
   explicitly selects `content`, and its list helpers select the fields they hydrate.
-  T29 digests this exact normalized set, never the raw query text
+  T22d digests this exact normalized set, never the raw query text
 - [x] Unknown query parameters, including unsupported OData options and v1-only filters,
   are refused rather than silently ignored. Use ToolKit's OData `$select` registration and
   extraction for GET routes, with a gear-level allowlist for accepted options and fields;
@@ -2146,7 +2147,7 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
 **Implementation notes:**
 - **One `FieldSelection` bitset** (`TR/src/domain/selection.rs`) is the normalized identity:
   order, case and duplicates cannot survive construction, `kind` and `lifecycle_status`
-  are always members, and `canonical()` is the sorted spelling the cursor binds and T29 will digest.
+  are always members, and `canonical()` is the sorted spelling the cursor binds and T22d will digest.
   The REST parser runs ToolKit's `parse_select` for its limits, then refuses the empty
   comma segments ToolKit drops. Every refusal is `400` naming `$select` with reason
   `INVALID_SELECT`; *unavailable* is `availability` / `owned_by_context_tenant`.
@@ -2194,7 +2195,7 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
   `cursor=` on its first page, which is a `400`; fixed here.
 
 **Dependencies:** T22a. Must complete before T23 fixes the SDK request/result models and
-before T29 fixes validator inputs; no dependency on deferred T22 inventory metadata.
+before T22d fixes validator inputs; no dependency on deferred T22 inventory metadata.
 **Files likely touched:** `docs/p0/SPEC.md`, `TR/src/domain/registry_service.rs`,
 `TR/src/domain/ports/mod.rs`, `TR/src/infra/storage/repo/`, `TR/src/api/rest/{dto,handlers,routes,cursor}.rs`,
 `TR/tests/api_rest_test.rs`, `TR/tests/repo_backends_test.rs`, `QUICKSTART.md`.
@@ -2345,6 +2346,87 @@ working implementation slices above.
 
 ---
 
+### - [x] T22d: Freshness validators and conditional reads
+
+**Description:** The per-request validator of DESIGN §3.3 and the conditional reads it
+enables (SPEC §8.5, `plan.md` P9/P19). For a P0 managed platform-plane read the validator is a
+versioned digest over `entity.resource_version`, `type_schema.resolution_fingerprint` (Type
+Schemas only) and T22b's normalized selected-field set — every other input in DESIGN's table is
+`tenant plane only`, availability-conditional or external, so none of them applies here.
+Ships the `ETag` / `If-None-Match` → `304` path on exact reads and per-key validators on
+`batchGet`.
+
+**Placement.** Formerly T29. Last in Phase 6, after T22c and before T23 (`plan.md` P21), so Checkpoint 6
+closes the complete P0 REST contract on `/v2/`. The task is server-only: the domain service
+computes the validator and the REST adapter carries it. T23 then exposes that same value in the
+SDK models — P9's requirement that the field precede T25/T26 is unaffected. T22a already
+accepts and length-checks each item's `if_none_match`; this task is where it is first compared.
+
+**Acceptance criteria:**
+- [x] Validator is **computed per request, never stored** (`cpt-cf-types-registry-principle-derive-not-store`) — no column, no cache entry holds one as authority
+- [x] Inputs are exactly `resource_version` + `resolution_fingerprint` (Type Schemas; Instances have no derived form) + T22b's normalized field set. A `TODO` names the P1 additions: subject visibility-chain version, Context Tenant availability-chain version, routing generation
+- [x] Wire form per DESIGN: base64url of a **versioned** JSON object, identical bytes in `ETag` and in batch bodies; 128-bit digest for the managed case. The version field is what lets P1 add inputs without honouring a P0 token
+- [x] Comparison decodes fields — never compares encoded strings, so serialization differences cannot read as a change
+- [x] Projection is digested as the **normalized field set**, not the query string; absent `$select` equals the explicit T22b default set (RFC 9110 §8.8.3). A narrow token never produces false `unchanged` for a wider representation, including two selections of the same key in P0
+- [x] Exact read: response carries `ETag`; a matching `If-None-Match` returns a bodyless `304` **that still carries the `ETag`**, declared through `no_content_response(StatusCode::NOT_MODIFIED, ..)`
+- [x] `batchGet`: validators travel **beside individual keys**, in each item's `if_none_match`, because one header cannot represent them; a result may be `unchanged`, and the response stays `200` even when all are. The two body fields are the two header names lowercased — request `if_none_match`, response `etag` — so the batch surface reads like the single one
+- [x] An `unchanged` result **carries its `etag`**, and the exact read's `304` **carries its `ETag`** — RFC 9110 §15.4.5 has a `304` send the validator a `200` would have. Every result but `not_found` therefore has one, so a refresh loop has no special case
+- [x] Test: `unchanged` and `304` both return the same validator the caller sent, byte for byte
+- [x] **Discovery pages carry no validator** and are never conditional (DESIGN: validators are for exact reads, *"never discovery pages"*) — `GET /entities` is unaffected
+- [x] A deleted entity still has a validator, and deletion moves it (deletion increments `resource_version`)
+- [x] Handlers stay mapping-only: the validator is computed in the domain service, so a future gRPC adapter gets it without new domain methods (SPEC §8.4)
+- [x] `types-registry-sdk` is untouched: the validator is a domain value, and T23's local client maps it into the SDK models rather than recomputing it (P21)
+- [x] `ponytail:`-style comment where the digest is built records ceiling C7's absent tenant/visibility dimensions and names the version field as the upgrade path
+
+**Verification:**
+- [x] Gear tests, all three backends (see [Commands](#commands))
+- [x] Test: unchanged entity yields a byte-identical validator across two reads; a revision changes it
+- [x] Test: a dependent whose `resolved_schema` was refreshed gets a new validator **even when its own `resource_version` did not move** — this is why `resolution_fingerprint` is an input, and it is the case a `resource_version`-only digest gets wrong
+- [x] Test: `If-None-Match` with the current validator returns `304` with no body; with a stale one returns `200` and the document
+- [x] Test: `batchGet` with a mix of current and stale validators returns `200`, `unchanged` for the current ones, full snapshots for the rest
+- [x] Test: an Instance validator omits `resolution_fingerprint` and still changes on revision
+- [x] Test: decoding rejects a validator whose version field is unknown rather than treating it as a match
+- [x] Test: one key under two different selected-field sets has two different validators;
+  field order, case, an explicit default set and explicitly naming mandatory
+  `kind` or `lifecycle_status` do not change the normalized validator when the effective fields match
+- [x] Test: deletion changes the validator
+- [x] `make e2e-local` remains green with no e2e file edited — only `/v2/` routes change
+
+**Dependencies:** T22a (`batchGet` and its per-item `if_none_match`), T22b (normalized
+projection and the three read routes, Phase 6 per P19). Not T23: the SDK carries the validator
+this task computes, not the reverse (P21)
+**Files likely touched:**
+- `TR/src/domain/validator.rs`
+- `TR/src/domain/registry_service.rs` (the database read path; `service.rs` is the legacy in-memory service)
+- `TR/src/api/rest/handlers.rs`, `TR/src/api/rest/routes.rs`, `TR/src/api/rest/dto.rs`,
+  `TR/src/api/rest/etag.rs`
+- `TR/tests/validator_test.rs`, `TR/tests/api_rest_test.rs`, `TR/tests/projected_read_backends_test.rs`
+**Scope:** M
+
+---
+
+### Checkpoint 6
+- [x] The REST surface is complete on `/v2/`: all seven routes in OpenAPI; `batchGet` returns
+      explicit per-key results; all three read routes apply `$select`; the default is
+      document-free and discovery filters by `pattern`, inclusive `depth` and `kind`;
+      its cursor binds those filters and the normalized field set while traversing the
+      matching stable set exactly once; `QUICKSTART.md` covers reads and mutations
+      (T20a, T22a, T22b, T22c, P17/P19/P20)
+- [x] Conditional reads work on `/v2/`: an exact read carries a per-request validator and
+      honours `If-None-Match` with a `304` that carries its `ETag`; `batchGet` reports
+      `unchanged` per key with its `etag`; discovery carries none (T22d, P21)
+- [x] The P0 REST contract is complete; the server work left is the cutover (T24) and the
+      path promotion (T24a), both in Phase 7 (P21)
+- [x] `make e2e-local` remains green with no e2e file edited; gear tests and `make lychee` pass
+- [x] Nothing is cut over yet — consumers still on the old path, and the new SDK trait is not
+      written yet (T23 opens Phase 7); T22 is deferred to P1 (P18)
+- [x] `make dylint` — full workspace, once for the phase (P13)
+- [ ] Human review
+
+---
+
+## Phase 7 — SDK contract, cutover and migration
+
 ### - [ ] T23: New SDK trait and explicit-document reconciliation helper
 
 **Description:** `TypesRegistryEntities` plus its models per SPEC §10.1, and the
@@ -2353,6 +2435,10 @@ helper so existing callers need not hand-roll batching, idempotency or retry (P1
 collection and per-gear filtering are deferred to P1; the helper does not discover declarations
 or delete entities absent from its input. The old trait is **not** kept — it is deleted in
 T26 once every consumer has moved.
+
+**Placement.** First in Phase 7, after Checkpoint 6 (`plan.md` P21): the SDK is written
+against the complete `/v2/` read contract, conditional reads included, and still lands before
+the cutover (T24) and before any consumer moves (T25/T26).
 
 **Acceptance criteria:**
 - [ ] Trait is object-safe: `hub.get::<dyn TypesRegistryEntities>()` compiles
@@ -2373,7 +2459,7 @@ T26 once every consumer has moved.
   `kind` server-side while preserving caller-supplied pattern/depth and cursor;
   they do not fetch the opposite kind and discard it client-side
 - [ ] `list_instances` / `list_type_schemas` **explicitly select the documents their callers read**, on the discovery page or through a following `batchGet`. The ~87 existing call sites keep reading payloads from the result. The doc comment states the trade: complete with respect to the traversal, not to an instant; `batchGet` is optional, for per-key validators and caching
-- [ ] **The validator field is in the models from this task**, and `BatchGet` accepts a validator per requested key in `BatchGetItem::if_none_match`, even though T29 computes them and T30 consumes them. Adding either later would break the SDK contract after ~50 call sites have moved onto it (SPEC §8.5, `plan.md` P9). A result variant for `unchanged` is part of the same shape
+- [ ] **The validator field is in the models from this task**, carrying the value T22d's domain service computes — the local client maps it and never recomputes one. `BatchGet` accepts a validator per requested key in `BatchGetItem::if_none_match`, and a result variant for `unchanged` is part of the same shape; T30 consumes both. Adding either later would break the SDK contract after ~50 call sites have moved onto it (SPEC §8.5, `plan.md` P9)
 - [ ] **Reconciliation helper** implements DESIGN §3.3's five steps: batch-read the desired identifiers, omit content equal to current, set `expected_resource_version` from the read for differing ones and leave it unset for missing ones, return `UpToDate` with no POST when nothing remains, otherwise submit once under one idempotency key and poll to terminality
 - [ ] The helper accepts an explicit desired-document set, requests `content` for its comparisons,
   and batches within `limits.batch_candidates`. It does not collect or filter process inventory:
@@ -2385,14 +2471,16 @@ T26 once every consumer has moved.
 **Verification:**
 - [ ] `cargo test -p cf-gears-types-registry-sdk`
 - [ ] Test: a mock consumer round-trips submit → poll → read through the new trait
+- [ ] Gear test (`cargo nextest run -p cf-gears-types-registry`): through the real local client over `RegistryService`, a read carries T22d's validator byte for byte and a `BatchGet` naming the current validator returns `unchanged` — an SDK-crate mock cannot prove that mapping
 - [ ] Test: helper returns `UpToDate` without submitting when everything already matches
 - [ ] Test: only supplied documents are reconciled; unrelated linked inventory and existing registry entities are neither submitted nor deleted
 - [ ] Test: helper converges when a base type is admitted only on the second attempt
 - [ ] Test: helper against an operation nothing will drain fails on its deadline with a diagnosable error, not a hang
 
 **Dependencies:** T4 (reads), T21 (async dispatch), T22b (projection contract), T22c
-(discovery filter contract). Scheduled after T22c so the read surface is verified before SDK
-integration; its contract shape is fixed by SPEC, not by the REST DTOs
+(discovery filter contract), T22d (validators). Scheduled after Checkpoint 6 so the whole read
+surface, conditional reads included, is verified before SDK integration (P21); its contract
+shape is fixed by SPEC, not by the REST DTOs
 **Files likely touched:**
 - `TR-SDK/src/entities.rs`
 - `TR-SDK/src/entity_models.rs`
@@ -2402,23 +2490,6 @@ integration; its contract shape is fixed by SPEC, not by the REST DTOs
 **Scope:** M
 
 ---
-
-### Checkpoint 6
-- [ ] The REST surface is complete on `/v2/`: all seven routes in OpenAPI; `batchGet` returns
-      explicit per-key results; all three read routes apply `$select`; the default is
-      document-free and discovery filters by `pattern`, inclusive `depth` and `kind`;
-      its cursor binds those filters and the normalized field set while traversing the
-      matching stable set exactly once; `QUICKSTART.md` covers reads and mutations
-      (T20a, T22a, T22b, T22c, P17/P19/P20)
-- [ ] `make e2e-local` remains green with no e2e file edited; gear tests and `make lychee` pass
-- [ ] New trait and explicit-document reconciliation helper pass against a mock consumer without inventory metadata/filtering; T22 is deferred to P1 (P18)
-- [ ] Nothing is cut over yet — consumers still on the old path
-- [ ] `make dylint` — full workspace, once for the phase (P13)
-- [ ] Human review
-
----
-
-## Phase 7 — Cutover and migration
 
 ### - [ ] T24: Cutover — linked inventory seeds into the database; ready mode and in-memory repository out
 
@@ -2493,8 +2564,9 @@ onto the `/types-registry/v1/` paths, so P0 ends on **one** version rather than 
 
 **Placement.** Directly after T24 (`plan.md` P17). T20a authored the deletion routes in
 **Phase 5**, while T22a/T22b completed `:batchGet`, paged discovery and projection on
-**all three reads in Phase 6**, all on v2. This task promotes all seven routes at once. The Phase 7 order is
-**T24 → T24a → T28**, with T25 then T26 alongside it: T25 needs T24, T26 needs T25 — it
+**all three reads in Phase 6**, and T22d added conditional reads to them, all on v2. This task
+promotes all seven routes at once. The Phase 7 order is
+**T23 → T24 → T24a → T28**, with T25 then T26 alongside it: T25 needs T24, T26 needs T25 — it
 deletes the shared trait, so it cannot run beside it.
 
 **The e2e window is a consequence of this ordering, not of a defect.** `make e2e-local` goes red
@@ -2508,7 +2580,7 @@ T20a and T22a preserve by not touching an e2e file.
 - [ ] The promotion changes paths only: registration and deletion routes remain internal-only
       (`exposed = false`) until C8's platform listener and authorization gate exist
 - [ ] `operation_id`s are unchanged by the move — `types_registry.submit_entities`, `.get_operation`, `.get_entity` and T20a/T22a's additions keep their names, so the promotion is a path change and nothing else. It is still a *breaking* path change for anything on `/v2/`: every such route is removed here, so a caller must move its base path. What the unchanged `operation_id`s buy is that nothing but the path moves — bodies, statuses and semantics are the ones it already had, and the interim surface was never exposed beyond the platform listener
-- [ ] All **seven** routes promote together, because all seven exist by the end of Phase 6 (P17)
+- [ ] All **seven** routes promote together, because all seven exist by the end of Phase 6 (P17); T22d's `ETag` / `If-None-Match` and per-key `unchanged` move with them unchanged — additive, so no changelog break entry (P21)
 - [ ] Old v1 handlers, DTOs and routes are **deleted**, not repointed — verified by T24's own criterion that the in-memory repository is gone; `grep -r 'types_registry\.register\|RegisterEntitiesRequest'` finds nothing outside history
 - [ ] Every surviving v1 route reads the database; none reads process memory
 - [ ] SPEC §10.2 records the final shape and closes the interim window, naming T9a as where it opened and this task as where it closed
@@ -2640,61 +2712,11 @@ paged list. It was missed because the earlier survey counted `/entities` referen
 
 ---
 
-### - [ ] T29: Freshness validators and conditional reads
-
-**Description:** The per-request validator of DESIGN §3.3 and the conditional reads it
-enables (SPEC §8.5, `plan.md` P9/P19). For a P0 managed platform-plane read the validator is a
-versioned digest over `entity.resource_version`, `type_schema.resolution_fingerprint` (Type
-Schemas only) and T22b's normalized selected-field set — every other input in DESIGN's table is
-`tenant plane only`, availability-conditional or external, so none of them applies here.
-Ships the `ETag` / `If-None-Match` → `304` path on exact reads and per-key validators on
-`batchGet`.
-
-**Acceptance criteria:**
-- [ ] Validator is **computed per request, never stored** (`cpt-cf-types-registry-principle-derive-not-store`) — no column, no cache entry holds one as authority
-- [ ] Inputs are exactly `resource_version` + `resolution_fingerprint` (Type Schemas; Instances have no derived form) + T22b's normalized field set. A `TODO` names the P1 additions: subject visibility-chain version, Context Tenant availability-chain version, routing generation
-- [ ] Wire form per DESIGN: base64url of a **versioned** JSON object, identical bytes in `ETag` and in batch bodies; 128-bit digest for the managed case. The version field is what lets P1 add inputs without honouring a P0 token
-- [ ] Comparison decodes fields — never compares encoded strings, so serialization differences cannot read as a change
-- [ ] Projection is digested as the **normalized field set**, not the query string; absent `$select` equals the explicit T22b default set (RFC 9110 §8.8.3). A narrow token never produces false `unchanged` for a wider representation, including two selections of the same key in P0
-- [ ] Exact read: response carries `ETag`; a matching `If-None-Match` returns a bodyless `304` **that still carries the `ETag`**, declared through `no_content_response(StatusCode::NOT_MODIFIED, ..)`
-- [ ] `batchGet`: validators travel **beside individual keys**, in each item's `if_none_match`, because one header cannot represent them; a result may be `unchanged`, and the response stays `200` even when all are. The two body fields are the two header names lowercased — request `if_none_match`, response `etag` — so the batch surface reads like the single one
-- [ ] An `unchanged` result **carries its `etag`**, and the exact read's `304` **carries its `ETag`** — RFC 9110 §15.4.5 has a `304` send the validator a `200` would have. Every result but `not_found` therefore has one, so a refresh loop has no special case
-- [ ] Test: `unchanged` and `304` both return the same validator the caller sent, byte for byte
-- [ ] **Discovery pages carry no validator** and are never conditional (DESIGN: validators are for exact reads, *"never discovery pages"*) — `GET /entities` is unaffected
-- [ ] A deleted entity still has a validator, and deletion moves it (deletion increments `resource_version`)
-- [ ] Handlers stay mapping-only: the validator is computed in the domain service, so a future gRPC adapter gets it without new domain methods (SPEC §8.4)
-- [ ] `ponytail:`-style comment where the digest is built records ceiling C7's absent tenant/visibility dimensions and names the version field as the upgrade path
-
-**Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Test: unchanged entity yields a byte-identical validator across two reads; a revision changes it
-- [ ] Test: a dependent whose `resolved_schema` was refreshed gets a new validator **even when its own `resource_version` did not move** — this is why `resolution_fingerprint` is an input, and it is the case a `resource_version`-only digest gets wrong
-- [ ] Test: `If-None-Match` with the current validator returns `304` with no body; with a stale one returns `200` and the document
-- [ ] Test: `batchGet` with a mix of current and stale validators returns `200`, `unchanged` for the current ones, full snapshots for the rest
-- [ ] Test: an Instance validator omits `resolution_fingerprint` and still changes on revision
-- [ ] Test: decoding rejects a validator whose version field is unknown rather than treating it as a match
-- [ ] Test: one key under two different selected-field sets has two different validators;
-  field order, case, an explicit default set and explicitly naming mandatory
-  `kind` or `lifecycle_status` do not change the normalized validator when the effective fields match
-- [ ] Test: deletion changes the validator
-
-**Dependencies:** T23 (validator field in the models), T22b (normalized projection and
-the three read routes, Phase 6 per P19)
-**Files likely touched:**
-- `TR/src/domain/validator.rs`
-- `TR/src/domain/service.rs`
-- `TR/src/api/rest/handlers.rs`, `TR/src/api/rest/routes.rs`
-- `TR-SDK/src/entity_models.rs`
-- `TR/tests/validator_test.rs`
-**Scope:** M
-
----
-
 ### - [ ] T30: SDK client cache — freshness window, byte bound, `fresh` bypass
 
 **Description:** Port the `local_client` cache onto `EntitySnapshot` and give it DESIGN §3.3's
 contract (SPEC §8.3, `plan.md` P7). Reads have been uncached since T24; this restores caching,
-and because T29 supplies validators the cache **revalidates** rather than merely expiring —
+and because T22d supplies validators the cache **revalidates** rather than merely expiring —
 which is what `cpt-cf-types-registry-fr-client-cache` asks for. T22b supplies the projection
 dimension in P0; visibility and Context-Tenant dimensions remain fixed until P1 tenancy.
 
@@ -2728,7 +2750,7 @@ dimension in P0; visibility and Context-Tenant dimensions remain fixed until P1 
 - [ ] Test: a failed revalidation surfaces the error and leaves the window unextended
 - [ ] `make e2e-local` — no staleness surfaces in the register → poll → read flow
 
-**Dependencies:** T24, T26, T29
+**Dependencies:** T24, T26, T22d
 **Files likely touched:**
 - `TR/src/infra/cache/cache.rs`, `TR/src/infra/cache/cache_tests.rs`
 - `TR/src/domain/local_client.rs`
@@ -2744,7 +2766,7 @@ dimension in P0; visibility and Context-Tenant dimensions remain fixed until P1 
 - [ ] `make ci`, gear tests on three backends, `make e2e-local`, `make e2e-docker`, `make dylint`, `make lychee` green
 - [ ] Every ceiling in SPEC §9 has a comment at the point it binds
 - [ ] `TypesRegistryClient` is deleted and no crate references it (D6, T26)
-- [ ] Conditional reads work end to end: an exact read carries a validator and honours `If-None-Match` with `304`, `batchGet` reports `unchanged` per key (T29)
+- [ ] Conditional reads work end to end: an exact read carries a validator and honours `If-None-Match` with `304`, `batchGet` reports `unchanged` per key (T22d) — proved on `/v2/` at Checkpoint 6, re-checked here on the promoted v1 paths and through the SDK (T23)
 - [ ] Discovery is bounded: no response is unbounded in items or bytes, and a cursor traverses the whole set exactly once (T22a, D12) — proved at Checkpoint 6, re-checked here on the promoted v1 paths
 - [ ] The client cache is in place on the new models with its window, byte bound, `fresh` bypass and batched conditional revalidation (T30) — P0 does not ship an uncached read path
 - [ ] Human review

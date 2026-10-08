@@ -1,0 +1,152 @@
+{
+  "golden": "resolve_nested_pairs",
+  "proves": "D-425, D-391 (phase 4 second review M1): a pair nested in an outer pair, both built by the domain's pair builder - the inner return restores the outer promo's money only until the outer promo's own end: a renewal pinned to the outer promo inside the inner return binds that return with ends_on at the outer end (its stored effective_to is the same explicit end), and resolved again with its pin on that ends_on it binds the outer return, open",
+  "exchanges": [
+    {
+      "case": "renewal pinned to the outer promo on 2026-11-05",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:promo-1>&date=2026-11-05&pins=<price:promo-outer>",
+      "status": 200,
+      "body": {
+        "plan_revision_id": "<revision:promo-1>",
+        "plan_id": "<plan:promo>",
+        "rev_no": 1,
+        "state": "published",
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "currency_minor_digits": 2,
+        "rounding_policy": "half_even",
+        "date": "2026-11-05",
+        "items": [
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:promo-1/promo>",
+            "sku_id": "<sku:promo>",
+            "price_book_entry_id": "<entry:promo>",
+            "charge_kind": "recurring",
+            "period": "month",
+            "model": "flat",
+            "sku_version": {
+              "published_version": 1,
+              "effective_from": "2026-01-01"
+            },
+            "invoice_line_template": {
+              "value": "{plan}: {sku} for {period}",
+              "source": "tenant"
+            },
+            "gl_code": {
+              "value": "9000",
+              "source": "tenant"
+            },
+            "tax_category": {
+              "value": "std",
+              "source": "tenant"
+            },
+            "billing_timing": {
+              "value": "arrears",
+              "source": "tenant"
+            },
+            "meter": {
+              "usage_type_ref": null,
+              "unit": null
+            },
+            "chains": [
+              {
+                "dim_value": null,
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:promo-inner-return>",
+                  "dim_used": null,
+                  "pinned_from": "<price:promo-outer>",
+                  "price": {
+                    "amount": "8.00"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-11-01",
+                  "effective_to": "2026-12-01",
+                  "temporary_until": null,
+                  "ends_on": "2026-12-01",
+                  "keep_for_bound": false
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case": "resolved again on its ends_on 2026-12-01, pinned to the inner return",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/resolve?plan_revision_id=<revision:promo-1>&date=2026-12-01&pins=<price:promo-inner-return>",
+      "status": 200,
+      "body": {
+        "plan_revision_id": "<revision:promo-1>",
+        "plan_id": "<plan:promo>",
+        "rev_no": 1,
+        "state": "published",
+        "book_id": "<book:eur>",
+        "currency": "EUR",
+        "currency_minor_digits": 2,
+        "rounding_policy": "half_even",
+        "date": "2026-12-01",
+        "items": [
+          {
+            "usage_rating_policy": null,
+            "item_id": "<item:promo-1/promo>",
+            "sku_id": "<sku:promo>",
+            "price_book_entry_id": "<entry:promo>",
+            "charge_kind": "recurring",
+            "period": "month",
+            "model": "flat",
+            "sku_version": {
+              "published_version": 1,
+              "effective_from": "2026-01-01"
+            },
+            "invoice_line_template": {
+              "value": "{plan}: {sku} for {period}",
+              "source": "tenant"
+            },
+            "gl_code": {
+              "value": "9000",
+              "source": "tenant"
+            },
+            "tax_category": {
+              "value": "std",
+              "source": "tenant"
+            },
+            "billing_timing": {
+              "value": "arrears",
+              "source": "tenant"
+            },
+            "meter": {
+              "usage_type_ref": null,
+              "unit": null
+            },
+            "chains": [
+              {
+                "dim_value": null,
+                "uncovered": false,
+                "binding": {
+                  "price_id": "<price:promo-outer-return>",
+                  "dim_used": null,
+                  "pinned_from": "<price:promo-inner-return>",
+                  "price": {
+                    "amount": "10.00"
+                  },
+                  "min_fee": null,
+                  "eligibility": "all",
+                  "effective_from": "2026-12-01",
+                  "effective_to": null,
+                  "temporary_until": null,
+                  "ends_on": null,
+                  "keep_for_bound": false
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

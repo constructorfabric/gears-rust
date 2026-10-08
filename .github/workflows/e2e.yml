@@ -47,7 +47,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -64,12 +64,12 @@ jobs:
       docker: ${{ steps.filter.outputs.docker }}
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Detect changed paths
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
@@ -123,7 +123,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -162,7 +162,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -238,9 +238,15 @@ jobs:
         run: make e2e-tr-authz
 
       # Self-managed suite (launcher: pytest): starts its own server plus a
-      # TimescaleDB container, so it needs a reachable Docker daemon.
-      - name: Run usage-collector E2E tests (TimescaleDB container)
+      # TimescaleDB or ClickHouse container, so it needs a reachable Docker daemon.
+      - name: Run usage-collector E2E tests (TimescaleDB + ClickHouse containers)
         run: make e2e-usage-collector
+
+      # Self-managed OoP (loopback, no k8s) suite: builds flight-control + three
+      # oop_module gear binaries and orchestrates them as processes itself, so it
+      # bypasses run_e2e.py and runs via its own target.
+      - name: Run OoP (loopback) E2E tests
+        run: make e2e-oop
 
       - name: Upload E2E logs
         if: failure()

@@ -22,10 +22,11 @@ use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, OnceLock},
 };
-use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
-use tonic::{service::RoutesBuilder, transport::Server};
+use tonic::{
+    service::RoutesBuilder,
+    transport::{Server, server::TcpIncoming},
+};
 
 use toolkit_security::{DynInternalAuthenticator, InternalAuthConfig};
 use toolkit_transport_grpc::{InternalAuthEnforcement, InternalAuthGrpcLayer};
@@ -582,8 +583,8 @@ impl GrpcHub {
         cancel: CancellationToken,
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
-        let listener = TcpListener::bind(addr).await?;
-        let bound_addr = listener.local_addr()?;
+        let incoming = TcpIncoming::bind(addr)?.with_nodelay(Some(true));
+        let bound_addr = incoming.local_addr()?;
         tracing::info!(%bound_addr, transport = "tcp", "gRPC hub listening");
 
         self.set_bound_endpoint(format!("http://{bound_addr}"));
@@ -599,7 +600,6 @@ impl GrpcHub {
 
         ready.notify();
 
-        let incoming = TcpListenerStream::new(listener);
         Server::builder()
             .layer(self.effective_auth_layer()?)
             .add_routes(routes)
@@ -1517,7 +1517,7 @@ mod tests {
             "should be None before DirectoryClient is registered"
         );
 
-        // Simulate gear_orchestrator registering DirectoryClient after grpc-hub init
+        // Simulate service_discovery registering DirectoryClient after grpc-hub init
         let mock_dir: Arc<dyn DirectoryClientTrait> = Arc::new(MockDirectoryClient);
         client_hub.register::<dyn DirectoryClientTrait>(mock_dir);
 

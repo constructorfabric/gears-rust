@@ -42,7 +42,6 @@ fn schema(gts_id: &str) -> Value {
 fn registration(idempotency_key: &str, gts_id: &str) -> SubmitRequest {
     SubmitRequest {
         idempotency_key: Some(idempotency_key.to_owned()),
-        kind: OperationKind::Registration,
         dry_run: false,
         candidates: vec![Candidate {
             gts_id: gts_id.to_owned(),
@@ -812,7 +811,7 @@ async fn seed_partition_operation(
                         &operation,
                         &[NewOperationItem {
                             item_no: 0,
-                            gts_id: gts_id.to_owned(),
+                            key: EntityKey::GtsId(gts_id.to_owned()),
                             precondition: Precondition::MustNotExist,
                             compat_forced: false,
                             request_payload: schema(gts_id).to_string(),

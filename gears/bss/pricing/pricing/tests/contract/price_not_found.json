@@ -1,0 +1,102 @@
+{
+  "golden": "price_not_found",
+  "proves": "D-422: a draft, pending or rejected price, an unknown id and another tenant's price are one and the same 404 - nothing about a price is revealed",
+  "exchanges": [
+    {
+      "case": "a draft price",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:pro-draft>",
+      "status": 404,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+        "title": "Not Found",
+        "status": 404,
+        "detail": "price not found",
+        "context": {
+          "resource_type": "gts.cf.bss.pricing.price.v1~",
+          "resource_name": "price"
+        }
+      }
+    },
+    {
+      "case": "a pending price",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:pro-pending>",
+      "status": 404,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+        "title": "Not Found",
+        "status": 404,
+        "detail": "price not found",
+        "context": {
+          "resource_type": "gts.cf.bss.pricing.price.v1~",
+          "resource_name": "price"
+        }
+      }
+    },
+    {
+      "case": "a rejected price",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:pro-rejected>",
+      "status": 404,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+        "title": "Not Found",
+        "status": 404,
+        "detail": "price not found",
+        "context": {
+          "resource_type": "gts.cf.bss.pricing.price.v1~",
+          "resource_name": "price"
+        }
+      }
+    },
+    {
+      "case": "an unknown id",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:unknown>",
+      "status": 404,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+        "title": "Not Found",
+        "status": 404,
+        "detail": "price not found",
+        "context": {
+          "resource_type": "gts.cf.bss.pricing.price.v1~",
+          "resource_name": "price"
+        }
+      }
+    },
+    {
+      "case": "another tenant's price",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:other-tenant>",
+      "status": 404,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+        "title": "Not Found",
+        "status": 404,
+        "detail": "price not found",
+        "context": {
+          "resource_type": "gts.cf.bss.pricing.price.v1~",
+          "resource_name": "price"
+        }
+      }
+    },
+    {
+      "case": "this tenant's price read by another tenant",
+      "caller": "another tenant",
+      "request": "GET /bss-pricing/v1/prices/<price:10>",
+      "status": 404,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+        "title": "Not Found",
+        "status": 404,
+        "detail": "price not found",
+        "context": {
+          "resource_type": "gts.cf.bss.pricing.price.v1~",
+          "resource_name": "price"
+        }
+      }
+    }
+  ]
+}

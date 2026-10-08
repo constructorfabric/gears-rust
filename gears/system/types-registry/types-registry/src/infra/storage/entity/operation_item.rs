@@ -40,7 +40,10 @@ pub struct Model {
     pub id: i64,
     pub operation_id: Uuid,
     pub item_no: i32,
-    pub gts_id: String,
+    /// An `EntityKey` in its `Display` form: always an identifier for a
+    /// registration, either kind of key for a deletion, a Registry Reference
+    /// lowercase and hyphenated.
+    pub entity_key: String,
     /// Copied from `operation.dry_run`; held in step by the composite FK.
     pub dry_run: bool,
     /// Copied from `operation.kind`; held in step by the composite FK.

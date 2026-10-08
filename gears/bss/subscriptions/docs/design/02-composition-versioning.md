@@ -176,7 +176,7 @@ At activation, `SnapshotSegmentStamper` freezes the `(currency, region)` segment
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-storage-composition-cmp`
+- [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-datastore-composition-cmp`
 
 Owned here: `plan_link` and `add_on` interval tables (tenant-partitioned by the pinned
 `orderingTenantId`, UTC), plus the `quantity_interval` history (the effective-dated committed seat

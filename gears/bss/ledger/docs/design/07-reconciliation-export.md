@@ -568,6 +568,20 @@ PK `(tenant_id, source_id, export_target, transaction_id)` — the idempotency k
 
 An out-of-tolerance run opens an `exception_queue` row and feeds the close gate.
 
+**Tenant-lifecycle gate + retention (the table's only delete path).** The tick's candidate set comes from `journal_entry`, which is append-only and never cleaned, so it retains every tenant that ever posted an entry — including soft-deleted ones and ones hard-deleted from the tenant registry outright. Enumerating from ledger data and appending one row per tenant per tick therefore compounds: enumerate from a table that never shrinks, write into another that never shrinks (measured on stage1: 29 GB / 61M rows, 98.9% of the app database, with ~99.9% of the rows belonging to tenants that no longer exist). The tick therefore:
+
+1. **Classifies the candidate set against the platform tenant registry** (`tenant-resolver`, queried for *every* status) before reconciling anything:
+   - `Active` / `Suspended` → reconciled. A suspended tenant still owns real money and keeps being reconciled.
+   - `Deleted` → skipped. `Deleted` is terminal in AM, so a soft-deleted tenant will never post again.
+   - not returned at all → skipped while `recon.unregistered_tenants = skip` (default; with the AM-backed plugin that is a tenant hard-deleted from `public.tenants`), reconciled under `reconcile` (for a non-authoritative plugin such as `static-tr-plugin`, which knows only its configured list).
+
+   An answer the tick cannot trust is fail-safe toward coverage — the tick reconciles the full candidate set and purges nothing, counting the fallback in `ledger_reconciliation_lifecycle_unavailable_total{reason}`. Two answers qualify: a read that *fails* (`read_failed`), and a read that succeeds but recognises *none* of a non-empty candidate set (`none_recognised` — what a caller-scoped plugin such as `single-tenant-tr-plugin` returns for the tick's anonymous context). Silently under-reconciling would blind the close gate.
+2. **Reclaims the soft-deleted remainder's uneventful runs** — `DONE`, `within_tolerance = true`, `variance_minor = 0`. Only a positive `Deleted` answer makes a tenant purgeable; an unregistered tenant is never purged, since an omission from the resolver's answer is not proof of deletion. Runs that recorded any variance, and unfinalized (`RUNNING`/`FAILED`) rows, are **never** purged for any tenant: those are the evidence that something was once wrong. The eligibility predicate is applied to both the batch selection and the delete. The delete is per-tenant, so it rides the `(tenant_id, run_id)` PK; it is bounded per statement (5,000 rows), per tick (`recon.purge_max_rows_per_tick`), and per tenants visited (`recon.purge_max_tenants_per_tick`, default 500), and rotates through the deleted set across ticks. The purge is **off by default** (`purge_max_rows_per_tick = 0`): stopping the growth needs no deletes, so reclamation is enabled per environment once the gate is seen classifying correctly there (`200_000` drains a multi-GB backlog within a day at the default cadence). Failed purge statements are counted in `ledger_reconciliation_purge_failed_total`.
+
+Rows accumulated for tenants that were hard-deleted before the purge reached them are not reclaimed by the tick (they are unregistered, not `Deleted`); a one-time purge by the same predicate, scoped to tenant ids absent from `public.tenants`, covers that backlog.
+
+Time-based retention for *live* tenants is deliberately not attempted here: the table carries no index on `at_utc`, so an age-based predicate is a sequential scan of the whole heap.
+
 ### 5.3 exception_queue
 
 | Column | Type | Notes |
@@ -783,7 +797,7 @@ Success via the Slice 1 outbox: `billing.ledger.export.acked`, `billing.ledger.r
 
 ### 8.2 Feature Metrics
 
-`ledger_reconciliation_variance_minor{check_type}`, `ledger_reconciliation_runs_total` / `_out_of_tolerance_total`, `ledger_export_acked_total` / `_failed_total`, `ledger_export_failed_age_seconds`, `ledger_export_payload_conflict_total`, `ledger_period_close_blocked_total{reason}`, `ledger_period_close_duration_days`, `ledger_exception_queue_depth{type}`. Thresholds wire to [§8.3](#83-nfr-mapping) + the recon-variance / failed-export alarms.
+`ledger_reconciliation_variance_minor{check_type}`, `ledger_reconciliation_runs_total` / `_out_of_tolerance_total`, `ledger_reconciliation_retired_tenants{state}` / `ledger_reconciliation_runs_purged_total` / `ledger_reconciliation_lifecycle_unavailable_total{reason}` / `ledger_reconciliation_purge_failed_total` (the tenant-lifecycle gate's backlog, drain progress and failure signals, [§5.2](#52-reconciliation_run)), `ledger_export_acked_total` / `_failed_total`, `ledger_export_failed_age_seconds`, `ledger_export_payload_conflict_total`, `ledger_period_close_blocked_total{reason}`, `ledger_period_close_duration_days`, `ledger_exception_queue_depth{type}`. Thresholds wire to [§8.3](#83-nfr-mapping) + the recon-variance / failed-export alarms.
 
 ### 8.3 NFR Mapping
 

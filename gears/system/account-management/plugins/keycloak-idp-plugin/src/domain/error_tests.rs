@@ -339,8 +339,10 @@ fn sa_error_variants_have_stable_labels() {
         field: Some("name".into()),
     };
     let not_found = PluginError::SaNotFound { detail: "d".into() };
+    let quota = PluginError::SaQuotaExceeded { detail: "d".into() };
     assert_eq!(failure_variant_label(&invalid), "sa_invalid_input");
     assert_eq!(failure_variant_label(&not_found), "sa_not_found");
+    assert_eq!(failure_variant_label(&quota), "sa_quota_exceeded");
 }
 
 // SP-saga wire detail strings: part of the ambig:{stage} prefix contract; must not change silently.

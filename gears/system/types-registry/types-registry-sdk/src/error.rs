@@ -24,7 +24,9 @@
 //! |---|---|---|
 //! | invalid GTS id / query / entity content (inspect [`FieldIssue::reason`]) | [`TypesRegistryError::Validation`] | 400 |
 //! | type-schema / instance missing | [`TypesRegistryError::NotFound`] | 404 |
+//! | admission operation missing (`resource_type` = [`crate::gts::OPERATION_RESOURCE_TYPE`]) | [`TypesRegistryError::NotFound`] | 404 |
 //! | duplicate-on-register | [`TypesRegistryError::AlreadyExists`] | 409 |
+//! | `Idempotency-Key` bound to another request (`resource_type` = [`crate::gts::OPERATION_RESOURCE_TYPE`]) | [`TypesRegistryError::AlreadyExists`] | 409 |
 //! | batch register: required parent type-schema absent | [`TypesRegistryError::ParentNotRegistered`] | — (in-process batch outcome) |
 //! | registry still initializing | [`TypesRegistryError::Unavailable`] | 503 |
 //! | internal failure | [`TypesRegistryError::Internal`] | 500 |
@@ -32,7 +34,8 @@
 //!
 //! Resource-scoped variants ([`TypesRegistryError::NotFound`] /
 //! [`TypesRegistryError::AlreadyExists`]) carry the raw `resource_type`; match it
-//! against [`crate::gts::TYPE_RESOURCE_TYPE`]. The type-schema-vs-instance
+//! against [`crate::gts::TYPE_RESOURCE_TYPE`] for an entity, or
+//! [`crate::gts::OPERATION_RESOURCE_TYPE`] for an admission operation. The type-schema-vs-instance
 //! distinction the legacy error enum carried is intentionally **not** modeled:
 //! it is redundant with the method the caller invoked (`get_type_schema` vs
 //! `get_instance`) and with the `~` suffix of the `gts_id`, and the canonical
@@ -128,10 +131,11 @@ pub enum TypesRegistryError {
         issues: Vec<FieldIssue>,
     },
 
-    /// No type-schema or instance is registered under the requested id / UUID.
-    /// `resource_type` is the canonical GTS type — match it against
-    /// [`crate::gts::TYPE_RESOURCE_TYPE`]; `name` is the raw identifier the
-    /// caller supplied.
+    /// No type-schema or instance is registered under the requested id / UUID,
+    /// or no admission operation has the requested id. `resource_type` is the
+    /// canonical GTS type — [`crate::gts::TYPE_RESOURCE_TYPE`] for an entity,
+    /// [`crate::gts::OPERATION_RESOURCE_TYPE`] for an operation; `name` is the
+    /// raw identifier the caller supplied.
     #[error("not found [{resource_type}]: {name}")]
     NotFound {
         resource_type: String,
@@ -139,7 +143,10 @@ pub enum TypesRegistryError {
         detail: String,
     },
 
-    /// An entity with the same GTS id already exists (duplicate-on-register).
+    /// An entity with the same GTS id already exists (duplicate-on-register,
+    /// [`crate::gts::TYPE_RESOURCE_TYPE`]), or an `Idempotency-Key` is already
+    /// bound to another request ([`crate::gts::OPERATION_RESOURCE_TYPE`], `name`
+    /// is that operation's UUID).
     #[error("already exists [{resource_type}]: {name}")]
     AlreadyExists {
         resource_type: String,

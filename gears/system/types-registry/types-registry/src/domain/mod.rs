@@ -32,6 +32,8 @@ pub mod compat;
 pub mod dependency;
 // Version-family key derivation and the three family rules.
 pub mod family;
+// How a caller names one entity: GTS identifier or Registry Reference.
+pub mod key;
 // The transient `gts-rust` store, one per admission unit (SPEC D2, §8.2).
 pub mod gts_store;
 // The registration-policy allowlist (DESIGN §3.2, SPEC §10.3).
@@ -44,6 +46,8 @@ pub mod registry_service;
 pub mod retry;
 // The normalized field set all three reads project by (T22b, SPEC §10.2).
 pub mod selection;
+// Freshness validators for conditional exact reads (T22d, SPEC §8.5).
+pub mod validator;
 
 // ---------------------------------------------------------------------------
 // Shared by both paths

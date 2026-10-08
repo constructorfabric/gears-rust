@@ -23,6 +23,8 @@
 //! crate's sources — the instrument must not be read as one of the sources it
 //! measures. The module is named for what it does rather than for the file.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 /// One file's text with every comment and every string, char and raw-string
 /// literal replaced by spaces — **byte positions and newlines preserved**, so a
 /// line number taken from the result is a line number in the input.
@@ -34,6 +36,7 @@
 /// A lifetime (`&'a str`) is deliberately not read as a char literal: a `'` opens
 /// one only when the next character is an escape or is followed by a closing
 /// quote, which is what distinguishes `'x'` from `'a` in the one place it matters.
+#[must_use]
 pub fn blank_comments_and_literals(text: &str) -> String {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut out = String::with_capacity(text.len());
@@ -69,6 +72,7 @@ pub fn blank_comments_and_literals(text: &str) -> String {
 /// a producing site can be attributed to the function that contains it. Two copies
 /// of a depth count would be two answers to *"where does this item end"* on two
 /// censuses that exist to keep one attestation honest.
+#[must_use]
 pub fn matching_brace(code: &str, open: usize) -> Option<usize> {
     matching_delim(code, open, b'{', b'}')
 }
@@ -81,6 +85,7 @@ pub fn matching_brace(code: &str, open: usize) -> Option<usize> {
 /// gate passes. Generalizing rather than copying is the module doc's own
 /// argument: two depth counts would be two answers to *"where does this item
 /// end"*.
+#[must_use]
 pub fn matching_delim(code: &str, open: usize, open_ch: u8, close_ch: u8) -> Option<usize> {
     let mut depth = 0_usize;
     for (offset, byte) in code.as_bytes()[open..].iter().enumerate() {

@@ -10,6 +10,7 @@ use std::future::Future;
 
 use toolkit_db::DbTx;
 use toolkit_db::secure::AccessScope;
+use uuid::Uuid;
 
 use super::AdmissionFailureReason;
 use super::errors::{ItemFailure, WorkerError};
@@ -18,6 +19,7 @@ use super::graph::{
     order_deletion_batch,
 };
 use crate::domain::enums::OperationItemStatus;
+use crate::domain::key::EntityKey;
 use crate::domain::ports::{OperationItemRow, Stores};
 
 /// Process each candidate once, returning slots in submission order.
@@ -41,7 +43,7 @@ where
     }
     for &index in order.order() {
         let refusal = blocked_by(order, index, |i| outcomes[i].as_ref().map(&status))
-            .map(|blocker| blocked_failure(blocker, &items[blocker.index].gts_id));
+            .map(|blocker| blocked_failure(blocker, &items[blocker.index].key.to_string()));
         outcomes[index] = Some(execute(index, refusal).await?);
     }
     Ok(outcomes)
@@ -58,7 +60,7 @@ pub(super) fn registration_order(items: &[OperationItemRow]) -> BatchOrder {
 /// `invalid_document`, which is a better message than anything this layer has.
 fn batch_candidate(item: &OperationItemRow) -> BatchCandidate {
     BatchCandidate {
-        gts_id: item.gts_id.clone(),
+        gts_id: item.key.to_string(),
         content: item
             .request_payload
             .as_deref()
@@ -66,17 +68,53 @@ fn batch_candidate(item: &OperationItemRow) -> BatchCandidate {
     }
 }
 
-/// Order deletions within the caller's snapshot.
+/// Order deletions within the caller's snapshot, resolving both key spellings
+/// in one read each.
 ///
 /// # Errors
-/// Propagates either read failure.
+/// Propagates any read failure.
 pub(super) async fn order_deletions(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
     scope: &AccessScope,
-    gts_ids: &[String],
+    keys: &[EntityKey],
 ) -> Result<BatchOrder, WorkerError> {
-    let rows = stores.find_by_gts_ids(tx, scope, gts_ids).await?;
+    let gts_ids: Vec<String> = keys
+        .iter()
+        .filter_map(|key| key.gts_id().map(str::to_owned))
+        .collect();
+    let gts_uuids: Vec<Uuid> = keys
+        .iter()
+        .filter_map(|key| match key {
+            EntityKey::Uuid(gts_uuid) => Some(*gts_uuid),
+            EntityKey::GtsId(_) => None,
+        })
+        .collect();
+    let mut rows = if gts_ids.is_empty() {
+        Vec::new()
+    } else {
+        stores.find_by_gts_ids(tx, scope, &gts_ids).await?
+    };
+    if !gts_uuids.is_empty() {
+        rows.extend(stores.find_by_gts_uuids(tx, scope, &gts_uuids).await?);
+    }
+    let by_uuid: HashMap<Uuid, String> = rows
+        .iter()
+        .map(|row| (row.gts_uuid, row.gts_id.clone()))
+        .collect();
+    // An unresolved key keeps its own spelling, which matches no identifier and
+    // therefore takes no edge.
+    let labels: Vec<String> = keys
+        .iter()
+        .map(|key| match key {
+            EntityKey::Uuid(gts_uuid) => by_uuid
+                .get(gts_uuid)
+                .cloned()
+                .unwrap_or_else(|| key.to_string()),
+            EntityKey::GtsId(gts_id) => gts_id.clone(),
+        })
+        .collect();
+
     let entity_ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
     let named: HashMap<i64, String> = rows.into_iter().map(|row| (row.id, row.gts_id)).collect();
     let links = stores
@@ -90,7 +128,7 @@ pub(super) async fn order_deletions(
             })
         })
         .collect::<Vec<_>>();
-    Ok(order_deletion_batch(gts_ids, &links))
+    Ok(order_deletion_batch(&labels, &links))
 }
 
 /// Find the first failed in-batch blocker, or `None`.

@@ -1,0 +1,10 @@
+{
+  "gts_id": "gts.cf.e2e.discovery.person.v1~cf.e2e.discovery.employee.v1~cf.e2e.discovery.manager.v1~cf.e2e.discovery.carol.v1",
+  "content": {
+    "name": "Carol",
+    "payload": {
+      "employee_id": "E002",
+      "team": "Platform"
+    }
+  }
+}

@@ -1,5 +1,5 @@
 //! The one normalized field set of all three reads (SPEC §10.2). Storage fetches
-//! only what it names; cursors and T29 validators use [`FieldSelection::canonical`].
+//! only what it names; cursors and T22d validators use [`FieldSelection::canonical`].
 
 use toolkit_macros::domain_model;
 

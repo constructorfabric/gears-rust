@@ -4,8 +4,12 @@
 //! `MISSED_POSTING` that blocks close, which the upstream's idempotent re-post then
 //! auto-clears. K3: a Payments↔PSP divergence opens a `PSP_VARIANCE`. K4: the
 //! bill-run-finished close gate (un-asserted blocks, asserted passes). K5: inert until
-//! the feed lands. Control feeds are exercised through the real in-process store (the
-//! push → framework / close-gate read path). Ignored by default; run with
+//! the feed lands. K8: the tick's tenant-registry lifecycle gate — a soft-deleted
+//! tenant is not reconciled and (purge enabled) its uneventful runs are reclaimed while
+//! its variance evidence is kept; an unregistered tenant is skipped but never purged;
+//! an untrusted registry answer (failed, or recognising nobody) falls back to
+//! reconciling everyone and purging nothing. Control feeds are exercised through the real in-process
+//! store (the push → framework / close-gate read path). Ignored by default; run with
 //! `cargo test -p cf-gears-bss-ledger --test postgres_reconciliation -- --ignored`.
 
 #![allow(
@@ -18,8 +22,10 @@
     clippy::panic
 )]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bss_ledger::config::ReconConfig;
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::ports::metrics::{LedgerMetricsPort, NoopLedgerMetrics};
@@ -31,6 +37,7 @@ use bss_ledger::infra::reconciliation::{
     CHECK_AR_DERIVED, CHECK_INVOICE_COMPLETENESS, CHECK_PAYMENTS_PSP, ReconciliationFramework,
 };
 use bss_ledger::infra::storage::migrations::Migrator;
+use bss_ledger::infra::tenant_lifecycle::{RegistryLifecycle, TenantLifecycleReader};
 use bss_ledger_sdk::{
     BillRunFinishedV1, IssuedInvoiceManifest, IssuedInvoiceManifestV1, PspSettlementFeedV1,
     PspSettlementReport, UnconfiguredBillRunFinishedV1, UnconfiguredIssuedInvoiceManifestV1,
@@ -220,6 +227,62 @@ fn noop_metrics() -> Arc<dyn LedgerMetricsPort> {
     Arc::new(NoopLedgerMetrics)
 }
 
+/// Tenant-registry double reporting every candidate live. The `run_check`-driven
+/// tests below never exercise the tick's lifecycle gate, so this keeps them on
+/// the pre-gate behaviour.
+struct AllTenantsLive;
+
+#[async_trait]
+impl TenantLifecycleReader for AllTenantsLive {
+    async fn lifecycles(
+        &self,
+        candidates: &[Uuid],
+    ) -> anyhow::Result<HashMap<Uuid, RegistryLifecycle>> {
+        Ok(candidates
+            .iter()
+            .map(|t| (*t, RegistryLifecycle::Live))
+            .collect())
+    }
+}
+
+/// Tenant-registry double with a fixed `id -> lifecycle` map; every other
+/// candidate is omitted from the answer (unregistered).
+struct FixedRegistry(HashMap<Uuid, RegistryLifecycle>);
+
+#[async_trait]
+impl TenantLifecycleReader for FixedRegistry {
+    async fn lifecycles(
+        &self,
+        candidates: &[Uuid],
+    ) -> anyhow::Result<HashMap<Uuid, RegistryLifecycle>> {
+        Ok(candidates
+            .iter()
+            .filter_map(|t| self.0.get(t).map(|l| (*t, *l)))
+            .collect())
+    }
+}
+
+/// Tenant-registry double whose read always fails.
+struct FailingRegistry;
+
+#[async_trait]
+impl TenantLifecycleReader for FailingRegistry {
+    async fn lifecycles(
+        &self,
+        _candidates: &[Uuid],
+    ) -> anyhow::Result<HashMap<Uuid, RegistryLifecycle>> {
+        Err(anyhow::anyhow!("no tenant-resolver plugin bound"))
+    }
+}
+
+/// Recon config with the retired-tenant purge switched on (it is off by default).
+fn purge_on() -> ReconConfig {
+    ReconConfig {
+        purge_max_rows_per_tick: 200_000,
+        ..ReconConfig::default()
+    }
+}
+
 /// Build a framework over the in-process control-feed store (the push → read path).
 #[allow(
     clippy::needless_pass_by_value,
@@ -230,6 +293,20 @@ fn framework(
     feeds: Arc<InProcessControlFeeds>,
     config: ReconConfig,
 ) -> ReconciliationFramework {
+    framework_with_registry(provider, feeds, config, Arc::new(AllTenantsLive))
+}
+
+/// As [`framework`], with an explicit tenant-registry lifecycle gate.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "test helper — clones the provider for the engine and moves it into the exception router"
+)]
+fn framework_with_registry(
+    provider: DBProvider<DbError>,
+    feeds: Arc<InProcessControlFeeds>,
+    config: ReconConfig,
+    registry: Arc<dyn TenantLifecycleReader>,
+) -> ReconciliationFramework {
     ReconciliationFramework::new(
         provider.clone(),
         Arc::new(LedgerEventPublisher::noop()),
@@ -237,6 +314,7 @@ fn framework(
         ExceptionRouter::shared(provider),
         Arc::clone(&feeds) as Arc<dyn IssuedInvoiceManifestV1>,
         Arc::clone(&feeds) as Arc<dyn PspSettlementFeedV1>,
+        registry,
         config,
     )
 }
@@ -732,6 +810,7 @@ async fn k5b_unconfigured_psp_check_is_inert() {
         ExceptionRouter::shared(provider),
         Arc::new(UnconfiguredIssuedInvoiceManifestV1),
         Arc::new(UnconfiguredPspSettlementFeedV1),
+        Arc::new(AllTenantsLive),
         ReconConfig::default(),
     );
     let err = fw
@@ -749,4 +828,213 @@ async fn k5b_unconfigured_psp_check_is_inert() {
         0,
         "no run written"
     );
+}
+
+/// Seed one finalized `reconciliation_run` row directly, bypassing the framework —
+/// the backlog a retired tenant accumulated before the lifecycle gate existed.
+async fn seed_recon_run(
+    raw: &DatabaseConnection,
+    tenant: Uuid,
+    status: &str,
+    variance_minor: i64,
+    within_tolerance: bool,
+) -> Uuid {
+    let run_id = Uuid::now_v7();
+    raw.execute_raw(pg(format!(
+        "INSERT INTO bss.ledger_reconciliation_run \
+            (tenant_id, run_id, period_id, check_type, variance_minor, within_tolerance, status) \
+         VALUES ('{tenant}','{run_id}','{PERIOD}','{CHECK_AR_DERIVED}',{variance_minor},{within_tolerance},'{status}')"
+    )))
+    .await
+    .unwrap();
+    run_id
+}
+
+/// Does a specific run row still exist?
+async fn run_exists(raw: &DatabaseConnection, tenant: Uuid, run_id: Uuid) -> bool {
+    raw.query_one_raw(pg(format!(
+        "SELECT 1 AS x FROM bss.ledger_reconciliation_run \
+         WHERE tenant_id='{tenant}' AND run_id='{run_id}'"
+    )))
+    .await
+    .unwrap()
+    .is_some()
+}
+
+/// Seed a fully-formed reconcilable tenant: an OPEN fiscal period, an AR account,
+/// and one posted `INVOICE_POST` entry (so the tenant shows up in the tick's
+/// `journal_entry`-derived candidate enumeration).
+async fn seed_reconcilable_tenant(raw: &DatabaseConnection, tenant: Uuid) {
+    raw.execute_raw(pg(format!(
+        "INSERT INTO bss.ledger_fiscal_period (tenant_id, legal_entity_id, period_id, fiscal_tz, status) \
+         VALUES ('{tenant}','{tenant}','{PERIOD}','UTC','OPEN')"
+    )))
+    .await
+    .unwrap();
+    let account = seed_ar_account(raw, tenant).await;
+    seed_invoice_post(raw, tenant, account, "inv-1").await;
+}
+
+/// K8 — the tick's tenant-registry lifecycle gate. Three tenants are
+/// indistinguishable from ledger data alone: each has posted entries and an OPEN
+/// period. The registry reports one live, one soft-deleted, and does not know the
+/// third. The tick must reconcile the live one, write NOTHING for the other two,
+/// and — purge enabled — reclaim ONLY the soft-deleted tenant's uneventful runs:
+/// variance evidence and unfinalized rows stay, and an unregistered tenant's rows
+/// are never touched (an omission is not proof of deletion).
+///
+/// Without the gate the tick reconciles all three forever: it enumerates from
+/// append-only ledger data and appends one row per tenant per tick to a table with
+/// no delete path (29 GB / 61M rows on stage1, 99.9% of it for tenants that no
+/// longer exist).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn k8_deleted_tenants_are_skipped_and_their_uneventful_runs_reclaimed() {
+    let container = test_containers::postgres().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    // `setup` seeds the live tenant's OPEN period; give it ledger data too.
+    let (raw, provider, live) = boot(&url).await;
+    let live_account = seed_ar_account(&raw, live).await;
+    seed_invoice_post(&raw, live, live_account, "inv-live").await;
+
+    let deleted = Uuid::now_v7();
+    seed_reconcilable_tenant(&raw, deleted).await;
+    // The deleted tenant's accumulated backlog: one uneventful finalized run
+    // (reclaimable), one that recorded a breach, one within tolerance but with a
+    // recorded variance (both evidence), one still RUNNING.
+    let uneventful = seed_recon_run(&raw, deleted, "DONE", 0, true).await;
+    let breached = seed_recon_run(&raw, deleted, "DONE", 4_200, false).await;
+    let rounded = seed_recon_run(&raw, deleted, "DONE", 1, true).await;
+    let unfinalized = seed_recon_run(&raw, deleted, "RUNNING", 0, true).await;
+
+    let unregistered = Uuid::now_v7();
+    seed_reconcilable_tenant(&raw, unregistered).await;
+    let unregistered_run = seed_recon_run(&raw, unregistered, "DONE", 0, true).await;
+
+    let fw = framework_with_registry(
+        provider,
+        Arc::new(InProcessControlFeeds::new()),
+        purge_on(),
+        Arc::new(FixedRegistry(HashMap::from([
+            (live, RegistryLifecycle::Live),
+            (deleted, RegistryLifecycle::Deleted),
+        ]))),
+    );
+
+    fw.run().await.unwrap();
+
+    assert_eq!(
+        count_runs(&raw, live, CHECK_AR_DERIVED).await,
+        1,
+        "the live tenant's AR↔derived check still runs every tick"
+    );
+    assert_eq!(
+        count_runs(&raw, deleted, CHECK_AR_DERIVED).await,
+        3,
+        "the deleted tenant gets no new run, and its uneventful backlog is reclaimed"
+    );
+    assert!(
+        !run_exists(&raw, deleted, uneventful).await,
+        "an uneventful DONE run of a deleted tenant is reclaimable noise"
+    );
+    for (run, why) in [
+        (breached, "a run that breached tolerance"),
+        (rounded, "a run that recorded any variance"),
+        (unfinalized, "an unfinalized run"),
+    ] {
+        assert!(
+            run_exists(&raw, deleted, run).await,
+            "{why} is never purged"
+        );
+    }
+    assert_eq!(
+        count_runs(&raw, unregistered, CHECK_AR_DERIVED).await,
+        1,
+        "the unregistered tenant gets no new run"
+    );
+    assert!(
+        run_exists(&raw, unregistered, unregistered_run).await,
+        "an unregistered tenant is skipped but never purged"
+    );
+}
+
+/// K8b — the purge is off by default, and off it leaves the backlog untouched
+/// while the lifecycle gate still stops the tick from adding to it. (Storage
+/// reclamation and the write-volume fix are independent switches: an operator
+/// wants the growth stopped before any deletes are allowed to run.)
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn k8b_default_config_keeps_the_backlog_but_still_skips_deleted_tenants() {
+    let container = test_containers::postgres().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let (raw, provider, live) = boot(&url).await;
+
+    let deleted = Uuid::now_v7();
+    seed_reconcilable_tenant(&raw, deleted).await;
+    let uneventful = seed_recon_run(&raw, deleted, "DONE", 0, true).await;
+
+    let fw = framework_with_registry(
+        provider,
+        Arc::new(InProcessControlFeeds::new()),
+        ReconConfig::default(),
+        Arc::new(FixedRegistry(HashMap::from([
+            (live, RegistryLifecycle::Live),
+            (deleted, RegistryLifecycle::Deleted),
+        ]))),
+    );
+
+    fw.run().await.unwrap();
+
+    assert!(
+        run_exists(&raw, deleted, uneventful).await,
+        "purge off by default: nothing is deleted"
+    );
+    assert_eq!(
+        count_runs(&raw, deleted, CHECK_AR_DERIVED).await,
+        1,
+        "but the deleted tenant is still not reconciled — no new row"
+    );
+}
+
+/// K8c — an untrusted registry answer is fail-safe toward coverage. Whether the
+/// read fails outright or succeeds recognising none of the candidates (what a
+/// caller-scoped plugin returns for the tick's anonymous context), the tick must
+/// reconcile the whole candidate set and purge nothing — even with the purge on.
+/// Read literally, either answer would stop reconciling the whole fleet and feed
+/// all of it to the purge.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn k8c_untrusted_registry_reconciles_everyone_and_purges_nothing() {
+    let failing: Arc<dyn TenantLifecycleReader> = Arc::new(FailingRegistry);
+    let recognises_nobody: Arc<dyn TenantLifecycleReader> = Arc::new(FixedRegistry(HashMap::new()));
+    for registry in [failing, recognises_nobody] {
+        let container = test_containers::postgres().start().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let (raw, provider, tenant) = boot(&url).await;
+        let account = seed_ar_account(&raw, tenant).await;
+        seed_invoice_post(&raw, tenant, account, "inv-1").await;
+        let seeded = seed_recon_run(&raw, tenant, "DONE", 0, true).await;
+
+        let fw = framework_with_registry(
+            provider,
+            Arc::new(InProcessControlFeeds::new()),
+            purge_on(),
+            registry,
+        );
+
+        fw.run().await.unwrap();
+
+        assert_eq!(
+            count_runs(&raw, tenant, CHECK_AR_DERIVED).await,
+            2,
+            "the tenant is still reconciled: a new run is written"
+        );
+        assert!(
+            run_exists(&raw, tenant, seeded).await,
+            "and nothing is purged on an untrusted answer"
+        );
+    }
 }

@@ -119,7 +119,6 @@ axum.workspace = true
 toolkit-http.workspace = true
 secrecy.workspace = true
 toolkit-security.workspace = true
-tower.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 # Dev-only cycle (Cargo permits dev-dependency cycles): `toolkit` regular-depends
 # on this crate, but the generated `register_<trait>_routes()` server codegen

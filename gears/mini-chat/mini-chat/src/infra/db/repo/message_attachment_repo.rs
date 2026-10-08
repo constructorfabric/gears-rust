@@ -80,6 +80,29 @@ impl crate::domain::repos::MessageAttachmentRepository for MessageAttachmentRepo
         }
         Ok(copied)
     }
+
+    async fn attachment_ids_for_message<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        chat_id: Uuid,
+        message_id: Uuid,
+    ) -> Result<Vec<Uuid>, DomainError> {
+        let rows = Entity::find()
+            .join(JoinType::InnerJoin, Relation::Attachment.def())
+            .filter(
+                Condition::all()
+                    .add(Column::MessageId.eq(message_id))
+                    .add(Column::ChatId.eq(chat_id))
+                    .add(AttCol::DeletedAt.is_null()),
+            )
+            .secure()
+            .scope_with(scope)
+            .all(runner)
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(|r| r.attachment_id).collect())
+    }
 }
 
 #[cfg(test)]

@@ -102,7 +102,7 @@ correctness core, not scope.
 | D10 | **`POST /entities` breaks**: `200` + results becomes `202` + operation | No compatibility path on that route. The gear's REST stability is `unstable`; the break is called out in the changelog |
 | D11 | **P0 retains registry-side inventory pull; per-gear push moves to P1** | Supersedes the original P0 push decision (plan P4/P18). types-registry seeds all linked inventory plus `cfg.entities` through the outbox, requiring every seed item to be `succeeded` or `unchanged` before publishing its client. T23 reconciles explicitly supplied documents for existing registration callers; no per-gear inventory filter or new inventory startup calls in P0. C3 remains open until P1 integrates inventory attribution and push with the platform-plane client |
 | D12 | **`GET /entities` becomes a bounded page with a cursor, document-free by default** | The old shape returns every match with full `content` in one response. A `limit` without a cursor would make the endpoint incomplete, so both land together. P19 adds `$select` on this page and the two exact-key routes; selected documents are explicit and the discovery cursor binds the normalized selection (§10.2) |
-| D13 | **P0 field projection on all three reads** (plan P19) | An absent `$select` means the same document-free managed metadata set on exact read, `batchGet` and discovery. P0 selects only fields it can answer; documents are flat and individually selectable. One normalized set drives SQL retrieval, cursor identity, T29 validators and T30 cache keys (§10.2) |
+| D13 | **P0 field projection on all three reads** (plan P19) | An absent `$select` means the same document-free managed metadata set on exact read, `batchGet` and discovery. P0 selects only fields it can answer; documents are flat and individually selectable. One normalized set drives SQL retrieval, cursor identity, T22d validators and T30 cache keys (§10.2) |
 | D14 | **Discovery filters by `pattern`, `depth`, `kind` and `lifecycle_status`, all exact SQL before `LIMIT`** (plan P20) | `depth` is an inclusive maximum GTS chain length; `kind` is `type_schema` or `instance`; `lifecycle_status` defaults to `active`. Admission materializes `entity.chain_depth` and one `entity_gts_segment` row per parsed segment; the repository compiles the `gts-rust`-parsed pattern into one join per constrained segment and fetches `limit + 1`, so only the last page is short. The cursor binds the filters so continuation cannot splice different result sets (§8.2, §10.2) |
 
 ---
@@ -851,7 +851,7 @@ What P0 builds is DESIGN's cache minus what needs inputs P0 does not have:
 |---|---|
 | Bounded store, LRU eviction | ✅ — bound is **bytes**, not entries: §3.2 caps one resolved document at 1 MB, so today's `capacity: 1024` bounds memory to nothing useful. DESIGN's argument, adopted |
 | Freshness window, `0` meaningful and supported | ✅ — DESIGN's 30 s default replaces today's 1 min |
-| `fresh` per-call bypass | ✅ — T29's validator makes the call revalidate unconditionally against the source, even within the freshness window |
+| `fresh` per-call bypass | ✅ — T22d's validator makes the call revalidate unconditionally against the source, even within the freshness window |
 | Invalidation on an observed terminal mutation, across identifier and UUID keys | ✅ — a client observes a mutation when a poll or the reconciliation helper returns a terminal successful outcome, **not** when the `POST` is accepted |
 | Entries indexed by both identifier and UUID | ✅ — already true of the current cache |
 | `NotFound`, `Failed`, discovery pages and operation resources never cached | ✅ — all four are expressible in P0 |
@@ -938,7 +938,7 @@ direct call to gRPC. Platform REST exists for callers that are not gears — hum
 external workloads authenticated by `X-ToolKit-Internal-Token` or mTLS SPIFFE. The repository
 shows the split: `examples/oop-gears/calculator` carries `proto/`, `client.rs` and `wiring.rs`
 in its SDK plus `api/grpc/server.rs` in the gear, and has no REST surface at all, while
-`gear-orchestrator` declares `capabilities = [grpc, system, rest]` and carries both.
+`service-discovery` declares `capabilities = [grpc, system, rest]` and carries both.
 
 Two P0 properties make the later gRPC surface cheap rather than a redesign. The async protocol
 is transport-neutral by construction — submit, get an id, poll — with no streaming or
@@ -1016,11 +1016,11 @@ document genuinely changed.
 **Computed, never stored** (`principle-derive-not-store`). No column holds a validator, and no
 cache holds one as authority.
 
-**Wire form is DESIGN's**: base64url of a versioned JSON object, byte-identical in the `ETag`
-header and in batch bodies, 128-bit digest for the managed case. Comparison decodes the fields
-rather than matching encoded strings. The version field is load-bearing — it is what lets P1
-add the chain versions while retaining the projection digest and refusing to honour a P0 token
-(ceiling C7).
+**Wire form is DESIGN's**: base64url of a version byte followed by the 128-bit digest,
+byte-identical in the `ETag` header and in batch bodies. The 23-character payload is quoted as
+an HTTP entity-tag; both REST surfaces carry those 25 bytes. The version is also digested, and
+it is load-bearing — it is what lets P1 add the chain versions while retaining the projection
+digest and refusing to honour a P0 token (ceiling C7).
 
 **Where they apply.** Exact reads carry an `ETag`; a matching `If-None-Match` returns a bodyless
 `304`. Batch reads carry validators **beside individual keys**, because one header cannot
@@ -1065,7 +1065,8 @@ it. What the write path emits is therefore part of the contract, not a by-produc
   a decided-against one in the metrics, not only in the refusal reason — which is what makes
   §16.12 observable in a deployment.
 
-Refusals persist `{reason, message}`, returned unchanged by operation reads. `reason`
+Refusals persist `{reason, message}`, returned unchanged by operation reads beside the
+reason-specific `context` (DESIGN §3.3). `reason`
 is the stable machine-readable refusal category; `message` is for humans and is not
 a parsing contract. There is no separate `diagnostics` field (PRD, ADR-0003).
 
@@ -1152,7 +1153,7 @@ and remains open until P1. The rows are kept because other documents cite the nu
 | C4 | **Struck by D2.** Was: startup reads the whole table on the platform boot path, so startup time is linear in entity count | Resolved in P0 — no warm-up read; startup cost is the seed set, not the table (§8.2) |
 | C5 | No operation-retention sweep: terminal operations accumulate | The §3.2 sweep, once volume justifies it |
 | C6 | **No PDP.** Access is authenticated but not authorized, contrary to `06`. `#[secure(unrestricted)]` entities reject tenant-scoped queries. Registration policy covers creations only (§8.1 step 3); callers reaching mutations can revise or tombstone eligible entities, including `cf.core.*`, even in closed regions. Lifecycle, version and dependant checks provide no authority check. P0 limits access through internal-only mutation routes (C8). Exact, batch and discovery reads are authenticated only too, and like every v2 route are not exposed through api-gateway | P1 epic #4628: identity-to-permission binding first, then owner/principal checks before `unit::commit_revision` and `deletion::commit_deletion`, plus `tenant_col` + `PolicyEnforcer` (§12) |
-| C7 | **The validator and cache key have no tenant or visibility dimensions.** P0's validator digests `resource_version`, `resolution_fingerprint` and T22b's normalized selected-field set (§8.5); the SDK cache key carries the same projection and fixed visibility/Context Tenant markers. Correct for managed platform-plane reads, and incomplete once tenant visibility or availability arrives | The wire form is a **versioned** JSON object, so P1 adds the chain versions under a new version and refuses to honour a P0 token. The cache key gains real visibility/Context Tenant dimensions without changing its projection rule |
+| C7 | **The validator and cache key have no tenant or visibility dimensions.** P0's validator digests `resource_version`, `resolution_fingerprint` and T22b's normalized selected-field set (§8.5); the SDK cache key carries the same projection and fixed visibility/Context Tenant markers. Correct for managed platform-plane reads, and incomplete once tenant visibility or availability arrives | The wire form leads with a **version** byte, so P1 adds the chain versions under a new version and refuses to honour a P0 token. The cache key gains real visibility/Context Tenant dimensions without changing its projection rule |
 | C8 | **Platform-plane mutations are internal-only.** Every P0 operation is platform-plane (`plane = 1`), but an in-process gear has no inbound platform-identity validator, api-gateway has no platform listener, and `OperationBuilder` cannot mark a route platform-only (§8.4). Registration and deletion therefore keep `exposed = false`; internal and non-mutating calls retain authentication, because `.anonymous()` without a platform identity would be a regression | A platform listener with `X-ToolKit-Internal-Token` / `PlatformIdentity`, a declarative platform-plane route marker, and a platform-principal/PDP decision before mutation dispatch. Only then may mutation routes be exposed. This is toolkit/api-gateway work outside this gear, and ADR-0006/0008 already ask for the listener |
 | C9 | **Implementation sequencing.** T14 adds reverse-impact refresh; T17 adds compatibility checks and effective waiver provenance, replacing the temporary `force` refusal. ADR-0004 still permanently forbids content revisions of minor-bearing Type Schemas; creation is admissible (§8.1 step 4). C8 keeps mutations internal | Remove this row when Checkpoints 3 and 4 are complete, before T24 exposes consumers. The ADR-0004 restriction remains |
 | C10 | **`batchGet` names at most 100 keys, not DESIGN §3.3's 500.** T22b's default and narrow projections reduce ordinary transfer cost, but `$select=content,resolved_schema,effective_traits,effective_traits_schema` can still request large documents for every key. The item limit is retained without claiming that it bounds aggregate response bytes; reconciliation inspecting more than 100 identifiers pages its reads | T23's reconciliation helper pages `batchGet`. A separately designed response-byte budget may justify lifting the key count later; discovery likewise limits items, and callers selecting documents should request smaller pages (§10.2) |
@@ -1172,7 +1173,7 @@ once every consumer has moved (D6). During the migration both exist briefly, but
 is not a supported surface — it is a step in the cutover, not a deprecation window.
 
 Shape follows DESIGN §3.3, minus tenancy, availability and federation. T22b supplies
-projection, and T29 supplies validators before the P0 cutover:
+projection, and T22d supplies validators before the P0 cutover:
 
 ```rust
 #[async_trait]
@@ -1197,7 +1198,7 @@ pub trait TypesRegistryEntities: Send + Sync {
         &self,
         key: IdempotencyKey,
         request: DeleteEntities,
-    ) -> Result<RegistrationOperation, CanonicalError>;
+    ) -> Result<DeletionOperation, CanonicalError>;
 
     /// Provided: a one-item `delete_entities`, mirroring
     /// `DELETE /entities/{entity_key}`. One deletion model, two spellings.
@@ -1206,12 +1207,12 @@ pub trait TypesRegistryEntities: Send + Sync {
         key: IdempotencyKey,
         entity: DeleteItem,
         dry_run: bool,
-    ) -> Result<RegistrationOperation, CanonicalError> { /* … */ }
+    ) -> Result<DeletionOperation, CanonicalError> { /* … */ }
 
     async fn get_operation(
         &self,
         operation_id: Uuid,
-    ) -> Result<RegistrationOperation, CanonicalError>;
+    ) -> Result<Operation, CanonicalError>;
 
     /// Provided: submits, polls to terminality, returns per-identifier outcomes.
     /// This is where the async contract is made ergonomic for startup
@@ -1303,7 +1304,8 @@ without federation), `EntitySnapshot`, `EntityKind`, `LifecycleStatus`,
 `Origin::Managed`, `Provenance`, `Projection`, `FieldSelection`,
 `EntityQuery`, `EntityPage`, `BatchGet`, `BatchGetItem`,
 `RegisterEntities`, `RegisterItem`, `DeleteEntities`, `DeleteItem`,
-`RegistrationOperation`, `RegistrationItemResult`,
+`Operation`, `RegistrationOperation`, `RegistrationItemResult`,
+`DeletionOperation`, `DeletionItemResult`,
 `OperationStatus`, `CandidateStatus`. Field-for-field the DESIGN §3.3 shapes with the
 out-of-scope fields absent — never renamed, so P1 adds rather than rewrites.
 
@@ -1320,7 +1322,7 @@ Business listener, `.authenticated()`, path `/types-registry/v1/...` per DE0801.
 | `POST` | `/types-registry/v1/entities:batchDelete` | `202` + operation; `200` on terminal replay |
 | `DELETE` | `/types-registry/v1/entities/{entity_key}` | `202` + operation; `200` on terminal replay |
 | `POST` | `/types-registry/v1/entities:batchGet` | `200`, one result per requested key |
-| `GET` | `/types-registry/v1/entities/{entity_key}` | `200`; `404` when absent |
+| `GET` | `/types-registry/v1/entities/{entity_key}` | `200`; `304` on a current `If-None-Match`; `404` when absent |
 | `GET` | `/types-registry/v1/entities` | `200` + one bounded page and a cursor; document-free by default |
 | `GET` | `/types-registry/v1/operations/{operation_id}` | `200` |
 
@@ -1441,7 +1443,7 @@ documents by default. P0 makes discovery a page and adopts DESIGN §3.3's field 
   deleted result, so a narrow projection still says which documents apply;
   they are always in the normalized effective set, so naming them does not change cursor,
   validator or cache identity. Unselected fields
-  are omitted, while a selected JSON `null` remains present. `key`, per-key status and
+  are omitted, while a selected JSON `null` remains present. `entity_key`, per-key status and
   `etag` are batch result
   envelope metadata outside selection. An exact `ETag` is likewise outside the body.
   REST DTOs and OpenAPI mark the four mandatory fields required and non-nullable and

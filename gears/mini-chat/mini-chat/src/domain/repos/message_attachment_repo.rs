@@ -33,4 +33,12 @@ pub trait MessageAttachmentRepository: Send + Sync {
         new_message_id: Uuid,
         chat_id: Uuid,
     ) -> Result<u64, DomainError>;
+    /// Attachment IDs linked to a message, excluding soft-deleted attachments.
+    async fn attachment_ids_for_message<C: DBRunner>(
+        &self,
+        runner: &C,
+        scope: &AccessScope,
+        chat_id: Uuid,
+        message_id: Uuid,
+    ) -> Result<Vec<Uuid>, DomainError>;
 }

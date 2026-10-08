@@ -30,6 +30,7 @@ use super::prioritizer::SharedPrioritizer;
 use super::record::{Record, Records};
 use super::store::OutboxStore;
 use super::strategy::{LeasedStrategy, ProcessContext, ProcessingStrategy, TransactionalStrategy};
+use super::subscription::TraceMailbox;
 use super::tables::OutboxTables;
 use super::taskward::{Directive, WorkerAction};
 use super::trace::TraceState;
@@ -1706,7 +1707,7 @@ async fn the_notifier_with_no_subscriptions_issues_no_query() {
     let cancel = tokio_util::sync::CancellationToken::new();
 
     assert!(
-        t.outbox.mailbox().subscriptions().is_idle(),
+        t.outbox.trace_mailbox().registry().is_idle(),
         "no subscriptions were taken"
     );
     recorder.clear();
@@ -2380,7 +2381,7 @@ async fn a_retrying_trace_nobody_watches_is_not_reported() {
     // Interest in the completion, but no interest in retry states.
     let waiting = t.outbox.subscribe("unwatched-1").unwrap();
     assert!(
-        !t.outbox.mailbox().subscriptions().wants_retry_reports(),
+        !t.outbox.trace_mailbox().registry().wants_retry_reports(),
         "awaiting a completion must not arm the retry query"
     );
 
@@ -2390,7 +2391,7 @@ async fn a_retrying_trace_nobody_watches_is_not_reported() {
 
     // Now follow state changes: that arms it, and the same row is reported.
     let mut states = watch_states(waiting);
-    while !t.outbox.mailbox().subscriptions().wants_retry_reports() {
+    while !t.outbox.trace_mailbox().registry().wants_retry_reports() {
         tokio::task::yield_now().await;
     }
     reporter.execute(&cancel).await.unwrap();
@@ -2733,7 +2734,7 @@ async fn run_transactional(
     let strategy = TransactionalStrategy::new(Box::new(handler));
     let tables = OutboxTables::default();
     let statements = super::statements::OutboxStatements::new(backend, &tables);
-    let mailbox = super::subscription::Mailbox::new(
+    let trace_mailbox = TraceMailbox::new(
         super::types::InstanceId::new("test-instance"),
         super::subscription::TraceRegistry::new(),
     );
@@ -2741,7 +2742,9 @@ async fn run_transactional(
         db,
         store: OutboxStore::new(&statements),
         partition_id,
-        mailbox: &mailbox,
+        trace_mailbox: &trace_mailbox,
+        cancel: &CancellationToken::new(),
+        stop_grace: Duration::from_secs(1),
     };
     strategy.process(&ctx, msg_batch_size).await.unwrap()
 }
@@ -2865,7 +2868,7 @@ async fn run_leased(
     );
     let tables = OutboxTables::default();
     let statements = super::statements::OutboxStatements::new(backend, &tables);
-    let mailbox = super::subscription::Mailbox::new(
+    let trace_mailbox = TraceMailbox::new(
         super::types::InstanceId::new("test-instance"),
         super::subscription::TraceRegistry::new(),
     );
@@ -2873,21 +2876,23 @@ async fn run_leased(
         db,
         store: OutboxStore::new(&statements),
         partition_id,
-        mailbox: &mailbox,
+        trace_mailbox: &trace_mailbox,
+        cancel: &CancellationToken::new(),
+        stop_grace: Duration::from_secs(1),
     };
     strategy.process(&ctx, msg_batch_size).await.unwrap()
 }
 
-/// Like `run_leased`, but drives the ack against a caller-supplied mailbox so a
+/// Like `run_leased`, but drives the ack against a caller-supplied trace mailbox so a
 /// test can subscribe to a trace before the ack runs and observe whether it is
 /// resolved.
-async fn run_leased_sharing_mailbox(
+async fn run_leased_sharing_trace_mailbox(
     db: &Db,
     partition_id: i64,
     handler: impl LeasedHandler + 'static,
     lease_duration: Duration,
     msg_batch_size: u32,
-    mailbox: &super::subscription::Mailbox,
+    trace_mailbox: &TraceMailbox,
 ) -> Option<super::strategy::ProcessResult> {
     let conn = db.sea_internal();
     let backend = conn.get_database_backend();
@@ -2907,7 +2912,47 @@ async fn run_leased_sharing_mailbox(
         db,
         store: OutboxStore::new(&statements),
         partition_id,
-        mailbox,
+        trace_mailbox,
+        cancel: &CancellationToken::new(),
+        stop_grace: Duration::from_secs(1),
+    };
+    strategy.process(&ctx, msg_batch_size).await.unwrap()
+}
+
+/// Like `run_leased`, but under a caller-supplied cancellation token, so a test
+/// can drive the pass as the outbox shuts down.
+async fn run_leased_under(
+    db: &Db,
+    partition_id: i64,
+    handler: impl LeasedHandler + 'static,
+    msg_batch_size: u32,
+    cancel: &CancellationToken,
+) -> Option<super::strategy::ProcessResult> {
+    let conn = db.sea_internal();
+    let backend = conn.get_database_backend();
+    drop(conn);
+
+    let strategy = LeasedStrategy::new(
+        Arc::new(handler),
+        "test-AAAAAA".to_owned(),
+        LeaseConfig {
+            duration: Duration::from_secs(30),
+            headroom: Duration::from_secs(2),
+        },
+    );
+    let tables = OutboxTables::default();
+    let statements = super::statements::OutboxStatements::new(backend, &tables);
+    let trace_mailbox = TraceMailbox::new(
+        super::types::InstanceId::new("test-instance"),
+        super::subscription::TraceRegistry::new(),
+    );
+    let ctx = ProcessContext {
+        db,
+        store: OutboxStore::new(&statements),
+        partition_id,
+        trace_mailbox: &trace_mailbox,
+        cancel,
+        stop_grace: Duration::from_secs(1),
     };
     strategy.process(&ctx, msg_batch_size).await.unwrap()
 }
@@ -2954,7 +2999,7 @@ async fn a_lost_lease_before_ack_delivers_no_completion() {
 
     let db = setup_db("ch2b_lease_lost_no_delivery").await;
 
-    // The trace's owner is the enqueuing instance; the processing mailbox must
+    // The trace's owner is the enqueuing instance; the processing trace mailbox must
     // share that identity for the completion claim to be attributable to it.
     let t = make_test_outbox(OutboxConfig {
         instance_id: super::types::InstanceId::new("owner"),
@@ -2974,13 +3019,13 @@ async fn a_lost_lease_before_ack_delivers_no_completion() {
     t.outbox.enqueue_batch(&conn, batch).await.unwrap().fire();
     run_sequencer_once(&t, &db).await;
 
-    let mailbox = super::subscription::Mailbox::new(
+    let trace_mailbox = TraceMailbox::new(
         super::types::InstanceId::new("owner"),
         super::subscription::TraceRegistry::new(),
     );
-    let sub = mailbox.subscriptions().subscribe("lease-lost-1");
+    let sub = trace_mailbox.registry().subscribe("lease-lost-1");
 
-    let result = run_leased_sharing_mailbox(
+    let result = run_leased_sharing_trace_mailbox(
         &db,
         pid,
         LeaseStealingHandler {
@@ -2989,7 +3034,7 @@ async fn a_lost_lease_before_ack_delivers_no_completion() {
         },
         Duration::from_secs(30),
         10,
-        &mailbox,
+        &trace_mailbox,
     )
     .await;
 
@@ -4239,6 +4284,322 @@ async fn graceful_shutdown_completes_current_batch() {
         after_stop,
         "no messages should be processed after stop()"
     );
+}
+
+/// `stop()` must not wait out the lease of a handler that is mid-pass. The
+/// lease is sized for the work (300s here), not for shutdown, so a cancelled
+/// pipeline has to bound the in-flight handler itself and still run the ack
+/// that hands the partition back.
+#[tokio::test]
+async fn stop_does_not_wait_out_the_lease_of_an_in_flight_handler() {
+    struct NeverReturns {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl LeasedMessageHandler for NeverReturns {
+        async fn handle(&self, _msg: &OutboxMessage) -> MessageResult {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    let db = setup_db("ch10_stop_bounds_leased_handler").await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+
+    let handle = Outbox::builder(db.clone())
+        .processor_tuning(
+            WorkerTuning::processor_default()
+                .idle_interval(Duration::from_millis(50))
+                // Short, so the test measures the bound rather than the default.
+                .stop_grace(Duration::from_millis(50)),
+        )
+        .sequencer_tuning(
+            WorkerTuning::sequencer_default().idle_interval(Duration::from_millis(50)),
+        )
+        .queue("q", Partitions::of(1))
+        .leased(NeverReturns {
+            entered: entered.clone(),
+        })
+        .lease(LeaseConfig {
+            duration: Duration::from_mins(5),
+            headroom: Duration::from_secs(2),
+        })
+        .start()
+        .await
+        .unwrap();
+
+    let outbox = handle.outbox();
+    let pid = outbox.all_partition_ids()[0];
+    let conn = db.conn().unwrap();
+    outbox
+        .enqueue(
+            &conn,
+            Record::to("q", 0)
+                .payload(b"stuck".to_vec(), "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .fire();
+
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("handler should be entered within 5s");
+
+    let started = std::time::Instant::now();
+    let stop_result = tokio::time::timeout(Duration::from_secs(5), handle.stop()).await;
+    assert!(
+        stop_result.is_ok(),
+        "stop() should bound the in-flight handler, not wait out its 300s lease"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "stop() took {:?}",
+        started.elapsed()
+    );
+
+    // The ack after a cancelled pass records a retry of the untouched message
+    // and releases the partition lease.
+    let state = read_processor_state(&db, pid).await;
+    assert_eq!(state.processed_seq, 0);
+    assert_eq!(state.attempts, 1);
+    assert_eq!(state.last_error.as_deref(), Some("outbox shutting down"));
+    assert_eq!(state.locked_by, None);
+    assert_eq!(state.locked_until, None);
+}
+
+/// A handler that runs past its lease budget is dropped at the cancel point;
+/// the ack still runs, records the retry and releases the partition.
+#[tokio::test]
+async fn a_leased_handler_past_its_budget_is_dropped_and_retried() {
+    struct NeverReturns;
+
+    #[async_trait::async_trait]
+    impl LeasedMessageHandler for NeverReturns {
+        async fn handle(&self, _msg: &OutboxMessage) -> MessageResult {
+            std::future::pending().await
+        }
+    }
+
+    let db = setup_db("ch5_dc_lease_budget_spent").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    enqueue_and_sequence(&t, &db, "q", 0, &["a"]).await;
+
+    // 3s lease - 2s headroom = 1s handler budget.
+    let result = run_leased(&db, pid, NeverReturns, Duration::from_secs(3), 10)
+        .await
+        .expect("the pass took a lease and read the batch");
+
+    assert_eq!(result.count, 1);
+    assert!(
+        matches!(&result.handler_result, HandlerResult::Retry { reason } if reason == "lease expired"),
+        "unexpected handler result: {:?}",
+        result.handler_result
+    );
+    let state = read_processor_state(&db, pid).await;
+    assert_eq!(state.processed_seq, 0);
+    assert_eq!(state.attempts, 1);
+    assert_eq!(state.last_error.as_deref(), Some("lease expired"));
+    assert_eq!(state.locked_by, None);
+    assert_eq!(state.locked_until, None);
+}
+
+/// A leased pass that starts after shutdown takes no lease and never calls the
+/// handler, so the message keeps its full delivery budget.
+#[tokio::test]
+async fn a_leased_pass_after_shutdown_takes_no_lease() {
+    let db = setup_db("ch10_leased_pass_after_shutdown").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    enqueue_and_sequence(&t, &db, "q", 0, &["a"]).await;
+
+    let count = Arc::new(AtomicU32::new(0));
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let result = run_leased_under(
+        &db,
+        pid,
+        CountingMessageHandler {
+            count: count.clone(),
+        },
+        10,
+        &cancel,
+    )
+    .await;
+
+    assert!(result.is_none(), "a cancelled pass must report no work");
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    let state = read_processor_state(&db, pid).await;
+    assert_eq!(state.processed_seq, 0);
+    assert_eq!(state.attempts, 0);
+    assert_eq!(state.last_error, None);
+    assert_eq!(state.locked_by, None);
+    assert_eq!(state.locked_until, None);
+}
+
+/// A handler that honours `should_stop()` returns on its own terms at
+/// shutdown: the message it acked is kept, the ones it never started stay
+/// queued.
+#[tokio::test]
+async fn a_leased_handler_honouring_should_stop_keeps_its_acked_work() {
+    /// Acks every message it is given, and triggers shutdown on the first.
+    struct CancelsOnFirst {
+        cancel: CancellationToken,
+        seen: Arc<Mutex<Vec<i64>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LeasedMessageHandler for CancelsOnFirst {
+        async fn handle(&self, msg: &OutboxMessage) -> MessageResult {
+            self.seen.lock().unwrap().push(msg.seq);
+            self.cancel.cancel();
+            MessageResult::Ok
+        }
+    }
+
+    let db = setup_db("ch10_leased_should_stop").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    enqueue_and_sequence(&t, &db, "q", 0, &["a", "b", "c"]).await;
+
+    let cancel = CancellationToken::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let result = run_leased_under(
+        &db,
+        pid,
+        CancelsOnFirst {
+            cancel: cancel.clone(),
+            seen: seen.clone(),
+        },
+        10,
+        &cancel,
+    )
+    .await
+    .expect("the pass took a lease and read the batch");
+
+    assert_eq!(result.count, 3);
+    assert!(matches!(result.handler_result, HandlerResult::Success));
+    assert_eq!(*seen.lock().unwrap(), [1]);
+    let state = read_processor_state(&db, pid).await;
+    assert_eq!(state.processed_seq, 1);
+    assert_eq!(state.attempts, 0);
+    assert_eq!(state.last_error, None);
+    assert_eq!(state.locked_by, None);
+    assert_eq!(state.locked_until, None);
+}
+
+/// A transactional handler gets no token, so shutdown drops it once the grace
+/// is spent. The transaction rolls back and nothing about the partition moves.
+#[tokio::test]
+async fn stop_drops_a_hung_transactional_handler_and_rolls_back() {
+    struct NeverReturns {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl TransactionalMessageHandler for NeverReturns {
+        async fn handle(
+            &self,
+            _txn: &sea_orm::DatabaseExecutor<'_>,
+            _msg: &OutboxMessage,
+        ) -> HandlerResult {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    let db = setup_db("ch10_stop_bounds_tx_handler").await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+
+    let handle = Outbox::builder(db.clone())
+        .processor_tuning(
+            WorkerTuning::processor_default()
+                .idle_interval(Duration::from_millis(50))
+                // Short, so the test measures the bound rather than the default.
+                .stop_grace(Duration::from_millis(50)),
+        )
+        .sequencer_tuning(
+            WorkerTuning::sequencer_default().idle_interval(Duration::from_millis(50)),
+        )
+        .queue("q", Partitions::of(1))
+        .transactional(NeverReturns {
+            entered: entered.clone(),
+        })
+        .start()
+        .await
+        .unwrap();
+
+    let outbox = handle.outbox();
+    let pid = outbox.all_partition_ids()[0];
+    let conn = db.conn().unwrap();
+    outbox
+        .enqueue(
+            &conn,
+            Record::to("q", 0)
+                .payload(b"stuck".to_vec(), "text/plain")
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .fire();
+
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("handler should be entered within 5s");
+
+    let started = std::time::Instant::now();
+    let stop_result = tokio::time::timeout(Duration::from_secs(5), handle.stop()).await;
+    assert!(stop_result.is_ok(), "stop() should drop the hung handler");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "stop() took {:?}",
+        started.elapsed()
+    );
+
+    let state = read_processor_state(&db, pid).await;
+    assert_eq!(state.processed_seq, 0);
+    assert_eq!(state.attempts, 0);
+    assert_eq!(state.last_error, None);
+    assert_eq!(state.locked_by, None);
+    assert_eq!(state.locked_until, None);
+    assert_eq!(
+        read_outgoing(&db, pid).await.len(),
+        1,
+        "the message stays queued"
+    );
+}
+
+/// A sequencer pass that starts after shutdown claims nothing; the rows stay in
+/// incoming and are sequenced by the next pass that runs.
+#[tokio::test]
+async fn a_sequencer_pass_after_shutdown_leaves_incoming_untouched() {
+    let db = setup_db("ch10_sequencer_after_shutdown").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    enqueue_msgs(&t.outbox, &db, "q", 0, &["a", "b"]).await;
+
+    let mut seq = make_sequencer(&t, SequencerConfig::default(), &db);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let directive = seq.execute(&cancel).await.unwrap();
+
+    assert!(
+        matches!(directive, Directive::Idle(ref r) if r.rows_claimed == 0),
+        "a cancelled pass claims nothing"
+    );
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 2);
+    assert_eq!(count_rows(&db, "toolkit_outbox_outgoing").await, 0);
+
+    run_sequencer_until_idle(&mut seq).await;
+    assert_eq!(count_rows(&db, "toolkit_outbox_incoming").await, 0);
+    assert_eq!(count_rows(&db, "toolkit_outbox_outgoing").await, 2);
 }
 
 #[tokio::test]

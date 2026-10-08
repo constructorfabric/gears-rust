@@ -13,9 +13,10 @@
 //! keys — which is why this composes with the stock formatter instead of
 //! reimplementing it, where it would silently drift from upstream.
 //!
-//! Enabled by `opentelemetry.tracing.logs_correlation.inject_trace_ids_into_logs`.
-//! It is off by default because resolving the context costs a lookup on every
-//! event.
+//! Gated by `opentelemetry.tracing.logs_correlation.inject_trace_ids_into_logs`,
+//! which is on by default: a log line that cannot be joined to the `trace_id` an
+//! error response returned to the caller is a broken incident trail. The cost is
+//! a span-context lookup on every event; set the flag to `false` to opt out.
 
 use std::fmt;
 
@@ -59,16 +60,19 @@ where
             return self.inner.format_event(ctx, writer, event);
         }
 
-        let Some(ids) = current_trace_ids() else {
+        let Some((trace_id, span_id)) = toolkit_trace_context::current_trace_ids() else {
             // No active OTel span (or no tracer installed): nothing to add.
             return self.inner.format_event(ctx, writer, event);
         };
 
+        // The only allocation on this path: the inner formatter needs somewhere
+        // to render into. The ids and the spliced line are then written straight
+        // into `writer` rather than copied into a second `String`.
         let mut buf = String::new();
         self.inner.format_event(ctx, Writer::new(&mut buf), event)?;
 
-        match splice_ids(&buf, &ids) {
-            Some(line) => writer.write_str(&line),
+        match splice_into(&mut writer, &buf, trace_id, span_id) {
+            Some(result) => result,
             // The inner formatter produced something that is not the expected
             // `{...}` object. Emitting it unchanged is strictly better than
             // corrupting it.
@@ -77,36 +81,22 @@ where
     }
 }
 
-/// The ids of the currently active span, if there is a valid one.
+/// Write `line` with the ids spliced in before its closing brace straight into
+/// `writer`, avoiding a second copy of the whole line.
 ///
-/// Reads OpenTelemetry's own thread-local context. `OpenTelemetrySpanExt::context()`
-/// would be the obvious route but it re-enters the subscriber to build the span,
-/// which is not possible from inside `on_event` — it silently yields an empty
-/// context there. `OpenTelemetryLayer` attaches the context on span entry
-/// (`context_activation`, on by default), so by the time an event is formatted
-/// the current context already carries the span.
-fn current_trace_ids() -> Option<(String, String)> {
-    use opentelemetry::trace::TraceContextExt as _;
-
-    let context = opentelemetry::Context::current();
-    let span = context.span();
-    let span_context = span.span_context();
-    if !span_context.is_valid() {
-        return None;
-    }
-    // `Display` for both is lowercase hex (32 and 16 chars), matching the
-    // `traceparent` wire form and `toolkit_http::otel::parse_trace_id`.
-    Some((
-        span_context.trace_id().to_string(),
-        span_context.span_id().to_string(),
-    ))
-}
-
-/// Insert the ids into a rendered JSON object, before its closing brace.
+/// `trace_id` / `span_id` are taken as `Display` so the live span's `Copy` id
+/// types are written without first allocating hex `String`s. Returns `None` when
+/// `line` is not a `{...}` object (nothing is written, so the caller can pass the
+/// original through); `Some(result)` carries the write outcome otherwise.
 ///
-/// Returns `None` when `line` is not a `{...}` object, leaving the caller to
-/// pass the original through.
-fn splice_ids(line: &str, (trace_id, span_id): &(String, String)) -> Option<String> {
+/// All structural checks run *before* the first write, so a `None` return never
+/// leaves a partial record in `writer`.
+fn splice_into(
+    writer: &mut Writer<'_>,
+    line: &str,
+    trace_id: impl fmt::Display,
+    span_id: impl fmt::Display,
+) -> Option<fmt::Result> {
     let trailing_newlines = line.len() - line.trim_end_matches('\n').len();
     let body = line.trim_end_matches('\n');
 
@@ -118,36 +108,58 @@ fn splice_ids(line: &str, (trace_id, span_id): &(String, String)) -> Option<Stri
     // An empty object (`{}`) takes no separating comma.
     let separator = if head.trim_end() == "{" { "" } else { "," };
 
-    let mut out = String::with_capacity(line.len() + 80);
-    out.push_str(head);
-    out.push_str(separator);
+    Some(write_spliced(
+        writer,
+        head,
+        separator,
+        trace_id,
+        span_id,
+        trailing_newlines,
+    ))
+}
+
+/// Emit the reassembled record. Split from [`splice_into`] so the latter can
+/// stay a pure predicate over `line`'s shape.
+fn write_spliced(
+    writer: &mut Writer<'_>,
+    head: &str,
+    separator: &str,
+    trace_id: impl fmt::Display,
+    span_id: impl fmt::Display,
+    trailing_newlines: usize,
+) -> fmt::Result {
+    writer.write_str(head)?;
+    writer.write_str(separator)?;
     // Both ids are hex, so they need no JSON escaping.
-    out.push_str(r#""trace_id":""#);
-    out.push_str(trace_id);
-    out.push_str(r#"","span_id":""#);
-    out.push_str(span_id);
-    out.push_str("\"}");
+    write!(writer, r#""trace_id":"{trace_id}","span_id":"{span_id}""#)?;
+    writer.write_str("}")?;
     for _ in 0..trailing_newlines {
-        out.push('\n');
+        writer.write_char('\n')?;
     }
-    Some(out)
+    Ok(())
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::splice_ids;
+    use super::splice_into;
+    use tracing_subscriber::fmt::format::Writer;
 
-    fn ids() -> (String, String) {
-        (
-            "4bf92f3577b34da6a3ce929d0e0e4736".to_owned(),
-            "00f067aa0ba902b7".to_owned(),
-        )
+    const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const SPAN_ID: &str = "00f067aa0ba902b7";
+
+    /// Splice the fixed ids into `line` the way the formatter does, returning the
+    /// bytes written to the sink, or `None` when `line` is not a JSON object.
+    fn spliced(line: &str) -> Option<String> {
+        let mut out = String::new();
+        let result = splice_into(&mut Writer::new(&mut out), line, TRACE_ID, SPAN_ID)?;
+        result.expect("writing to a String cannot fail");
+        Some(out)
     }
 
     #[test]
     fn adds_ids_before_the_closing_brace() {
-        let out = splice_ids(r#"{"level":"INFO","message":"hi"}"#, &ids()).expect("object");
+        let out = spliced(r#"{"level":"INFO","message":"hi"}"#).expect("object");
         assert_eq!(
             out,
             r#"{"level":"INFO","message":"hi","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"00f067aa0ba902b7"}"#
@@ -158,7 +170,7 @@ mod tests {
     /// line-delimited JSON stream is not broken.
     #[test]
     fn preserves_the_trailing_newline() {
-        let out = splice_ids("{\"a\":1}\n", &ids()).expect("object");
+        let out = spliced("{\"a\":1}\n").expect("object");
         assert!(out.ends_with("}\n"), "got {out:?}");
         assert_eq!(out.matches('\n').count(), 1);
     }
@@ -166,17 +178,17 @@ mod tests {
     /// An empty object must not gain a leading comma.
     #[test]
     fn empty_object_gets_no_separator() {
-        let out = splice_ids("{}", &ids()).expect("object");
+        let out = spliced("{}").expect("object");
         assert!(out.starts_with(r#"{"trace_id":"#), "got {out:?}");
     }
 
     /// Anything that is not a JSON object is passed back as unsplicable rather
-    /// than corrupted.
+    /// than corrupted — and nothing is written to the sink in that case.
     #[test]
     fn non_object_input_is_rejected() {
-        assert!(splice_ids("not json", &ids()).is_none());
-        assert!(splice_ids("[1,2,3]", &ids()).is_none());
-        assert!(splice_ids("", &ids()).is_none());
+        assert!(spliced("not json").is_none());
+        assert!(spliced("[1,2,3]").is_none());
+        assert!(spliced("").is_none());
     }
 
     // ===== end-to-end through a real subscriber =============================

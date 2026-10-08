@@ -157,7 +157,7 @@ pub(super) fn published_outcome(
             tracing::info!(
                 %operation_id,
                 operation_item_id = item.id,
-                gts_id = %item.gts_id,
+                entity_key = %item.key,
                 "types_registry predicted a candidate would be admitted"
             );
             metrics.candidate_terminalized(TerminalStatus::Succeeded, item.pass_labels());
@@ -175,7 +175,7 @@ pub(super) fn published_outcome(
             tracing::info!(
                 %operation_id,
                 operation_item_id = item.id,
-                gts_id = %item.gts_id,
+                entity_key = %item.key,
                 resource_version,
                 "types_registry predicted a candidate's content is already current"
             );
@@ -207,7 +207,7 @@ fn published_refusal(
     tracing::warn!(
         %operation_id,
         operation_item_id = item.id,
-        gts_id = %item.gts_id,
+        entity_key = %item.key,
         reason = %failure.reason,
         "types_registry predicted a candidate would be refused"
     );

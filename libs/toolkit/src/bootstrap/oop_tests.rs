@@ -973,7 +973,7 @@ mod platform_credentials {
 /// (`cpt-cf-adr-eventual-readiness`).
 mod directory_client_bootstrap {
     use super::*;
-    use cf_system_sdks::directory::DirectoryClient;
+    use cf_system_sdks::directory::{DIRECTORY_SERVICE_NAME, DirectoryClient};
     use tokio_util::sync::CancellationToken;
     use toolkit_security::InternalAuthConfig;
 
@@ -993,7 +993,7 @@ mod directory_client_bootstrap {
         // The deferred connect surfaces as an RPC error, not a hang.
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            client.resolve_grpc_service("cf.directory.v1.DirectoryService"),
+            client.resolve_grpc_service(DIRECTORY_SERVICE_NAME),
         )
         .await;
         assert!(outcome.is_ok(), "first RPC must not hang");

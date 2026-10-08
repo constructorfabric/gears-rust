@@ -14,6 +14,7 @@
 //! nothing else — one function branching on an `Option<i64>` would make each half's
 //! writes reachable under the other's precondition.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use gts::{CompatibilityVerdict, GTS_IMPLEMENTATION_VERSION, GTS_SPECIFICATION_VERSION, GtsId};
@@ -431,6 +432,9 @@ async fn read_evaluation_snapshot(
     if let Err(breach) = compat::quarantine(&plan.id, &edges) {
         return Ok(Err(ItemFailure::new(breach.reason(), breach.to_string())));
     }
+    if let Some(edge) = edge_to_tombstone(stores, tx, scope, &edges).await? {
+        return Ok(Err(ItemFailure::deleted_dependency(edge)));
+    }
 
     let candidates = vec![UnitDocument {
         gts_id: plan.candidate_id.clone(),
@@ -497,6 +501,35 @@ async fn read_evaluation_snapshot(
         content,
         baseline: Box::new(baseline),
     }))
+}
+
+/// The first direct edge whose target is a tombstone, base and conforming type
+/// before `$ref`. A tombstone still loads as a cross-minor baseline, which is no
+/// edge. A deletion committed after this read moves the target's version, which
+/// the commit's vector guard sees.
+async fn edge_to_tombstone(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    edges: &[DependencyEdge],
+) -> Result<Option<DependencyEdge>, WorkerError> {
+    if edges.is_empty() {
+        return Ok(None);
+    }
+    let targets: Vec<String> = edges.iter().map(|edge| edge.target.clone()).collect();
+    let deleted: HashSet<String> = stores
+        .find_by_gts_ids(tx, scope, &targets)
+        .await?
+        .into_iter()
+        .filter(|row| row.lifecycle_status == LifecycleStatus::Deleted)
+        .map(|row| row.gts_id)
+        .collect();
+    let mut ordered: Vec<&DependencyEdge> = edges.iter().collect();
+    ordered.sort_by_key(|edge| edge.kind == DependencyKind::SchemaRef);
+    Ok(ordered
+        .into_iter()
+        .find(|edge| deleted.contains(&edge.target))
+        .cloned())
 }
 
 /// Validate and materialize, away from the executor.

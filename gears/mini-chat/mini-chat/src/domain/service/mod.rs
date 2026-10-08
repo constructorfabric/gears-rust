@@ -36,6 +36,7 @@ mod reaction_service;
 pub(crate) mod replay;
 mod stream_service;
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod test_helpers;
 pub(crate) mod thumbnail;
 pub(crate) mod token_estimator;
@@ -50,7 +51,7 @@ pub(crate) use model_service::ModelService;
 pub(crate) use quota_service::QuotaService;
 pub(crate) use reaction_service::ReactionService;
 pub(crate) use stream_service::{StreamError, StreamService};
-pub(crate) use turn_service::{MutationError, MutationResult, TurnService};
+pub(crate) use turn_service::{MutationError, TurnService};
 
 /// Extract the W3C trace ID from the current tracing span.
 ///

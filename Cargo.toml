@@ -51,6 +51,7 @@ debug = true
 [workspace]
 members = [
     "apps/cf-gears-example-server",
+    "apps/cf-gears-flight-control",
     "tools/gts-analyze",
     "tools/xtask",
     "libs/toolkit",
@@ -66,6 +67,7 @@ members = [
     "libs/toolkit-gts",
     "libs/toolkit-gts-macros",
     "libs/toolkit-http",
+    "libs/toolkit-trace-context",
     "libs/toolkit-http-middleware",
     "libs/toolkit-gateway",
     "libs/toolkit-k8s-auth",
@@ -77,6 +79,7 @@ members = [
     "libs/toolkit-stable-hash",
     "libs/toolkit-transport-grpc",
     "libs/toolkit-utils",
+    "libs/ai/toolkit-onnx-runtime",
     "libs/rustls-corecrypto-provider",
     "libs/rustls-fips-shim",
     "libs/toolkit-contract",
@@ -88,6 +91,10 @@ members = [
     "gears/credstore/credstore-sdk",
     "gears/credstore/credstore",
     "gears/credstore/plugins/static-credstore-plugin",
+    "gears/graph-storage/graph-storage-sdk",
+    "gears/graph-storage/graph-storage",
+    "gears/graph-storage/onnx-embedding-plugin",
+    "gears/graph-storage/remote-embedding-plugin",
     "gears/file-parser/file-parser-sdk",
     "gears/file-parser/file-parser",
     "gears/file-storage/file-storage-sdk",
@@ -111,7 +118,7 @@ members = [
     "gears/system/nodes-registry/nodes-registry-sdk",
     "gears/system/resource-group/resource-group-sdk",
     "gears/system/resource-group/resource-group",
-    "gears/system/gear-orchestrator",
+    "gears/system/service-discovery",
     "examples/toolkit/users-info/users-info-sdk",
     "examples/toolkit/users-info/users-info",
     "examples/toolkit/users-info/users-info-server",
@@ -119,11 +126,14 @@ members = [
     "examples/oop-gears/calculator-gateway/calculator-gateway",
     "examples/oop-gears/calculator/calculator-sdk",
     "examples/oop-gears/calculator/calculator",
+    "examples/toolkit/hello/hello",
     "examples/cf-gears-fips-probe",
     "gears/system/types-registry/types-registry-sdk",
     "gears/system/types-registry/types-registry",
     "gears/simple-user-settings/simple-user-settings-sdk",
     "gears/simple-user-settings/simple-user-settings",
+    "gears/settings-service/settings-service-sdk",
+    "gears/settings-service/settings-service",
     "gears/system/tenant-resolver/tenant-resolver-sdk",
     "gears/system/tenant-resolver/tenant-resolver",
     "gears/system/tenant-resolver/plugins/static-tr-plugin",
@@ -143,6 +153,7 @@ members = [
     "gears/system/usage-collector/usage-collector",
     "gears/system/usage-collector/plugins/noop-usage-collector-plugin",
     "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin",
+    "gears/system/usage-collector/plugins/clickhouse-usage-collector-plugin",
     "gears/mini-chat/mini-chat-sdk",
     "gears/mini-chat/mini-chat",
     "examples/toolkit/api-contracts/api-contracts-sdk",
@@ -156,13 +167,17 @@ members = [
     "gears/bss/ledger/ledger-sdk",
     "gears/bss/pricing/pricing",
     "gears/bss/pricing/pricing-sdk",
+    "gears/bss/products/products",
+    "gears/bss/products/products-sdk",
+    "gears/bss/approvals/approvals",
+    "gears/bss/approvals/approvals-sdk",
     "gears/bss/rate-provider/rate-provider-sdk",
     "gears/bss/rate-provider/rate-provider",
     "gears/bss/rate-provider/plugins/ecb-plugin",
     "gears/bss/rate-provider/plugins/http-json-plugin",
     "gears/bss/libs/coord",
-    "gears/bss/fixtures/bss-fixtures",
-    "gears/bss/fixtures/bss-fixtures-conformance",
+    "gears/bss/libs/approval",
+    "gears/bss/libs/rest",
     "gears/system/event-broker/event-broker-sdk",
     "gears/system/event-broker/event-broker",
     "gears/system/license-resolver/license-resolver-sdk",
@@ -262,6 +277,9 @@ unnecessary_wraps = "deny"
 unnested_or_patterns = "deny"
 unreadable_literal = "deny"
 unused_async = "deny"
+# Trait impls stay `async fn` to mirror the trait; the lint's `future::ready`
+# rewrite runs the body at call time instead of first poll.
+unused_async_trait_impl = "allow"
 unused_self = "deny"
 unwrap_used = "deny"
 use_debug = "deny"
@@ -301,6 +319,7 @@ verbose_file_reads = "deny"
 # libs
 toolkit = { package = "cf-gears-toolkit", version = "0.10.0", path = "libs/toolkit" }
 toolkit-http = { package = "cf-gears-toolkit-http", version = "0.6.18", path = "libs/toolkit-http" }
+toolkit-trace-context = { package = "cf-gears-toolkit-trace-context", version = "0.1.0", path = "libs/toolkit-trace-context" }
 toolkit-http-middleware = { package = "cf-gears-toolkit-http-middleware", version = "0.3.2", path = "libs/toolkit-http-middleware" }
 toolkit-gateway = { package = "cf-gears-toolkit-gateway", version = "0.2.8", path = "libs/toolkit-gateway" }
 toolkit-k8s-auth = { package = "cf-gears-toolkit-k8s-auth", version = "0.3.0", path = "libs/toolkit-k8s-auth" }
@@ -323,6 +342,7 @@ toolkit-security = { package = "cf-gears-toolkit-security", version = "0.11.0", 
 toolkit-stable-hash = { package = "cf-gears-toolkit-stable-hash", version = "0.1.0", path = "libs/toolkit-stable-hash" }
 toolkit-transport-grpc = { package = "cf-gears-toolkit-transport-grpc", version = "0.9.0", path = "libs/toolkit-transport-grpc" }
 toolkit-utils = { package = "cf-gears-toolkit-utils", version = "0.7.2", path = "libs/toolkit-utils" }
+toolkit-onnx-runtime = { package = "cf-gears-toolkit-onnx-runtime", version = "0.1.0", path = "libs/ai/toolkit-onnx-runtime" }
 rustls-corecrypto-provider = { package = "cf-gears-rustls-corecrypto-provider", version = "0.1.3", path = "libs/rustls-corecrypto-provider" }
 rustls-fips-shim = { package = "cf-gears-rustls-fips-shim", version = "0.1.2", path = "libs/rustls-fips-shim" }
 # Windows CNG-backed rustls CryptoProvider (Windows-only FIPS path). Caret-pinned to 0.1.x;
@@ -368,7 +388,6 @@ cf-gears-cluster-conformance = { version = "0.3.8", path = "gears/system/cluster
 
 # System gears SDKs
 account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.7.5", path = "gears/system/account-management/account-management-sdk" }
-keycloak-idp-plugin = { package = "cf-gears-keycloak-idp-plugin", version = "0.1.7", path = "gears/system/account-management/plugins/keycloak-idp-plugin" }
 cluster-sdk = { package = "cf-gears-cluster-sdk", version = "0.2.8", path = "gears/system/cluster/cluster-sdk" }
 types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.9", path = "gears/system/types-registry/types-registry-sdk" }
 tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.4.5", path = "gears/system/tenant-resolver/tenant-resolver-sdk" }
@@ -393,24 +412,42 @@ bss-ledger-sdk = { package = "cf-gears-bss-ledger-sdk", version = "0.1.8", path 
 # must gain one in the same change or that gate turns red — which is the intended
 # coupling, not a latent trap.
 bss-pricing-sdk = { package = "cf-gears-bss-pricing-sdk", path = "gears/bss/pricing/pricing-sdk" }
+# Products' seam suite boots this gear beside `bss-products` on one hub.
+# Dev-only consumer; no `version` for the same WIP reason as the SDK above.
+bss-pricing = { package = "cf-gears-bss-pricing", path = "gears/bss/pricing/pricing" }
+# The products registry SDK. Same posture as pricing-sdk above: no `version`,
+# because neither crate is a release artifact and the gear that consumes it is
+# not published either.
+bss-products-sdk = { package = "cf-gears-bss-products-sdk", path = "gears/bss/products/products-sdk" }
+# The approvals inbox. Same WIP posture as pricing: no `version`, because neither
+# crate is a release artifact yet.
+bss-approvals-sdk = { package = "cf-gears-bss-approvals-sdk", path = "gears/bss/approvals/approvals-sdk" }
+bss-approvals = { package = "cf-gears-bss-approvals", path = "gears/bss/approvals/approvals" }
+# NFKC for the products registry's `normalized(name)`, the operand of its
+# uniqueness index. Already in the tree transitively; taken as a direct
+# dependency because the normalization must be identical on both engines and
+# std offers neither NFKC nor full casefold.
+unicode-normalization = "0.1"
 bss-rate-provider-sdk = { package = "cf-gears-bss-rate-provider-sdk", version = "0.1.10", path = "gears/bss/rate-provider/rate-provider-sdk" }
 coord = { package = "cf-gears-bss-coord", path = "gears/bss/libs/coord" }
-# The joint golden conformance fixture corpus. `bss-fixtures` carries no charge
-# arithmetic and is the only one a gear may depend on in production; the
-# conformance harness is a dev-dependency only.
-#
-# `default-features = false` here so a **gear** can inherit the narrow
-# production surface (`ModelKind` + `Registry` + `gate_open_for`): Cargo refuses
-# `default-features = false` on an inherited dependency unless the workspace
-# entry states it, so the default is set narrow and the corpus half is opted
-# into by name where it is actually wanted.
-bss-fixtures = { package = "cf-gears-bss-fixtures", path = "gears/bss/fixtures/bss-fixtures", default-features = false }
-bss-fixtures-conformance = { package = "cf-gears-bss-fixtures-conformance", path = "gears/bss/fixtures/bss-fixtures-conformance" }
+bss-approval = { package = "cf-gears-bss-approval", path = "gears/bss/libs/approval" }
+# Weak ETag and If-None-Match for the BSS list and reference reads.
+bss-rest = { package = "cf-gears-bss-rest", path = "gears/bss/libs/rest" }
 # FIPS-validated SHA-256 for the ledger idempotency payload fingerprint.
 aws-lc-rs = "1.17"
 
+# settings-service
+settings-service-sdk = { package = "cf-gears-settings-service-sdk", version = "0.1.0", path = "gears/settings-service/settings-service-sdk" }
+settings-service = { package = "cf-gears-settings-service", version = "0.1.4", path = "gears/settings-service/settings-service" }
+
 # credstore
 credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.17", path = "gears/credstore/credstore-sdk" }
+
+# graph-storage
+graph-storage = { package = "cf-gears-graph-storage", version = "0.1.4", path = "gears/graph-storage/graph-storage" }
+graph-storage-sdk = { package = "cf-gears-graph-storage-sdk", version = "0.1.1", path = "gears/graph-storage/graph-storage-sdk" }
+onnx-embedding-plugin = { package = "cf-gears-graph-storage-onnx-embedding-plugin", version = "0.1.0", path = "gears/graph-storage/onnx-embedding-plugin" }
+remote-embedding-plugin = { package = "cf-gears-graph-storage-remote-embedding-plugin", version = "0.1.0", path = "gears/graph-storage/remote-embedding-plugin" }
 
 # mini-chat
 mini-chat-sdk = { package = "cf-gears-mini-chat-sdk", version = "0.10.26", path = "gears/mini-chat/mini-chat-sdk" }
@@ -424,17 +461,7 @@ grpc_hub = { package = "cf-gears-grpc-hub", version = "0.3.2", path = "gears/sys
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# `toolkit-contract-protogen`'s, and it stays at the major upstream chose for it.
-#
-# **This is an add/add and not a disagreement**: `toml` was in neither side's
-# workspace table at the merge base. Upstream added `0.8` for the protogen tool
-# and this branch added `1` for the golden-fixture corpus
-# (`gears/bss/fixtures/corpus`), which is hand-authored and hand-reviewed as
-# normative text and was written against the 1.x API. Neither crate can be moved
-# onto the other's major by this rebase without a code change nobody has reviewed,
-# so `bss-fixtures` and `bss-fixtures-conformance` name `toml = "1"` directly
-# instead of inheriting. The lockfile already carries both — 0.8.23 and 1.1.2 —
-# so the duplication is upstream's own resolution and not something this adds.
+# `toolkit-contract-protogen`'s major; pricing's golden runner inherits it.
 toml = "0.8"
 serde-saphyr = "1.3.0"
 humantime-serde = "1.1"
@@ -553,6 +580,9 @@ proptest = "1"
 # CLI support
 clap = { version = "4.5", features = ["derive"] }
 
+# Allocator
+mimalloc = { version = "0.1" }
+
 # Database utilities
 #
 # TLS note: sea-orm and sea-orm-migration use runtime-tokio (NOT runtime-tokio-rustls).
@@ -648,6 +678,16 @@ fred = { version = "10.1", default-features = false, features = [
     "enable-rustls",
     "partial-tracing",
 ] }
+
+# ClickHouse async client (official crate, HTTP-based, rustls TLS).
+# Used by the clickhouse-usage-collector-plugin (DESIGN.md §3.5).
+clickhouse = { version = "0.15", features = ["rustls-tls"] }
+# `#[repr(i8)]` (de)serialization for ClickHouse Enum8 columns -- the
+# `clickhouse` crate's RowBinaryWithNamesAndTypes schema validation requires
+# Enum8/Enum16 columns to (de)serialize as their underlying integer
+# discriminant, not as a string (see clickhouse crate README "Enum(8|16)").
+# Used by the clickhouse-usage-collector-plugin (DESIGN.md §3.5).
+serde_repr = "0.1"
 
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
@@ -764,7 +804,7 @@ proc-macro-crate = "3"
 # `testcontainers` pair it wraps.
 test-containers = { package = "cf-gears-test-containers", path = "libs/test-containers" }
 trybuild = "1"
-serial_test = { version = "3", features = ["file_locks"] }
+serial_test = { version = "4", features = ["file_locks"] }
 criterion = { version = "0.8", default-features = false }
 testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
 testcontainers-modules = { version = "0.15", default-features = false, features = ["aws-lc-rs", "postgres", "mysql", "redis"] }
@@ -805,9 +845,13 @@ magika = "1.1"
 # unconditionally, not feature-gated) references an `OrtApi` struct field that only exists
 # at the api-24 ABI level; this is unrelated to which execution providers we actually use.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"] }
+# WordPiece tokenization for the MiniLM-class sentence model behind the
+# graph-storage ONNX embedding provider. Default features off deliberately:
+# they pull a progress bar, an HTTP downloader and a C++ suffix-array build,
+# none of which a gear that loads operator-supplied artifacts from disk wants.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 
 # Additional testing utilities
-tokio-test = "0.4"
 mockall = "0.15"
 temp-env = { version = "0.3", features = ["async_closure"] }
 wiremock = "0.6"

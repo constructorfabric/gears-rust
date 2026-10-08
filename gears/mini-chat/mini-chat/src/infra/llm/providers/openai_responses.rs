@@ -1,7 +1,7 @@
 // Updated: 2026-04-14 by Constructor Tech
 //! `OpenAI` Responses API adapter (`/v1/responses`).
 //!
-//! Implements [`LlmProvider`] by converting [`LlmRequest`] to the Responses
+//! Implements [`LlmProvider`](crate::infra::llm::LlmProvider) by converting [`LlmRequest`] to the Responses
 //! API wire format, proxying through OAGW, parsing SSE events, and
 //! translating them to the shared `TranslatedEvent` contract.
 
@@ -48,6 +48,7 @@ pub(super) enum ProviderEvent {
     ResponseWebSearchCallSearching,
     ResponseWebSearchCallCompleted,
     ResponseCodeInterpreterCallInProgress,
+    /// `response.output_item.done` of a `code_interpreter_call` item.
     ResponseCodeInterpreterCallCompleted {
         /// Concatenated text from all `logs` output items.
         output: String,
@@ -57,6 +58,9 @@ pub(super) enum ProviderEvent {
     },
     ResponseFailed {
         error: ProviderErrorPayload,
+        /// `response.usage` of a `response.failed` event, when the provider
+        /// reports it; `None` for a bare `error` event.
+        usage: Option<RawUsage>,
     },
     ResponseIncomplete {
         response: ResponseObject,
@@ -130,13 +134,22 @@ impl RawUsage {
     }
 }
 
-/// Provider error payload from `response.failed` event.
+/// Provider error payload (`response.failed`, `error` event, HTTP error body).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct ProviderErrorPayload {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     code: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     message: String,
+}
+
+/// `OpenAI` sends `"code": null` in some error bodies and events.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// `OpenAI` wraps errors in `{"error": {...}}`.
@@ -233,6 +246,10 @@ pub struct Annotation {
     pub url: Option<String>,
     #[serde(default)]
     pub file_id: Option<String>,
+    /// Present on `file_citation` (the provider-side filename). A real
+    /// `file_citation` has no title, text or range, only a position `index`.
+    #[serde(default)]
+    pub filename: Option<String>,
     #[serde(default)]
     pub start_index: Option<usize>,
     #[serde(default)]
@@ -266,10 +283,52 @@ struct ResponseCompletedData {
     response: ResponseObject,
 }
 
+/// Payload of `response.failed` and of the `error` event.
+///
+/// `response.failed` carries the error in `response.error`; the `error`
+/// event is flat (`{"type":"error","code","message"}`). A top-level
+/// `{"error":{...}}` is accepted as a fallback for both.
 #[derive(Deserialize)]
-struct ResponseFailedData {
+struct ErrorEventData {
     #[serde(default)]
-    error: ProviderErrorPayload,
+    response: Option<FailedResponse>,
+    #[serde(default)]
+    error: Option<ProviderErrorPayload>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FailedResponse {
+    #[serde(default)]
+    error: Option<ProviderErrorPayload>,
+    #[serde(default)]
+    usage: Option<RawUsage>,
+}
+
+impl ErrorEventData {
+    /// The error payload and, for `response.failed`, the reported usage.
+    fn into_error_and_usage(mut self) -> (Option<ProviderErrorPayload>, Option<RawUsage>) {
+        let usage = self.response.as_mut().and_then(|r| r.usage.take());
+        (self.into_error(), usage)
+    }
+
+    fn into_error(self) -> Option<ProviderErrorPayload> {
+        let Self {
+            response,
+            error,
+            code,
+            message,
+        } = self;
+        response.and_then(|r| r.error).or(error).or_else(|| {
+            (code.is_some() || message.is_some()).then(|| ProviderErrorPayload {
+                code: code.unwrap_or_default(),
+                message: message.unwrap_or_default(),
+            })
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -277,29 +336,76 @@ struct ResponseIncompleteData {
     response: ResponseObject,
 }
 
-/// A single output item from `response.code_interpreter_call.completed`.
+/// One entry of a `code_interpreter_call` item's `outputs`.
 #[derive(Deserialize)]
 struct CodeInterpreterOutputItem {
     #[serde(default, rename = "type")]
     output_type: String,
     /// Present when `output_type == "logs"`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     logs: String,
 }
 
 #[derive(Deserialize)]
-struct CodeInterpreterCompletedData {
+struct OutputItemDoneData {
     #[serde(default)]
+    item: OutputItemDoneItem,
+}
+
+/// The item of `response.output_item.done`; only `code_interpreter_call`
+/// items are read. `outputs` is `null` unless the request has
+/// `include: ["code_interpreter_call.outputs"]`.
+#[derive(Deserialize, Default)]
+struct OutputItemDoneItem {
+    #[serde(default, rename = "type")]
+    item_type: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     outputs: Vec<CodeInterpreterOutputItem>,
+}
+
+/// Join the `logs` outputs, capped at [`MAX_CODE_INTERPRETER_OUTPUT_CHARS`].
+fn code_interpreter_logs(outputs: Vec<CodeInterpreterOutputItem>) -> String {
+    let mut output = outputs
+        .into_iter()
+        .filter(|o| o.output_type == "logs")
+        .map(|o| o.logs)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if output.chars().count() > MAX_CODE_INTERPRETER_OUTPUT_CHARS {
+        output = output
+            .chars()
+            .take(MAX_CODE_INTERPRETER_OUTPUT_CHARS)
+            .collect::<String>();
+        output.push_str("...[truncated]");
+    }
+    output
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // FromServerEvent
 // ════════════════════════════════════════════════════════════════════════════
 
+/// The `type` field shared by every Responses streaming event.
+#[derive(Deserialize)]
+struct EventTypeData {
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+}
+
 impl FromServerEvent for ProviderEvent {
     fn from_server_event(event: ServerEvent) -> Result<Self, StreamingError> {
-        let event_name = event.event.as_deref().unwrap_or("message");
+        // Every Responses event carries its name in `data.type` as well. Fall
+        // back to it when the `event:` line is missing, e.g. dropped by a proxy.
+        let type_from_data: Option<String>;
+        let event_name = match event.event.as_deref() {
+            Some(name) if name != "message" => name,
+            _ => {
+                type_from_data = serde_json::from_str::<EventTypeData>(&event.data)
+                    .ok()
+                    .and_then(|d| d.event_type);
+                type_from_data.as_deref().unwrap_or("message")
+            }
+        };
 
         match event_name {
             "response.output_text.delta" => {
@@ -348,33 +454,29 @@ impl FromServerEvent for ProviderEvent {
                 Ok(ProviderEvent::ResponseCodeInterpreterCallInProgress)
             }
 
-            "response.code_interpreter_call.interpreting" => {
-                // Intermediate event — no client-visible update needed.
-                Ok(ProviderEvent::Unknown {
-                    event_name: event_name.to_owned(),
-                })
-            }
+            // `.completed` carries no outputs (only item_id, output_index,
+            // sequence_number); they arrive in the `response.output_item.done`
+            // that follows, which ends the tool call.
+            "response.code_interpreter_call.interpreting"
+            | "response.code_interpreter_call.completed" => Ok(ProviderEvent::Unknown {
+                event_name: event_name.to_owned(),
+            }),
 
-            "response.code_interpreter_call.completed" => {
-                let data: CodeInterpreterCompletedData = serde_json::from_str(&event.data)
-                    .map_err(|e| StreamingError::ServerEventsParse {
-                        detail: format!("failed to parse code interpreter completed: {e}"),
-                    })?;
-                let mut output = data
-                    .outputs
-                    .into_iter()
-                    .filter(|o| o.output_type == "logs")
-                    .map(|o| o.logs)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if output.chars().count() > MAX_CODE_INTERPRETER_OUTPUT_CHARS {
-                    output = output
-                        .chars()
-                        .take(MAX_CODE_INTERPRETER_OUTPUT_CHARS)
-                        .collect::<String>();
-                    output.push_str("...[truncated]");
+            "response.output_item.done" => {
+                let data: OutputItemDoneData = serde_json::from_str(&event.data).map_err(|e| {
+                    StreamingError::ServerEventsParse {
+                        detail: format!("failed to parse output item done: {e}"),
+                    }
+                })?;
+                if data.item.item_type == "code_interpreter_call" {
+                    Ok(ProviderEvent::ResponseCodeInterpreterCallCompleted {
+                        output: code_interpreter_logs(data.item.outputs),
+                    })
+                } else {
+                    Ok(ProviderEvent::Unknown {
+                        event_name: event_name.to_owned(),
+                    })
                 }
-                Ok(ProviderEvent::ResponseCodeInterpreterCallCompleted { output })
             }
 
             "response.completed" => {
@@ -390,12 +492,24 @@ impl FromServerEvent for ProviderEvent {
             }
 
             "response.failed" => {
-                let data: ResponseFailedData = serde_json::from_str(&event.data).map_err(|e| {
+                let data: ErrorEventData = serde_json::from_str(&event.data).map_err(|e| {
                     StreamingError::ServerEventsParse {
                         detail: format!("failed to parse response failed: {e}"),
                     }
                 })?;
-                Ok(ProviderEvent::ResponseFailed { error: data.error })
+                let (error, usage) = data.into_error_and_usage();
+                // No known error shape: keep the raw payload as the message,
+                // as the `error` event does.
+                let error = error.unwrap_or_else(|| {
+                    let sanitized_data =
+                        crate::infra::llm::sanitize_provider_message(&event.data);
+                    tracing::warn!(data = %sanitized_data, "response.failed without an error object");
+                    ProviderErrorPayload {
+                        code: String::new(),
+                        message: event.data.clone(),
+                    }
+                });
+                Ok(ProviderEvent::ResponseFailed { error, usage })
             }
 
             "response.incomplete" => {
@@ -411,24 +525,18 @@ impl FromServerEvent for ProviderEvent {
             }
 
             "error" => {
-                // OpenAI sends `event: error` with the actual error details.
-                // Try nested `{"error": {...}}` shape first, then flat shape.
+                // Flat `{"type":"error","code","message"}`; the nested shapes
+                // are accepted too. Unparseable data becomes the message.
                 let sanitized_data = crate::infra::llm::sanitize_provider_message(&event.data);
                 tracing::warn!(data = %sanitized_data, "provider error SSE event");
-                let error =
-                    if let Ok(data) = serde_json::from_str::<ResponseFailedData>(&event.data) {
-                        data.error
-                    } else if let Ok(payload) =
-                        serde_json::from_str::<ProviderErrorPayload>(&event.data)
-                    {
-                        payload
-                    } else {
-                        ProviderErrorPayload {
-                            code: String::new(),
-                            message: event.data.clone(),
-                        }
-                    };
-                Ok(ProviderEvent::ResponseFailed { error })
+                let error = serde_json::from_str::<ErrorEventData>(&event.data)
+                    .ok()
+                    .and_then(ErrorEventData::into_error)
+                    .unwrap_or_else(|| ProviderErrorPayload {
+                        code: String::new(),
+                        message: event.data.clone(),
+                    });
+                Ok(ProviderEvent::ResponseFailed { error, usage: None })
             }
 
             other => {
@@ -565,7 +673,7 @@ pub(super) fn translate_provider_event(
             })
         }
 
-        ProviderEvent::ResponseFailed { error } => {
+        ProviderEvent::ResponseFailed { error, usage } => {
             let sanitized = crate::infra::llm::sanitize_provider_message(&error.message);
             TranslatedEvent::Terminal(TerminalOutcome::Failed {
                 error: LlmProviderError::ProviderError {
@@ -573,7 +681,7 @@ pub(super) fn translate_provider_event(
                     message: sanitized,
                     raw_detail: Some(RawDetail(error.message.clone())),
                 },
-                usage: None,
+                usage: usage.as_ref().map(RawUsage::to_usage),
                 partial_content: accumulated_text.to_owned(),
             })
         }
@@ -594,6 +702,16 @@ pub(super) fn translate_provider_event(
 }
 
 /// Extract citations from a `ResponseCompleted`'s output annotations.
+/// Characters `start..end` of `text`, or `None` if the range is empty or
+/// outside the text.
+fn char_slice(text: &str, start: usize, end: usize) -> Option<String> {
+    if start >= end {
+        return None;
+    }
+    let slice: String = text.chars().skip(start).take(end - start).collect();
+    (slice.chars().count() == end - start).then_some(slice)
+}
+
 pub(super) fn extract_citations(
     response: &ResponseObject,
     accumulated_text: &str,
@@ -611,7 +729,14 @@ pub(super) fn extract_citations(
                             .or_else(|| {
                                 annotation.start_index.zip(annotation.end_index).and_then(
                                     |(start, end)| {
-                                        accumulated_text.get(start..end).map(ToOwned::to_owned)
+                                        // Indices are character offsets into the
+                                        // annotated `output_text` part.
+                                        let source = if content_part.text.is_empty() {
+                                            accumulated_text
+                                        } else {
+                                            content_part.text.as_str()
+                                        };
+                                        char_slice(source, start, end)
                                     },
                                 )
                             })
@@ -622,13 +747,22 @@ pub(super) fn extract_citations(
                         };
 
                         let is_file = annotation.r#type == "file_citation";
+                        // A real `file_citation` has `filename` and no `title`,
+                        // text or range: its snippet is empty and it has no
+                        // span. `map_citation_ids` replaces the title with the
+                        // attachment filename.
+                        let title = if annotation.title.is_empty() {
+                            annotation.filename.clone().unwrap_or_default()
+                        } else {
+                            annotation.title.clone()
+                        };
                         Citation {
                             source: if is_file {
                                 CitationSource::File
                             } else {
                                 CitationSource::Web
                             },
-                            title: annotation.title.clone(),
+                            title,
                             url: if is_file {
                                 None
                             } else {
@@ -733,7 +867,7 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
 
     // User field: "{tenant_id}:{user_id}"
     if let Some(ref identity) = request.user_identity {
-        body["user"] = serde_json::json!(format!("{}:{}", identity.tenant_id, identity.user_id));
+        body["user"] = serde_json::json!(identity.provider_user());
     }
 
     if let Some(ref metadata) = request.metadata {
@@ -792,15 +926,30 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools);
     }
+    // Without it the provider sends `outputs: null` and the tool `done`
+    // event has an empty output.
+    if request
+        .tools
+        .iter()
+        .any(|t| matches!(t, LlmTool::CodeInterpreter { .. }))
+    {
+        body["include"] = serde_json::json!(["code_interpreter_call.outputs"]);
+    }
 
     // Inference params from the typed model-policy channel. The Responses API
     // wraps reasoning effort under `reasoning: { effort }` rather than using
     // the Chat Completions–style top-level `reasoning_effort`.
     if let Some(p) = request.api_params.as_ref() {
-        body["temperature"] = serde_json::json!(p.temperature);
-        body["top_p"] = serde_json::json!(p.top_p);
-        body["frequency_penalty"] = serde_json::json!(p.frequency_penalty);
-        body["presence_penalty"] = serde_json::json!(p.presence_penalty);
+        for (key, value) in [
+            ("temperature", p.temperature),
+            ("top_p", p.top_p),
+            ("frequency_penalty", p.frequency_penalty),
+            ("presence_penalty", p.presence_penalty),
+        ] {
+            if let Some(v) = value {
+                body[key] = serde_json::json!(v);
+            }
+        }
         if !p.stop.is_empty() {
             body["stop"] = serde_json::json!(&p.stop);
         }
@@ -809,12 +958,8 @@ fn build_request_body<M>(request: &LlmRequest<M>, stream: bool) -> serde_json::V
         }
         // `extra_body` is merged at the top level; policy author's escape
         // hatch for fields not covered by `ModelApiParams`.
-        if let Some(ref extra) = p.extra_body
-            && let (Some(body_obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object())
-        {
-            for (k, v) in extra_obj {
-                body_obj.insert(k.clone(), v.clone());
-            }
+        if let Some(ref extra) = p.extra_body {
+            super::merge_extra_body(&mut body, extra);
         }
     }
 
@@ -936,6 +1081,9 @@ impl crate::infra::llm::LlmProvider for OpenAiResponsesProvider {
             ServerEventsResponse::Response(resp) => {
                 // Non-SSE response — parse as JSON error
                 let (parts, body) = resp.into_parts();
+                if let Some(e) = crate::infra::llm::error_from_status(&parts) {
+                    return Err(e);
+                }
                 tracing::warn!(status = %parts.status, "provider returned non-SSE response");
                 match body.into_bytes().await {
                     Ok(bytes) => {
@@ -1031,5 +1179,6 @@ impl crate::infra::llm::LlmProvider for OpenAiResponsesProvider {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "openai_responses_tests.rs"]
 mod openai_responses_tests;

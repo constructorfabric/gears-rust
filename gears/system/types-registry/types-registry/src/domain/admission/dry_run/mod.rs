@@ -25,11 +25,14 @@ use self::view::{AdmissionView, ItemOutcomeWrite};
 use super::batch;
 use super::deletion;
 use super::errors::{ItemFailure, WorkerError};
-use super::outcome::{ItemOutcome, OperationOutcome, read_operation, stored_outcome};
+use super::outcome::{
+    ItemOutcome, OperationOutcome, read_operation, registration_gts_id, stored_outcome,
+};
 use super::tuning::Tuning;
 use super::unit::{CommitRequest, EvaluationTarget, PreparedUnit, commit_prepared_in, evaluate_in};
 use crate::domain::admission::{AdmissionFailureReason, Precondition};
 use crate::domain::enums::{OperationItemStatus, OperationKind};
+use crate::domain::key::EntityKey;
 use crate::domain::ports::{OperationItemRow, OperationRow, Stores, snapshot_read};
 use crate::observability;
 
@@ -114,7 +117,7 @@ pub(super) async fn run_batch(
         }
         let reported = publish::published_outcome(operation_id, item, prediction, tuning.metrics);
         outcomes.push(ItemOutcome {
-            gts_id: item.gts_id.clone(),
+            key: item.key.clone(),
             status: reported.status,
             gts_uuid: reported.gts_uuid,
             resource_version: reported.resource_version,
@@ -166,8 +169,8 @@ async fn predict_batch(
             // committing pass orders them — and a deletion's edges are read
             // through this batch's own snapshot rather than a second one.
             let order = if kind == OperationKind::Deletion {
-                let gts_ids: Vec<String> = items.iter().map(|item| item.gts_id.clone()).collect();
-                batch::order_deletions(&view, tx, &scope, &gts_ids).await?
+                let keys: Vec<EntityKey> = items.iter().map(|item| item.key.clone()).collect();
+                batch::order_deletions(&view, tx, &scope, &keys).await?
             } else {
                 batch::registration_order(&items)
             };
@@ -196,7 +199,7 @@ async fn predict_batch(
                                 )
                                 .instrument(observability::unit_span(
                                     operation_id,
-                                    &item.gts_id,
+                                    &item.key,
                                     item.kind,
                                     item.dry_run,
                                     item.id,
@@ -265,7 +268,7 @@ async fn predict_item(
             view.keep_candidate(layer);
             tracing::debug!(
                 operation_item_id = item.id,
-                gts_id = %item.gts_id,
+                entity_key = %item.key,
                 "types_registry predicted a candidate would be admitted"
             );
             return Ok(Predicted::Terminal {
@@ -318,7 +321,7 @@ async fn predict_commit(
         tx,
         scope,
         EvaluationTarget {
-            gts_id: &item.gts_id,
+            gts_id: registration_gts_id(item)?,
             canonical_body: payload,
             operation_item_id: item.id,
             precondition: item.precondition,
@@ -383,8 +386,7 @@ async fn predict_deletion(
     };
     let span = tracing::Span::current();
     let committed =
-        deletion::commit_deletion(view, tx, scope, &item.gts_id, expected, limits, &span, now)
-            .await?;
+        deletion::commit_deletion(view, tx, scope, &item.key, expected, limits, &span, now).await?;
     Ok(committed.map(|commit| PredictedCommit {
         gts_uuid: commit.gts_uuid,
         write: Some(ItemOutcomeWrite::Succeeded(

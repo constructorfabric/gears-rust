@@ -13,7 +13,7 @@ use super::prioritizer::SharedPrioritizer;
 use super::record::{Record, RecordItem, Records};
 use super::statements::OutboxStatements;
 use super::store::OutboxStore;
-use super::subscription::{Mailbox, TraceRegistry, TraceSubscription, TraceWatch};
+use super::subscription::{TraceMailbox, TraceRegistry, TraceSubscription, TraceWatch};
 use super::trace::{TraceOutcome, TraceState};
 use super::types::{OutboxConfig, OutboxError, OutboxMessageId};
 use super::wake::Wake;
@@ -46,7 +46,7 @@ pub struct Outbox {
     /// Who this instance is, and who is waiting for a completion. Shared with
     /// the ack path so a completion this instance both finishes and owns is
     /// delivered without a query.
-    mailbox: Arc<Mailbox>,
+    trace_mailbox: Arc<TraceMailbox>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -87,13 +87,13 @@ impl Outbox {
     #[must_use]
     pub(crate) fn new_with_backend(config: OutboxConfig, backend: DbBackend) -> Self {
         let statements = Arc::new(OutboxStatements::new(backend, &config.tables));
-        let mailbox = Arc::new(Mailbox::new(
+        let trace_mailbox = Arc::new(TraceMailbox::new(
             config.instance_id.clone(),
             TraceRegistry::new(),
         ));
         Self {
             config,
-            mailbox,
+            trace_mailbox,
             statements,
             partitions: DashMap::new(),
             partition_to_queue: DashMap::new(),
@@ -134,7 +134,7 @@ impl Outbox {
     /// the trace is not a valid 1-256 byte printable-ASCII id.
     pub fn subscribe(&self, trace: &str) -> Result<TraceSubscription, OutboxError> {
         super::validation::validate_trace(trace)?;
-        Ok(self.mailbox.subscriptions().subscribe(trace))
+        Ok(self.trace_mailbox.registry().subscribe(trace))
     }
 
     /// Run `on_complete` when a traced batch finishes, without holding a future.
@@ -202,12 +202,12 @@ impl Outbox {
     /// answer to "is this instance polling for mail right now".
     #[must_use]
     pub fn outstanding_traces(&self) -> usize {
-        self.mailbox.subscriptions().len()
+        self.trace_mailbox.registry().len()
     }
 
     /// Who this instance is and who is waiting, for the ack path.
-    pub(crate) fn mailbox(&self) -> Arc<Mailbox> {
-        Arc::clone(&self.mailbox)
+    pub(crate) fn trace_mailbox(&self) -> Arc<TraceMailbox> {
+        Arc::clone(&self.trace_mailbox)
     }
 
     /// Record a traced submission.

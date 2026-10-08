@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use axum::extract::Path;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -14,6 +13,7 @@ use tokio::time::{Interval, interval};
 use tokio_util::sync::CancellationToken;
 use toolkit::api::canonical_prelude::*;
 use toolkit::api::odata::OData;
+use toolkit::api::rest::extract::Path;
 use toolkit_security::SecurityContext;
 use tracing::{Instrument, debug, info, warn};
 
@@ -47,7 +47,40 @@ pub(crate) async fn stream_message(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<AppServices>>,
     Path(chat_id): Path<uuid::Uuid>,
-    Json(body): Json<StreamMessageRequest>,
+    extract::Json(body): extract::Json<StreamMessageRequest>,
+) -> Response {
+    run_to_completion(async move { start_stream(&svc, ctx, chat_id, body).await }).await
+}
+
+/// Run a stream setup to its response in its own task. A client that
+/// disconnects drops the handler future; without the task, a drop after the
+/// turn (or the retry/edit mutation) commits would leave the new turn
+/// `running`, with its reserve booked, until the orphan watchdog. With it the
+/// setup finishes, the unsent response drops its `SseRelay`, and that
+/// cancels the stream, which finalizes the turn as cancelled.
+pub(crate) async fn run_to_completion(
+    fut: impl std::future::Future<Output = Response> + Send + 'static,
+) -> Response {
+    match tokio::spawn(fut.instrument(tracing::Span::current())).await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::error!(error = ?e, "stream setup task failed");
+            CanonicalError::internal("stream setup failed")
+                .create()
+                .into_response()
+        }
+    }
+}
+
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "sequential early returns with logging; tracing macros add most of the score"
+)]
+async fn start_stream(
+    svc: &AppServices,
+    ctx: SecurityContext,
+    chat_id: uuid::Uuid,
+    body: StreamMessageRequest,
 ) -> Response {
     // ── Pre-stream validation ──────────────────────────────────────────
     if body.content.trim().is_empty() {
@@ -66,18 +99,17 @@ pub(crate) async fn stream_message(
     tracing::Span::current().record("turn_request_id", tracing::field::display(request_id));
 
     // ── Resolve model + provider from chat ─────────────────────────────
-    let chat = match svc.chats.get_chat(&ctx, chat_id).await {
-        Ok(c) => c,
+    let selected_model = match svc.chats.chat_model_for_send(&ctx, chat_id).await {
+        Ok(model) => model,
         Err(e) => {
             warn!(error = %e, "failed to fetch chat for stream");
             return CanonicalError::from(e).into_response();
         }
     };
 
-    let selected_model = chat.model;
     let resolved = match svc
         .models
-        .resolve_model(ctx.subject_id(), Some(selected_model.clone()))
+        .resolve_chat_model(ctx.subject_id(), &selected_model)
         .await
     {
         Ok(r) => r,
@@ -119,7 +151,7 @@ pub(crate) async fn stream_message(
     {
         Ok(handle) => handle,
         Err(StreamError::Replay { turn }) => {
-            return replay_response(&svc, tenant_id, &selected_model, &turn, ping_secs).await;
+            return replay_response(svc, tenant_id, &selected_model, &turn, ping_secs).await;
         }
         Err(e) => return CanonicalError::from(e).into_response(),
     };

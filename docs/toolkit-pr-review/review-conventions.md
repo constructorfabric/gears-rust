@@ -50,7 +50,7 @@ this is not fixed — not by which rule the criterion happens to live under.
 A criterion may carry an inline marker. Each one changes whether you may post a finding.
 
 - **`Requires Rust >= X.Y`** — the rule depends on an API or compiler behavior newer than the
-  baseline. Check `rust-toolchain.toml` (currently `1.97.0`) and the workspace `rust-version`
+  baseline. Check `rust-toolchain.toml` (currently `1.98.1`) and the workspace `rust-version`
   (currently `1.95.0`) first. Never flag code for failing to use an API newer than the pinned
   toolchain, and never flag it for failing to use one newer than the MSRV in a crate that must
   honor it.

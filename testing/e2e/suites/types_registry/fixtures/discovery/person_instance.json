@@ -1,0 +1,7 @@
+{
+  "gts_id": "gts.cf.e2e.discovery.person.v1~cf.e2e.discovery.alice.v1",
+  "content": {
+    "name": "Alice",
+    "payload": {}
+  }
+}

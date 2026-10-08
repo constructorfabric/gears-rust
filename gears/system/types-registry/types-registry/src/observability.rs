@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::domain::compat::Baseline;
 use crate::domain::enums::OperationKind;
+use crate::domain::key::EntityKey;
 
 /// The label an operation's kind carries.
 const fn kind_label(kind: OperationKind) -> &'static str {
@@ -34,18 +35,23 @@ pub fn record_operation_facts(span: &Span, kind: OperationKind, dry_run: bool) {
 
 /// Span for one candidate. Record binary GTS versions now (ADR-0003);
 /// [`record_compat_facts`] fills fields learned during evaluation.
+///
+/// `entity_key` is the key the request named; `gts_id` is only ever an
+/// identifier — the key itself when it is one, and otherwise what a deletion
+/// resolved it to, recorded by [`record_resolved_gts_id`].
 #[must_use]
 pub fn unit_span(
     operation_id: Uuid,
-    gts_id: &str,
+    key: &EntityKey,
     kind: OperationKind,
     dry_run: bool,
     operation_item_id: i64,
 ) -> Span {
-    tracing::info_span!(
+    let span = tracing::info_span!(
         "types_registry.admission.unit",
         %operation_id,
-        gts_id,
+        entity_key = %key,
+        gts_id = field::Empty,
         kind = kind_label(kind),
         dry_run,
         operation_item_id,
@@ -59,7 +65,16 @@ pub fn unit_span(
         // and on the span rather than in a label: identities are unbounded and
         // the caller may not be entitled to read them.
         blocked_dependents = field::Empty,
-    )
+    );
+    if let Some(gts_id) = key.gts_id() {
+        record_resolved_gts_id(&span, gts_id);
+    }
+    span
+}
+
+/// The identifier a deletion's Registry Reference resolved to.
+pub fn record_resolved_gts_id(span: &Span, gts_id: &str) {
+    span.record("gts_id", gts_id);
 }
 
 /// Record how many live direct dependants refused a deletion (T20).
