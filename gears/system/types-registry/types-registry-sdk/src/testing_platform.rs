@@ -526,7 +526,7 @@ fn snapshot(gts_id: &str, stored: &Stored, fields: &crate::FieldSelection) -> En
 }
 
 fn validator(stored: &Stored) -> Validator {
-    Validator::from_bytes(format!("\"v{}\"", stored.resource_version).into_bytes())
+    Validator::from_bytes(format!("v{}", stored.resource_version).into_bytes())
 }
 
 impl FakePlatformRegistry {

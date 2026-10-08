@@ -20,8 +20,8 @@ use super::dto::{
 };
 use super::params::{DiscoveryParams, ExactReadSelection, NoQuery};
 use super::paths::V2;
-use crate::api::encoding::cursor::{self, Binding};
 use crate::domain::admission::{Accepted, Candidate, SubmitRequest};
+use crate::domain::cursor::{self, Binding};
 use crate::domain::error::DomainError;
 use crate::domain::registry_service::{
     BatchGetItem, DeleteRequest, DeleteTarget, DiscoveryQuery, EntityKey, EntityLookup,

@@ -208,7 +208,7 @@ impl<S: Send + Sync> FromRequestParts<S> for DiscoveryParams {
             return Err(page_size_zero(name));
         }
         let cursor = cursor
-            .map(|(_, token)| crate::api::encoding::cursor::read(token))
+            .map(|(_, token)| crate::domain::cursor::read(token))
             .transpose()?;
 
         let (query, selection) = odata(parts, state, &pairs).await?;

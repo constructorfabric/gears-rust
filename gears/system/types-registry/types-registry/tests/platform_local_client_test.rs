@@ -8,10 +8,10 @@ use serde_json::json;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::gts_id;
 use toolkit_security::PlatformSecurityContext;
-use types_registry::api::local_client::LocalClient;
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::OperationDispatch;
 use types_registry::domain::key::EntityKey as DomainKey;
+use types_registry::domain::local_client::LocalClient;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::registry_service::{EntityLookup as DomainLookup, RegistryService};
 use types_registry::domain::selection::FieldSelection as DomainSelection;
@@ -309,7 +309,7 @@ async fn a_read_carries_the_domain_validator_byte_for_byte_and_answers_unchanged
         })
     ));
 
-    // T22d's value, framed exactly as REST frames it.
+    // T22d's token itself: the RFC 9110 quotes are REST's representation, not the validator.
     let selection = DomainSelection::parse(&["content", "origin"]).expect("selection");
     let DomainLookup::Found { etag: domain, .. } = h
         .service
@@ -319,10 +319,7 @@ async fn a_read_carries_the_domain_validator_byte_for_byte_and_answers_unchanged
     else {
         panic!("found");
     };
-    assert_eq!(
-        etag.as_bytes(),
-        format!("\"{}\"", domain.encode()).as_bytes()
-    );
+    assert_eq!(etag.as_bytes(), domain.encode().as_bytes());
 
     let again = h
         .client
@@ -342,6 +339,32 @@ async fn a_read_carries_the_domain_validator_byte_for_byte_and_answers_unchanged
         again.0[&key],
         EntityLookup::Unchanged { etag: etag.clone() }
     );
+}
+
+#[tokio::test]
+async fn a_validator_this_registry_never_issued_is_answered_in_full() {
+    let h = harness().await;
+    register_and_complete(&h, "k-n", register(vec![create(CF_TYPE, schema(CF_TYPE))])).await;
+    let key = EntityKey::from(id(CF_TYPE));
+
+    let lookups = h
+        .client
+        .batch_get_entities(
+            &ctx(),
+            batch(
+                vec![BatchGetItem {
+                    key: key.clone(),
+                    if_none_match: Some(types_registry_sdk::Validator::from_bytes(
+                        b"\"not-a-token\"".to_vec(),
+                    )),
+                }],
+                Projection::Default,
+            ),
+        )
+        .await
+        .expect("an unknown token is not a refusal");
+
+    assert!(matches!(lookups.0[&key], EntityLookup::Found { .. }));
 }
 
 #[tokio::test]

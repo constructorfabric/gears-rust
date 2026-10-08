@@ -6,11 +6,12 @@
 //! build understands. A cursor that outlives a protocol change is then a `400`
 //! rather than a silently wrong page.
 //!
-//! # Adapter boundary
+//! # Domain, not transport
 //!
-//! The domain's position is a stored `gts_id` — [`DiscoveryQuery::after`]. The
-//! base64url envelope is shared by both adapters; discovery sees only a key.
-//! Refusals use the transport-free [`crate::api::error`] ladder.
+//! The page position is a stored `gts_id` — [`DiscoveryQuery::after`] — and the
+//! token is how the registry hands it out: which query it binds is a pagination rule,
+//! so it lives here and every adapter passes the token through as it is. Refusals are
+//! [`ServiceError`]s; the API ladder turns them into canonical errors.
 //!
 //! # What the cursor binds
 //!
@@ -23,13 +24,12 @@
 
 use std::num::NonZeroU8;
 
-use toolkit_canonical_errors::CanonicalError;
+use toolkit_macros::domain_model;
 use toolkit_odata::pagination::short_filter_hash;
 use toolkit_odata::{CursorV1, ODataOrderBy, OrderKey, SortDir, ast, validate_cursor_against};
 
-use crate::api::error::{cursor_not_usable, cursor_too_long};
 use crate::domain::enums::{EntityKind, LifecycleFilter};
-use crate::domain::registry_service::{DiscoveryQuery, MAX_KEY_LEN, is_canonical};
+use crate::domain::registry_service::{DiscoveryQuery, MAX_KEY_LEN, ServiceError, is_canonical};
 use crate::domain::selection::FieldSelection;
 
 /// The one keyset column. `gts_id` is unique and immutable, which is what makes the
@@ -102,6 +102,7 @@ fn binding_hash(binding: &Binding<'_>) -> Option<String> {
 }
 
 /// What a discovery cursor is bound to.
+#[domain_model]
 pub struct Binding<'a> {
     pub pattern: Option<&'a str>,
     pub kind: Option<EntityKind>,
@@ -135,9 +136,9 @@ impl<'a> From<&'a DiscoveryQuery> for Binding<'a> {
 /// Encode the position a page stopped at, bound to the query that produced it.
 ///
 /// # Errors
-/// A canonical internal error if the token will not serialize, which is a bug here
-/// rather than anything the caller did.
-pub fn encode(after: &str, binding: &Binding<'_>) -> Result<String, CanonicalError> {
+/// [`ServiceError::CursorUnencodable`] if the token will not serialize, which is a bug
+/// here rather than anything the caller did.
+pub fn encode(after: &str, binding: &Binding<'_>) -> Result<String, ServiceError> {
     CursorV1 {
         k: vec![after.to_owned()],
         o: SortDir::Asc,
@@ -148,7 +149,7 @@ pub fn encode(after: &str, binding: &Binding<'_>) -> Result<String, CanonicalErr
     .encode()
     .map_err(|e| {
         tracing::error!(error = %e, "types_registry could not encode a discovery cursor");
-        CanonicalError::internal("the registry could not construct a page cursor").create()
+        ServiceError::CursorUnencodable
     })
 }
 
@@ -158,54 +159,59 @@ const MAX_TOKEN_LEN: usize = 4096;
 /// Read a token, refusing an oversized or undecodable one.
 ///
 /// # Errors
-/// A `400` naming `cursor`.
-pub fn read(token: &str) -> Result<CursorV1, CanonicalError> {
+/// [`ServiceError::CursorTooLong`] or [`ServiceError::CursorNotUsable`].
+pub fn read(token: &str) -> Result<CursorV1, ServiceError> {
     if token.len() > MAX_TOKEN_LEN {
-        return Err(cursor_too_long(token.len()));
+        return Err(ServiceError::CursorTooLong { len: token.len() });
     }
-    CursorV1::decode(token).map_err(|e| cursor_not_usable(&e.to_string()))
+    CursorV1::decode(token).map_err(|e| not_usable(&e.to_string()))
 }
 
 #[cfg(test)]
-fn decode(token: &str, binding: &Binding<'_>) -> Result<String, CanonicalError> {
+fn decode(token: &str, binding: &Binding<'_>) -> Result<String, ServiceError> {
     resume(&read(token)?, binding)
 }
 
 /// The stored `gts_id` a [`read`] cursor resumes after.
 ///
 /// # Errors
-/// A `400` problem naming `cursor` when the token is of an unsupported shape or
-/// bound to a different query than this request asks.
-pub fn resume(cursor: &CursorV1, binding: &Binding<'_>) -> Result<String, CanonicalError> {
+/// [`ServiceError::CursorNotUsable`] when the token is of an unsupported shape or bound
+/// to a different query than this request asks.
+pub fn resume(cursor: &CursorV1, binding: &Binding<'_>) -> Result<String, ServiceError> {
     let expected = binding_hash(binding);
     validate_cursor_against(cursor, &page_order(), expected.as_deref())
-        .map_err(|e| cursor_not_usable(&e.to_string()))?;
+        .map_err(|e| not_usable(&e.to_string()))?;
     // `validate_cursor_against` skips the comparison when the token has no filter,
     // which only a pre-T22b cursor lacks.
     if cursor.f != expected {
-        return Err(cursor_not_usable(
+        return Err(not_usable(
             "it was issued for a different pattern, depth, kind, lifecycle_status or \
              $select than this request names",
         ));
     }
     if cursor.d != FORWARD {
-        return Err(cursor_not_usable("discovery pages forward only"));
+        return Err(not_usable("discovery pages forward only"));
     }
     match cursor.k.as_slice() {
         [after] if after.len() <= MAX_KEY_LEN && is_canonical(after) => Ok(after.clone()),
-        [_] => Err(cursor_not_usable(
-            "its position is not a canonical GTS identifier",
-        )),
-        keys => Err(cursor_not_usable(&format!(
+        [_] => Err(not_usable("its position is not a canonical GTS identifier")),
+        keys => Err(not_usable(&format!(
             "a discovery cursor names exactly one key, not {}",
             keys.len()
         ))),
     }
 }
 
+/// A refused cursor, with the reason the caller is told.
+fn not_usable(detail: &str) -> ServiceError {
+    ServiceError::CursorNotUsable {
+        detail: detail.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use toolkit_canonical_errors::{FieldViolation, InvalidArgument};
+    use toolkit_canonical_errors::{CanonicalError, FieldViolation, InvalidArgument};
     use types_registry_sdk::field;
 
     use super::*;
@@ -263,8 +269,8 @@ mod tests {
     }
 
     /// The one violation a refusal carries.
-    fn violation<T: std::fmt::Debug>(result: Result<T, CanonicalError>) -> FieldViolation {
-        match result {
+    fn violation<T: std::fmt::Debug>(result: Result<T, ServiceError>) -> FieldViolation {
+        match result.map_err(CanonicalError::from) {
             Err(CanonicalError::InvalidArgument {
                 ctx: InvalidArgument::FieldViolations { field_violations },
                 ..

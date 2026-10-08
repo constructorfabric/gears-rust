@@ -58,6 +58,10 @@ impl fmt::Display for EntityKey {
 }
 
 /// Opaque registry freshness bytes (SPEC §8.5); equality only, never recomputed here.
+///
+/// The registry's validator token, never an HTTP entity-tag: a REST transport strips the
+/// RFC 9110 quotes on receipt and restores them on send, so a token is the same bytes from
+/// any client.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Validator(Vec<u8>);
 

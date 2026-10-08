@@ -17,7 +17,7 @@ use types_registry_sdk::{RegisterResult, RegisterSummary, TypesRegistryClient};
 
 use crate::config::TypesRegistryConfig;
 use crate::domain::admission::OperationDispatch;
-use crate::domain::local_client::TypesRegistryLocalClient;
+use crate::domain::legacy_local_client::TypesRegistryLocalClient;
 use crate::domain::policy::RegistrationPolicy;
 use crate::domain::ports::Stores;
 use crate::domain::ports::metrics::AdmissionMetrics;

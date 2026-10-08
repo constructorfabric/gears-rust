@@ -2591,8 +2591,8 @@ T47 for the always-submit change below, now T41.)*
   remaining violations are context.<name>/value. Unknown reasons/context round-trip.
   Default list helpers select content and schema materializations; explicit Select
   is preserved.
-- `api::local_client::LocalClient` shares REST cursor/tag encoding and
-  errors. Accepted-submit read-back failures are Aborted with operation ID; an
+- `domain::local_client::LocalClient` shares the domain cursor and the error ladder
+  with REST, and hands out the domain validator token unquoted (SPEC §8.5). Accepted-submit read-back failures are Aborted with operation ID; an
   injected outbox/database test proves same-key recovery. ClientHub registration
   waits for T29.
 - Reconciliation settles equal content immediately. Only explicit NotFound permits
@@ -2652,13 +2652,13 @@ for both crates.
 - `TypesRegistryApiExt` and `PlatformTypesRegistryApiExt` bind their contract and context into
   one private `EntityReads`; the helpers exist once. `FakePlatformRegistry` serves both contracts
   from one store through shared inherent reads.
-- `api::local_client::LocalClient` (renamed from `PlatformLocalClient`) implements both traits
+- `domain::local_client::LocalClient` (renamed from `PlatformLocalClient`) implements both traits
   over two shared inherent reads, so parity is structural; `tenant_local_client_test` compares
   every tenant answer, validators, cursors and refusals included, with the platform's.
   The gear registers neither client in its ClientHub; fixture hosts construct it.
 
 **Dependencies:** T24
-**Files likely touched:** `TR-SDK/src/{tenant_contract,ext,lib}.rs` and their tests, `TR/src/api/local_client.rs`, `TR/tests/tenant_local_client_test.rs`
+**Files likely touched:** `TR-SDK/src/{tenant_contract,ext,lib}.rs` and their tests, `TR/src/domain/local_client.rs`, `TR/tests/tenant_local_client_test.rs`
 **Scope:** M — two commits as listed
 
 ---
@@ -2781,7 +2781,7 @@ Commits inside the task: (1) private wire DTOs and codecs; (2) the platform clie
 QUICKSTART examples, as one commit.
 
 **Acceptance criteria:**
-- [ ] Codecs round-trip projected snapshots, validators and operations without serde or HTTP on the semantic models; unknown failure reasons and context are preserved; omission and `null` stay distinct; a malformed operation payload is refused, not defaulted
+- [ ] Codecs round-trip projected snapshots, validators and operations without serde or HTTP on the semantic models; a received entity-tag becomes `Validator` without its RFC 9110 quotes and gets them back when sent, so a validator is the same token from either transport (SPEC §8.5); unknown failure reasons and context are preserved; omission and `null` stay distinct; a malformed operation payload is refused, not defaulted
 - [ ] Every `PlatformTypesRegistryApi` method works over real TCP and meets the platform rows of the REST contract — `Idempotency-Key`, `Location`, `Retry-After`, `200`/`202`, read-back through `get_operation`, `ETag`/`304`, per-key `unchanged`, projection, bounded pagination and cursor/filter binding — with a freshly resolved internal token on every attempt and never a bearer
 - [ ] Submit → poll → read returns real item outcomes, never a synthesized receipt; a lost read-back names the accepted operation so the caller can replay the same key (D19); only keyed submissions and safe reads retry
 - [ ] The platform route set serves only `/types-registry/platform/v1/` with `.platform_authenticated()`; no `/v2/` mutation or `get_operation` route remains; the three `/v2/` reads keep their bearer. C2, C6 and C8 source comments match the REST contract
@@ -2814,7 +2814,7 @@ Commits inside the task: (1) tenant routes on shared domain calls and the tenant
 (2) the authenticator bootstrap/gate and SPEC §8.4.
 
 **Acceptance criteria:**
-- [ ] Real TCP tenant reads match the T24a local client: `ETag`/`304`, `unchanged` and cursor semantics; each call forwards its own `SecurityContext` bearer and never the internal token; tenant handlers read `Extension<SecurityContext>` only
+- [ ] Real TCP tenant reads match the T24a local client: `ETag`/`304`, `unchanged` and cursor semantics, the validator as the unquoted token (SPEC §8.5); each call forwards its own `SecurityContext` bearer and never the internal token; tenant handlers read `Extension<SecurityContext>` only
 - [ ] The tenant routes share their handlers' domain calls with the platform twins; `get_operation` has no tenant route
 - [ ] The standalone registry installs `AuthNResolverBearerAuthenticator`; the production linked/remote authn-resolver topology is decided and recorded in SPEC §8.4; without an authenticator a tenant route answers a canonical `401` before handler dispatch while platform routes are served
 - [ ] Every REST-contract item owned by T27 is met; the interim tenant path is adapter-internal, so callers see the semantic API only
@@ -2905,7 +2905,7 @@ in P0; visibility and Context-Tenant dimensions remain fixed until P1 tenancy.
 - [ ] Gear test through the real local client and the REST client: register → poll → read shows no stale entry after the terminal outcome
 
 **Dependencies:** T27a, T24, T22d
-**Files likely touched:** `TR-SDK/src/cache/` (moved from `TR/src/infra/cache/`), `TR/src/api/local_client.rs`, `TR/src/gear.rs`, `TR/src/config.rs`, `TR-SDK/tests/client_cache_test.rs`
+**Files likely touched:** `TR-SDK/src/cache/` (moved from `TR/src/infra/cache/`), `TR/src/domain/local_client.rs`, `TR/src/gear.rs`, `TR/src/config.rs`, `TR-SDK/tests/client_cache_test.rs`
 **Scope:** M
 
 ---
@@ -3089,7 +3089,7 @@ removed — it remains the deployment-time escape hatch for identities no gear c
 - [ ] Manual: restart, confirm entities and artifacts byte-identical
 
 **Dependencies:** T30 (Checkpoint 7A)
-**Files likely touched:** the audit list in this file and toolkit docs; `TR/src/gear.rs`, `TR/src/domain/{seeding,service}.rs`, `TR/src/config.rs`; `TR/src/infra/storage/in_memory_repo.rs`, `TR/src/domain/local_client.rs` and the old cache (deleted); `TR-SDK/src/legacy/` (deleted) and the legacy block in `TR-SDK/src/lib.rs`; `gear.rs` and the types-registry call sites of every consumer (~30 crates); `TR/tests/seeding_test.rs`, `TR/tests/ready_mode_tests.rs` (deleted)
+**Files likely touched:** the audit list in this file and toolkit docs; `TR/src/gear.rs`, `TR/src/domain/{seeding,service}.rs`, `TR/src/config.rs`; `TR/src/infra/storage/in_memory_repo.rs`, `TR/src/domain/legacy_local_client.rs` and the old cache (deleted); `TR-SDK/src/legacy/` (deleted) and the legacy block in `TR-SDK/src/lib.rs`; `gear.rs` and the types-registry call sites of every consumer (~30 crates); `TR/tests/seeding_test.rs`, `TR/tests/ready_mode_tests.rs` (deleted)
 **Scope:** L — the audit commit, the registry half, then mechanical consumer commits per gear group; the cutover merges as one change, because the old trait is deleted in it
 
 ---
@@ -3473,7 +3473,7 @@ Commits inside the task: (1) stamp; (2) migration; (3) durable context and finge
 - [ ] The real local client and the real TCP contract test — mixed credentials, an invalid SemVer, strict operation-result parsing
 
 **Dependencies:** T38 (Checkpoint 8)
-**Files likely touched:** `TR/src/domain/admission/{publication,acceptance,fingerprint}.rs`, `TR/src/domain/ports/mod.rs`, a new migration and `migrations/mod.rs`, migration tests, `TR/src/infra/storage/{entity,repo/entity_repo}.rs` and the operation ORM/repo, `docs/database.sql`, `TR/src/api/rest/{dto,handlers}.rs`, `TR/src/api/local_client.rs`, `TR-SDK/src/rest_client/dto.rs`, `TR/tests/rest_client_contract_test.rs`
+**Files likely touched:** `TR/src/domain/admission/{publication,acceptance,fingerprint}.rs`, `TR/src/domain/ports/mod.rs`, a new migration and `migrations/mod.rs`, migration tests, `TR/src/infra/storage/{entity,repo/entity_repo}.rs` and the operation ORM/repo, `docs/database.sql`, `TR/src/api/rest/{dto,handlers}.rs`, `TR/src/domain/local_client.rs`, `TR-SDK/src/rest_client/dto.rs`, `TR/tests/rest_client_contract_test.rs`
 **Scope:** L — four commits as listed
 
 ---
@@ -3542,7 +3542,7 @@ Every P0 mutation is global and platform-plane, so after this task no write bypa
 - [ ] `make e2e-local` green with every request carrying a publisher
 
 **Dependencies:** T40
-**Files likely touched:** `TR-SDK/src/publication/{reconcile,mod,publish}.rs`, `TR/src/domain/seeding.rs`, `TR/src/api/rest/{dto,routes,handlers}.rs`, `TR/src/api/local_client.rs`, `TR/src/domain/admission/publication.rs`, SDK and API tests, e2e helpers, operator docs
+**Files likely touched:** `TR-SDK/src/publication/{reconcile,mod,publish}.rs`, `TR/src/domain/seeding.rs`, `TR/src/api/rest/{dto,routes,handlers}.rs`, `TR/src/domain/local_client.rs`, `TR/src/domain/admission/publication.rs`, SDK and API tests, e2e helpers, operator docs
 **Scope:** L — writers first, then the requirement as its own commit
 
 ---

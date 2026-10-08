@@ -2,11 +2,12 @@
 //! compatibility.
 
 use toolkit_canonical_errors::{CanonicalError, resource_error};
-use types_registry_sdk::{field, precondition};
+use types_registry_sdk::{field, precondition, reason};
 
 use crate::domain::admission::acceptance::{AcceptanceError, MAX_IDEMPOTENCY_KEY};
 use crate::domain::admission::worker::WorkerError;
 use crate::domain::error::DomainError;
+use crate::domain::local_client::LocalClientError;
 use crate::domain::registry_service::{MAX_BATCH_GET_KEYS, MAX_KEY_LEN, ServiceError};
 use crate::domain::selection::{EntityField, SelectionError};
 
@@ -26,6 +27,41 @@ pub fn operation_not_found(operation_id: uuid::Uuid) -> CanonicalError {
     OperationError::not_found(format!("No operation with id: {operation_id}"))
         .with_resource(operation_id.to_string())
         .create()
+}
+
+/// The local client's own refusals, in the shapes REST gives the same situations.
+impl From<LocalClientError> for CanonicalError {
+    fn from(e: LocalClientError) -> Self {
+        match e {
+            LocalClientError::ReadBackFailed { operation_id, why } => {
+                OperationError::aborted(format!(
+                    "operation {operation_id} was accepted, but {why}; retry with the same \
+                     idempotency key"
+                ))
+                .with_resource(operation_id.to_string())
+                .with_reason(reason::aborted::OPERATION_READ_FAILED)
+                .create()
+            }
+            LocalClientError::WrongKind { operation_id } => OperationError::unknown(format!(
+                "operation {operation_id} was accepted, but read back as an operation of an \
+                 unexpected kind"
+            ))
+            .with_resource(operation_id.to_string())
+            .create(),
+            LocalClientError::Unrepresentable { operation_id } => OperationError::unknown(format!(
+                "operation {operation_id} was accepted, but its record could not be represented"
+            ))
+            .with_resource(operation_id.to_string())
+            .create(),
+            LocalClientError::OperationNotFound { operation_id } => {
+                operation_not_found(operation_id)
+            }
+            LocalClientError::VersionOutOfRange { key, version } => invalid_version(
+                &key,
+                format!("{version} is not a resource version this registry issues"),
+            ),
+        }
+    }
 }
 
 impl From<DomainError> for CanonicalError {
@@ -189,6 +225,12 @@ impl From<ServiceError> for CanonicalError {
             // when it is parsed.
             ServiceError::ValidatorTooLong { len } => {
                 validator_too_long(field::IF_NONE_MATCH_FIELD, len)
+            }
+            ServiceError::CursorTooLong { len } => cursor_too_long(len),
+            ServiceError::CursorNotUsable { detail } => cursor_not_usable(&detail),
+            // A defect of ours, logged where it happened; the detail names the step.
+            ServiceError::CursorUnencodable => {
+                CanonicalError::internal("the registry could not construct a page cursor").create()
             }
         }
     }
@@ -555,7 +597,7 @@ fn invalid_candidate(gts_id: &str, field_name: &str, detail: String, code: &str)
 }
 
 /// A refused `expected_resource_version`, naming the candidate as the resource.
-pub(super) fn invalid_version(gts_id: &str, detail: String) -> CanonicalError {
+fn invalid_version(gts_id: &str, detail: String) -> CanonicalError {
     invalid_candidate(
         gts_id,
         field::EXPECTED_RESOURCE_VERSION_FIELD,

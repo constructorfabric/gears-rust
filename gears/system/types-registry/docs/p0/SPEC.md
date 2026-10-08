@@ -1172,6 +1172,14 @@ a versioned digest over `resource_version`, `resolution_fingerprint` where the k
 and the normalized selected-field set. A validator for a narrow representation cannot
 match a wider one, even if the underlying entity version is unchanged.
 
+**The SDK carries the token, not the entity-tag.** `Validator` holds the token's bytes —
+base64url of `version || digest`. The RFC 9110 framing — the quotes of `ETag` and
+`If-None-Match`, and of a batch item's `etag` and `if_none_match` — is REST's representation:
+the server adds it, and the REST SDK clients (T26, T27) strip it on receipt and restore it on
+send. The local client hands the token over as it is. Bytes that are not UTF-8 or not a
+current-version token make the condition unusable and the read proceeds in full (DESIGN
+§3.3); a value over the key bound is refused.
+
 `resolution_fingerprint` is not redundant beside `resource_version`, and this is the case a
 simpler digest gets wrong: a dependent's effective schema is refreshed when a base is revised
 (§8.1 step 4.6), and §13 requires an identical recomputation to move **no** `resource_version`.
@@ -1914,7 +1922,7 @@ libs/toolkit/src/                         Gear::post_wiring hook, generic readin
     │   ├── ports.rs                       NEW  persistence ports + the row / input types
     │   ├── service.rs                    rewritten
     │   └── repo.rs                       rewritten: async, DB-backed traits
-    ├── api/local_client.rs               PlatformTypesRegistryApi over the domain service; passes ctx through
+    ├── domain/local_client.rs            both contracts over the domain service; passes ctx through
     ├── infra/
     │   ├── storage/
     │   │   ├── entity/                    NEW  one file per entity, 9 tables (`02`)

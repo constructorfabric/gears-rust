@@ -231,6 +231,15 @@ pub enum ServiceError {
     /// The discovery pattern is not a GTS identifier pattern.
     #[error("the discovery pattern is not a GTS pattern: {message}")]
     InvalidPattern { message: String },
+    /// A discovery cursor longer than any token this registry issues.
+    #[error("a cursor must be at most 4096 bytes; this one is {len}")]
+    CursorTooLong { len: usize },
+    /// A cursor that will not decode, or that was issued for another query.
+    #[error("the cursor cannot be used for this request: {detail}")]
+    CursorNotUsable { detail: String },
+    /// A page cursor would not serialize: a defect here, never the caller's.
+    #[error("the registry could not construct a page cursor")]
+    CursorUnencodable,
 }
 
 impl ServiceError {
@@ -249,6 +258,9 @@ impl ServiceError {
             Self::ValidatorTooLong { .. } => "validator_too_long",
             Self::PageSizeOutOfRange { .. } => "page_size_out_of_range",
             Self::InvalidPattern { .. } => "invalid_pattern",
+            Self::CursorTooLong { .. } => "cursor_too_long",
+            Self::CursorNotUsable { .. } => "cursor_not_usable",
+            Self::CursorUnencodable => "cursor_unencodable",
         }
     }
 }

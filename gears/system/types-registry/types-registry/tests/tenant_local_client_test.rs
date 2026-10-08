@@ -11,9 +11,9 @@ use serde_json::json;
 use toolkit_canonical_errors::{CanonicalError, Problem};
 use toolkit_gts::gts_id;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
-use types_registry::api::local_client::LocalClient;
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::OperationDispatch;
+use types_registry::domain::local_client::LocalClient;
 use types_registry::domain::policy::RegistrationPolicy;
 use types_registry::domain::registry_service::RegistryService;
 use types_registry::infra::outbox::OutboxDispatch;
@@ -240,25 +240,43 @@ async fn a_batch_read_is_found_then_unchanged_under_the_same_select() {
 }
 
 #[tokio::test]
-async fn an_unreadable_condition_is_refused_as_the_platform_refuses_it() {
+async fn an_unusable_condition_reads_in_full_and_an_oversized_one_is_refused() {
     let h = harness().await;
-    let request = batch(
-        vec![BatchGetItem {
-            key: EntityKey::from(id(CF_TYPE)),
-            if_none_match: Some(Validator::from_bytes(vec![0xff, 0xfe])),
-        }],
-        Projection::Default,
+    seed(&h, vec![create(CF_TYPE, schema(CF_TYPE))]).await;
+    let key = EntityKey::from(id(CF_TYPE));
+    let conditional = |validator: Vec<u8>| {
+        batch(
+            vec![BatchGetItem {
+                key: key.clone(),
+                if_none_match: Some(Validator::from_bytes(validator)),
+            }],
+            Projection::Default,
+        )
+    };
+
+    // Not UTF-8, so not a token this registry issued: the condition is unusable (DESIGN §3.3).
+    let unusable = conditional(vec![0xff, 0xfe]);
+    let tenant_read = TypesRegistryApi::batch_get_entities(&h.client, &tenant(), unusable.clone())
+        .await
+        .expect("an unusable condition is not a refusal");
+    assert!(matches!(tenant_read.0[&key], EntityLookup::Found { .. }));
+    assert_eq!(
+        tenant_read,
+        PlatformTypesRegistryApi::batch_get_entities(&h.client, &platform(), unusable)
+            .await
+            .expect("reads")
     );
 
+    // The bound holds whatever the bytes are.
+    let oversized = conditional(vec![0xff; 2048]);
     let tenant_refusal =
-        TypesRegistryApi::batch_get_entities(&h.client, &tenant(), request.clone())
+        TypesRegistryApi::batch_get_entities(&h.client, &tenant(), oversized.clone())
             .await
-            .expect_err("not entity-tag text");
+            .expect_err("over the validator bound");
     let platform_refusal =
-        PlatformTypesRegistryApi::batch_get_entities(&h.client, &platform(), request)
+        PlatformTypesRegistryApi::batch_get_entities(&h.client, &platform(), oversized)
             .await
-            .expect_err("not entity-tag text");
-
+            .expect_err("over the validator bound");
     assert!(matches!(
         tenant_refusal,
         CanonicalError::InvalidArgument { .. }

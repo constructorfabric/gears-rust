@@ -1,4 +1,4 @@
-//! Shared REST/local entity-tag encoding (RFC 9110 §8.8.3).
+//! REST's entity-tag representation of the domain validator token (RFC 9110 §8.8.3).
 //! Reject unreadable conditions: answering unconditionally would change the caller’s request.
 
 use toolkit_canonical_errors::CanonicalError;

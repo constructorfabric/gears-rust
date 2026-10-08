@@ -1,4 +1,3 @@
-//! Shared cursor and validator encodings for API adapters.
+//! REST's representation of the domain validator token.
 
-pub mod cursor;
 pub mod entity_tag;
