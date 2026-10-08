@@ -13,8 +13,7 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 # PRD — Contracts & Agreements
 
 > **Status: first draft (2026-08-17).** Harvested from three sources: (a) the consumer-side
-> obligations already enumerated by Subscriptions in `gears/bss/subscriptions/docs/SEAMS.md`
-> **SUB-C1…C5**, which are today unfulfilled and governed by platform defaults; (b) the upstream
+> commercial lifecycle requirements from Subscriptions; (b) the upstream
 > `PRD-contracts-agreements-202601120119` in vhp-architecture, whose scope tables predate the
 > current gear split; (c) the two asks raised by the Orders Lifecycle PRD. Ownership boundaries
 > below reflect the **current** split (rating owns evaluation and true-up math, pricing owns the
@@ -450,7 +449,6 @@ TBD — to be derived per FR once §6 is reviewed.
 
 | Material | Link | Comments |
 |---|---|---|
-| Subscriptions seam map | `gears/bss/subscriptions/docs/SEAMS.md` | `SUB-C1…C5` are the consumer-side requirement list this draft harvests |
 | Orders Lifecycle PRD + review | vhp-architecture `docs/bss/prd/PRD-orders-lifecycle-202608101404/` | `contractId` precondition and the eligibility predicate; review findings F-11, F-9 |
 | Upstream Contracts PRD | vhp-architecture `docs/bss/prd/PRD-contracts-agreements-202601120119/` | Pre-split scope tables; see §2.2 migration |
 | Pricing PRD | `gears/bss/pricing/docs/PRD.md` | Canonical scope key the override windows bind to |
