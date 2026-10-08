@@ -199,8 +199,12 @@ impl<S: Send + Sync> FromRequestParts<S> for DiscoveryParams {
         let limit = slot(&pairs, [field::LIMIT_FIELD, field::TOP_FIELD])?;
         let cursor = slot(&pairs, [field::CURSOR_FIELD, field::SKIPTOKEN_FIELD])?;
         // Checked before ToolKit's extraction so the refusal names the spelling
-        // the caller used and carries the gear's cursor diagnostics.
-        if let Some((name, "0")) = limit {
+        // the caller used and carries the gear's cursor diagnostics. Any spelling
+        // ToolKit would read as zero (`00`, `+0`) is refused here, or it would answer
+        // with its own `$top` / `INVALID_LIMIT`.
+        if let Some((name, raw)) = limit
+            && raw.parse::<u64>() == Ok(0)
+        {
             return Err(page_size_zero(name));
         }
         let cursor = cursor

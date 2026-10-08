@@ -4314,8 +4314,19 @@ async fn toolkit_spellings_of_limit_and_cursor_are_one_slot_each() {
         let response = call(&router, discover(&query)).await;
         assert_field_refusal(&response, field, "VALIDATION_FAILED");
     }
-    let zero = call(&router, discover("?$top=0")).await;
-    assert_field_refusal(&zero, "$top", "VALIDATION_FAILED");
+    // Every spelling of zero is the gear's refusal under the name sent, never
+    // ToolKit's `$top` / `INVALID_LIMIT`; `%2B` is a literal `+`.
+    for (query, field) in [
+        ("?$top=0", "$top"),
+        ("?$top=00", "$top"),
+        ("?$top=%2B0", "$top"),
+        ("?limit=0", "limit"),
+        ("?limit=00", "limit"),
+        ("?limit=%2B0", "limit"),
+    ] {
+        let zero = call(&router, discover(query)).await;
+        assert_field_refusal(&zero, field, "VALIDATION_FAILED");
+    }
 }
 
 #[tokio::test]
