@@ -53,6 +53,6 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 toolkit-canonical-errors = { workspace = true }
 # The real Event Broker ingest service and its PolicyEnforcer produce checks.
 event-broker = { workspace = true, features = ["test-utils"] }
-event-broker-sdk = { workspace = true }
+event-broker-sdk = { path = "../../../event-broker/event-broker-sdk", package = "cf-gears-event-broker-sdk" }
 gts = { workspace = true }
 chrono = { workspace = true }

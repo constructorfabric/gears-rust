@@ -102,14 +102,14 @@ fn request<'r>(
 /// Observable gate result, detached from the transaction.
 #[derive(Debug, Clone, PartialEq)]
 enum Seen {
-    Replay(Replay),
+    Replay(Box<Replay>),
     Mismatch,
     Still,
     Owned(ClaimOrigin, Uuid),
 }
 fn seen<T: TransactionRunner>(gate: &Gate<'_, T>) -> Seen {
     match gate {
-        Gate::Replay(r) => Seen::Replay(r.clone()),
+        Gate::Replay(r) => Seen::Replay(Box::new(r.clone())),
         Gate::Mismatch => Seen::Mismatch,
         Gate::StillProcessing => Seen::Still,
         Gate::Owned(o) => Seen::Owned(o.origin(), o.record().execution_id),
@@ -964,7 +964,7 @@ async fn lost_reply_and_advisory_miss_return_the_winning_settlement_once() -> an
         else {
             panic!("probe did not replay")
         };
-        assert_eq!(again, replay);
+        assert_eq!(again, *replay);
         // A probe for another order (or another fingerprint) never replays this record.
         let other_scope = AccessScope::for_resources(vec![u(2)]);
         assert_eq!(
@@ -1251,10 +1251,10 @@ async fn commercial_execution_is_fenced_across_remote_calls() -> anyhow::Result<
     let (db, _) = pg.role("runtime").await?;
     create(&db, 1).await?;
     let doc = json!({"lines": ["line-a"]});
-    let k = key(Trigger::Submit, 40, "submit-1");
-    let f = fp(Trigger::Submit, Some(1), &doc);
+    let submit_key = key(Trigger::Submit, 40, "submit-1");
+    let submit_fp = fp(Trigger::Submit, Some(1), &doc);
     // 1. Short transaction: claim, allocate candidate, stamp it into line requests, commit.
-    let (k1, f1) = (k.clone(), f.clone());
+    let (k1, f1) = (submit_key.clone(), submit_fp.clone());
     let worker_a: DurableExecution = db
         .transaction_ref_mapped(move |tx| {
             Box::pin(async move {
@@ -1296,9 +1296,9 @@ async fn commercial_execution_is_fenced_across_remote_calls() -> anyhow::Result<
     let order_scope = AccessScope::for_resources(vec![u(1)]);
     let Probe::Existing(Frozen::Commercial(frozen)) = reg::probe(
         &db.conn()?,
-        &private_scope(&k),
-        &k,
-        &f,
+        &private_scope(&submit_key),
+        &submit_key,
+        &submit_fp,
         Some((u(1), &order_scope)),
     )
     .await?
@@ -1341,7 +1341,7 @@ async fn commercial_execution_is_fenced_across_remote_calls() -> anyhow::Result<
         .await?;
     pg.sql("UPDATE bss_orders__commercial_attempt SET lease_until=now()-interval '1 second'")
         .await?;
-    let (kb, fb) = (k.clone(), f.clone());
+    let (kb, fb) = (submit_key.clone(), submit_fp.clone());
     let worker_b: DurableExecution = db
         .transaction_ref_mapped(move |tx| {
             Box::pin(async move {
@@ -1408,7 +1408,12 @@ async fn commercial_execution_is_fenced_across_remote_calls() -> anyhow::Result<
             Err(Ok(RegistryError::StaleOwner))
         ));
     }
-    let (ka, fa, a_owner, b_owner) = (k.clone(), f.clone(), worker_a.owner(), worker_b.owner());
+    let (ka, fa, a_owner, b_owner) = (
+        submit_key.clone(),
+        submit_fp.clone(),
+        worker_a.owner(),
+        worker_b.owner(),
+    );
     let presented = db
         .transaction_ref_mapped(move |tx| {
             Box::pin(async move {
@@ -1463,7 +1468,7 @@ async fn commercial_execution_is_fenced_across_remote_calls() -> anyhow::Result<
             .await?,
         1
     );
-    let (kr, fr) = (k.clone(), f.clone());
+    let (kr, fr) = (submit_key.clone(), submit_fp.clone());
     let replay = db
         .transaction_ref_mapped(move |tx| {
             Box::pin(async move {
@@ -1480,10 +1485,7 @@ async fn commercial_execution_is_fenced_across_remote_calls() -> anyhow::Result<
         .await?;
     assert!(matches!(
         replay,
-        Seen::Replay(Replay {
-            outcome: ReplayOutcome::Refused(_),
-            ..
-        })
+        Seen::Replay(r) if matches!(r.outcome, ReplayOutcome::Refused(_))
     ));
     // The settled worker's handle is now stale too: no second settlement.
     let b = worker_b.clone();
