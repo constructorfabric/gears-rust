@@ -269,7 +269,7 @@ the design set — each slice implements the Subscriptions side of the seams lis
 
 ### Lifecycle D-201 receiver amendments
 
-The [receiver contract matrix](../../orders-lifecycle/docs/implementation/RECEIVER_CONTRACTS.md) preserves historical
+The receiver contract matrix preserves historical
 SUB-O aliases and names each semantic operation. All activation writers (direct, Orders,
 resume, transfer and key-changing plan change) obey the shared capacity/fence protocol.
 An Orders draft rebuild requires the [engine-issued successor](../../orders-lifecycle/docs/DESIGN.md#contract-06-replace-fulfillment-grant);

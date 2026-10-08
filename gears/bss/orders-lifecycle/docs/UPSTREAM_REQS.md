@@ -695,7 +695,7 @@ See the [selected integration contract](DESIGN.md#contract-01-event-platform-int
 
 **S2-08 integration status (2026-10-06).** Orders binds the real `EventBrokerApi`, managed
 Chained `DbProducer` and toolkit queue `bss-orders-events`; readiness requires every prerequisite
-([evidence](implementation/EVENTS.md)). These platform findings remain open:
+(evidence). These platform findings remain open:
 
 - **Partition-count read capability (requested).** No Event Broker API reports the partition
   count. `models::Topic` deliberately omits it because it is the broker's own configuration:
@@ -1168,7 +1168,7 @@ removes it when the gateway variant lands. Architecture decides between waiting 
 **Status (2026-10-07, S2-12, D-211):** the fallback is implemented and verified
 (`api::rest::throttle::PerOrderLimiter`, 20/min baseline, bounded key store, consulted before
 boundary validation; real-PostgreSQL and live E2E evidence in
-[MILESTONE](implementation/MILESTONE.md)). The request to the gateway stands: the gear-local
+MILESTONE). The request to the gateway stands: the gear-local
 limiter is per replica and Orders removes it when the composite key lands.
 
 ## 3. Priorities

@@ -1274,7 +1274,7 @@ Acceptance recording checks the current immutable version and never accepts a dr
 expiry and draft auto-void are scheduler-driven and deliberately absent from this surface;
 their complete internal engine inputs are specified in [07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6).
 
-**Implementation binding baseline (S1-02).** The [operation/storage catalog and boundary fixtures](implementation/contracts/CONTRACTS.md) enumerate the interfaces below and select adapter names, headers and routine input bounds where this design left them open. The catalog preserves business refusal ordering and documents the explicit HTTP 428 adapter exception. It is a design/fixture deliverable, not runtime or provider conformance.
+**Implementation binding baseline (S1-02).** The operation/storage catalog and boundary fixtures enumerate the interfaces below and select adapter names, headers and routine input bounds where this design left them open. The catalog preserves business refusal ordering and documents the explicit HTTP 428 adapter exception. It is a design/fixture deliverable, not runtime or provider conformance.
 
 #### API evolution and stability
 

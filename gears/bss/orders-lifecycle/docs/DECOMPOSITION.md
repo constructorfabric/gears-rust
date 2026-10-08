@@ -921,7 +921,7 @@ a production dependency. No feature may mark itself implemented merely because i
 
 ### 3.2 Selected reconciliation fixes and delivery sequence
 
-Agent-ready breakdown: [implementation handoff](implementation/README.md), [review and dispositions](implementation/REVIEW.md), and [source coverage inventory](implementation/COVERAGE.md). The six detailed plans contain 70 work packages with owner dependencies and completion evidence; stage numbers do not delay early upstream provider work.
+Agent-ready breakdown: implementation handoff, review and dispositions, and source coverage inventory. The six detailed plans contain 70 work packages with owner dependencies and completion evidence; stage numbers do not delay early upstream provider work.
 
 On 2026-10-05 the user selected A for R01–R10 and authorized the best recommendation
 for all remaining findings. R11–R14 also select A. These are **selected design contracts**,

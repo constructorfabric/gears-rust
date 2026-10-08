@@ -4282,7 +4282,7 @@
     "gears/bss/orders-lifecycle/docs/DESIGN.md": "0ab5463e778e8b74426ea7d92d018174c2e274b70ce8b5221808f61cf57ff657",
     "gears/bss/orders-lifecycle/docs/features/01-foundation.md": "b381b31eb3dcff85061e72ab759365b048ba821ce3630b5c2a92141be00e2f4d",
     "libs/toolkit-canonical-errors/src/problem.rs": "62cb4668bdd9fb7bbb76b2543dbd71667c3b480b64c1bd148d799312e2e9bb98",
-    "gears/bss/orders-lifecycle/docs/implementation/contracts/models.json": "8e2bdb3f82359094de71597fbc1334f66c505108ee28220f55b85ec9a086ef94"
+    "gears/bss/orders-lifecycle/orders-lifecycle-sdk/contracts/models.json": "8e2bdb3f82359094de71597fbc1334f66c505108ee28220f55b85ec9a086ef94"
   },
   "startup_invariants": [
     "unique operation method/path and SDK identity",
