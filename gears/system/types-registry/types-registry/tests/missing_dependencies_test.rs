@@ -71,6 +71,7 @@ async fn first_delivery_with_mode(
 ) -> Uuid {
     let receipt = registry
         .submit(
+            common::caller(),
             &SubmitRequest {
                 idempotency_key: Some("missing-dependency".to_owned()),
                 dry_run,
@@ -102,7 +103,7 @@ async fn assert_missing_dependency(
     dependency_kind: &str,
 ) {
     let operation = registry
-        .operation(operation_id)
+        .operation(common::caller(), operation_id)
         .await
         .expect("read operation")
         .expect("operation exists");
@@ -165,6 +166,7 @@ async fn assert_missing_dependency(
     assert!(
         registry
             .entity(
+                common::caller(),
                 &EntityKey::GtsId(candidate_id.to_owned()),
                 FieldSelection::full()
             )
@@ -238,7 +240,7 @@ async fn a_missing_dependency_does_not_prevent_an_independent_candidate_from_com
     )
     .await;
     let operation = registry
-        .operation(operation_id)
+        .operation(common::caller(), operation_id)
         .await
         .expect("read")
         .expect("operation");
@@ -253,6 +255,7 @@ async fn a_missing_dependency_does_not_prevent_an_independent_candidate_from_com
     assert!(
         registry
             .entity(
+                common::caller(),
                 &EntityKey::GtsId(INDEPENDENT.to_owned()),
                 FieldSelection::full()
             )
@@ -295,7 +298,7 @@ async fn dry_run_missing_dependencies_keep_the_same_diagnostics_without_entity_w
         )
         .await;
         let operation = registry
-            .operation(operation_id)
+            .operation(common::caller(), operation_id)
             .await
             .expect("read dry-run operation")
             .expect("operation exists");
@@ -310,6 +313,7 @@ async fn dry_run_missing_dependencies_keep_the_same_diagnostics_without_entity_w
         assert!(
             registry
                 .entity(
+                    common::caller(),
                     &EntityKey::GtsId(INDEPENDENT.to_owned()),
                     FieldSelection::full()
                 )
@@ -335,7 +339,7 @@ async fn an_instance_before_its_conforming_type_in_the_same_batch_succeeds() {
     .await;
 
     let operation = registry
-        .operation(operation_id)
+        .operation(common::caller(), operation_id)
         .await
         .expect("read operation")
         .expect("operation exists");
@@ -356,7 +360,11 @@ async fn an_instance_before_its_conforming_type_in_the_same_batch_succeeds() {
         assert!(item.error.is_none());
         assert!(
             registry
-                .entity(&EntityKey::GtsId(id.to_owned()), FieldSelection::full())
+                .entity(
+                    common::caller(),
+                    &EntityKey::GtsId(id.to_owned()),
+                    FieldSelection::full()
+                )
                 .await
                 .expect("read registered entity")
                 .is_some(),

@@ -156,6 +156,19 @@ impl std::ops::Deref for TestApi {
     }
 }
 
+/// The gear's routes with the request context `.authenticated()` installs in production:
+/// these tests call the handlers directly, below the authentication layer.
+fn routes(
+    router: Router,
+    openapi: &dyn toolkit::api::OpenApiRegistry,
+    legacy: Arc<TypesRegistryService>,
+    registry: Option<Arc<RegistryService>>,
+) -> Router {
+    types_registry::api::rest::routes::register_routes(router, openapi, legacy, registry).layer(
+        axum::Extension(toolkit_security::SecurityContext::anonymous()),
+    )
+}
+
 /// A router with both services wired, as `register_rest` builds it.
 async fn router_with_db() -> TestApi {
     router_with(false).await
@@ -225,12 +238,7 @@ async fn router_and_db_setup(
     } else {
         None
     };
-    let router = types_registry::api::rest::routes::register_routes(
-        Router::new(),
-        &openapi,
-        legacy,
-        Some(registry),
-    );
+    let router = routes(Router::new(), &openapi, legacy, Some(registry));
     let api = TestApi {
         router,
         _handle: handle,
@@ -249,7 +257,7 @@ fn router_without_db() -> Router {
         config,
     ));
     legacy.switch_to_ready().expect("switch legacy to ready");
-    types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None)
+    routes(Router::new(), &openapi, legacy, None)
 }
 
 fn schema(gts_id: &str) -> Value {
@@ -1374,8 +1382,7 @@ fn both_versions_are_declared_with_distinct_operation_ids() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let declared = openapi.operations.lock().expect("operations lock").clone();
 
@@ -1459,8 +1466,7 @@ fn mutation_routes_are_internal_only() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let exposure = openapi.exposure.lock().expect("exposure lock");
     for operation_id in MUTATION_OPERATIONS {
@@ -1484,8 +1490,7 @@ fn the_idempotency_key_header_is_declared_as_a_required_parameter() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let params = openapi.params.lock().expect("params lock").clone();
     for operation_id in V2_MUTATION_OPERATIONS {
@@ -1517,8 +1522,7 @@ fn the_single_deletion_query_parameters_are_declared() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let params = openapi.params.lock().expect("params lock").clone();
     let declared = params
@@ -1568,8 +1572,7 @@ fn submission_response_headers_are_declared() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let headers = openapi
         .response_headers
@@ -1616,8 +1619,7 @@ fn json_extractor_error_statuses_are_declared_for_both_post_operations() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let responses = openapi.responses.lock().expect("responses lock");
     for operation_id in [
@@ -3571,8 +3573,7 @@ fn the_discovery_query_parameters_are_declared() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let params = openapi.params.lock().expect("params lock").clone();
     let declared = params
@@ -3643,8 +3644,7 @@ fn all_seven_v2_operations_declare_problem_responses() {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &openapi, legacy, None);
+    let _router = routes(Router::new(), &openapi, legacy, None);
 
     let responses = openapi.responses.lock().expect("responses lock");
     for operation_id in V2_OPERATIONS {
@@ -4114,7 +4114,7 @@ fn router_for_openapi(openapi: &TestOpenApi) -> Router {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    types_registry::api::rest::routes::register_routes(Router::new(), openapi, legacy, None)
+    routes(Router::new(), openapi, legacy, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -4561,8 +4561,7 @@ fn generated_openapi() -> Value {
         Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
         config,
     ));
-    let _router =
-        types_registry::api::rest::routes::register_routes(Router::new(), &registry, legacy, None);
+    let _router = routes(Router::new(), &registry, legacy, None);
     let document = registry
         .build_openapi(&toolkit::api::OpenApiInfo::default())
         .expect("the document builds");

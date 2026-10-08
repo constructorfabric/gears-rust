@@ -17,6 +17,8 @@
 pub mod admission;
 // Materialized effective artifacts and the resolution fingerprint (SPEC D3).
 pub mod artifacts;
+// Who a call is made for, by plane (D17); P0 passes it through unread (C2/C6).
+pub mod caller;
 // Compatibility against one baseline: which definition, and the verdict (ADR-0003).
 pub mod compat;
 // The discovery page token: its envelope and the query it binds (D12).

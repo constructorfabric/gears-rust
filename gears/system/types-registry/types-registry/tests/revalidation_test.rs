@@ -1354,7 +1354,7 @@ async fn a_commit_on_one_pod_is_visible_to_the_others_first_read() -> Result<(),
     let key = EntityKey::parse(BASE);
     assert!(
         service(&pod_b)
-            .entity(&key, FieldSelection::full())
+            .entity(common::caller(), &key, FieldSelection::full())
             .await?
             .is_none(),
         "nothing is admitted yet"
@@ -1363,7 +1363,7 @@ async fn a_commit_on_one_pod_is_visible_to_the_others_first_read() -> Result<(),
     admit(&pod_a, "k-base", BASE, base_schema("name"), None).await;
 
     let first_read = service(&pod_b)
-        .entity(&key, FieldSelection::full())
+        .entity(common::caller(), &key, FieldSelection::full())
         .await?
         .expect("B's first read after A's commit must see it");
     assert_eq!(first_read.origin.map(|o| o.resource_version), Some(1));
@@ -1372,7 +1372,7 @@ async fn a_commit_on_one_pod_is_visible_to_the_others_first_read() -> Result<(),
     // there is no second thing to invalidate.
     admit(&pod_a, "k-base-2", BASE, base_schema("label"), Some(1)).await;
     let second_read = service(&pod_b)
-        .entity(&key, FieldSelection::full())
+        .entity(common::caller(), &key, FieldSelection::full())
         .await?
         .expect("the entity is still there");
     assert_eq!(second_read.origin.map(|o| o.resource_version), Some(2));

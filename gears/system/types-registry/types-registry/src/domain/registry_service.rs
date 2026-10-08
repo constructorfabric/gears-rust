@@ -23,6 +23,7 @@ use crate::domain::admission::{
     Accepted, OperationDispatch, StoredFailure, SubmitRequest, UnreadableFailure,
 };
 pub use crate::domain::admission::{DeleteRequest, DeleteTarget};
+use crate::domain::caller::CallerContext;
 use crate::domain::enums::{
     EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus, OperationKind,
     OperationStatus,
@@ -367,6 +368,7 @@ impl RegistryService {
     /// fingerprint conflict.
     pub async fn submit(
         &self,
+        _caller: CallerContext<'_>,
         request: &SubmitRequest,
         now: OffsetDateTime,
     ) -> Result<Accepted, ServiceError> {
@@ -419,6 +421,7 @@ impl RegistryService {
     /// Registry Reference is not one: its item fails in the worker.
     pub async fn delete(
         &self,
+        _caller: CallerContext<'_>,
         request: &DeleteRequest,
         now: OffsetDateTime,
     ) -> Result<Accepted, ServiceError> {
@@ -444,7 +447,22 @@ impl RegistryService {
     /// # Errors
     /// [`ServiceError::Storage`] for a read failure. An absent operation is
     /// `Ok(None)`, because "not found" is an answer rather than a fault.
-    pub async fn operation(&self, id: Uuid) -> Result<Option<OperationRecord>, ServiceError> {
+    pub async fn operation(
+        &self,
+        _caller: CallerContext<'_>,
+        id: Uuid,
+    ) -> Result<Option<OperationRecord>, ServiceError> {
+        self.operation_record(id).await
+    }
+
+    /// [`Self::operation`] for the registry's own driver, which acts for no caller.
+    ///
+    /// # Errors
+    /// As [`Self::operation`].
+    pub(crate) async fn operation_record(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<OperationRecord>, ServiceError> {
         let provider: DBProvider<ServiceError> = DBProvider::new(self.db.clone());
         let scope = Self::scope();
         let stores = Arc::clone(&self.stores);
@@ -501,10 +519,11 @@ impl RegistryService {
     /// [`ServiceError::CorruptDocument`] if a stored document is not JSON.
     pub async fn entity(
         &self,
+        caller: CallerContext<'_>,
         key: &EntityKey,
         selection: FieldSelection,
     ) -> Result<Option<EntityRecord>, ServiceError> {
-        Ok(match self.lookup(key, selection, None).await? {
+        Ok(match self.lookup(caller, key, selection, None).await? {
             EntityLookup::Found { record, .. } => Some(record),
             EntityLookup::Unchanged { .. } | EntityLookup::NotFound => None,
         })
@@ -516,6 +535,7 @@ impl RegistryService {
     /// As [`Self::batch_get`].
     pub async fn lookup(
         &self,
+        caller: CallerContext<'_>,
         key: &EntityKey,
         selection: FieldSelection,
         if_none_match: Option<IfNoneMatch>,
@@ -525,7 +545,7 @@ impl RegistryService {
             if_none_match,
         };
         let mut results = self
-            .batch_get(std::slice::from_ref(&item), selection)
+            .batch_get(caller, std::slice::from_ref(&item), selection)
             .await?;
         Ok(results
             .pop()
@@ -552,6 +572,7 @@ impl RegistryService {
     /// [`ServiceError::CorruptDocument`] if a stored document is not JSON.
     pub async fn batch_get(
         &self,
+        _caller: CallerContext<'_>,
         items: &[BatchGetItem],
         selection: FieldSelection,
     ) -> Result<Vec<(EntityKey, EntityLookup)>, ServiceError> {
@@ -684,7 +705,11 @@ impl RegistryService {
     /// [`ServiceError::PageSizeOutOfRange`] for a refused `limit`,
     /// [`ServiceError::InvalidPattern`] for a pattern `gts-rust` will not compile,
     /// or [`ServiceError::Storage`] for a read failure.
-    pub async fn discover(&self, query: &DiscoveryQuery) -> Result<DiscoveryPage, ServiceError> {
+    pub async fn discover(
+        &self,
+        _caller: CallerContext<'_>,
+        query: &DiscoveryQuery,
+    ) -> Result<DiscoveryPage, ServiceError> {
         let max = self.config.limits.page_size_max;
         let limit = match query.limit {
             None => self.config.limits.page_size_default,

@@ -2786,6 +2786,7 @@ QUICKSTART examples, as one commit.
 - [ ] Submit → poll → read returns real item outcomes, never a synthesized receipt; a lost read-back names the accepted operation so the caller can replay the same key (D19); only keyed submissions and safe reads retry
 - [ ] The platform route set serves only `/types-registry/platform/v1/` with `.platform_authenticated()`; no `/v2/` mutation or `get_operation` route remains; the three `/v2/` reads keep their bearer. C2, C6 and C8 source comments match the REST contract
 - [ ] The async-surface e2e callers and configuration move in the same commit as the routes (REST contract, e2e item); legacy v1 writers are untouched
+- [ ] Platform routes pass `CallerContext::Platform` from the validated internal token, and `RegistryService::{submit, delete, operation}` narrow to it: a `CallerContext::Tenant` reaching them is refused (D17), so a tenant bearer cannot mutate or read an operation by any path
 
 **Verification:**
 - [ ] `cargo test -p cf-gears-types-registry-sdk --features rest-client`; `cargo check -p cf-gears-types-registry-sdk --all-targets --all-features`

@@ -324,7 +324,12 @@ async fn a_read_carries_the_domain_validator_byte_for_byte_and_answers_unchanged
     let selection = DomainSelection::parse(&["content", "origin"]).expect("selection");
     let DomainLookup::Found { etag: domain, .. } = h
         .service
-        .lookup(&DomainKey::GtsId(CF_TYPE.to_owned()), selection, None)
+        .lookup(
+            common::caller(),
+            &DomainKey::GtsId(CF_TYPE.to_owned()),
+            selection,
+            None,
+        )
         .await
         .expect("domain read")
     else {
@@ -581,7 +586,7 @@ async fn a_failed_read_back_names_the_accepted_operation_and_the_same_key_recove
     let operation_id = aborted_operation(&lost);
     assert!(
         h.service
-            .operation(operation_id)
+            .operation(common::caller(), operation_id)
             .await
             .expect("reads")
             .is_some(),
@@ -741,6 +746,7 @@ async fn a_full_read_carries_every_materialized_document_and_the_provenance() {
     let DomainLookup::Found { record, .. } = h
         .service
         .lookup(
+            common::caller(),
             &DomainKey::GtsId(CF_TYPE.to_owned()),
             DomainSelection::full(),
             None,

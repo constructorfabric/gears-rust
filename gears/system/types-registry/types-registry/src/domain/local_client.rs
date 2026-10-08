@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::domain::admission::{
     Candidate, DeleteRequest, DeleteTarget, StoredFailure, SubmitRequest, UnreadableFailure,
 };
+use crate::domain::caller::CallerContext;
 use crate::domain::cursor::{self, Binding};
 use crate::domain::enums::{
     EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus, OperationKind,
@@ -47,8 +48,12 @@ impl LocalClient {
     }
 
     /// The operation an accepted submit created, read back (D19).
-    async fn read_back(&self, operation_id: Uuid) -> Result<OperationRecord, CanonicalError> {
-        match self.service.operation(operation_id).await {
+    async fn read_back(
+        &self,
+        caller: CallerContext<'_>,
+        operation_id: Uuid,
+    ) -> Result<OperationRecord, CanonicalError> {
+        match self.service.operation(caller, operation_id).await {
             Ok(Some(record)) => Ok(record),
             Ok(None) => Err(read_back_failed(operation_id, "it could not be found")),
             Err(e) => {
@@ -65,6 +70,7 @@ impl LocalClient {
     /// The batch read both contracts serve.
     async fn batch_get(
         &self,
+        caller: CallerContext<'_>,
         request: sdk::BatchGetEntitiesRequest,
     ) -> Result<sdk::BatchGetEntitiesResponse, CanonicalError> {
         let selection = selection(&request.projection);
@@ -83,7 +89,7 @@ impl LocalClient {
 
         let results = self
             .service
-            .batch_get(&reads, selection)
+            .batch_get(caller, &reads, selection)
             .await
             .map_err(CanonicalError::from)?;
 
@@ -104,6 +110,7 @@ impl LocalClient {
     /// The discovery page both contracts serve.
     async fn list(
         &self,
+        caller: CallerContext<'_>,
         query: sdk::ListEntitiesRequest,
     ) -> Result<sdk::ListEntitiesResponse, CanonicalError> {
         let mut discovery = DiscoveryQuery {
@@ -122,7 +129,7 @@ impl LocalClient {
 
         let page = self
             .service
-            .discover(&discovery)
+            .discover(caller, &discovery)
             .await
             .map_err(CanonicalError::from)?;
 
@@ -147,23 +154,23 @@ impl LocalClient {
 impl PlatformTypesRegistryApi for LocalClient {
     async fn batch_get_entities(
         &self,
-        _ctx: &PlatformSecurityContext,
+        ctx: &PlatformSecurityContext,
         request: sdk::BatchGetEntitiesRequest,
     ) -> Result<sdk::BatchGetEntitiesResponse, CanonicalError> {
-        self.batch_get(request).await
+        self.batch_get(CallerContext::Platform(ctx), request).await
     }
 
     async fn list_entities(
         &self,
-        _ctx: &PlatformSecurityContext,
+        ctx: &PlatformSecurityContext,
         query: sdk::ListEntitiesRequest,
     ) -> Result<sdk::ListEntitiesResponse, CanonicalError> {
-        self.list(query).await
+        self.list(CallerContext::Platform(ctx), query).await
     }
 
     async fn register_entities(
         &self,
-        _ctx: &PlatformSecurityContext,
+        ctx: &PlatformSecurityContext,
         key: sdk::IdempotencyKey,
         request: sdk::RegisterEntitiesRequest,
     ) -> Result<sdk::RegistrationOperation, CanonicalError> {
@@ -192,12 +199,19 @@ impl PlatformTypesRegistryApi for LocalClient {
 
         let accepted = self
             .service
-            .submit(&submit, time::OffsetDateTime::now_utc())
+            .submit(
+                CallerContext::Platform(ctx),
+                &submit,
+                time::OffsetDateTime::now_utc(),
+            )
             .await
             .map_err(CanonicalError::from)?;
         let operation_id = accepted.operation_id;
-        match operation_from(self.read_back(operation_id).await?)
-            .map_err(|e| unrepresentable(operation_id, &e))?
+        match operation_from(
+            self.read_back(CallerContext::Platform(ctx), operation_id)
+                .await?,
+        )
+        .map_err(|e| unrepresentable(operation_id, &e))?
         {
             sdk::Operation::Registration(operation) => Ok(operation),
             sdk::Operation::Deletion(_) => Err(wrong_kind(operation_id)),
@@ -206,7 +220,7 @@ impl PlatformTypesRegistryApi for LocalClient {
 
     async fn delete_entities(
         &self,
-        _ctx: &PlatformSecurityContext,
+        ctx: &PlatformSecurityContext,
         key: sdk::IdempotencyKey,
         request: sdk::DeleteEntitiesRequest,
     ) -> Result<sdk::DeletionOperation, CanonicalError> {
@@ -231,12 +245,19 @@ impl PlatformTypesRegistryApi for LocalClient {
 
         let accepted = self
             .service
-            .delete(&delete, time::OffsetDateTime::now_utc())
+            .delete(
+                CallerContext::Platform(ctx),
+                &delete,
+                time::OffsetDateTime::now_utc(),
+            )
             .await
             .map_err(CanonicalError::from)?;
         let operation_id = accepted.operation_id;
-        match operation_from(self.read_back(operation_id).await?)
-            .map_err(|e| unrepresentable(operation_id, &e))?
+        match operation_from(
+            self.read_back(CallerContext::Platform(ctx), operation_id)
+                .await?,
+        )
+        .map_err(|e| unrepresentable(operation_id, &e))?
         {
             sdk::Operation::Deletion(operation) => Ok(operation),
             sdk::Operation::Registration(_) => Err(wrong_kind(operation_id)),
@@ -245,12 +266,12 @@ impl PlatformTypesRegistryApi for LocalClient {
 
     async fn get_operation(
         &self,
-        _ctx: &PlatformSecurityContext,
+        ctx: &PlatformSecurityContext,
         operation_id: Uuid,
     ) -> Result<sdk::Operation, CanonicalError> {
         let record = self
             .service
-            .operation(operation_id)
+            .operation(CallerContext::Platform(ctx), operation_id)
             .await
             .map_err(CanonicalError::from)?
             .ok_or(LocalClientError::OperationNotFound { operation_id })?;
@@ -260,24 +281,24 @@ impl PlatformTypesRegistryApi for LocalClient {
 
 /// The tenant reads are the platform's own (D17): the same lookups, encodings and errors.
 ///
-/// C2/C6: P0 applies no tenant scope and records no principal from the `SecurityContext`;
-/// the context is accepted, not validated, exactly as the platform context is.
+/// C2/C6: the context reaches the service as [`CallerContext::Tenant`], which P0 reads
+/// nowhere — no tenant scope, no recorded principal — exactly as with the platform context.
 #[async_trait]
 impl TypesRegistryApi for LocalClient {
     async fn batch_get_entities(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         request: sdk::BatchGetEntitiesRequest,
     ) -> Result<sdk::BatchGetEntitiesResponse, CanonicalError> {
-        self.batch_get(request).await
+        self.batch_get(CallerContext::Tenant(ctx), request).await
     }
 
     async fn list_entities(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         query: sdk::ListEntitiesRequest,
     ) -> Result<sdk::ListEntitiesResponse, CanonicalError> {
-        self.list(query).await
+        self.list(CallerContext::Tenant(ctx), query).await
     }
 }
 

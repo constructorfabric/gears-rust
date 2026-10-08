@@ -299,7 +299,8 @@ impl AdmissionHandler {
         deadline: tokio::time::Instant,
         envelope: Option<Envelope<'_>>,
     ) -> MessageResult {
-        let status = tokio::time::timeout_at(deadline, self.registry.operation(operation_id)).await;
+        let status =
+            tokio::time::timeout_at(deadline, self.registry.operation_record(operation_id)).await;
         match status {
             Ok(Ok(Some(op))) if op.status == OperationStatus::Completed => {
                 info!(
