@@ -606,6 +606,22 @@ mod tests {
         );
     }
 
+    /// Same contract for the plain `PostgreSQL` image the Rust integration
+    /// suites run (`postgres()`): the self-managed `bss-orders-lifecycle` E2E
+    /// lane must exercise the same major, or its migrations and role grants are
+    /// validated against one server and run against another.
+    #[test]
+    fn e2e_sidecar_pins_the_same_postgres_image() {
+        assert_sidecar_pins(
+            &[
+                ("POSTGRES_IMAGE", "postgres"),
+                ("POSTGRES_TAG", POSTGRES_TAG),
+                ("ENV_POSTGRES_TAG", ENV_POSTGRES_TAG),
+            ],
+            "PostgreSQL majors",
+        );
+    }
+
     /// Same contract as `e2e_sidecar_pins_the_same_timescaledb_image`, for
     /// `ClickHouse`. Until this existed the two lanes were kept together by a
     /// comment in each file and nothing else; a skew validates the plugin's

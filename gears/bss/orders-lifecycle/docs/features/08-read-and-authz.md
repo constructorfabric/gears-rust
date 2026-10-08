@@ -25,6 +25,7 @@
 - [7. Detailed Behavior Contracts](#7-detailed-behavior-contracts)
   - [Reads and authorization: Interactions and Sequences](#reads-and-authorization-interactions-and-sequences)
   - [Reads and authorization: Traceability](#reads-and-authorization-traceability)
+  - [R08 commercial service identity (D-194)](#r08-commercial-service-identity-d-194)
 
 <!-- /toc -->
 
@@ -81,8 +82,8 @@ Payer Reader and configured event consumers are permission paths, not new audit 
 2. Prefetch only the target's minimal authorization properties under the approved point-read exception. Nothing from this prefetch is a response or grant.
 3. Request the exact resource/action with current properties and unvalidated proof reference through PolicyEnforcer, requiring constraints. If the target is absent, still make the target-ID call with empty properties and perform the scoped re-read; discard results and take the not-found arm. Provider outage returns the same sanitized 503 on both arms.
 4. Re-read the parent and children through PDP scope in one consistent database snapshot started after authorization. If authorization facts changed, restart authorization before disclosure. Never return the prefetched row. An already authorized in-flight snapshot may finish; each subsequent request/page uses current relationships.
-5. Compose the current aggregate/version without walking the version chain. Return stored lines with their full `OrderPin` (`items[].chains[]`), the total, declared pre-tax/overlay exclusions, line fulfillment/subscription linkage, requested and deferred dates, expected fulfillment time, and stored fulfillment inputs (`overlap_scope_key`, market, version payer, each line's `activation_deadline` and `accepted_version_ref`). All authorized order readers see these commercial facts.
-6. Return the current commercial version as ETag and a coherent `draftRevision` while draft. ETag alone does not protect mutable draft edits. Historical children remain authorized through the current parent; a historical payer grants no access. An authorized missing version uses `version-not-found`.
+5. Compose the current aggregate/version without walking the version chain. Return stored lines with their schema-2 `OrderPin` (complete issued receipt/query, BillingTerms and selected accepted bindings under D-192), the total, declared pre-tax/overlay exclusions, line fulfillment/subscription linkage, requested and deferred dates, expected fulfillment time, and stored fulfillment inputs (`overlap_scope_key`, market, version payer, each line's `activation_deadline` and `accepted_version_ref`). All authorized order readers see these commercial facts.
+6. Return the current commercial version as ETag and a coherent `draft_revision` while draft. ETag alone does not protect mutable draft edits. Historical children remain authorized through the current parent; a historical payer grants no access. An authorized missing version uses `version-not-found`.
 7. Persist any required served access log before returning data. Apply §3.3 failure semantics; never return partial/stale content, guard state, registry/outbox/dead-letter contents or diagnostics.
 
 ### 2.2 List and page authorized collections
@@ -212,7 +213,7 @@ The implementation MUST deliver the common wrapper to every REST/SDK read, corre
 - [ ] Each paged collection tests sizes 0/1/200/201, N/N+1 boundaries, immutable ties, malformed/cross-parent/cross-principal/filter-mismatched tokens, and revoked access. Microsecond/binary UUID ordering and retention of cursor position prevent fixed-dataset duplicates/skips.
 - [ ] Audit tests merge both scoped branches before LIMIT, separate operational unresolved grants, omit optionally denied rows and fail on outage. Concurrent commits behind/ahead of the cursor demonstrate the documented live-view limitation; no snapshot-complete export is claimed.
 - [ ] All REST/SDK surfaces test the logging table, including proof-bearing own-tenant reads, direct seller/payer cross-tenant reads, mixed/empty collections, missing targets, served/refused log failures and operational-only proof details.
-- [ ] Store failure serves no stale/cache/replica result; required served-log failure discloses nothing. Current views expose coherent version/draftRevision, fulfillment inputs, requested/actual dates and total exclusions without internal state or identifying enrichment.
+- [ ] Store failure serves no stale/cache/replica result; required served-log failure discloses nothing. Current views expose coherent version/draft_revision, fulfillment inputs, requested/actual dates and total exclusions without internal state or identifying enrichment.
 - [ ] PostgreSQL races prove scoped isolation and rollback of failed audit/outbox effects; public callers cannot reach worker capabilities, broad discovery scopes cannot write, and retention/verifier grants stay restricted. The first two are blocking CI gates with `trybuild` compile-fail cases (`DiscoveryScope` outside its module or into a write/worker-entry parameter, `TargetScope` from a raw ID) and the `allow_all` lint (D-184).
 - [ ] Production-scale query plans/load tests verify read/list p95 < 200 ms by filter shape, deep version history and mixed-axis scope. Selected-provider policy/delegation/three-axis tests and deployed broker grants are separately recorded before integration acceptance; documentation alone marks none complete.
 
@@ -325,7 +326,7 @@ Output: the composed read view, or a registered refusal
    1. [ ] - `p1` - Include expected fulfillment time and the per-line deferral - `inst-sr-include-deferral`
 7. [ ] - `p1` - Include the resolved total's declared exclusions - `inst-sr-include-exclusions`
 8. [ ] - `p1` - Apply §4.4's logging decision table: append a served access-log row when a delegation proof reference was supplied on the allowed request or when the current resource tenant differs from the authenticated subject tenant, including direct seller/payer access. Record the proof reference PDP reports accepting, else the supplied one; an own-resource-tenant read with no supplied proof appends nothing - `inst-sr-log-served`
-9. [ ] - `p1` - **RETURN** the composed view with the current version as the ETag and, for a draft, draftRevision from the same coherent snapshot as its commercial content - `inst-sr-return-view`
+9. [ ] - `p1` - **RETURN** the composed view with the current version as the ETag and, for a draft, draft_revision from the same coherent snapshot as its commercial content - `inst-sr-return-view`
 
 **Description**: Step 3 returns not-found rather than forbidden by design: to a caller with no
 relationship, the difference between "this order is not yours" and "no such order" is itself
@@ -495,3 +496,21 @@ read-access-log write-rate signal of §3.8 rather than converted into a differen
 - **ADRs**: [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md) transition through the engine; [`ADR/0002`](../ADR/0002-cpt-cf-bss-orders-lifecycle-adr-slice-decomposition.md) the foundation-plus-seven-slices decomposition
 
 <!-- /contract -->
+
+
+**D-188 reconciliation:** History enumerates committed rows only and follows explicit supersedes_version; sparse identities are valid. Authorized exact-version reads for reserved-only candidates return normal not-found, without leaking operational attempts. Operational recovery still checks original current/proposed commercial authority; service maintenance permissions cannot replace it. See the [normative attempt and sparse-history contract](../DESIGN.md#contract-01-commercial-attempt).
+
+**D-190 committed receipt handoff.** The authorized exact-version read supplies committed line receipt identities/digests for Subscriptions to verify, under its finite order-ID scope. Reserved-only D-188 attempts and their unselected receipts are not commercial versions and cannot be returned as activation inputs. A historical read is not permission to activate an obsolete version: Subscriptions must implement the R12 order/version/attempt fence. See [activation contract](../DESIGN.md#contract-03-accepted-price-activation); Pricing grants remain separate requirements.
+
+
+**D-192 committed commercial evidence:** authorized exact-version reads return the complete schema-2 receipt/query and selected binding evidence under the existing finite parent scope. Unsupported encoding or mismatching receipt/query/row links fails closed; do not reconstruct history from current catalog data. Subscriptions materializes complete accepted query (including BillingTerms) plus identical held bindings under the [frozen snapshot contract](../DESIGN.md#contract-03-frozen-commercial-snapshot). Workflow carries exact committed version/attempt, not a client-supplied snapshot. Current display metadata is separate; D-198 selects the admission/fencing/control protocol; D-201/S5-01 reconciles the executable seam contracts locally; receiver implementation and real-provider recovery conformance remain pending.
+
+
+### R08 commercial service identity (D-194)
+
+The [D-194 service authorization contract](../DESIGN.md#contract-08-commercial-service-authorization)
+replaces custom Orders system-actor construction with platform-authenticated seller-scoped service
+principals and explicit PDP grants. This upstream service authority is separate from every inbound
+order/resource/proposed-payer permission in this feature. Missing service grants do not justify
+falling back to a buyer context or borrowing Pricing's privileged actor; provider denials retain
+existing sanitized unavailable mapping. Provisioning and real-provider conformance remain open.

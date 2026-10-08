@@ -1,0 +1,21 @@
+suite: bss-orders-lifecycle
+# Self-managed (`launcher: pytest`): the suite starts its own PostgreSQL container, applies the
+# Orders migrations with an admin login (`cf-gears-example-server migrate`), provisions the
+# restricted runtime and worker-class logins, and runs the server under the runtime login. The
+# shared `make e2e-local` server is SQLite-backed and carries no AuthZ policy for Orders, so this
+# suite cannot share it. Run with `make e2e-orders-lifecycle` (or
+# `make e2e-local SUITE=bss-orders-lifecycle`).
+#
+# `rules-authz` is the configurable, fail-closed platform PDP provider the Orders permission
+# matrix is evaluated against (S2-03); `static-authz` stays linked at a lower priority and is
+# never selected. The Orders feature links Event Broker, the standalone cluster cache and the
+# SQLite event-log backend.
+features:
+  - bss-orders-lifecycle
+  - rules-authz
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: pytest
+pytest_args:
+  - -vv

@@ -1,0 +1,119 @@
+# Orders Lifecycle gear block for the live HTTP E2E server (S2-12 merges it into the E2E host
+# config and adds matching static-authn tokens). Every identity is distinct: the maintenance
+# actor is `system`, the configured service principals are `service`, and every other
+# authenticated subject (for example the existing tenant-a user) is `user` (D-115). A
+# lookalike subject_id in another tenant is a `user`. The `events` producer principal is the
+# Orders Event Broker publisher (D-200): distinct from every other identity, granted only the
+# Orders event family under platform-root tenancy, and `broker_partitions` must equal the
+# Event Broker deployment's configured partition count for the Orders topic (D-205). The
+# `audit_minimization.key` is a secret reference (D-204): the E2E launcher exports
+# ORDERS_AUDIT_MINIMIZATION_KEY (32..1024 bytes) and the gear resolves it at load time; the key
+# is never committed here. Values are test identities only.
+bss-orders-lifecycle:
+  config:
+    lock_route: direct
+    idempotency_lease_seconds: 30
+    dependency_timeout_ms: 2000
+    maintenance:
+      actor_subject_id: "0e0e0000-0000-4000-8000-000000000001"
+      actor_tenant_id: "0e0e0000-0000-4000-8000-0000000000aa"
+      tasks: [retention_purge, idempotency_cleanup, audit_verification, audit_checkpoint]
+      # S2-11: one restricted login per privilege class (migration 08 `bss_orders_<class>`
+      # group roles; the E2E launcher provisions `LOGIN` members and exports their DSNs). The
+      # gear attests each connection's privileges at startup; the host connection keeps the
+      # only advisory-lock session. Expiry/auto-void are not enabled: their bodies are Stage 5.
+      connections:
+        retention: "${ORDERS_RETENTION_DSN}"
+        maintenance: "${ORDERS_MAINTENANCE_DSN}"
+        verifier: "${ORDERS_VERIFIER_DSN}"
+        checkpoint: "${ORDERS_CHECKPOINT_DSN}"
+    service_principals:
+      - role: workflow
+        subject_id: "0e0e0000-0000-4000-8000-000000000002"
+        tenant_id: "0e0e0000-0000-4000-8000-0000000000aa"
+      - role: subscriptions
+        subject_id: "0e0e0000-0000-4000-8000-000000000003"
+        tenant_id: "0e0e0000-0000-4000-8000-0000000000aa"
+      - role: billing
+        subject_id: "0e0e0000-0000-4000-8000-000000000004"
+        tenant_id: "0e0e0000-0000-4000-8000-0000000000aa"
+    events:
+      producer_subject_id: "0e0e0000-0000-4000-8000-000000000005"
+      producer_tenant_id: "0e0e0000-0000-4000-8000-0000000000aa"
+      broker_partitions: 4
+    audit_minimization:
+      key_id: "e2e-1"
+      key: "${ORDERS_AUDIT_MINIMIZATION_KEY}"
+    # S2-10 policy channel (D-121, D-207): explicit switches, promoted at startup. These equal the
+    # migration seed, so the E2E boot writes nothing and needs no policy-role privilege.
+    date_policy:
+      platform_default:
+        service_activation_required: false
+        acceptance_due_required: false
+# The pre-engine request limiter's gateway half (Foundation contract §3.7, D-185; S2-12),
+# deep-merged into the E2E host's `api-gateway` block. The identity key is the authenticated
+# `subject_id`, so the zones are bound through `ThrottlingSpec { require_security_context: true,
+# dry_run: false }` (identity keying is refused on anonymous routes and with `auth_disabled`).
+# `rl_orders_caller_write`: every caller-facing engine-entering operation (create, header and
+# line edits now; submit, amendments, cancel, hold, resume, acceptance when delivered), 3/s with
+# burst 20, so at most 200 in any 60 s window. `rl_orders_workflow_write`: the five workflow-only
+# operations (S5-08), 50/s with burst 100 (the §4.1 transition baseline), because one service
+# principal carries every order's workflow traffic. Gateway state is per replica until throttling
+# ADR-0001 lands. The per-(caller, order) half (20/min) is the gear-local edge limiter
+# (`bss-orders-lifecycle.config.throttling`, baseline when absent), pending the gateway
+# path-parameter key (UPSTREAM_REQS §2.12). A gear test pins these values to the code's bindings.
+api-gateway:
+  config:
+    rate_limit_zones:
+      rl_orders_caller_write:
+        rate_limit: 3/s
+        burst_limit: 20
+        response_status_code: 429
+        response_retry_after: auto
+        key:
+          type: identity
+        max_keys: 100000
+      rl_orders_workflow_write:
+        rate_limit: 50/s
+        burst_limit: 100
+        response_status_code: 429
+        response_retry_after: auto
+        key:
+          type: identity
+        max_keys: 10000
+# Paired Event Broker setting, deep-merged into the E2E host's `event-broker` block. The broker
+# resolves the Orders topic's partition count from this entry (otherwise from an instance-less
+# `gts.cf.core.events.topic.v1~` entry, otherwise its built-in 8). Orders' declared
+# `events.broker_partitions` above MUST equal it: no broker API reports the count, and a
+# mismatch silently loses events (DESIGN §3.7; UPSTREAM_REQS §2.7). A gear test pins the pair.
+event-broker:
+  config:
+    topics:
+      "gts.cf.core.events.topic.v1~cf.bss.orders.events.v1":
+        partitions: 4
+# Orders producer authorization for the rules AuthZ provider, merged into the E2E host's
+# `rules-authz-plugin` block (S2-12). Event Broker's publish makes two PolicyEnforcer checks for
+# the producer principal above: the property-less `event_type` `produce` check, granted by an
+# exact unconditional grant (no wildcard, no allow-all), and the tenant-scope `request`
+# `produce` check, granted only for the platform root tenant of the E2E host (Orders publishes
+# under platform-root tenancy, D-95). A gear test pins both to `events.producer_*`.
+rules-authz-plugin:
+  config:
+    unconditional_grants:
+      - id: "orders-producer-event-type-produce"
+        subject:
+          id: "0e0e0000-0000-4000-8000-000000000005"
+          tenant_id: "0e0e0000-0000-4000-8000-0000000000aa"
+        resource_type: "gts.cf.core.events.event_type.v1~"
+        action: "produce"
+    rules:
+      - id: "orders-producer-root-tenant-produce"
+        subject:
+          id: "0e0e0000-0000-4000-8000-000000000005"
+          tenant_id: "0e0e0000-0000-4000-8000-0000000000aa"
+        resource_type: "gts.cf.core.events.request.v1~"
+        actions: ["produce"]
+        paths:
+          - predicates:
+              - property: "owner_tenant_id"
+                values: ["00000000-df51-5b42-9538-d2b56b7ee953"]

@@ -1,0 +1,32 @@
+{
+  "format_version": 1,
+  "status": "dependency inventory; null budgets require ratification, no measured SLO claim",
+  "clock_basis": "one assessment instant/UTC resolve date; Pricing current_revision still uses its own current server clock",
+  "deadline_rule": "one logical deadline per port across bounded batches, queues and at most two transient attempts; no reset per line/chunk/retry; command recovery additionally follows D-188 exact frozen identity",
+  "nodes": [
+    {"id":"authorize","after":[],"owner":"Orders + PDP","package":"S2-03","budget_ms":null,"effect":"SafeRead"},
+    {"id":"identity-market","after":["authorize"],"owner":"Account Management","package":"S4-02","budget_ms":250,"effect":"SafeRead"},
+    {"id":"contract","after":["identity-market"],"owner":"Contracts","package":"S4-02","budget_ms":250,"effect":"SafeRead"},
+    {"id":"current-revision","after":["authorize"],"owner":"Pricing","package":"S3-02","budget_ms":250,"effect":"SafeRead with authorized scheduled-publication catch-up"},
+    {"id":"resolve-bindings","after":["identity-market","current-revision"],"owner":"Pricing","package":"S3-02","budget_ms":250,"effect":"SafeRead"},
+    {"id":"sku-evidence","after":["resolve-bindings"],"owner":"Products","package":"S3-02","budget_ms":250,"effect":"SafeRead until authoritative assessment replaces this evidence"},
+    {"id":"terms","after":["resolve-bindings","contract"],"owner":"Subscriptions","package":"S3-04","budget_ms":null,"effect":"SafeRead"},
+    {"id":"hold-policy","after":["authorize"],"owner":"Pricing","package":"S3-05","budget_ms":null,"effect":"SafeRead; optional forecast-only input for Preview"},
+    {"id":"assessment","after":["resolve-bindings","sku-evidence","terms","hold-policy"],"owner":"Pricing","package":"S3-03","budget_ms":null,"effect":"SafeRead; incomplete optional Preview inputs explicitly tagged"},
+    {"id":"rating","after":["assessment","terms","contract"],"owner":"Rating","package":"S3-07","budget_ms":500,"effect":"SafeRead"},
+    {"id":"canonical-key","after":["resolve-bindings","identity-market"],"owner":"Subscriptions","package":"S5-06a","budget_ms":250,"effect":"SafeRead"},
+    {"id":"occupancy","after":["canonical-key"],"owner":"Subscriptions","package":"S5-06a","budget_ms":250,"effect":"SafeRead; includes active and admitted-pending; advisory until receiver enforcement"},
+    {"id":"indicative-tax","after":["rating","identity-market"],"owner":"Unassigned tax owner","package":"S3-08","budget_ms":250,"effect":"SafeRead; Preview only"},
+    {"id":"preview-diagnostics","after":["assessment","rating","occupancy","indicative-tax"],"owner":"Orders","package":"S3-10/11","budget_ms":null,"effect":"Diagnostic persistence only; no acceptance/hold/order/attempt"},
+    {"id":"reserve-attempt","after":["assessment","rating","occupancy"],"owner":"Orders","package":"S2-05/S3-12","budget_ms":null,"effect":"Commit frozen query/evaluation and reserve candidate before remote commands"},
+    {"id":"accept-lines","after":["reserve-attempt"],"owner":"Pricing","package":"S3-12","budget_ms":null,"effect":"SellabilityV1::check commands outside Orders transaction; stable per-attempt/line keys"},
+    {"id":"final-authorization","after":["accept-lines"],"owner":"Orders + PDP","package":"S2-03/S3-12","budget_ms":null,"effect":"SafeRead; recheck required current authority before final transaction"},
+    {"id":"commercial-commit","after":["final-authorization"],"owner":"Orders","package":"S3-12","budget_ms":null,"effect":"Locked fact/fence/deadline/capacity recheck, selected version + audit + outbox atomic commit"},
+    {"id":"broker-publication","after":["commercial-commit"],"owner":"Platform producer","package":"S2-08","budget_ms":null,"effect":"Post-commit delivery; governing durable-write-plus-publish p95 < 1 s remains"}
+  ],
+  "existing_resolution_ceilings_ms":{"submit":2250,"preview":2500},
+  "ceilings_status":"historical incomplete port sums, not budgets for the expanded path and not latency evidence",
+  "blocking_decisions":["Pricing assessment budget","Subscriptions terms/policy dependency budget","Pricing hold-policy budget","per-line acceptance dispatch and recovery budget","complete critical-path measurement and Q-11/Q-16 ratification"],
+  "replay":"Authorize and load settled response/frozen live attempt before fresh reads. Resume uses frozen requests, evaluation, issuer identity, policy versions and command keys; it does not traverse the fresh-resolution DAG again.",
+  "cycle_break":"Terms consumes authorized selected read contexts, not completed assessment. Full assessment consumes resolved terms. Compare resulting bindings with the terms/Rating basis; mismatch requires fresh execution."
+}

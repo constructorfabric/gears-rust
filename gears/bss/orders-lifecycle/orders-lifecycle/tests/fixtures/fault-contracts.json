@@ -1,0 +1,149 @@
+{
+  "format_version": 1,
+  "faults": [
+    {
+      "id": "before_remote_acceptance",
+      "owner_package": "S3-11/S3-12",
+      "durable_facts": "Persisted candidate/execution and frozen command identity; response may be unknown.",
+      "recovery": "Read/replay the same owner command; reconcile committed acceptance before a new candidate.",
+      "forbidden": "Do not invent acceptance failure, rerun pricing or reuse an abandoned candidate.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "after_remote_acceptance",
+      "owner_package": "S3-11/S3-12",
+      "durable_facts": "Persisted candidate/execution and frozen command identity; response may be unknown.",
+      "recovery": "Read/replay the same owner command; reconcile committed acceptance before a new candidate.",
+      "forbidden": "Do not invent acceptance failure, rerun pricing or reuse an abandoned candidate.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "before_local_commit",
+      "owner_package": "S2-04/S2-05/S3-12",
+      "durable_facts": "Before commit: no public mutation/evidence/outbox visible. After commit: all durable facts survive lost response.",
+      "recovery": "Replay retained authorized outcome; inspect execution ownership before any remote work.",
+      "forbidden": "No duplicate transition, missing audit/event or exposed pre-commit grant.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "after_local_commit",
+      "owner_package": "S2-04/S2-05/S3-12",
+      "durable_facts": "Before commit: no public mutation/evidence/outbox visible. After commit: all durable facts survive lost response.",
+      "recovery": "Replay retained authorized outcome; inspect execution ownership before any remote work.",
+      "forbidden": "No duplicate transition, missing audit/event or exposed pre-commit grant.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "before_outbox_enqueue",
+      "owner_package": "S2-08",
+      "durable_facts": "Enqueue and mutation share the local transaction; rolled-back enqueue cannot publish.",
+      "recovery": "Retry entire uncommitted transaction; committed payload retains event_id.",
+      "forbidden": "No mutation committed without its required enqueue; no ghost event.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "after_outbox_enqueue",
+      "owner_package": "S2-08",
+      "durable_facts": "Enqueue and mutation share the local transaction; rolled-back enqueue cannot publish.",
+      "recovery": "Retry entire uncommitted transaction; committed payload retains event_id.",
+      "forbidden": "No mutation committed without its required enqueue; no ghost event.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "before_outbox_ack",
+      "owner_package": "S2-08/S6-05",
+      "durable_facts": "Broker may already have accepted event even when producer acknowledgement was lost.",
+      "recovery": "Platform lease/replay recovery; consumer deduplicates original event_id durably.",
+      "forbidden": "Do not mint a new business event ID or count a DLQ claim as republication.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "after_outbox_ack",
+      "owner_package": "S2-08/S6-05",
+      "durable_facts": "Broker may already have accepted event even when producer acknowledgement was lost.",
+      "recovery": "Platform lease/replay recovery; consumer deduplicates original event_id durably.",
+      "forbidden": "Do not mint a new business event ID or count a DLQ claim as republication.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "before_receiver_admission",
+      "owner_package": "S5-06b",
+      "durable_facts": "Pending slot and provisioning intent commit together under current policy/grant fence.",
+      "recovery": "Read intent by full identity; retain uncertain claim and recheck authority.",
+      "forbidden": "No free capacity from timeout or confirmed activation from merely approved intent.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "after_receiver_admission",
+      "owner_package": "S5-06b",
+      "durable_facts": "Pending slot and provisioning intent commit together under current policy/grant fence.",
+      "recovery": "Read intent by full identity; retain uncertain claim and recheck authority.",
+      "forbidden": "No free capacity from timeout or confirmed activation from merely approved intent.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "before_receiver_confirmation",
+      "owner_package": "S5-06b/S5-07",
+      "durable_facts": "Applied external outcome may exist before confirmation; same attempt fence must still authorize commit.",
+      "recovery": "Reconcile late external success after closure; pending-to-active uses same slot.",
+      "forbidden": "No double slot, stale active confirmation or discarded external effect.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "after_receiver_confirmation",
+      "owner_package": "S5-06b/S5-07",
+      "durable_facts": "Applied external outcome may exist before confirmation; same attempt fence must still authorize commit.",
+      "recovery": "Reconcile late external success after closure; pending-to-active uses same slot.",
+      "forbidden": "No double slot, stale active confirmation or discarded external effect.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "before_grant_revocation",
+      "owner_package": "S5-09/S5-15",
+      "durable_facts": "Pending control, exact roster and installed receiver tombstones survive partial fan-out.",
+      "recovery": "Resume same fenced control; ordinary terminal transition waits for exact barrier.",
+      "forbidden": "No reopened old generation, cleared newer pointer or uncertain-slot release.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "after_grant_revocation",
+      "owner_package": "S5-09/S5-15",
+      "durable_facts": "Pending control, exact roster and installed receiver tombstones survive partial fan-out.",
+      "recovery": "Resume same fenced control; ordinary terminal transition waits for exact barrier.",
+      "forbidden": "No reopened old generation, cleared newer pointer or uncertain-slot release.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "before_payment_response",
+      "owner_package": "S4-11",
+      "durable_facts": "Stable Workflow payment intent/order/version/basis remains persisted regardless of response loss.",
+      "recovery": "Read status of original authorization intent; pending survives restart.",
+      "forbidden": "No duplicate payment or tolerance path based on outage instead of conclusive failure.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    },
+    {
+      "id": "after_payment_response",
+      "owner_package": "S4-11",
+      "durable_facts": "Stable Workflow payment intent/order/version/basis remains persisted regardless of response loss.",
+      "recovery": "Read status of original authorization intent; pending survives restart.",
+      "forbidden": "No duplicate payment or tolerance path based on outage instead of conclusive failure.",
+      "venue": "real PostgreSQL plus authenticated owner/broker adapter as applicable",
+      "runtime_evidence": "pending; S1-06 proves hook plumbing only"
+    }
+  ]
+}

@@ -52,6 +52,9 @@ use static_authz_plugin as _;
 #[cfg(feature = "tr-authz")]
 use tr_authz_plugin as _;
 
+#[cfg(feature = "rules-authz")]
+use rules_authz_plugin as _;
+
 #[cfg(feature = "static-license")]
 use static_license_plugin as _;
 
@@ -116,3 +119,14 @@ use bss_pricing as _;
 
 #[cfg(feature = "bss-approvals")]
 use bss_approvals as _;
+
+#[cfg(feature = "bss-orders-lifecycle")]
+use bss_orders_lifecycle as _;
+// Orders' required Event Broker gear (and, through it, the cluster gear) plus the plugins its
+// standalone deployment selects.
+#[cfg(feature = "bss-orders-lifecycle")]
+use event_broker as _;
+#[cfg(feature = "bss-orders-lifecycle")]
+use sqlite_event_broker_plugin as _;
+#[cfg(feature = "bss-orders-lifecycle")]
+use standalone_cluster_plugin as _;

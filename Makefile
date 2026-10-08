@@ -1092,7 +1092,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-usage-collector-timescaledb e2e-usage-collector-clickhouse e2e-event-broker e2e-oop
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-usage-collector-timescaledb e2e-usage-collector-clickhouse e2e-event-broker e2e-oop e2e-orders-lifecycle
 
 E2E_TARGET ?=
 # E2E selectors for `make e2e-local`:
@@ -1194,6 +1194,12 @@ e2e-usage-collector:
 	$(call print_target_banner)
 	$(MAKE) e2e-usage-collector-timescaledb
 	$(MAKE) e2e-usage-collector-clickhouse
+
+## Run the Orders Lifecycle draft-milestone E2E (self-managed: own PostgreSQL container, migrate
+## as the schema owner, then the server under the restricted runtime login; Docker required)
+e2e-orders-lifecycle: py-env
+	$(call print_target_banner)
+	$(PYTHON) tools/scripts/run_e2e.py --suite bss-orders-lifecycle -- $(E2E_TARGET)
 
 ## Run event-broker E2E tests (its own standalone binary, not a cf-gears-example-server feature)
 e2e-event-broker: py-env

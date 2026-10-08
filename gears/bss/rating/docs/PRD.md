@@ -324,9 +324,29 @@ Tariff evaluation **MUST** expose a conceptual evaluation contract that, for a g
 
 #### Pre-purchase evaluation (order-time price preview)
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-fr-pre-purchase-evaluation`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-fr-pre-purchase-evaluation`
 
-Tariff evaluation **MUST** expose a **pre-purchase** evaluation contract for a prospective purchase that has **no subscription yet** — no `subscriptionId`, no `activatedAt`, no bound `cohort`. Inputs are order-scope: plan/price references, quantity, the tenant axes, the `(currency, region)` market derived from the payer's commercial profile, and an evaluation timestamp `t`. The contract **MUST** return per-line resolved amounts **decomposed by `chargeKind`** — `recurring`, `one_time` (listed at the phase entry that charges it; T-D-36) — and **MUST** flag `usage` components as carrying no committed amount (they price at rating time from the pinned snapshot). It **MUST** return the **catalog-frozen prefix** of the snapshot (`catalogVersion`, resolved price ids incl. `cohort`, eval-policy version) so the caller can pin it, and **MUST NOT** present that prefix as a complete `pricingSnapshotRef` — composition remains owned by `fr-snapshot-carry`, whose `(currency, region)` segment is written by Subscriptions at activation and whose overlay/coupon/FX/commitment segments are written at eval. The outcome is **non-authoritative**: it **MUST NOT** be a billing input, **MUST NOT** post, and **MUST NOT** create evaluation state. Scopes that are not resolvable before a subscription exists — brand-scoped `PriceOverlay` matching, and any `priceEligibility` generation keyed on `activatedAt`/`cohort` — **MUST** fail explicitly rather than silently resolving to a default. Access is `sellerTenantId`-scoped: a caller **MUST NOT** be returned overlay layers it is not entitled to see. Aggregation of the returned per-line amounts into an order-level total is the **caller's** summation and is not price computation.
+**Selected target reconciliation, Orders D-197 (2026-10-05); implementation remains missing.**
+Rating **MUST** expose an authorized, nonbinding pre-purchase evaluation SDK over the exact
+selected native Pricing bindings, quantities, market and Subscriptions-resolved term/BillingTerms
+specified by [the joint purchase contract](../../orders-lifecycle/docs/DESIGN.md#contract-03-rating-purchase-evaluation).
+No subscription, activated cohort, receipt or complete billing snapshot is invented. The request
+fixes assessment/line/revision identity and producer digests; Rating does not select a successor
+or return the obsolete catalog-version/cohort prefix as purchase authority.
+
+Rating **MUST** compute item/line/order monetary aggregation, scale conversion and rounding,
+return integer minor units with gross/net/discount, promotion availability, all three charge kinds,
+cycle-labelled components and one net pre-tax TCV with finite/rolling-annualized/mixed basis.
+Usage has no committed amount; one-time is counted once without synthesizing a usage evaluation
+unit. The caller **MUST NOT** sum or convert money. No implicit defaults, FX or guessed discount
+are allowed. Required unsupported scope/model/context fails explicitly; the declared subscription-
+context exclusions and Preview-only term/cycle withholding follow the joint contract.
+
+The result **MUST NOT** post, create evaluation state or become a billing input. Seller/resource/
+payer authorization and the service grant are required before disclosure. Actual period-snapshot
+composition and activation geometry remain owned downstream. This replaces only the former
+pre-purchase caller-summation/catalog-prefix contract; it does not claim delivery, producer-owner
+signoff or reconciliation of the rest of Rating's historical design.
 
 **Rationale**: A purchase must be priced, displayed and threshold-checked **before** the subscription that anchors evaluation exists; without this contract the order-capture path has no input, and every caller would re-implement step-2 selection and fork it. The predecessor PRD carried this as a partner-facing effective-price preview scope item with its access model unresolved; authoring it here as a contract keeps the selection logic single-sourced.
 

@@ -147,6 +147,7 @@ members = [
     "gears/system/authz-resolver/authz-resolver",
     "gears/system/authz-resolver/plugins/static-authz-plugin",
     "gears/system/authz-resolver/plugins/tr-authz-plugin",
+    "gears/system/authz-resolver/plugins/rules-authz-plugin",
     "gears/system/oagw/oagw",
     "gears/system/oagw/oagw-sdk",
     "gears/system/usage-collector/usage-collector-sdk",
@@ -169,6 +170,8 @@ members = [
     "gears/bss/pricing/pricing-sdk",
     "gears/bss/products/products",
     "gears/bss/products/products-sdk",
+    "gears/bss/orders-lifecycle/orders-lifecycle",
+    "gears/bss/orders-lifecycle/orders-lifecycle-sdk",
     "gears/bss/approvals/approvals",
     "gears/bss/approvals/approvals-sdk",
     "gears/bss/rate-provider/rate-provider-sdk",
@@ -381,6 +384,7 @@ api-gateway = { package = "cf-gears-api-gateway", version = "0.5.2", path = "gea
 # Concrete plugins needed to link a standalone-mode binary.
 static-authn-plugin = { package = "cf-gears-static-authn-plugin", version = "0.3.18", path = "gears/system/authn-resolver/plugins/static-authn-plugin" }
 static-authz-plugin = { package = "cf-gears-static-authz-plugin", version = "0.1.38", path = "gears/system/authz-resolver/plugins/static-authz-plugin" }
+rules-authz-plugin = { package = "cf-gears-rules-authz-plugin", version = "0.1.0", path = "gears/system/authz-resolver/plugins/rules-authz-plugin" }
 standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", version = "0.2.8", path = "gears/system/cluster/plugins/standalone-cluster-plugin" }
 
 cf-gears-cluster-sdk = { version = "0.2.8", path = "gears/system/cluster/cluster-sdk" }
@@ -396,6 +400,7 @@ resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.5
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.15", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.14", path = "gears/system/usage-collector/usage-collector-sdk" }
 event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.2.6", path = "gears/system/event-broker/event-broker-sdk" }
+event-broker = { package = "cf-gears-event-broker", path = "gears/system/event-broker/event-broker" }
 sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/sqlite-event-broker-plugin" }
 
 # BSS gears (ported from vhp-core)
@@ -419,6 +424,7 @@ bss-pricing = { package = "cf-gears-bss-pricing", path = "gears/bss/pricing/pric
 # because neither crate is a release artifact and the gear that consumes it is
 # not published either.
 bss-products-sdk = { package = "cf-gears-bss-products-sdk", path = "gears/bss/products/products-sdk" }
+bss-orders-lifecycle-sdk = { package = "cf-gears-bss-orders-lifecycle-sdk", path = "gears/bss/orders-lifecycle/orders-lifecycle-sdk" }
 # The approvals inbox. Same WIP posture as pricing: no `version`, because neither
 # crate is a release artifact yet.
 bss-approvals-sdk = { package = "cf-gears-bss-approvals-sdk", path = "gears/bss/approvals/approvals-sdk" }

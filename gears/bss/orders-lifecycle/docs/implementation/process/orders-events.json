@@ -1,0 +1,593 @@
+{
+  "format_version": 1,
+  "venue": "S1-05 specification reference model only; not live provider conformance",
+  "cases": [
+    {
+      "id": "duplicate-delivery",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "effect",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        },
+        {
+          "op": "deliver",
+          "expect": "duplicate",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1"
+        ],
+        "pending": [],
+        "effects": [
+          "e1"
+        ],
+        "reads": 2
+      }
+    },
+    {
+      "id": "duplicate-republished",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "effect",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        },
+        {
+          "op": "deliver",
+          "expect": "duplicate",
+          "event_id": "e1",
+          "broker_sequence": 900,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1"
+        ],
+        "pending": [],
+        "effects": [
+          "e1"
+        ],
+        "reads": 2
+      }
+    },
+    {
+      "id": "gap",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "effect",
+          "event_id": "e1",
+          "broker_sequence": 40,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1"
+        ],
+        "pending": [],
+        "effects": [
+          "e1"
+        ],
+        "reads": 2
+      }
+    },
+    {
+      "id": "out-of-order",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "effect",
+          "event_id": "e2",
+          "broker_sequence": 900,
+          "known_event": true,
+          "known_state": true,
+          "rule": "historical_financial",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        },
+        {
+          "op": "deliver",
+          "expect": "effect",
+          "event_id": "e1",
+          "broker_sequence": 2,
+          "known_event": true,
+          "known_state": true,
+          "rule": "historical_financial",
+          "event_version": 4,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1",
+          "e2"
+        ],
+        "pending": [],
+        "effects": [
+          "e2",
+          "e1"
+        ],
+        "reads": 4
+      }
+    },
+    {
+      "id": "stale-version",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "obsolete",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 4,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1"
+        ],
+        "pending": [],
+        "effects": [],
+        "reads": 2
+      }
+    },
+    {
+      "id": "hold-defers",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "deferred",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "on_hold"
+        },
+        {
+          "op": "deliver",
+          "expect": "effect",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1"
+        ],
+        "pending": [],
+        "effects": [
+          "e1"
+        ],
+        "reads": 4
+      }
+    },
+    {
+      "id": "unknown-state",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "ignored_unknown",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": false,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1"
+        ],
+        "pending": [],
+        "effects": [],
+        "reads": 2
+      }
+    },
+    {
+      "id": "unknown-event-type",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "ignored_unknown",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": false,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1"
+        ],
+        "pending": [],
+        "effects": [],
+        "reads": 0
+      }
+    },
+    {
+      "id": "read-unavailable",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "pending",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "unavailable",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [],
+        "pending": [
+          "e1"
+        ],
+        "effects": [],
+        "reads": 2
+      }
+    },
+    {
+      "id": "read-denied",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "pending",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "denied",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [],
+        "pending": [
+          "e1"
+        ],
+        "effects": [],
+        "reads": 2
+      }
+    },
+    {
+      "id": "recovered-dead-letter-after-newer-state",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "obsolete",
+          "event_id": "e1",
+          "broker_sequence": 999,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 4,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1"
+        ],
+        "pending": [],
+        "effects": [],
+        "reads": 2
+      }
+    },
+    {
+      "id": "restart-while-pending",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "pending",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "unavailable",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        },
+        {
+          "op": "restart",
+          "expect": "recovered"
+        },
+        {
+          "op": "deliver",
+          "expect": "effect",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1"
+        ],
+        "pending": [],
+        "effects": [
+          "e1"
+        ],
+        "reads": 4
+      }
+    },
+    {
+      "id": "effect-free-on-payload",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "effect",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "effect_free",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "unavailable",
+          "current_read": "denied",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1"
+        ],
+        "pending": [],
+        "effects": [
+          "e1"
+        ],
+        "reads": 0
+      }
+    },
+    {
+      "id": "missing-version-escalates",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "escalated_pending",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "missing",
+          "current_read": "ok",
+          "state": "in_fulfillment",
+          "budget_exhausted": true
+        }
+      ],
+      "expected": {
+        "complete": [],
+        "pending": [
+          "e1"
+        ],
+        "effects": [],
+        "reads": 2
+      }
+    },
+    {
+      "id": "historical-financial-survives-hold-and-amendment",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "effect",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "historical_financial",
+          "event_version": 4,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "on_hold"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1"
+        ],
+        "pending": [],
+        "effects": [
+          "e1"
+        ],
+        "reads": 2
+      }
+    },
+    {
+      "id": "crash-before-effect-and-completion-commit",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "pending",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment",
+          "crash_before_commit": true
+        },
+        {
+          "op": "restart",
+          "expect": "recovered"
+        },
+        {
+          "op": "deliver",
+          "expect": "effect",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        },
+        {
+          "op": "deliver",
+          "expect": "duplicate",
+          "event_id": "e1",
+          "broker_sequence": 1,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "ok",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [
+          "e1"
+        ],
+        "pending": [],
+        "effects": [
+          "e1"
+        ],
+        "reads": 4
+      }
+    },
+    {
+      "id": "broker-authority-not-orders-read-authority",
+      "steps": [
+        {
+          "op": "deliver",
+          "expect": "pending",
+          "event_id": "e1",
+          "broker_sequence": 901,
+          "known_event": true,
+          "known_state": true,
+          "rule": "current_version",
+          "event_version": 7,
+          "current_version": 7,
+          "version_read": "ok",
+          "current_read": "denied",
+          "state": "in_fulfillment"
+        }
+      ],
+      "expected": {
+        "complete": [],
+        "pending": [
+          "e1"
+        ],
+        "effects": [],
+        "reads": 2
+      }
+    }
+  ]
+}

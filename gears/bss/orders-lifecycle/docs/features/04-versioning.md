@@ -64,7 +64,7 @@ Append a new immutable commercial version when an order is amended, re-run the f
 - **Dependencies**: [Foundation](01-foundation.md), [Capture](02-capture.md), [Gate and Pin](03-gate-and-pin.md).
 - **Consumers**: [Workflow Seam](06-workflow-seam.md), [Read and Authorization](08-read-and-authz.md).
 
-DESIGN owns schemas and architectural rationale; this feature owns the complete guard registration and behavior contracts. The migration does not resolve [DECISIONS.md](../DECISIONS.md) Q-12 (two-step re-approval), Q-28 (payer/seller rebinding), or Q-41 (`OrderAmended` trigger wording, split from Q-25 by D-186). D-82's version/audit reason split also remains explicitly disclosed by the design.
+DESIGN owns schemas and architectural rationale; this feature owns the complete guard registration and behavior contracts. D-174 selects two-step re-approval and S1-01 reconciles Q-12's stale PRD wording. [DECISIONS.md](../DECISIONS.md) Q-28 (payer/seller rebinding) and Q-41 (`OrderAmended` trigger wording, split from Q-25 by D-186) retain their product scope. D-82's version/audit reason split also remains explicitly disclosed by the design.
 
 **UI applicability**: UI layout, keyboard navigation, screen-reader behavior and visual accessibility are not applicable because this feature specifies backend contracts, not a user interface. API usability, actionable errors and non-disclosing diagnostics remain applicable; consuming consoles own their UI requirements.
 
@@ -149,12 +149,12 @@ Store complete immutable versions and enforce immediate-predecessor supersession
 
 | Source | Result | Version and event |
 |--------|--------|-------------------|
-| `submitted` | `submitted` | Append N+1; `OrderAmended`; unchanged state does not reset state-entry time. |
-| `pending_approval`, `approved` | `submitted` | Append N+1; `OrderAmended`; engine resets state-entry time on actual state change. |
+| `submitted` | `submitted` | Append M; `OrderAmended`; unchanged state does not reset state-entry time. |
+| `pending_approval`, `approved` | `submitted` | Append M; `OrderAmended`; engine resets state-entry time on actual state change. |
 | `draft`, `on_hold`, `in_fulfillment`, terminal | Refused | `not-admissible`; no append. |
 | Any non-terminal, administrative edit | Same state | Same version; per-field audit only. |
 
-All amendment rows increment `amendment_count`; no transition resets it. Once N+1 exists, stale workflow results naming N return `version-conflict` naming the current version before state admissibility is checked. Workflow re-reads and requests a fresh verdict; it must not reinterpret a stale approval as a denial.
+All amendment rows increment `amendment_count`; no transition resets it. Once M exists, stale workflow results naming N return `version-conflict` naming the current version before state admissibility is checked. Workflow re-reads and requests a fresh verdict; it must not reinterpret a stale approval as a denial.
 
 ## 5. Definitions of Done
 
@@ -454,8 +454,8 @@ obtains the verdict for the new version and reflects the order onward through th
 already exist: `submitted → pending_approval` where approval is required (row 7) or
 `submitted → approved` where it is not (row 8).
 
-**Why the verdict cannot be a guard here.** A verdict for version N+1 is unobtainable at the
-moment the amendment commits, because version N+1 does not exist until it does. Verdicts are
+**Why the verdict cannot be a guard here.** A verdict for version M is unobtainable at the
+moment the amendment commits, because version M does not exist until it does. Verdicts are
 stored only as reflections keyed `(order_id, version)`
 ([06-workflow-seam — Database Schemas and Tables](../DESIGN.md#contract-06-3-7)), that slice's §4.2 forbids deriving one for an
 amended version from the version it superseded, this gear declares no port to the approval policy
@@ -468,15 +468,11 @@ amendment from `approved` impossible.
 unconditionally on the grounds that it "left row 20's `pending_approval` target unreachable and
 silently narrowed a PRD edge". Half of that objection is now moot and half is met head-on. The
 earlier two-row split is folded into the `approved → submitted` row, which carries the §3.6 amendment guards but no guard on the approval verdict,
-and `pending_approval` is reached by row 7, a real edge the sibling gear already drives. What
-remains is a genuine divergence: PRD §6.1's diagram declares a **direct**
-`approved → pending_approval` amendment edge, and this design reaches that state in two steps
-instead. That divergence is **disclosed, not silent** — recorded as
-[`../DECISIONS.md`](../DECISIONS.md) D-61 and routed to Product as Q-12. The same route discloses
-that this design's `pending_approval → submitted` amendment transition conflicts with PRD §6.1's
-statement that amendments from `pending_approval` do not change order state; §10 UC-002 step 3
-and §12 AC-5 then require a return to the pre-approval state, while §5.1 and §6.2 scope that
-clause to `approved` only.
+and `pending_approval` is reached by row 7, a real edge the sibling gear already drives. The historical divergence was recorded by D-61/Q-12. D-174 subsequently selected this
+two-step shape, and S1-01 aligns PRD §6.1, §6.2 and AC-5 with it. Amendments from all three
+admitted source states commit in `submitted`; only a fresh version-specific Workflow
+reflection can then move the new version to `pending_approval` or `approved`. No new verdict
+port or direct amendment edge is introduced.
 
 **What a caller observes.** An amendment returns the new version with the order in `submitted`.
 An order that requires approval is briefly in `submitted` before the sibling gear reflects it to
@@ -492,7 +488,7 @@ path is why no amendment can ever be refused for want of a verdict.
 <!-- contract:04-versioning:4.4 -->
 ### Versioning: Stale results (normative)
 
-Once version N+1 exists, an approval reflection or fulfillment acknowledgement carrying version
+Once version M exists, an approval reflection or fulfillment acknowledgement carrying version
 N **MUST** be refused with the engine's `version-conflict` reason — the identifier for the
 PRD's stale-version condition ([01-foundation — Idempotency Semantics (normative)](01-foundation.md#contract-01-4-2)). The engine performs the check, and
 for these callers it performs it **before** state-table admissibility: every such result is a
@@ -505,7 +501,7 @@ owns the caller contract, which has two obligations. The refusal **MUST** name t
 version, so a caller can re-read and retry rather than poll blindly. And a refused stale result
 **MUST NOT** be treated as a failure of the operation it reports — the approval that was granted
 against version N really was granted, and the sibling gear's correct response is to open a gate
-against version N+1, not to record a denial.
+against version M, not to record a denial.
 
 
 <!-- /contract -->
@@ -561,3 +557,6 @@ add a second concurrency token to clients for fields whose history is already co
 - **ADRs**: [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md) transition through the engine; [`ADR/0002`](../ADR/0002-cpt-cf-bss-orders-lifecycle-adr-slice-decomposition.md) the foundation-plus-seven-slices decomposition
 
 <!-- /contract -->
+
+
+**D-188 reconciliation:** Throughout this feature M denotes the reserved candidate greater than prior committed N, not N+1. Every successful amendment records explicit supersedes_version=N. Candidate failures leave current_version and amendment_count unchanged. History is immutable and may be sparse; the numbered 2-to-3 diagram is only a no-failed-attempt example. See the [normative attempt and sparse-history contract](../DESIGN.md#contract-01-commercial-attempt).

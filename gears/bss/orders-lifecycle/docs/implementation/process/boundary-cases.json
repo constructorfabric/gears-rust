@@ -1,0 +1,2812 @@
+{
+  "format_version": 1,
+  "venue": "S1-05 specification reference model only; not live provider conformance",
+  "cases": [
+    {
+      "id": "exact-terminal-barrier",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": true,
+        "owns_pending_pointer": true,
+        "terminal": true,
+        "all_effects_settled": true,
+        "observed": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        }
+      },
+      "expected": "finalize"
+    },
+    {
+      "id": "barrier-mismatch-control_id",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": true,
+        "owns_pending_pointer": true,
+        "terminal": true,
+        "all_effects_settled": true,
+        "observed": {
+          "control_id": "old",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        }
+      },
+      "expected": "pending_or_refuse"
+    },
+    {
+      "id": "barrier-mismatch-version",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": true,
+        "owns_pending_pointer": true,
+        "terminal": true,
+        "all_effects_settled": true,
+        "observed": {
+          "control_id": "c1",
+          "version": 4,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        }
+      },
+      "expected": "pending_or_refuse"
+    },
+    {
+      "id": "barrier-mismatch-attempt",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": true,
+        "owns_pending_pointer": true,
+        "terminal": true,
+        "all_effects_settled": true,
+        "observed": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "old",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        }
+      },
+      "expected": "pending_or_refuse"
+    },
+    {
+      "id": "barrier-mismatch-generation",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": true,
+        "owns_pending_pointer": true,
+        "terminal": true,
+        "all_effects_settled": true,
+        "observed": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 10,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        }
+      },
+      "expected": "pending_or_refuse"
+    },
+    {
+      "id": "barrier-mismatch-roster_digest",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": true,
+        "owns_pending_pointer": true,
+        "terminal": true,
+        "all_effects_settled": true,
+        "observed": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "old",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        }
+      },
+      "expected": "pending_or_refuse"
+    },
+    {
+      "id": "barrier-mismatch-owner_fence",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": true,
+        "owns_pending_pointer": true,
+        "terminal": true,
+        "all_effects_settled": true,
+        "observed": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 2,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        }
+      },
+      "expected": "pending_or_refuse"
+    },
+    {
+      "id": "barrier-mismatch-targets",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": true,
+        "owns_pending_pointer": true,
+        "terminal": true,
+        "all_effects_settled": true,
+        "observed": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1"
+          ]
+        }
+      },
+      "expected": "pending_or_refuse"
+    },
+    {
+      "id": "barrier-mismatch-targets-duplicate",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": true,
+        "owns_pending_pointer": true,
+        "terminal": true,
+        "all_effects_settled": true,
+        "observed": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r1/k1"
+          ]
+        }
+      },
+      "expected": "pending_or_refuse"
+    },
+    {
+      "id": "barrier-missing-durable_fences",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": false,
+        "reauthorized": true,
+        "owns_pending_pointer": true,
+        "terminal": true,
+        "all_effects_settled": true,
+        "observed": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        }
+      },
+      "expected": "pending_or_refuse"
+    },
+    {
+      "id": "barrier-missing-reauthorized",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": false,
+        "owns_pending_pointer": true,
+        "terminal": true,
+        "all_effects_settled": true,
+        "observed": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        }
+      },
+      "expected": "pending_or_refuse"
+    },
+    {
+      "id": "barrier-missing-owns_pending_pointer",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": true,
+        "owns_pending_pointer": false,
+        "terminal": true,
+        "all_effects_settled": true,
+        "observed": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        }
+      },
+      "expected": "pending_or_refuse"
+    },
+    {
+      "id": "barrier-missing-all_effects_settled",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": true,
+        "owns_pending_pointer": true,
+        "terminal": true,
+        "all_effects_settled": false,
+        "observed": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        }
+      },
+      "expected": "pending_or_refuse"
+    },
+    {
+      "id": "hold-barrier-retains-active",
+      "rule": "barrier",
+      "input": {
+        "expected": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        },
+        "durable_fences": true,
+        "reauthorized": true,
+        "owns_pending_pointer": true,
+        "terminal": false,
+        "all_effects_settled": false,
+        "observed": {
+          "control_id": "c1",
+          "version": 7,
+          "attempt": "attempt-2",
+          "generation": 11,
+          "roster_digest": "digest-a",
+          "owner_fence": 3,
+          "targets": [
+            "r1/k1",
+            "r2/k2"
+          ]
+        }
+      },
+      "expected": "finalize"
+    },
+    {
+      "id": "expired-draft-successor-on-version-7",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "successor"
+    },
+    {
+      "id": "successor-refuses-expected_version",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 4,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "successor-refuses-authorized",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": false,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "successor-refuses-pending_control",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": true,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "successor-refuses-predecessor_closed",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": false,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "successor-refuses-all_old_keys_settled",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": false,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "successor-refuses-same_commercial_roster",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": false,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "successor-refuses-active_members_fixed",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": false,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "successor-refuses-new_keys_only_rebuilt",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": false,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "successor-refuses-generation",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 11,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "successor-refuses-spawn_reset",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": true,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "successor-generation-overflow",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 9223372036854775808,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "force-current-observation",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "current": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "requester": "operator-a",
+        "approver": "operator-b",
+        "both_authorized": true,
+        "age_seconds": 10,
+        "request_is_refusal": true,
+        "revocation_durable": true,
+        "uncertain_claims_retained": true,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": null,
+        "request_prev_hash": null
+      },
+      "expected": "forced_unknown"
+    },
+    {
+      "id": "force-same-timestamp-changed-audit_sequence",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "current": {
+          "audit_sequence": 56,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "requester": "operator-a",
+        "approver": "operator-b",
+        "both_authorized": true,
+        "age_seconds": 10,
+        "request_is_refusal": true,
+        "revocation_durable": true,
+        "uncertain_claims_retained": true,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": null,
+        "request_prev_hash": null
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "force-same-timestamp-changed-state",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "current": {
+          "audit_sequence": 55,
+          "state": "on_hold",
+          "version": 7
+        },
+        "requester": "operator-a",
+        "approver": "operator-b",
+        "both_authorized": true,
+        "age_seconds": 10,
+        "request_is_refusal": true,
+        "revocation_durable": true,
+        "uncertain_claims_retained": true,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": null,
+        "request_prev_hash": null
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "force-same-timestamp-changed-version",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "current": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 8
+        },
+        "requester": "operator-a",
+        "approver": "operator-b",
+        "both_authorized": true,
+        "age_seconds": 10,
+        "request_is_refusal": true,
+        "revocation_durable": true,
+        "uncertain_claims_retained": true,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": null,
+        "request_prev_hash": null
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "force-refuses-approver",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "current": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "requester": "operator-a",
+        "approver": "operator-a",
+        "both_authorized": true,
+        "age_seconds": 10,
+        "request_is_refusal": true,
+        "revocation_durable": true,
+        "uncertain_claims_retained": true,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": null,
+        "request_prev_hash": null
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "force-refuses-both_authorized",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "current": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "requester": "operator-a",
+        "approver": "operator-b",
+        "both_authorized": false,
+        "age_seconds": 10,
+        "request_is_refusal": true,
+        "revocation_durable": true,
+        "uncertain_claims_retained": true,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": null,
+        "request_prev_hash": null
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "force-refuses-age_seconds",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "current": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "requester": "operator-a",
+        "approver": "operator-b",
+        "both_authorized": true,
+        "age_seconds": 86400,
+        "request_is_refusal": true,
+        "revocation_durable": true,
+        "uncertain_claims_retained": true,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": null,
+        "request_prev_hash": null
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "force-refuses-revocation_durable",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "current": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "requester": "operator-a",
+        "approver": "operator-b",
+        "both_authorized": true,
+        "age_seconds": 10,
+        "request_is_refusal": true,
+        "revocation_durable": false,
+        "uncertain_claims_retained": true,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": null,
+        "request_prev_hash": null
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "force-refuses-uncertain_claims_retained",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "current": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "requester": "operator-a",
+        "approver": "operator-b",
+        "both_authorized": true,
+        "age_seconds": 10,
+        "request_is_refusal": true,
+        "revocation_durable": true,
+        "uncertain_claims_retained": false,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": null,
+        "request_prev_hash": null
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "force-refuses-request_is_refusal",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "current": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "requester": "operator-a",
+        "approver": "operator-b",
+        "both_authorized": true,
+        "age_seconds": 10,
+        "request_is_refusal": false,
+        "revocation_durable": true,
+        "uncertain_claims_retained": true,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": null,
+        "request_prev_hash": null
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "ordinary-compensation",
+      "rule": "compensation",
+      "input": {
+        "evidence": {
+          "drafts_voided": [],
+          "activated_rolled_back": [],
+          "activation_dispatched": false,
+          "at_sale_facts_emitted": false,
+          "no_active_subscription_remains": true
+        }
+      },
+      "expected": "ordinary_complete"
+    },
+    {
+      "id": "missing-compensation",
+      "rule": "compensation",
+      "input": {
+        "evidence": null
+      },
+      "expected": "compensation-evidence-missing"
+    },
+    {
+      "id": "invalid-compensation-no_active_subscription_remains-False",
+      "rule": "compensation",
+      "input": {
+        "evidence": {
+          "drafts_voided": [],
+          "activated_rolled_back": [],
+          "activation_dispatched": false,
+          "at_sale_facts_emitted": false,
+          "no_active_subscription_remains": false
+        }
+      },
+      "expected": "compensation-evidence-incomplete"
+    },
+    {
+      "id": "invalid-compensation-no_active_subscription_remains-unknown",
+      "rule": "compensation",
+      "input": {
+        "evidence": {
+          "drafts_voided": [],
+          "activated_rolled_back": [],
+          "activation_dispatched": false,
+          "at_sale_facts_emitted": false,
+          "no_active_subscription_remains": "unknown"
+        }
+      },
+      "expected": "compensation-evidence-incomplete"
+    },
+    {
+      "id": "invalid-compensation-at_sale_facts_emitted-0",
+      "rule": "compensation",
+      "input": {
+        "evidence": {
+          "drafts_voided": [],
+          "activated_rolled_back": [],
+          "activation_dispatched": false,
+          "at_sale_facts_emitted": 0,
+          "no_active_subscription_remains": true
+        }
+      },
+      "expected": "compensation-evidence-incomplete"
+    },
+    {
+      "id": "invalid-compensation-operator_attestation-{}",
+      "rule": "compensation",
+      "input": {
+        "evidence": {
+          "drafts_voided": [],
+          "activated_rolled_back": [],
+          "activation_dispatched": false,
+          "at_sale_facts_emitted": false,
+          "no_active_subscription_remains": true,
+          "operator_attestation": {}
+        }
+      },
+      "expected": "compensation-evidence-incomplete"
+    },
+    {
+      "id": "invalid-compensation-drafts_voided-None",
+      "rule": "compensation",
+      "input": {
+        "evidence": {
+          "drafts_voided": null,
+          "activated_rolled_back": [],
+          "activation_dispatched": false,
+          "at_sale_facts_emitted": false,
+          "no_active_subscription_remains": true
+        }
+      },
+      "expected": "compensation-evidence-incomplete"
+    },
+    {
+      "id": "missing-compensation-member",
+      "rule": "compensation",
+      "input": {
+        "evidence": {
+          "activated_rolled_back": [],
+          "activation_dispatched": false,
+          "at_sale_facts_emitted": false,
+          "no_active_subscription_remains": true
+        }
+      },
+      "expected": "compensation-evidence-incomplete"
+    },
+    {
+      "id": "future-complete-release-proof",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": true,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "eligible_for_pricing_release"
+    },
+    {
+      "id": "retain-without-enabled",
+      "rule": "release",
+      "input": {
+        "enabled": false,
+        "pricing_authority": true,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "retain-without-pricing_authority",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": false,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "retain-without-closure_durable",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": true,
+        "closure_durable": false,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "retain-without-handoff_durable",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": true,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": false,
+        "reports": {
+          "orders": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "retain-missing-owner",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": true,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "retain-status-denied",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": true,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "denied",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "retain-status-unavailable",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": true,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "unavailable",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "retain-generation-5",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": true,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "ok",
+            "generation": 5,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "retain-closed-False",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": true,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "ok",
+            "generation": 6,
+            "closed": false,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "retain-drained-False",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": true,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": false,
+            "holders": 0,
+            "uncertain": 0
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "retain-holders-1",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": true,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 1,
+            "uncertain": 0
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "retain-uncertain-1",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": true,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 1
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        }
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "expired-key-and-lease-do-not-prove-drain",
+      "rule": "release",
+      "input": {
+        "enabled": true,
+        "pricing_authority": true,
+        "closure_durable": true,
+        "writers": [
+          "orders",
+          "subscriptions"
+        ],
+        "generation": 6,
+        "handoff_durable": true,
+        "reports": {
+          "orders": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 1
+          },
+          "subscriptions": {
+            "status": "ok",
+            "generation": 6,
+            "closed": true,
+            "drained": true,
+            "holders": 0,
+            "uncertain": 0
+          }
+        },
+        "key_expired": true,
+        "lease_expired": true
+      },
+      "expected": "retain"
+    },
+    {
+      "id": "payment-authorized",
+      "rule": "payment",
+      "input": {
+        "identity_matches": true,
+        "basis_explicit": true,
+        "outcome": "authorized"
+      },
+      "expected": "satisfied"
+    },
+    {
+      "id": "payment-failed",
+      "rule": "payment",
+      "input": {
+        "identity_matches": true,
+        "basis_explicit": true,
+        "outcome": "failed"
+      },
+      "expected": "evaluate_lifecycle_tolerance"
+    },
+    {
+      "id": "payment-pending",
+      "rule": "payment",
+      "input": {
+        "identity_matches": true,
+        "basis_explicit": true,
+        "outcome": "pending"
+      },
+      "expected": "pending"
+    },
+    {
+      "id": "payment-unavailable",
+      "rule": "payment",
+      "input": {
+        "identity_matches": true,
+        "basis_explicit": true,
+        "outcome": "unavailable"
+      },
+      "expected": "pending"
+    },
+    {
+      "id": "payment-denied",
+      "rule": "payment",
+      "input": {
+        "identity_matches": true,
+        "basis_explicit": true,
+        "outcome": "denied"
+      },
+      "expected": "pending"
+    },
+    {
+      "id": "payment-missing",
+      "rule": "payment",
+      "input": {
+        "identity_matches": true,
+        "basis_explicit": true,
+        "outcome": "missing"
+      },
+      "expected": "pending"
+    },
+    {
+      "id": "payment-tcv-not-authorized-basis",
+      "rule": "payment",
+      "input": {
+        "identity_matches": true,
+        "basis_explicit": false,
+        "outcome": "authorized"
+      },
+      "expected": "invalid_evidence"
+    },
+    {
+      "id": "payment-wrong-version-or-request",
+      "rule": "payment",
+      "input": {
+        "identity_matches": false,
+        "basis_explicit": true,
+        "outcome": "authorized"
+      },
+      "expected": "invalid_evidence"
+    },
+    {
+      "id": "live-customer-consent",
+      "rule": "consent",
+      "input": {
+        "live_requirement": "required",
+        "version_matches": true,
+        "authorized_party": true,
+        "customer_consent": true
+      },
+      "expected": "satisfied"
+    },
+    {
+      "id": "consent-live_requirement",
+      "rule": "consent",
+      "input": {
+        "live_requirement": "unavailable",
+        "version_matches": true,
+        "authorized_party": true,
+        "customer_consent": true
+      },
+      "expected": "acceptance-requirement-unevaluable"
+    },
+    {
+      "id": "consent-version_matches",
+      "rule": "consent",
+      "input": {
+        "live_requirement": "required",
+        "version_matches": false,
+        "authorized_party": true,
+        "customer_consent": true
+      },
+      "expected": "consent_required"
+    },
+    {
+      "id": "consent-authorized_party",
+      "rule": "consent",
+      "input": {
+        "live_requirement": "required",
+        "version_matches": true,
+        "authorized_party": false,
+        "customer_consent": true
+      },
+      "expected": "consent_required"
+    },
+    {
+      "id": "consent-customer_consent",
+      "rule": "consent",
+      "input": {
+        "live_requirement": "required",
+        "version_matches": true,
+        "authorized_party": true,
+        "customer_consent": false
+      },
+      "expected": "consent_required"
+    },
+    {
+      "id": "activation-outcome-applied",
+      "rule": "outcome",
+      "input": {
+        "expected": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "observed": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "status": "applied"
+      },
+      "expected": "activated"
+    },
+    {
+      "id": "activation-outcome-approved",
+      "rule": "outcome",
+      "input": {
+        "expected": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "observed": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "status": "approved"
+      },
+      "expected": "not_complete"
+    },
+    {
+      "id": "activation-outcome-oss_unconfirmed",
+      "rule": "outcome",
+      "input": {
+        "expected": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "observed": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "status": "oss_unconfirmed"
+      },
+      "expected": "not_complete"
+    },
+    {
+      "id": "activation-outcome-failed",
+      "rule": "outcome",
+      "input": {
+        "expected": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "observed": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "status": "failed"
+      },
+      "expected": "not_complete"
+    },
+    {
+      "id": "outcome-mismatch-version",
+      "rule": "outcome",
+      "input": {
+        "expected": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "observed": {
+          "order": "o1",
+          "version": 4,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "status": "applied"
+      },
+      "expected": "not_complete"
+    },
+    {
+      "id": "outcome-mismatch-wave_attempt",
+      "rule": "outcome",
+      "input": {
+        "expected": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "observed": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 1,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "status": "applied"
+      },
+      "expected": "not_complete"
+    },
+    {
+      "id": "outcome-mismatch-correlation_id",
+      "rule": "outcome",
+      "input": {
+        "expected": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "observed": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "other",
+          "transition_request_id": "t1"
+        },
+        "status": "applied"
+      },
+      "expected": "not_complete"
+    },
+    {
+      "id": "outcome-mismatch-transition_request_id",
+      "rule": "outcome",
+      "input": {
+        "expected": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t1"
+        },
+        "observed": {
+          "order": "o1",
+          "version": 7,
+          "line": "l1",
+          "wave": "activate",
+          "kind": "activate",
+          "wave_attempt": 2,
+          "correlation_id": "corr",
+          "transition_request_id": "t2"
+        },
+        "status": "applied"
+      },
+      "expected": "not_complete"
+    },
+    {
+      "id": "single-ended-predecessor-handover",
+      "rule": "handover",
+      "input": {
+        "predecessor_ended": true,
+        "same_scope": true,
+        "unique_successor": true,
+        "durable_link": true
+      },
+      "expected": "admit_linked_successor"
+    },
+    {
+      "id": "no-handover-predecessor_ended",
+      "rule": "handover",
+      "input": {
+        "predecessor_ended": false,
+        "same_scope": true,
+        "unique_successor": true,
+        "durable_link": true
+      },
+      "expected": "no_exemption"
+    },
+    {
+      "id": "no-handover-same_scope",
+      "rule": "handover",
+      "input": {
+        "predecessor_ended": true,
+        "same_scope": false,
+        "unique_successor": true,
+        "durable_link": true
+      },
+      "expected": "no_exemption"
+    },
+    {
+      "id": "no-handover-unique_successor",
+      "rule": "handover",
+      "input": {
+        "predecessor_ended": true,
+        "same_scope": true,
+        "unique_successor": false,
+        "durable_link": true
+      },
+      "expected": "no_exemption"
+    },
+    {
+      "id": "no-handover-durable_link",
+      "rule": "handover",
+      "input": {
+        "predecessor_ended": true,
+        "same_scope": true,
+        "unique_successor": true,
+        "durable_link": false
+      },
+      "expected": "no_exemption"
+    },
+    {
+      "id": "async-clocks-stay-distinct",
+      "rule": "clock",
+      "input": {
+        "quoted_at": "2030-01-01T00:00:00Z",
+        "intent_at": "2030-01-02T01:00:00Z",
+        "applied_at": "2030-01-02T01:00:30Z",
+        "acceptance_at": "2029-12-31T08:00:00Z",
+        "terms_compatible": true,
+        "held_activation_at": "2030-01-01T00:00:00Z",
+        "requested_activation_at": "2030-01-01T00:00:00Z",
+        "profile_supported": true,
+        "status": "applied",
+        "authoritative_outcome": true
+      },
+      "expected": {
+        "service_effective_at": "2030-01-02T01:00:30Z",
+        "quoted_at": "2030-01-01T00:00:00Z",
+        "intent_at": "2030-01-02T01:00:00Z",
+        "acceptance_at": "2029-12-31T08:00:00Z",
+        "held_activation_at": "2030-01-01T00:00:00Z"
+      }
+    },
+    {
+      "id": "clock-incompatibility-not-anchor-rewrite",
+      "rule": "clock",
+      "input": {
+        "quoted_at": "2030-01-01T00:00:00Z",
+        "intent_at": "2030-01-02T01:00:00Z",
+        "applied_at": "2030-01-02T01:00:30Z",
+        "acceptance_at": "2029-12-31T08:00:00Z",
+        "terms_compatible": false,
+        "held_activation_at": "2030-01-01T00:00:00Z",
+        "requested_activation_at": "2030-01-01T00:00:00Z",
+        "profile_supported": true,
+        "status": "applied",
+        "authoritative_outcome": true
+      },
+      "expected": "reconcile_without_rewriting_anchor"
+    },
+    {
+      "id": "failure-confirmed_expiry",
+      "rule": "failure_mapping",
+      "input": {
+        "observation": "confirmed_expiry"
+      },
+      "expected": "order-binding-expired"
+    },
+    {
+      "id": "failure-explicit_closure",
+      "rule": "failure_mapping",
+      "input": {
+        "observation": "explicit_closure"
+      },
+      "expected": "order-binding-expired"
+    },
+    {
+      "id": "failure-temporary_end",
+      "rule": "failure_mapping",
+      "input": {
+        "observation": "temporary_end"
+      },
+      "expected": "order-binding-expired"
+    },
+    {
+      "id": "failure-market_changed",
+      "rule": "failure_mapping",
+      "input": {
+        "observation": "market_changed"
+      },
+      "expected": "market-divergence"
+    },
+    {
+      "id": "failure-successor_price",
+      "rule": "failure_mapping",
+      "input": {
+        "observation": "successor_price"
+      },
+      "expected": "not_expiry"
+    },
+    {
+      "id": "failure-unavailable",
+      "rule": "failure_mapping",
+      "input": {
+        "observation": "unavailable"
+      },
+      "expected": "unresolved"
+    },
+    {
+      "id": "failure-denied",
+      "rule": "failure_mapping",
+      "input": {
+        "observation": "denied"
+      },
+      "expected": "unresolved"
+    },
+    {
+      "id": "failure-mismatch",
+      "rule": "failure_mapping",
+      "input": {
+        "observation": "mismatch"
+      },
+      "expected": "repair_or_compensated_line_failure"
+    },
+    {
+      "id": "failure-retired",
+      "rule": "failure_mapping",
+      "input": {
+        "observation": "retired"
+      },
+      "expected": "repair_or_compensated_line_failure"
+    },
+    {
+      "id": "failure-not_dispatchable",
+      "rule": "failure_mapping",
+      "input": {
+        "observation": "not_dispatchable"
+      },
+      "expected": "reread_without_ack"
+    },
+    {
+      "id": "ack-exact-flat-roster",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": true,
+        "failure_reason": null,
+        "historical_replay": false,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          },
+          {
+            "line": "l2",
+            "status": "activated",
+            "subscription": "s2"
+          }
+        ]
+      },
+      "expected": "completed"
+    },
+    {
+      "id": "ack-missing-line",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": true,
+        "failure_reason": null,
+        "historical_replay": false,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          }
+        ]
+      },
+      "expected": "acknowledgement-lines-incomplete"
+    },
+    {
+      "id": "ack-duplicate-line",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": true,
+        "failure_reason": null,
+        "historical_replay": false,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          },
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          }
+        ]
+      },
+      "expected": "acknowledgement-lines-incomplete"
+    },
+    {
+      "id": "ack-unapplied",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": true,
+        "failure_reason": null,
+        "historical_replay": false,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          },
+          {
+            "line": "l2",
+            "status": "approved",
+            "subscription": "s2"
+          }
+        ]
+      },
+      "expected": "acknowledgement-lines-incomplete"
+    },
+    {
+      "id": "ack-missing-subscription",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": true,
+        "failure_reason": null,
+        "historical_replay": false,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          },
+          {
+            "line": "l2",
+            "status": "activated",
+            "subscription": null
+          }
+        ]
+      },
+      "expected": "acknowledgement-subscription-missing"
+    },
+    {
+      "id": "ack-duplicate-subscription",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": true,
+        "failure_reason": null,
+        "historical_replay": false,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          },
+          {
+            "line": "l2",
+            "status": "activated",
+            "subscription": "s1"
+          }
+        ]
+      },
+      "expected": "acknowledgement-subscription-duplicated"
+    },
+    {
+      "id": "ack-completed-with-reason",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": true,
+        "failure_reason": "order-binding-expired",
+        "historical_replay": false,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          },
+          {
+            "line": "l2",
+            "status": "activated",
+            "subscription": "s2"
+          }
+        ]
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "ack-failed-order-binding-expired",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": false,
+        "failure_reason": "order-binding-expired",
+        "historical_replay": false,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          },
+          {
+            "line": "l2",
+            "status": "activated",
+            "subscription": "s2"
+          }
+        ]
+      },
+      "expected": "validate_compensation"
+    },
+    {
+      "id": "ack-failed-operator-forced-unreconciled",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": false,
+        "failure_reason": "operator-forced-unreconciled",
+        "historical_replay": false,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          },
+          {
+            "line": "l2",
+            "status": "activated",
+            "subscription": "s2"
+          }
+        ]
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "ack-failed-invented",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": false,
+        "failure_reason": "invented",
+        "historical_replay": false,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          },
+          {
+            "line": "l2",
+            "status": "activated",
+            "subscription": "s2"
+          }
+        ]
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "ack-failed-None",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": false,
+        "failure_reason": null,
+        "historical_replay": false,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          },
+          {
+            "line": "l2",
+            "status": "activated",
+            "subscription": "s2"
+          }
+        ]
+      },
+      "expected": "failure-reason-missing"
+    },
+    {
+      "id": "ack-failed-dependency-graph-invalid",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": false,
+        "failure_reason": "dependency-graph-invalid",
+        "historical_replay": false,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          },
+          {
+            "line": "l2",
+            "status": "activated",
+            "subscription": "s2"
+          }
+        ]
+      },
+      "expected": "must_not_emit"
+    },
+    {
+      "id": "historical-graph-decoding-only",
+      "rule": "acknowledgement",
+      "input": {
+        "completed": false,
+        "failure_reason": "dependency-graph-invalid",
+        "historical_replay": true,
+        "roster": [
+          "l1",
+          "l2"
+        ],
+        "lines": [
+          {
+            "line": "l1",
+            "status": "activated",
+            "subscription": "s1"
+          },
+          {
+            "line": "l2",
+            "status": "activated",
+            "subscription": "s2"
+          }
+        ]
+      },
+      "expected": "validate_compensation"
+    },
+    {
+      "id": "rebuild-rejects-state",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "on_hold",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "rebuild-rejects-spawn_recorded",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": false,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "rebuild-rejects-current_predecessor",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": false,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "rebuild-rejects-version_committed",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 12,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": false,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "rebuild-rejects-generation",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 14,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 11
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "force-rejects-request_chain_sequence",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "current": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "requester": "operator-a",
+        "approver": "operator-b",
+        "both_authorized": true,
+        "age_seconds": 10,
+        "request_is_refusal": true,
+        "revocation_durable": true,
+        "uncertain_claims_retained": true,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": 55,
+        "request_prev_hash": null
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "force-rejects-request_prev_hash",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "current": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "requester": "operator-a",
+        "approver": "operator-b",
+        "both_authorized": true,
+        "age_seconds": 10,
+        "request_is_refusal": true,
+        "revocation_durable": true,
+        "uncertain_claims_retained": true,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": null,
+        "request_prev_hash": "not-null"
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "force-rejects-observed",
+      "rule": "forced_freshness",
+      "input": {
+        "observed": null,
+        "current": {
+          "audit_sequence": 55,
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "requester": "operator-a",
+        "approver": "operator-b",
+        "both_authorized": true,
+        "age_seconds": 10,
+        "request_is_refusal": true,
+        "revocation_durable": true,
+        "uncertain_claims_retained": true,
+        "requested_at": "2030-01-01T00:00:00Z",
+        "state_entered_at": "2030-01-01T00:00:00Z",
+        "request_chain_sequence": null,
+        "request_prev_hash": null
+      },
+      "expected": "refuse"
+    },
+    {
+      "id": "clock-rejects-profile_supported",
+      "rule": "clock",
+      "input": {
+        "quoted_at": "2030-01-01T00:00:00Z",
+        "intent_at": "2030-01-02T01:00:00Z",
+        "applied_at": "2030-01-02T01:00:30Z",
+        "acceptance_at": "2029-12-31T08:00:00Z",
+        "terms_compatible": true,
+        "held_activation_at": "2030-01-01T00:00:00Z",
+        "requested_activation_at": "2030-01-01T00:00:00Z",
+        "profile_supported": false,
+        "status": "applied",
+        "authoritative_outcome": true
+      },
+      "expected": "reconcile_without_rewriting_anchor"
+    },
+    {
+      "id": "clock-rejects-requested_activation_at",
+      "rule": "clock",
+      "input": {
+        "quoted_at": "2030-01-01T00:00:00Z",
+        "intent_at": "2030-01-02T01:00:00Z",
+        "applied_at": "2030-01-02T01:00:30Z",
+        "acceptance_at": "2029-12-31T08:00:00Z",
+        "terms_compatible": true,
+        "held_activation_at": "2030-01-01T00:00:00Z",
+        "requested_activation_at": "2030-01-02T01:00:30Z",
+        "profile_supported": true,
+        "status": "applied",
+        "authoritative_outcome": true
+      },
+      "expected": "reconcile_without_rewriting_anchor"
+    },
+    {
+      "id": "clock-rejects-status",
+      "rule": "clock",
+      "input": {
+        "quoted_at": "2030-01-01T00:00:00Z",
+        "intent_at": "2030-01-02T01:00:00Z",
+        "applied_at": "2030-01-02T01:00:30Z",
+        "acceptance_at": "2029-12-31T08:00:00Z",
+        "terms_compatible": true,
+        "held_activation_at": "2030-01-01T00:00:00Z",
+        "requested_activation_at": "2030-01-01T00:00:00Z",
+        "profile_supported": true,
+        "status": "approved",
+        "authoritative_outcome": true
+      },
+      "expected": "reconcile_without_rewriting_anchor"
+    },
+    {
+      "id": "clock-rejects-authoritative_outcome",
+      "rule": "clock",
+      "input": {
+        "quoted_at": "2030-01-01T00:00:00Z",
+        "intent_at": "2030-01-02T01:00:00Z",
+        "applied_at": "2030-01-02T01:00:30Z",
+        "acceptance_at": "2029-12-31T08:00:00Z",
+        "terms_compatible": true,
+        "held_activation_at": "2030-01-01T00:00:00Z",
+        "requested_activation_at": "2030-01-01T00:00:00Z",
+        "profile_supported": true,
+        "status": "applied",
+        "authoritative_outcome": false
+      },
+      "expected": "reconcile_without_rewriting_anchor"
+    },
+    {
+      "id": "rebuild-after-control-generation-gap",
+      "rule": "replacement",
+      "input": {
+        "current_version": 7,
+        "expected_version": 7,
+        "authorized": true,
+        "pending_control": false,
+        "predecessor_closed": true,
+        "all_old_keys_settled": true,
+        "same_commercial_roster": true,
+        "active_members_fixed": true,
+        "new_keys_only_rebuilt": true,
+        "generation": 14,
+        "previous_generation": 11,
+        "spawn_reset": false,
+        "state": "in_fulfillment",
+        "spawn_recorded": true,
+        "current_predecessor": true,
+        "version_committed": true,
+        "aggregate_generation": 13
+      },
+      "expected": "successor"
+    }
+  ]
+}

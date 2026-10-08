@@ -154,13 +154,59 @@ fn migration_table_name(gear_name: &str) -> String {
     format!("{PREFIX}{prefix_part}{SEP}{hash8}")
 }
 
+/// Whether the migration history table already exists in the connection's current schema.
+///
+/// Probed before any DDL so that a connection whose role may only read an already-migrated
+/// schema (a restricted runtime login, separate from the migration/admin login) never issues
+/// `CREATE TABLE IF NOT EXISTS`: `PostgreSQL` checks `CREATE` on the schema before it checks
+/// whether the table exists, so the statement is refused even when there is nothing to create.
+async fn migration_table_exists(
+    conn: &impl ConnectionTrait,
+    table_name: &str,
+    gear_name: &str,
+) -> Result<bool, MigrationError> {
+    let backend = conn.get_database_backend();
+    let statement = match backend {
+        DatabaseBackend::Postgres => Statement::from_sql_and_values(
+            backend,
+            "SELECT 1 AS present FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1",
+            [table_name.into()],
+        ),
+        DatabaseBackend::MySql => Statement::from_sql_and_values(
+            backend,
+            "SELECT 1 AS present FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?",
+            [table_name.into()],
+        ),
+        DatabaseBackend::Sqlite => Statement::from_sql_and_values(
+            backend,
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?",
+            [table_name.into()],
+        ),
+        _ => return Err(unsupported_backend(gear_name, backend)),
+    };
+    let row = conn
+        .query_one_raw(statement)
+        .await
+        .map_err(|e| MigrationError::CreateTable {
+            gear: gear_name.to_owned(),
+            source: e,
+        })?;
+    Ok(row.is_some())
+}
+
 /// Create the migration history table for a gear if it doesn't exist.
+///
+/// An existing table is left untouched without any DDL (see [`migration_table_exists`]); the
+/// `IF NOT EXISTS` below only guards the race between two runtimes creating it at once.
 async fn ensure_migration_table(
     conn: &impl ConnectionTrait,
     table_name: &str,
     gear_name: &str,
 ) -> Result<(), MigrationError> {
     let backend = conn.get_database_backend();
+    if migration_table_exists(conn, table_name, gear_name).await? {
+        return Ok(());
+    }
 
     let sql = match backend {
         DatabaseBackend::Postgres => format!(
