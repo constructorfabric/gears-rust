@@ -101,7 +101,7 @@ fn a_refused_idempotency_key_names_its_field_and_reason() {
         assert_eq!(field_violations[0].field, "idempotency_key", "{bad:?}");
         assert_eq!(
             field_violations[0].reason,
-            crate::entity_models::INVALID_IDEMPOTENCY_KEY,
+            crate::field::INVALID_IDEMPOTENCY_KEY,
             "{bad:?}"
         );
     }

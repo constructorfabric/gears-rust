@@ -2,8 +2,9 @@
 //! Reject unreadable conditions: answering unconditionally would change the caller’s request.
 
 use toolkit_canonical_errors::CanonicalError;
+use types_registry_sdk::field;
 
-use crate::api::error::{malformed_condition, validator_too_long, violation_field};
+use crate::api::error::{malformed_condition, validator_too_long};
 use crate::domain::registry_service::MAX_KEY_LEN;
 use crate::domain::validator::{IfNoneMatch, Validator};
 
@@ -38,12 +39,12 @@ pub fn item_condition(tag: &str) -> Result<IfNoneMatch, CanonicalError> {
     let tag = tag.trim();
     if tag == "*" {
         return Err(malformed_condition(
-            violation_field::IF_NONE_MATCH_ITEM,
+            field::IF_NONE_MATCH_FIELD,
             "if_none_match takes the etag of an earlier read, and `*` is not one",
         ));
     }
     Ok(IfNoneMatch::Validators(vec![token(
         tag,
-        violation_field::IF_NONE_MATCH_ITEM,
+        field::IF_NONE_MATCH_FIELD,
     )?]))
 }

@@ -77,7 +77,8 @@ fn reason(outcome: &Outcome) -> String {
         ) => e,
         Outcome::Admitted => return "admitted".to_owned(),
     };
-    AdmissionFailure::from_canonical(error).map_or_else(|| format!("{error:?}"), |f| f.reason)
+    AdmissionFailure::from_canonical(error)
+        .map_or_else(|| format!("{error:?}"), |f| f.reason.as_wire().to_owned())
 }
 
 fn keys(submissions: &[(IdempotencyKey, RegisterEntitiesRequest)]) -> Vec<String> {
@@ -765,7 +766,13 @@ fn every_exact_reason_maps_to_its_outcome() {
     let failed = |r: &str| {
         classify(
             CandidateStatus::Failed,
-            Some(AdmissionFailure::new(r, "m").into_canonical(A)),
+            Some(
+                AdmissionFailure::new(
+                    crate::item_failure::AdmissionFailureReason::from_wire(r),
+                    "m",
+                )
+                .into_canonical(A),
+            ),
         )
     };
     for r in [

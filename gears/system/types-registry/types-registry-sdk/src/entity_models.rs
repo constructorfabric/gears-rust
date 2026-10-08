@@ -389,9 +389,6 @@ pub struct ListEntitiesResponse {
 
 // ---- write path -------------------------------------------------------------
 
-/// The `field_violations[].reason` of a refused [`IdempotencyKey`].
-pub const INVALID_IDEMPOTENCY_KEY: &str = "INVALID_IDEMPOTENCY_KEY";
-
 /// Mutation replay key for one identical request (ADR-0012); changed requests need a new key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IdempotencyKey(String);
@@ -430,7 +427,11 @@ impl IdempotencyKey {
         match refusal {
             None => Ok(Self(key)),
             Some(detail) => Err(crate::gts::TypeResource::invalid_argument()
-                .with_field_violation("idempotency_key", detail, INVALID_IDEMPOTENCY_KEY)
+                .with_field_violation(
+                    crate::field::IDEMPOTENCY_KEY_FIELD,
+                    detail,
+                    crate::field::INVALID_IDEMPOTENCY_KEY,
+                )
                 .create()),
         }
     }

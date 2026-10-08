@@ -52,6 +52,7 @@ pub mod item_failure;
 pub mod precondition;
 pub mod publication;
 pub mod publish;
+pub mod reason;
 pub mod reconcile;
 pub mod supervised;
 

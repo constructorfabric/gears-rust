@@ -40,8 +40,20 @@ fn a_precondition_above_the_stored_range_is_refused_not_wrapped() {
     else {
         panic!("not a field violation: {error:?}");
     };
-    assert_eq!(field_violations[0].field, "expected_resource_version");
-    assert_eq!(field_violations[0].reason, "INVALID_RESOURCE_VERSION");
+    assert_eq!(
+        field_violations[0].field,
+        types_registry_sdk::field::EXPECTED_RESOURCE_VERSION_FIELD
+    );
+    assert_eq!(
+        field_violations[0].reason,
+        types_registry_sdk::field::VALIDATION_FAILED,
+        "the same shape the ladder gives an unusable precondition"
+    );
+    assert_eq!(
+        error.resource_name(),
+        Some("k"),
+        "the candidate is the resource"
+    );
 }
 
 #[test]

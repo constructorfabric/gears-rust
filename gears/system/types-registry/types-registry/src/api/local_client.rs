@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use types_registry_sdk::field;
 
 use async_trait::async_trait;
 use gts::GtsId;
@@ -12,12 +13,13 @@ use serde_json::value::RawValue;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk as sdk;
+use types_registry_sdk::item_failure::AdmissionFailureReason;
 use types_registry_sdk::{AdmissionFailure, PlatformTypesRegistryApi};
 use uuid::Uuid;
 
 use super::encoding::cursor::{self, Binding};
 use super::encoding::entity_tag;
-use super::error::{OperationError, TypeRegistryError, malformed_condition, violation_field};
+use super::error::{OperationError, invalid_version, malformed_condition};
 use crate::domain::admission::{
     Candidate, DeleteRequest, DeleteTarget, StoredFailure, SubmitRequest, UnreadableFailure,
 };
@@ -248,7 +250,7 @@ fn read_back_failed(operation_id: Uuid, why: &str) -> CanonicalError {
         "operation {operation_id} was accepted, but {why}; retry with the same idempotency key"
     ))
     .with_resource(operation_id.to_string())
-    .with_reason("OPERATION_READ_FAILED")
+    .with_reason(types_registry_sdk::reason::aborted::OPERATION_READ_FAILED)
     .create()
 }
 
@@ -292,22 +294,20 @@ fn corrupt(
 fn validator_text(validator: &sdk::Validator) -> Result<&str, CanonicalError> {
     std::str::from_utf8(validator.as_bytes()).map_err(|_| {
         malformed_condition(
-            violation_field::IF_NONE_MATCH_ITEM,
+            field::IF_NONE_MATCH_FIELD,
             "a validator from this registry is entity-tag text",
         )
     })
 }
 
-/// `u64` precondition to the service's `i64`; above `i64::MAX` cannot exist.
+/// `u64` precondition to the service's `i64`; above `i64::MAX` cannot exist. Refused in
+/// the ladder's own shape for an unusable `expected_resource_version`.
 fn stored_version(key: &str, version: u64) -> Result<i64, CanonicalError> {
     i64::try_from(version).map_err(|_| {
-        TypeRegistryError::invalid_argument()
-            .with_field_violation(
-                "expected_resource_version",
-                format!("'{key}': {version} is not a resource version this registry issues"),
-                "INVALID_RESOURCE_VERSION",
-            )
-            .create()
+        invalid_version(
+            key,
+            format!("{version} is not a resource version this registry issues"),
+        )
     })
 }
 
@@ -572,7 +572,10 @@ fn item_failure(
                 .into_iter()
                 .filter_map(|(name, value)| Some((name, value?)))
                 .fold(
-                    AdmissionFailure::new(failure.reason, failure.message),
+                    AdmissionFailure::new(
+                        AdmissionFailureReason::from_wire(&failure.reason),
+                        failure.message,
+                    ),
                     |acc, (name, value)| acc.with_context(name, value),
                 )
         }
@@ -580,14 +583,11 @@ fn item_failure(
             tracing::error!(
                 %operation_id,
                 entity_key = %key,
-                reason = unreadable.reason.as_str(),
+                reason = unreadable.reason.as_wire(),
                 cause = %unreadable.cause,
                 "types_registry cannot read a stored item failure"
             );
-            AdmissionFailure::new(
-                unreadable.reason.as_str(),
-                "the recorded failure could not be read",
-            )
+            AdmissionFailure::new(unreadable.reason, "the recorded failure could not be read")
         }
     }
 }

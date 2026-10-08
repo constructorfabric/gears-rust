@@ -512,7 +512,7 @@ fn settled_superseded(
 fn rejection_of(error: &CanonicalError) -> RejectionReason {
     if let Some(failure) = AdmissionFailure::from_canonical(error) {
         return RejectionReason::Registry {
-            reason: failure.reason,
+            reason: failure.reason.as_wire().to_owned(),
             message: failure.message,
         };
     }

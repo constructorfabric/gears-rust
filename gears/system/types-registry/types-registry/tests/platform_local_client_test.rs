@@ -475,7 +475,10 @@ async fn deletion_round_trips_and_a_failed_item_carries_its_reason() {
     assert_eq!(stale.items[0].status, CandidateStatus::Failed);
     let failure = AdmissionFailure::from_canonical(stale.items[0].error.as_ref().expect("error"))
         .expect("decodes");
-    assert_eq!(failure.reason, "precondition_failed");
+    assert_eq!(
+        failure.reason,
+        types_registry_sdk::item_failure::AdmissionFailureReason::PreconditionFailed
+    );
 
     let ok = h
         .client

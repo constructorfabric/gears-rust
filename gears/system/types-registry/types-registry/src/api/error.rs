@@ -164,7 +164,7 @@ impl From<ServiceError> for CanonicalError {
             // rather than the configuration key holding it — as
             // `AcceptanceError::BatchTooLarge` does, and for the same reason.
             ServiceError::BatchReadOutOfRange { count } => invalid_field(
-                violation_field::ITEMS,
+                field::ITEMS_FIELD,
                 format!(
                     "a batch read must name between 1 and {MAX_BATCH_GET_KEYS} keys; \
                      this one named {count}"
@@ -172,7 +172,7 @@ impl From<ServiceError> for CanonicalError {
                 field::VALIDATION_FAILED,
             ),
             ServiceError::PageSizeOutOfRange { limit, max } => invalid_field(
-                violation_field::LIMIT,
+                field::LIMIT_FIELD,
                 format!("a page size must be between 1 and {max}; this request asked for {limit}"),
                 field::VALIDATION_FAILED,
             ),
@@ -180,7 +180,7 @@ impl From<ServiceError> for CanonicalError {
             // refused, which is what a caller fixing a wildcard needs, and it
             // describes the caller's input rather than anything of ours.
             ServiceError::InvalidPattern { message } => invalid_field(
-                violation_field::PATTERN,
+                field::PATTERN_FIELD,
                 format!("the pattern is not a GTS identifier pattern: {message}"),
                 field::INVALID_QUERY,
             ),
@@ -188,7 +188,7 @@ impl From<ServiceError> for CanonicalError {
             // Only a batch item reaches the domain bound; the header is bounded
             // when it is parsed.
             ServiceError::ValidatorTooLong { len } => {
-                validator_too_long(violation_field::IF_NONE_MATCH_ITEM, len)
+                validator_too_long(field::IF_NONE_MATCH_FIELD, len)
             }
         }
     }
@@ -296,29 +296,6 @@ impl From<WorkerError> for CanonicalError {
     }
 }
 
-/// The field names this mapping keys violations by, beyond the two `field::`
-/// constants the SDK already publishes.
-///
-/// Header and query-parameter names are spelled exactly as the caller sent them,
-/// `$select` included, so a caller greps the violation for the thing it wrote.
-pub(super) mod violation_field {
-    pub const IDEMPOTENCY_KEY: &str = "Idempotency-Key";
-    pub const IF_MATCH: &str = "If-Match";
-    pub const IF_NONE_MATCH: &str = "If-None-Match";
-    pub const ITEMS: &str = "items";
-    pub const ENTITY_KEY: &str = "entity_key";
-    pub const IF_NONE_MATCH_ITEM: &str = "if_none_match";
-    pub const FORCE: &str = "force";
-    pub const EXPECTED_RESOURCE_VERSION: &str = "expected_resource_version";
-    pub const PATTERN: &str = "pattern";
-    pub const KIND: &str = "kind";
-    pub const LIFECYCLE_STATUS: &str = "lifecycle_status";
-    pub const DEPTH: &str = "depth";
-    pub const LIMIT: &str = "limit";
-    pub const CURSOR: &str = "cursor";
-    pub const SELECT: &str = "$select";
-}
-
 /// One invalid-argument problem keyed by a field, with no resource attached.
 fn invalid_field(field_name: &str, detail: String, code: &str) -> CanonicalError {
     TypeRegistryError::invalid_argument()
@@ -336,7 +313,7 @@ fn invalid_field(field_name: &str, detail: String, code: &str) -> CanonicalError
 #[must_use]
 pub fn idempotency_key_not_utf8() -> CanonicalError {
     invalid_field(
-        violation_field::IDEMPOTENCY_KEY,
+        field::IDEMPOTENCY_KEY_HEADER,
         "the Idempotency-Key header is not valid UTF-8".to_owned(),
         field::VALIDATION_FAILED,
     )
@@ -347,7 +324,7 @@ pub fn idempotency_key_not_utf8() -> CanonicalError {
 #[must_use]
 pub fn if_match_not_supported() -> CanonicalError {
     invalid_field(
-        violation_field::IF_MATCH,
+        field::IF_MATCH_HEADER,
         "If-Match is not supported on this route; name the precondition in \
          expected_resource_version, whose failure is reported on the operation item"
             .to_owned(),
@@ -364,7 +341,7 @@ pub fn if_match_not_supported() -> CanonicalError {
 #[must_use]
 pub fn if_none_match_not_supported() -> CanonicalError {
     invalid_field(
-        violation_field::IF_NONE_MATCH,
+        field::IF_NONE_MATCH_HEADER,
         "If-None-Match is not supported on a batch read; carry each key's validator \
          in that item's if_none_match, because one header cannot represent a batch"
             .to_owned(),
@@ -382,7 +359,7 @@ fn shown(raw: &str) -> String {
 pub fn depth_not_recognized(raw: &str) -> CanonicalError {
     let shown = shown(raw);
     invalid_field(
-        violation_field::DEPTH,
+        field::DEPTH_FIELD,
         format!("depth must be an integer from 1 to 255, not `{shown}`"),
         field::VALIDATION_FAILED,
     )
@@ -392,7 +369,7 @@ pub fn depth_not_recognized(raw: &str) -> CanonicalError {
 pub fn kind_not_recognized(raw: &str) -> CanonicalError {
     let shown = shown(raw);
     invalid_field(
-        violation_field::KIND,
+        field::KIND_FIELD,
         format!("kind must be `type_schema` or `instance`, not `{shown}`"),
         field::VALIDATION_FAILED,
     )
@@ -402,7 +379,7 @@ pub fn kind_not_recognized(raw: &str) -> CanonicalError {
 pub fn lifecycle_status_not_recognized(raw: &str) -> CanonicalError {
     let shown = shown(raw);
     invalid_field(
-        violation_field::LIFECYCLE_STATUS,
+        field::LIFECYCLE_STATUS_FIELD,
         format!("lifecycle_status must be `active`, `deleted` or `all`, not `{shown}`"),
         field::VALIDATION_FAILED,
     )
@@ -418,9 +395,6 @@ pub fn page_size_zero(name: &str) -> CanonicalError {
         field::VALIDATION_FAILED,
     )
 }
-
-/// Reason code of every `$select` refusal, matching `ToolKit`'s own `$select` parser.
-const INVALID_SELECT: &str = "INVALID_SELECT";
 
 #[must_use]
 pub fn select_refused(error: &SelectionError) -> CanonicalError {
@@ -442,7 +416,7 @@ pub fn select_refused(error: &SelectionError) -> CanonicalError {
             format!("'{name}' names a path inside a field; $select takes whole top-level fields")
         }
     };
-    invalid_field(violation_field::SELECT, detail, INVALID_SELECT)
+    invalid_field(field::SELECT_FIELD, detail, field::INVALID_SELECT)
 }
 
 /// One violation per key, with `ToolKit`'s reason code for the `$` namespace.
@@ -456,7 +430,7 @@ pub fn unsupported_query_params(keys: &[&str], allowed: &[&str]) -> CanonicalErr
     let violation = |key: &str| {
         let key = shown(key);
         let detail = format!("unsupported query parameter `{key}`; {accepted}");
-        (key, detail, "UNSUPPORTED_QUERY_PARAM")
+        (key, detail, field::UNSUPPORTED_QUERY_PARAM)
     };
     let Some((first, rest)) = keys.split_first() else {
         return query_params_unreadable("no parameter to refuse");
@@ -473,7 +447,7 @@ pub fn unsupported_query_params(keys: &[&str], allowed: &[&str]) -> CanonicalErr
 #[must_use]
 pub fn too_many_query_params(count: usize, max: usize) -> CanonicalError {
     invalid_field(
-        "query",
+        field::QUERY_FIELD,
         format!("at most {max} query parameters are accepted; this request has {count}"),
         field::VALIDATION_FAILED,
     )
@@ -491,7 +465,7 @@ pub fn duplicate_query_param(key: &str) -> CanonicalError {
 #[must_use]
 pub fn query_params_unreadable(detail: &str) -> CanonicalError {
     invalid_field(
-        "query",
+        field::QUERY_FIELD,
         format!("the query string could not be read: {detail}"),
         field::VALIDATION_FAILED,
     )
@@ -506,7 +480,7 @@ fn selectable_fields() -> String {
 #[must_use]
 pub fn key_too_long(len: usize) -> CanonicalError {
     invalid_field(
-        violation_field::ENTITY_KEY,
+        field::ENTITY_KEY_FIELD,
         format!("a key must be at most {MAX_KEY_LEN} bytes; this one is {len}"),
         field::VALIDATION_FAILED,
     )
@@ -540,7 +514,7 @@ pub fn malformed_condition(field_name: &'static str, detail: &str) -> CanonicalE
 #[must_use]
 pub fn pattern_too_long(len: usize) -> CanonicalError {
     invalid_field(
-        violation_field::PATTERN,
+        field::PATTERN_FIELD,
         format!("pattern must be at most 1024 bytes; this one is {len}"),
         field::VALIDATION_FAILED,
     )
@@ -551,7 +525,7 @@ pub fn pattern_too_long(len: usize) -> CanonicalError {
 #[must_use]
 pub fn cursor_too_long(len: usize) -> CanonicalError {
     invalid_field(
-        violation_field::CURSOR,
+        field::CURSOR_FIELD,
         format!("cursor must be at most 4096 bytes; this one is {len}"),
         field::VALIDATION_FAILED,
     )
@@ -566,7 +540,7 @@ pub fn cursor_too_long(len: usize) -> CanonicalError {
 #[must_use]
 pub fn cursor_not_usable(detail: &str) -> CanonicalError {
     invalid_field(
-        violation_field::CURSOR,
+        field::CURSOR_FIELD,
         format!("the cursor cannot be used for this request: {detail}"),
         field::VALIDATION_FAILED,
     )
@@ -581,10 +555,10 @@ fn invalid_candidate(gts_id: &str, field_name: &str, detail: String, code: &str)
 }
 
 /// A refused `expected_resource_version`, naming the candidate as the resource.
-fn invalid_version(gts_id: &str, detail: String) -> CanonicalError {
+pub(super) fn invalid_version(gts_id: &str, detail: String) -> CanonicalError {
     invalid_candidate(
         gts_id,
-        violation_field::EXPECTED_RESOURCE_VERSION,
+        field::EXPECTED_RESOURCE_VERSION_FIELD,
         detail,
         field::VALIDATION_FAILED,
     )
@@ -592,16 +566,15 @@ fn invalid_version(gts_id: &str, detail: String) -> CanonicalError {
 
 impl From<AcceptanceError> for CanonicalError {
     fn from(e: AcceptanceError) -> Self {
-        use violation_field as vf;
         match &e {
             // --- the envelope -------------------------------------------------
             AcceptanceError::MissingIdempotencyKey => invalid_field(
-                vf::IDEMPOTENCY_KEY,
+                field::IDEMPOTENCY_KEY_HEADER,
                 "an Idempotency-Key header is required".to_owned(),
                 field::VALIDATION_FAILED,
             ),
             AcceptanceError::IdempotencyKeyTooLong { length } => invalid_field(
-                vf::IDEMPOTENCY_KEY,
+                field::IDEMPOTENCY_KEY_HEADER,
                 format!(
                     "an Idempotency-Key may be at most {MAX_IDEMPOTENCY_KEY} characters; \
                      this one is {length}"
@@ -609,14 +582,14 @@ impl From<AcceptanceError> for CanonicalError {
                 field::VALIDATION_FAILED,
             ),
             AcceptanceError::EmptyBatch => invalid_field(
-                vf::ITEMS,
+                field::ITEMS_FIELD,
                 "a request must carry at least one entity".to_owned(),
                 field::VALIDATION_FAILED,
             ),
             // The limit is a deployment setting, so the number is given rather
             // than the config key that holds it.
             AcceptanceError::BatchTooLarge { count, limit } => invalid_field(
-                vf::ITEMS,
+                field::ITEMS_FIELD,
                 format!("{count} entities exceeds the limit of {limit} per request"),
                 field::VALIDATION_FAILED,
             ),
@@ -649,7 +622,7 @@ impl From<AcceptanceError> for CanonicalError {
                 first_index,
                 second_index,
             } => invalid_field(
-                vf::ENTITY_KEY,
+                field::ENTITY_KEY_FIELD,
                 format!("items[{first_index}] and items[{second_index}] name the same entity"),
                 field::VALIDATION_FAILED,
             ),
@@ -738,13 +711,13 @@ impl From<AcceptanceError> for CanonicalError {
             // is told the outcome rather than the setting to go and change.
             AcceptanceError::ForceNotPermitted { gts_id } => invalid_candidate(
                 gts_id,
-                vf::FORCE,
+                field::FORCE_FIELD,
                 format!("force is not permitted on '{gts_id}' in this deployment"),
                 field::VALIDATION_FAILED,
             ),
             AcceptanceError::ForceHasNothingToWaive { gts_id } => invalid_candidate(
                 gts_id,
-                vf::FORCE,
+                field::FORCE_FIELD,
                 format!("force on '{gts_id}' has no cross-minor compatibility check to waive"),
                 field::VALIDATION_FAILED,
             ),
@@ -796,9 +769,13 @@ impl From<AcceptanceError> for CanonicalError {
                         .0
                         .region
                         .clone()
-                        .unwrap_or_else(|| "<default>".to_owned()),
+                        .unwrap_or_else(|| precondition::DEFAULT_REGION.to_owned()),
                     refusal.to_string(),
-                    format!("REGISTRATION_POLICY_{}", refusal.0.parameter.to_uppercase()),
+                    format!(
+                        "{}{}",
+                        precondition::REGISTRATION_POLICY_PREFIX,
+                        refusal.0.parameter.to_uppercase()
+                    ),
                 )
                 .create(),
 
@@ -874,27 +851,27 @@ mod tests {
         let cases = vec![
             (
                 AcceptanceError::MissingIdempotencyKey,
-                violation_field::IDEMPOTENCY_KEY,
+                field::IDEMPOTENCY_KEY_HEADER,
                 field::VALIDATION_FAILED,
             ),
             (
                 AcceptanceError::IdempotencyKeyTooLong { length: 300 },
-                violation_field::IDEMPOTENCY_KEY,
+                field::IDEMPOTENCY_KEY_HEADER,
                 field::VALIDATION_FAILED,
             ),
             (
                 AcceptanceError::EmptyBatch,
-                violation_field::ITEMS,
+                field::ITEMS_FIELD,
                 field::VALIDATION_FAILED,
             ),
             (
                 AcceptanceError::BatchTooLarge { count: 2, limit: 1 },
-                violation_field::ITEMS,
+                field::ITEMS_FIELD,
                 field::VALIDATION_FAILED,
             ),
             (
                 AcceptanceError::KeyTooLong { length: 1025 },
-                violation_field::ENTITY_KEY,
+                field::ENTITY_KEY_FIELD,
                 field::VALIDATION_FAILED,
             ),
             (
@@ -920,12 +897,12 @@ mod tests {
                     first_index: 0,
                     second_index: 1,
                 },
-                violation_field::ENTITY_KEY,
+                field::ENTITY_KEY_FIELD,
                 field::VALIDATION_FAILED,
             ),
             (
                 AcceptanceError::DeletionZeroPrecondition { gts_id: id.clone() },
-                violation_field::EXPECTED_RESOURCE_VERSION,
+                field::EXPECTED_RESOURCE_VERSION_FIELD,
                 field::VALIDATION_FAILED,
             ),
             (
@@ -988,12 +965,12 @@ mod tests {
             ),
             (
                 AcceptanceError::ForceNotPermitted { gts_id: id.clone() },
-                violation_field::FORCE,
+                field::FORCE_FIELD,
                 field::VALIDATION_FAILED,
             ),
             (
                 AcceptanceError::ForceHasNothingToWaive { gts_id: id.clone() },
-                violation_field::FORCE,
+                field::FORCE_FIELD,
                 field::VALIDATION_FAILED,
             ),
             (
@@ -1003,12 +980,12 @@ mod tests {
             ),
             (
                 AcceptanceError::MinorTypeSchemaRevision { gts_id: id.clone() },
-                violation_field::EXPECTED_RESOURCE_VERSION,
+                field::EXPECTED_RESOURCE_VERSION_FIELD,
                 field::VALIDATION_FAILED,
             ),
             (
                 AcceptanceError::ZeroPrecondition { gts_id: id.clone() },
-                violation_field::EXPECTED_RESOURCE_VERSION,
+                field::EXPECTED_RESOURCE_VERSION_FIELD,
                 field::VALIDATION_FAILED,
             ),
             (
@@ -1016,7 +993,7 @@ mod tests {
                     gts_id: id,
                     version: -1,
                 },
-                violation_field::EXPECTED_RESOURCE_VERSION,
+                field::EXPECTED_RESOURCE_VERSION_FIELD,
                 field::VALIDATION_FAILED,
             ),
         ];
@@ -1044,7 +1021,7 @@ mod tests {
             .expect("policy refusal must carry a precondition violation");
         assert_eq!(
             violation.get("type").and_then(serde_json::Value::as_str),
-            Some("REGISTRATION_POLICY_ALLOWED_VENDORS"),
+            Some(precondition::REGISTRATION_POLICY_ALLOWED_VENDORS),
         );
 
         let operation_id = uuid::Uuid::nil();

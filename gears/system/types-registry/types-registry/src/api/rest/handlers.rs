@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use types_registry_sdk::field;
 
 use axum::Json;
 use axum::extract::{Extension, OriginalUri};
@@ -443,7 +444,7 @@ pub async fn batch_get_entities(
             && validator.len() > MAX_KEY_LEN
         {
             return Err(super::error::validator_too_long(
-                super::error::violation_field::IF_NONE_MATCH_ITEM,
+                field::IF_NONE_MATCH_FIELD,
                 validator.len(),
             ));
         }

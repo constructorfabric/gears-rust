@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use gts::GtsIdSegment;
 use types_registry_sdk::RegisterSummary;
+use types_registry_sdk::item_failure::context;
 
 use crate::domain::admission::{AdmissionFailureReason, StoredFailure, UnreadableFailure};
 use crate::domain::enums::{
@@ -1201,7 +1202,7 @@ fn item_error(
                 tracing::error!(
                     %operation_id,
                     entity_key = %key,
-                    reason = unreadable.reason.as_str(),
+                    reason = unreadable.reason.as_wire(),
                     cause = %unreadable.cause,
                     "types_registry cannot read a stored item failure"
                 );
@@ -1242,7 +1243,7 @@ impl OperationItemErrorDto {
     /// Reported by reason; the stored text is never echoed.
     fn unreadable(reason: &AdmissionFailureReason) -> Self {
         Self {
-            reason: reason.as_str().to_owned(),
+            reason: reason.as_wire().to_owned(),
             message: "the recorded failure could not be read".to_owned(),
             context: serde_json::Map::new(),
         }
@@ -1253,9 +1254,9 @@ impl From<StoredFailure> for OperationItemErrorDto {
     /// `operation_id` is not exposed: it is always the enclosing operation.
     fn from(failure: StoredFailure) -> Self {
         let context = [
-            ("dependency_id", failure.dependency_id),
-            ("dependency_kind", failure.dependency_kind),
-            ("diagnostic_code", failure.error_code),
+            (context::DEPENDENCY_ID, failure.dependency_id),
+            (context::DEPENDENCY_KIND, failure.dependency_kind),
+            (context::DIAGNOSTIC_CODE, failure.error_code),
         ]
         .into_iter()
         .filter_map(|(key, value)| Some((key.to_owned(), value?.into())))

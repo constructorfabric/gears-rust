@@ -3,8 +3,9 @@
 
 use axum::http::{HeaderMap, header};
 use toolkit_canonical_errors::CanonicalError;
+use types_registry_sdk::field;
 
-use super::error::{malformed_condition, violation_field};
+use super::error::malformed_condition;
 use crate::api::encoding::entity_tag::token;
 pub use crate::api::encoding::entity_tag::{entity_tag, item_condition};
 use crate::domain::validator::IfNoneMatch;
@@ -13,7 +14,7 @@ use crate::domain::validator::IfNoneMatch;
 /// across however many header lines. Empty list elements are ignored (§5.6.1.2);
 /// a list with no element at all, or `*` beside a tag, is refused.
 pub fn header_condition(headers: &HeaderMap) -> Result<Option<IfNoneMatch>, CanonicalError> {
-    let field = violation_field::IF_NONE_MATCH;
+    let field = field::IF_NONE_MATCH_HEADER;
     let mut elements = Vec::new();
     for value in headers.get_all(header::IF_NONE_MATCH) {
         let value = value

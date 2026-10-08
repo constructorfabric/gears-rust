@@ -22,7 +22,7 @@ use crate::entity_models::{
 };
 use crate::ext::{MAX_BATCH_GET_KEYS, await_registration, bounded, deadline_from_now, jittered};
 use crate::gts::TypeResource;
-use crate::item_failure::{AdmissionFailure, reason};
+use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason};
 
 /// How a submitted batch is retried at the transport level, key and request unchanged.
 const TRANSPORT_ATTEMPTS: u32 = 3;
@@ -673,17 +673,17 @@ fn classify(status: CandidateStatus, error: Option<CanonicalError>) -> Outcome {
             let Some(failure) = AdmissionFailure::from_canonical(&error) else {
                 return Outcome::Rejected(error);
             };
-            match failure.reason.as_str() {
-                reason::DEPENDENCY_NOT_FOUND
-                | reason::BLOCKED_BY_DEPENDENCY
-                | reason::BLOCKED_BY_PREDECESSOR
-                | reason::MISSING_PREDECESSOR => Outcome::Pending(PendingCause::Dependency(error)),
-                reason::ALREADY_EXISTS | reason::PRECONDITION_FAILED => {
+            match failure.reason {
+                Reason::DependencyNotFound
+                | Reason::BlockedByDependency
+                | Reason::BlockedByPredecessor
+                | Reason::MissingPredecessor => Outcome::Pending(PendingCause::Dependency(error)),
+                Reason::AlreadyExists | Reason::PreconditionFailed => {
                     Outcome::Pending(PendingCause::Conflict(error))
                 }
-                reason::SYSTEM_FAILURE => Outcome::Pending(PendingCause::Unavailable(error)),
+                Reason::SystemFailure => Outcome::Pending(PendingCause::Unavailable(error)),
                 // Supersession applies only within one publisher; other ownership is refused (D18).
-                reason::SUPERSEDED => Outcome::Superseded {
+                Reason::Superseded => Outcome::Superseded {
                     error,
                     liveness: Liveness::Unverified,
                 },

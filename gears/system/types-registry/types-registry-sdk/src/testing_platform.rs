@@ -23,8 +23,10 @@ use crate::entity_models::{
     Operation, OperationStatus, Origin, RegisterEntitiesRequest, RegistrationItemResult,
     RegistrationOperation, Validator,
 };
+use crate::field;
 use crate::gts::{OperationResource, TypeResource};
-use crate::item_failure::{AdmissionFailure, context, reason};
+use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason, context};
+use crate::reason::aborted;
 
 #[derive(Debug, Clone)]
 struct Stored {
@@ -288,7 +290,7 @@ impl FakePlatformRegistry {
         {
             return Err(OperationResource::aborted("lost read back")
                 .with_resource(operation_id.to_string())
-                .with_reason("OPERATION_READ_FAILED")
+                .with_reason(aborted::OPERATION_READ_FAILED)
                 .create());
         }
         self.operation(operation_id, false)
@@ -329,7 +331,7 @@ impl FakePlatformRegistry {
 }
 
 fn decide(entities: &mut BTreeMap<String, Stored>, candidate: &Candidate) -> Outcome {
-    let failed = |reason: &str, message: &str| {
+    let failed = |reason: Reason, message: &str| {
         (
             CandidateStatus::Failed,
             None,
@@ -350,7 +352,7 @@ fn decide(entities: &mut BTreeMap<String, Stored>, candidate: &Candidate) -> Out
                     stored.resource_version += 1;
                 }
                 let (status, version, failure) =
-                    failed(reason::SUPERSEDED, "a newer release owns this entity");
+                    failed(Reason::Superseded, "a newer release owns this entity");
                 let versions = content
                     .get("x-fake-superseded-versions")
                     .and_then(serde_json::Value::as_str);
@@ -370,22 +372,20 @@ fn decide(entities: &mut BTreeMap<String, Stored>, candidate: &Candidate) -> Out
             }
             if content.get("x-fake-publisher-mismatch") == Some(&serde_json::Value::Bool(true)) {
                 return failed(
-                    reason::PUBLISHER_MISMATCH,
+                    Reason::PublisherMismatch,
                     "another publisher owns this entity",
                 );
             }
             if content.get("x-fake-invalid") == Some(&serde_json::Value::Bool(true)) {
-                return failed("invalid_schema", "the fake refuses this document");
+                return failed(Reason::InvalidSchema, "the fake refuses this document");
             }
             if let Some(dep) = content.get("x-fake-depends-on").and_then(|v| v.as_str())
                 && !entities
                     .get(dep)
                     .is_some_and(|s| s.lifecycle == LifecycleStatus::Active)
             {
-                let (status, version, failure) = failed(
-                    reason::DEPENDENCY_NOT_FOUND,
-                    "a dependency is not registered",
-                );
+                let (status, version, failure) =
+                    failed(Reason::DependencyNotFound, "a dependency is not registered");
                 return (
                     status,
                     version,
@@ -396,11 +396,11 @@ fn decide(entities: &mut BTreeMap<String, Stored>, candidate: &Candidate) -> Out
                 .get(gts_id.id())
                 .filter(|s| s.lifecycle == LifecycleStatus::Active);
             match (current, expected) {
-                (Some(_), None) => failed(reason::ALREADY_EXISTS, "already exists"),
+                (Some(_), None) => failed(Reason::AlreadyExists, "already exists"),
                 (Some(s), Some(v)) if s.resource_version != *v => {
-                    failed(reason::PRECONDITION_FAILED, "stale precondition")
+                    failed(Reason::PreconditionFailed, "stale precondition")
                 }
-                (None, Some(_)) => failed(reason::PRECONDITION_FAILED, "nothing to update"),
+                (None, Some(_)) => failed(Reason::PreconditionFailed, "nothing to update"),
                 (Some(s), Some(_)) if s.content == *content => {
                     (CandidateStatus::Unchanged, Some(s.resource_version), None)
                 }
@@ -420,7 +420,10 @@ fn decide(entities: &mut BTreeMap<String, Stored>, candidate: &Candidate) -> Out
         }
         Candidate::Delete { key, expected } => {
             let EntityKey::GtsId(id) = key else {
-                return failed("not_found", "the fake deletes by identifier only");
+                return failed(
+                    Reason::from_wire("not_found"),
+                    "the fake deletes by identifier only",
+                );
             };
             match entities.get_mut(id.id()) {
                 Some(s)
@@ -431,8 +434,8 @@ fn decide(entities: &mut BTreeMap<String, Stored>, candidate: &Candidate) -> Out
                     s.resource_version += 1;
                     (CandidateStatus::Succeeded, Some(s.resource_version), None)
                 }
-                Some(_) => failed(reason::PRECONDITION_FAILED, "stale precondition"),
-                None => failed("not_found", "absent"),
+                Some(_) => failed(Reason::PreconditionFailed, "stale precondition"),
+                None => failed(Reason::from_wire("not_found"), "absent"),
             }
         }
     }
@@ -547,7 +550,11 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
         }
         if request.items.is_empty() || request.items.len() > crate::ext::MAX_BATCH_GET_KEYS {
             return Err(TypeResource::invalid_argument()
-                .with_field_violation("items", "batch read out of range", "VALIDATION_FAILED")
+                .with_field_violation(
+                    field::ITEMS_FIELD,
+                    "batch read out of range",
+                    field::VALIDATION_FAILED,
+                )
                 .create());
         }
         let fields = request.projection.normalized();
@@ -658,13 +665,13 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
         if request.items.len() > self.max_batch {
             return Err(TypeResource::invalid_argument()
                 .with_field_violation(
-                    "items",
+                    field::ITEMS_FIELD,
                     format!(
                         "{} entities exceeds the limit of {} per request",
                         request.items.len(),
                         self.max_batch
                     ),
-                    "VALIDATION_FAILED",
+                    field::VALIDATION_FAILED,
                 )
                 .create());
         }

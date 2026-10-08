@@ -36,6 +36,9 @@ pub const POLL_INTERVAL_MAX: Duration = Duration::from_secs(1);
 pub const MAX_LIST_PAGES: usize = 1_000;
 
 /// Blanket-implemented helpers over [`PlatformTypesRegistryApi`].
+///
+/// Errors are `CanonicalError`; [`TypesRegistryError`](crate::TypesRegistryError) projects
+/// them, including this trait's own `DeadlineExceeded` and `Cancelled`.
 #[async_trait]
 pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     /// One-item delete batch; the single-key route carries no publisher.
@@ -346,7 +349,7 @@ async fn list_kind<A: PlatformTypesRegistryApi + ?Sized>(
     if query.filter.kind.is_some_and(|asked| asked != kind) {
         return Err(TypeResource::invalid_argument()
             .with_field_violation(
-                "kind",
+                field::KIND_FIELD,
                 format!("this helper lists {kind:?} entities only"),
                 field::INVALID_QUERY,
             )
@@ -373,7 +376,7 @@ async fn list_kind<A: PlatformTypesRegistryApi + ?Sized>(
     }
     Err(TypeResource::invalid_argument()
         .with_field_violation(
-            "page",
+            field::PAGE_FIELD,
             format!(
                 "the listing did not end within {MAX_LIST_PAGES} pages; narrow the \
                  query or raise its page limit"
@@ -457,9 +460,9 @@ pub(crate) fn deadline_from_now(budget: Duration) -> Result<Instant, CanonicalEr
     Instant::now().checked_add(budget).ok_or_else(|| {
         TypeResource::invalid_argument()
             .with_field_violation(
-                "deadline",
+                field::DEADLINE_FIELD,
                 format!("a deadline of {budget:?} from now cannot be represented"),
-                "INVALID_DEADLINE",
+                field::INVALID_DEADLINE,
             )
             .create()
     })
