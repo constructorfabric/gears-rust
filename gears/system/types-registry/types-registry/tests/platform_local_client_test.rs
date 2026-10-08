@@ -8,7 +8,7 @@ use serde_json::json;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::gts_id;
 use toolkit_security::PlatformSecurityContext;
-use types_registry::api::local_client::PlatformLocalClient;
+use types_registry::api::local_client::LocalClient;
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::admission::OperationDispatch;
 use types_registry::domain::key::EntityKey as DomainKey;
@@ -31,7 +31,7 @@ const CF_OTHER: &str = gts_id!("cf.core.example.other.v1~");
 const CF_INSTANCE: &str = gts_id!("cf.core.example.type.v1~cf.core.example.first.v1");
 
 struct Harness {
-    client: PlatformLocalClient,
+    client: LocalClient,
     service: Arc<RegistryService>,
     db: Arc<DBProvider<DbError>>,
     dispatch: Arc<OutboxDispatch>,
@@ -64,7 +64,7 @@ async fn serve(db: Arc<DBProvider<DbError>>, dir: Arc<common::TestDir>) -> Harne
         .await
         .expect("start the admission outbox");
     Harness {
-        client: PlatformLocalClient::new(Arc::clone(&service)),
+        client: LocalClient::new(Arc::clone(&service)),
         service,
         db,
         dispatch,
@@ -74,8 +74,8 @@ async fn serve(db: Arc<DBProvider<DbError>>, dir: Arc<common::TestDir>) -> Harne
 }
 
 /// Accept through h’s running outbox, but fail operation read-back.
-fn failing_read_back(h: &Harness) -> PlatformLocalClient {
-    PlatformLocalClient::new(Arc::new(RegistryService::new(
+fn failing_read_back(h: &Harness) -> LocalClient {
+    LocalClient::new(Arc::new(RegistryService::new(
         h.db.db(),
         common::TestStores::failing_operation_read(),
         RegistrationPolicy::default(),
@@ -126,7 +126,7 @@ fn create(gts_id: &str, content: serde_json::Value) -> RegisterItem {
     }
 }
 
-async fn completed(client: &PlatformLocalClient, operation_id: uuid::Uuid) -> Operation {
+async fn completed(client: &LocalClient, operation_id: uuid::Uuid) -> Operation {
     common::await_delivery("operation completes", || async {
         let operation = client
             .get_operation(&ctx(), operation_id)
@@ -608,8 +608,7 @@ async fn register_and_await_completes_through_the_local_client_and_the_outbox() 
     use types_registry_sdk::PlatformTypesRegistryApiExt;
 
     let h = harness().await;
-    let api: Arc<dyn PlatformTypesRegistryApi> =
-        Arc::new(PlatformLocalClient::new(Arc::clone(&h.service)));
+    let api: Arc<dyn PlatformTypesRegistryApi> = Arc::new(LocalClient::new(Arc::clone(&h.service)));
 
     let operation = api
         .register_and_await(

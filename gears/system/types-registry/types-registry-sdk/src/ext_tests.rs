@@ -600,3 +600,184 @@ async fn a_spent_budget_submits_nothing_even_to_an_instant_registry() {
     );
     assert!(fake.submissions().is_empty());
 }
+
+// ---- TypesRegistryApiExt: the same helpers over the tenant contract ---------
+//
+// Called through `&dyn TypesRegistryApi`: the fake implements both contracts, and the
+// trait object leaves only the tenant helpers in reach.
+
+mod tenant {
+    use serde_json::json;
+    use toolkit_canonical_errors::CanonicalError;
+    use toolkit_security::SecurityContext;
+
+    use super::{FakePlatformRegistry, INSTANCE, TYPE, id};
+    use crate::TypesRegistryApiExt;
+    use crate::models::{
+        EntityField, EntityKind, FieldSelection, ListEntitiesRequest, PageRequest, Projection,
+    };
+    use crate::tenant_contract::TypesRegistryApi;
+
+    fn tenant() -> SecurityContext {
+        SecurityContext::anonymous()
+    }
+
+    #[tokio::test]
+    async fn kind_narrowing_fails_locally_without_a_round_trip() {
+        let fake = FakePlatformRegistry::new();
+        let api: &dyn TypesRegistryApi = &fake;
+
+        let error = api
+            .get_type_schema(&tenant(), INSTANCE, Projection::Default)
+            .await
+            .expect_err("an Instance identifier");
+        assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
+        let error = api
+            .get_instance(&tenant(), TYPE, Projection::Default)
+            .await
+            .expect_err("a Type Schema identifier");
+        assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
+        let many = api
+            .get_instances(&tenant(), vec![TYPE.to_owned()], Projection::Default)
+            .await;
+        assert!(matches!(
+            many.get(TYPE),
+            Some(Err(CanonicalError::InvalidArgument { .. }))
+        ));
+
+        assert_eq!(fake.batch_reads(), 0);
+    }
+
+    #[tokio::test]
+    async fn reads_answer_by_identifier_and_by_reference_within_their_kind() {
+        let fake = FakePlatformRegistry::new();
+        fake.seed(TYPE, json!({ "type": "object" }));
+        fake.seed(INSTANCE, json!({ "n": 1 }));
+        let api: &dyn TypesRegistryApi = &fake;
+        let absent = "gts.cf.test.pkg.absent.v1~";
+
+        let schema = api
+            .get_type_schema(&tenant(), TYPE, Projection::Default)
+            .await
+            .expect("present");
+        assert_eq!(schema.kind, EntityKind::TypeSchema);
+        let instance = api
+            .get_instance_by_uuid(&tenant(), id(INSTANCE).to_uuid(), Projection::Default)
+            .await
+            .expect("present");
+        assert_eq!(instance.gts_id, id(INSTANCE));
+        let other_kind = api
+            .get_type_schema_by_uuid(&tenant(), id(INSTANCE).to_uuid(), Projection::Default)
+            .await
+            .expect_err("an Instance");
+        assert!(matches!(other_kind, CanonicalError::NotFound { .. }));
+
+        let schemas = api
+            .get_type_schemas(
+                &tenant(),
+                vec![TYPE.to_owned(), absent.to_owned()],
+                Projection::Default,
+            )
+            .await;
+        assert!(schemas[TYPE].is_ok());
+        assert!(matches!(
+            schemas[absent],
+            Err(CanonicalError::NotFound { .. })
+        ));
+        let instances = api
+            .get_instances_by_uuid(&tenant(), vec![id(INSTANCE).to_uuid()], Projection::Default)
+            .await;
+        assert!(instances[&id(INSTANCE).to_uuid()].is_ok());
+        assert_eq!(fake.batch_reads(), 5, "the two-key read is one batch");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_selection_reaches_the_read() {
+        let fake = FakePlatformRegistry::new();
+        fake.seed(INSTANCE, json!({ "n": 1 }));
+        let api: &dyn TypesRegistryApi = &fake;
+
+        let light = api
+            .get_instance(
+                &tenant(),
+                INSTANCE,
+                Projection::Select(FieldSelection::light()),
+            )
+            .await
+            .expect("present");
+        assert!(light.content.is_none(), "a light selection has no document");
+        let with_content = api
+            .get_instance(
+                &tenant(),
+                INSTANCE,
+                Projection::Select(FieldSelection::with(&[EntityField::Content])),
+            )
+            .await
+            .expect("present");
+        assert_eq!(with_content.content, Some(json!({ "n": 1 })));
+    }
+
+    #[tokio::test]
+    async fn list_helpers_select_their_documents_by_default_and_follow_every_page() {
+        let fake = FakePlatformRegistry::new();
+        fake.seed(TYPE, json!({ "type": "object" }));
+        for n in 0..3 {
+            fake.seed(
+                &format!("gts.cf.test.pkg.thing.v1~cf.test.pkg.i{n}.v1"),
+                json!({ "n": n }),
+            );
+        }
+        let api: &dyn TypesRegistryApi = &fake;
+        let query = ListEntitiesRequest {
+            page: PageRequest {
+                limit: Some(1),
+                cursor: None,
+            },
+            ..ListEntitiesRequest::default()
+        };
+
+        let instances = api
+            .list_instances(&tenant(), query.clone())
+            .await
+            .expect("lists");
+        assert_eq!(instances.len(), 3, "every page is followed");
+        assert!(instances.iter().all(|s| s.content.is_some()));
+
+        let light = api
+            .list_instances(
+                &tenant(),
+                ListEntitiesRequest {
+                    projection: Projection::Select(FieldSelection::light()),
+                    ..query
+                },
+            )
+            .await
+            .expect("lists");
+        assert!(light.iter().all(|s| s.content.is_none()), "kept as asked");
+
+        let schemas = api
+            .list_type_schemas(&tenant(), ListEntitiesRequest::default())
+            .await
+            .expect("lists");
+        assert_eq!(schemas.len(), 1);
+        assert!(
+            schemas[0].resolved_schema.is_some(),
+            "materializations selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_list_helper_refuses_a_query_for_the_other_kind() {
+        let fake = FakePlatformRegistry::new();
+        let api: &dyn TypesRegistryApi = &fake;
+        let mut query = ListEntitiesRequest::default();
+        query.filter.kind = Some(EntityKind::TypeSchema);
+
+        let error = api
+            .list_instances(&tenant(), query)
+            .await
+            .expect_err("refused");
+
+        assert!(matches!(error, CanonicalError::InvalidArgument { .. }));
+    }
+}

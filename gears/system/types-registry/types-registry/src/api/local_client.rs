@@ -1,4 +1,4 @@
-//! In-process platform API over `RegistryService` (SPEC §10.1, D15).
+//! In-process platform and tenant APIs over `RegistryService` (SPEC §10.1, D15, D17).
 //! Shares cursor/tag encodings and errors with REST. Outbox mutations read back accepted
 //! operations; failures return Aborted with `operation_id` for same-key replay (D19).
 //! Contexts stay unvalidated with no principal (C2); publisher reaches the service at T45/Phase 9.
@@ -11,10 +11,10 @@ use async_trait::async_trait;
 use gts::GtsId;
 use serde_json::value::RawValue;
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_security::PlatformSecurityContext;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use types_registry_sdk as sdk;
 use types_registry_sdk::item_failure::AdmissionFailureReason;
-use types_registry_sdk::{AdmissionFailure, PlatformTypesRegistryApi};
+use types_registry_sdk::{AdmissionFailure, PlatformTypesRegistryApi, TypesRegistryApi};
 use uuid::Uuid;
 
 use super::encoding::cursor::{self, Binding};
@@ -35,12 +35,13 @@ use crate::domain::registry_service::{
 use crate::domain::selection::{EntityField, FieldSelection};
 use crate::domain::validator::Validator;
 
-/// [`PlatformTypesRegistryApi`] served from this process's [`RegistryService`].
-pub struct PlatformLocalClient {
+/// [`PlatformTypesRegistryApi`] and [`TypesRegistryApi`] served from this process's
+/// [`RegistryService`]; the tenant reads are the platform reads.
+pub struct LocalClient {
     service: Arc<RegistryService>,
 }
 
-impl PlatformLocalClient {
+impl LocalClient {
     #[must_use]
     pub fn new(service: Arc<RegistryService>) -> Self {
         Self { service }
@@ -61,13 +62,10 @@ impl PlatformLocalClient {
             }
         }
     }
-}
 
-#[async_trait]
-impl PlatformTypesRegistryApi for PlatformLocalClient {
-    async fn batch_get_entities(
+    /// The batch read both contracts serve.
+    async fn batch_get(
         &self,
-        _ctx: &PlatformSecurityContext,
         request: sdk::BatchGetEntitiesRequest,
     ) -> Result<sdk::BatchGetEntitiesResponse, CanonicalError> {
         let selection = selection(&request.projection);
@@ -104,9 +102,9 @@ impl PlatformTypesRegistryApi for PlatformLocalClient {
         Ok(sdk::BatchGetEntitiesResponse(lookups))
     }
 
-    async fn list_entities(
+    /// The discovery page both contracts serve.
+    async fn list(
         &self,
-        _ctx: &PlatformSecurityContext,
         query: sdk::ListEntitiesRequest,
     ) -> Result<sdk::ListEntitiesResponse, CanonicalError> {
         let mut discovery = DiscoveryQuery {
@@ -143,6 +141,25 @@ impl PlatformTypesRegistryApi for PlatformLocalClient {
                 .collect::<Result<_, _>>()?,
             next,
         })
+    }
+}
+
+#[async_trait]
+impl PlatformTypesRegistryApi for LocalClient {
+    async fn batch_get_entities(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        request: sdk::BatchGetEntitiesRequest,
+    ) -> Result<sdk::BatchGetEntitiesResponse, CanonicalError> {
+        self.batch_get(request).await
+    }
+
+    async fn list_entities(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        query: sdk::ListEntitiesRequest,
+    ) -> Result<sdk::ListEntitiesResponse, CanonicalError> {
+        self.list(query).await
     }
 
     async fn register_entities(
@@ -239,6 +256,29 @@ impl PlatformTypesRegistryApi for PlatformLocalClient {
             .map_err(CanonicalError::from)?
             .ok_or_else(|| super::error::operation_not_found(operation_id))?;
         operation_from(record)
+    }
+}
+
+/// The tenant reads are the platform's own (D17): the same lookups, encodings and errors.
+///
+/// C2/C6: P0 applies no tenant scope and records no principal from the `SecurityContext`;
+/// the context is accepted, not validated, exactly as the platform context is.
+#[async_trait]
+impl TypesRegistryApi for LocalClient {
+    async fn batch_get_entities(
+        &self,
+        _ctx: &SecurityContext,
+        request: sdk::BatchGetEntitiesRequest,
+    ) -> Result<sdk::BatchGetEntitiesResponse, CanonicalError> {
+        self.batch_get(request).await
+    }
+
+    async fn list_entities(
+        &self,
+        _ctx: &SecurityContext,
+        query: sdk::ListEntitiesRequest,
+    ) -> Result<sdk::ListEntitiesResponse, CanonicalError> {
+        self.list(query).await
     }
 }
 

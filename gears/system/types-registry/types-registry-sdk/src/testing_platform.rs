@@ -1,4 +1,4 @@
-//! In-memory platform fixture with delayed completion and idempotency replay (`test-util`).
+//! In-memory fixture for both contracts, with delayed completion and idempotency replay (`test-util`).
 //! Document hooks simulate invalid schemas, dependencies, supersession and publisher mismatch;
 //! use `x-fake-invalid`, `x-fake-depends-on`, `x-fake-superseded`, `x-fake-publisher-mismatch`.
 //! request hooks simulate failures, delays, panics, missing results and concurrent writes.
@@ -12,10 +12,13 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_security::PlatformSecurityContext;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use uuid::Uuid;
 
 use crate::contract::PlatformTypesRegistryApi;
+use crate::field;
+use crate::gts::{OperationResource, TypeResource};
+use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason, context};
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, CandidateStatus, DeleteEntitiesRequest,
     DeletionItemResult, DeletionOperation, EntityField, EntityKey, EntityKind, EntityLookup,
@@ -23,10 +26,8 @@ use crate::models::{
     Operation, OperationStatus, Origin, RegisterEntitiesRequest, RegistrationItemResult,
     RegistrationOperation, Validator,
 };
-use crate::field;
-use crate::gts::{OperationResource, TypeResource};
-use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason, context};
 use crate::reason::aborted;
+use crate::tenant_contract::TypesRegistryApi;
 
 #[derive(Debug, Clone)]
 struct Stored {
@@ -528,11 +529,10 @@ fn validator(stored: &Stored) -> Validator {
     Validator::from_bytes(format!("\"v{}\"", stored.resource_version).into_bytes())
 }
 
-#[async_trait]
-impl PlatformTypesRegistryApi for FakePlatformRegistry {
-    async fn batch_get_entities(
+impl FakePlatformRegistry {
+    /// The batch read both contracts serve, with its faults and counter.
+    async fn read_batch(
         &self,
-        _ctx: &PlatformSecurityContext,
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
         let call = self.batch_reads.fetch_add(1, Ordering::SeqCst) + 1;
@@ -588,11 +588,8 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
         Ok(BatchGetEntitiesResponse(out))
     }
 
-    async fn list_entities(
-        &self,
-        _ctx: &PlatformSecurityContext,
-        query: ListEntitiesRequest,
-    ) -> Result<ListEntitiesResponse, CanonicalError> {
+    /// The discovery page both contracts serve.
+    fn read_page(&self, query: &ListEntitiesRequest) -> ListEntitiesResponse {
         let fields = query.projection.normalized();
         let limit = query.page.limit.unwrap_or(50) as usize;
         let after = query.page.cursor.as_ref().map(|c| c.as_str().to_owned());
@@ -617,14 +614,33 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
             _ => (matching.len() > limit)
                 .then(|| crate::Cursor::from_token(matching[limit - 1].0.clone())),
         };
-        Ok(ListEntitiesResponse {
+        ListEntitiesResponse {
             items: matching
                 .into_iter()
                 .take(limit)
                 .map(|(id, stored)| snapshot(id, stored, &fields))
                 .collect(),
             next,
-        })
+        }
+    }
+}
+
+#[async_trait]
+impl PlatformTypesRegistryApi for FakePlatformRegistry {
+    async fn batch_get_entities(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        request: BatchGetEntitiesRequest,
+    ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
+        self.read_batch(request).await
+    }
+
+    async fn list_entities(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        request: ListEntitiesRequest,
+    ) -> Result<ListEntitiesResponse, CanonicalError> {
+        Ok(self.read_page(&request))
     }
 
     async fn register_entities(
@@ -731,5 +747,25 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
             toolkit::tokio::time::sleep(delay).await;
         }
         self.operation(operation_id, true)
+    }
+}
+
+/// The tenant reads are the platform's: one store, one set of faults and counters.
+#[async_trait]
+impl TypesRegistryApi for FakePlatformRegistry {
+    async fn batch_get_entities(
+        &self,
+        _ctx: &SecurityContext,
+        request: BatchGetEntitiesRequest,
+    ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
+        self.read_batch(request).await
+    }
+
+    async fn list_entities(
+        &self,
+        _ctx: &SecurityContext,
+        request: ListEntitiesRequest,
+    ) -> Result<ListEntitiesResponse, CanonicalError> {
+        Ok(self.read_page(&request))
     }
 }

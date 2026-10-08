@@ -2591,7 +2591,7 @@ T47 for the always-submit change below, now T41.)*
   remaining violations are context.<name>/value. Unknown reasons/context round-trip.
   Default list helpers select content and schema materializations; explicit Select
   is preserved.
-- `api::local_client::PlatformLocalClient` shares REST cursor/tag encoding and
+- `api::local_client::LocalClient` shares REST cursor/tag encoding and
   errors. Accepted-submit read-back failures are Aborted with operation ID; an
   injected outbox/database test proves same-key recovery. ClientHub registration
   waits for T29.
@@ -2620,7 +2620,7 @@ status, `PublisherVersion`, supervision helper)
 
 ---
 
-### - [ ] T24a: `TypesRegistryApi` tenant contract, its extension helpers and local client
+### - [x] T24a: `TypesRegistryApi` tenant contract, its extension helpers and local client
 
 **Description:** The read-only tenant-plane `TypesRegistryApi` — `SecurityContext` first;
 exact read, `batchGet` and discovery — with `TypesRegistryApiExt` convenience reads and a
@@ -2632,16 +2632,30 @@ resolving wrappers and `#[provides]` are T27a.
 Commits inside the task: (1) tenant contract and extension helpers; (2) tenant local client.
 
 **Acceptance criteria:**
-- [ ] `TypesRegistryApi` is declared with `#[toolkit::contract(gear = "types-registry", version = "v1")]` and compiles: `&SecurityContext` first on every method, `Result<_, CanonicalError>`, `#[idempotency(SafeRead)]`, no default methods. Object-safe: `hub.get::<dyn TypesRegistryApi>()` compiles and the extension methods are callable on it
-- [ ] The tenant contract shares the platform's semantic models, projection and validators; it has no mutation and no operation access
-- [ ] `TypesRegistryApiExt`, blanket-implemented for `T: TypesRegistryApi + ?Sized`, offers the read conveniences of `PlatformTypesRegistryApiExt` — `get_type_schema`, `get_instance`, their plural and `_by_uuid` variants, `list_type_schemas`, `list_instances` — with the same local kind narrowing and explicit document selection. One implementation of the helper logic serves both extension traits; no copy, and no mutation helper
-- [ ] Its local client reuses the platform lookups, encodings and errors — no second domain implementation — and returns what the platform local client returns for the same request, `unchanged` and cursors included
-- [ ] The local client applies no tenant scope and records no principal from the `SecurityContext` in P0; the C2/C6 source comments say so. It is verified in fixture hosts only — the existing embedded consumers stay on the legacy client until T31
+- [x] `TypesRegistryApi` is declared with `#[toolkit::contract(gear = "types-registry", version = "v1")]` and compiles: `&SecurityContext` first on every method, `Result<_, CanonicalError>`, `#[idempotency(SafeRead)]`, no default methods. Object-safe: `hub.get::<dyn TypesRegistryApi>()` compiles and the extension methods are callable on it
+- [x] The tenant contract shares the platform's semantic models, projection and validators; it has no mutation and no operation access
+- [x] `TypesRegistryApiExt`, blanket-implemented for `T: TypesRegistryApi + ?Sized`, offers the read conveniences of `PlatformTypesRegistryApiExt` — `get_type_schema`, `get_instance`, their plural and `_by_uuid` variants, `list_type_schemas`, `list_instances` — with the same local kind narrowing and explicit document selection. One implementation of the helper logic serves both extension traits; no copy, and no mutation helper
+- [x] Its local client reuses the platform lookups, encodings and errors — no second domain implementation — and returns what the platform local client returns for the same request, `unchanged` and cursors included
+- [x] The local client applies no tenant scope and records no principal from the `SecurityContext` in P0; the C2/C6 source comments say so. It is verified in fixture hosts only — the existing embedded consumers stay on the legacy client until T31
 
 **Verification:**
-- [ ] `cargo test -p cf-gears-types-registry-sdk`: extension helpers over a fake tenant API — kind mismatch refused locally without a call, explicit selection preserved, list helpers select the documents their callers read
-- [ ] `cargo nextest run -p cf-gears-types-registry --test tenant_local_client_test` (new target): exact read, `batchGet` `found` then `unchanged` under the same `$select`, discovery cursor, and parity with the platform local client
-- [ ] Gear tests; `make fmt`, `make clippy`
+- [x] `cargo test -p cf-gears-types-registry-sdk`: extension helpers over a fake tenant API — kind mismatch refused locally without a call, explicit selection preserved, list helpers select the documents their callers read
+- [x] `cargo nextest run -p cf-gears-types-registry --test tenant_local_client_test` (new target): exact read, `batchGet` `found` then `unchanged` under the same `$select`, discovery cursor, and parity with the platform local client
+- [x] Gear tests; `make fmt`, `make clippy`
+
+**Outcome (two commits).** Verified with scoped `cargo fmt --check` and `cargo clippy -D warnings`
+for both crates.
+
+- `TypesRegistryApi` has two methods, `batch_get_entities` and `list_entities`: the tenant
+  REST plane's three routes map onto them as on the platform contract, the exact read being
+  an extension helper over the batch read.
+- `TypesRegistryApiExt` and `PlatformTypesRegistryApiExt` bind their contract and context into
+  one private `EntityReads`; the helpers exist once. `FakePlatformRegistry` serves both contracts
+  from one store through shared inherent reads.
+- `api::local_client::LocalClient` (renamed from `PlatformLocalClient`) implements both traits
+  over two shared inherent reads, so parity is structural; `tenant_local_client_test` compares
+  every tenant answer, validators, cursors and refusals included, with the platform's.
+  The gear registers neither client in its ClientHub; fixture hosts construct it.
 
 **Dependencies:** T24
 **Files likely touched:** `TR-SDK/src/{tenant_contract,ext,lib}.rs` and their tests, `TR/src/api/local_client.rs`, `TR/tests/tenant_local_client_test.rs`
