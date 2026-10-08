@@ -153,6 +153,7 @@ async fn run(service: &SearchService<Staged>, raw: &str, corpus: Corpus) -> Vec<
                 tenant_ids: &[harness.tree.root],
                 hidden_for: &[],
                 override_limit: 1_000,
+                flagged_only: false,
                 query: &query,
             },
         )
@@ -375,6 +376,7 @@ async fn a_page_whose_matching_overrides_exceed_the_bound_is_refused_not_cut() {
         tenant_ids: &tenants,
         hidden_for: &[],
         override_limit,
+        flagged_only: false,
         query: &query,
     };
 

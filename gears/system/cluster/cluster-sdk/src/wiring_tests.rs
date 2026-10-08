@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use toolkit::client_hub::ClientHub;
 use toolkit::discovery::{EndpointResolver, NullEndpointResolver, WireOutcome};
+use toolkit_contract::wiring::ClientTuning;
 
 use super::{
     CLUSTER_GEAR, CLUSTER_GRPC_PORT, POD_NAMESPACE_ENV, derive_endpoint, register_remote_client,
@@ -122,7 +123,8 @@ fn a_local_client_wins_and_no_channel_is_built() {
     // Unset, so that a closure which ignored the local client would fail loudly
     // rather than silently building an endpoint.
     let outcome = temp_env::with_var_unset(POD_NAMESPACE_ENV, || {
-        wire(&hub, resolver(), None).expect("wiring must not fail when a local client is present")
+        wire(&hub, resolver(), ClientTuning::default())
+            .expect("wiring must not fail when a local client is present")
     });
 
     assert_eq!(outcome, WireOutcome::Local);
@@ -148,7 +150,8 @@ async fn an_empty_hub_gets_a_remote_proxy_and_reports_remote() {
     let hub = ClientHub::default();
 
     let outcome = temp_env::with_var(POD_NAMESPACE_ENV, Some(NS), || {
-        wire(&hub, resolver(), None).expect("a derivable endpoint wires without error")
+        wire(&hub, resolver(), ClientTuning::default())
+            .expect("a derivable endpoint wires without error")
     });
 
     assert_eq!(outcome, WireOutcome::Remote);
@@ -192,7 +195,7 @@ async fn wiring_twice_reuses_the_first_client() {
 fn an_underivable_endpoint_fails_the_wiring_rather_than_reporting_local() {
     let hub = ClientHub::default();
     temp_env::with_var_unset(POD_NAMESPACE_ENV, || {
-        let result = wire(&hub, resolver(), None);
+        let result = wire(&hub, resolver(), ClientTuning::default());
         assert!(
             result.is_err(),
             "an empty hub with no derivable endpoint must not report Local - that would \

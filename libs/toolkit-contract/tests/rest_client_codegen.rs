@@ -165,12 +165,12 @@ async fn echo_post_handler(Json(req): Json<EchoRequest>) -> Json<EchoResponse> {
 async fn flaky_handler(
     State(state): State<ServerState>,
     Path(id): Path<String>,
-) -> Result<Json<EchoResponse>, (http::StatusCode, Json<Problem>)> {
+) -> Result<Json<EchoResponse>, Box<Problem>> {
     let n = state.flaky_attempts.fetch_add(1, Ordering::SeqCst);
     if n < 1 {
         // Canonical Problem (RFC 9457 + GTS URI in `type`).
         let problem = Problem::from(CanonicalError::service_unavailable().create());
-        Err((http::StatusCode::SERVICE_UNAVAILABLE, Json(problem)))
+        Err(Box::new(problem))
     } else {
         Ok(Json(EchoResponse {
             echoed: format!("flaky:{id}"),

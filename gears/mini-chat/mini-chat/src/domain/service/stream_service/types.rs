@@ -37,6 +37,16 @@ pub(super) struct InvalidAttachmentError {
     pub(super) message: String,
 }
 
+/// A concurrent request reserved between the preflight check and the reserve
+/// write, and this reserve no longer fits: the same 429 as a preflight reject.
+pub(super) fn reserve_limit_exceeded() -> StreamError {
+    StreamError::QuotaExhausted {
+        error_code: "quota_exceeded".to_owned(),
+        http_status: 429,
+        quota_scope: "tokens".to_owned(),
+    }
+}
+
 pub(super) fn attachment_err(message: impl Into<String>) -> toolkit_db::DbError {
     toolkit_db::DbError::Other(anyhow::Error::new(InvalidAttachmentError {
         message: message.into(),
@@ -165,14 +175,9 @@ pub enum StreamError {
 
 impl From<authz_resolver_sdk::EnforcerError> for StreamError {
     fn from(e: authz_resolver_sdk::EnforcerError) -> Self {
-        match e {
-            e @ authz_resolver_sdk::EnforcerError::Denied { .. } => Self::AuthorizationFailed {
-                source: DomainError::from(e),
-            },
-            e @ (authz_resolver_sdk::EnforcerError::EvaluationFailed(_)
-            | authz_resolver_sdk::EnforcerError::CompileFailed(_)) => Self::TurnCreationFailed {
-                source: DomainError::from(e),
-            },
+        // Every enforcer failure denies access (fail closed).
+        Self::AuthorizationFailed {
+            source: DomainError::from(e),
         }
     }
 }
@@ -218,6 +223,8 @@ pub(super) struct FinalizationCtx<TR: TurnRepository + 'static, MR: MessageRepos
     )>,
     /// Context window size of the effective model (tokens) — for summary trigger.
     pub(super) context_window: u32,
+    /// Input token limit of the effective model — for summary trigger.
+    pub(super) max_input_tokens: u32,
     /// Estimated input tokens from context assembly (all messages + system prompt).
     pub(super) assembled_context_tokens: u64,
     /// `true` when context assembly dropped older messages due to budget.
@@ -278,6 +285,7 @@ impl<TR: TurnRepository + 'static, MR: MessageRepository + 'static> Finalization
             code_interpreter_calls,
             file_search_calls,
             context_window: self.context_window,
+            max_input_tokens: self.max_input_tokens,
             assembled_context_tokens: self.assembled_context_tokens,
             messages_truncated: self.messages_truncated,
             ttft_ms,
@@ -310,7 +318,8 @@ pub(super) fn check_input_token_limit(
         },
         &pf.estimation_budgets,
     );
-    if estimate.estimated_input_tokens > u64::from(pf.max_input_tokens) {
+    // 0 means the catalog sets no separate input limit, as in the context budget.
+    if pf.max_input_tokens > 0 && estimate.estimated_input_tokens > u64::from(pf.max_input_tokens) {
         return Err(StreamError::InputTooLong {
             estimated_tokens: estimate.estimated_input_tokens,
             max_input_tokens: pf.max_input_tokens,
@@ -328,6 +337,18 @@ pub(super) fn requester_type_from_str(s: Option<&str>) -> RequesterType {
     match s {
         Some("system") => RequesterType::System,
         _ => RequesterType::User,
+    }
+}
+
+/// Value stored in `chat_turns.requester_type` (`CHECK IN ('user', 'system')`).
+///
+/// The authenticated `subject_type` is a GTS type id (for example
+/// `gts.cf.core.security.subject_user.v1~`), not a column value, so it must be
+/// mapped rather than stored verbatim.
+pub fn requester_type_column(subject_type: Option<&str>) -> &'static str {
+    match requester_type_from_str(subject_type) {
+        RequesterType::User => "user",
+        RequesterType::System => "system",
     }
 }
 
@@ -383,6 +404,9 @@ pub(super) fn normalize_error(err: &LlmProviderError) -> (String, String) {
 pub(super) struct PreflightResult {
     pub(super) effective_model: String,
     pub(super) effective_provider_model_id: String,
+    /// Provider routing key of the effective model; after a downgrade it can
+    /// differ from the selected model's provider.
+    pub(super) effective_provider_id: String,
     pub(super) reserve_tokens: i64,
     pub(super) max_output_tokens_applied: i32,
     pub(super) reserved_credits_micro: i64,
@@ -400,6 +424,8 @@ pub(super) struct PreflightResult {
     pub(super) tool_support: mini_chat_sdk::ModelToolSupport,
     pub(super) api_params: mini_chat_sdk::ModelApiParams,
     pub(super) web_search_context_size: mini_chat_sdk::models::WebSearchContextSize,
+    /// Whether the effective model accepts image input.
+    pub(super) vision_input: bool,
 }
 
 /// Convert a `PreflightDecision` into a flat `PreflightResult` or a `StreamError`.
@@ -411,6 +437,7 @@ pub(super) fn flatten_preflight(
         PreflightDecision::Allow {
             effective_model,
             effective_provider_model_id,
+            effective_provider_id,
             reserve_tokens,
             max_output_tokens_applied,
             reserved_credits_micro,
@@ -425,10 +452,12 @@ pub(super) fn flatten_preflight(
             tool_support,
             api_params,
             web_search_context_size,
+            vision_input,
             ..
         } => Ok(PreflightResult {
             effective_model,
             effective_provider_model_id,
+            effective_provider_id,
             reserve_tokens,
             max_output_tokens_applied,
             reserved_credits_micro,
@@ -446,10 +475,12 @@ pub(super) fn flatten_preflight(
             tool_support,
             api_params,
             web_search_context_size,
+            vision_input,
         }),
         PreflightDecision::Downgrade {
             effective_model,
             effective_provider_model_id,
+            effective_provider_id,
             reserve_tokens,
             max_output_tokens_applied,
             reserved_credits_micro,
@@ -466,10 +497,12 @@ pub(super) fn flatten_preflight(
             tool_support,
             api_params,
             web_search_context_size,
+            vision_input,
             ..
         } => Ok(PreflightResult {
             effective_model,
             effective_provider_model_id,
+            effective_provider_id,
             reserve_tokens,
             max_output_tokens_applied,
             reserved_credits_micro,
@@ -487,6 +520,7 @@ pub(super) fn flatten_preflight(
             tool_support,
             api_params,
             web_search_context_size,
+            vision_input,
         }),
         PreflightDecision::Reject {
             error_code,

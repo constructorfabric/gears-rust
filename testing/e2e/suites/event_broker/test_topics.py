@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from .conftest import EVENT_TYPE_STREAM, TOPIC_STREAM, TOPIC_LONGPOLL
+from .conftest import EVENT_TYPE_STREAM, TOPIC_STREAM, TOPIC_LONGPOLL, TRACE_ID
 
 
 async def test_list_topics_returns_paged_list(api):
@@ -72,7 +72,7 @@ async def test_segments_for_unknown_topic_returns_404(api):
         "status": 404,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": {
             "resource_type": "gts.cf.core.events.topic.v1~",
             "resource_name": unknown,

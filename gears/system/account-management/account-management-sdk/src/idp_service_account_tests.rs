@@ -73,6 +73,12 @@ fn metric_labels_are_stable() {
             },
             "unsupported_operation",
         ),
+        (
+            IdpServiceAccountFailure::QuotaExceeded {
+                detail: String::new(),
+            },
+            "quota_exceeded",
+        ),
     ];
     for (failure, label) in cases {
         assert_eq!(failure.as_metric_label(), label);

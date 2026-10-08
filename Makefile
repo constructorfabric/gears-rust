@@ -24,7 +24,7 @@ COMMA := ,
 EXAMPLE_SERVER_BIN ?= cf-gears-example-server
 EXAMPLE_SERVER_DEBUG_BINARY ?= target/debug/$(EXAMPLE_SERVER_BIN)
 EXAMPLE_SERVER_MANIFEST ?= apps/cf-gears-example-server/Cargo.toml
-EXAMPLE_SERVER_FEATURE_EXCLUDES ?= default fips k8s otel oop-example timescaledb-usage-collector magika
+EXAMPLE_SERVER_FEATURE_EXCLUDES ?= default fips k8s otel oop-example timescaledb-usage-collector clickhouse-usage-collector magika
 EXAMPLE_SERVER_ALL_FEATURES := $(strip $(shell cargo gears ls features --manifest $(EXAMPLE_SERVER_MANIFEST) 2>/dev/null))
 EXAMPLE_SERVER_FEATURES ?= $(subst $(SPACE),$(COMMA),$(filter-out $(EXAMPLE_SERVER_FEATURE_EXCLUDES),$(EXAMPLE_SERVER_ALL_FEATURES)))
 EXAMPLE_SERVER_FEATURE_ARGS ?= $(if $(EXAMPLE_SERVER_FEATURES),--features $(EXAMPLE_SERVER_FEATURES),)
@@ -38,7 +38,7 @@ OPENAPI_SERVER_FEATURE_ARGS ?= $(E2E_SERVER_FEATURE_ARGS)
 # `shear`, which drives -Zunpretty=expanded). This default serves local runs;
 # CI overrides it via `make shear RUST_NIGHTLY=...` so the toolchain it installs
 # and caches cannot drift from the one that actually compiles.
-RUST_NIGHTLY ?= nightly-2026-04-16
+RUST_NIGHTLY ?= nightly-2026-08-21
 
 # cargo-shear version installed by `make setup`. Pinned because an unused-dep
 # verdict that disagrees with CI is worse than no local check at all.
@@ -307,12 +307,7 @@ export PATH := $(HOME)/.local/bin:$(PATH)
 #
 # Use `make clippy-deep` for the full 182-run matrix (nightly / pre-release).
 CLIPPY_FLAGS := -- -D warnings -D clippy::perf
-# `bss-fixtures` is on the list because it is the one crate whose *production*
-# surface is the narrow one: pricing's `FixtureGate` inherits it with
-# `default-features = false`, while `default = ["corpus"]` means every ordinary
-# build compiles the wide one. A feature-combination pass is the only thing that
-# lints the surface a gear actually takes.
-CLIPPY_HACK_CRATES := -p cf-gears-toolkit -p cf-gears-toolkit-db -p cf-gears-toolkit-http -p cf-gears-bss-fixtures
+CLIPPY_HACK_CRATES := -p cf-gears-toolkit -p cf-gears-toolkit-db -p cf-gears-toolkit-http
 # `_any-backend` is toolkit-db's internal "some backend is on" marker (see its
 # [features] block); enabling it *alone* asserts a driver exists while none does,
 # which the outbox benchmarks reject with a compile_error!. Not a configuration
@@ -342,7 +337,7 @@ clippy-deep:
 lychee: ensure-submodules
 	$(call print_target_banner)
 	$(call check_tool,lychee)
-	lychee --exclude-path 'docs/web-docs' docs examples guidelines gears/system/event-broker/docs
+	lychee --exclude-path 'docs/web-docs' docs examples guidelines gears/system/event-broker/docs studio-kit-gears
 
 ## Validate internal links in web-docs.
 # The web-docs pages use Starlight route-relative links (e.g. ../foo/) that only
@@ -664,16 +659,20 @@ GEAR_COVERAGE_ARGS := $(if $(GEAR),--package $(firstword $(subst -p ,,$(GEAR_PKG
 
 # --- Server feature selection for run / openapi ---
 # Base features always enabled when running a focused server.
-GEAR_SERVER_BASE_FEATURES ?= static-tenants,static-authn,static-authz,account-management
+GEAR_SERVER_BASE_FEATURES ?= static-tenants,static-authn,static-authz
 # System gears that are non-optional deps of the example server (always linked).
-GEAR_SERVER_ALWAYS_LINKED ?= api-gateway gear-orchestrator types-registry tenant-resolver authn-resolver authz-resolver
+GEAR_SERVER_ALWAYS_LINKED ?= api-gateway service-discovery types-registry tenant-resolver authn-resolver authz-resolver
 # Check whether GEAR is a valid example-server feature or an always-linked gear.
 # When GEAR has no server feature (e.g. toolkit-db, toolkit-http), server-dependent
 # targets (run, openapi, e2e-local) are skipped; library-safe targets still work.
 GEAR_HAS_SERVER_FEATURE := $(or $(filter $(GEAR),$(GEAR_SERVER_ALWAYS_LINKED)),$(filter $(GEAR),$(EXAMPLE_SERVER_ALL_FEATURES)))
 # The gear itself as an optional feature (empty if it's an always-linked gear).
 GEAR_SERVER_OPTIONAL_FEATURES := $(if $(GEAR_HAS_SERVER_FEATURE),$(filter-out $(GEAR_SERVER_ALWAYS_LINKED),$(GEAR)),)
-GEAR_SERVER_FEATURES ?= $(GEAR_SERVER_OPTIONAL_FEATURES)$(if $(GEAR_SERVER_OPTIONAL_FEATURES),$(COMMA),)$(GEAR_SERVER_BASE_FEATURES)
+# Extra local-dev plugins a gear needs to start (GEAR_SERVER_EXTRA_FEATURES_<gear>).
+# mini-chat registers OAGW upstreams whose secret_ref OAGW checks in credstore.
+GEAR_SERVER_EXTRA_FEATURES_mini-chat ?= static-credstore
+GEAR_SERVER_EXTRA_FEATURES := $(GEAR_SERVER_EXTRA_FEATURES_$(GEAR))
+GEAR_SERVER_FEATURES ?= $(GEAR_SERVER_OPTIONAL_FEATURES)$(if $(GEAR_SERVER_OPTIONAL_FEATURES),$(COMMA),)$(GEAR_SERVER_BASE_FEATURES)$(if $(GEAR_SERVER_EXTRA_FEATURES),$(COMMA)$(GEAR_SERVER_EXTRA_FEATURES),)
 GEAR_SERVER_FEATURE_ARGS := $(if $(GEAR),$(if $(GEAR_HAS_SERVER_FEATURE),--no-default-features --features $(GEAR_SERVER_FEATURES),),$(EXAMPLE_SERVER_FEATURE_ARGS))
 
 # --- OpenAPI ---
@@ -688,7 +687,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -736,6 +735,35 @@ test-pgq: install-tools
 	cargo nextest run -p cf-gears-toolkit-db --features pgq,integration \
 		-E 'kind(lib) | binary(mod) | binary(ui)'
 
+## Run the graph-storage gear's database-free suites: unit tests, the
+## in-memory conformance lane, the domain-service and REST lanes. The
+## PostgreSQL lanes skip here; `test-graph-storage-pg` runs them.
+test-graph-storage: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-graph-storage -p cf-gears-graph-storage-sdk
+
+## Run the graph-storage gear's PostgreSQL 19 lane: the same conformance
+## suite against the built-in store, plus the SQL/PGQ cases that only a real
+## server can answer. It needs an image carrying PostgreSQL 19 **and**
+## pgvector — `test_containers::postgres_graph()` pins a stock 19beta
+## alpine, which has only the former — so point GEARS_TEST_PG_GRAPH_IMAGE at
+## one until the platform pin carries both. GEARS_TEST_PG_GRAPH_REQUIRED=1
+## turns "no such image, skipping" into a failure, so CI cannot go green by
+## running nothing; that is the default here, because a target whose whole
+## purpose is the database has no business passing without one.
+## Every case in this lane gets its own PostgreSQL instance (two of them are
+## operator surgery on server-wide state), and more than a handful at once is
+## more than Docker and PostgreSQL will take: the pools time out and a
+## different case fails on each run. nextest runs each case in its own
+## process, so the bound has to be its own — GRAPH_PG_TEST_THREADS raises it
+## on a host with the memory for it. Two is what held on an 8-core, 23 GiB
+## developer machine; four failed about half its runs there.
+GRAPH_PG_TEST_THREADS ?= 2
+test-graph-storage-pg: install-tools
+	$(call print_target_banner)
+	GEARS_TEST_PG_GRAPH_REQUIRED=1 cargo nextest run -p cf-gears-graph-storage \
+		--test pg_conformance --test-threads=$(GRAPH_PG_TEST_THREADS)
+
 ## Run MySQL integration tests
 test-mysql: install-tools
 	$(call print_target_banner)
@@ -755,6 +783,19 @@ test-users-info-pg: install-tools
 test-usage-collector-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres
+
+## Run ClickHouse usage-collector plugin integration tests (Docker required;
+## every test gets its own database on one shared, named clickhouse container,
+## `uc-clickhouse-test-harness-<tag>`, which is reused across runs — remove it
+## with `docker rm -fv` to start clean).
+## `--run-ignored all` because the suite is double-gated: the `clickhouse`
+## feature compiles the test files, and every Docker-backed test inside them is
+## `#[ignore]`d. CH_REQUIRE_DOCKER=1 turns an unreachable Docker into a panic —
+## without it bring_up_or_skip() reports `ok` on a suite that ran nothing.
+test-usage-collector-ch: install-tools
+	$(call print_target_banner)
+	CH_REQUIRE_DOCKER=1 cargo nextest run -p cf-gears-clickhouse-usage-collector-plugin \
+		--features clickhouse --run-ignored all --no-fail-fast
 
 ## Run types-registry PostgreSQL + MySQL integration tests (Docker required;
 ## each test spins up its own postgres or mysql container via testcontainers).
@@ -840,6 +881,15 @@ coverage-cluster-k8s:
 test-rg-pg: install-tools
 	cargo nextest run -p cf-gears-resource-group --features integration
 
+## Run the settings-service gear's PostgreSQL migration suite (Docker required;
+## spins up its own postgres container via testcontainers -- see
+## gears/settings-service/settings-service/tests/pg_migrations_test.rs). The
+## suites beside the gear's migrations run on SQLite, where a statement
+## PostgreSQL refuses can still pass; this lane runs the chain a stand's startup
+## runs, on the backend it runs it on.
+test-settings-service-pg: install-tools
+	cargo nextest run -p cf-gears-settings-service --features integration --test pg_migrations_test
+
 ## Run bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).
 ##
@@ -888,18 +938,29 @@ test-pricing-pg: install-tools
 test-coord-pg: install-tools
 	cargo nextest run -p cf-gears-bss-coord --run-ignored ignored-only -E 'binary(/^postgres_/)'
 
-## Compile and run `bss-fixtures` on the surface a **gear** actually takes.
+## Run bss-products' Postgres tier (Docker required; testcontainers).
 ##
-## Pricing's `FixtureGate` inherits this crate with `default-features = false`
-## (`Cargo.toml`'s workspace entry) — `ModelKind` + `Registry` + `gate_open_for`
-## and nothing else. `default = ["corpus"]`, so every other build in the
-## workspace, `make test-no-macros` included, compiles the wide surface: the
-## test written to guard the narrow one (`tests/production_surface.rs`, whose
-## module doc names this invocation) ran only in the configuration it does not
-## guard, where its assertions hold trivially. The narrow build's only other
-## consumer is the example server's release build, which never runs a test.
-test-fixtures-narrow: install-tools
-	cargo nextest run -p cf-gears-bss-fixtures --no-default-features --test production_surface
+## Same `--run-ignored ignored-only` shape and the same reason as the two above:
+## the gate is an ignored-test attribute rather than a feature. This gear's tier was added on
+## 2026-08-30 and, until this target existed, repeated the donor's own 2026-08-11
+## failure exactly — 23 tests across six `postgres_*` binaries that compiled on
+## every run and executed on none, while the DoD they discharge
+## (`cpt-cf-bss-products-dod-concurrency`) had already been ticked on their
+## strength. Two review lenses found it independently.
+##
+## What lives here and nowhere else: every proof about two writers racing for one
+## reservation index, one head row or one idempotency key, and the **Postgres
+## half of every trigger in the gear**. Both engine arms are written from the
+## same design clauses but in different shapes — SQLite gets one trigger per
+## clause, Postgres one `plpgsql` function with sequential `IF` blocks — so the
+## in-crate SQLite suite cannot fail for anything the Postgres arm gets wrong.
+## That asymmetry is what let a `json`-column publish defect ship in Phase 6.
+##
+## `--no-fail-fast` for the donor's reason: a tier whose whole purpose is to be
+## the one place a Postgres-only defect surfaces must report every failure it
+## found, not the first.
+test-products-pg: install-tools
+	cargo nextest run -p cf-gears-bss-products --run-ignored ignored-only -E 'binary(/^postgres_/)' --no-fail-fast
 
 ## Run the Redis cluster plugin's conformance (Layer 2) and Layer 3 integration
 ## suites (Docker required; each spins up its own redis container via
@@ -931,6 +992,11 @@ test-cluster-redis: install-tools
 ##                                test surface). See issue #1935.
 ##   - cf-gears-oagw           : startup validation rejects allow_http_upstream
 ##                                under --features fips (PR #1985).
+##   - cf-gears-clickhouse-usage-collector-plugin
+##                              : the ClickHouse HTTP transport is built from the
+##                                installed CryptoProvider rather than the
+##                                `clickhouse` crate's hardcoded non-FIPS
+##                                aws-lc-rs (see infra::storage::pool).
 ##
 ## Per-package `pkg/feat` syntax is required because `bootstrap` exists only
 ## on `cf-gears-toolkit` and the crates have independent FIPS feature
@@ -939,7 +1005,7 @@ test-cluster-redis: install-tools
 ## compiles once.
 test-fips: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-oagw \
+	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-oagw -p cf-gears-clickhouse-usage-collector-plugin \
 		--features cf-gears-toolkit/bootstrap,cf-gears-toolkit/fips,cf-gears-toolkit-http/fips,cf-gears-oagw/fips
 
 ## Cross-compile gate for the Windows+FIPS path (Windows handshake
@@ -1026,7 +1092,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-event-broker
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-usage-collector-timescaledb e2e-usage-collector-clickhouse e2e-event-broker e2e-oop
 
 E2E_TARGET ?=
 # E2E selectors for `make e2e-local`:
@@ -1100,10 +1166,34 @@ e2e-mini-chat:
 	$(call print_target_banner)
 	$(MAKE) e2e-local SUITE=mini-chat
 
-## Run usage-collector E2E tests (alias for focused local E2E; Docker required)
+UC_E2E_FEATURES = usage-collector,static-tenants,static-authn,static-authz
+
+## Run usage-collector E2E tests against TimescaleDB (dedicated binary; Docker required)
+## Shared UC_E2E_FEATURES plus this backend's storage plugin. The two plugins
+## cannot share a binary: every linked gear is initialized, and both fail init
+## without their own live database. Hence two builds, two runs.
+e2e-usage-collector-timescaledb: py-env
+	$(call print_target_banner)
+	cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES),timescaledb-usage-collector
+	E2E_BINARY=target/debug/cf-gears-example-server UC_E2E_BACKEND=timescaledb \
+		$(PYTHON) -m pytest testing/e2e/suites/usage_collector/ -vv $(E2E_TARGET)
+
+## Run usage-collector E2E tests against ClickHouse
+## (dedicated binary + ClickHouse container; Docker required)
+e2e-usage-collector-clickhouse: py-env
+	$(call print_target_banner)
+	cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES),clickhouse-usage-collector
+	E2E_BINARY=target/debug/cf-gears-example-server UC_E2E_BACKEND=clickhouse \
+		$(PYTHON) -m pytest testing/e2e/suites/usage_collector/ -vv $(E2E_TARGET)
+
+## Run usage-collector E2E tests against both storage backends.
+## Sequential even under `make -j`: both lanes build the same
+## target/debug/cf-gears-example-server path, bind 127.0.0.1:8088, and share
+## ~/.cf-gears, so they must never run concurrently.
 e2e-usage-collector:
 	$(call print_target_banner)
-	$(MAKE) e2e-local SUITE=usage-collector
+	$(MAKE) e2e-usage-collector-timescaledb
+	$(MAKE) e2e-usage-collector-clickhouse
 
 ## Run event-broker E2E tests (its own standalone binary, not a cf-gears-example-server feature)
 e2e-event-broker: py-env
@@ -1111,6 +1201,23 @@ e2e-event-broker: py-env
 	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
 	E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv
+
+# Out-of-process (loopback) E2E: boots flight-control + OoP gears as local
+# processes (no Kubernetes) and asserts the cross-process seams. Self-managed:
+# its conftest builds the binaries and owns the process lifecycle, so it runs
+# pytest directly (not via run_e2e.py). `timeout_func_only` keeps the per-test
+# timeout from counting the heavy fixture setup (build + boot + route sync), and
+# the 30s per-test cap (vs pytest.ini's default) leaves headroom for the
+# lifecycle tests' process stop/start + polling while still failing fast.
+## Run the out-of-process (loopback, no-k8s) E2E suite
+e2e-oop: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-flight-control --bin flight-control
+	cargo build -p hello --features oop_module --bin hello-oop
+	cargo build -p cf-api-contracts --features oop_module --bin api-contracts-oop
+	cargo build -p cf-api-contracts-consumer --features oop_module --bin api-contracts-consumer-oop
+	OOP_E2E=1 $(PYTHON) -m pytest testing/e2e/suites/oop \
+		-o timeout_func_only=true --timeout=30 -vv
 
 # -------- Code coverage --------
 
@@ -1385,7 +1492,7 @@ ci_docs: lychee gts-docs
 	$(call print_target_banner)
 
 # Run CI pipeline locally, requires docker
-ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-usage-collector-pg test-types-registry-db lychee gts-docs dylint
+ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db lychee gts-docs dylint
 	$(call print_target_banner)
 
 ## Build the cf-gears-example-server release binary, or a single gear when GEAR=<gear> is set

@@ -5,3 +5,12 @@ features:
   - static-authz
 launcher: e2e-launcher
 config_gears: []
+profiles:
+  force-disabled:
+    config_overrides:
+      gears:
+        types-registry:
+          config:
+            allow_compatibility_force: false
+    env:
+      TYPES_REGISTRY_FORCE_ENABLED_E2E: "0"

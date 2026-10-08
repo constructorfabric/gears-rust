@@ -13,6 +13,11 @@ pub enum DomainError {
     #[error("Access forbidden: {0}")]
     Forbidden(String),
 
+    /// A per-user bound is reached: the request is well-formed, and succeeds
+    /// once the caller frees room (e.g. deletes a named setting).
+    #[error("Limit reached: {0}")]
+    LimitReached(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 

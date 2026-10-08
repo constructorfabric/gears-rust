@@ -1,104 +1,75 @@
 """Web search usage verification tests.
 
-Exercises web search with mock/real LLM, then verifies quota usage via
-the REST quota endpoint and message tokens via the messages API.
+Exercises web search with the mock provider, then checks quota usage via the
+REST quota endpoint (literal expected credits, see EXPECTED_CREDITS), message
+tokens via the messages API, and that no quota reserve is left in the DB.
 
-Falls back to direct SQLite only for turn-level fields not exposed via REST
-(reserve_tokens, reserved_credits_micro).
-
-Provider-parameterized — runs against both OpenAI and Azure.
+Provider-parameterized — runs against both OpenAI and Azure mock endpoints.
 """
 
 from __future__ import annotations
 
-import os
-import sqlite3
-import time
+import dataclasses
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 import httpx
 
 from .conftest import (
-    API_PREFIX, DB_PATH, DEFAULT_MODEL, STANDARD_MODEL, PROVIDER_DEFAULT_MODEL,
-    expect_done, parse_sse,
+    API_PREFIX, PROVIDER_DEFAULT_MODEL, USER_A_ID,
+    assert_no_reserves, expect_done, find_period, get_quota_status, parse_sse, query_db,
+    stream_message,
 )
+from .mock_provider.responses import SCENARIOS, Usage
+
+# Compares or seeds daily usage (conftest `same_utc_day`).
+pytestmark = pytest.mark.usefixtures("same_utc_day")
 
 
-# ── Quota endpoint helpers ───────────────────────────────────────────────
-
-def _get_quota_status() -> dict:
-    resp = httpx.get(f"{API_PREFIX}/quota/status", timeout=10)
-    assert resp.status_code == 200
-    return resp.json()
-
-
-def _find_period(tiers: list, tier_name: str, period_name: str) -> dict | None:
-    for t in tiers:
-        if t["tier"] == tier_name:
-            for p in t["periods"]:
-                if p["period"] == period_name:
-                    return p
-    return None
+def _query_ws_calls(user_id: str = USER_A_ID) -> int:
+    """web_search_calls of today's daily `total` quota_usage row (not exposed
+    over REST)."""
+    rows = query_db(
+        "SELECT web_search_calls FROM quota_usage "
+        "WHERE user_id = ? AND period_type = 'daily' "
+        "AND period_start = ? AND bucket = 'total'",
+        (user_id, datetime.now(timezone.utc).date().isoformat()),
+    )
+    assert len(rows) == 1, rows
+    return rows[0]["web_search_calls"]
 
 
-# ── DB helpers (only for turn-level fields not in REST API) ──────────────
-
-def _to_blob(value):
-    if isinstance(value, str):
-        try:
-            return uuid.UUID(value).bytes
-        except ValueError:
-            pass
-    return value
-
-
-def query_db(sql: str, params: tuple = ()) -> list[dict]:
-    if not os.path.exists(DB_PATH):
-        pytest.skip(f"DB not found at {DB_PATH}")
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    blob_params = tuple(_to_blob(p) for p in params)
-    try:
-        rows = conn.execute(sql, blob_params).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
-# ── Credit math helpers ──────────────────────────────────────────────────
-
-def ceil_div(a: int, b: int) -> int:
-    if a == 0 or b == 0:
-        return 0
-    return (a + b - 1) // b
-
-
-def expected_credits_micro(input_tokens: int, output_tokens: int, in_mult: int, out_mult: int) -> int:
-    divisor = 1_000_000
-    return ceil_div(input_tokens * in_mult, divisor) + ceil_div(output_tokens * out_mult, divisor)
-
-
-MODEL_MULTIPLIERS = {
-    "gpt-5.2": (1_000_000, 3_000_000),
-    "gpt-5-mini": (1_000_000, 3_000_000),
-    "gpt-5-nano": (500_000, 1_500_000),
-    "azure-gpt-4.1": (3_000_000, 15_000_000),
-}
+# ── Expected charges ─────────────────────────────────────────────────────
+#
+# The test sends the mock's "SEARCH:*" answer with this usage, taken as is
+# (`scale_input=False`: not the mock's per-input-item estimate).
+# credits_micro = ceil(input * in_mult / 1e6) + ceil(output * out_mult / 1e6)
+# with the base.yaml multipliers:
+#   gpt-5.2        (openai): 400 * 1.0 + 50 * 3.0  =  400 + 150 =  550
+#   azure-gpt-4.1  (azure):  400 * 3.0 + 50 * 15.0 = 1200 + 750 = 1950
+SEARCH_USAGE = Usage(input_tokens=400, output_tokens=50, scale_input=False)
+EXPECTED_USAGE = {"input_tokens": 400, "output_tokens": 50}
+EXPECTED_CREDITS = {"openai": 550, "azure": 1950}
 
 
 @pytest.mark.multi_provider
+@pytest.mark.usefixtures("offline_only")
 class TestWebSearchUsageAccounting:
-    """Verify that web search turns produce correct quota and message records."""
+    """Verify that web search turns produce correct quota and message records.
 
-    def test_web_search_usage_correct(self, provider, server):
+    Offline only: the test sets the provider usage (SEARCH_USAGE)."""
+
+    @pytest.mark.timeout(20)
+    def test_web_search_usage_correct(self, provider, server, mock_provider):
         """Single web-search turn: verify credits, messages, and turn state."""
         model = PROVIDER_DEFAULT_MODEL[provider]
+        mock_provider.set_next_scenario(
+            dataclasses.replace(SCENARIOS["SEARCH:*"], usage=SEARCH_USAGE),
+        )
 
         # Snapshot quota before via REST
-        before = _get_quota_status()
-        before_td = _find_period(before["tiers"], "total", "daily")
-        spent_before = before_td["used_credits_micro"]
+        spent_before = find_period(get_quota_status(), "total", "daily")["used_credits_micro"]
 
         resp = httpx.post(f"{API_PREFIX}/chats", json={"model": model})
         assert resp.status_code == 201
@@ -117,13 +88,7 @@ class TestWebSearchUsageAccounting:
         sse_input = sse_usage["input_tokens"]
         sse_output = sse_usage["output_tokens"]
 
-        tool_events = [e for e in events if e.event == "tool"]
-        ws_tool_dones = [
-            e for e in tool_events
-            if isinstance(e.data, dict)
-            and e.data.get("phase") == "done"
-            and e.data.get("name") in ("web_search", "web_search_preview")
-        ]
+        tools = [(e.data["name"], e.data["phase"]) for e in events if e.event == "tool"]
 
         # ── Verify turn state via REST ──
         resp = httpx.get(f"{API_PREFIX}/chats/{chat_id}/turns/{rid}")
@@ -137,8 +102,8 @@ class TestWebSearchUsageAccounting:
         assert resp.status_code == 200
         msgs = resp.json()["items"]
         asst_msgs = [m for m in msgs if m["role"] == "assistant"]
-        assert len(asst_msgs) >= 1
-        m = asst_msgs[-1]
+        assert len(asst_msgs) == 1, msgs  # a new chat with one turn
+        m = asst_msgs[0]
         assert m["input_tokens"] == sse_input, (
             f"API input_tokens ({m['input_tokens']}) != SSE ({sse_input})"
         )
@@ -147,162 +112,29 @@ class TestWebSearchUsageAccounting:
         )
 
         # ── Verify credits via quota endpoint ──
-        time.sleep(0.5)  # settlement delay
-        after = _get_quota_status()
-        after_td = _find_period(after["tiers"], "total", "daily")
-        spent_after = after_td["used_credits_micro"]
+        assert sse_usage == EXPECTED_USAGE
+        assert_no_reserves(USER_A_ID)
+        spent_after = find_period(get_quota_status(), "total", "daily")["used_credits_micro"]
+        assert spent_after - spent_before == EXPECTED_CREDITS[provider]
 
-        # Credit formula with overshoot cap
-        in_mult, out_mult = MODEL_MULTIPLIERS[model]
-        formula_credits = expected_credits_micro(sse_input, sse_output, in_mult, out_mult)
+        assert tools == [("web_search", "start"), ("web_search", "done")], tools
 
-        # Need turn DB data for overshoot check (reserve_tokens not in REST)
-        turns_db = query_db(
-            "SELECT reserve_tokens, reserved_credits_micro FROM chat_turns WHERE chat_id = ? AND request_id = ?",
-            (chat_id, rid),
-        )
-        assert len(turns_db) == 1
-        reserve_tokens = turns_db[0]["reserve_tokens"]
-        reserved_credits = turns_db[0]["reserved_credits_micro"]
-        actual_tokens = sse_input + sse_output
-        overshoot_tolerance = 1.1
-
-        if actual_tokens > reserve_tokens and actual_tokens / max(reserve_tokens, 1) > overshoot_tolerance:
-            expected_credits = reserved_credits
-            capped = True
-        else:
-            expected_credits = formula_credits
-            capped = False
-
-        spent_delta = spent_after - spent_before
-
-        print(f"  CREDIT VERIFICATION ({provider}/{model}):")
-        print(f"    SSE tokens: input={sse_input}, output={sse_output}")
-        print(f"    actual_tokens={actual_tokens}, reserve_tokens={reserve_tokens}")
-        print(f"    Overshoot capped: {capped}")
-        print(f"    Expected: {expected_credits}, Actual delta: {spent_delta}")
-
-        assert spent_delta == expected_credits, (
-            f"Credit mismatch: delta={spent_delta} != expected={expected_credits} "
-            f"(formula={formula_credits}, capped={capped})"
-        )
-
-        # ws_delta via tool events
-        assert len(ws_tool_dones) > 0, "Expected web_search tool done events"
-
-        # No stuck reserves
-        for tier in after["tiers"]:
-            for p in tier["periods"]:
-                expected_remaining = p["limit_credits_micro"] - p["used_credits_micro"]
-                assert p["remaining_credits_micro"] == expected_remaining, (
-                    f"Stuck reserve in {tier['tier']}/{p['period']}"
-                )
-
-    def test_non_websearch_turn_has_no_tool_events(self, provider, server):
-        """A normal turn (no web_search) should not change credits more than expected."""
-        model = PROVIDER_DEFAULT_MODEL[provider]
-
-        before = _get_quota_status()
-        before_td = _find_period(before["tiers"], "total", "daily")
-        spent_before = before_td["used_credits_micro"]
-
-        resp = httpx.post(f"{API_PREFIX}/chats", json={"model": model})
-        assert resp.status_code == 201
-        chat_id = resp.json()["id"]
-
-        _url2 = f"{API_PREFIX}/chats/{chat_id}/messages:stream"
-        _resp2 = httpx.post(_url2, json={"content": "What is 2+2? Answer in one word."}, headers={"Accept": "text/event-stream"}, timeout=90)
-        status = _resp2.status_code
-        events = parse_sse(_resp2.text) if status == 200 else []
+    @pytest.mark.timeout(20)
+    def test_web_search_calls_counted(self, provider, chat_with_model):
+        """The daily `total` usage row counts the completed web searches of a
+        turn: the mock `SEARCH:*` answer has one."""
+        chat_id = chat_with_model(PROVIDER_DEFAULT_MODEL[provider])["id"]
+        # A turn creates today's row if it is missing.
+        status, events, _ = stream_message(chat_id, "Say OK.")
         assert status == 200
-        done = expect_done(events)
+        expect_done(events)
+        assert_no_reserves(USER_A_ID)
+        before = _query_ws_calls()
 
-        time.sleep(0.5)
-
-        after = _get_quota_status()
-        after_td = _find_period(after["tiers"], "total", "daily")
-        spent_after = after_td["used_credits_micro"]
-
-        # Credits should increase (message was processed). Compare
-        # within the same period — if the daily bucket rolled over
-        # between the `before` and `after` snapshots the counter
-        # resets and a naive `>` fails. Fall back to verifying the
-        # SSE done event reported non-zero usage when the daily
-        # counter appears to have rolled.
-        sse_usage = done.data.get("usage", {})
-        if spent_after < spent_before:
-            # Period rolled over; verify via SSE usage instead.
-            assert spent_after > 0, (
-                "Daily quota rolled over but after-snapshot shows zero credits"
-            )
-            assert (sse_usage.get("input_tokens", 0) + sse_usage.get("output_tokens", 0)) > 0, (
-                "Period rollover: SSE done event must still report non-zero token usage"
-            )
-        else:
-            assert spent_after > spent_before
-
-        # Verify no tool events (no web search happened)
-        tool_events = [e for e in events if e.event == "tool"]
-        assert len(tool_events) == 0, (
-            f"Unexpected tool events without web_search: {[t.data for t in tool_events]}"
+        status, events, _ = stream_message(
+            chat_id, "SEARCH: population of Oslo", web_search={"enabled": True},
         )
-
-    @pytest.mark.online_only
-    def test_web_search_credits_match_model_multipliers(self, provider, chat_with_model, server):
-        """Verify credit formula with real provider web search (overshoot-cap logic)."""
-        model = PROVIDER_DEFAULT_MODEL[provider]
-        chat = chat_with_model(model)
-        chat_id = chat["id"]
-
-        before = _get_quota_status()
-        before_td = _find_period(before["tiers"], "total", "daily")
-        spent_before = before_td["used_credits_micro"]
-
-        rid = str(uuid.uuid4())
-        _url3 = f"{API_PREFIX}/chats/{chat_id}/messages:stream"
-        _resp3 = httpx.post(_url3, json={"content": "Search the web: who invented the telephone?", "web_search": {"enabled": True}, "request_id": rid}, headers={"Accept": "text/event-stream"}, timeout=90)
-        status = _resp3.status_code
-        events = parse_sse(_resp3.text) if status == 200 else []
         assert status == 200
-        done = expect_done(events)
-
-        sse_input = done.data["usage"]["input_tokens"]
-        sse_output = done.data["usage"]["output_tokens"]
-
-        time.sleep(0.5)
-
-        after = _get_quota_status()
-        after_td = _find_period(after["tiers"], "total", "daily")
-        spent_after = after_td["used_credits_micro"]
-        spent_delta = spent_after - spent_before
-
-        in_mult, out_mult = MODEL_MULTIPLIERS[model]
-        formula_credits = expected_credits_micro(sse_input, sse_output, in_mult, out_mult)
-
-        # Overshoot check via DB (reserve_tokens not in REST)
-        turns_db = query_db(
-            "SELECT reserve_tokens, reserved_credits_micro FROM chat_turns WHERE chat_id = ? AND request_id = ?",
-            (chat_id, rid),
-        )
-        assert len(turns_db) == 1
-        reserve_tokens = turns_db[0]["reserve_tokens"]
-        reserved_credits = turns_db[0]["reserved_credits_micro"]
-        actual_tokens = sse_input + sse_output
-        overshoot_tolerance = 1.1
-
-        if actual_tokens > reserve_tokens and actual_tokens / max(reserve_tokens, 1) > overshoot_tolerance:
-            expected = reserved_credits
-            capped = True
-        else:
-            expected = formula_credits
-            capped = False
-
-        print(f"  CREDIT VERIFICATION ({provider}/{model}):")
-        print(f"    actual_tokens={actual_tokens}, reserve_tokens={reserve_tokens}")
-        print(f"    Overshoot capped: {capped}")
-        print(f"    Expected: {expected}, Actual delta: {spent_delta}")
-
-        assert spent_delta == expected, (
-            f"Credit mismatch for {provider}/{model}: "
-            f"delta={spent_delta} != expected={expected}"
-        )
+        expect_done(events)
+        assert_no_reserves(USER_A_ID)
+        assert _query_ws_calls() == before + 1

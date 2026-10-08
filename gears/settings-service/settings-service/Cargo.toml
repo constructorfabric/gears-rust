@@ -1,7 +1,7 @@
 # Created: 2026-08-12 by Virtuozzo International GmbH
 [package]
 name = "cf-gears-settings-service"
-version = "0.1.0"
+version = "0.1.4"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -14,6 +14,13 @@ metadata.docs.rs.all-features = true
 
 [lints]
 workspace = true
+
+[features]
+# `tests/pg_migrations_test.rs`: the migration chain on a real PostgreSQL via
+# testcontainers, Docker required (`make test-settings-service-pg`). Brings the
+# PostgreSQL driver in for that lane only; the lib leaves the backend to the
+# server that hosts it.
+integration = ["toolkit-db/pg"]
 
 [dependencies]
 # Trait boundaries of consumed SDKs are `CanonicalError` (ADR 0005).
@@ -70,6 +77,9 @@ toolkit-macros = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+# The SQL query recorder: the impact walk pins its round trips as a count of
+# statements, which no timing assertion could do without flaking.
+toolkit-db = { workspace = true, features = ["test-support"] }
 # Drives a request through the real router in the REST tests: the routes are
 # registered exactly as the gear registers them, and `oneshot` answers.
 tower = { workspace = true }
@@ -86,3 +96,8 @@ credstore-sdk = { workspace = true, features = ["test-util"] }
 # beside `aws-lc-rs`, and rustls 0.23 panics process-wide when it cannot
 # choose between two.
 sea-orm = { workspace = true, features = ["sqlx-sqlite"] }
+# The PostgreSQL migration suite behind `integration`: a real PostgreSQL in a
+# container, since what SQLite accepts PostgreSQL may refuse.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }

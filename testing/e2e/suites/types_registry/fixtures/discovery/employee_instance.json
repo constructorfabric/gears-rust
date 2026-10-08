@@ -1,0 +1,9 @@
+{
+  "gts_id": "gts.cf.e2e.discovery.person.v1~cf.e2e.discovery.employee.v1~cf.e2e.discovery.bob.v1",
+  "content": {
+    "name": "Bob",
+    "payload": {
+      "employee_id": "E001"
+    }
+  }
+}

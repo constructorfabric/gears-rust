@@ -54,23 +54,36 @@ impl MigrationTrait for Migration {
 /// database as a bound value, never as SQL text. Idempotent: a second run
 /// matches nothing.
 async fn rewrite(manager: &SchemaManager<'_>, from: &str, to: &str) -> Result<(), DbErr> {
+    manager.exec_stmt(statement(from, to)?).await
+}
+
+/// The rewrite as a statement, built from primitives the query builder
+/// renders for each backend: `to || SUBSTR(value_type_id, start)`, where `||`
+/// and `SUBSTR(text, int)` exist on PostgreSQL and SQLite alike, and every
+/// input is a bound value in the backend's own placeholder. A custom SQL
+/// fragment is not: its placeholder is spelt one way, and a backend that
+/// spells it another passes the text through — PostgreSQL read SQLite's `?`
+/// as an operator, failed the statement with a syntax error, and dropped the
+/// values bound to it on the way.
+fn statement(from: &str, to: &str) -> Result<UpdateStatement, DbErr> {
     let start = <i32 as std::convert::TryFrom<usize>>::try_from(from.len() + 1)
         .map_err(|_| DbErr::Custom("value type prefix longer than any id".to_owned()))?;
-    let statement = Query::update()
+    Ok(Query::update()
         .table(Alias::new("setting_declarations"))
         .value(
             Alias::new("value_type_id"),
-            Expr::cust_with_values(
-                "? || SUBSTR(value_type_id, ?)",
-                [Value::from(to.to_owned()), Value::from(start)],
+            Expr::val(to).binary(
+                BinOper::Custom("||"),
+                Func::cust(Alias::new("SUBSTR"))
+                    .arg(Expr::col(Alias::new("value_type_id")))
+                    .arg(Expr::val(start)),
             ),
         )
         .and_where(
             Expr::col(Alias::new("value_type_id"))
                 .like(LikeExpr::new(format!("{}%", like_literal(from))).escape('\\')),
         )
-        .to_owned();
-    manager.exec_stmt(statement).await
+        .to_owned())
 }
 
 /// `text` as a `LIKE` pattern that matches it and nothing else: the wildcards

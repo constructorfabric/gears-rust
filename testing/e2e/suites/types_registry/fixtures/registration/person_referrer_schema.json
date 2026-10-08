@@ -1,0 +1,19 @@
+{
+  "gts_id": "gts.cf.e2e.registration.referrer.v1~",
+  "content": {
+    "$id": "gts://gts.cf.e2e.registration.referrer.v1~",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "payload": {
+        "type": "object",
+        "properties": {
+          "person": {"$ref": "gts://gts.cf.e2e.registration.person.v1~"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "required": ["payload"],
+    "additionalProperties": false
+  }
+}

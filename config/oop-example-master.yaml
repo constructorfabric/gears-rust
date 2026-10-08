@@ -17,7 +17,7 @@ gears:
       # fixed port so the child can find it
       listen_addr: "127.0.0.1:50051"
 
-  gear-orchestrator:
+  service-discovery:
     config: { }
 
   calculator-gateway:

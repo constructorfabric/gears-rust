@@ -56,6 +56,9 @@ struct FakeResolver {
     /// The `max_depth` the last descendants request carried; `None` when it
     /// asked for the whole tree.
     depth_asked: std::sync::Mutex<Option<u32>>,
+    /// The `status` filter the last descendants request carried; empty when
+    /// it asked for every status.
+    status_asked: std::sync::Mutex<Vec<TenantStatus>>,
 }
 
 fn not_found() -> TenantResolverError {
@@ -140,12 +143,25 @@ impl TenantResolverClient for FakeResolver {
             "administration stops at a barrier"
         );
         *self.depth_asked.lock().expect("lock") = options.max_depth;
+        self.status_asked
+            .lock()
+            .expect("lock")
+            .clone_from(&options.status);
         if self.knows == Knows::Nothing {
             return Err(not_found());
         }
+        // The status filter as every plugin applies it: a descendant whose
+        // status is not asked for is left out of the answer, and an empty
+        // filter asks for every status.
+        let descendants = self
+            .descendants
+            .iter()
+            .filter(|r| options.status.is_empty() || options.status.contains(&r.status))
+            .cloned()
+            .collect();
         Ok(GetDescendantsResponse {
             tenant: tenant_ref(id.0, None),
-            descendants: self.descendants.clone(),
+            descendants,
         })
     }
 
@@ -285,6 +301,39 @@ async fn the_descendants_are_the_set_the_resolver_answers_in_breadth_first_order
 }
 
 #[tokio::test]
+async fn the_walk_keeps_the_link_each_descendant_was_reached_through() {
+    // A walk over the whole subtree reads every descendant's chain off the
+    // links, instead of asking the resolver again per node: one request for
+    // the subtree, and the chains are the links'.
+    let parent = Uuid::new_v4();
+    let a = Uuid::new_v4();
+    let a_child = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let (hierarchy, resolver) = over(FakeResolver {
+        descendants: vec![
+            tenant_ref(a_child, Some(a)),
+            tenant_ref(b, Some(parent)),
+            tenant_ref(a, Some(parent)),
+        ],
+        ..FakeResolver::default()
+    });
+
+    let subtree = hierarchy.subtree(parent, 100).await.expect("subtree");
+    assert_eq!(subtree.order, vec![b, a, a_child]);
+    assert_eq!(
+        subtree.parent,
+        std::collections::HashMap::from([(b, parent), (a, parent), (a_child, a)])
+    );
+    assert_eq!(subtree.path_from(parent, a_child), vec![parent, a, a_child]);
+    assert!(!subtree.truncated);
+    assert_eq!(
+        resolver.asked.load(Ordering::SeqCst),
+        1,
+        "one request for the whole subtree"
+    );
+}
+
+#[tokio::test]
 async fn the_breadth_first_walk_is_rebuilt_from_the_parent_links() {
     // The impact report shows the nearest affected scopes first, so the flat
     // set the resolver answers has to be re-ordered level by level. Depth-first
@@ -378,6 +427,55 @@ async fn the_resolver_is_asked_for_a_bounded_depth_and_the_ceiling_marks_truncat
         .await
         .expect("a walk order");
     assert!(!truncated);
+}
+
+#[tokio::test]
+async fn the_walk_asks_for_live_tenants_only_and_skips_a_deleted_one_it_is_handed() {
+    // A soft-deleted tenant is kept for its retention window, is neither
+    // administered nor read, and used to count against the subtree budget: a
+    // stand whose suites delete the tenants they create refused every search
+    // at platform scope once their tombstones passed the budget. The request
+    // names the live statuses, so the resolver leaves the tombstones out, and
+    // a tenant reachable only through one is not reached.
+    let root = Uuid::new_v4();
+    let live = Uuid::new_v4();
+    let suspended = Uuid::new_v4();
+    let deleted = Uuid::new_v4();
+    let under_deleted = Uuid::new_v4();
+    let (hierarchy, resolver) = over(FakeResolver {
+        descendants: vec![
+            tenant_ref(live, Some(root)),
+            TenantRef {
+                status: TenantStatus::Suspended,
+                ..tenant_ref(suspended, Some(root))
+            },
+            TenantRef {
+                status: TenantStatus::Deleted,
+                ..tenant_ref(deleted, Some(root))
+            },
+            tenant_ref(under_deleted, Some(deleted)),
+        ],
+        ..FakeResolver::default()
+    });
+
+    let (order, truncated) = hierarchy
+        .descendants_bfs(root, 2)
+        .await
+        .expect("a walk order");
+    assert_eq!(
+        *resolver.status_asked.lock().expect("lock"),
+        vec![TenantStatus::Active, TenantStatus::Suspended],
+        "the request asks for the tenants that are still administered"
+    );
+    assert_eq!(
+        order,
+        vec![live, suspended],
+        "a suspended tenant is live, a deleted one is not"
+    );
+    assert!(
+        !truncated,
+        "two live tenants fit a budget of two: a tombstone is not in the answer, so not in the count"
+    );
 }
 
 #[tokio::test]

@@ -268,7 +268,7 @@ deployment profile (ADR-0001):
     2 or Profile 3** - Profile 1 tests exercise the degenerate single-instance path only. **Coverage owner:** the
     adopting gear owns its Profile 2/3 integration coverage of targeting (e.g. `event-broker` owns the
     dispatcher->shard tests); this ADR's own confirmation matrix (below) is defined against Profile 2/3.
-* **Profile 2 (Host + Workers)** - each OoP Worker is its own process registered with the Platform Host's
+* **Profile 2 (Host + Workers)** - each OoP Worker is its own process registered with Flight Control's
   `DirectoryService`, advertising a **per-instance** endpoint: a **UDS** socket path (single-node) or a
   **TCP + mTLS** address (multi-node), per ADR-0001. Workers are not fronted by a shared VIP, so the advertised
   endpoint is inherently instance-addressable; labels + targeted resolve work exactly as in Profile 3, keying

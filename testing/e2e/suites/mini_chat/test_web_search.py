@@ -12,53 +12,60 @@ import uuid
 import pytest
 import httpx
 
-from .conftest import API_PREFIX, PROVIDER_DEFAULT_MODEL, STANDARD_MODEL, expect_done, expect_stream_started, parse_sse
+from .conftest import (
+    API_PREFIX,
+    delta_text,
+    expect_done,
+    expect_stream_started,
+    parse_sse,
+    poll_turn,
+)
+from .mock_provider.responses import MockEvent, Scenario
+
+
+def stream_search(chat_id: str, content: str, **extra) -> list:
+    """Send `content` with web search enabled; return the SSE events of a `done` stream."""
+    resp = httpx.post(
+        f"{API_PREFIX}/chats/{chat_id}/messages:stream",
+        json={"content": content, "web_search": {"enabled": True}, **extra},
+        headers={"Accept": "text/event-stream"},
+        timeout=90,
+    )
+    assert resp.status_code == 200, resp.text
+    events = parse_sse(resp.text)
+    expect_done(events)
+    return events
+
+
+def tool_events(events) -> list[tuple[str, str]]:
+    """(name, phase) of each `tool` event."""
+    return [(e.data["name"], e.data["phase"]) for e in events if e.event == "tool"]
 
 
 @pytest.mark.multi_provider
 class TestWebSearchBasic:
     """Web search happy path — tool events, usage, deltas."""
 
-    def test_web_search_returns_tool_events(self, provider_chat):
-        """Streaming with web_search enabled should produce tool events."""
-        resp = httpx.post(
-            f"{API_PREFIX}/chats/{provider_chat['id']}/messages:stream",
-            json={"content": "SEARCH: current weather in Berlin", "web_search": {"enabled": True}},
-            headers={"Accept": "text/event-stream"},
-            timeout=90,
-        )
-        assert resp.status_code == 200
-        events = parse_sse(resp.text)
-        expect_done(events)
-        ss = expect_stream_started(events)
-        assert "request_id" in ss.data
-        assert "message_id" in ss.data
-        assert ss.data.get("is_new_turn") is True
-
-        tool_events = [e for e in events if e.event == "tool"]
-        assert len(tool_events) > 0, (
-            f"Expected tool events for web search but got none. "
-            f"Event types: {[e.event for e in events]}"
-        )
+    @pytest.mark.usefixtures("offline_only")
+    def test_web_search_tool_events_name_and_phases(self, provider_chat):
+        """05-05, 18-01: the mock's one web search is sent as two `tool`
+        events named `web_search`: phase `start`, then `done`, each with
+        empty `details`."""
+        events = stream_search(provider_chat["id"], "SEARCH: current weather in Berlin")
+        assert tool_events(events) == [("web_search", "start"), ("web_search", "done")], events
+        assert [e.data["details"] for e in events if e.event == "tool"] == [{}, {}], events
 
     def test_web_search_done_has_usage(self, provider_chat):
         """Done event after web search should include usage with tokens."""
-        resp = httpx.post(
-            f"{API_PREFIX}/chats/{provider_chat['id']}/messages:stream",
-            json={"content": "SEARCH: population of Tokyo", "web_search": {"enabled": True}},
-            headers={"Accept": "text/event-stream"},
-            timeout=90,
-        )
-        assert resp.status_code == 200
-        events = parse_sse(resp.text)
+        events = stream_search(provider_chat["id"], "SEARCH: population of Tokyo")
         done = expect_done(events)
         ss = expect_stream_started(events)
         assert "request_id" in ss.data
         assert "message_id" in ss.data
         assert ss.data.get("is_new_turn") is True
-        assert "effective_model" in done.data, "done must have effective_model"
-        assert "selected_model" in done.data, "done must have selected_model"
-        assert done.data.get("quota_decision") in ("allow", "downgrade"), f"unexpected quota_decision: {done.data.get('quota_decision')}"
+        assert done.data["effective_model"] == provider_chat["model"]
+        assert done.data["selected_model"] == provider_chat["model"]
+        assert done.data["quota_decision"] == "allow"
         usage = done.data.get("usage")
         assert usage is not None, f"Done event missing usage: {done.data}"
         assert usage["input_tokens"] > 0
@@ -66,15 +73,7 @@ class TestWebSearchBasic:
 
     def test_web_search_has_delta_events(self, provider_chat):
         """Web search stream should still have delta text events."""
-        resp = httpx.post(
-            f"{API_PREFIX}/chats/{provider_chat['id']}/messages:stream",
-            json={"content": "SEARCH: what year was Python created?", "web_search": {"enabled": True}},
-            headers={"Accept": "text/event-stream"},
-            timeout=90,
-        )
-        assert resp.status_code == 200
-        events = parse_sse(resp.text)
-        expect_done(events)
+        events = stream_search(provider_chat["id"], "SEARCH: what year was Python created?")
         ss = expect_stream_started(events)
         assert "request_id" in ss.data
         assert "message_id" in ss.data
@@ -87,151 +86,91 @@ class TestWebSearchBasic:
 
 
 @pytest.mark.multi_provider
+@pytest.mark.usefixtures("offline_only")
 class TestWebSearchCitations:
-    """Web search citation event structure.
+    """Web search citation event structure, with the mock's one `url_citation`
+    (mock_provider/responses.py, scenario `SEARCH:*`). Real providers may omit
+    citations: see TestWebSearchOnline::test_citations_structure_if_present."""
 
-    Offline: mock guarantees citations are present — assert presence + structure.
-    Online: real providers may omit citations — only validate structure if present.
-    """
+    def test_web_search_produces_citations(self, provider_chat):
+        """Web search emits one citations event with the mock's one citation."""
+        events = stream_search(provider_chat["id"], "SEARCH: capital of Australia")
+        citation_events = [e.data for e in events if e.event == "citations"]
+        assert len(citation_events) == 1, [e.event for e in events]
+        assert len(citation_events[0]["items"]) == 1, citation_events
 
-    def test_web_search_produces_citations(self, request, provider_chat):
-        """Web search should emit a citations event with at least one item."""
-        resp = httpx.post(
-            f"{API_PREFIX}/chats/{provider_chat['id']}/messages:stream",
-            json={"content": "SEARCH: capital of Australia", "web_search": {"enabled": True}},
-            headers={"Accept": "text/event-stream"},
-            timeout=90,
-        )
-        assert resp.status_code == 200
-        events = parse_sse(resp.text)
-        expect_done(events)
+    def test_citation_has_required_fields(self, provider_chat):
+        """The citation carries source `web`, the title, the URL, the snippet
+        and the span. The OpenAI `url_citation` has no text: the snippet is
+        the cited range [3, 8) of the `output_text` part that carries the
+        annotation, the second message of the answer ("...found results"):
+        "found". Sliced from the whole answer ("Searching...found results")
+        the same range would be "rchin"."""
+        events = stream_search(provider_chat["id"], "SEARCH: when was the Eiffel Tower built")
+        assert delta_text(events) == "Searching...found results"
+        (citations,) = [e.data for e in events if e.event == "citations"]
+        assert citations["items"] == [{
+            "source": "web",
+            "title": "Mock Search Result",
+            "url": "https://example.com",
+            "snippet": "found",
+            "span": {"start": 3, "end": 8},
+        }], citations
 
-        citation_events = [e for e in events if e.event == "citations"]
-        if request.config.getoption("mode") == "offline":
-            assert len(citation_events) >= 1, (
-                f"Expected citations event for web search. "
-                f"Event types: {[e.event for e in events]}"
-            )
-        if not citation_events:
-            pytest.skip("Provider did not return citations for this query")
-
-        data = citation_events[0].data
-        assert isinstance(data, dict), f"Citations data should be dict, got {type(data)}"
-        items = data.get("items", [])
-        assert len(items) > 0, f"Citations items should not be empty: {data}"
-
-    def test_citation_has_required_fields(self, request, provider_chat):
-        """Each citation should have source, title, and snippet."""
-        resp = httpx.post(
-            f"{API_PREFIX}/chats/{provider_chat['id']}/messages:stream",
-            json={"content": "SEARCH: when was the Eiffel Tower built", "web_search": {"enabled": True}},
-            headers={"Accept": "text/event-stream"},
-            timeout=90,
-        )
-        assert resp.status_code == 200
-        events = parse_sse(resp.text)
-        expect_done(events)
-
-        citation_events = [e for e in events if e.event == "citations"]
-        if not citation_events:
-            if request.config.getoption("mode") == "offline":
-                pytest.fail("Mock should always produce citations")
-            pytest.skip("Provider did not return citations for this query")
-
-        items = citation_events[0].data["items"]
-        for c in items:
-            assert "source" in c, f"Citation missing 'source': {c}"
-            assert c["source"] == "web", f"Expected source='web', got '{c['source']}'"
-            assert "title" in c and len(c["title"]) > 0, f"Citation missing/empty 'title': {c}"
-            assert "snippet" in c and len(c["snippet"]) > 0, f"Citation missing/empty 'snippet': {c}"
-
-    def test_web_citation_has_url(self, request, provider_chat):
-        """Web citations should include a URL."""
-        resp = httpx.post(
-            f"{API_PREFIX}/chats/{provider_chat['id']}/messages:stream",
-            json={"content": "SEARCH: population of Japan", "web_search": {"enabled": True}},
-            headers={"Accept": "text/event-stream"},
-            timeout=90,
-        )
-        assert resp.status_code == 200
-        events = parse_sse(resp.text)
-        expect_done(events)
-
-        citation_events = [e for e in events if e.event == "citations"]
-        if not citation_events:
-            if request.config.getoption("mode") == "offline":
-                pytest.fail("Mock should always produce citations")
-            pytest.skip("Provider did not return citations for this query")
-
-        items = citation_events[0].data["items"]
-        for c in items:
-            assert "url" in c and c["url"] is not None, f"Web citation missing 'url': {c}"
-            assert c["url"].startswith("http"), f"URL should start with http: {c['url']}"
+    def test_web_citation_has_url(self, provider_chat):
+        """A web citation carries the URL of the source."""
+        events = stream_search(provider_chat["id"], "SEARCH: population of Japan")
+        (citations,) = [e.data for e in events if e.event == "citations"]
+        assert [c["url"] for c in citations["items"]] == ["https://example.com"], citations
 
 
 @pytest.mark.multi_provider
 class TestWebSearchEventOrdering:
     """SSE event grammar: ping* (delta|tool)* citations? (done|error)"""
 
+    @pytest.mark.usefixtures("offline_only")
     def test_citations_before_done(self, provider_chat):
-        """If citations are present, they must appear before the done event."""
-        resp = httpx.post(
-            f"{API_PREFIX}/chats/{provider_chat['id']}/messages:stream",
-            json={"content": "SEARCH: capital of France", "web_search": {"enabled": True}},
-            headers={"Accept": "text/event-stream"},
-            timeout=90,
-        )
-        assert resp.status_code == 200
-        events = parse_sse(resp.text)
-        expect_done(events)
+        """One `citations` event, sent right before `done` (grammar: ... citations? done)."""
+        events = stream_search(provider_chat["id"], "SEARCH: capital of France")
+        types = [e.event for e in events]
+        assert types.count("citations") == 1, types
+        assert types[-2:] == ["citations", "done"], types
 
-        citation_idx = None
-        done_idx = None
-        for i, e in enumerate(events):
-            if e.event == "citations" and citation_idx is None:
-                citation_idx = i
-            if e.event == "done":
-                done_idx = i
-
-        # Citations are optional (provider may not always return them),
-        # but if present they must come before done.
-        if citation_idx is not None:
-            assert citation_idx < done_idx, (
-                f"citations at index {citation_idx} should come before done at {done_idx}"
-            )
-
+    @pytest.mark.usefixtures("offline_only")
     def test_tool_events_before_done(self, provider_chat):
-        """Tool events must appear before the terminal done event."""
-        resp = httpx.post(
-            f"{API_PREFIX}/chats/{provider_chat['id']}/messages:stream",
-            json={"content": "SEARCH: who won the latest Nobel Prize in Physics?", "web_search": {"enabled": True}},
-            headers={"Accept": "text/event-stream"},
-            timeout=90,
+        """The events are relayed in the provider's order (grammar
+        `stream_started ping* (delta|tool)* citations? done`). The mock
+        `SEARCH:*` answer is a message ("Searching"), the web search call,
+        then a second message in two deltas that carries the citation, so
+        the stream is `stream_started`, one delta, the tool `start` and
+        `done`, two deltas, `citations`, `done`."""
+        events = stream_search(
+            provider_chat["id"], "SEARCH: who won the latest Nobel Prize in Physics?",
         )
-        assert resp.status_code == 200
-        events = parse_sse(resp.text)
-        expect_done(events)
-
-        done_idx = next(i for i, e in enumerate(events) if e.event == "done")
-        tool_events = [e for e in events if e.event == "tool"]
-        assert len(tool_events) > 0, (
-            f"Expected tool events for web search but got none. "
-            f"Event types: {[e.event for e in events]}"
-        )
-        for i, e in enumerate(events):
-            if e.event == "tool":
-                assert i < done_idx, f"tool event at {i} should be before done at {done_idx}"
+        sequence = [
+            (e.event, e.data["phase"] if e.event == "tool" else None) for e in events
+        ]
+        assert sequence == [
+            ("stream_started", None),
+            ("delta", None),
+            ("tool", "start"), ("tool", "done"),
+            ("delta", None), ("delta", None),
+            ("citations", None),
+            ("done", None),
+        ], sequence
 
 
 @pytest.mark.multi_provider
 class TestWebSearchDisabledByDefault:
-    """When web_search is not requested, no tool events should appear."""
+    """Without the `web_search` flag the provider gets no web_search tool."""
 
-    def test_no_tool_events_without_web_search(self, provider_chat):
-        """A normal message (no web_search flag) should not trigger web search."""
+    @pytest.mark.usefixtures("offline_only")
+    def test_search_prompt_without_flag_has_no_web_search(self, provider_chat, mock_provider):
+        """18-04: a `SEARCH:` prompt (the mock's web search scenario) sent
+        without the flag: the provider request carries no `tools`."""
         resp = httpx.post(
             f"{API_PREFIX}/chats/{provider_chat['id']}/messages:stream",
-            json={"content": "What is 2+2? Answer in one word."},
+            json={"content": "SEARCH: current weather in Berlin"},
             headers={"Accept": "text/event-stream"},
             timeout=90,
         )
@@ -239,52 +178,8 @@ class TestWebSearchDisabledByDefault:
         events = parse_sse(resp.text)
         expect_done(events)
 
-        tool_events = [e for e in events if e.event == "tool"]
-        assert len(tool_events) == 0, (
-            f"Unexpected tool events without web_search: {[t.data for t in tool_events]}"
-        )
-
-    def test_no_citations_without_web_search(self, provider_chat):
-        """A normal message should not produce citation events."""
-        resp = httpx.post(
-            f"{API_PREFIX}/chats/{provider_chat['id']}/messages:stream",
-            json={"content": "Say hello."},
-            headers={"Accept": "text/event-stream"},
-            timeout=90,
-        )
-        assert resp.status_code == 200
-        events = parse_sse(resp.text)
-        expect_done(events)
-
-        citations = [e for e in events if e.event == "citations"]
-        assert len(citations) == 0, "Unexpected citations without web_search"
-
-
-@pytest.mark.multi_provider
-class TestWebSearchPerProvider:
-    """Web search on each provider's non-default model (web_search: true)."""
-
-    def test_web_search_works_on_non_default_model(self, request, provider, chat_with_model):
-        """Web search should work on each provider's default model."""
-        if request.config.getoption("mode") == "online" and provider == "azure":
-            pytest.skip("Azure does not return web search tool events in online mode")
-        model = PROVIDER_DEFAULT_MODEL[provider]
-        chat = chat_with_model(model)
-        resp = httpx.post(
-            f"{API_PREFIX}/chats/{chat['id']}/messages:stream",
-            json={"content": "SEARCH: tallest building in the world", "web_search": {"enabled": True}},
-            headers={"Accept": "text/event-stream"},
-            timeout=90,
-        )
-        assert resp.status_code == 200
-        events = parse_sse(resp.text)
-        expect_done(events)
-
-        tool_events = [e for e in events if e.event == "tool"]
-        assert len(tool_events) > 0, (
-            f"Expected tool events for web search on {model}. "
-            f"Event types: {[e.event for e in events]}"
-        )
+        (req,) = mock_provider.get_captured_requests()
+        assert "tools" not in req, req["tools"]
 
 
 @pytest.mark.multi_provider
@@ -313,24 +208,55 @@ class TestWebSearchTurnStatus:
         assert body.get("assistant_message_id") is not None, "done turn must have assistant_message_id"
 
     def test_messages_persisted_after_web_search(self, provider_chat):
-        """Both user and assistant messages should be persisted after web search."""
+        """18-07: after a web search turn the chat holds exactly the user
+        message and the answer, in that order, with the turn's request_id;
+        the answer is the text of the `delta` events."""
         chat_id = provider_chat["id"]
-        resp = httpx.post(
-            f"{API_PREFIX}/chats/{chat_id}/messages:stream",
-            json={"content": "SEARCH: when was the Eiffel Tower built?", "web_search": {"enabled": True}},
-            headers={"Accept": "text/event-stream"},
-            timeout=90,
-        )
-        assert resp.status_code == 200
-        events = parse_sse(resp.text)
-        expect_done(events)
+        prompt = "SEARCH: when was the Eiffel Tower built?"
+        events = stream_search(chat_id, prompt)
+        request_id = expect_stream_started(events).data["request_id"]
 
         resp = httpx.get(f"{API_PREFIX}/chats/{chat_id}/messages")
         assert resp.status_code == 200
         msgs = resp.json()["items"]
-        roles = [m["role"] for m in msgs]
-        assert "user" in roles
-        assert "assistant" in roles
+        assert [(m["role"], m["content"], m["request_id"]) for m in msgs] == [
+            ("user", prompt, request_id),
+            ("assistant", delta_text(events), request_id),
+        ], msgs
+
+
+class TestWebSearchPerMessageLimit:
+    """At most `quota.web_search_max_calls_per_message` (2, QuotaConfig default
+    in config.rs, not overridden in base.yaml) web searches per message."""
+
+    @pytest.mark.usefixtures("offline_only")
+    @pytest.mark.timeout(30)
+    def test_third_web_search_fails_the_turn(self, chat, mock_provider):
+        """18-10: the provider starts a third web search in one answer: the
+        stream ends with SSE `error` `web_search_calls_exceeded` and the turn
+        fails."""
+        search = [
+            MockEvent("response.web_search_call.searching", {}),
+            MockEvent("response.web_search_call.completed", {}),
+        ]
+        mock_provider.set_next_scenario(Scenario(events=[
+            *search, *search, *search,
+            MockEvent("response.output_text.delta", {"delta": "Too many searches"}),
+            MockEvent("response.output_text.done", {"text": "Too many searches"}),
+        ]))
+        rid = str(uuid.uuid4())
+        resp = httpx.post(
+            f"{API_PREFIX}/chats/{chat['id']}/messages:stream",
+            json={"content": "SEARCH: everything", "web_search": {"enabled": True},
+                  "request_id": rid},
+            headers={"Accept": "text/event-stream"},
+            timeout=30,
+        )
+        assert resp.status_code == 200
+        events = parse_sse(resp.text)
+        assert events[-1].event == "error", [e.event for e in events]
+        assert events[-1].data["code"] == "web_search_calls_exceeded"
+        assert poll_turn(chat["id"], rid)["state"] == "error"
 
 
 # ── Online-only tests ────────────────────────────────────────────────────
@@ -371,11 +297,21 @@ class TestWebSearchOnline:
         events = parse_sse(resp.text)
         expect_done(events)
 
-        tool_events = [e for e in events if e.event == "tool"]
-        ws_tools = [
-            t for t in tool_events
-            if isinstance(t.data, dict) and t.data.get("name") in ("web_search", "web_search_preview")
-        ]
-        assert len(ws_tools) > 0, (
-            f"No web_search tool events found. Tool events: {[t.data for t in tool_events]}"
-        )
+        assert ("web_search", "done") in tool_events(events), tool_events(events)
+
+    def test_citations_structure_if_present(self, provider_chat):
+        """A real provider may answer without citations (then the test skips);
+        when it cites, there is one `citations` event right before `done`
+        and each item is a web citation with title, snippet and URL."""
+        events = stream_search(provider_chat["id"], "Search the web: capital of Australia")
+        types = [e.event for e in events]
+        if "citations" not in types:
+            pytest.skip("Provider did not return citations for this query")
+        assert types.count("citations") == 1, types
+        assert types[-2:] == ["citations", "done"], types
+        (citations,) = [e.data for e in events if e.event == "citations"]
+        assert len(citations["items"]) > 0, citations
+        for c in citations["items"]:
+            assert c["source"] == "web", c
+            assert c["title"] and c["snippet"], c
+            assert c["url"].startswith("http"), c

@@ -18,13 +18,13 @@ Every Gear must always have **PRD** and **DESIGN** documents.
 
 Use these templates and keep them aligned with the code:
 
-- **[Overview & guide](https://github.com/constructorfabric/gears-rust/tree/main/docs/spec-templates/gears-sdlc)** — template set and placement under the Gear SDLC spec structure.
-- **[PRD](https://github.com/constructorfabric/gears-rust/tree/main/docs/spec-templates/gears-sdlc/PRD)** — product requirements: vision, actors, capabilities, use cases, FR/NFR.
-- **[DESIGN](https://github.com/constructorfabric/gears-rust/tree/main/docs/spec-templates/gears-sdlc/DESIGN)** — technical design: architecture, principles, constraints, domain model, API contracts.
-- **[ADR](https://github.com/constructorfabric/gears-rust/tree/main/docs/spec-templates/gears-sdlc/ADR)** — architecture decision records: decisions, options, trade-offs, consequences.
-- **[DECOMPOSITION](https://github.com/constructorfabric/gears-rust/tree/main/docs/spec-templates/gears-sdlc/DECOMPOSITION)** — decomposition of work into features, sequencing, and dependency structure.
-- **[FEATURE](https://github.com/constructorfabric/gears-rust/tree/main/docs/spec-templates/gears-sdlc/FEATURE)** — feature specs: flows, algorithms, states, definition of done.
-- **[UPSTREAM_REQS](https://github.com/constructorfabric/gears-rust/tree/main/docs/spec-templates/gears-sdlc/UPSTREAM_REQS)** — technical requirements flowing from other gears into this one.
+- **[Overview & guide](https://github.com/constructorfabric/gears-rust/tree/main/studio-kit-gears/artifacts)** — template set and placement under the Gear SDLC spec structure.
+- **[PRD](https://github.com/constructorfabric/gears-rust/tree/main/studio-kit-gears/artifacts/PRD)** — product requirements: vision, actors, capabilities, use cases, FR/NFR.
+- **[DESIGN](https://github.com/constructorfabric/gears-rust/tree/main/studio-kit-gears/artifacts/DESIGN)** — technical design: architecture, principles, constraints, domain model, API contracts.
+- **[ADR](https://github.com/constructorfabric/gears-rust/tree/main/studio-kit-gears/artifacts/ADR)** — architecture decision records: decisions, options, trade-offs, consequences.
+- **[DECOMPOSITION](https://github.com/constructorfabric/gears-rust/tree/main/studio-kit-gears/artifacts/DECOMPOSITION)** — decomposition of work into features, sequencing, and dependency structure.
+- **[FEATURE](https://github.com/constructorfabric/gears-rust/tree/main/studio-kit-gears/artifacts/FEATURE)** — feature specs: flows, algorithms, states, definition of done.
+- **[UPSTREAM_REQS](https://github.com/constructorfabric/gears-rust/tree/main/studio-kit-gears/artifacts/UPSTREAM_REQS)** — technical requirements flowing from other gears into this one.
 
 ## Constructor Studio
 

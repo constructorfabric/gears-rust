@@ -13,8 +13,8 @@ pub use test_stores::{FailingCall, Hooks, PausePoint, SharedPause, TestStores, T
 
 use gts::GtsConfig;
 use types_registry::{
-    config::TypesRegistryConfig, domain::service::TypesRegistryService,
-    infra::InMemoryGtsRepository,
+    config::TypesRegistryConfig, domain::registry_service::EntityLookup,
+    domain::service::TypesRegistryService, infra::InMemoryGtsRepository,
 };
 
 pub fn default_config() -> GtsConfig {
@@ -176,6 +176,21 @@ where
 /// A read document as a tree, to compare with an authored `json!` value.
 pub fn doc(raw: Option<&serde_json::value::RawValue>) -> Option<serde_json::Value> {
     raw.map(|raw| serde_json::from_str(raw.get()).expect("a read document is JSON"))
+}
+
+/// A batch read's answer for `key`, found by key: batch order is not contractual
+/// (DESIGN §3.3).
+pub fn answer_for<'a>(
+    results: &'a [(EntityKey, EntityLookup)],
+    key: &EntityKey,
+) -> &'a EntityLookup {
+    &results
+        .iter()
+        .find(|(asked, _)| asked == key)
+        // Neither the key nor the results are printed: both can carry a `Uuid`,
+        // and CodeQL reads a `{:?}` of one as cleartext logging.
+        .expect("every asked key is answered")
+        .1
 }
 
 pub fn stores() -> Arc<dyn types_registry::domain::ports::Stores> {
@@ -417,7 +432,7 @@ pub async fn seed_completed_operation_item(
         operation_item::ActiveModel {
             operation_id: Set(op_id),
             item_no: Set(0),
-            gts_id: Set(gts_id.to_owned()),
+            entity_key: Set(gts_id.to_owned()),
             dry_run: Set(false),
             kind: Set(OperationKind::Registration),
             expected_resource_version: Set(0),
@@ -493,7 +508,7 @@ pub async fn seed_pending_revision_item_with(
         operation_item::ActiveModel {
             operation_id: Set(op_id),
             item_no: Set(0),
-            gts_id: Set(gts_id.to_owned()),
+            entity_key: Set(gts_id.to_owned()),
             dry_run: Set(false),
             kind: Set(OperationKind::Registration),
             expected_resource_version: Set(expected_resource_version),
@@ -554,7 +569,7 @@ pub async fn seed_pending_deletion_item(
         operation_item::ActiveModel {
             operation_id: Set(op_id),
             item_no: Set(0),
-            gts_id: Set(gts_id.to_owned()),
+            entity_key: Set(gts_id.to_owned()),
             dry_run: Set(dry_run),
             kind: Set(OperationKind::Deletion),
             expected_resource_version: Set(expected_resource_version),
@@ -704,4 +719,69 @@ async fn restate_stored_revision(
         "no stored revision of '{gts_id}' was found to restate; the fixture would \
          otherwise assert over a baseline it never changed",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Submitting either kind of operation
+// ---------------------------------------------------------------------------
+
+use types_registry::domain::admission::acceptance::{
+    AcceptanceContext, AcceptanceError, accept, accept_deletion,
+};
+use types_registry::domain::admission::{
+    Accepted, DeleteRequest, DeleteTarget, OperationDispatch, SubmitRequest,
+};
+use types_registry::domain::enums::OperationKind as DomainOperationKind;
+use types_registry::domain::key::EntityKey;
+use types_registry::domain::ports::Stores;
+
+/// A deletion of the entities `request` names, as both REST routes build one.
+/// Tests describe a batch as candidates whatever its kind; a deletion target has
+/// no document and no `force`, so a candidate carrying either is a test bug.
+pub fn deletion_of(request: SubmitRequest) -> DeleteRequest {
+    DeleteRequest {
+        idempotency_key: request.idempotency_key,
+        dry_run: request.dry_run,
+        targets: request
+            .candidates
+            .into_iter()
+            .map(|candidate| {
+                assert!(
+                    candidate.content.is_none() && !candidate.force,
+                    "a deletion target carries no document and no force: {}",
+                    candidate.gts_id,
+                );
+                DeleteTarget {
+                    key: EntityKey::parse(&candidate.gts_id),
+                    expected_resource_version: candidate.expected_resource_version,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Accept `request` as the operation `kind` names: a registration as itself, a
+/// deletion through [`deletion_of`] and `accept_deletion`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`accept`'s own context, plus the kind that picks between it and `accept_deletion`"
+)]
+pub async fn accept_as(
+    kind: DomainOperationKind,
+    stores: &Arc<dyn Stores>,
+    db: &DBProvider<AcceptanceError>,
+    scope: &AccessScope,
+    ctx: &AcceptanceContext<'_>,
+    dispatch: &Arc<dyn OperationDispatch>,
+    request: SubmitRequest,
+    now: OffsetDateTime,
+) -> Result<Accepted, AcceptanceError> {
+    match kind {
+        DomainOperationKind::Registration => {
+            accept(stores, db, scope, ctx, dispatch, &request, now).await
+        }
+        DomainOperationKind::Deletion => {
+            accept_deletion(stores, db, scope, ctx, dispatch, &deletion_of(request), now).await
+        }
+    }
 }

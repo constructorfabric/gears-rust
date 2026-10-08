@@ -574,7 +574,7 @@ mod tests {
             DirectoryGrpcClient::connect_lazy("http://127.0.0.1:1").expect("lazy build ok");
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            client.resolve_grpc_service("cf.directory.v1.DirectoryService"),
+            client.resolve_grpc_service(crate::DIRECTORY_SERVICE_NAME),
         )
         .await;
         assert!(

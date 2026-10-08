@@ -20,7 +20,7 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
   - [Keep the 4-axis key with post-selection filters](#keep-the-4-axis-key-with-post-selection-filters)
   - [Define a Tariffs-local key](#define-a-tariffs-local-key)
-  - [Adopt the pricing 8-axis canonical key (chosen)](#adopt-the-pricing-8-axis-canonical-key-chosen)
+  - [Adopt the pricing canonical key verbatim (chosen)](#adopt-the-pricing-canonical-key-verbatim-chosen)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
@@ -52,16 +52,25 @@ Tariffs use so that selection is unique without banning hybrid / grandfathered /
 
 1. Keep the 4-axis key with post-selection `priceEligibility` filters.
 2. Define a Tariffs-local key.
-3. Adopt the pricing 8-axis canonical key verbatim (chosen).
+3. Adopt the pricing canonical key verbatim (chosen).
 
 ## Decision Outcome
 
-Chosen option: **Adopt the pricing 8-axis canonical scope key verbatim** —
-`(planId, currency, region, priceOverlay, phase, priceEligibility, chargeKind, cohort)` — for both
+Chosen option: **Adopt the pricing canonical scope key verbatim — ten axes since pricing D-196
+(2026-08-06; eight at this ADR's decision date)** —
+`(planId, currency, region, priceOverlay, phase, priceEligibility, chargeKind, cohort)` plus the
+usage pair `(meter, dimensionKey)` (`none` on non-usage rows) — for both
 selection and the non-overlap invariant. `phase` is a `phase_id` (uuid). Within
 `existing_grandfathered`, the generation is selected by the `cohort` of the subscription's **pinned
 price id** in `pricingSnapshotRef`, never by `activatedAt` alone. Eligibility classes order
 `existing_grandfathered > new_subscriptions_only > all_subscriptions`.
+
+> **Amendment (2026-08-25).** Pricing D-196 (2026-08-06) widened the canonical key it owns to
+> **ten axes**: the usage pair `(meter, dimensionKey)` joined as normative axes (`none` on
+> non-usage rows; the pricing store holds one price row per usage line, both unique indexes key
+> over the pair). This ADR's adoption is *verbatim*, so the adopted key is the full ten; the
+> 8-axis spelling above is the key as of the decision date. The slice-02 `SelectionKey`
+> carries the full ten since T-D-35 (2026-08-25; SEAMS K6 resolved).
 
 ### Consequences
 
@@ -86,19 +95,19 @@ price id** in `pricingSnapshotRef`, never by `activatedAt` alone. Eligibility cl
 * Good: self-contained.
 * Bad: guaranteed drift from the pricing SoR; contradicts the cross-team contract in pricing `ADR/0001`/`ADR/0002`; duplicates an identity the catalog already owns.
 
-### Adopt the pricing 8-axis canonical key (chosen)
+### Adopt the pricing canonical key verbatim (chosen)
 
 * Good: unique selection; no drift; no new store; honors the ratified cross-gear contract.
 * Bad: Tariffs must consume `priceEligibility`, `chargeKind`, and `cohort` from the frozen snapshot — a bounded contract addition, already available via the pinned price id.
 
 ## More Information
 
-Cross-gear seam analysis (seams K1-K5), rationale, and the ownership matrix are in
-[`../SEAMS.md`](../SEAMS.md). Pricing-side ADRs: `cpt-cf-bss-pricing-adr-canonical-scope-key`,
-`cpt-cf-bss-pricing-adr-grandfathering-cohort-axis`.
+Cross-gear seam analysis (seams K1-K5 and K6 (K6 resolved 2026-08-25, T-D-35)), rationale, and the ownership matrix are in
+[`../SEAMS.md`](../SEAMS.md). Pricing-side ADRs: Canonical scope key (superseded by the PriceBook model, see T-D-37 in rating DECISIONS),
+Grandfathering cohort axis (superseded by the PriceBook model, see T-D-37 in rating DECISIONS).
 
 ## Traceability
 
 - **PRD**: [`../PRD.md`](../PRD.md) §1.4 (`PriceWindow`, `Price eligibility`), §6.3 (step 2), §6.5.
-- **Seams**: [`../SEAMS.md`](../SEAMS.md) K1-K5.
+- **Seams**: [`../SEAMS.md`](../SEAMS.md) K1-K5, K6.
 - **Design**: [`../design/02-selection-eligibility.md`](../design/02-selection-eligibility.md).

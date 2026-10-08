@@ -2,7 +2,7 @@ use axum::Router;
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::operation_builder::OperationBuilder;
 
-use super::AiChatLicense;
+use super::{AiChatLicense, retry_after_header};
 use crate::api::rest::dto::{ModelDto, ModelListDto};
 use crate::api::rest::handlers;
 
@@ -22,7 +22,11 @@ pub(super) fn register_model_routes(
         .require_license_features([&AiChatLicense])
         .handler(handlers::models::list_models)
         .json_response_with_schema::<ModelListDto>(openapi, http::StatusCode::OK, "List of models")
-        .standard_errors(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
         .register(router, openapi);
 
     // GET {prefix}/v1/models/{id}
@@ -35,7 +39,12 @@ pub(super) fn register_model_routes(
         .path_param("id", "Model identifier")
         .handler(handlers::models::get_model)
         .json_response_with_schema::<ModelDto>(openapi, http::StatusCode::OK, "Model details")
-        .standard_errors(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .response_header(retry_after_header())
         .register(router, openapi);
 
     router

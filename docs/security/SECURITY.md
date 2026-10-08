@@ -634,7 +634,7 @@ Every pull request is reviewed by automated bots before human review:
 
 ## 13. Specification Templates & SDLC
 
-> Source: [`docs/spec-templates/`](../spec-templates/) · [`docs/spec-templates/gears-sdlc/`](../spec-templates/gears-sdlc/)
+> Source: [`studio-kit-gears/artifacts/`](../../studio-kit-gears/artifacts/)
 
 Gears follow a **spec-driven development** lifecycle where PRD and DESIGN documents are written before implementation. Security is addressed at multiple points:
 

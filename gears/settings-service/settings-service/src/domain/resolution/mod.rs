@@ -9,6 +9,8 @@
 pub mod cache;
 pub mod resolver;
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use settings_service_sdk::EffectiveSource;
@@ -108,6 +110,49 @@ pub fn subtree_too_large(field: &str, whose: &str) -> DomainError {
     }
 }
 
+/// A bounded breadth-first walk of a subtree, with the parent links it was
+/// rebuilt from.
+///
+/// The links are what a walk over the whole subtree needs: every
+/// descendant's chain below the walked tenant is read off them in memory,
+/// rather than asked of the tenant resolver once per descendant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Subtree {
+    /// The descendants in breadth-first order, standalone subtrees left out.
+    pub order: Vec<Uuid>,
+    /// Each descendant's parent, the one it was reached through: the walked
+    /// tenant for its children.
+    pub parent: HashMap<Uuid, Uuid>,
+    /// Whether the budget or the depth ceiling cut the walk short.
+    pub truncated: bool,
+}
+
+impl Subtree {
+    /// Whether `tenant` is one of the descendants walked.
+    #[must_use]
+    pub fn contains(&self, tenant: Uuid) -> bool {
+        self.parent.contains_key(&tenant)
+    }
+
+    /// The chain from the walked `tenant` down to `descendant`, both included,
+    /// read off the parent links. Every descendant was reached from the walked
+    /// tenant through the links it records, so the chain always closes.
+    #[must_use]
+    pub fn path_from(&self, tenant: Uuid, descendant: Uuid) -> Vec<Uuid> {
+        let mut path = vec![descendant];
+        let mut cursor = descendant;
+        while cursor != tenant {
+            let Some(parent) = self.parent.get(&cursor) else {
+                break;
+            };
+            cursor = *parent;
+            path.push(cursor);
+        }
+        path.reverse();
+        path
+    }
+}
+
 /// The tenant hierarchy, as the resolver needs it.
 ///
 /// A port over the tenant resolver: ancestry is owned there and is never
@@ -141,8 +186,14 @@ pub trait TenantHierarchy: Send + Sync {
     async fn is_standalone(&self, tenant: Uuid) -> Result<bool, DomainError>;
 
     /// The descendants of `tenant` in breadth-first order, at most `budget` of
-    /// them, standalone subtrees left out; the flag says whether the budget
-    /// cut the walk short.
+    /// them, standalone subtrees left out, with the parent links the order was
+    /// rebuilt from; the subtree says whether the budget cut the walk short.
+    ///
+    /// # Errors
+    /// As [`Self::chain`].
+    async fn subtree(&self, tenant: Uuid, budget: usize) -> Result<Subtree, DomainError>;
+
+    /// The descendants alone, for a walk that needs no chain of its own.
     ///
     /// # Errors
     /// As [`Self::chain`].
@@ -150,8 +201,15 @@ pub trait TenantHierarchy: Send + Sync {
         &self,
         tenant: Uuid,
         budget: usize,
-    ) -> Result<(Vec<Uuid>, bool), DomainError>;
+    ) -> Result<(Vec<Uuid>, bool), DomainError> {
+        let subtree = self.subtree(tenant, budget).await?;
+        Ok((subtree.order, subtree.truncated))
+    }
 }
+
+#[cfg(test)]
+#[path = "subtree_tests.rs"]
+mod subtree_tests;
 
 /// One scope the resolver inspected, in full.
 ///

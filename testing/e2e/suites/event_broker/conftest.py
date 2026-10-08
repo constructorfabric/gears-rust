@@ -44,6 +44,15 @@ SERVER_PORT = 8089
 API_BASE = "/event-broker/v1"
 REQUEST_TIMEOUT = 5.0
 
+# Every client sends this valid W3C `traceparent`, so the wire `trace_id` the
+# canonical error layer echoes is deterministic. `extract_trace_id` prefers the
+# live OTel span, but the request span continues this inbound `traceparent`, so
+# its trace-id equals the header's; with OTel off the header is used directly.
+# Either way the value is TRACE_ID, the header's 32-hex trace-id segment. Uses
+# the W3C spec's example ids.
+TRACE_ID = "0af7651916cd43dd8448eb211c80319c"
+TRACEPARENT = f"00-{TRACE_ID}-b7ad6b7169203331-01"
+
 SUBJECT_TYPE = "gts.cf.e2e.event_broker.subject.v1~"
 
 # Active streaming topic: tests publish events here and verify delivery via
@@ -284,6 +293,7 @@ def api(test_env):
         return httpx.AsyncClient(
             base_url=f"{test_env.base_url}{API_BASE}",
             timeout=REQUEST_TIMEOUT,
+            headers={"traceparent": TRACEPARENT},
         )
 
     return _client

@@ -51,7 +51,8 @@ pub enum ProviderKind {
 /// Create a provider adapter from a [`ProviderKind`].
 ///
 /// The upstream alias is not stored in the adapter — it is passed per-request
-/// to [`LlmProvider::stream()`] and [`LlmProvider::complete()`].
+/// to [`LlmProvider::stream`](crate::infra::llm::LlmProvider::stream) and
+/// [`LlmProvider::complete`](crate::infra::llm::LlmProvider::complete).
 #[must_use]
 pub fn create_provider(
     gateway: Arc<dyn ServiceGatewayClientV1>,
@@ -82,5 +83,49 @@ pub fn upstream_headers_for_kind(kind: ProviderKind) -> Option<oagw_sdk::Headers
         ProviderKind::OpenAiResponses
         | ProviderKind::OpenAiChatCompletions
         | ProviderKind::VllmResponses => None,
+    }
+}
+
+/// Request fields `extra_body` must not overwrite: the model and input, the
+/// output and tool-call caps derived from the quota, the tools the turn was
+/// granted and how they are chosen, the usage report that settlement reads
+/// (`stream_options`), the requested tool outputs (`include`), provider-side
+/// storage (`store`, `previous_response_id`), and the caller identity.
+/// Sampling knobs (`stop`, `reasoning`, `reasoning_effort`, ...) are not
+/// reserved: they are catalog settings like `extra_body` itself.
+const RESERVED_BODY_KEYS: &[&str] = &[
+    "model",
+    "input",
+    "messages",
+    "instructions",
+    "system",
+    "stream",
+    "stream_options",
+    "max_output_tokens",
+    "max_completion_tokens",
+    "max_tokens",
+    "max_tool_calls",
+    "tools",
+    "tool_choice",
+    "include",
+    "store",
+    "previous_response_id",
+    "user",
+    "metadata",
+];
+
+/// Merge the model policy's `extra_body` object into the top level of a
+/// request body. Reserved keys are skipped (with a warning), so a catalog
+/// entry cannot lift quota-derived caps or change the model or identity.
+pub(super) fn merge_extra_body(body: &mut serde_json::Value, extra: &serde_json::Value) {
+    let (Some(body_obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object()) else {
+        return;
+    };
+    for (k, v) in extra_obj {
+        if RESERVED_BODY_KEYS.contains(&k.as_str()) {
+            tracing::warn!(key = %k, "extra_body key ignored: the request sets it");
+            continue;
+        }
+        body_obj.insert(k.clone(), v.clone());
     }
 }

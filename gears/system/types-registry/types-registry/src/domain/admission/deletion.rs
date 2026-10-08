@@ -18,7 +18,8 @@ use super::errors::{ItemFailure, WorkerError};
 use crate::config::Limits;
 use crate::domain::admission::AdmissionFailureReason;
 use crate::domain::enums::LifecycleStatus;
-use crate::domain::ports::{ItemSuccess, Stores};
+use crate::domain::key::EntityKey;
+use crate::domain::ports::{EntityRow, ItemSuccess, Stores};
 use crate::observability;
 
 /// What committing a deletion produced.
@@ -27,8 +28,10 @@ use crate::observability;
 /// revision that does not exist (ADR-0005) — the same reason `unchanged` carries
 /// none.
 #[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeletionCommit {
+    /// The identifier the target resolved to, whichever key named it.
+    pub gts_id: String,
     pub gts_uuid: Uuid,
     /// The version the tombstone now carries.
     pub resource_version: i64,
@@ -46,7 +49,8 @@ impl DeletionCommit {
 }
 
 /// Tombstone one entity inside the caller's commit transaction, after claiming
-/// write order. Check lifecycle, version and live registered dependants.
+/// write order. Resolve the key, then check lifecycle, version and live
+/// registered dependants.
 ///
 /// ponytail: ceiling C6 — P0 has no owner/principal check. Any caller reaching
 /// the route can delete an eligible entity, including `cf.core.*`; mutation
@@ -62,7 +66,7 @@ pub async fn commit_deletion(
     stores: &dyn Stores,
     tx: &DbTx<'_>,
     scope: &AccessScope,
-    gts_id: &str,
+    key: &EntityKey,
     expected_resource_version: i64,
     limits: &Limits,
     span: &Span,
@@ -71,13 +75,45 @@ pub async fn commit_deletion(
     // First statement, nothing before it, reads included.
     stores.claim_entity_write_order(tx, scope, now).await?;
 
-    let Some(entity) = stores.find_by_gts_id(tx, scope, gts_id).await? else {
+    let found = match key {
+        EntityKey::GtsId(gts_id) => stores.find_by_gts_id(tx, scope, gts_id).await?,
+        EntityKey::Uuid(gts_uuid) => stores.find_by_gts_uuid(tx, scope, *gts_uuid).await?,
+    };
+    let Some(entity) = found else {
         return Ok(Err(ItemFailure::new(
             AdmissionFailureReason::PreconditionFailed,
-            format!("'{gts_id}' names no entity, so there is nothing to delete"),
+            format!("'{key}' names no entity, so there is nothing to delete"),
         )));
     };
+    decide(
+        stores,
+        tx,
+        scope,
+        &entity,
+        expected_resource_version,
+        limits,
+        span,
+        now,
+    )
+    .await
+}
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`commit_deletion`'s context with the resolved entity in place of its key"
+)]
+async fn decide(
+    stores: &dyn Stores,
+    tx: &DbTx<'_>,
+    scope: &AccessScope,
+    entity: &EntityRow,
+    expected_resource_version: i64,
+    limits: &Limits,
+    span: &Span,
+    now: OffsetDateTime,
+) -> Result<Result<DeletionCommit, ItemFailure>, WorkerError> {
+    let gts_id = &entity.gts_id;
+    observability::record_resolved_gts_id(span, gts_id);
     // Asked **before** the version, deliberately: a tombstone must never suggest
     // retrying with a newer version, which is exactly what `precondition_failed`
     // would invite.
@@ -136,6 +172,7 @@ pub async fn commit_deletion(
     };
 
     Ok(Ok(DeletionCommit {
+        gts_id: gts_id.clone(),
         gts_uuid: entity.gts_uuid,
         resource_version,
     }))

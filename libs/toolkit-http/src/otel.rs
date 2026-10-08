@@ -1,169 +1,25 @@
-//! OpenTelemetry trace context helpers for HTTP headers
+//! OpenTelemetry trace context helpers for HTTP headers.
 //!
-//! Provides W3C Trace Context propagation with optional OpenTelemetry integration.
-//! - With `otel` feature: Uses proper OTEL propagators for distributed tracing
-//! - Without `otel` feature: No-op implementations (graceful degradation)
+//! This module is a thin facade over `cf-gears-toolkit-trace-context`, the one
+//! crate that owns W3C Trace Context propagation (parsing, inbound span-parent
+//! seeding, and outbound injection). `cf-gears-toolkit` depends on the same
+//! crate, so this crate and the core toolkit cannot drift on what a valid
+//! `traceparent` is or on how context is propagated.
+//!
+//! The names are re-exported here so existing `toolkit_http::otel::*` call sites
+//! (e.g. the outgoing-request tracing layer and the api-gateway `TraceLayer`)
+//! keep working unchanged.
 
-use http::HeaderMap;
-
-/// W3C Trace Context header name
-pub const TRACEPARENT: &str = "traceparent";
-
-/// Extract traceparent header value from HTTP headers
-#[must_use]
-pub fn get_traceparent(headers: &HeaderMap) -> Option<&str> {
-    headers.get(TRACEPARENT)?.to_str().ok()
-}
-
-/// Parse trace ID from W3C traceparent header (format: "00-{trace_id}-{span_id}-{flags}")
-#[must_use]
-pub fn parse_trace_id(traceparent: &str) -> Option<String> {
-    let parts: Vec<&str> = traceparent.split('-').collect();
-    if parts.len() >= 4 && parts[0] == "00" {
-        Some(parts[1].to_owned())
-    } else {
-        None
-    }
-}
-
-#[cfg(feature = "otel")]
-mod imp {
-    use super::{get_traceparent, parse_trace_id};
-    use http::{HeaderMap, HeaderName, HeaderValue};
-    use opentelemetry::{
-        Context, global,
-        propagation::{Extractor, Injector},
-    };
-    use tracing::Span;
-    use tracing_opentelemetry::OpenTelemetrySpanExt;
-
-    /// Adapter for extracting W3C Trace Context from HTTP headers
-    struct HeadersExtractor<'a>(&'a HeaderMap);
-
-    impl Extractor for HeadersExtractor<'_> {
-        fn get(&self, key: &str) -> Option<&str> {
-            self.0.get(key).and_then(|v| v.to_str().ok())
-        }
-
-        fn keys(&self) -> Vec<&str> {
-            self.0.keys().map(http::HeaderName::as_str).collect()
-        }
-    }
-
-    /// Adapter for injecting W3C Trace Context into HTTP headers
-    struct HeadersInjector<'a>(&'a mut HeaderMap);
-
-    impl Injector for HeadersInjector<'_> {
-        fn set(&mut self, key: &str, value: String) {
-            if let Ok(name) = HeaderName::from_bytes(key.as_bytes())
-                && let Ok(val) = HeaderValue::from_str(&value)
-            {
-                self.0.insert(name, val);
-            }
-        }
-    }
-
-    /// Inject current OpenTelemetry context into HTTP headers.
-    /// Uses the global propagator to inject W3C Trace Context.
-    pub fn inject_current_span(headers: &mut HeaderMap) {
-        let cx = Context::current();
-        global::get_text_map_propagator(|propagator| {
-            propagator.inject_context(&cx, &mut HeadersInjector(headers));
-        });
-    }
-
-    /// Set span parent from W3C Trace Context headers.
-    /// Extracts the trace context and sets it as the parent of the given span.
-    pub fn set_parent_from_headers(span: &Span, headers: &HeaderMap) {
-        // Extract parent context using OTEL propagator
-        let parent_cx = global::get_text_map_propagator(|propagator| {
-            propagator.extract(&HeadersExtractor(headers))
-        });
-
-        // Set as parent of current span
-        _ = span.set_parent(parent_cx);
-
-        // Also record trace IDs for log correlation
-        if let Some(traceparent) = get_traceparent(headers)
-            && let Some(trace_id) = parse_trace_id(traceparent)
-        {
-            span.record("trace_id", &trace_id);
-            span.record("parent.trace_id", &trace_id);
-        }
-    }
-}
-
-#[cfg(not(feature = "otel"))]
-mod imp {
-    use super::{get_traceparent, parse_trace_id};
-    use http::HeaderMap;
-    use tracing::Span;
-
-    /// No-op: OpenTelemetry is disabled
-    pub fn inject_current_span(_headers: &mut HeaderMap) {
-        // No-op when OTEL is disabled
-    }
-
-    /// No-op: OpenTelemetry is disabled
-    /// Records trace IDs if present in headers for log correlation only.
-    pub fn set_parent_from_headers(span: &Span, headers: &HeaderMap) {
-        // Without OTEL, just record trace IDs for log correlation if present
-        if let Some(traceparent) = get_traceparent(headers)
-            && let Some(trace_id) = parse_trace_id(traceparent)
-        {
-            span.record("trace_id", &trace_id);
-            span.record("parent.trace_id", &trace_id);
-        }
-    }
-}
-
-pub use imp::{inject_current_span, set_parent_from_headers};
+pub use toolkit_trace_context::{
+    TRACEPARENT, get_traceparent, inject_current_span, parse_trace_id, set_parent_from_headers,
+};
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use http::HeaderMap;
     use tracing::info_span;
-
-    #[test]
-    fn test_get_traceparent_none() {
-        let headers = HeaderMap::new();
-        assert!(get_traceparent(&headers).is_none());
-    }
-
-    #[test]
-    fn test_get_traceparent_ok() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            TRACEPARENT,
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-                .parse()
-                .expect("valid header"),
-        );
-
-        let tp = get_traceparent(&headers);
-        assert!(tp.is_some());
-        assert_eq!(
-            tp.expect("should be some"),
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-        );
-    }
-
-    #[test]
-    fn test_parse_trace_id_ok() {
-        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-        let trace_id = parse_trace_id(traceparent);
-        assert_eq!(
-            trace_id,
-            Some("4bf92f3577b34da6a3ce929d0e0e4736".to_owned())
-        );
-    }
-
-    #[test]
-    fn test_parse_trace_id_invalid() {
-        assert!(parse_trace_id("invalid").is_none());
-        assert!(parse_trace_id("").is_none());
-    }
 
     #[test]
     #[cfg(not(feature = "otel"))]
@@ -182,12 +38,14 @@ mod tests {
 
         global::set_text_map_propagator(TraceContextPropagator::new());
 
-        let mut headers = http::HeaderMap::new();
+        let mut headers = HeaderMap::new();
         let _span = tracing::info_span!("test").entered();
         // Without full OTEL setup, this may not inject anything, but shouldn't panic
         inject_current_span(&mut headers);
     }
 
+    /// The re-exported inbound helpers stay reachable under this crate's own
+    /// `toolkit_http::otel::*` path in both feature modes.
     #[test]
     fn test_set_parent_from_headers_no_panic() {
         let mut headers = HeaderMap::new();
@@ -206,5 +64,9 @@ mod tests {
 
         // Should not panic in either mode
         set_parent_from_headers(&span, &headers);
+        assert_eq!(
+            parse_trace_id("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").as_deref(),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736")
+        );
     }
 }

@@ -128,7 +128,16 @@ Types Registry validates the candidate without a long-lived database lock, then 
 * the conforming Type Schema current revision still equals the revision used for validation;
 * other correctness-relevant dependency freshness tokens still match.
 
-The first is the caller's baseline and the other two are internal, and they fail differently. A caller-precondition mismatch is a terminal per-candidate `precondition_failed`: Types Registry neither overwrites a concurrent change nor rebases the update onto it. A conforming schema or dependency that moved during validation causes the worker to revalidate within a bounded retry policy, without weakening the caller's precondition.
+The first is the caller's baseline and the other two are internal, and they
+fail differently. An update whose target is absent or whose active target's
+observed version no longer matches terminates with per-candidate
+`precondition_failed`; a tombstoned target yields `entity_deleted` before
+the version check. Types Registry neither overwrites a concurrent change nor rebases the update
+onto it. A fresh creation attempt against an existing Instance ID instead
+terminates with `already_exists`, as for a Type Schema (ADR-0012). A
+conforming schema or dependency that moved during validation causes the
+worker to revalidate within a bounded retry policy, without weakening the
+caller's precondition.
 
 Before initial admission there is no public logical registered Instance and no entity Lifecycle Status. A failed initial candidate may remain as an operation or audit artifact, but it does not create a logical entity or tombstone, issue a Registry Reference for domain persistence, or establish a permanent GTS ID reservation. While an update candidate is `pending`, an existing logical Instance retains its current revision and its Lifecycle Status.
 

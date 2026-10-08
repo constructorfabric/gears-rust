@@ -12,7 +12,7 @@ import uuid
 
 import pytest
 
-from .conftest import EVENT_TYPE_STREAM, SUBJECT_TYPE, TOPIC_STREAM
+from .conftest import EVENT_TYPE_STREAM, SUBJECT_TYPE, TOPIC_STREAM, TRACE_ID
 
 _AUTH_DISABLED_REASON = (
     "standalone config sets auth_disabled: true; "
@@ -36,7 +36,7 @@ async def test_missing_bearer_token_returns_401(api):
         "status": 401,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -57,7 +57,7 @@ async def test_invalid_bearer_token_returns_401(api):
         "status": 401,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -88,7 +88,7 @@ async def test_no_produce_permission_returns_403(api):
         "status": 403,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -125,7 +125,7 @@ async def test_no_consume_permission_returns_403(api):
         "status": 403,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }
 
@@ -169,6 +169,6 @@ async def test_cross_tenant_anonymous_group_returns_403(api):
         "status": 403,
         "detail": body["detail"],
         "instance": body["instance"],
-        "trace_id": body["trace_id"],
+        "trace_id": TRACE_ID,
         "context": body["context"],
     }

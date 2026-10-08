@@ -519,8 +519,8 @@ impl LeasedHandler for AdmissionHandler {
                 MessageResult::Reject(reason) => batch.reject(reason),
             }
 
-            // Do not start work on an expired lease.
-            if batch.remaining().is_zero() {
+            // Do not start work on an expired lease or during shutdown.
+            if batch.should_stop() {
                 break;
             }
         }

@@ -171,7 +171,8 @@ units.
 
 ### 3.2 Component Model
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-component-usage-ingestion`
+Declared by [`../DESIGN.md`](../DESIGN.md) §3.2's component model as `cpt-cf-bss-rating-component-usage-ingestion`.
+This slice details it; the component model is where it is defined.
 
 - **`IntakeConsumer`** — the durable at-least-once transport consumer; hands each `RawUsageEvent` to normalization; commits its transport offset only after the dedup upsert commits (no lost, no double-counted event).
 - **`Normalizer`** — `RawUsageEvent` → `UsageRecord`: canonical units, UTC coordinates, tenant-axis + subscription/meter resolution against the frozen context, `dimensionKey` verbatim pass-through; a resolution failure routes to quarantine (§4.5).
@@ -227,7 +228,7 @@ collision with the record it corrects.
 
 ### 3.7 Database Schemas and Tables
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-storage-ingestion-ing`
+- [ ] `p2` - **ID**: `cpt-cf-bss-rating-datastore-ingestion-ing`
 
 **Owned (the gear's first authoritative stores; partitioned by the pinned `orderingTenantId`, UTC):**
 
@@ -240,7 +241,7 @@ doctrine. No monetary column (the gear computes no money — core slice [`01`](.
 
 #### Hot/cold tiering of `usage_record` (storage posture)
 
-- [ ] `p3` - **ID**: `cpt-cf-bss-rating-storage-tiering-ing`
+- [ ] `p3` - **ID**: `cpt-cf-bss-rating-datastore-tiering-ing`
 
 `usage_record` is tiered; the guarantees are tier-invariant. **Hot** (PostgreSQL): open windows
 plus a trailing K months past `closed_posted` (K is deployment-tuned; correction traffic decays

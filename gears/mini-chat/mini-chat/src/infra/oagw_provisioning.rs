@@ -7,10 +7,11 @@
 //! deterministically misconfigured ones fail the boot
 //! ([`ProvisioningReport::ensure_no_misconfigured`]).
 //!
-//! After each successful `create_upstream`, the OAGW-assigned alias is
-//! stamped onto [`ProviderEntry::upstream_alias`] (or
-//! [`ProviderTenantOverride::upstream_alias`]) so the rest of mini-chat uses
-//! the authoritative alias from OAGW rather than deriving one locally.
+//! The upstream is created under the alias `init()` put on the entry
+//! (configured, or the host), which is the alias `ProviderResolver` uses.
+//! After each successful `create_upstream` the alias OAGW returns is
+//! written into the entries passed in; those are a copy made in `init()`,
+//! so the resolver does not see it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,9 +56,10 @@ impl ProvisioningReport {
 
 /// Register OAGW upstreams and routes for each configured provider.
 ///
-/// On success the **OAGW-assigned alias** is written into
-/// [`ProviderEntry::upstream_alias`] (root) and
-/// [`ProviderTenantOverride::upstream_alias`] (per-tenant).
+/// On success the alias OAGW returns is written into `providers`
+/// ([`ProviderEntry::upstream_alias`] and
+/// [`ProviderTenantOverride::upstream_alias`]). The gear passes a copy of
+/// the config here; `ProviderResolver` keeps the aliases set in `init()`.
 ///
 /// Returns a [`ProvisioningReport`] splitting the failed providers into
 /// **deferred** (worth retrying: with the stateful credstore a provider's
@@ -366,11 +368,7 @@ async fn create_or_reuse_tenant_upstream(
     }
 }
 
-/// Create an OAGW upstream for a single provider entry.
-///
-/// Only passes `upstream_alias` to OAGW when explicitly configured
-/// (required for IP-based hosts). For hostname-based hosts OAGW
-/// auto-derives the alias.
+/// OAGW server endpoint (scheme, host, port) of a provider entry.
 fn endpoint_for(entry: &ProviderEntry) -> oagw_sdk::Endpoint {
     use oagw_sdk::{Endpoint, Scheme};
     let scheme = if entry.use_http {
@@ -430,7 +428,9 @@ async fn create_upstream(
 
     let mut builder = CreateUpstreamRequest::builder(server, HTTP_PROTOCOL_ID).enabled(true);
 
-    // Only pass alias when explicitly configured (IP-based hosts).
+    // `init()` fills `upstream_alias` with the host when it is not configured,
+    // so the alias is always passed and OAGW creates (or `reuse_existing_upstream`
+    // finds) the upstream under the alias the `ProviderResolver` already uses.
     if let Some(alias) = &entry.upstream_alias {
         builder = builder.alias(alias);
     }
@@ -462,9 +462,8 @@ async fn create_upstream(
 /// Create an OAGW upstream for a tenant-specific override.
 ///
 /// Uses [`ProviderEntry::effective_host_for_tenant`] and the tenant's auth
-/// config. Only passes `upstream_alias` when the tenant override explicitly
-/// sets one (required for IP-based hosts). For hostname-based hosts OAGW
-/// auto-derives the alias.
+/// config. Passes the override's `upstream_alias`: the configured one, or the
+/// override host that `init()` fills in when no alias is configured.
 ///
 /// Returns the OAGW-assigned alias on success.
 async fn create_tenant_upstream(
@@ -488,7 +487,7 @@ async fn create_tenant_upstream(
 
     let mut builder = CreateUpstreamRequest::builder(server, HTTP_PROTOCOL_ID).enabled(true);
 
-    // Only pass alias when the tenant override explicitly sets one (IP-based hosts).
+    // The override alias (configured, or the override host filled in by init).
     if let Some(alias) = entry
         .tenant_overrides
         .get(tenant_id)
@@ -602,7 +601,18 @@ const RAG_ROUTES: &[(&str, &str, bool)] = &[
     ("POST", "/vector_stores", true),
     // DELETE {prefix}/vector_stores/{vs_id}/files/{file_id} — remove file from vector store
     ("DELETE", "/vector_stores", true),
+    // GET {prefix}/vector_stores/{vs_id}/files/{file_id} — indexing status poll on upload
+    ("GET", "/vector_stores", true),
 ];
+
+fn rag_route_method(method: &str) -> Option<oagw_sdk::HttpMethod> {
+    match method {
+        "GET" => Some(oagw_sdk::HttpMethod::Get),
+        "POST" => Some(oagw_sdk::HttpMethod::Post),
+        "DELETE" => Some(oagw_sdk::HttpMethod::Delete),
+        _ => None,
+    }
+}
 
 /// Register OAGW routes for RAG operations (Files API, Vector Stores API).
 ///
@@ -616,7 +626,7 @@ async fn register_rag_routes(
     entry: &ProviderEntry,
     upstream: &oagw_sdk::Upstream,
 ) {
-    use oagw_sdk::{CreateRouteRequest, HttpMatch, HttpMethod, MatchRules, PathSuffixMode};
+    use oagw_sdk::{CreateRouteRequest, HttpMatch, MatchRules, PathSuffixMode};
 
     // Derive RAG path prefix from storage_kind:
     // Azure → /openai (+ api-version query param), OpenAi → /v1
@@ -626,10 +636,8 @@ async fn register_rag_routes(
     };
 
     for &(method_str, path_suffix, append_suffix) in RAG_ROUTES {
-        let method = match method_str {
-            "POST" => HttpMethod::Post,
-            "DELETE" => HttpMethod::Delete,
-            _ => continue,
+        let Some(method) = rag_route_method(method_str) else {
+            continue;
         };
 
         let suffix_mode = if append_suffix {
@@ -721,8 +729,26 @@ fn extract_query_allowlist(api_path: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    /// Every RAG route method is registered, and the upload's indexing
+    /// status poll (`GET …/vector_stores/{id}/files/{file_id}`) has a route.
+    #[test]
+    fn rag_routes_cover_indexing_status_poll() {
+        for &(method, _, _) in RAG_ROUTES {
+            assert!(
+                rag_route_method(method).is_some(),
+                "unmapped method {method}"
+            );
+        }
+        assert!(
+            RAG_ROUTES
+                .iter()
+                .any(|&(m, p, suffix)| m == "GET" && p == "/vector_stores" && suffix)
+        );
+    }
 
     #[test]
     fn derive_simple_path() {
@@ -1048,7 +1074,6 @@ mod tests {
             auth_plugin_type: None,
             auth_config: None,
             storage_backend: None,
-            supports_file_search_filters: true,
             storage_kind: crate::config::StorageKind::OpenAi,
             api_version: None,
             rag_provider: None,

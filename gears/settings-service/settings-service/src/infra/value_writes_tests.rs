@@ -798,7 +798,13 @@ async fn a_declaration_outside_the_callers_domain_is_absent_to_its_writes() {
     assert!(is_absent(&err), "{err:?}");
     let err = h
         .coordinator
-        .validate(&outside, &h.base.key("flag"), None, &json!(true), None)
+        .validate(
+            &outside,
+            &h.base.key("flag"),
+            None,
+            &json!(true),
+            crate::domain::writes::ImpactPage::Of(None),
+        )
         .await
         .expect_err("a validate");
     assert!(is_absent(&err), "{err:?}");

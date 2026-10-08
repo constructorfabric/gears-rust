@@ -105,7 +105,7 @@ pub async fn list_payments_handler(
 /// Returns a [`Problem`] from the **open** — authentication, or a filter the
 /// service rejects — before any part is written.
 ///
-/// The handler returns `Problem`: `stream_payments` fails with a
+/// The handler returns a boxed `Problem`: `stream_payments` fails with a
 /// `CanonicalError` (the open's rejected filter or missing partition position),
 /// which `From<CanonicalError> for Problem` renders as
 /// `application/problem+json`. `IntoResponse for Problem` takes the status
@@ -120,7 +120,7 @@ pub async fn payment_feed_handler(
     MultipartJsonStream<
         impl futures_core::Stream<Item = Result<PaymentSummary, CanonicalError>> + Send + 'static,
     >,
-    Problem,
+    Box<Problem>,
 > {
     // The open. Everything it can reject is rejected here, as a normal
     // `application/problem+json` response with a real status — no stream has

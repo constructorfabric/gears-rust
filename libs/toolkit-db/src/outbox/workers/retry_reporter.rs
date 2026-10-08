@@ -64,8 +64,8 @@ impl WorkerAction for RetryReporter {
         &mut self,
         _cancel: &CancellationToken,
     ) -> Result<Directive<u64>, Self::Error> {
-        let mailbox = self.outbox.mailbox();
-        if !mailbox.subscriptions().wants_retry_reports() {
+        let trace_mailbox = self.outbox.trace_mailbox();
+        if !trace_mailbox.registry().wants_retry_reports() {
             // Nobody is watching retries, so there is nothing a query could tell us.
             return Ok(Directive::Idle(0));
         }
@@ -76,7 +76,7 @@ impl WorkerAction for RetryReporter {
         let rows = match RetryRow::find_by_statement(Statement::from_sql_and_values(
             store.backend(),
             store.trace_retrying(),
-            [mailbox.instance_id().into(), limit.into()],
+            [trace_mailbox.instance_id().into(), limit.into()],
         ))
         .all(&conn)
         .await
@@ -97,12 +97,12 @@ impl WorkerAction for RetryReporter {
         for row in rows {
             retrying.insert(row.trace.clone());
             let trace = row.trace.clone();
-            mailbox
-                .subscriptions()
+            trace_mailbox
+                .registry()
                 .publish_retry(&trace, row.into_state());
         }
         if complete_picture {
-            mailbox.subscriptions().clear_retries_except(&retrying);
+            trace_mailbox.registry().clear_retries_except(&retrying);
         }
 
         // A retry is a state, not a backlog: there is never "more" of it to

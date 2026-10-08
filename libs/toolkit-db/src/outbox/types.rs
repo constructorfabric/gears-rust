@@ -274,6 +274,11 @@ pub struct WorkerTuning {
     /// Lease duration for leased mode partition locks.
     /// Processor-only. Ignored for transactional mode. Default: 30s.
     pub lease_duration: Duration,
+    /// How long a pass may keep running after shutdown begins. A worker
+    /// checks for shutdown between its own steps; work still running this
+    /// long after `stop()` is dropped. Default: 5s, enough for a transaction on
+    /// a real database to commit.
+    pub stop_grace: Duration,
 }
 
 impl WorkerTuning {
@@ -333,6 +338,12 @@ impl WorkerTuning {
         self
     }
 
+    #[must_use]
+    pub fn stop_grace(mut self, d: Duration) -> Self {
+        self.stop_grace = d;
+        self
+    }
+
     // -- Per-worker-type constructors (defaults) --
 
     /// Processor defaults (balanced profile).
@@ -360,6 +371,7 @@ impl WorkerTuning {
             retry_max: Duration::from_mins(1),
             degradation_threshold: 1,
             lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
         }
     }
 
@@ -383,6 +395,7 @@ impl WorkerTuning {
             degradation_threshold: 1,
             // Unused by this worker; it holds no lease.
             lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
         }
     }
 
@@ -404,6 +417,7 @@ impl WorkerTuning {
             retry_max: Duration::from_mins(1),
             degradation_threshold: 1,
             lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
         }
     }
 
@@ -420,6 +434,7 @@ impl WorkerTuning {
             retry_max: Duration::from_mins(1),
             degradation_threshold: 1,
             lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
         }
     }
 
@@ -439,6 +454,7 @@ impl WorkerTuning {
             retry_max: Duration::from_mins(1),
             degradation_threshold: 2,
             lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
         }
     }
 
@@ -457,6 +473,7 @@ impl WorkerTuning {
             retry_max: Duration::from_secs(10),
             degradation_threshold: 3,
             lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
         }
     }
 
@@ -474,6 +491,7 @@ impl WorkerTuning {
             retry_max: Duration::from_mins(1),
             degradation_threshold: 2,
             lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
         }
     }
 
@@ -491,6 +509,7 @@ impl WorkerTuning {
             retry_max: Duration::from_mins(5),
             degradation_threshold: 1,
             lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
         }
     }
 
@@ -509,6 +528,7 @@ impl WorkerTuning {
             retry_max: Duration::from_secs(30),
             degradation_threshold: 1,
             lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
         }
     }
 
@@ -525,6 +545,7 @@ impl WorkerTuning {
             retry_max: Duration::from_secs(30),
             degradation_threshold: 1,
             lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
         }
     }
 
@@ -541,6 +562,7 @@ impl WorkerTuning {
             retry_max: Duration::from_secs(30),
             degradation_threshold: 1,
             lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
         }
     }
 
@@ -557,6 +579,7 @@ impl WorkerTuning {
             retry_max: Duration::from_secs(30),
             degradation_threshold: 1,
             lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
         }
     }
 }

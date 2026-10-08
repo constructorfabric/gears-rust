@@ -61,7 +61,7 @@ pricing gear owns the catalog (the canonical scope key, `PriceWindow`, `PriceOve
 `CatalogVersion`, and publish governance); the core **adopts** those and evaluates over a frozen
 snapshot ([`PRD.md`](./PRD.md) §1.1).
 
-The complementarity contract with the pricing gear — the 8-axis key, cohort selection, overlay
+The complementarity contract with the pricing gear — the canonical scope key (ten axes since pricing D-196), cohort selection, overlay
 stacking, snapshot composition, single governance engine, launch-scope models — is frozen in
 [`SEAMS.md`](./SEAMS.md); every slice here implements the rating side of a resolved seam.
 
@@ -227,7 +227,7 @@ Horizontal per-partition evaluation with no cross-partition locks on the hot pat
 
 **Cross-cutting normatives** (frozen resolutions from [`SEAMS.md`](./SEAMS.md), binding every slice):
 
-- **Canonical scope key (K1-K5):** selection and non-overlap use the pricing 8-axis key `(planId, currency, region, priceOverlay, phase, priceEligibility, chargeKind, cohort)`; `phase` is a `phase_id`; grandfathering selects the generation by the pinned price id's `cohort`.
+- **Canonical scope key (K1-K5, K6):** selection and non-overlap use the pricing canonical key — eight unconditional axes `(planId, currency, region, priceOverlay, phase, priceEligibility, chargeKind, cohort)` plus, since pricing D-196 (2026-08-06), the usage pair `(skuId, dimensionKey)`; `phase` is a `phase_id`; grandfathering selects the generation by the pinned price id's `cohort`. The slice-02 `SelectionKey` carries the full ten (K6 resolved, T-D-35).
 - **Overlays (O1-O3):** step 4 **stacks** all PriceOverlay survivors; the class-specificity order `customerGroup > partner > orgTier > brand > region > global` breaks ties, not exclusivity.
 - **Snapshot (S1):** one `pricingSnapshotRef`, **four writers** (D-66 producer split; review #10) — the registry commits `catalogVersion`, pricing pre-stamps its catalog subset, Rating (composition SoR) adds overlay/coupon/FX-lock/`commitmentReservation` (T-D-09), Subscriptions freezes the `(currency, region)` binding.
 - **Determinism / corrections (W2, M7):** replay strictly from the pinned snapshot; counter key `(subscription, meter, dimensionKey, window)`.
@@ -238,8 +238,8 @@ Horizontal per-partition evaluation with no cross-partition locks on the hot pat
 **Later gear decisions binding every slice** (2026-07-11 / 2026-07-16 / 2026-07-28 / 2026-08-01 — the list above is the frozen 2026-07-10 seam set; full text in [`DECISIONS.md`](./DECISIONS.md)):
 
 - **The 2026-07-11 Design-pass wave (T-D-09…T-D-16)** — omitted from this page until the 2026-07-31 review (#25), though several rows amend the seam set above: the **eighth snapshot segment `commitmentReservation`** (T-D-09 — amends the S1 bullet); the **balance write-back protocol** — `CommitmentBalanceEffect`s, Contracts-serialized `balanceVersion`, delta-only cascades (T-D-10); **delta-dedup owner = Rating** (T-D-11); **sub-window slices + frozen `bandOffsetQ`** with the correction key gaining the slice coordinate (T-D-12); the **steps-3–5 reservation-remainder recompute** (T-D-13); **frozen `poolType ∈ {prepaid_drawdown, committed_rate}` + true-up formulas** (T-D-14); **period-driven units synthesized by Rating's period tick** (T-D-15); and the **gear consolidation** itself (T-D-16 / ADR-0002).
-- **Level-based aggregation (T-D-17, joint with pricing D-44) — a `p1` launch capability:** `aggregationFunction ∈ {sum, peak, time_weighted}` with `aggregationGranularity ∈ {hour, day}`; for non-`sum` the window `Q` is the **sum of granule folds**, so it stays additive and every counter invariant (M7 key, supersession continuity, `bandOffsetQ`, band/package math, delta-only corrections) is untouched. Supersedes the former "sum-only at launch" posture. No composite co-occurrence at launch.
-- **One-time charges are not rated (T-D-18):** no evaluation unit is synthesized for `one_time` / `one_time_setup`; the three unit kinds remain exhaustive. Subscriptions/Billing bill them at the qualifying instant from the frozen snapshot; one-time rows still resolve in step-2 selection for coverage/preview/quote.
+- **Level-based aggregation (T-D-17, joint with pricing D-44) — a `p1` launch capability:** `aggregationFunction ∈ {sum, peak, time_weighted}` with `aggregationGranularity ∈ {hour, day}`; for non-`sum` the window `Q` is the **sum of granule folds**, so it stays additive and every counter invariant (M7 key, supersession continuity, `bandOffsetQ`, band/package math, delta-only corrections) is untouched. Supersedes the former "sum-only at launch" posture. No composite co-occurrence at launch. *Amended by T-D-39:* each input folds per granule as the derived declaration states (`Sum`, `Peak` or `TimeWeighted`); the formula applies per granule, and the window's output is the sum of the granule outputs.
+- **One-time charges are not rated (T-D-18):** no evaluation unit is synthesized for `one_time` (`one_time_setup` is withdrawn — T-D-36); the three unit kinds remain exhaustive. Subscriptions/Billing bill it at each actual phase entry from the frozen snapshot, deduplicated per phase-entry occurrence; one-time rows still resolve in step-2 selection for coverage/preview/quote.
 - **Overage-rate selector (T-D-19):** a frozen `overageRate` on the `commitmentReservation` segment selects flat-rate vs banded pricing of the post-pool residual — the field's **presence** is the selector.
 - **Coupon cross-scope exclusivity (T-D-20) and its launch gate (T-D-22):** with a `line_total` candidate present, `exclusive_best` widens to one coupon per plan per period. **At launch `line_total` fails closed** — step 7 is per-line and every evaluation unit is sub-plan, so no plan-scoped base exists; T-D-20 is inert until that base is pinned with Promotions.
 - **Administrative re-rate (T-D-21):** the one sanctioned exception to strict pin replay — a *policy* correction replays over the **superseding** snapshot; input corrections stay strictly on the pin — **which it advances (T-D-24, 2026-08-01)**: after a re-rate, later input corrections replay the superseding pin, so a delta never embeds the negation of an approved repricing.
@@ -247,7 +247,7 @@ Horizontal per-partition evaluation with no cross-partition locks on the hot pat
 
 **ADR index:**
 
-- [`ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md`](./ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md) (`cpt-cf-bss-rating-adr-scope-key-adoption`) — adopt the pricing 8-axis canonical scope key + cohort selection rather than define a Rating key.
+- [`ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md`](./ADR/0001-cpt-cf-bss-rating-adr-scope-key-adoption.md) (`cpt-cf-bss-rating-adr-scope-key-adoption`) — adopt the pricing canonical scope key (8 axes at adoption; **ten** since pricing D-196 — dated amendment note in the ADR) + cohort selection rather than define a Rating key.
 - [`ADR/0002-cpt-cf-bss-rating-adr-rating-gear-consolidation.md`](./ADR/0002-cpt-cf-bss-rating-adr-rating-gear-consolidation.md) (`cpt-cf-bss-rating-adr-rating-gear-consolidation`) — consolidate Rating (evaluation core) and the Rating pipeline into one `rating` gear; core = no-I/O crate; naming + migration map (T-D-16).
 - _Further ADRs (determinism/replay model; snapshot composition split; single governance engine) to be seeded during Design._
 

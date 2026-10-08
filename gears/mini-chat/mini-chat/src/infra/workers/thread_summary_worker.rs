@@ -12,6 +12,7 @@ use toolkit_security::AccessScope;
 use tracing::{debug, error, info, warn};
 
 use crate::domain::ports::MiniChatMetricsPort;
+use crate::domain::ports::metric_labels::summary_result;
 use crate::domain::repos::{SummaryFrontier, ThreadSummaryRepository, ThreadSummaryTaskPayload};
 use crate::infra::db::entity::message::MessageRole;
 
@@ -44,6 +45,40 @@ impl ThreadSummaryHandler {
 impl LeasedMessageHandler for ThreadSummaryHandler {
     #[tracing::instrument(name = "worker", skip_all, fields(worker = "thread_summary"))]
     async fn handle(&self, msg: &OutboxMessage) -> MessageResult {
+        let result = self.process(msg).await;
+        let bounded = bound_retries(result, msg.attempts, self.deps.config.max_attempts);
+        if let MessageResult::Reject(reason) = &bounded {
+            let chat_id = serde_json::from_slice::<ThreadSummaryTaskPayload>(&msg.payload)
+                .ok()
+                .map(|p| p.chat_id);
+            warn!(
+                partition_id = msg.partition_id,
+                seq = msg.seq,
+                attempts = msg.attempts,
+                chat_id = ?chat_id,
+                reason = %reason,
+                "thread summary: task rejected"
+            );
+        }
+        bounded
+    }
+}
+
+/// `Retry` blocks the rest of the partition, so a task that keeps failing is
+/// dead-lettered once this delivery is its `max_attempts`-th.
+fn bound_retries(result: MessageResult, attempts: i16, max_attempts: u32) -> MessageResult {
+    let this_attempt = u32::try_from(attempts).unwrap_or(0).saturating_add(1);
+    match result {
+        MessageResult::Retry if this_attempt >= max_attempts => {
+            MessageResult::Reject(format!("max attempts ({max_attempts}) reached"))
+        }
+        other => other,
+    }
+}
+
+impl ThreadSummaryHandler {
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    async fn process(&self, msg: &OutboxMessage) -> MessageResult {
         // 1. Deserialize payload
         let payload: ThreadSummaryTaskPayload = match serde_json::from_slice(&msg.payload) {
             Ok(p) => p,
@@ -121,6 +156,9 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                         chat_id = %payload.chat_id,
                         "thread summary: expected frontier but none found, skipping"
                     );
+                    self.deps
+                        .metrics
+                        .record_thread_summary_execution(summary_result::BASE_MISSING);
                     return MessageResult::Ok;
                 }
             }
@@ -176,11 +214,7 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
             .map(|s| s.content.as_str());
 
         // 4a. Resolve model
-        let model_id = if self.deps.config.summary_model_id.is_empty() {
-            "gpt-4.1-mini".to_owned()
-        } else {
-            self.deps.config.summary_model_id.clone()
-        };
+        let model_id = summary_model_id(&self.deps.config);
 
         let resolved_model = match self
             .deps
@@ -192,9 +226,24 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
             .await
         {
             Ok(m) => m,
+            // Missing or disabled in the catalog: retrying does not help.
+            Err(e @ crate::domain::error::DomainError::InvalidModel { .. }) => {
+                error!(
+                    chat_id = %payload.chat_id,
+                    model = %model_id,
+                    error = %e,
+                    "thread summary: summary model is not in the catalog or disabled - dropping task"
+                );
+                self.deps
+                    .metrics
+                    .record_thread_summary_execution(summary_result::MODEL_UNAVAILABLE);
+                return MessageResult::Reject(format!("summary model unavailable: {model_id}"));
+            }
             Err(e) => {
                 warn!(chat_id = %payload.chat_id, error = %e, "thread summary: model resolution failed");
-                self.deps.metrics.record_thread_summary_execution("retry");
+                self.deps
+                    .metrics
+                    .record_thread_summary_execution(summary_result::RETRY);
                 return MessageResult::Retry;
             }
         };
@@ -209,7 +258,9 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
             Ok(p) => p,
             Err(e) => {
                 warn!(chat_id = %payload.chat_id, error = %e, "thread summary: provider resolution failed");
-                self.deps.metrics.record_thread_summary_execution("retry");
+                self.deps
+                    .metrics
+                    .record_thread_summary_execution(summary_result::RETRY);
                 return MessageResult::Retry;
             }
         };
@@ -236,6 +287,24 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
         let mut ptl_retries = 0u32;
         let content_limit = self.deps.config.message_content_limit;
 
+        // Fit the prompt into the model's input budget before the first
+        // call; the context-length retry below stays as the fallback.
+        let dropped = fit_summary_prompt(
+            &resolved_model,
+            &system_prompt,
+            existing_summary,
+            &mut messages_for_prompt,
+            content_limit,
+        );
+        if dropped > 0 {
+            warn!(
+                chat_id = %payload.chat_id,
+                dropped,
+                remaining = messages_for_prompt.len(),
+                "thread summary: prompt over the model's input budget, dropped oldest messages"
+            );
+        }
+
         #[allow(clippy::expect_used)]
         let security_ctx = toolkit_security::SecurityContext::builder()
             .subject_tenant_id(payload.tenant_id)
@@ -247,10 +316,20 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
             let user_content =
                 build_summary_prompt(existing_summary, &messages_for_prompt, content_limit);
 
+            // System task identity: tenant plus the platform default subject.
+            let system_user = toolkit_security::constants::DEFAULT_SUBJECT_ID.to_string();
             let request = crate::infra::llm::llm_request(&resolved_model.provider_model_id)
                 .system_instructions(&system_prompt)
                 .message(crate::infra::llm::LlmMessage::user(&user_content))
                 .max_output_tokens(u64::from(resolved_model.max_output_tokens))
+                .metadata(crate::infra::llm::RequestMetadata {
+                    tenant_id: payload.tenant_id.to_string(),
+                    user_id: system_user.clone(),
+                    chat_id: payload.chat_id.to_string(),
+                    request_type: crate::infra::llm::RequestType::Summary,
+                    features: Vec::new(),
+                })
+                .user_identity(payload.tenant_id.to_string(), system_user)
                 .build_non_streaming();
 
             let ctx = security_ctx.clone();
@@ -268,7 +347,7 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                               "thread summary: prompt too long, cannot drop more messages");
                         self.deps
                             .metrics
-                            .record_thread_summary_execution("provider_error");
+                            .record_thread_summary_execution(summary_result::PROVIDER_ERROR);
                         self.deps.metrics.record_summary_fallback();
                         return MessageResult::Retry;
                     }
@@ -286,7 +365,7 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                     warn!(chat_id = %payload.chat_id, error = %e, "thread summary: LLM call failed");
                     self.deps
                         .metrics
-                        .record_thread_summary_execution("provider_error");
+                        .record_thread_summary_execution(summary_result::PROVIDER_ERROR);
                     self.deps.metrics.record_summary_fallback();
                     return MessageResult::Retry;
                 }
@@ -298,11 +377,15 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
             warn!(chat_id = %payload.chat_id, "thread summary: LLM returned empty summary, retrying");
             self.deps
                 .metrics
-                .record_thread_summary_execution("empty_summary");
+                .record_thread_summary_execution(summary_result::EMPTY_SUMMARY);
             return MessageResult::Retry;
         }
         let llm_usage = response.usage;
-        let token_estimate = estimate_summary_tokens(llm_usage.output_tokens, summary_text.len());
+        let token_estimate = estimate_summary_tokens(
+            llm_usage.output_tokens,
+            llm_usage.reasoning_tokens,
+            summary_text.len(),
+        );
 
         // 5. CAS-protected atomic commit
         let deps = Arc::clone(&self.deps);
@@ -325,7 +408,23 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                 let payload_clone = payload_clone.clone();
                 let model_id_clone = model_id_clone.clone();
                 Box::pin(async move {
-                    // 5a. Upsert summary with CAS
+                    // 5a. A retry, edit or delete may have removed the target
+                    //     frontier message while the summary was generated;
+                    //     the summary would then hold content of a turn that
+                    //     no longer exists. The row lock orders this check
+                    //     against that mutation, which drops a summary covering
+                    //     its turn after soft-deleting the messages.
+                    if !frontier_message_is_live(tx, &scope, payload_clone.chat_id, &target_clone)
+                        .await?
+                    {
+                        info!(
+                            chat_id = %payload_clone.chat_id,
+                            "thread summary: target frontier message deleted, skipping"
+                        );
+                        return Ok(CommitOutcome::FrontierDeleted);
+                    }
+
+                    // 5b. Upsert summary with CAS
                     let rows = deps
                         .thread_summary_repo
                         .upsert_with_cas(
@@ -341,10 +440,10 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::anyhow!("{e}")))?;
 
                     if rows == 0 {
-                        return Ok((false, crate::domain::repos::Wake::empty()));
+                        return Ok(CommitOutcome::CasLost);
                     }
 
-                    // 5b. Mark messages as compressed
+                    // 5c. Mark messages as compressed
                     crate::domain::repos::MessageRepository::mark_messages_compressed(
                         deps.message_repo.as_ref(),
                         tx,
@@ -356,7 +455,7 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                     .await
                     .map_err(|e| toolkit_db::DbError::Other(anyhow::anyhow!("{e}")))?;
 
-                    // 5c. Enqueue system usage event
+                    // 5d. Enqueue system usage event
                     let usage_event = mini_chat_sdk::UsageEvent {
                         tenant_id: payload_clone.tenant_id,
                         user_id: None,
@@ -404,15 +503,17 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                         .await
                         .map_err(|e| toolkit_db::DbError::Other(anyhow::anyhow!("{e}")))?;
 
-                    Ok((true, wake))
+                    Ok(CommitOutcome::Committed(wake))
                 })
             })
             .await;
 
         match cas_result {
-            Ok((true, wake)) => {
+            Ok(CommitOutcome::Committed(wake)) => {
                 wake.fire();
-                self.deps.metrics.record_thread_summary_execution("success");
+                self.deps
+                    .metrics
+                    .record_thread_summary_execution(summary_result::SUCCESS);
                 info!(
                     chat_id = %payload.chat_id,
                     messages_compressed = msg_count,
@@ -420,7 +521,13 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                 );
                 MessageResult::Ok
             }
-            Ok((false, _)) => {
+            Ok(CommitOutcome::FrontierDeleted) => {
+                self.deps
+                    .metrics
+                    .record_thread_summary_execution(summary_result::FRONTIER_DELETED);
+                MessageResult::Ok
+            }
+            Ok(CommitOutcome::CasLost) => {
                 self.deps.metrics.record_thread_summary_cas_conflict();
                 info!(
                     chat_id = %payload.chat_id,
@@ -434,7 +541,9 @@ impl LeasedMessageHandler for ThreadSummaryHandler {
                     error = %e,
                     "thread summary: commit failed"
                 );
-                self.deps.metrics.record_thread_summary_execution("retry");
+                self.deps
+                    .metrics
+                    .record_thread_summary_execution(summary_result::RETRY);
                 MessageResult::Retry
             }
         }
@@ -463,6 +572,131 @@ Your summary MUST include these sections:
 5. Current Topic: What was being discussed most recently, with enough detail to continue naturally
 
 Respond with an <analysis> block followed by a <summary> block.";
+
+/// Summary model used when `thread_summary_worker.summary_model_id` is empty.
+pub const DEFAULT_SUMMARY_MODEL_ID: &str = "gpt-4.1-mini";
+
+/// The configured summary model, or [`DEFAULT_SUMMARY_MODEL_ID`].
+pub fn summary_model_id(config: &crate::config::background::ThreadSummaryWorkerConfig) -> String {
+    if config.summary_model_id.is_empty() {
+        DEFAULT_SUMMARY_MODEL_ID.to_owned()
+    } else {
+        config.summary_model_id.clone()
+    }
+}
+
+/// Startup check: log an error when summaries are enabled but the summary
+/// model is not in the catalog or is disabled. Startup continues, because a
+/// dynamic policy plugin can add the model later; each task that finds the
+/// model missing is rejected (`model_unavailable`). Returns whether the
+/// model resolved.
+pub async fn check_summary_model(
+    resolver: &dyn crate::domain::repos::ModelResolver,
+    config: &crate::config::background::ThreadSummaryWorkerConfig,
+) -> bool {
+    if !config.enabled {
+        return true;
+    }
+    let model_id = summary_model_id(config);
+    match resolver
+        .resolve_model(
+            toolkit_security::constants::DEFAULT_SUBJECT_ID,
+            Some(model_id.clone()),
+        )
+        .await
+    {
+        Ok(_) => true,
+        Err(e @ crate::domain::error::DomainError::InvalidModel { .. }) => {
+            error!(
+                model = %model_id,
+                error = %e,
+                "thread summary model is not in the catalog or disabled; summary tasks will be rejected"
+            );
+            false
+        }
+        Err(e) => {
+            warn!(model = %model_id, error = %e, "thread summary model check failed at startup");
+            false
+        }
+    }
+}
+
+/// Result of the summary commit transaction.
+enum CommitOutcome {
+    Committed(crate::domain::repos::Wake),
+    /// The stored frontier moved: another handler committed first.
+    CasLost,
+    /// The target frontier message was soft-deleted meanwhile.
+    FrontierDeleted,
+}
+
+/// Whether the frontier message still exists (not soft-deleted). Locks the
+/// row on Postgres for the rest of the transaction.
+async fn frontier_message_is_live(
+    tx: &impl toolkit_db::secure::DBRunner,
+    scope: &AccessScope,
+    chat_id: uuid::Uuid,
+    frontier: &SummaryFrontier,
+) -> Result<bool, toolkit_db::DbError> {
+    use crate::infra::db::entity::message::{Column, Entity};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+    use toolkit_db::secure::SecureEntityExt;
+
+    let row = Entity::find()
+        .filter(Column::Id.eq(frontier.message_id))
+        .filter(Column::ChatId.eq(chat_id))
+        .filter(Column::DeletedAt.is_null())
+        .lock(sea_orm::sea_query::LockType::Update)
+        .secure()
+        .scope_with(scope)
+        .one(tx)
+        .await
+        .map_err(|e| toolkit_db::DbError::Other(anyhow::Error::new(e)))?;
+    Ok(row.is_some())
+}
+
+/// Input token budget of a summary request: the context window minus the
+/// output reserve, capped by `max_input_tokens` when set. `None` when the
+/// catalog gives no context window.
+fn summary_input_budget(model: &crate::domain::models::ResolvedModel) -> Option<u64> {
+    if model.context_window == 0 {
+        return None;
+    }
+    let mut budget =
+        u64::from(model.context_window).saturating_sub(u64::from(model.max_output_tokens));
+    if model.max_input_tokens > 0 {
+        budget = budget.min(u64::from(model.max_input_tokens));
+    }
+    Some(budget)
+}
+
+/// Drop the oldest messages until the estimated prompt (system prompt plus
+/// user prompt, `bytes_per_token_conservative` bytes per token) fits the
+/// input budget. Keeps at least two messages. Returns how many were dropped.
+fn fit_summary_prompt(
+    model: &crate::domain::models::ResolvedModel,
+    system_prompt: &str,
+    existing_summary: Option<&str>,
+    messages: &mut Vec<crate::infra::db::entity::message::Model>,
+    message_content_limit: usize,
+) -> usize {
+    let Some(budget) = summary_input_budget(model) else {
+        return 0;
+    };
+    let bpt = u64::from(model.bytes_per_token_conservative.max(1));
+    let estimate = |msgs: &[crate::infra::db::entity::message::Model]| {
+        let bytes = system_prompt.len()
+            + build_summary_prompt(existing_summary, msgs, message_content_limit).len();
+        (bytes as u64).div_ceil(bpt)
+    };
+    let mut dropped = 0;
+    while messages.len() > 2 && estimate(messages) > budget {
+        let step = messages.len().div_ceil(5).min(messages.len() - 2);
+        messages.drain(..step);
+        dropped += step;
+    }
+    dropped
+}
 
 /// Build the user-message prompt for summary generation.
 ///
@@ -549,9 +783,17 @@ fn format_summary_output(raw: &str) -> String {
 
 /// Derive a token estimate for the stored summary.
 /// Prefers actual `output_tokens` from the provider; falls back to `bytes/4`.
-fn estimate_summary_tokens(output_tokens: i64, summary_byte_len: usize) -> i32 {
-    if output_tokens > 0 {
-        i32::try_from(output_tokens).unwrap_or(i32::MAX)
+/// Tokens of the summary text: the provider's output tokens without the
+/// reasoning tokens (a reasoning model counts them in `output_tokens`, but
+/// they are not part of the stored text), else `ceil(bytes / 4)`.
+fn estimate_summary_tokens(
+    output_tokens: i64,
+    reasoning_tokens: i64,
+    summary_byte_len: usize,
+) -> i32 {
+    let text_tokens = output_tokens.saturating_sub(reasoning_tokens.max(0));
+    if text_tokens > 0 {
+        i32::try_from(text_tokens).unwrap_or(i32::MAX)
     } else {
         i32::try_from(summary_byte_len.div_ceil(4)).unwrap_or(i32::MAX)
     }
@@ -567,6 +809,7 @@ fn is_context_length_error(e: &crate::infra::llm::LlmProviderError) -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use toolkit_db::outbox::LeasedMessageHandler;
@@ -609,13 +852,20 @@ mod tests {
 
     #[test]
     fn token_estimate_prefers_output_tokens() {
-        assert_eq!(estimate_summary_tokens(250, 1000), 250);
+        assert_eq!(estimate_summary_tokens(250, 0, 1000), 250);
+    }
+
+    #[test]
+    fn token_estimate_excludes_reasoning_tokens() {
+        assert_eq!(estimate_summary_tokens(250, 200, 1000), 50);
+        // Reasoning only (no text tokens reported): fall back to the length.
+        assert_eq!(estimate_summary_tokens(200, 200, 40), 10);
     }
 
     #[test]
     fn token_estimate_falls_back_to_len_div_4() {
         // 200 bytes / 4 = 50 tokens
-        assert_eq!(estimate_summary_tokens(0, 200), 50);
+        assert_eq!(estimate_summary_tokens(0, 0, 200), 50);
     }
 
     // ── E2E tests: full handler pipeline with real DB ──────────────────
@@ -737,6 +987,26 @@ mod tests {
         (deps, db)
     }
 
+    #[test]
+    fn bound_retries_rejects_on_last_attempt() {
+        assert!(matches!(
+            bound_retries(MessageResult::Retry, 0, 3),
+            MessageResult::Retry
+        ));
+        assert!(matches!(
+            bound_retries(MessageResult::Retry, 1, 3),
+            MessageResult::Retry
+        ));
+        assert!(matches!(
+            bound_retries(MessageResult::Retry, 2, 3),
+            MessageResult::Reject(_)
+        ));
+        assert!(matches!(
+            bound_retries(MessageResult::Ok, 5, 3),
+            MessageResult::Ok
+        ));
+    }
+
     #[tokio::test]
     async fn e2e_handler_rejects_invalid_payload() {
         let (deps, _db) = make_e2e_deps().await;
@@ -778,6 +1048,66 @@ mod tests {
         let result = handler.handle(&make_outbox_msg(&payload)).await;
         // No messages → should succeed (skip)
         assert!(matches!(result, MessageResult::Ok));
+    }
+
+    /// A summary model that is not in the catalog (or disabled) rejects the
+    /// task at once instead of retrying it until it is dead-lettered.
+    #[tokio::test]
+    async fn e2e_handler_rejects_when_summary_model_unavailable() {
+        let (deps, db) = make_e2e_deps().await;
+        let mut deps = Arc::try_unwrap(deps).ok().expect("single owner");
+        deps.config.summary_model_id = "no-such-model".to_owned();
+        let deps = Arc::new(deps);
+        let tenant_id = uuid::Uuid::new_v4();
+        let chat_id = uuid::Uuid::new_v4();
+        insert_chat(&db, tenant_id, chat_id).await;
+        let base = time::OffsetDateTime::now_utc();
+        insert_message(&db, tenant_id, chat_id, MessageRole::User, "q", base).await;
+        let last = insert_message(
+            &db,
+            tenant_id,
+            chat_id,
+            MessageRole::Assistant,
+            "a",
+            base + time::Duration::seconds(1),
+        )
+        .await;
+
+        let payload = ThreadSummaryTaskPayload {
+            tenant_id,
+            chat_id,
+            system_request_id: uuid::Uuid::new_v4(),
+            system_task_type: "thread_summary_update".to_owned(),
+            base_frontier_created_at: None,
+            base_frontier_message_id: None,
+            frozen_target_created_at: base + time::Duration::seconds(1),
+            frozen_target_message_id: last,
+        };
+        let handler = ThreadSummaryHandler::new(deps);
+        let result = handler.handle(&make_outbox_msg(&payload)).await;
+        assert!(
+            matches!(&result, MessageResult::Reject(reason) if reason.contains("no-such-model")),
+            "expected Reject, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_summary_model_reports_missing_model() {
+        let resolver = crate::domain::service::test_helpers::MockModelResolver::default();
+        let mut config = crate::config::background::ThreadSummaryWorkerConfig {
+            summary_model_id: "gpt-5.2".to_owned(),
+            ..Default::default()
+        };
+        assert!(check_summary_model(&resolver, &config).await);
+
+        config.summary_model_id = "no-such-model".to_owned();
+        assert!(!check_summary_model(&resolver, &config).await);
+
+        config.enabled = false;
+        assert!(
+            check_summary_model(&resolver, &config).await,
+            "disabled: nothing to check"
+        );
     }
 
     #[tokio::test]
@@ -1034,6 +1364,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frontier_message_is_live_false_after_soft_delete() {
+        use crate::infra::db::entity::message::{Column, Entity as MessageEntity};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr};
+        use toolkit_db::secure::SecureUpdateExt;
+
+        let db = crate::domain::service::test_helpers::inmem_db().await;
+        let tenant_id = uuid::Uuid::new_v4();
+        let chat_id = uuid::Uuid::new_v4();
+        insert_chat(&db, tenant_id, chat_id).await;
+        let created_at = time::OffsetDateTime::now_utc();
+        let msg_id = insert_message(
+            &db,
+            tenant_id,
+            chat_id,
+            MessageRole::Assistant,
+            "a",
+            created_at,
+        )
+        .await;
+        let frontier = SummaryFrontier {
+            created_at,
+            message_id: msg_id,
+        };
+        let scope = AccessScope::for_tenant(tenant_id);
+        let conn = db.conn().unwrap();
+        assert!(
+            frontier_message_is_live(&conn, &scope, chat_id, &frontier)
+                .await
+                .unwrap()
+        );
+
+        MessageEntity::update_many()
+            .col_expr(Column::DeletedAt, Expr::value(Some(created_at)))
+            .filter(Column::Id.eq(msg_id))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(&conn)
+            .await
+            .unwrap();
+        assert!(
+            !frontier_message_is_live(&conn, &scope, chat_id, &frontier)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn e2e_mark_messages_compressed() {
         let db = crate::domain::service::test_helpers::inmem_db().await;
         let tenant_id = uuid::Uuid::new_v4();
@@ -1247,6 +1624,86 @@ mod tests {
             raw_detail: None,
         };
         assert!(!is_context_length_error(&e3));
+    }
+
+    fn summary_model(
+        context_window: u32,
+        max_output: u32,
+        max_input: u32,
+    ) -> crate::domain::models::ResolvedModel {
+        crate::domain::models::ResolvedModel {
+            model_id: "m".to_owned(),
+            provider_model_id: "m".to_owned(),
+            provider_id: "openai".to_owned(),
+            display_name: "m".to_owned(),
+            tier: "standard".to_owned(),
+            multiplier_display: "1x".to_owned(),
+            description: None,
+            multimodal_capabilities: vec![],
+            context_window,
+            max_file_size_mb: 25,
+            system_prompt: String::new(),
+            tool_support: mini_chat_sdk::ModelToolSupport {
+                web_search: false,
+                file_search: false,
+                image_generation: false,
+                code_interpreter: false,
+                mcp: false,
+            },
+            thread_summary_prompt: String::new(),
+            max_output_tokens: max_output,
+            max_input_tokens: max_input,
+            bytes_per_token_conservative: 4,
+        }
+    }
+
+    #[test]
+    fn summary_input_budget_uses_window_and_input_cap() {
+        assert_eq!(
+            summary_input_budget(&summary_model(10_000, 1_000, 0)),
+            Some(9_000)
+        );
+        assert_eq!(
+            summary_input_budget(&summary_model(10_000, 1_000, 2_000)),
+            Some(2_000)
+        );
+        assert_eq!(summary_input_budget(&summary_model(0, 1_000, 0)), None);
+    }
+
+    /// Oldest messages are dropped until the estimate fits; at least two stay.
+    #[test]
+    fn fit_summary_prompt_drops_oldest_until_it_fits() {
+        let big = "x".repeat(4_000); // ~1000 tokens at 4 bytes/token
+        let mut msgs: Vec<_> = (0..10)
+            .map(|i| test_message(MessageRole::User, &format!("{i}:{big}")))
+            .collect();
+        // Budget 3_000 tokens: about three messages fit.
+        let model = summary_model(4_000, 1_000, 0);
+        let dropped = fit_summary_prompt(&model, "sys", None, &mut msgs, 0);
+        assert!(dropped > 0);
+        assert_eq!(msgs.len(), 10 - dropped);
+        assert!(msgs.len() >= 2);
+        assert!(
+            msgs[0].content.starts_with(&format!("{dropped}:")),
+            "oldest dropped first"
+        );
+        let bytes = 3 + build_summary_prompt(None, &msgs, 0).len();
+        assert!((bytes as u64).div_ceil(4) <= 3_000);
+
+        // Within budget: nothing dropped.
+        let mut small = vec![
+            test_message(MessageRole::User, "hi"),
+            test_message(MessageRole::Assistant, "ok"),
+        ];
+        assert_eq!(fit_summary_prompt(&model, "sys", None, &mut small, 0), 0);
+
+        // Never below two messages, even when two do not fit.
+        let tiny = summary_model(600, 100, 0);
+        let mut two_plus: Vec<_> = (0..4)
+            .map(|_| test_message(MessageRole::User, &big))
+            .collect();
+        fit_summary_prompt(&tiny, "sys", None, &mut two_plus, 0);
+        assert_eq!(two_plus.len(), 2);
     }
 
     fn test_message(role: MessageRole, content: &str) -> crate::infra::db::entity::message::Model {

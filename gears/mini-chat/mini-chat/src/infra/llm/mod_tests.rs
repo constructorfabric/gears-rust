@@ -29,6 +29,23 @@ fn sanitize_removes_credentials() {
 }
 
 #[test]
+fn sanitize_removes_file_and_vector_store_ids() {
+    let msg = "File file-4XkVvZt9pQ2rS8mN not found in vector store vs_67a1b2c3d4e5f6a7 \
+               (assistant-Ab12Cd34Ef56Gh78, file_011CNha8iCJcU1wXNR6q4V8w)";
+    let sanitized = sanitize_provider_message(msg);
+    assert!(!sanitized.contains("file-4XkVvZt9pQ2rS8mN"));
+    assert!(!sanitized.contains("file_011CNha8iCJcU1wXNR6q4V8w"));
+    assert!(!sanitized.contains("vs_67a1b2c3d4e5f6a7"));
+    assert!(!sanitized.contains("assistant-Ab12Cd34Ef56Gh78"));
+}
+
+#[test]
+fn sanitize_keeps_ordinary_words() {
+    let msg = "file-based upload failed; file_search disabled";
+    assert_eq!(sanitize_provider_message(msg), msg);
+}
+
+#[test]
 fn sanitize_mixed_content() {
     let msg = "resp_abc123 at https://api.openai.com with sk-test1234567890";
     let sanitized = sanitize_provider_message(msg);
@@ -138,4 +155,79 @@ fn gateway_internal_maps_to_provider_error() {
         }
         _ => panic!("expected ProviderError"),
     }
+}
+
+#[test]
+fn provider_429_response_is_rate_limited() {
+    let (parts, ()) = http::Response::builder()
+        .status(http::StatusCode::TOO_MANY_REQUESTS)
+        .header(http::header::RETRY_AFTER, "7")
+        .body(())
+        .unwrap()
+        .into_parts();
+    assert!(matches!(
+        error_from_status(&parts),
+        Some(LlmProviderError::RateLimited {
+            retry_after_secs: Some(7)
+        })
+    ));
+
+    let (parts, ()) = http::Response::builder()
+        .status(http::StatusCode::BAD_GATEWAY)
+        .body(())
+        .unwrap()
+        .into_parts();
+    assert!(error_from_status(&parts).is_none());
+}
+
+#[test]
+fn provider_429_without_numeric_retry_after_has_no_hint() {
+    let (parts, ()) = http::Response::builder()
+        .status(http::StatusCode::TOO_MANY_REQUESTS)
+        .body(())
+        .unwrap()
+        .into_parts();
+    assert!(matches!(
+        error_from_status(&parts),
+        Some(LlmProviderError::RateLimited {
+            retry_after_secs: None
+        })
+    ));
+
+    // The HTTP-date form of Retry-After is not parsed.
+    let (parts, ()) = http::Response::builder()
+        .status(http::StatusCode::TOO_MANY_REQUESTS)
+        .header(http::header::RETRY_AFTER, "Wed, 21 Oct 2015 07:28:00 GMT")
+        .body(())
+        .unwrap()
+        .into_parts();
+    assert!(matches!(
+        error_from_status(&parts),
+        Some(LlmProviderError::RateLimited {
+            retry_after_secs: None
+        })
+    ));
+}
+
+#[test]
+fn gateway_504_problem_is_a_timeout_provider_504_is_not() {
+    let (parts, ()) = http::Response::builder()
+        .status(http::StatusCode::GATEWAY_TIMEOUT)
+        .header(http::header::CONTENT_TYPE, "application/problem+json")
+        .body(())
+        .unwrap()
+        .into_parts();
+    assert!(matches!(
+        error_from_status(&parts),
+        Some(LlmProviderError::Timeout)
+    ));
+
+    // The provider's own 504 with a JSON error body is parsed as a provider error.
+    let (parts, ()) = http::Response::builder()
+        .status(http::StatusCode::GATEWAY_TIMEOUT)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(())
+        .unwrap()
+        .into_parts();
+    assert!(error_from_status(&parts).is_none());
 }

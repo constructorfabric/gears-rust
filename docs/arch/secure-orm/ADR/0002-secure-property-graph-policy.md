@@ -724,7 +724,7 @@ broken code.
 - First intended consumer:
   [IRM DESIGN.md](../../../../gears/infrastructure-resource-manager/docs/DESIGN.md),
   [IRM PRD.md](../../../../gears/infrastructure-resource-manager/docs/PRD.md)
-- ADR template & checklist: [docs/checklists/ADR.md](../../../checklists/ADR.md)
+- ADR template & checklist: [studio-kit-gears/artifacts/ADR/checklist.md](../../../../studio-kit-gears/artifacts/ADR/checklist.md)
 - PostgreSQL 19 (beta) documentation:
   [7.9. Graph Queries](https://www.postgresql.org/docs/19/queries-graph.html),
   [5.15. Property Graphs](https://www.postgresql.org/docs/19/ddl-property-graphs.html),

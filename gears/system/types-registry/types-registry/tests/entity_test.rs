@@ -205,7 +205,7 @@ async fn operation_and_its_item_round_trip_together() {
     let item = operation_item::ActiveModel {
         operation_id: Set(op_id),
         item_no: Set(0),
-        gts_id: Set(GTS_TYPE.to_owned()),
+        entity_key: Set(GTS_TYPE.to_owned()),
         dry_run: Set(false),
         kind: Set(OperationKind::Registration),
         expected_resource_version: Set(0),
@@ -278,7 +278,7 @@ async fn operation_item_advances_to_a_succeeded_terminal_shape() {
     let item = operation_item::ActiveModel {
         operation_id: Set(op_id),
         item_no: Set(0),
-        gts_id: Set(GTS_TYPE.to_owned()),
+        entity_key: Set(GTS_TYPE.to_owned()),
         dry_run: Set(false),
         kind: Set(OperationKind::Registration),
         expected_resource_version: Set(0),
@@ -340,7 +340,7 @@ async fn instance_revision_cannot_reference_a_missing_schema_revision() {
     let item = operation_item::ActiveModel {
         operation_id: Set(op_id),
         item_no: Set(0),
-        gts_id: Set(INSTANCE_GTS_ID.to_owned()),
+        entity_key: Set(INSTANCE_GTS_ID.to_owned()),
         dry_run: Set(false),
         kind: Set(OperationKind::Registration),
         expected_resource_version: Set(0),
@@ -449,7 +449,7 @@ async fn type_schema_revision_and_current_pointer_round_trip() {
     let item = operation_item::ActiveModel {
         operation_id: Set(op_id),
         item_no: Set(0),
-        gts_id: Set(GTS_TYPE.to_owned()),
+        entity_key: Set(GTS_TYPE.to_owned()),
         dry_run: Set(false),
         kind: Set(OperationKind::Registration),
         expected_resource_version: Set(0),

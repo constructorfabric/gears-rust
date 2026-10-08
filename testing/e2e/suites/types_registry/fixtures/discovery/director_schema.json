@@ -1,0 +1,30 @@
+{
+  "gts_id": "gts.cf.e2e.discovery.person.v1~cf.e2e.discovery.employee.v1~cf.e2e.discovery.manager.v1~cf.e2e.discovery.director.v1~",
+  "content": {
+    "$id": "gts://gts.cf.e2e.discovery.person.v1~cf.e2e.discovery.employee.v1~cf.e2e.discovery.manager.v1~cf.e2e.discovery.director.v1~",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "allOf": [
+      {
+        "$ref": "gts://gts.cf.e2e.discovery.person.v1~cf.e2e.discovery.employee.v1~cf.e2e.discovery.manager.v1~"
+      }
+    ],
+    "type": "object",
+    "properties": {
+      "payload": {
+        "type": "object",
+        "properties": {
+          "division": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "division"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "payload"
+    ]
+  }
+}

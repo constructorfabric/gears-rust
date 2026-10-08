@@ -10,6 +10,8 @@ mod types;
 
 #[cfg(test)]
 mod direct_tests;
+#[cfg(all(test, feature = "outbox"))]
+mod outbox_tests;
 #[cfg(test)]
 mod partitioning_tests;
 

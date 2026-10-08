@@ -231,18 +231,31 @@ impl SearchRepository for SearchRepo {
             .add(default_matches)
             .add(declaration::Column::Id.in_subquery(overrides.into_query()));
 
-        let base = declaration_repo::exclude_hidden_for(
+        let mut base = declaration_repo::exclude_hidden_for(
             declaration_repo::apply_visibility(DeclarationEntity::find(), request.visibility),
             request.hidden_for,
         )
         .filter(declaration::Column::Status.eq("active"))
-        .filter(matched)
-        .secure()
-        .scope_with(request.scope);
+        .filter(matched);
+        // `needs_review eq true`, in the query: only settings with an override
+        // flagged for review at one of the bounded tenants. A page filtered
+        // afterwards would page the unfiltered set, which is the defect a
+        // filter in the query exists to avoid.
+        if request.flagged_only {
+            let flagged = ValueEntity::find()
+                .select_only()
+                .column(setting_value::Column::DeclarationId)
+                .filter(setting_value::Column::NeedsReview.eq(true))
+                .filter(setting_value::Column::TenantId.is_in(request.tenant_ids.iter().copied()))
+                .filter(value_repo::subjectless());
+            base = base.filter(declaration::Column::Id.in_subquery(flagged.into_query()));
+        }
+        let base = base.secure().scope_with(request.scope);
 
         // Tiebreaker `key`, unique, so a page boundary neither repeats nor
-        // skips a row. No OData filter: the query carries only the page and
-        // the binding the cursor must match.
+        // skips a row. The query carries the page, the `$filter` remainder on
+        // `key` and `category_id` — browse's grammar, on the declaration
+        // columns — and the binding the cursor must match.
         let page = paginate_odata::<DeclarationFilterField, DeclarationODataMapper, _, _, _, _>(
             base,
             conn,

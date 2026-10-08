@@ -76,7 +76,8 @@ pub trait MiniChatMetricsPort: Send + Sync {
     // ── P0: Audit Emission Health (2 metrics) ──────────────────────────
 
     /// `{prefix}_audit_emit_total` — counter
-    /// `result`: `ok`, `retry`, `reject`
+    /// `result`: `ok`, `retry`, `reject`, `dropped` (no audit plugin
+    /// registered; the event is acknowledged without delivery)
     fn record_audit_emit(&self, result: &str);
 
     /// `{prefix}_finalization_latency_ms` — histogram
@@ -124,7 +125,7 @@ pub trait MiniChatMetricsPort: Send + Sync {
     fn record_time_to_abort_ms(&self, trigger: &str, ms: f64);
 
     /// `{prefix}_streams_aborted_total` — counter
-    /// `trigger`: `client_disconnect`, `pod_crash`, `orphan_timeout`, `internal_abort`
+    /// `trigger`: `client_disconnect`, `orphan_timeout`, `internal_abort`
     fn record_streams_aborted(&self, trigger: &str);
 
     // ── P1: Attachment Upload (3 metrics) ──────────────────────────────
@@ -155,7 +156,8 @@ pub trait MiniChatMetricsPort: Send + Sync {
     fn record_cleanup_failed(&self, resource_type: &str);
 
     /// `{prefix}_cleanup_retry` — counter
-    /// `resource_type`: `file`, `vector_store`; `reason`: free-form
+    /// `resource_type`: `file`, `vector_store`; `reason`: `provider_error`,
+    /// `vector_store_delete_failed` (see `metric_labels::cleanup_retry_reason`)
     fn record_cleanup_retry(&self, resource_type: &str, reason: &str);
 
     /// `{prefix}_cleanup_backlog` — gauge
@@ -187,6 +189,17 @@ pub trait MiniChatMetricsPort: Send + Sync {
     /// `{prefix}_orphan_scan_duration_seconds` — histogram
     fn record_orphan_scan_duration_seconds(&self, seconds: f64);
 
+    /// `{prefix}_attachment_upload_abandoned` — counter
+    /// `from_status`: `pending`, `uploaded`
+    fn record_upload_abandoned(&self, from_status: &str);
+
+    /// `{prefix}_upload_reaper_scan_duration_seconds` — histogram
+    fn record_upload_reaper_scan_duration_seconds(&self, seconds: f64);
+
+    /// `{prefix}_attachment_background_indexing` — counter
+    /// `result`: `ready`, `failed`, `timeout`, `set_ready_failed`
+    fn record_background_indexing(&self, result: &str);
+
     // ── P1: Thread Summary Health (4 metrics) ──────────────────────────
 
     /// `{prefix}_thread_summary_trigger` — counter
@@ -194,7 +207,9 @@ pub trait MiniChatMetricsPort: Send + Sync {
     fn record_thread_summary_trigger(&self, result: &str);
 
     /// `{prefix}_thread_summary_execution` — counter
-    /// `result`: `success`, `provider_error`, `timeout`, `retry`
+    /// `result`: see [`metric_labels::summary_result`](super::metric_labels::summary_result)
+    /// (`success`, `retry`, `provider_error`, `empty_summary`,
+    /// `model_unavailable`, `frontier_deleted`, `base_missing`)
     fn record_thread_summary_execution(&self, result: &str);
 
     /// `{prefix}_thread_summary_cas_conflicts` — counter
@@ -266,6 +281,9 @@ impl MiniChatMetricsPort for NoopMetrics {
     fn record_orphan_detected(&self, _: &str) {}
     fn record_orphan_finalized(&self, _: &str) {}
     fn record_orphan_scan_duration_seconds(&self, _: f64) {}
+    fn record_upload_abandoned(&self, _: &str) {}
+    fn record_upload_reaper_scan_duration_seconds(&self, _: f64) {}
+    fn record_background_indexing(&self, _: &str) {}
     fn record_thread_summary_trigger(&self, _: &str) {}
     fn record_thread_summary_execution(&self, _: &str) {}
     fn record_thread_summary_cas_conflict(&self) {}

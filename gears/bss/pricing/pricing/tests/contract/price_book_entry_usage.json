@@ -1,0 +1,352 @@
+{
+  "golden": "price_book_entry_usage",
+  "proves": "D-428: the two entry reads answer the entry's fields and its usage - its prices by state (a rejected price is not counted), the distinct plans whose draft, pending, scheduled or published revisions name it (one plan counts once however many of its revisions name the entry) and the distinct plans that name it only through superseded revisions; the list carries it on every entry, an entry nothing uses reads zeros; another tenant reads nothing",
+  "exchanges": [
+    {
+      "case": "an entry with approved, pending, draft and rejected prices, named by a superseded and a published revision of one plan",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/price-book-entries/<entry:pro>",
+      "status": 200,
+      "body": {
+        "usage_rating_policy": null,
+        "usage_sku_version": null,
+        "id": "<entry:pro>",
+        "tenant_id": "<tenant>",
+        "book_id": "<book:eur>",
+        "sku_id": "<sku:pro>",
+        "charge_kind": "recurring",
+        "period": "month",
+        "model": "flat",
+        "dimension_key": null,
+        "invoice_line_override": "Pro plan, {period}",
+        "reservation_id": "<reservation:entry:pro>",
+        "reference_state": "confirmed",
+        "version": 1,
+        "created_at": "2025-12-01T09:00:00Z",
+        "updated_at": "2025-12-01T09:00:00Z",
+        "usage": {
+          "prices": {
+            "approved": 3,
+            "pending": 1,
+            "draft": 1
+          },
+          "plans": 1,
+          "plans_superseded_only": 0
+        }
+      }
+    },
+    {
+      "case": "an entry named by a published revision of one plan and the pending revision of another",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/price-book-entries/<entry:egress>",
+      "status": 200,
+      "body": {
+        "usage_rating_policy": null,
+        "usage_sku_version": null,
+        "id": "<entry:egress>",
+        "tenant_id": "<tenant>",
+        "book_id": "<book:eur>",
+        "sku_id": "<sku:egress>",
+        "charge_kind": "usage",
+        "period": null,
+        "model": "per_unit",
+        "dimension_key": "region",
+        "invoice_line_override": null,
+        "reservation_id": "<reservation:entry:egress>",
+        "reference_state": "confirmed",
+        "version": 1,
+        "created_at": "2025-12-01T09:00:00Z",
+        "updated_at": "2025-12-01T09:00:00Z",
+        "usage": {
+          "prices": {
+            "approved": 3,
+            "pending": 0,
+            "draft": 0
+          },
+          "plans": 2,
+          "plans_superseded_only": 0
+        }
+      }
+    },
+    {
+      "case": "an entry no revision names",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/price-book-entries/<entry:archive>",
+      "status": 200,
+      "body": {
+        "usage_rating_policy": null,
+        "usage_sku_version": null,
+        "id": "<entry:archive>",
+        "tenant_id": "<tenant>",
+        "book_id": "<book:eur>",
+        "sku_id": "<sku:archive>",
+        "charge_kind": "usage",
+        "period": null,
+        "model": "per_unit",
+        "dimension_key": null,
+        "invoice_line_override": null,
+        "reservation_id": "<reservation:entry:archive>",
+        "reference_state": "confirmed",
+        "version": 1,
+        "created_at": "2025-12-01T09:00:00Z",
+        "updated_at": "2025-12-01T09:00:00Z",
+        "usage": {
+          "prices": {
+            "approved": 1,
+            "pending": 0,
+            "draft": 0
+          },
+          "plans": 0,
+          "plans_superseded_only": 0
+        }
+      }
+    },
+    {
+      "case": "the book's entries, each with its usage",
+      "caller": "the tenant",
+      "request": "GET /bss-pricing/v1/price-books/<book:eur>/entries",
+      "status": 200,
+      "body": {
+        "items": [
+          {
+            "usage_rating_policy": null,
+            "usage_sku_version": null,
+            "id": "<entry:pro>",
+            "tenant_id": "<tenant>",
+            "book_id": "<book:eur>",
+            "sku_id": "<sku:pro>",
+            "charge_kind": "recurring",
+            "period": "month",
+            "model": "flat",
+            "dimension_key": null,
+            "invoice_line_override": "Pro plan, {period}",
+            "reservation_id": "<reservation:entry:pro>",
+            "reference_state": "confirmed",
+            "version": 1,
+            "created_at": "2025-12-01T09:00:00Z",
+            "updated_at": "2025-12-01T09:00:00Z",
+            "usage": {
+              "prices": {
+                "approved": 3,
+                "pending": 1,
+                "draft": 1
+              },
+              "plans": 1,
+              "plans_superseded_only": 0
+            }
+          },
+          {
+            "usage_rating_policy": null,
+            "usage_sku_version": null,
+            "id": "<entry:storage>",
+            "tenant_id": "<tenant>",
+            "book_id": "<book:eur>",
+            "sku_id": "<sku:storage>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "per_unit",
+            "dimension_key": "region",
+            "invoice_line_override": null,
+            "reservation_id": "<reservation:entry:storage>",
+            "reference_state": "confirmed",
+            "version": 1,
+            "created_at": "2025-12-01T09:00:00Z",
+            "updated_at": "2025-12-01T09:00:00Z",
+            "usage": {
+              "prices": {
+                "approved": 6,
+                "pending": 0,
+                "draft": 0
+              },
+              "plans": 1,
+              "plans_superseded_only": 0
+            }
+          },
+          {
+            "usage_rating_policy": null,
+            "usage_sku_version": null,
+            "id": "<entry:egress>",
+            "tenant_id": "<tenant>",
+            "book_id": "<book:eur>",
+            "sku_id": "<sku:egress>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "per_unit",
+            "dimension_key": "region",
+            "invoice_line_override": null,
+            "reservation_id": "<reservation:entry:egress>",
+            "reference_state": "confirmed",
+            "version": 1,
+            "created_at": "2025-12-01T09:00:00Z",
+            "updated_at": "2025-12-01T09:00:00Z",
+            "usage": {
+              "prices": {
+                "approved": 3,
+                "pending": 0,
+                "draft": 0
+              },
+              "plans": 2,
+              "plans_superseded_only": 0
+            }
+          },
+          {
+            "usage_rating_policy": null,
+            "usage_sku_version": null,
+            "id": "<entry:requests>",
+            "tenant_id": "<tenant>",
+            "book_id": "<book:eur>",
+            "sku_id": "<sku:requests>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "graduated",
+            "dimension_key": "region",
+            "invoice_line_override": null,
+            "reservation_id": "<reservation:entry:requests>",
+            "reference_state": "confirmed",
+            "version": 1,
+            "created_at": "2025-12-01T09:00:00Z",
+            "updated_at": "2025-12-01T09:00:00Z",
+            "usage": {
+              "prices": {
+                "approved": 1,
+                "pending": 0,
+                "draft": 0
+              },
+              "plans": 1,
+              "plans_superseded_only": 0
+            }
+          },
+          {
+            "usage_rating_policy": null,
+            "usage_sku_version": null,
+            "id": "<entry:archive>",
+            "tenant_id": "<tenant>",
+            "book_id": "<book:eur>",
+            "sku_id": "<sku:archive>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "per_unit",
+            "dimension_key": null,
+            "invoice_line_override": null,
+            "reservation_id": "<reservation:entry:archive>",
+            "reference_state": "confirmed",
+            "version": 1,
+            "created_at": "2025-12-01T09:00:00Z",
+            "updated_at": "2025-12-01T09:00:00Z",
+            "usage": {
+              "prices": {
+                "approved": 1,
+                "pending": 0,
+                "draft": 0
+              },
+              "plans": 0,
+              "plans_superseded_only": 0
+            }
+          },
+          {
+            "usage_rating_policy": null,
+            "usage_sku_version": null,
+            "id": "<entry:requests-volume>",
+            "tenant_id": "<tenant>",
+            "book_id": "<book:eur>",
+            "sku_id": "<sku:requests-volume>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "volume",
+            "dimension_key": "region",
+            "invoice_line_override": null,
+            "reservation_id": "<reservation:entry:requests-volume>",
+            "reference_state": "confirmed",
+            "version": 1,
+            "created_at": "2025-12-01T09:00:00Z",
+            "updated_at": "2025-12-01T09:00:00Z",
+            "usage": {
+              "prices": {
+                "approved": 1,
+                "pending": 0,
+                "draft": 0
+              },
+              "plans": 1,
+              "plans_superseded_only": 0
+            }
+          },
+          {
+            "usage_rating_policy": null,
+            "usage_sku_version": null,
+            "id": "<entry:requests-package>",
+            "tenant_id": "<tenant>",
+            "book_id": "<book:eur>",
+            "sku_id": "<sku:requests-package>",
+            "charge_kind": "usage",
+            "period": null,
+            "model": "package",
+            "dimension_key": "region",
+            "invoice_line_override": null,
+            "reservation_id": "<reservation:entry:requests-package>",
+            "reference_state": "confirmed",
+            "version": 1,
+            "created_at": "2025-12-01T09:00:00Z",
+            "updated_at": "2025-12-01T09:00:00Z",
+            "usage": {
+              "prices": {
+                "approved": 1,
+                "pending": 0,
+                "draft": 0
+              },
+              "plans": 1,
+              "plans_superseded_only": 0
+            }
+          },
+          {
+            "usage_rating_policy": null,
+            "usage_sku_version": null,
+            "id": "<entry:promo>",
+            "tenant_id": "<tenant>",
+            "book_id": "<book:eur>",
+            "sku_id": "<sku:promo>",
+            "charge_kind": "recurring",
+            "period": "month",
+            "model": "flat",
+            "dimension_key": null,
+            "invoice_line_override": null,
+            "reservation_id": "<reservation:entry:promo>",
+            "reference_state": "confirmed",
+            "version": 1,
+            "created_at": "2025-12-01T09:00:00Z",
+            "updated_at": "2025-12-01T09:00:00Z",
+            "usage": {
+              "prices": {
+                "approved": 5,
+                "pending": 0,
+                "draft": 0
+              },
+              "plans": 1,
+              "plans_superseded_only": 0
+            }
+          }
+        ],
+        "page_info": {
+          "next_cursor": null,
+          "prev_cursor": null,
+          "limit": 500
+        }
+      }
+    },
+    {
+      "case": "this tenant's entry read by another tenant",
+      "caller": "another tenant",
+      "request": "GET /bss-pricing/v1/price-book-entries/<entry:pro>",
+      "status": 404,
+      "body": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+        "title": "Not Found",
+        "status": 404,
+        "detail": "ENTRY_NOT_FOUND: price book entry not found",
+        "context": {
+          "resource_type": "gts.cf.bss.pricing.price_book.v1~",
+          "resource_name": "price_book_entry"
+        }
+      }
+    }
+  ]
+}

@@ -98,7 +98,7 @@ use crate::domain::cluster::EventBrokerCluster;
 
 /// `standalone_event_broker_cluster()` wires the toolkit's own real,
 /// production `LocalDirectoryClient` (backed by a fresh `GearManager`, the
-/// same in-memory store `gear-orchestrator` itself runs standalone mode on -
+/// same in-memory store `service-discovery` itself runs standalone mode on -
 /// no DB, no network) into the same `ClientHub` production code paths
 /// (`module::EventBrokerModule::register_self`, `infra::dispatcher::forward`)
 /// resolve their `Arc<dyn DirectoryClient>` from, so dispatcher tests

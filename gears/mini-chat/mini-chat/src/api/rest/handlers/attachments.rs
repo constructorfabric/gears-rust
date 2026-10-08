@@ -3,10 +3,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::Extension;
-use axum::extract::Path;
 use bytes::Bytes;
 use futures::stream::Stream;
 use toolkit::api::canonical_prelude::*;
+use toolkit::api::rest::extract::Path;
 use toolkit_security::SecurityContext;
 
 use crate::api::rest::dto::AttachmentDetailDto;

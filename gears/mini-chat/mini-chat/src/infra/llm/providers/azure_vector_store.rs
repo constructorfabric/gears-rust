@@ -8,9 +8,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use toolkit_security::SecurityContext;
 
-use crate::domain::ports::{AddFileToVectorStoreParams, FileStorageError, VectorStoreProvider};
+use crate::domain::ports::{
+    AddFileToVectorStoreParams, FileStorageError, VectorStoreFileStatus, VectorStoreProvider,
+};
 use crate::infra::llm::provider_resolver::ProviderResolver;
-use crate::infra::llm::providers::rag_http_client::RagHttpClient;
+use crate::infra::llm::providers::rag_http_client::{RagHttpClient, VectorStoreFileObject};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct VectorStoreObject {
@@ -77,7 +79,7 @@ impl VectorStoreProvider for AzureVectorStore {
         ctx: SecurityContext,
         provider_id: &str,
         params: AddFileToVectorStoreParams,
-    ) -> Result<(), FileStorageError> {
+    ) -> Result<VectorStoreFileStatus, FileStorageError> {
         let uri = self.resolve_uri(
             &ctx,
             provider_id,
@@ -87,7 +89,28 @@ impl VectorStoreProvider for AzureVectorStore {
             "file_id": params.provider_file_id,
             "attributes": params.attributes,
         });
-        self.client.json_post_no_response(ctx, &uri, &body).await
+        self.client
+            .json_post::<VectorStoreFileObject>(ctx, &uri, &body)
+            .await
+            .map(VectorStoreFileObject::into_status)
+    }
+
+    async fn get_vector_store_file_status(
+        &self,
+        ctx: SecurityContext,
+        provider_id: &str,
+        vector_store_id: &str,
+        provider_file_id: &str,
+    ) -> Result<VectorStoreFileStatus, FileStorageError> {
+        let uri = self.resolve_uri(
+            &ctx,
+            provider_id,
+            &format!("vector_stores/{vector_store_id}/files/{provider_file_id}"),
+        )?;
+        self.client
+            .json_get::<VectorStoreFileObject>(ctx, &uri)
+            .await
+            .map(VectorStoreFileObject::into_status)
     }
 
     async fn delete_vector_store(
