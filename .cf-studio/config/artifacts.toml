@@ -22,6 +22,10 @@ reason = "Ignore 'gears/bss/libs' — not a module, only a grouping for shared B
 patterns = ["gears/bss/libs"]
 
 [[ignore]]
+reason = "Ignore 'gears/bss/docs' — BSS-wide architecture decisions shared by the BSS gears (ADR/), not a module; each gear's own design set stays under gears/bss/$system/docs."
+patterns = ["gears/bss/docs", "gears/bss/docs/*"]
+
+[[ignore]]
 reason = "Ignore 'coord' shared utility library (distributed-lease primitive; infrastructure crate, not an SDLC-documented product module — no PRD/DESIGN required, README-documented)."
 patterns = ["gears/bss/libs/coord/*"]
 
