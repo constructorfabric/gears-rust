@@ -29,6 +29,11 @@ authz-resolver = { workspace = true }
 # Tenant settings (the personalization default for new subjects)
 settings-service-sdk = { workspace = true }
 
+# Model calls: the chat completions adapter goes through OAGW
+oagw-sdk = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+
 # Record types: the types registry resolves a record's type and base types
 types-registry-sdk = { workspace = true }
 types-registry = { workspace = true }
