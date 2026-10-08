@@ -229,7 +229,8 @@ macro_rules! digest_newtype {
                     kind: stringify!($name),
                     value: hex.to_owned(),
                 };
-                if hex.len() != 64 {
+                // `from_str_radix` alone would accept a `+` sign in a pair.
+                if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                     return Err(bad());
                 }
                 let mut bytes = [0_u8; 32];

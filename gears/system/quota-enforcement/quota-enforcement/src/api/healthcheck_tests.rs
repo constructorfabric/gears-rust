@@ -33,13 +33,16 @@ async fn the_check_mirrors_the_readiness_cell_and_names_the_failing_dependency()
     assert_eq!(pending.status, unhealthy);
     assert_eq!(pending.code.as_deref(), Some("qe_bootstrap_pending"));
 
-    readiness.mark_failed(Dependency::Cluster, "no backend bound for profile");
+    readiness.mark_failed(Dependency::Cluster, "no backend bound at db.internal:5432");
     let failed = check.check().await;
     assert_eq!(failed.status, unhealthy);
     assert_eq!(failed.code.as_deref(), Some("qe_cluster_unavailable"));
     let message = failed.message.expect("failure message");
     assert!(message.contains("cluster"), "{message}");
-    assert!(message.contains("profile"), "{message}");
+    assert!(
+        !message.contains("db.internal"),
+        "the unauthenticated /health must not carry the error text: {message}"
+    );
 
     readiness.mark_ready();
     let ready = check.check().await;
