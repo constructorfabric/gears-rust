@@ -420,4 +420,4 @@ Tests that add confidence without blocking delivery:
 - Every domain invariant from gear acceptance criteria is covered by at least one test
 - `make all` (or `make fmt && make lint && make test`) passes with zero errors
 
-See also: [`14_db_behavior_testing.md`](14_db_behavior_testing.md) for transaction-boundary and N+1 checks (SQLite tests with a query recorder, reusing this guide's setup) and for concurrency correctness, which is out of scope here.
+See also: [`14_db_behavior_testing.md`](14_db_behavior_testing.md) for DB behavior rules and the query-recorder and barrier tests (reusing this guide's setup), and [`TRADEOFFS.md`](../arch/database/TRADEOFFS.md) for choices such as batching versus per-row queries; concurrency correctness is out of scope here.

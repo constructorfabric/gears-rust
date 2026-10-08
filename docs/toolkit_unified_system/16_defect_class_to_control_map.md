@@ -200,5 +200,6 @@ survive.
   disclosure and in-process classes.
 - `15_gear_api_baseline.md` — the walk-before-merge form of the API-completeness class.
 - `11_database_patterns.md` — transactions, isolation and retry, for the concurrency class.
-- `14_db_behavior_testing.md` — the database-axis specialization of this map's "N+1 and query-count
-  regressions" and "Concurrency and write-skew" rows: a defect catalog and audit method.
+- `14_db_behavior_testing.md` — rules with no exceptions and the audit method for this map's "N+1 and query-count
+  regressions" and "Concurrency and write-skew" rows; the choices behind them are in
+  `docs/arch/database/TRADEOFFS.md`.

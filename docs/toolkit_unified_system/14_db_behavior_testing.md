@@ -5,20 +5,29 @@
 <!-- toc -->
 
 - [Why and when](#why-and-when)
-- [Defect catalog](#defect-catalog)
-  - [Check-then-act races (TOCTOU)](#check-then-act-races-toctou)
-  - [CAS without rows_affected check; lost update](#cas-without-rows_affected-check-lost-update)
-  - [External effects inside a transaction; events outside it](#external-effects-inside-a-transaction-events-outside-it)
-  - [Retry wiring and non-idempotent retries](#retry-wiring-and-non-idempotent-retries)
-  - [N+1, unchunked IN, missing LIMIT](#n1-unchunked-in-missing-limit)
-  - [Non-deterministic ORDER BY under offset pagination](#non-deterministic-order-by-under-offset-pagination)
-  - [Unindexed FK columns](#unindexed-fk-columns)
-  - [COUNT used to check existence](#count-used-to-check-existence)
-  - [SQLite / PostgreSQL / MySQL divergence](#sqlite--postgresql--mysql-divergence)
-  - [Migration hazards](#migration-hazards)
-  - [Deadlocks and lock ordering](#deadlocks-and-lock-ordering)
-  - [Mappers defaulting instead of erroring](#mappers-defaulting-instead-of-erroring)
-  - [Tests that prove nothing](#tests-that-prove-nothing)
+- [Rules](#rules)
+  - [Transactions and retries](#transactions-and-retries)
+    - [R1. A retried closure is safe to run again](#r1-a-retried-closure-is-safe-to-run-again)
+    - [R2. The retry can fire](#r2-the-retry-can-fire)
+    - [R3. Rows locked one at a time are locked in key order](#r3-rows-locked-one-at-a-time-are-locked-in-key-order)
+  - [Queries](#queries)
+    - [R4. No statement binds a list that can outgrow the bind limit](#r4-no-statement-binds-a-list-that-can-outgrow-the-bind-limit)
+    - [R5. A paginated query has a total order](#r5-a-paginated-query-has-a-total-order)
+    - [R6. Existence is checked with LIMIT 1](#r6-existence-is-checked-with-limit-1)
+  - [Backends](#backends)
+    - [R7. Constraint violations are recognized by code](#r7-constraint-violations-are-recognized-by-code)
+    - [R8. UUIDs are bound as Uuid](#r8-uuids-are-bound-as-uuid)
+    - [R9. On MySQL only Update and Share locks](#r9-on-mysql-only-update-and-share-locks)
+  - [Migrations](#migrations)
+    - [R10. A shipped migration is never edited](#r10-a-shipped-migration-is-never-edited)
+    - [R11. A SQLite table rebuild keeps its child rows](#r11-a-sqlite-table-rebuild-keeps-its-child-rows)
+    - [R12. down() says what it does](#r12-down-says-what-it-does)
+  - [Tests](#tests)
+    - [T1. A suite CI relies on fails instead of skipping](#t1-a-suite-ci-relies-on-fails-instead-of-skipping)
+    - [T2. Assertions check the outcome](#t2-assertions-check-the-outcome)
+    - [T3. Concurrent callers start on a barrier](#t3-concurrent-callers-start-on-a-barrier)
+    - [T4. Lock- and type-dependent behaviour is tested on a real PostgreSQL](#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-postgresql)
+    - [T5. A migration that adds a constraint meets a violating row](#t5-a-migration-that-adds-a-constraint-meets-a-violating-row)
 - [How to run an audit](#how-to-run-an-audit)
   - [Barrier-test template](#barrier-test-template)
 - [Where to keep which test](#where-to-keep-which-test)
@@ -32,10 +41,13 @@ and E2E tests ask whether the result is correct; this layer asks how the code ta
 survives a second concurrent caller. A check-then-insert with no unique constraint behind it is correct on every
 sequential call and corrupts data only when two callers overlap. Unit tests call one thing at a time and E2E tests are
 stability-first (13), so both are blind to it by design.
+
+The document has two parts: (1) **Rules**: only what holds in every gear with no exception, each with its cost; (2) the
+testing and audit method. Everything that depends on load, data shape or the guarantees a gear chooses is in
+[`docs/arch/database/TRADEOFFS.md`](../arch/database/TRADEOFFS.md) and is not repeated here; this document only
+provides the tools to pin such a choice with a test.
 [`16_defect_class_to_control_map.md`](16_defect_class_to_control_map.md) maps defect classes to controls for a whole
-gear; this document specializes its N+1 and concurrency rows for SeaORM / toolkit-db. Choices that depend on load or
-data shape are not made here; they are laid out as trade-offs in
-[`docs/arch/database/TRADEOFFS.md`](../arch/database/TRADEOFFS.md).
+gear; this document specializes its database rows for SeaORM / toolkit-db.
 
 ## Why and when
 Run the audit in full, or as a targeted pass in code review, when:
@@ -47,148 +59,67 @@ Run the audit in full, or as a targeted pass in code review, when:
   mapping is touched, or a symptom appears (lost update, duplicate row after retry, orphaned child, flaky
   concurrency test).
 
-## Defect catalog
-Each class: what it is, how to find it, how to catch it with a test, the typical fix. `rec` is the `QueryRecorder`
-of [step 5](#how-to-run-an-audit).
+## Rules
+Every rule has five fields: **Rule.** **Why.** **Cost.** **How to find it.** **How to test it.** Cost is always
+present; "None." is written only where a rule really costs nothing. `rec` is the `QueryRecorder` of
+[step 5](#how-to-run-an-audit).
 
-### Check-then-act races (TOCTOU)
-- **What it is.** A read establishes a fact, a decision follows, and a write acts on it; a concurrent commit in
-  between invalidates the fact. A bare connection, two transactions and one `READ COMMITTED` transaction all leave
-  that window open.
-  ```rust
-  // BAD: a kitten inserted after the check is cascaded away, or the FK fails the delete unmapped
-  let has_kitten = KittenEntity::find().filter(kitten::Column::CatId.eq(id))
-      .secure().scope_with(&scope).one(runner).await?.is_some();
-  if !has_kitten {
-      CatEntity::delete_many().filter(cat::Column::Id.eq(id)).secure().scope_with(&scope).exec(runner).await?;
-  }
+### Transactions and retries
 
-  // GOOD: the FK (kitten.cat_id REFERENCES cat ON DELETE RESTRICT) decides; no pre-check, no extra isolation
-  let res = CatEntity::delete_many().filter(cat::Column::Id.eq(id)).secure().scope_with(&scope).exec(runner).await;
-  match res {
-      Ok(r) if r.rows_affected == 0 => Err(DomainError::not_found()),
-      Ok(_) => Ok(()),
-      Err(e) if e.is_foreign_key_violation() => Err(DomainError::conflict("cat has kittens")),
-      Err(e) => Err(e.into()),
-  }
-  ```
-- **How to find it.** A `SELECT`/`find()` whose result decides a later write, with no constraint, lock or
-  `SERIALIZABLE` retry path behind the decision; one transaction around both is not enough.
-- **How to catch it with a test.** On SQLite (FKs are enforced): deleting a cat with a kitten returns `Conflict`
-  and leaves both rows; deleting a missing cat returns `NotFound`. Reproduce the race with a PostgreSQL
-  [barrier test](#barrier-test-template) asserting the post-state invariant. Where a path deliberately runs
-  `SERIALIZABLE`, assert `rec.all_in_serializable_transaction()` on it and on every writer sharing its predicate.
-- **Typical fix.** A constraint, whenever one can express the invariant: a unique index for check-then-insert, an
-  FK with `ON DELETE RESTRICT`/`NO ACTION` for delete-if-no-children, a `CHECK` for a per-row bound; map the
-  violation with `ScopeError::is_unique_violation()`/`is_foreign_key_violation()` (GOOD above). When no constraint
-  can express it, the remaining options (a parent row lock, `SERIALIZABLE` with retry, an advisory lock) trade
-  correctness, contention and operational cost against each other; see
-  [Database trade-offs](../arch/database/TRADEOFFS.md#check-then-act-invariants).
+#### R1. A retried closure is safe to run again
+- **Rule.** Everything inside a closure passed to `transaction_with_retry` either rolls back with the transaction or is
+  idempotent: no external call, no direct publish, no change to state outside the closure.
+- **Why.** The closure re-runs on PostgreSQL `40001`/`40P01`, MySQL deadlocks and SQLite `SQLITE_BUSY`; anything
+  outside the transaction repeats.
+- **Cost.** That work moves out of the closure, so it runs outside the transaction; where it goes is a choice, see
+  [Transactions and external work](../arch/database/TRADEOFFS.md#transactions-and-external-work).
+- **How to find it.** An injected client (`Arc<dyn Client>`), a `producer.publish(..)`, or a write to captured shared
+  state inside the closure.
+- **How to test it.** A static `#[test]` over `include_str!`'d source matching the client type inside the closure,
+  with a negative control (audit step 8).
 
-### CAS without rows_affected check; lost update
-- **What it is.** A conditional `UPDATE .. WHERE <expected state>` guards a transition only if `rows_affected`
-  is checked; zero rows looks like success. Lost update: reading a whole row, changing one field and writing all
-  back overwrites a concurrent change to another field (a whole-`ActiveModel` `.update()`).
-  ```rust
-  // BAD: no state guard and rows_affected ignored: a lost race looks like success
-  CatEntity::update_many().col_expr(cat::Column::State, Expr::value("active"))
-      .filter(cat::Column::Id.eq(id)).secure().scope_with(&scope).exec(runner).await?;
+#### R2. The retry can fire
+- **Rule.** For a contention failure, `as_db_err` returns a `DbErr` the classifier recognizes after every `map_err`.
+- **Why.** The backend-dispatched classifier matches the SQLSTATE or error code, or the message text, including the
+  text of a `DbErr::Custom`. If the error was flattened into a `String` that `as_db_err` cannot return as a `DbErr`, or
+  a conversion drops that text, the loop never retries and the wrapper is dead code. A `.to_string()` used only for a
+  log line does not change the returned error.
+- **Cost.** The domain error type keeps the source `DbErr` (or a `DbErr::Custom` carrying the original message)
+  reachable.
+- **How to find it.** Follow every `map_err` between the repository call and the closure's return value.
+- **How to test it.** A unit round-trip passing a real contention error through the actual `map_err` chain into
+  `as_db_err` and the classifier.
 
-  // GOOD: guard on the expected state, set only touched columns, check rows_affected
-  let res = CatEntity::update_many().col_expr(cat::Column::State, Expr::value("active"))
-      .filter(cat::Column::Id.eq(id)).filter(cat::Column::State.eq("pending"))
-      .secure().scope_with(&scope).exec(runner).await?;
-  if res.rows_affected == 0 { return Err(DomainError::conflict("cat is not pending")); }
-  ```
-- **How to find it.** Is `rows_affected` mapped to a domain outcome? Do updates write only changed columns?
-- **How to catch it with a test.** Call the CAS twice with the same precondition; the second must return the
-  domain error. For lost update load two copies, change a different field in each, write both, and assert both
-  changes by a direct entity query ("Direct DB assertions" in 12).
-- **Typical fix.** Map zero rows to `Conflict`/`NotFound`/`StaleVersion`; update only changed columns or add an
-  optimistic-concurrency column checked in the `WHERE`.
+#### R3. Rows locked one at a time are locked in key order
+- **Rule.** A transaction that updates, deletes or locks several rows of one table one statement at a time visits them
+  in sorted key order.
+- **Why.** Two transactions visiting the same rows in opposite order wait on each other; PostgreSQL aborts one with
+  `40P01`. Locks taken by a single multi-row statement, an FK check or a cascade cannot be ordered this way; handling
+  those deadlocks is a choice, see [Row locks and dialects](../arch/database/TRADEOFFS.md#row-locks-and-dialects).
+- **Cost.** Sorting the keys before the loop.
+- **How to find it.** A loop of `update`/`delete`/locking `select` inside a transaction over an unsorted collection.
+- **How to test it.** A looped PostgreSQL barrier test running two opposite-order inputs and asserting both complete.
 
-### External effects inside a transaction; events outside it
-- **What it is.** (1) Network I/O or other slow work inside an open transaction holds locks longer and repeats on
-  every retry. (2) An event that must not be lost is published after `COMMIT`, so a crash in between loses it.
-  ```rust
-  // BAD: external call inside the transaction (holds locks, repeats on retry); event published after COMMIT
-  db.transaction_ref_mapped(|tx| Box::pin(async move {
-      vet.approve(&cat).await?;
-      repo.insert(tx, &scope, &cat).await
-  })).await?;
-  producer.publish(CatCreated { id }).await?;          // a crash before this line loses the event
+### Queries
 
-  // GOOD: call out first; state change and outbox row in one transaction; the wake fires only on commit
-  vet.approve(&cat).await?;
-  toolkit_db::outbox::in_transaction(&db, |tx| Box::pin(async move {
-      repo.insert(tx, &scope, &cat).await?;
-      let wake = producer.enqueue(tx, CatCreated { id }).await?;
-      Ok(((), wake))
-  })).await?;
-  ```
-- **How to find it.** An injected client (`Arc<dyn Client>`) called inside a closure; an event write outside it.
-- **How to catch it with a test.** Static: a source-text rule matching the client type inside the closure, with a
-  negative control. Dynamic: on the write-plus-event trace assert `rec.all_in_one_transaction()`,
-  `rec.writes_outside_tx().is_empty()` and that `rec.stats()` contains the outbox `INSERT`.
-- **Typical fix.** Call out before `BEGIN`, or after `COMMIT` when the effect tolerates a lost or repeated call. An
-  event that must survive a crash goes through `outbox::in_transaction`: its row commits with the state change and
-  the wake fires only after `COMMIT`. Whether an event needs that guarantee is a trade-off; see
-  [Database trade-offs](../arch/database/TRADEOFFS.md#transactions-and-external-work).
+#### R4. No statement binds a list that can outgrow the bind limit
+- **Rule.** A list whose length follows the data, not a validated request bound, is never bound into one statement
+  unbounded.
+- **Why.** Every backend caps bind parameters per statement; above the cap the statement fails at run time, usually
+  only on production-sized data.
+- **Cost.** The rule itself costs nothing; each way of staying under the cap (bounding the input, chunking against
+  `max_bind_params_for` with headroom for the other predicates including the scope's tenant filter, a PostgreSQL array
+  parameter) has its own cost, see [Batching and bind budgets](../arch/database/TRADEOFFS.md#batching-and-bind-budgets).
+- **How to find it.** `is_in(..)` or `insert_many(..)` fed by a collection loaded from the database or from an
+  unbounded request field.
+- **How to test it.** Run the operation with a list above the chunk size (or make the chunk size a parameter the test
+  can lower) and assert each `param_count` in `rec.events()` is at most `max_bind_params_for`.
 
-### Retry wiring and non-idempotent retries
-- **What it is.** `transaction_with_retry` re-runs the whole closure on PostgreSQL `40001`/`40P01`, MySQL
-  deadlocks and SQLite `SQLITE_BUSY`; that is correct only if the closure is safe to re-run. Failures: a durable
-  side effect outside the transaction repeats; a transaction that can abort (a deadlock, or `40001` under
-  `SERIALIZABLE`) has no retry wrapper; the `DbErr` is unreachable when the classifier runs.
-  ```rust
-  // BAD: this path locks two cats, so it can deadlock (40P01); the abort reaches the caller as a failed request
-  db.transaction_ref_mapped(|tx| Box::pin(async move {
-      repo.swap_kittens(tx, &scope, cat_a, cat_b).await
-  })).await
-
-  // GOOD: retry wrapper; the body is FnMut and runs again on retry, so clone captures per attempt.
-  // as_db_err: fn(&DomainError) -> Option<&DbErr>; it must still find the DbErr after every map_err
-  db.transaction_with_retry(TxConfig::default(), as_db_err, |tx| {
-      let (repo, scope) = (repo.clone(), scope.clone());
-      Box::pin(async move { repo.swap_kittens(tx, &scope, cat_a, cat_b).await })   // idempotent
-  }).await
-  ```
-- **How to find it.** Grep per file: a `transaction_ref_mapped`/`transaction_with_config` on a path that locks
-  rows or runs `SERIALIZABLE`, beside `transaction_with_retry` siblings, is the tell.
-- **How to catch it with a test.** Static scan of retried vs unretried calls, with a negative control; a round-trip
-  test passing the real contention error through the actual `map_err` chain into the classifier. The `DbErr` must
-  stay reachable by `extract_db_err`; a `.to_string()` anywhere in the chain turns the retry loop into dead code.
-- **Typical fix.** Wrap every transaction that can hit contention in the retry helper and keep non-idempotent
-  work outside the closure.
-
-### N+1, unchunked IN, missing LIMIT
-- **What it is.** An operation over N rows issues one statement per row (`O(N)`, `O(A*N)` for a hierarchy with
-  `A` ancestors) instead of a batch. Also: an `IN (..)` list bounded by data, not chunk size, can exceed the
-  bind limit; a `SELECT` without `LIMIT` on an unbounded table.
-  ```rust
-  // BAD: one query per id, and an unbounded IN list
-  for id in ids { CatEntity::find_by_id(id).secure().scope_with(&scope).one(runner).await?; }
-  CatEntity::find().filter(cat::Column::Id.is_in(ids.clone())).secure().scope_with(&scope).all(runner).await?;
-
-  // GOOD: one query per chunk replaces both the per-id loop and the unbounded IN
-  const RESERVED: usize = 2; // binds used by the other predicates, including the scope's tenant filter
-  let step = max_bind_params_for(runner) - RESERVED;
-  for chunk in ids.chunks(step) {
-      rows.extend(CatEntity::find().filter(cat::Column::Id.is_in(chunk.iter().copied()))
-          .secure().scope_with(&scope).all(runner).await?);
-  }
-  ```
-- **How to find it.** Classify each repository call in a loop as request- or data-bounded; collection `IN`s use
-  `toolkit_db::secure::max_bind_params_for` with headroom; reads have a `LIMIT` or keyset bound.
-- **How to catch it with a test.** Scale-invariance at small and large N via `rec.stats()` (audit step 7);
-  `rec.redundant_reads_after_write()` finds "insert, discard, re-read".
-- **Typical fix.** One batched `INSERT .. VALUES` or `IN (..)`, chunked when the list follows the data; add
-  `LIMIT`/keyset bounds; return what the write gave back.
-
-### Non-deterministic ORDER BY under offset pagination
-- **What it is.** A list sorts by a non-unique column and paginates with `LIMIT`/`OFFSET` without a unique
-  tie-breaker, so equal rows can swap order between pages: duplicates or skips, no error.
-  The OData layer refuses `$skip` ([07](07_odata_pagination_select_filter.md)); this is about hand-written `.offset()`.
+#### R5. A paginated query has a total order
+- **Rule.** The `ORDER BY` of every hand-written paginated query, offset or keyset, ends with a unique column in the
+  same direction. The OData layer refuses `$skip` ([07](07_odata_pagination_select_filter.md)); this is about
+  hand-written `.offset()` and cursors. Offset versus keyset is a choice, see
+  [Pagination](../arch/database/TRADEOFFS.md#pagination).
   ```rust
   // BAD: equal created_at values may swap order between pages
   CatEntity::find().order_by_desc(cat::Column::CreatedAt).limit(n).offset(m)
@@ -197,25 +128,17 @@ of [step 5](#how-to-run-an-audit).
   CatEntity::find().order_by_desc(cat::Column::CreatedAt)
       .order_by_desc(cat::Column::Id).limit(n).offset(m)
   ```
-- **How to find it.** For every `.offset(`, check `ORDER BY` ends with a unique column.
-- **How to catch it with a test.** On SQLite insert rows sharing one sort value, page through, assert the ids
-  across pages equal the inserted set, with no duplicates or omissions.
-- **Typical fix.** Append the primary key in the same direction, and as the trailing key of the index that
-  serves the sort. Whether offset paging is acceptable at all is a load question; see
-  [Database trade-offs](../arch/database/TRADEOFFS.md#pagination).
+- **Why.** Rows equal on the sort key can swap order between page queries: duplicates or skips, no error.
+- **Cost.** The index that serves the sort carries the unique column as its trailing key, or the database adds a sort
+  step.
+- **How to find it.** Every `.offset(` or hand-written cursor: the last `order_by` is a unique column.
+- **How to test it.** On SQLite insert rows sharing one sort value, page through, assert the ids across pages equal the
+  inserted set, with no duplicates or omissions.
 
-### Unindexed FK columns
-- **What it is.** A child table's FK column has no index, so deleting or updating a parent row scans the whole child
-  table to cascade or to check, under locks.
-- **How to find it.** List every FK column (audit step 3) and confirm an index starts with it.
-- **How to catch it with a test.** Invisible to a statement recorder; a migration-review question. Which other
-  indexes a query needs depends on the planner and the load; see
-  [Database trade-offs](../arch/database/TRADEOFFS.md#indexes).
-- **Typical fix.** A new migration adding the index.
-
-### COUNT used to check existence
-- **What it is.** `SELECT COUNT(*) .. > 0` counts all matches instead of stopping at the first. `COUNT` queries
-  are forbidden here: pagination is cursor-based and returns no total.
+#### R6. Existence is checked with LIMIT 1
+- **Rule.** A yes/no question uses `.one(..)` (a `LIMIT 1` query), never `COUNT(*) > 0`. Whether a list page carries a
+  total is decided in [07](07_odata_pagination_select_filter.md) (it does not); what to do when a number is really
+  needed is in [Counting and existence](../arch/database/TRADEOFFS.md#counting-and-existence).
   ```rust
   // BAD: counts every match to answer a yes/no question
   let exists = CatEntity::find().filter(cat::Column::Name.eq(name))
@@ -225,34 +148,63 @@ of [step 5](#how-to-run-an-audit).
   let exists = CatEntity::find().filter(cat::Column::Name.eq(name))
       .secure().scope_with(&scope).one(runner).await?.is_some();
   ```
-- **How to find it.** Grep `.count(` in repository code ([`07`](07_odata_pagination_select_filter.md): no totals).
-- **How to catch it with a test.** A static scan for `.count(` (allow-list real aggregates), or assert the normalized
-  SQL has `LIMIT` and no bare `COUNT(*)`.
-- **Typical fix.** `.filter(predicate).one(runner)`, branch on the `Option`.
+- **Why.** `COUNT` reads every match; `LIMIT 1` stops at the first.
+- **Cost.** None; `LIMIT 1` is never slower.
+- **How to find it.** `.count(` compared with zero.
+- **How to test it.** A static scan for `.count(` compared with zero, or assert the operation's trace has `LIMIT` and
+  no `COUNT(*)`.
 
-### SQLite / PostgreSQL / MySQL divergence
-- **What it is.** One code path behaves differently per backend, and SQLite's permissiveness hides it:
-  - **Locking.** `.lock(..)` renders differently per backend and SQLite renders no lock at all, so a SQLite race
-    test proves nothing about a lock; see [Database trade-offs](../arch/database/TRADEOFFS.md#row-locks-and-dialects).
-  - **Errors.** Map unique and FK violations with `ScopeError::is_unique_violation()`/`is_foreign_key_violation()`
-    (SQLSTATE first), not a hand-written message match; leave contention classification to `transaction_with_retry`.
-  - **Types.** SQLite compares a UUID with `TEXT` silently (often matching nothing); PostgreSQL raises
-    `operator does not exist: uuid = text`: bind a `Uuid`. Plain `json` has no equality operator on PostgreSQL:
-    use `jsonb`.
-- **How to find it.** Each `.lock(..)` renders valid SQL on every supported backend; each error `match` uses a code
-  or variant; each UUID/JSON predicate runs on a real engine.
-- **How to catch it with a test.** Execute the predicate on the real engine, as in
-  [`16_defect_class_to_control_map.md`](16_defect_class_to_control_map.md#wire--storage-type-mismatch); only a
-  real engine tells "no rows matched" from "the query would not run".
-- **Typical fix.** Structured error matching; explicit casts; route lock- and type-sensitive cases to PostgreSQL.
+### Backends
 
-### Migration hazards
-- **What it is.** Schema-evolution mistakes:
-  - editing a shipped migration;
-  - a SQLite table rebuild (create new, copy, drop old, rename) with `foreign_keys = ON`, where `DROP TABLE`
-    runs an implicit `DELETE` that fires `CASCADE`/`SET NULL` on children;
-  - an undocumented no-op `down()`;
-  - a new `NOT NULL`/`CHECK`/FK that existing rows violate, which passes on an empty test database.
+#### R7. Constraint violations are recognized by code
+- **Rule.** Unique and FK violations are recognized with `ScopeError::is_unique_violation()` /
+  `is_foreign_key_violation()`, never by matching message text; contention is left to `transaction_with_retry`.
+- **Why.** Message text differs per backend and version.
+- **Cost.** None.
+- **How to find it.** `.contains(..)` or string comparison on a database error.
+- **How to test it.** Provoke the violation in a SQLite unit test and assert the mapped domain error; the same on a
+  real PostgreSQL (and MySQL where supported).
+
+#### R8. UUIDs are bound as Uuid
+- **Rule.** A UUID column is compared with a `Uuid` value, never a string.
+- **Why.** SQLite compares a UUID with `TEXT` silently, often matching nothing; PostgreSQL raises
+  `operator does not exist: uuid = text`.
+- **Cost.** None.
+- **How to find it.** A UUID column filtered with a `String`/`&str`.
+- **How to test it.** Run the predicate on a real PostgreSQL (T4).
+
+#### R9. On MySQL only Update and Share locks
+- **Rule.** A gear that runs on MySQL uses only `LockType::Update` and `LockType::Share`.
+- **Why.** MySQL has only `FOR UPDATE` and `FOR SHARE` / `LOCK IN SHARE MODE`; sea-query does not translate
+  `NoKeyUpdate` and `KeyShare` for it, they come out as PostgreSQL phrases and fail with a syntax error.
+- **Cost.** The weaker PostgreSQL lock strengths are unavailable on that path.
+- **How to find it.** `.lock(LockType::NoKeyUpdate)` / `KeyShare` in a gear that supports MySQL.
+- **How to test it.** Run the locking query on every supported backend.
+
+### Migrations
+
+#### R10. A shipped migration is never edited
+- **Rule.** A change to the schema is a new migration; a migration that has shipped is never edited.
+- **Why.** Databases that already ran it keep the old schema while new ones get the edited one, and nothing records
+  the difference.
+- **Cost.** Every change, however small, is a new migration.
+- **How to find it.** The diff modifies an existing migration file instead of adding one.
+- **How to test it.** Review only.
+
+#### R11. A SQLite table rebuild keeps its child rows
+- **Rule.** A migration that rebuilds a SQLite table (create new, copy, drop old, rename) preserves every row of the
+  tables that reference it.
+- **Why.** The toolkit runner executes `up()` inside a transaction, where `PRAGMA foreign_keys = OFF` is a no-op; with
+  foreign keys on, `DROP TABLE` runs an implicit `DELETE` that fires `CASCADE` or `SET NULL` on child rows.
+- **Cost.** The migration copies child rows out and back, or rebuilds the children as well: more code, a longer
+  migration.
+- **How to find it.** A `DROP TABLE` of a referenced table on the SQLite path.
+- **How to test it.** Seed a parent with children, run `up()`, assert the children are intact; check the rebuild in a
+  real `sqlite3` session with the pragma set explicitly.
+
+#### R12. down() says what it does
+- **Rule.** `down()` undoes `up()`, or returns `Err(DbErr::Migration(..))` stating why it cannot; a documented
+  `Ok(())` only when `up()` left nothing to undo.
   ```rust
   // BAD: no-op down() that reads as a working rollback
   async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> { Ok(()) }
@@ -263,53 +215,37 @@ of [step 5](#how-to-run-an-audit).
                             rebuild `cat` (create, copy, drop, rename) by hand".into()))
   }
   ```
-- **How to find it.** The diff adds a migration, not edits one; trace child tables when a rebuilt table drops;
-  each `down()` undoes `up()` or documents why not; ask what violating rows do.
-- **How to catch it with a test.** Run `up()`, `down()`, `up()` on both backends, calling `down()` directly (the
-  toolkit runner applies only `up()`); an irreversible `down()` returns `Err(DbErr::Migration(..))` and is exempt.
-  Check SQLite rebuilds in a real `sqlite3` session with the pragma set explicitly. Seed a violating row and
-  confirm the migration fails loudly on it instead of passing only on an empty database.
-- **Typical fix.** A new migration; `Err(DbErr::Migration(..))` for an irreversible `down()`, a documented `Ok(())`
-  only when nothing needs undoing. Rebuilds and constraint changes on populated tables have options with different
-  lock and downtime costs; see [Database trade-offs](../arch/database/TRADEOFFS.md#migrations-on-populated-tables).
+- **Why.** The toolkit runner applies only `up()`, so nothing exercises `down()`; a no-op `Ok(())` reads as a working
+  rollback.
+- **Cost.** None beyond writing the reason.
+- **How to find it.** Each `down()` against its `up()`.
+- **How to test it.** Run `up()`, `down()`, `up()` on both backends, calling `down()` directly; an irreversible
+  `down()` returning `Err(DbErr::Migration(..))` is exempt.
 
-### Deadlocks and lock ordering
-- **What it is.** Two operations lock the same rows in opposite order and wait on each other; PostgreSQL aborts
-  one with `40P01`, which `transaction_with_retry` treats like `40001`.
-- **How to find it.** Operations that lock the same rows (by `UPDATE`/`DELETE`, `FOR UPDATE` or an FK check) take
-  them in one order (id order for a batch, or `SELECT .. ORDER BY id FOR UPDATE` first), or run inside retry.
-- **How to catch it with a test.** A looped PostgreSQL barrier test running the opposite-order operations and
-  asserting both complete.
-- **Typical fix.** One lock order at every call site; otherwise wrap both operations in `transaction_with_retry`.
+### Tests
 
-### Mappers defaulting instead of erroring
-- **What it is.** A row-to-domain mapper meets a value that does not parse (a migration gap or manual fix) and
-  substitutes a default, which may silently decide authorization or ownership.
-  ```rust
-  // BAD: an unparseable column silently becomes Breed::default()
-  impl From<cat::Model> for Cat {
-      fn from(m: cat::Model) -> Self { Self { id: m.id, breed: Breed::parse(&m.breed).unwrap_or_default() } }
-  }
+#### T1. A suite CI relies on fails instead of skipping
+- **Rule.** A PostgreSQL suite that CI relies on fails when Docker is missing; a local run may skip only when the CI
+  flag (e.g. `<GEAR>_PG_REQUIRE_DOCKER=1`) is unset.
+- **Why.** A PostgreSQL suite that returns early without Docker is green in CI having run nothing.
+- **Cost.** CI runners need Docker.
+- **How to find it.** An early `return` when the fixture is `None` without checking the flag.
+- **How to test it.** The [template](#barrier-test-template) below does it.
 
-  // GOOD: fallible conversion; the caller sees the corrupt row
-  impl TryFrom<cat::Model> for Cat {
-      type Error = DomainError;
-      fn try_from(m: cat::Model) -> Result<Self, DomainError> {
-          let breed = Breed::parse(&m.breed).ok_or_else(|| DomainError::internal("cat.breed"))?;
-          Ok(Self { id: m.id, breed })
-      }
-  }
-  ```
-- **How to find it.** Does an unparseable column give `Err` or a logged default?
-- **How to catch it with a test.** On SQLite insert a garbage value directly, run the mapper, assert `Err`.
-- **Typical fix.** Return `Result` and propagate.
+#### T2. Assertions check the outcome
+- **Rule.** No `is_ok()` alone, no `is_err()` without the error variant, no "both callers succeeded" without the table
+  state.
+- **Why.** Such assertions pass with the bug present.
+- **Cost.** None.
+- **How to find it.** Ask of each assertion whether it fails when the bug is present; revert a fix to confirm.
+- **How to test it.** Not mechanizable; the backstop is
+  [`16_defect_class_to_control_map.md`](16_defect_class_to_control_map.md#coverage-that-proves-nothing): every known
+  defect has a named assertion; an `#[ignore]`d one names the defect in its reason string.
 
-### Tests that prove nothing
-- **What it is.** Suite defects that let the classes above through:
-  - silent skip without Docker, so nothing guarantees the PostgreSQL suite runs in CI;
-  - tautological assertions (`is_ok()`; both callers succeeded, no table-state check);
-  - `is_err()` without the error;
-  - `sleep` instead of a barrier, a timing guess.
+#### T3. Concurrent callers start on a barrier
+- **Rule.** A concurrency test releases its callers with a barrier, never a `sleep`, and asserts the table state. A
+  barrier only starts the calls together; a passing run does not rule out a race, only a failed post-state assertion
+  demonstrates it (see the [template](#barrier-test-template)).
   ```rust
   // BAD: sleep is a timing guess; the assertion ignores table state
   let t1 = tokio::spawn(async move { svc1.create(a).await });
@@ -327,16 +263,32 @@ of [step 5](#how-to-run-an-audit).
   assert_eq!(CatEntity::find().filter(cat::Column::Name.eq("tom"))
       .secure().scope_with(&scope).all(&conn).await?.len(), 1);
   ```
-- **How to find it.** Confirm CI sets a flag (e.g. `<GEAR>_PG_REQUIRE_DOCKER=1`) that makes the PostgreSQL suite
-  fail instead of skip without Docker (see the template). Ask of each assertion whether it fails when the bug is
-  present; revert a fix to confirm.
-- **How to catch it with a test.** Not mechanizable; the backstop is
-  [`16_defect_class_to_control_map.md`](16_defect_class_to_control_map.md#coverage-that-proves-nothing):
-  every known defect has a named assertion; an `#[ignore]`d one names the defect in its reason string.
-- **Typical fix.** Fail closed in CI; assert table state and specific error variants; use barriers.
+- **Why.** A `sleep` is a timing guess.
+- **Cost.** None.
+- **How to find it.** `tokio::time::sleep` between the spawns of a concurrency test.
+- **How to test it.** The test itself; revert the fix and confirm the post-state assertion fails.
+
+#### T4. Lock- and type-dependent behaviour is tested on a real PostgreSQL
+- **Rule.** Behaviour that depends on a lock or a column type is tested on a real PostgreSQL, not only on SQLite.
+- **Why.** SQLite renders no lock at all and serializes writers per database, and it compares a UUID with `TEXT`
+  silently, so a SQLite run proves nothing about a lock or a typed predicate; only a real engine tells "no rows
+  matched" from "the query would not run"
+  ([`16_defect_class_to_control_map.md`](16_defect_class_to_control_map.md#wire--storage-type-mismatch)).
+- **Cost.** Docker in CI and a slower suite.
+- **How to find it.** A `.lock(..)` or a UUID predicate covered only by SQLite tests.
+- **How to test it.** A feature-gated Rust suite via `testcontainers`, in-process, no HTTP.
+
+#### T5. A migration that adds a constraint meets a violating row
+- **Rule.** A migration adding `NOT NULL`, `CHECK` or an FK is tested on a table that holds a violating row.
+- **Why.** On an empty test database it passes; on populated data it fails or blocks.
+- **Cost.** A seeded fixture per such migration.
+- **How to find it.** A migration that adds a constraint with no test that seeds a violating row.
+- **How to test it.** Seed the violating row and confirm the migration fails loudly or its backfill handles the row.
+  How to roll it out on a populated table is a choice, see
+  [Migrations on populated tables](../arch/database/TRADEOFFS.md#migrations-on-populated-tables).
 
 ## How to run an audit
-Run the audit as an LLM pass over the gear, with the catalog above as the checklist; the output is fixes and
+Run the audit as an LLM pass over the gear, with the rules above as the checklist; the output is fixes and
 pinned tests, not a stored report. Tooling: `toolkit_db::test_support` behind the `test-support` cargo feature
 (enable it in the gear's `[dev-dependencies]`); `rec` below is its `QueryRecorder`.
 
@@ -344,9 +296,10 @@ pinned tests, not a stored report. Tooling: `toolkit_db::test_support` behind th
 2. **Transaction map.** Per state-changing operation: what runs before and inside the transaction (order,
    isolation), where external effects sit relative to `BEGIN`/`COMMIT`, and what a crash or a concurrent caller
    does between steps. This is the highest-yield step.
-3. **FK index check.** For each FK column, confirm an index starts with it ([Unindexed FK columns](#unindexed-fk-columns));
-   other index questions are planner- and load-dependent ([trade-offs](../arch/database/TRADEOFFS.md#indexes)).
-4. **Loop check.** Find repository calls inside loops; classify as request- or data-bounded ([N+1](#n1-unchunked-in-missing-limit)).
+3. **Rules.** Walk the [Rules](#rules) above, using each rule's "How to find it".
+4. **Decision points.** For each [TRADEOFFS](../arch/database/TRADEOFFS.md) topic that occurs in the gear, confirm
+   the chosen option is deliberate, recorded (a comment at the call site for a local choice, the gear's design doc,
+   an ADR when callers or consumers depend on the guarantee) and pinned by a test.
 5. **Trace and read.** Write one *trace test* per write operation: a normal `#[tokio::test]` that runs the
    operation once over a recorder-backed `Db` and records every statement:
    ```rust
@@ -358,24 +311,28 @@ pinned tests, not a stored report. Tooling: `toolkit_db::test_support` behind th
    ```
    Dump with `DB_AUDIT_TRACE_DIR=target/db-behavior-traces cargo nextest run -p <gear> --test <trace test file>`
    and read each `.txt` by eye before writing assertions.
-6. **Assert the shapes.** Assert `rec.untransacted_read_modify_write().is_empty()` and
-   `rec.untransacted_write_runs().is_empty()` (advisory: a hit is a defect only if the write relies on what came
-   before it) and, for paths that must not re-read what they wrote, `rec.redundant_reads_after_write().is_empty()`.
-   A lone write outside a transaction is fine. For an operation that must be one transaction assert
-   `rec.all_in_one_transaction()` with `rec.writes_outside_tx().is_empty()` (the former ignores statements outside
-   a transaction). Assert `rec.all_in_serializable_transaction()` only on a path that deliberately runs
-   `SERIALIZABLE` and on its sibling writers; it checks the level the code *requested* (SQLite is serializable
-   regardless), and both `all_in_*` are `false` when nothing ran in a transaction. Put `rec.dump()` in assertion
-   messages.
-7. **Scale-invariance.** Run the same operation at N=2 and N=50 (`rec.clear()` between) and compare `rec.stats()`:
-   statement counts must be identical unless a list is chunked. `rec.total_params()` may grow with N wherever one
-   statement binds a list, by a constant per row. A chunked list adds a statement each time N crosses the chunk
-   size, `ceil(N / chunk_size)` in all; run a case above the chunk size (or make it a parameter the test can lower),
-   assert that count and that each `param_count` in `rec.events()` is at most `max_bind_params_for`.
-8. **Static rules for what SQL cannot show.** Retry wiring, external calls in transactions and `COUNT` use are
-   not in a trace: write a `#[test]` over `include_str!`'d source that fails on the pattern, plus a *negative
-   control* that must fail on a deliberately bad string.
-9. **Barrier tests** (PostgreSQL): for each TOCTOU/CAS/deadlock finding, start two callers at once (template below).
+6. **Assert the shapes.** Pin the transaction shape the gear chose: assert
+   `rec.untransacted_read_modify_write().is_empty()` and `rec.untransacted_write_runs().is_empty()` (advisory: a hit
+   is a defect only if the write relies on what came before it) and, for paths that must not re-read what they wrote,
+   `rec.redundant_reads_after_write().is_empty()`. A lone write outside a transaction is fine. For an operation that
+   must be one transaction assert `rec.all_in_one_transaction()` with `rec.writes_outside_tx().is_empty()` (the former
+   ignores statements outside a transaction). Assert `rec.all_in_serializable_transaction()` only on a path that
+   deliberately runs `SERIALIZABLE` and on its sibling writers; it checks the level the code *requested* (SQLite is
+   serializable regardless), and both `all_in_*` are `false` when nothing ran in a transaction. Put `rec.dump()` in
+   assertion messages.
+7. **Pin the statement count.** Run the same operation at N=2 and N=50 (`rec.clear()` between) and assert the
+   statement counts the gear chose: constant, or `ceil(N / chunk_size)` for a chunked list (run a case above the
+   chunk size or lower it through a parameter); a change in either fails the test and turns into a deliberate
+   decision. `rec.total_params()` may grow with N wherever one statement binds a list; each `param_count` stays
+   within [R4](#r4-no-statement-binds-a-list-that-can-outgrow-the-bind-limit).
+8. **Static rules for what SQL cannot show.** The contents of a retried closure
+   ([R1](#r1-a-retried-closure-is-safe-to-run-again)), `COUNT` used for existence
+   ([R6](#r6-existence-is-checked-with-limit-1)) and message matching on errors
+   ([R7](#r7-constraint-violations-are-recognized-by-code)) are not in a trace: write a `#[test]` over
+   `include_str!`'d source that fails on the pattern, plus a *negative control* that must fail on a deliberately bad
+   string.
+9. **Barrier tests** (PostgreSQL): for each race-prone decision point (check-then-act, conditional writes) and for
+   [R3](#r3-rows-locked-one-at-a-time-are-locked-in-key-order), start two callers at once (template below).
 10. **Pin every known defect** as a named assertion for the *correct* behaviour, `#[ignore = "known defect: <what>"]`;
     the fix removes the `#[ignore]`. If it cannot be asserted directly, assert today's behaviour and comment what
     to flip.
@@ -408,21 +365,14 @@ the plain barrier for likely races, the hook to reproduce one deterministically.
 
 ## Where to keep which test
 
-| Class | Test level | Dialect | Guide |
+| Test kind | What it can show | Dialect | Used for |
 |---|---|---|---|
-| Check-then-act / TOCTOU shape | SQLite unit test, query recorder | SQLite suffices | this doc; [`12_unit_testing.md`](12_unit_testing.md) for test setup |
-| The race behind a TOCTOU shape, or a CAS under real concurrency | Barrier test (can fail, cannot prove) | PostgreSQL only | this doc |
-| CAS / `rows_affected` / lost update (sequential) | SQLite unit test | SQLite suffices | this doc; [`12_unit_testing.md`](12_unit_testing.md) for test setup |
-| External call / event-in-tx | Static scan + recorder (`all_in_one_transaction`, `writes_outside_tx`) | SQLite suffices | this doc |
-| Retry wiring / error-shape preservation | Static scan + unit round-trip test | SQLite suffices | this doc |
-| N+1 / scale-invariance | Query recorder, small-N vs large-N | SQLite suffices | this doc |
-| Pagination tie-breaker | SQLite unit test (forced duplicate sort key) | SQLite suffices | this doc; [`12_unit_testing.md`](12_unit_testing.md) for test setup, [`13_e2e_testing.md`](13_e2e_testing.md) for the HTTP cursor roundtrip |
-| Unindexed FK column | Migration review | N/A | this doc |
-| `COUNT`-for-existence | Static scan | N/A | this doc |
-| Backend divergence (types, locking, errors) | Feature-gated Rust suite via `testcontainers`, in-process, no HTTP | PostgreSQL (and MySQL where supported) | [`13_e2e_testing.md`](13_e2e_testing.md#coverage-goal-one-call-per-api-method) (which PostgreSQL suite to use) |
-| Migration correctness (rebuild, `down()`, constraints on populated data) | Migration test on both backends | Both; SQLite rebuild also needs a raw `sqlite3` check | [`11_database_patterns.md`](11_database_patterns.md#database-migrations) |
-| Deadlock / lock ordering | Barrier test, looped | PostgreSQL only | this doc |
-| Mapper defaulting | SQLite unit test (garbage column value) | SQLite suffices | this doc; [`12_unit_testing.md`](12_unit_testing.md) for test setup |
+| SQLite unit test (setup from [`12_unit_testing.md`](12_unit_testing.md)) | Sequential behaviour, error mapping, page order | SQLite | R5, R6, R7, T2, and pinned choices that do not depend on concurrency |
+| Query-recorder trace test | Statement shape, transaction boundaries, statement and bind counts | SQLite suffices | R4, audit steps 6-7 |
+| Static source rule with a negative control | What SQL cannot show | N/A | R1, R6, R7 |
+| Barrier test, looped where needed (can fail, cannot prove) | Races and deadlocks | PostgreSQL only | R3, T3, check-then-act and conditional-write choices |
+| Feature-gated real-engine suite (`testcontainers`, in-process, no HTTP) | Locks, types, backend errors | PostgreSQL (and MySQL where supported) | R8, R9, T4; [`13_e2e_testing.md`](13_e2e_testing.md#coverage-goal-one-call-per-api-method) says which PostgreSQL suite to use |
+| Migration test on both backends | `up`/`down`/`up`, rebuilds, constraints on populated data | Both; a SQLite rebuild also in a raw `sqlite3` session | R10-R12, T5; [`11_database_patterns.md`](11_database_patterns.md#database-migrations) |
 
 Needs HTTP and a real database: E2E (13). Needs real PostgreSQL/MySQL but no HTTP: a feature-gated Rust suite
 inside the gear, outside the 12/13 split; name it in the gear's testing doc. Anything else: SQLite unit test (12).
@@ -433,4 +383,4 @@ inside the gear, outside the 12/13 split; name it in the gear's testing doc. Any
 - [`12_unit_testing.md`](12_unit_testing.md): the sequential, SQLite-backed half of DB tests.
 - [`13_e2e_testing.md`](13_e2e_testing.md): HTTP-level cursor roundtrips; why concurrency is not E2E's job.
 - [`16_defect_class_to_control_map.md`](16_defect_class_to_control_map.md): the whole-gear defect-to-control map this document specializes.
-- [`docs/arch/database/TRADEOFFS.md`](../arch/database/TRADEOFFS.md): the load- and shape-dependent choices behind the catalog (isolation, locks, indexes, pagination, batching, migrations), as pros and cons, not rules.
+- [`docs/arch/database/TRADEOFFS.md`](../arch/database/TRADEOFFS.md): the choices with a price (isolation, locks, indexes, pagination, batching, events, migrations): options with their guarantees and costs, not rules.
