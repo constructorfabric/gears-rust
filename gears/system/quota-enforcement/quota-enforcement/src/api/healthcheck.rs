@@ -64,8 +64,9 @@ impl Healthcheck for ReadinessCheck {
             ReadinessState::Ready => self.cluster_verdict().await,
             ReadinessState::Starting => HealthcheckResult::unhealthy("bootstrap in progress")
                 .with_code("qe_bootstrap_pending"),
-            ReadinessState::Failed { dependency, reason } => {
-                HealthcheckResult::unhealthy(format!("{dependency} unavailable: {reason}"))
+            // The reason stays in the bootstrap log: `/health` is unauthenticated.
+            ReadinessState::Failed { dependency, .. } => {
+                HealthcheckResult::unhealthy(format!("{dependency} unavailable"))
                     .with_code(format!("qe_{}_unavailable", dependency.as_label()))
             }
         }

@@ -215,7 +215,13 @@ fn digest_hex_round_trip_and_rejection() {
     );
     let json = serde_json::to_string(&key).expect("serialize");
     assert_eq!(json, format!("\"{hex}\""));
-    for bad in ["", "abc", &"zz".repeat(32), &"ab".repeat(31)] {
+    for bad in [
+        "",
+        "abc",
+        &"zz".repeat(32),
+        &"ab".repeat(31),
+        &"+f".repeat(32),
+    ] {
         assert!(
             IdempotencySubjectKey::parse_hex(bad).is_err(),
             "must reject {bad:?}"
