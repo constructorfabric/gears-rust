@@ -28,8 +28,9 @@ decision-makers: BSS Orders team
 ## Context and Problem Statement
 
 The submit gate adopts the published pricing sellability gate **by reference** (PRD §6.1) and adds
-the Orders delta. Under the PriceBook target (ADR-0008), the `PricingReadV1` trait, the Products SKU read grant, the residual
-`SellabilityV1` verdict and Subscriptions' pinned comparison at activation are unavailable, and the
+the Orders delta. Under the reconciled PriceBook target (D-187–D-190), Pricing read/acceptance/hold
+capabilities exist, but Orders integration/evidence, Products grants, nonbinding assessment and
+Subscriptions' [receipt-based activation protocol](../DESIGN.md#contract-03-accepted-price-activation) remain prerequisites; the
 against-existing-subscriptions half of the overlap rule needs an occupancy read (`SUB-O5`, amended by D-126) that
 Subscriptions does not expose.
 

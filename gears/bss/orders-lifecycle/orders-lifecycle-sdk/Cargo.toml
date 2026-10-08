@@ -1,0 +1,24 @@
+[package]
+name = "cf-gears-bss-orders-lifecycle-sdk"
+edition.workspace = true
+license.workspace = true
+description = "Orders Lifecycle shared contract and typed local SDK boundary"
+
+[lib]
+name = "bss_orders_lifecycle_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-gts = { workspace = true }
+bss-pricing-sdk = { workspace = true }
+rust_decimal = { workspace = true }

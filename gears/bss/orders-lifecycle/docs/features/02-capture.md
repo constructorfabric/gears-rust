@@ -313,6 +313,7 @@ Output: line_id, or a registered refusal
 2. [ ] - `p1` - Assign a stable line_id - `inst-al-assign-line-id`
 3. [ ] - `p1` - Retain any explicitly authored calendar field as authored; resolution of the cascade belongs to the gate per §4.2 and is **not** performed here - `inst-al-retain-authored-dates`
 4. [ ] - `p1` - Record term_duration and billing_cycle as authored - `inst-al-record-term-cycle`
+   Preserve calendar units and rolling intent for the [D-193 exact invoice-period mapping](../DESIGN.md#contract-03-billing-terms-resolution); no day/second approximation or implicit anchor default. Unsupported intent can remain a draft diagnostic but cannot pass commercial acceptance.
 5. [ ] - `p1` - Request the line-authoring transition with expected_draft_revision; the engine checks it against the locked draft revision and increments draft_revision atomically with the commercial edit, without advancing current_version. A mismatch returns version-conflict - `inst-al-request-transition`
 6. [ ] - `p1` - **RETURN** line_id and the committed draft_revision - `inst-al-return-line-id`
 
@@ -389,7 +390,7 @@ editable in place through the same endpoint.
 A `draft` order **MUST** be modifiable freely: lines added, amended and removed, administrative
 and commercial content alike edited in place — with one exception, the seller, below. This is possible because draft content lives in the
 **mutable** `orders_draft_content` table rather than in the append-only version chain, and the
-submit transition materialises it into version 2 ([01-foundation — Database Schemas and Tables](../DESIGN.md#contract-01-3-7)).
+submit transition materialises it into its reserved candidate version (D-188; [01-foundation — Database Schemas and Tables](../DESIGN.md#contract-01-3-7)).
 Without that separation, "a draft is freely modifiable" and "the version chain is append-only"
 would contradict each other. Authoring **MUST NOT** resolve a catalog
 reference, evaluate a sellability predicate, capture a price pin or produce a resolved total. A
@@ -406,7 +407,7 @@ resource and payer axes stay editable in `draft`; a seller change is a new order
 Every commercial draft edit (including line insertion/removal and resource or payer axis
 changes) requires `expected_draft_revision`, included in the idempotency request fingerprint. On
 `draft-mutate` it is **optional at the boundary** (D-147): omitting it is never a boundary
-rejection, since a client of an order past `draft` has never been shown a `draftRevision`. The
+rejection, since a client of an order past `draft` has never been shown a `draft_revision`. The
 engine compares it only at foundation §3.6 *Attempt Transition* step 12, after step 11's
 admissibility check, so a commercial `PATCH` outside `draft` refuses `not-admissible` (D-145), and
 in `draft` an omitted value refuses `version-conflict` naming the current draft revision. An
@@ -529,3 +530,6 @@ schedules or performs the sweep.
 - **ADRs**: [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md) transition through the engine; [`ADR/0002`](../ADR/0002-cpt-cf-bss-orders-lifecycle-adr-slice-decomposition.md) the foundation-plus-seven-slices decomposition; [`ADR/0004`](../ADR/0004-cpt-cf-bss-orders-lifecycle-adr-closed-enumerations.md) the closed state and event enumerations
 
 <!-- /contract -->
+
+
+**D-188 reconciliation:** Draft edits retain current_version=1 even after failed submissions burn candidates. Every new submission snapshots the new draft revision; it cannot reuse a failed attempt or Pricing query identity. See the [normative attempt and sparse-history contract](../DESIGN.md#contract-01-commercial-attempt).

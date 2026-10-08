@@ -29,6 +29,11 @@
   - [Gate and pin: The Orders delta (normative)](#gate-and-pin-the-orders-delta-normative)
   - [Gate and pin: Preview (normative)](#gate-and-pin-preview-normative)
   - [Gate and pin: Traceability](#gate-and-pin-traceability)
+  - [R07 billing terms before acceptance (D-193)](#r07-billing-terms-before-acceptance-d-193)
+  - [R08 service authority before commercial calls (D-194)](#r08-service-authority-before-commercial-calls-d-194)
+  - [R09 complete diagnostics and mapping (D-195)](#r09-complete-diagnostics-and-mapping-d-195)
+  - [R10 catalog reads and reference protection (D-196)](#r10-catalog-reads-and-reference-protection-d-196)
+  - [R11 evaluation contract (D-197)](#r11-evaluation-contract-d-197)
 
 <!-- /toc -->
 
@@ -68,8 +73,8 @@ Ensure admission has complete, explainable evidence and consistent per-line revi
 - **Architecture**: [DESIGN.md](../DESIGN.md), including [03 models](../DESIGN.md#contract-03-3-1), [03 interfaces](../DESIGN.md#contract-03-3-3), and [03 persistence](../DESIGN.md#contract-03-3-7). Complete behavior is in [§7](#7-detailed-behavior-contracts).
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md).
 - **Dependencies**: [Foundation](01-foundation.md), `cpt-cf-bss-orders-lifecycle-feature-foundation`; [Capture](02-capture.md), `cpt-cf-bss-orders-lifecycle-feature-capture`.
-- **Upstream blockers**: [UPSTREAM_REQS.md](../UPSTREAM_REQS.md) retains the unexposed `PricingReadV1` trait, the `bss-orders.system` grant, the residual purchase verdict, Subscriptions' compare-at-activation step and complete item coverage, the SUB-G1 overlap-key answer, Rating evaluation/TCV, payer profile, Contracts, indicative tax, Subscriptions occupancy and atomic activation enforcement. Missing contracts remain unevaluable/unavailable; no local substitute is authorized.
-- **Open decisions**: [DECISIONS.md](../DECISIONS.md) retains latency/budget ratification, partner overlap-key dimension, activation-duration policy and quote coverage (Q-29). The new initial-binding deadline is specified in DESIGN §4.3; its producer capability and Product duration policy remain open.
+- **Upstream blockers**: [UPSTREAM_REQS.md](../UPSTREAM_REQS.md) retains Orders integration/conformance for the existing typed `PricingReadV1` (D-187), required evidence gaps, the Orders service-principal grants (D-194), the proposed D-189 nonbinding Pricing assessment, Subscriptions' D-190 receipt/hold/live-eligibility handoff and complete item coverage, the SUB-G1 overlap-key answer, Rating evaluation/TCV, payer profile, Contracts, indicative tax, Subscriptions occupancy and atomic activation enforcement. Missing contracts remain unevaluable/unavailable; no local substitute is authorized.
+- **Open decisions**: [DECISIONS.md](../DECISIONS.md) retains latency/budget ratification, partner overlap-key dimension and quote coverage (Q-29). D-191 resolves deadline ownership; Pricing seller-policy discovery/resolution, policy values and integration remain implementation prerequisites.
 
 **UI applicability**: UI layout, keyboard navigation, screen-reader behavior and visual accessibility are not applicable because this feature specifies backend contracts, not a user interface. API usability, actionable errors and non-disclosing diagnostics remain applicable; consuming consoles own their UI requirements.
 
@@ -83,7 +88,7 @@ Ensure admission has complete, explainable evidence and consistent per-line revi
 
 **Actor**: An authorized order submitter.
 
-**Success Scenarios**: All required inputs pass; submit commits version 2, pins, totals, dates, market, diagnostics, audit, claims, replay response and `OrderSubmitted` enqueue together.
+**Success Scenarios**: All required inputs pass; submit commits reserved candidate version C, pins, totals, dates, market, diagnostics, audit, claims, replay response and `OrderSubmitted` enqueue together.
 
 **Error Scenarios**: Engine authorization/idempotency/state/revision refusal; empty basket; structural or date-basis refusal; failed/unevaluable assessment; authoritative overlap collision; persistence failure.
 
@@ -92,7 +97,7 @@ Ensure admission has complete, explainable evidence and consistent per-line revi
 2. Snapshot the authorized authored basket under its lock with `prepared_draft_revision`; declare the non-empty guard and snapshot effective resource-tenant date policy. Prepare the exact proposed dates before dependent resolution.
 3. Resolve identity once, including the payer profile, and derive market from the payer. Fix the seller scope, common assessment date and revision per line; no latest-revision substitution.
 4. Resolve each line's catalog product key at that version in one batched call; build the payer/product claim tuple from that result, never from line labels or guessed identifiers.
-5. Resolve independent catalog predicates, referenced-contract facts, batched occupancy and accepted-binding composition under §3.3; Rating evaluation follows composition. Independent checks run in parallel, and composition still records its outcome when an independent check fails. Skip only operations whose prerequisite input is missing.
+5. Follow [D-188](../DESIGN.md#contract-01-commercial-attempt) before any durable Pricing acceptance command: reserve/fence an immutable attempt and candidate, with stable per-line keys. Resolve independent catalog predicates, referenced-contract facts, batched occupancy and accepted-binding composition under §3.3; Rating evaluation follows composition. Independent checks run in parallel, and composition still records its outcome when an independent check fails. Skip only operations whose prerequisite input is missing.
 6. Assess the adopted predicates and all nine Orders predicates (§3.1), retaining passed, failed and unevaluable results. Include each line's pin outcome. Keep the failure list separate and avoid duplicate reference/pin or date failures.
 7. Pass the complete assessment and admission/refusal contribution to the engine. Locked state/version/client/prepared-revision and pre-gate structural checks retain precedence. Check the date defaults against the engine timestamp before accepting date-dependent evidence.
 8. On refusal after assessment, atomically persist complete diagnostic rows, audit and owned idempotency response; write no commercial version, pin, total or event. Replace advisory overlap predicate 9 with any authoritative claim collision before settlement.
@@ -130,7 +135,7 @@ Ensure admission has complete, explainable evidence and consistent per-line revi
 1. Read the authorized current order/version and stored payer, market and overlap keys. If held, terminal or superseded, return `not-dispatchable` with observed state/version; stop dispatch and do not acknowledge failure just for that result.
 2. Read the current payer profile. Unavailability returns `defer(identity-party-unavailable)`; an actual market difference returns per-line `reject(market-divergence)`.
 3. Read occupancy in one batch using stored keys, never a new registry lookup. Missing count/limit returns `defer(overlap-presence-unevaluable)`.
-4. Compare active count plus pending lines with the effective maximum, returning `reject(overlap-collision)` on excess. Also reject an elapsed stored activation deadline as `order-binding-expired`; otherwise return `proceed`, subject to Subscriptions' pinned comparison at activation (DESIGN §4.3, D-162).
+4. Compare active count plus pending lines with the effective maximum, returning `reject(overlap-collision)` on excess. Also reject an elapsed stored activation deadline as `order-binding-expired`; otherwise return `proceed`, subject to Subscriptions' committed-receipt admission protocol (DESIGN §4.3, D-190); D-191 requires the stored deadline to equal the selected receipt’s `hold_until`.
 5. Workflow handles `reject` by voiding wave-1 drafts and acknowledging failure with reasons and compensation evidence. It handles `not-dispatchable` by rereading/waiting/following supersession or ending terminal work. On `defer`, retry from step 1 under the design baseline of three attempts over at most 60 seconds; dispatch remains stopped. Exhaustion voids drafts and acknowledges failure with the unavailable-port reason.
 
 This is a Workflow integration algorithm, not a Lifecycle endpoint or begin-fulfillment guard. A passing read is only an early-abort check: Subscriptions must enforce concurrent-active cardinality at its own active commit. A collision after active commit is a fulfillment failure requiring rollback evidence, not a fictitious rejected inactive line. That upstream enforcement remains open: until `…-upreq-overlap-activation-atomicity` is delivered, subscription-side cardinality is advisory at order time and the path is not production-ready (D-180).
@@ -145,7 +150,7 @@ This is a Workflow integration algorithm, not a Lifecycle endpoint or begin-fulf
 
 **Output**: Complete ordered outcome vector and separate ordered failures.
 
-Evaluate the nine catalog rows of [DESIGN §4.1](../DESIGN.md#contract-03-4-1): six from the `PricingReadV1` answers (`current_revision`, `resolve`) and the Products `get_sku` flags, recorded locally as `passed`, `failed` with `catalog-predicate-failed`, or `unevaluable` with `catalog-predicate-unevaluable`; the residual rows (market applicability, the owner's further rule) from `SellabilityV1` when it exists, normalizing its `satisfied`/`failed`/`not_evaluable` the same way and preserving its predicate/item/slot identity and `detail`/`owed_to`, and `unevaluable` until then. Transport failure is an operation outcome, not a fabricated predicate answer. A truncated roster or a missing required answer makes the response unusable (`catalog-predicates-unavailable`).
+Evaluate the adopted catalog predicates of [DESIGN §4.1](../DESIGN.md#contract-03-4-1) through the Orders-owned adapter (D-187). The [typed mapping](../DESIGN.md#contract-03-pricing-read-mapping) governs which facts `PricingReadV1` and Products actually supply; required absent evidence remains a gap, not a passed predicate. Predicate outcomes are recorded locally as `passed`, `failed` with `catalog-predicate-failed`, or `unevaluable` with `catalog-predicate-unevaluable`. The proposed D-189 Pricing assessment supplies all applicable independent owner results, preserving predicate/item/slot identity, authorized detail and unavailable observations; its shared evaluator also serves authoritative acceptance. Its versioned result/coverage contract and explicit Orders mapping follow [D-195](../DESIGN.md#contract-03-diagnostic-mapping), including lossless producer subresults, operation-specific applicability and malformed-response handling. It remains an upstream implementation requirement. Existing `SellabilityV1::check` is a durable command and MUST NOT supply Preview results. Missing required evidence remains unevaluable; optional-context applicability and TCV-only withholding follow D-189. Transport failure is an operation outcome, not a fabricated predicate answer. A demonstrably truncated roster or missing required answer makes the response unusable (`catalog-predicates-unavailable`); the typed cell answer has no independent roster/count that proves completeness (D-187).
 
 | Orders predicate | Check and refusal behavior |
 |------------------|----------------------------|
@@ -169,10 +174,10 @@ Evaluate every independent predicate even after a failure; a single failure bloc
 
 **Output**: Version-consistent catalog facts/pins, received total and stable overlap keys.
 
-1. Read the revision facts through `PricingReadV1` (`current_revision`, `resolve`) as the configured `bss-orders.system` subject in the order's seller tenant (D-160). There is no caller-tenant fallback. PEP denial is unavailable with an operator-only diagnostic.
+1. Read the revision facts through `PricingReadV1` (`current_revision`, `resolve`) as the configured authenticated Orders service principal (D-194) in the order's seller tenant, with the same seller in each query's `CatalogRef` (D-160 as amended by D-187). PDP scope remains mandatory; there is no caller-tenant fallback. PEP denial is unavailable with an operator-only diagnostic.
 2. Distinguish a successful missing revision (`pricing-revision-absent`) from unavailable revision reads. Fix one revision per line and a common assessment date. Rating must use the exact composition result; no mid-run latest-price substitution.
 3. Distinguish an answered missing product key (`overlap-key-unresolvable`) from operation outage. Use the same resolved key for occupancy, predicates, persisted lines and claim tuples.
-4. Store only the catalog-written pin segment: assessment identity, revision per line, selected items and exact price/descriptor bindings, with the activation deadline. Exclude composed snapshot references, overlays, coupon, FX lock and commitment.
+4. Stage proposed catalog pin evidence: assessment identity, revision per line, selected items and exact price/descriptor bindings. Submit/amendment attach the selected receipt’s issued deadline through D-188/D-191 before storing the committed pin; Preview stores no commercial pin or issued deadline. Exclude composed snapshot references, overlays, coupon, FX lock and commitment.
 5. Persist evaluation's gross/net, explicit discount and promotion, separate recurring/usage/one-time components and computed net pre-tax TCV verbatim. Lifecycle performs no money arithmetic. Usage is flagged/excluded; tax and subscription-context overlays, including brand, are excluded and disclosed on surfaces.
 6. Re-pin and re-evaluate on amendment. No refresh worker is introduced. The absolute acceptance deadline is independent of state TTLs; see DESIGN §4.3.
 
@@ -203,10 +208,10 @@ The conservative resolution ceilings are 2.25 seconds for submit and 2.5 seconds
 
 **Output**: Durable assessment identity/vector bound to the response, or infrastructure failure.
 
-1. Retain every evaluated result, including passed outcomes, identified by run, line, predicate, resolve `item_id` and the slot's `dim_value` (token `default` for the null slot, D-159). Preserve distinct item/slot results without expanding order lines; reject duplicate identities or incomplete coverage.
-2. Order by declared predicate order, then binary line ID, binary item ID and slot-key UTF-8 bytes, with NULL first. Persist trusted run metadata atomically with the complete vector.
+1. Retain every evaluated result, including passed outcomes, identified by run, line, predicate, resolve `item_id`, selection-presence flag and raw nullable `dim_value` (D-195; selected NULL differs from literal text `default`). Preserve distinct item/slot results without expanding order lines; reject duplicate identities or incomplete coverage.
+2. Order by declared predicate order, then binary line ID, binary item ID, selection presence (`false` first) and raw dimension UTF-8 bytes, with NULL first at nullable levels. Persist trusted run metadata atomically with the complete vector.
 3. For submit/amendment, use the engine transaction and bind `assessmentId=run_id` to its immutable settled response. Engine-only/state/version/date-basis refusals discard provisional stale results and carry no assessment ID.
-4. Choose the first unavailable result as primary Problem if any is unevaluable; otherwise choose the first failed result, preserving the complete authorized report. Canonical reason/domain/code mapping remains Foundation's contract.
+4. Within the **blocking** result set, choose the first unavailable result as primary Problem; otherwise choose the first failed result, preserving the complete authorized report. D-195 excludes only approved D-189/D-193 optional-context TCV unevaluability and D-191 optional forecast absence from this set, preserving successful Preview/`tcvWithheld`; required sellability checks and actual business failures retain their blocking behavior. Canonical reason/domain/code mapping remains Foundation's contract.
 5. Preview commits a standalone diagnostic transaction; repeated calls create new runs. Operational lookup requires current diagnostic grants scoped by subject tenant; possession of an assessment ID is never authority. No public diagnostic endpoint is added.
 
 ## 4. States (CDSL)
@@ -219,7 +224,7 @@ The conservative resolution ceilings are 2.25 seconds for submit and 2.5 seconds
 
 | From / context | Condition | Result |
 |----------------|-----------|--------|
-| `draft` | All engine, structural, assessment, date-basis, capacity, binding-deadline and claim checks pass | `submitted`, appended version 2, atomic pins/totals/evidence/event |
+| `draft` | All engine, structural, assessment, date-basis, capacity, binding-deadline and claim checks pass | `submitted`, appended reserved candidate version C, atomic pins/totals/evidence/event |
 | `draft` | Admission refused | Remain `draft`; no commercial admission; reached diagnostics settle as defined above |
 | Amendment | Assessment passes | Versioning appends/re-pins and follows its declared transition; this feature adds no edge |
 | Preview | Assessment completed | Diagnostic-only run, no order transition or pin persistence |
@@ -269,7 +274,7 @@ The implementation MUST expose the [design §3.8](../DESIGN.md#contract-03-3-8) 
 ## 6. Acceptance Criteria
 
 - [ ] A fully evaluable authorized basket admits one version with a resolvable pin per line and verbatim totals; a failed/unevaluable line prevents all commercial admission.
-- [ ] Mixed failed/unevaluable predicates return all independent failures, persisted passed results and pin outcomes. An unresolvable reference creates no duplicate pin failure; primary Problem follows unavailable-first ordering.
+- [ ] Mixed failed/unevaluable predicates return all independent failures, persisted passed results and pin outcomes. An unresolvable reference creates no duplicate pin failure; primary Problem follows unavailable-first ordering within the blocking set; optional-context TCV-only unevaluability remains diagnostic and preserves successful `tcvWithheld`.
 - [ ] Revision absence/outage, overlap-key absence/outage, composition timeout and incomplete bundle component/key coverage produce distinct declared diagnostics and no pin/version admission.
 - [ ] Partner callers use seller/revision inputs for every catalog-facing operation; denied catalog access yields unavailable diagnostics, never a buyer-facing 403. Revision or price publication mid-run does not mix the assessed bindings and totals.
 - [ ] A 200-line basket invokes each basket-dependent port once per run; validate deadline, bounded retry, breaker, bulkhead and caller-rate behavior through shared facilities.
@@ -320,24 +325,25 @@ Output: submitted order with pin and total, or a refusal listing every failure
 3. [ ] - `p1` - Fix the assessment identity, UTC resolve date and explicitly seller-scoped revision per line through the revision SDK. Require each supplied revision to belong to its plan/seller. Do not choose a later revision implicitly. Missing revision is `pricing-revision-absent`; outage/denial/deadline is `pricing-revision-unavailable`. Retain independent diagnostic results when dependent inputs are unavailable - `inst-gs-fix-catalog-version`
 4. [ ] - `p1` - Request each proposed line's SUB-G1 `catalogSubscriptionProductKey` from Subscriptions' key operation for every proposed line/revision under the same assessment in one logical batched request (proposed PriceBook derivation: the SKU of the line's paid `recurring` item(s), D-163); store the key(s) and provenance as answered and never compute them. `plan_id` is not a key. A missing key is `overlap-key-unresolvable`; unavailable owner contract is `overlap-key-unavailable`. All claims and occupancy checks reuse these exact keys - `inst-gs-resolve-overlap-key`
 5. [ ] - `p1` - Resolve the following dependency graph under per-port shared deadlines; only independent branches run in parallel. Purchase assessment/composition precedes evaluation, key resolution precedes occupancy, and neither failed independent check suppresses another evaluable result - `inst-gs-parallel-resolve`
-   - [ ] - `p1` - `PricingReadV1::current_revision` and `PricingReadV1::resolve` over each fixed revision (the roster, the chain matrix, SKU versions and descriptors), `ProductsClient::get_sku` for each consumed SKU, and, when it exists, `SellabilityV1` for the residual rows - `inst-gs-resolve-catalog`
+   - [ ] - `p1` - `PricingReadV1::current_revision` and `PricingReadV1::resolve` over each fixed revision (typed cells, revision identity and supplied SKU/binding inputs, with D-187 evidence gaps preserved), `ProductsClient::get_sku` for each consumed SKU, and the proposed D-189 Pricing assessment for complete owner diagnostics (missing capability remains unavailable) - `inst-gs-resolve-catalog`
+   - [ ] - `p1` - after authorized selected-binding and required policy/contract context is available, call the proposed D-193 Subscriptions resolver; validate complete BillingTerms and exact Term before term-dependent Pricing assessment and Rating evaluation. Independent predicates may proceed; incomplete Preview preserves D-189 withholding. Freeze the resolved values before D-188 acceptance, with no subscription creation - `inst-gs-resolve-billing-terms`
    - [ ] - `p1` - reuse step 2's tenant-axis validity and payer-profile result without a second identity call - `inst-gs-resolve-identity`
    - [ ] - `p1` - contract status and party eligibility, only where a contract reference is present - `inst-gs-resolve-contract`
    - [ ] - `p1` - overlap occupancy `(activeCount, maxConcurrentActive, provenance)` for each distinct `(payer_tenant_id, resource_tenant_id, overlap_scope_key)` **as resolved in step 4**, applied on the tuple Subscriptions answers (D-179), in one batched call, skipped for a line without one; an answer missing `activeCount` or `maxConcurrentActive` is `overlap-presence-unevaluable` (D-126) - `inst-gs-resolve-overlap`
    - [ ] - `p1` - the resolved total and TCV from Rating over exactly the returned accepted bindings; this depends on composition and never runs against independently resolved prices - `inst-gs-resolve-total`
-   - [ ] - `p1` - the accepted order pin for each line under [DESIGN §4.3](../DESIGN.md#contract-03-4-3), complete with descriptor provenance and absolute deadline; record its result even when an independent predicate fails - `inst-gs-compose-pin`
+   - [ ] - `p1` - the proposed pin evidence for each line under [DESIGN §4.3](../DESIGN.md#contract-03-4-3), with D-192 required accepted commercial values (optional provenance is separate) and D-191 authorized seller-policy resolution; assessment has no issued deadline. Record its result even when an independent predicate fails - `inst-gs-compose-pin`
 6. [ ] - `p1` - Retain step 1's policy snapshot, resolved cascade and proposed UTC date basis for engine validation under [02-capture — The date cascade (normative)](02-capture.md#contract-02-4-2); every date-dependent predicate/evaluation uses those same proposed dates - `inst-gs-resolve-cascade`
 7. [ ] - `p1` - Initialize the complete per-predicate outcome vector and a separate empty failure list - `inst-gs-init-failures`
-8. [ ] - `p1` - **FOR EACH** catalog row of §4.1 and each consumed item/slot: evaluate the six read rows from the `PricingReadV1` and `get_sku` answers, take the residual rows from `SellabilityV1` or record them `unevaluable`, and record every passed/failed/unevaluable result in the outcome vector and collect failures separately, preserving upstream detail - `inst-gs-collect-adopted`
+8. [ ] - `p1` - **FOR EACH** catalog row of §4.1 and each consumed item/slot: evaluate read predicates only from the evidence supplied by `PricingReadV1` and `get_sku` under D-187; retain required missing evidence as unevaluable/unavailable, take owner results from the proposed D-189 shared assessment or record required missing results `unevaluable`, and record every passed/failed/unevaluable result in the outcome vector and collect failures separately, preserving upstream detail - `inst-gs-collect-adopted`
 9. [ ] - `p1` - **FOR EACH** of the nine delta predicates: evaluate, record its outcome including passed, and add any failure to the separate failure list; predicates 7 and 9 evaluate over step 4's resolved overlap keys - `inst-gs-collect-delta`
-10. [ ] - `p1` - **FOR EACH** line: compose its `OrderPin` locally from the resolve answer (the matrix as answered, the consumed slot per item, the locally derived `activation_deadline`) and record the outcome in the vector. A resolve answer missing, truncated or deadline-exhausted contributes `catalog-pin-composition-unavailable`; an unset seller `max_acceptance_interval` contributes `order-binding-policy-missing`; an uncovered or absent consumed slot contributes `pin-unresolvable`. Where the line's reference is unresolvable (predicate 5), record the pin outcome as `unevaluable` carrying that same `reference-unresolvable` reason and add **no second failure**; without a valid revision input it is `unevaluable` with that input's reason - `inst-gs-collect-pin`
+10. [ ] - `p1` - **FOR EACH** line: compose its proposed evidence from the selected resolve bindings under D-192, retaining required D-187 sale-coverage gaps; any full matrix is separate diagnostic evidence, and record the outcome in the vector. The issued `activation_deadline` is attached only from the acceptance receipt through D-188/D-191 after assessment passes. A resolve answer missing, truncated or port-deadline-exhausted contributes `catalog-pin-composition-unavailable`; for submit/amendment, absent required seller policy contributes `order-binding-policy-missing`, while unavailable/denied/malformed policy evidence retains its distinct category under D-191. Preview may omit policy used only for an optional forecast; that absence withholds the forecast, not an otherwise evaluable independent sellability result; genuinely required commercial evidence remains fail-closed; an uncovered or absent consumed slot contributes `pin-unresolvable`. Where the line's reference is unresolvable (predicate 5), record the pin outcome as `unevaluable` carrying that same `reference-unresolvable` reason and add **no second failure**; without a valid revision input it is `unevaluable` with that input's reason - `inst-gs-collect-pin`
 11. [ ] - `p1` - **IF** any other port was unresolvable: add its unevaluable reason (absence is a refusal); pin composition's was recorded at step 10 and is not added twice - `inst-gs-collect-unevaluable`
 12. [ ] - `p1` - Predicate 8's `date-cascade-invalid` failure was recorded by step 9 and is not added again - `inst-gs-collect-cascade-invalid`
 13. [ ] - `p1` - **IF** the failure list is non-empty: - `inst-gs-if-failures`
     1. [ ] - `p1` - Pass the complete outcome vector and failure set as the contribution so the engine persists the gate outcome, audits the refusal and settles the idempotency record in one transaction - `inst-gs-contribute-refusal-outcome`
     2. [ ] - `p1` - **RETURN** the engine's settled response, including every gate failure when gate guards were reached; engine authorization/admissibility/version checks retain precedence - `inst-gs-return-all-failures`
 14. [ ] - `p1` - Assemble the resolved total rows and the TCV figure per §4.4 - `inst-gs-assemble-total`
-15. [ ] - `p1` - Request the submit transition with both draft revisions, pin, total, market, proposed dates/date basis and policy snapshot, gate outcome, each line's resolved `overlap_scope_key` from step 4 (persisted on `orders_order_line`), the complete resolved `(payer_tenant_id, resource_tenant_id, overlap_scope_key)` claim set built from it and the **submitting principal as the initiating actor**. Before accepting date-dependent results, the engine checks the accepted-binding deadline and aggregate capacity, then checks defaults and assessment date against the UTC date of its single pre-write transition timestamp `t`; a changed date basis refuses with `date-cascade-invalid`. On admission it persists the validated dates and snapshot atomically with the version. The transition carries `05`'s automatic acceptance contribution only where [05-preconditions — Acceptance on the two paths (normative)](05-preconditions.md#contract-05-4-2)'s submit-request rule holds — the allowed submit carried no delegation proof reference and the submitting principal's subject tenant equals the order's `resourceTenantId` (D-146) — never on `orders_order.sales_path` alone; otherwise it carries none - `inst-gs-request-transition`
+15. [ ] - `p1` - Through D-188, freeze each resolved `hold_policy_version` in the immutable attempt and issue acceptance only after assessment passes. Validate each returned receipt, copy its finite `hold_until` verbatim to that line’s `activation_deadline` (D-191), and fail closed on absent/mismatched evidence. Request the submit transition with both draft revisions, pin, total, market, proposed dates/date basis and policy snapshot, gate outcome, each line's resolved `overlap_scope_key` from step 4 (persisted on `orders_order_line`), the complete resolved `(payer_tenant_id, resource_tenant_id, overlap_scope_key)` claim set built from it and the **submitting principal as the initiating actor**. Before accepting date-dependent results, the engine checks the accepted-binding deadline and aggregate capacity, then checks defaults and assessment date against the UTC date of its single pre-write transition timestamp `t`; a changed date basis refuses with `date-cascade-invalid`. On admission it persists the validated dates and snapshot atomically with the version. The transition carries `05`'s automatic acceptance contribution only where [05-preconditions — Acceptance on the two paths (normative)](05-preconditions.md#contract-05-4-2)'s submit-request rule holds — the allowed submit carried no delegation proof reference and the submitting principal's subject tenant equals the order's `resourceTenantId` (D-146) — never on `orders_order.sales_path` alone; otherwise it carries none - `inst-gs-request-transition`
 16. [ ] - `p1` - **RETURN** the submitted order - `inst-gs-return-submitted`
 
 **Description**: Steps 7 through 13 are the all-failures contract, and pin composition is one of
@@ -421,7 +427,7 @@ Output: exactly one of `proceed` | `reject` (per-line reasons) | `not-dispatchab
    1. [ ] - `p1` - **RETURN** `defer` carrying `overlap-presence-unevaluable`; never default the limit to one and never fabricate a collision - `inst-rc-return-defer-occupancy`
 8. [ ] - `p1` - **IF** for any key `activeCount + pending > maxConcurrentActive`, where `pending` is the number of this order's lines carrying the key that are not yet activated (all of them, before the first activation): - `inst-rc-if-overlap-collision`
    1. [ ] - `p1` - **RETURN** `reject` with overlap-collision for the affected lines - `inst-rc-return-overlap-collision`
-9. [ ] - `p1` - Check each stored accepted-binding deadline against the live Workflow clock; if elapsed return `reject(order-binding-expired)`. Pass the exact version reference to Subscriptions, which resolves with the accepted consumed slots as pins on the activation date and compares the answer with the accepted `chains[]` before committing `active` under DESIGN §4.3 (D-162). No current-price resolution occurs here. **RETURN** `proceed`, which is an **early-abort pass and not an admission guarantee**: the caller **MUST NOT** treat it as one, and **MUST** be able to handle an `overlap-collision` raised later by Subscriptions on the failure-acknowledgement path of [06-workflow-seam — Acknowledgement (normative)](06-workflow-seam.md#contract-06-4-4) - `inst-rc-return-proceed`
+9. [ ] - `p1` - Check each stored accepted-binding deadline against the live Workflow clock; if elapsed return `reject(order-binding-expired)`. Pass the exact version reference to Subscriptions, which owns the hold for the selected committed receipt, performs fresh fulfillment eligibility checking and fences order/version/attempt before activation intent under DESIGN §4.3 (D-190). D-191 policy/deadline implementation, D-192 frozen snapshot mapping implementation and R12 concrete admission/recovery remain release gates. No current-price resolution occurs here. **RETURN** `proceed`, which is an **early-abort pass and not an admission guarantee**: the caller **MUST NOT** treat it as one, and **MUST** be able to handle an `overlap-collision` raised later by Subscriptions on the failure-acknowledgement path of [06-workflow-seam — Acknowledgement (normative)](06-workflow-seam.md#contract-06-4-4) - `inst-rc-return-proceed`
 
 **What Workflow does with each outcome** (normative; the transitions are those of
 [06-workflow-seam — Begin fulfillment and the spawn signal (normative)](06-workflow-seam.md#contract-06-4-3) and §4.4):
@@ -541,7 +547,7 @@ fulfillment time plus a per-line deferral where a quoted date is earlier.
 before upstream facts are resolved. `sellerTenantId` selects the permitted seller/catalog
 relationship; selecting a different seller does not mean representing that seller. Preview
 reads that seller's revision and purchase facts exactly as submit does, through operations
-called as the `bss-orders.system` subject in that tenant (D-160); a PEP denial on those reads is `pricing-revision-unavailable`
+called as the authenticated Orders service principal (D-194) in that tenant (D-160); a PEP denial on those reads is `pricing-revision-unavailable`
 (or the port's own unavailable reason) with an operator diagnostic, never a 403 to the buyer
 ([`../DECISIONS.md`](../DECISIONS.md) D-122). A direct
 customer T may preview `resource=T, payer=T, seller=S` when that selling relationship is
@@ -594,7 +600,84 @@ bound — is routed as [`../DECISIONS.md`](../DECISIONS.md) **Q-29**.
 - **Engine**: [`01-foundation`](../DESIGN.md#contract-01-1-1) — transition contract, reason registry, resolved-total schema
 - **Producers**: [`02-capture`](../DESIGN.md#contract-02-1-1) authors the lines and the policy-switch state this gate reads
 - **Consumers**: [`04-versioning`](../DESIGN.md#contract-04-1-1) re-runs this gate on amendment; [`05-preconditions`](../DESIGN.md#contract-05-1-1) contributes the self-service acceptance instant to the submit transition this slice owns; [`06-workflow-seam`](../DESIGN.md#contract-06-1-1) consumes the activation re-check outcome (specified by 03, executed by Workflow)
-- **Upstream asks**: `SUB-O5` overlap occupancy (amended from presence, D-126); `cpt-cf-bss-orders-lifecycle-upreq-catalog-subscription-product-key` (legacy requirement ID for authoritative overlap derivation, D-153); `cpt-cf-bss-orders-lifecycle-upreq-pricing-read-sdk` (`PricingReadV1` over the existing reads, D-161); `cpt-cf-bss-orders-lifecycle-upreq-pricing-catalog-tenant-reads` (the `bss-orders.system` grant, D-160); `cpt-cf-bss-orders-lifecycle-upreq-pricing-purchase-assessment` (the residual market-applicability verdict); `cpt-cf-bss-orders-lifecycle-upreq-rating-evaluation`; `cpt-cf-bss-orders-lifecycle-upreq-payer-commercial-profile`; `cpt-cf-bss-orders-lifecycle-upreq-contract-party-eligibility`; `cpt-cf-bss-orders-lifecycle-upreq-contract-acceptance-declaration` (the port's `acceptance_required` output, read by `05`, D-132); the overlap **dimension** binding for the partner path
+- **Upstream asks**: `SUB-O5` overlap occupancy (amended from presence, D-126); `cpt-cf-bss-orders-lifecycle-upreq-catalog-subscription-product-key` (legacy requirement ID for authoritative overlap derivation, D-153); `cpt-cf-bss-orders-lifecycle-upreq-pricing-read-sdk` (`PricingReadV1` capability present; Orders adapter and required evidence conformance pending, D-187); `cpt-cf-bss-orders-lifecycle-upreq-pricing-catalog-tenant-reads` (the Orders service-principal grants (D-194), D-160); `cpt-cf-bss-orders-lifecycle-upreq-pricing-purchase-assessment` (D-189 nonbinding shared Pricing assessment, not the existing acceptance command); `cpt-cf-bss-orders-lifecycle-upreq-rating-evaluation`; `cpt-cf-bss-orders-lifecycle-upreq-payer-commercial-profile`; `cpt-cf-bss-orders-lifecycle-upreq-contract-party-eligibility`; `cpt-cf-bss-orders-lifecycle-upreq-contract-acceptance-declaration` (the port's `acceptance_required` output, read by `05`, D-132); the overlap **dimension** binding for the partner path
 - **ADRs**: [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md) transition through the engine; [`ADR/0002`](../ADR/0002-cpt-cf-bss-orders-lifecycle-adr-slice-decomposition.md) the foundation-plus-seven-slices decomposition; [`ADR/0003`](../ADR/0003-cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate.md) fail closed on an unevaluable gate input; [`ADR/0007`](../ADR/0007-cpt-cf-bss-orders-lifecycle-adr-in-transaction-concurrency.md) concurrency enforced by the in-transaction overlap constraint behind predicate 9
 
 <!-- /contract -->
+
+
+**D-188 acceptance orchestration:** `SellabilityV1::check` exists as a durable command, not a residual read-only verdict. It MUST NOT be called by generic read-only guard preparation. Submit/amendment issue it only through the engine-owned reserved-candidate subflow and retain exact receipt IDs/digests with committed lines. D-189 specifies the proposed read-only assessment and its shared composition; the upstream implementation and detailed evidence mapping remain pending. D-190 defines the hold handoff and D-191 deadline/policy authority; their integration remains pending. Refusal leaves no Orders commercial effects, but its operational attempt and independently committed Pricing receipts may survive; the [failure matrix](../DESIGN.md#contract-01-commercial-attempt) is mandatory.
+
+
+**D-189 Preview contract and completion gate:** the proposed [nonbinding Pricing assessment](../DESIGN.md#contract-03-nonbinding-assessment)
+shares Pricing-owned evaluation with acceptance and supplies one Orders composition for Preview,
+submit and amendment. Preview uses basket-local correlation, never invented order identities,
+never `check`/`hold`, never a candidate reservation or durable attempt. Only bounded seven-day
+per-predicate diagnostics persist, with distinct repeat-run IDs and no money/TCV/tax; catalog
+catch-up remains allowed. Missing Preview term/cycle preserves successful TCV withholding;
+applicability and required dependency failures must be distinguished as D-189 specifies.
+Completion requires real-provider proof of no commercial artifacts, complete independent
+tri-state results, least-privilege access, unchanged-input parity and rejection at acceptance
+when previously observed facts change. None of these tests is claimed executed by this design.
+
+
+**D-192 frozen commercial pin:** submit/amendment persist the complete issued receipt/query, including BillingTerms, original digests and exact selected bindings in Orders schema 2. Preview has only proposed nonbinding evidence. The [field reconciliation](../DESIGN.md#contract-03-frozen-commercial-snapshot) explicitly replaces the legacy mandatory matrix/provenance shape without weakening required invoice/meter/terms/coverage facts. Consumers combine complete query with matching hold bindings; live display metadata cannot update commercial inputs. Encoding, downstream adoption and conformance remain unchecked work.
+
+
+### R07 billing terms before acceptance (D-193)
+
+- [ ] Integrate the proposed Subscriptions-owned SafeRead resolver according to the
+  [complete terms contract](../DESIGN.md#contract-03-billing-terms-resolution), using authorized
+  intent/policy and selected binding contexts. This is a missing upstream producer, not an
+  existing Pricing read. Preserve canonical digest and exact invoice-period Term.
+- [ ] Resolve complete terms before issuing acceptance and freeze them in the D-188 query;
+  D-192 retains the exact accepted snapshot. Retries cannot re-resolve terms or move anchors.
+- [ ] Keep missing policy, outage, unsupported profile, denial and malformed evidence distinct;
+  optional incomplete Preview withholds dependent TCV/checks without fabricating defaults.
+- [ ] Prove actual activation remains distinct from earliest start and invoice anchor, with
+  shared supported-cycle/anchor/usage and no-backdating fixtures before production delivery.
+
+
+### R08 service authority before commercial calls (D-194)
+
+Use the [authenticated service-principal contract and call matrix](../DESIGN.md#contract-08-commercial-service-authorization)
+for every catalog/acceptance port. Provisioned seller identity and explicit PDP grants remain
+unchecked dependencies (`cpt-cf-bss-orders-lifecycle-upreq-commercial-service-provisioning`).
+Authorize original resource/proposed-payer use before foreign-party reads and recheck for final
+commit. Freeze authenticated commercial caller identity with each D-188 attempt; neither token
+refresh nor credential rotation permits rebinding an uncertain command to a different principal.
+Preview uses only its read capabilities; hold remains Subscriptions-owned. Real Pricing→Products
+provider tests, missing/revoked grants and foreign-seller/payer failures are required before release.
+
+### R09 complete diagnostics and mapping (D-195)
+
+- [ ] Implement the [versioned owner profile and Orders registry](../DESIGN.md#contract-03-diagnostic-mapping)
+  with explicit expected coverage, stable typed identities and allowlisted evidence.
+- [ ] Preserve multiple owner subresults per Orders result without overwriting; apply declared
+  aggregation and blocking applicability. Distinguish selected NULL from text `default` and no selection.
+- [ ] Validate complete, partial and malformed responses; do not synthesize passes or turn one
+  acceptance error into a fresh full assessment. Keep validated independent diagnostics.
+- [ ] Persist immutable mapping identity and authorized public replay; restricted producer evidence
+  remains in the scoped diagnostic store. Test registry upgrades, redaction and retention separately.
+
+### R10 catalog reads and reference protection (D-196)
+
+Use authorized Products SKU reads only as the interim D-189/D-195 assessment source; authoritative
+new-sale acceptance and accepted-order fulfillment retain their distinct Pricing rules. A deprecated
+SKU is not automatically a retired SKU. Orders never writes Products reference reservations.
+
+- [ ] Implement the [D-196 Orders usage and admission-fence contribution](../DESIGN.md#contract-03-revision-reference-protection)
+  before Pricing enables revision-reference release; current superseded revision references remain.
+- [ ] Include preparations that can still commit, nonterminal selected versions and unresolved
+  handoff/recovery, even before a subscription exists. Final commit must respect closure/drain fencing.
+- [ ] Test concurrent closure against new and resumed D-188 attempts and Subscriptions handoff;
+  missing or stale evidence retains protection. Historical receipts never become activation authority.
+
+### R11 evaluation contract (D-197)
+
+The [Rating-owned exact-binding contract](../DESIGN.md#contract-03-rating-purchase-evaluation) governs inputs, outputs, authorization, failure mapping and production evidence. Store producer minor-unit values verbatim, distinguish uncommitted usage from explicit zero, and use exactly one order TCV carrier with finite/rolling/mixed basis. D-188 freezes evaluation before acceptance; issued receipt inputs must match. Only the existing Preview missing-term/cycle exception may withhold TCV; tax remains a separate owner dependency.
+
+- [ ] Implement the missing SDK/provider and Orders mapping with real-provider conformance; no local arithmetic or guessed totals.
+
+
+**D-198 capacity alignment:** the selected target scope includes payer, resource tenant and registry product key. Until the producer adopts it, apply its legacy scope/provenance unchanged. Occupancy includes explicit admitted-pending capacity without double-counting already-reserved proposed lines. Submit/recheck remain advisory; only Subscriptions receiver slot admission and generation fencing authorize effects. [Normative receiver protocol](../DESIGN.md#contract-06-activation-admission).

@@ -33,6 +33,7 @@ static-authn = ["dep:static-authn-plugin"]
 static-authz = ["dep:static-authz-plugin"]
 static-license = ["dep:static-license-plugin"]
 tr-authz = ["dep:tr-authz-plugin"]
+rules-authz = ["dep:rules-authz-plugin"]
 tenant-resolver-rg = ["dep:rg-tr-plugin"]
 static-credstore = ["credstore", "dep:static-credstore-plugin"]
 mini-chat = ["dep:mini-chat"]
@@ -66,6 +67,14 @@ quota-enforcement = [
 # feature doc comment for what it pulls in).
 magika = ["file_parser/magika"]
 bss-products = ["dep:bss_products"]
+# Orders requires the Event Broker gear (D-200) and the plugins its standalone deployment
+# resolves: the standalone cluster cache and the SQLite event-log backend.
+bss-orders-lifecycle = [
+    "dep:bss_orders_lifecycle",
+    "dep:event_broker",
+    "dep:standalone-cluster-plugin",
+    "dep:sqlite-event-broker-plugin",
+]
 bss-pricing = ["dep:bss_pricing", "bss-products"]
 bss-approvals = ["dep:bss_approvals"]
 admission-control = ["dep:admission-control"]
@@ -95,6 +104,7 @@ rg-tr-plugin = { package = "cf-gears-rg-tr-plugin", path = "../../gears/system/t
 static-authn-plugin = { package = "cf-gears-static-authn-plugin", path = "../../gears/system/authn-resolver/plugins/static-authn-plugin", optional = true }
 static-authz-plugin = { package = "cf-gears-static-authz-plugin", path = "../../gears/system/authz-resolver/plugins/static-authz-plugin", optional = true }
 tr-authz-plugin = { package = "cf-gears-tr-authz-plugin", path = "../../gears/system/authz-resolver/plugins/tr-authz-plugin", optional = true }
+rules-authz-plugin = { package = "cf-gears-rules-authz-plugin", path = "../../gears/system/authz-resolver/plugins/rules-authz-plugin", optional = true }
 
 # Optional license resolver plugins
 static-license-plugin = { package = "cf-gears-static-license-plugin", path = "../../gears/system/license-resolver/plugins/static-license-plugin", optional = true }
@@ -147,6 +157,10 @@ cluster = { package = "cf-gears-cluster", path = "../../gears/system/cluster/clu
 # Optional BSS Plan & Price Modeling gear
 bss_pricing = { package = "cf-gears-bss-pricing", path = "../../gears/bss/pricing/pricing", optional = true }
 bss_products = { package = "cf-gears-bss-products", path = "../../gears/bss/products/products", optional = true }
+bss_orders_lifecycle = { package = "cf-gears-bss-orders-lifecycle", path = "../../gears/bss/orders-lifecycle/orders-lifecycle", optional = true }
+event_broker = { package = "cf-gears-event-broker", path = "../../gears/system/event-broker/event-broker", optional = true }
+standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", path = "../../gears/system/cluster/plugins/standalone-cluster-plugin", optional = true }
+sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", path = "../../gears/system/event-broker/plugins/sqlite-event-broker-plugin", optional = true }
 bss_approvals = { package = "cf-gears-bss-approvals", path = "../../gears/bss/approvals/approvals", optional = true }
 
 # Optional Admission Control gear

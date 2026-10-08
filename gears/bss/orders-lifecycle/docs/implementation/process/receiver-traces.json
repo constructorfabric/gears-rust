@@ -1,0 +1,1178 @@
+{
+  "format_version": 1,
+  "venue": "S1-05 specification reference model only; not live provider conformance",
+  "cases": [
+    {
+      "id": "commit-authority-before-dispatch",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "denied",
+          "verified": false,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "not_authorized",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "close-before-open",
+      "steps": [
+        {
+          "op": "close",
+          "expect": "closed",
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "open",
+          "expect": "closed",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "closed",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "settle-before-late-create",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "settle",
+          "expect": "no_draft_tombstone"
+        },
+        {
+          "op": "create",
+          "expect": "closed",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "create-before-settle",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "settle",
+          "expect": "draft_found"
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "same-key-replay-payload-conflict",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "create",
+          "expect": "replayed",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "create",
+          "expect": "conflict",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-b"
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "same-generation-roster-immutable",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "open",
+          "expect": "conflict",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "foreign"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "not_authorized",
+          "key": "foreign",
+          "version": 7,
+          "payload": "receipt-a"
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "sparse-version-exact-match",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "not_authorized",
+          "key": "k1",
+          "version": 4,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "greater-number-is-not-authority",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "not_authorized",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a",
+          "generation": 99
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "pause-before-intent",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "close",
+          "expect": "closed",
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "admit",
+          "expect": "closed",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "intent-before-pause-late-oss",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "close",
+          "expect": "closed",
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "confirm",
+          "expect": "closed",
+          "key": "k1",
+          "version": 7,
+          "oss_applied": true,
+          "terms_compatible": true
+        }
+      ],
+      "expected": {
+        "pending": 1,
+        "active": 0,
+        "reconcile": [
+          "k1"
+        ]
+      }
+    },
+    {
+      "id": "applied-before-pause-retains-active",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "confirm",
+          "expect": "active",
+          "key": "k1",
+          "version": 7,
+          "oss_applied": true,
+          "terms_compatible": true
+        },
+        {
+          "op": "close",
+          "expect": "closed",
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 1,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "pending-to-active-one-slot",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "confirm",
+          "expect": "active",
+          "key": "k1",
+          "version": 7,
+          "oss_applied": true,
+          "terms_compatible": true
+        },
+        {
+          "op": "confirm",
+          "expect": "replayed",
+          "key": "k1",
+          "version": 7,
+          "oss_applied": true,
+          "terms_compatible": true
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k2",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "capacity_exhausted",
+          "key": "k2",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 1,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "timeout-does-not-release",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "timeout",
+          "expect": "unresolved"
+        },
+        {
+          "op": "abort",
+          "expect": "unresolved",
+          "definitive": false
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k2",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "capacity_exhausted",
+          "key": "k2",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        }
+      ],
+      "expected": {
+        "pending": 1,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "definitive-abort-releases",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "abort",
+          "expect": "released",
+          "definitive": true
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k2",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k2",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        }
+      ],
+      "expected": {
+        "pending": 1,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "unconfirmed-is-not-applied",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "confirm",
+          "expect": "unresolved",
+          "key": "k1",
+          "version": 7,
+          "oss_applied": false,
+          "terms_compatible": true
+        }
+      ],
+      "expected": {
+        "pending": 1,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "terms-incompatible-after-oss",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "confirm",
+          "expect": "reconcile_terms",
+          "key": "k1",
+          "version": 7,
+          "oss_applied": true,
+          "terms_compatible": false
+        }
+      ],
+      "expected": {
+        "pending": 1,
+        "active": 0,
+        "reconcile": [
+          "k1"
+        ]
+      }
+    },
+    {
+      "id": "resource-scope-separated",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k2",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k2",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/other-resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        }
+      ],
+      "expected": {
+        "pending": 2,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "legacy-scope-unproven",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "scope_unproven",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": false,
+          "pricing_fresh": true
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "grant-does-not-replace-pricing",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "commercial_unproven",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": false
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "limit-reduction-no-eviction",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "limit",
+          "expect": "updated",
+          "scope": "payer/resource/product",
+          "value": 2
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "confirm",
+          "expect": "active",
+          "key": "k1",
+          "version": 7,
+          "oss_applied": true,
+          "terms_compatible": true
+        },
+        {
+          "op": "limit",
+          "expect": "updated",
+          "scope": "payer/resource/product",
+          "value": 1
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k2",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "capacity_exhausted",
+          "key": "k2",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        }
+      ],
+      "expected": {
+        "pending": 0,
+        "active": 1,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "direct_activate-shares-capacity",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k2",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "capacity_exhausted",
+          "key": "k2",
+          "version": 7,
+          "writer": "direct_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        }
+      ],
+      "expected": {
+        "pending": 1,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "orders_activate-shares-capacity",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k2",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "capacity_exhausted",
+          "key": "k2",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        }
+      ],
+      "expected": {
+        "pending": 1,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "resume-shares-capacity",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k2",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "capacity_exhausted",
+          "key": "k2",
+          "version": 7,
+          "writer": "resume",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        }
+      ],
+      "expected": {
+        "pending": 1,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "transfer-shares-capacity",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k2",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "capacity_exhausted",
+          "key": "k2",
+          "version": 7,
+          "writer": "transfer",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        }
+      ],
+      "expected": {
+        "pending": 1,
+        "active": 0,
+        "reconcile": []
+      }
+    },
+    {
+      "id": "key_altering_change_plan-shares-capacity",
+      "steps": [
+        {
+          "op": "open",
+          "expect": "open",
+          "verified": true,
+          "version": 7,
+          "roster": [
+            "k1",
+            "k2"
+          ]
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k1",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "pending",
+          "key": "k1",
+          "version": 7,
+          "writer": "orders_activate",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        },
+        {
+          "op": "create",
+          "expect": "created",
+          "key": "k2",
+          "version": 7,
+          "payload": "receipt-a"
+        },
+        {
+          "op": "admit",
+          "expect": "capacity_exhausted",
+          "key": "k2",
+          "version": 7,
+          "writer": "key_altering_change_plan",
+          "scope": "payer/resource/product",
+          "provenance_valid": true,
+          "pricing_fresh": true
+        }
+      ],
+      "expected": {
+        "pending": 1,
+        "active": 0,
+        "reconcile": []
+      }
+    }
+  ]
+}

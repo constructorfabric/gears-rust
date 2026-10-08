@@ -1,0 +1,665 @@
+{
+  "format_version": 1,
+  "representation": "Selected normalized SDK call fields and snake_case REST body fields, following Pricing authoring DTOs. Metadata/header binding is specified in CONTRACTS.md; existing event payload camelCase and published response annotations retain their design names. No production serializer is delivered.",
+  "models": {
+    "CreateOrder": {
+      "required_fields": [
+        "resource_tenant_id",
+        "payer_tenant_id",
+        "seller_tenant_id",
+        "category"
+      ],
+      "optional_fields": [
+        "contract_id"
+      ],
+      "additional_fields": false,
+      "semantics": "Empty draft; actor and sales_path derived from trusted context; no caller IDs, lines, pin or total."
+    },
+    "OrderId": {
+      "required_fields": [],
+      "optional_fields": [],
+      "additional_fields": false,
+      "semantics": ""
+    },
+    "LineId": {
+      "required_fields": [],
+      "optional_fields": [],
+      "additional_fields": false,
+      "semantics": ""
+    },
+    "VersionRef": {
+      "required_fields": [],
+      "optional_fields": [],
+      "additional_fields": false,
+      "semantics": ""
+    },
+    "ListOrders": {
+      "required_fields": [],
+      "optional_fields": [
+        "page_size",
+        "cursor",
+        "state",
+        "created_from",
+        "created_to",
+        "state_entered_before",
+        "contract_id"
+      ],
+      "additional_fields": false,
+      "semantics": "Selected query names for existing filters only: created_from inclusive, created_to exclusive, state_entered_before inclusive (has remained in current state since that instant or earlier); state exact; contract_id exact. Fixed collection-specific sorts, no client-selected sort."
+    },
+    "VersionList": {
+      "required_fields": [],
+      "optional_fields": [
+        "page_size",
+        "cursor"
+      ],
+      "additional_fields": false,
+      "semantics": ""
+    },
+    "LineList": {
+      "required_fields": [],
+      "optional_fields": [
+        "page_size",
+        "cursor"
+      ],
+      "additional_fields": false,
+      "semantics": ""
+    },
+    "AcceptanceList": {
+      "required_fields": [],
+      "optional_fields": [
+        "page_size",
+        "cursor"
+      ],
+      "additional_fields": false,
+      "semantics": ""
+    },
+    "AuditList": {
+      "required_fields": [],
+      "optional_fields": [
+        "page_size",
+        "cursor"
+      ],
+      "additional_fields": false,
+      "semantics": ""
+    },
+    "HeaderPatch": {
+      "required_fields": [
+        "fields"
+      ],
+      "optional_fields": [],
+      "additional_fields": false,
+      "semantics": "Named fields alone choose write versus edit. Empty/unknown fields are boundary-invalid; mixed classes are checked only after engine admissibility."
+    },
+    "LinePatch": {
+      "required_fields": [
+        "fields"
+      ],
+      "optional_fields": [],
+      "additional_fields": false,
+      "semantics": "As HeaderPatch; line membership is checked against working/current version before slice classification guards."
+    },
+    "AddLine": {
+      "required_fields": [
+        "plan_id",
+        "plan_revision_id",
+        "selected_items",
+        "currency"
+      ],
+      "optional_fields": [
+        "contract_effective_date",
+        "service_activation_date",
+        "acceptance_due_date",
+        "term_duration",
+        "billing_cycle"
+      ],
+      "additional_fields": false,
+      "semantics": "Dates/term intent may remain absent in draft. No external_reference here; separate admin PATCH."
+    },
+    "PreviewBasket": {
+      "required_fields": [
+        "resource_tenant_id",
+        "payer_tenant_id",
+        "seller_tenant_id",
+        "lines"
+      ],
+      "optional_fields": [
+        "contract_id"
+      ],
+      "additional_fields": false,
+      "semantics": "Nonbinding Pricing assessment; optional term/cycle missing withholds TCV; no receipt, hold, attempt, authoritative deadline or approval verdict."
+    },
+    "Submit": {
+      "required_fields": [],
+      "optional_fields": [],
+      "additional_fields": false,
+      "semantics": ""
+    },
+    "Amendment": {
+      "required_fields": [
+        "delta"
+      ],
+      "optional_fields": [
+        "amendment_reason"
+      ],
+      "additional_fields": false,
+      "semantics": "Delta is nonempty commercial authored content; missing/invalid reason is registered amendment-reason-invalid guard; frozen axes and administrative changes refused."
+    },
+    "Cancel": {
+      "required_fields": [],
+      "optional_fields": [
+        "reason"
+      ],
+      "additional_fields": false,
+      "semantics": "Reason required for every cancellation through the registered guard, after state/version admissibility; never an actor-specific bypass."
+    },
+    "Hold": {
+      "required_fields": [],
+      "optional_fields": [
+        "reason"
+      ],
+      "additional_fields": false,
+      "semantics": ""
+    },
+    "Resume": {
+      "required_fields": [],
+      "optional_fields": [],
+      "additional_fields": false,
+      "semantics": ""
+    },
+    "ForcedFailure": {
+      "required_fields": [],
+      "optional_fields": [
+        "reason",
+        "request_audit_id",
+        "compensation_evidence"
+      ],
+      "additional_fields": false,
+      "semantics": "Two distinct break-glass users; missing reason is a registered guard refusal. Never caller-selected failure_reason or success compensation assertion. S5-01 binds freshness to exact audit generation."
+    },
+    "Acceptance": {
+      "required_fields": [],
+      "optional_fields": [],
+      "additional_fields": false,
+      "semantics": "accepted_at and recorded_by are server facts, not authored. Current immutable version only; party bars use actual sparse submit/amendment actors."
+    },
+    "ApprovalReflection": {
+      "required_fields": [
+        "verdict"
+      ],
+      "optional_fields": [
+        "deciding_authority",
+        "denial_reason"
+      ],
+      "additional_fields": false,
+      "semantics": "required/not_required/granted/denied; authority missing and denied reason missing remain named guards. denial_reason forbidden for every non-denied verdict."
+    },
+    "AuthorizationOutcome": {
+      "required_fields": [
+        "outcome"
+      ],
+      "optional_fields": [],
+      "additional_fields": false,
+      "semantics": "authorized/pending/failed; transient Workflow fact, never persisted as an order-owned payment status."
+    },
+    "SpawnContribution": {
+      "required_fields": [
+        "fulfillment_attempt_id",
+        "receivers"
+      ],
+      "optional_fields": [],
+      "additional_fields": false,
+      "semantics": "Exact committed line/receipt roster plus receiver/create/activate keys. Server verifies digest and allocates grant_id/generation; caller cannot grant authority. S5-01 successor-grant amendment remains later prerequisite."
+    },
+    "FulfillmentAcknowledgement": {
+      "required_fields": [
+        "outcome",
+        "per_line_results"
+      ],
+      "optional_fields": [
+        "failure_reason",
+        "compensation_evidence"
+      ],
+      "additional_fields": false,
+      "semantics": "completed forbids failure/evidence fields; failed requires declared failure and complete evidence through guards. Full expected roster comes from storage, not request."
+    },
+    "WorkflowCancel": {
+      "required_fields": [],
+      "optional_fields": [
+        "cancel_reason",
+        "compensation_evidence"
+      ],
+      "additional_fields": false,
+      "semantics": "Configured Workflow only; reason and complete compensation evidence required even pre-spawn."
+    },
+    "TransitionResult": {
+      "required_fields": [
+        "order_id",
+        "state",
+        "version"
+      ],
+      "optional_fields": [
+        "draft_revision",
+        "assessment_id",
+        "assessment",
+        "request_audit_id",
+        "line_id"
+      ],
+      "additional_fields": false,
+      "semantics": "Exact settled authorized outcome is replayed; sparse commercial version is not operational execution ID. A line insert also returns its server-reserved line_id (D-206)."
+    },
+    "SpawnSignalResult": {
+      "required_fields": [
+        "transition",
+        "spawn_signal_at",
+        "grant_id",
+        "generation"
+      ],
+      "optional_fields": [],
+      "additional_fields": false,
+      "semantics": "Grant visible only after atomic engine commit; replay returns identical grant identity."
+    },
+    "OrderView": {
+      "required_fields": [
+        "order",
+        "version",
+        "lines"
+      ],
+      "optional_fields": [
+        "resolved_total",
+        "acceptance",
+        "admin",
+        "expected_fulfillment_time",
+        "contract_read_through",
+        "draft_revision"
+      ],
+      "additional_fields": false,
+      "semantics": "Composition of catalog table schemas under consistent current-parent authority; no attempts/grants/controls, outbox, private diagnostics or historical authority bypass."
+    },
+    "OrderVersionView": {
+      "required_fields": [
+        "order_id",
+        "version",
+        "lines"
+      ],
+      "optional_fields": [
+        "resolved_total",
+        "admin"
+      ],
+      "additional_fields": false,
+      "semantics": "Exact committed version with complete schema-2 receipt/query/BillingTerms/selected bindings and exclusions. Separate mutable admin projection. Reserved candidates never readable."
+    },
+    "PreviewResult": {
+      "required_fields": [
+        "assessment_id",
+        "assessment",
+        "lines"
+      ],
+      "optional_fields": [
+        "resolved_total",
+        "indicative_tax",
+        "expected_fulfillment_time",
+        "tcv",
+        "tcvWithheld"
+      ],
+      "additional_fields": false,
+      "semantics": "Optional-context withholding is successful and retains diagnostics. No stored tax/total or issued activation deadline."
+    },
+    "OrderPage": {
+      "required_fields": [
+        "orders"
+      ],
+      "optional_fields": [
+        "next_cursor",
+        "current_version",
+        "current_acceptance"
+      ],
+      "additional_fields": false,
+      "semantics": "Authorized keyset page, 1–200/default 50; current acceptance/absence and history share a consistent read."
+    },
+    "VersionPage": {
+      "required_fields": [
+        "versions"
+      ],
+      "optional_fields": [
+        "next_cursor",
+        "current_version",
+        "current_acceptance"
+      ],
+      "additional_fields": false,
+      "semantics": "Authorized keyset page, 1–200/default 50; current acceptance/absence and history share a consistent read."
+    },
+    "LinePage": {
+      "required_fields": [
+        "lines"
+      ],
+      "optional_fields": [
+        "next_cursor",
+        "current_version",
+        "draft_revision",
+        "current_acceptance"
+      ],
+      "additional_fields": false,
+      "semantics": "Authorized keyset page, 1–200/default 50; current acceptance/absence and history share a consistent read."
+    },
+    "AcceptancePage": {
+      "required_fields": [
+        "acceptances"
+      ],
+      "optional_fields": [
+        "next_cursor",
+        "current_version",
+        "current_acceptance"
+      ],
+      "additional_fields": false,
+      "semantics": "Authorized keyset page, 1–200/default 50; current acceptance/absence and history share a consistent read."
+    },
+    "AuditPage": {
+      "required_fields": [
+        "audit"
+      ],
+      "optional_fields": [
+        "next_cursor",
+        "current_version",
+        "current_acceptance"
+      ],
+      "additional_fields": false,
+      "semantics": "Authorized keyset page, 1–200/default 50; current acceptance/absence and history share a consistent read."
+    }
+  },
+  "field_classes": {
+    "header": {
+      "commercial": [
+        "category",
+        "payer_tenant_id",
+        "contract_id"
+      ],
+      "commercial_frozen": [
+        "resource_tenant_id",
+        "seller_tenant_id"
+      ],
+      "administrative": [
+        "external_reference",
+        "display_label",
+        "internal_notes"
+      ]
+    },
+    "line": {
+      "commercial": [
+        "plan_id",
+        "plan_revision_id",
+        "selected_items",
+        "currency",
+        "contract_effective_date",
+        "service_activation_date",
+        "acceptance_due_date",
+        "term_duration",
+        "billing_cycle"
+      ],
+      "commercial_frozen": [],
+      "administrative": [
+        "external_reference",
+        "display_label",
+        "internal_notes"
+      ]
+    }
+  },
+  "prose_table_fields": {
+    "orders_order_admin": {
+      "order_id": "uuid",
+      "external_reference": "nullable bounded text",
+      "display_label": "nullable bounded text",
+      "internal_notes": "nullable bounded text",
+      "updated_by": "trusted actor",
+      "updated_at": "timestamptz"
+    },
+    "orders_order_line_admin": {
+      "order_id": "uuid",
+      "line_id": "uuid",
+      "external_reference": "nullable bounded text",
+      "display_label": "nullable bounded text",
+      "internal_notes": "nullable bounded text",
+      "updated_by": "trusted actor",
+      "updated_at": "timestamptz"
+    },
+    "orders_policy_election": {
+      "policy_id": "uuid NOT NULL PK",
+      "election": "enum tolerate_authorization_failure|acceptance_required",
+      "scope": "enum platform|seller",
+      "scope_id": "uuid nullable only platform",
+      "elected": "boolean",
+      "elected_by": "trusted promotion actor",
+      "elected_at": "timestamptz"
+    },
+    "orders_read_access_log": {
+      "access_id": "uuid",
+      "order_id": "uuid nullable",
+      "requested_order_ref": "uuid nullable; no FK",
+      "actor": "trusted subject UUID text",
+      "actor_class": "system|service|user",
+      "operation": "read operation",
+      "outcome": "served|refused",
+      "refusal_reason": "nullable registered reason",
+      "internal_refusal_detail": "nullable restricted text",
+      "delegation_proof_ref": "nullable opaque reference",
+      "accessed_at": "timestamptz"
+    },
+    "orders_commercial_attempt": {
+      "attempt_id": "uuid PK",
+      "order_id": "uuid FK",
+      "idempotency_execution_id": "uuid unique; no cascading registry FK",
+      "operation": "submit|amendment",
+      "principal_scope": "immutable scope",
+      "request_fingerprint": "immutable digest",
+      "candidate_version": "positive signed SQL integer",
+      "previous_committed_version": "positive signed SQL integer",
+      "prepared_draft_revision": "nonnegative bigint on submit; absent on amendment",
+      "proposed_arrangement": "immutable complete typed content",
+      "authorization_fact_fingerprint": "immutable digest",
+      "original_principal": "immutable trusted actor",
+      "proof_reference": "nullable immutable reference",
+      "pricing_requests": "per-line exact native query/hash/command key",
+      "date_policy_basis": "immutable date/policy snapshot",
+      "commercial_subject_id": "uuid",
+      "commercial_subject_type": "text",
+      "commercial_subject_tenant_id": "uuid",
+      "status": "prepared|running|committed|refused|abandoned",
+      "owner_token": "uuid",
+      "fencing_generation": "monotonic positive integer",
+      "lease_until": "timestamptz",
+      "created_at": "timestamptz",
+      "terminal_at": "nullable timestamptz",
+      "receipt_results": "per-line first result identities/digests; no rewrite"
+    },
+    "orders_fulfillment_grant": {
+      "grant_id": "uuid PK",
+      "order_id": "uuid FK",
+      "order_version": "committed version FK",
+      "fulfillment_attempt_id": "uuid",
+      "generation": "monotonic integer; unique with order_id",
+      "roster_receipt_digest": "verified immutable digest",
+      "receivers": "exact immutable receiver/line/create/activate-key roster",
+      "authority_fact_digest": "authenticated immutable facts",
+      "predecessor_grant_id": "uuid nullable only first spawn",
+      "created_at": "timestamptz",
+      "execution_id": "uuid",
+      "audit_id": "uuid FK to originating committed audit entry"
+    },
+    "orders_fulfillment_control": {
+      "control_id": "uuid PK",
+      "order_id": "uuid FK",
+      "execution_id": "uuid unique",
+      "operation": "existing hold/cancel/failure control",
+      "request_fingerprint": "immutable digest",
+      "expected_version": "committed commercial version",
+      "fulfillment_attempt_id": "uuid",
+      "generation": "dispatch generation",
+      "original_actor": "trusted immutable actor",
+      "proof_reference": "nullable immutable proof reference",
+      "authorization_fact_fingerprint": "immutable digest",
+      "receivers": "exact immutable receiver/line/create-key roster",
+      "roster_digest": "verified immutable digest",
+      "created_at": "timestamptz",
+      "status": "prepared|awaiting|barrier_ready|settled|refused|abandoned",
+      "owner_token": "uuid",
+      "fencing_generation": "monotonic integer",
+      "lease_until": "timestamptz",
+      "command_results": "per-receiver command IDs and first outcomes/evidence",
+      "error_classification": "nullable typed classification",
+      "terminal_at": "nullable timestamptz"
+    }
+  },
+  "internal_operations": {
+    "attempt_transition": {
+      "public": false,
+      "inputs": [
+        "order_id",
+        "trigger",
+        "security_context",
+        "idempotency_key",
+        "expected_version",
+        "correlation_id",
+        "typed_contribution"
+      ],
+      "result": "TransitionResult or registered refusal",
+      "rules": [
+        "same authorization and guard order for every adapter",
+        "no arbitrary public trigger endpoint"
+      ]
+    },
+    "prepare_receiver_control": {
+      "public": false,
+      "inputs": [
+        "existing_operation",
+        "OrderRef",
+        "CallMeta",
+        "original_authority",
+        "exact_attempt_generation",
+        "immutable_receiver_roster"
+      ],
+      "result": [
+        "control_id",
+        "execution_id",
+        "owner_token",
+        "fencing_generation"
+      ],
+      "rules": [
+        "persist under aggregate then registry/control locks",
+        "public state/version/claims/events unchanged",
+        "remote work outside SQL transaction",
+        "one nonterminal control per order"
+      ]
+    },
+    "finalize_receiver_control": {
+      "public": false,
+      "inputs": [
+        "control_id",
+        "execution_id",
+        "owner_token",
+        "fencing_generation",
+        "complete_bound_barrier_evidence"
+      ],
+      "result": "existing operation TransitionResult",
+      "rules": [
+        "recheck current authority/version and exact pending pointer",
+        "unknown or unavailable receiver outcome is not a success barrier",
+        "hold retains capacity/active service; ordinary terminal requires settled no-active evidence",
+        "clear pending pointer only if equal to this control_id",
+        "D-182 explicit unknown-outcome exception retains uncertain receiver claims"
+      ]
+    },
+    "expire": {
+      "public": false,
+      "inputs": [
+        "order_id",
+        "expected_version",
+        "observed_state_entry",
+        "effective_policy_revision",
+        "idempotency_key",
+        "bounded_maintenance_capability"
+      ],
+      "result": "TransitionResult",
+      "rules": [
+        "target recheck under lock",
+        "no fulfillment expiry; held fulfillment exempt"
+      ]
+    },
+    "auto_void": {
+      "public": false,
+      "inputs": [
+        "order_id",
+        "expected_version",
+        "observed_created_at",
+        "effective_policy_revision",
+        "idempotency_key",
+        "bounded_maintenance_capability"
+      ],
+      "result": "TransitionResult",
+      "rules": [
+        "draft only",
+        "age from creation; no external provisioning"
+      ]
+    },
+    "replace_fulfillment_grant": {
+      "public": false,
+      "source": "DESIGN.md#contract-06-replace-fulfillment-grant",
+      "inputs": [
+        "OrderRef",
+        "CallMeta",
+        "predecessor_grant_id",
+        "closed_predecessor_proof",
+        "verified_successor_roster"
+      ],
+      "result": [
+        "grant_id",
+        "generation",
+        "predecessor_grant_id"
+      ],
+      "rules": [
+        "configured Workflow and order:spawn-signal PDP authorization",
+        "current committed version; in_fulfillment and recorded spawn",
+        "no pending control; current closed predecessor; all keys/intents settled",
+        "identical commercial roster; active members fixed; new keys only rebuilt drafts",
+        "checked next aggregate generation; no spawn/state/timestamp/cap reset",
+        "grant/internal audit sequence/owned settlement commit atomically; no public event"
+      ],
+      "failures": [
+        "not-admissible",
+        "spawn-signal-not-recorded",
+        "still-processing",
+        "grant-source-mismatch",
+        "grant-predecessor-unsettled",
+        "grant-generation-exhausted"
+      ]
+    }
+  },
+  "limits": {
+    "lines": 200,
+    "consumed_items_per_order": 200,
+    "selected_bindings_per_line": 1000,
+    "immutable_version_bytes": 1048576,
+    "serialized_event_bytes": 65536,
+    "page_default": 50,
+    "page_min": 1,
+    "page_max": 200,
+    "amendment_reason_min_characters": 1,
+    "amendment_reason_max_characters": 4096,
+    "version_max": 2147483647,
+    "idempotency_key_bytes": 255,
+    "external_reference_characters": 256,
+    "display_label_characters": 200,
+    "internal_notes_characters": 2000,
+    "draft_revision_max": 9223372036854775807
+  },
+  "transport": {
+    "idempotency_key": "Idempotency-Key header; printable ASCII 1..255 bytes; no trim or normalization",
+    "expected_version": "single strong If-Match commercial ETag for REST; positive signed SQL integer in SDK",
+    "expected_draft_revision": "separate body field extracted into normalized metadata for draft writes/submit; nonnegative bigint; required at submit boundary; omitted draft-mutate stays engine version-conflict after admissibility",
+    "security_context": "trusted authenticated argument only; never from body",
+    "correlation_id": "trusted middleware propagation into CallMeta; not idempotency identity",
+    "path_identifiers": "path only in REST; separate typed SDK arguments; cannot be overridden in body",
+    "request_names": "snake_case; terms/receipt profiles keep native owner codec; external presentation labels in design are mapped explicitly",
+    "success_statuses": "create order 201; other mutations/reads/Preview 200 with typed result, including line removal; no 204 or implicit 202",
+    "event_payload_names": "existing camelCase contract; no body-name conversion of stored receipt/query"
+  }
+}

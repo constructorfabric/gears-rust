@@ -1,0 +1,1240 @@
+{
+  "format_version": 1,
+  "scope": "Frozen independent contract expectations; event root UUID is synthetic fixture identity, not production root identity. Boundary-pass does not imply authorization or business admission. Native receipt/terms/digest golden codecs remain S1-04/06.",
+  "cases": [
+    {
+      "id": "B01-empty-draft",
+      "kind": "boundary",
+      "call": {
+        "operation": "create",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "resource_tenant_id": "11111111-1111-4111-8111-111111111111",
+          "payer_tenant_id": "11111111-1111-4111-8111-111111111111",
+          "seller_tenant_id": "33333333-3333-4333-8333-333333333333",
+          "category": "gts.cf.bss.orders.category.v1~cf.bss.orders.new_sale.v1"
+        }
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B02-no-actor-override",
+      "kind": "boundary",
+      "call": {
+        "operation": "create",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "resource_tenant_id": "11111111-1111-4111-8111-111111111111",
+          "payer_tenant_id": "11111111-1111-4111-8111-111111111111",
+          "seller_tenant_id": "33333333-3333-4333-8333-333333333333",
+          "category": "gts.cf.bss.orders.category.v1~cf.bss.orders.new_sale.v1",
+          "actor": "forged"
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B03-no-client-order-id",
+      "kind": "boundary",
+      "call": {
+        "operation": "create",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "resource_tenant_id": "11111111-1111-4111-8111-111111111111",
+          "payer_tenant_id": "11111111-1111-4111-8111-111111111111",
+          "seller_tenant_id": "33333333-3333-4333-8333-333333333333",
+          "category": "gts.cf.bss.orders.category.v1~cf.bss.orders.new_sale.v1",
+          "order_id": "11111111-1111-4111-8111-111111111111"
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B04-missing-version",
+      "kind": "boundary",
+      "call": {
+        "operation": "submit",
+        "meta": {
+          "idempotency_key": "a"
+        },
+        "body": {}
+      },
+      "expected": "expected-version-required"
+    },
+    {
+      "id": "B05-zero-version",
+      "kind": "boundary",
+      "call": {
+        "operation": "submit",
+        "meta": {
+          "expected_version": 0,
+          "idempotency_key": "a"
+        },
+        "body": {}
+      },
+      "expected": "expected-version-required"
+    },
+    {
+      "id": "B06-bool-not-version",
+      "kind": "boundary",
+      "call": {
+        "operation": "submit",
+        "meta": {
+          "expected_version": true,
+          "idempotency_key": "a"
+        },
+        "body": {}
+      },
+      "expected": "expected-version-required"
+    },
+    {
+      "id": "B07-sparse-submit-version",
+      "kind": "boundary",
+      "call": {
+        "operation": "submit",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key",
+          "expected_draft_revision": 0
+        },
+        "body": {}
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B08-missing-key",
+      "kind": "boundary",
+      "call": {
+        "operation": "hold",
+        "meta": {
+          "expected_version": 4
+        },
+        "body": {}
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B09-key-exact-max",
+      "kind": "boundary",
+      "call": {
+        "operation": "hold",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+        },
+        "body": {}
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B10-key-over-max",
+      "kind": "boundary",
+      "call": {
+        "operation": "hold",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+        },
+        "body": {}
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B11-key-non-ascii",
+      "kind": "boundary",
+      "call": {
+        "operation": "hold",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "résumé"
+        },
+        "body": {}
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B12-header-commercial",
+      "kind": "boundary",
+      "call": {
+        "operation": "patch_order",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "fields": {
+            "payer_tenant_id": "11111111-1111-4111-8111-111111111111"
+          }
+        }
+      },
+      "expected": "draft-mutate"
+    },
+    {
+      "id": "B13-admin-no-draft-revision",
+      "kind": "boundary",
+      "call": {
+        "operation": "patch_order",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "fields": {
+            "display_label": "new"
+          }
+        }
+      },
+      "expected": "administrative-edit"
+    },
+    {
+      "id": "B14-mixed-routing-before-state",
+      "kind": "boundary",
+      "call": {
+        "operation": "patch_line",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "fields": {
+            "currency": "USD",
+            "internal_notes": "note"
+          }
+        }
+      },
+      "expected": "draft-mutate"
+    },
+    {
+      "id": "B15-missing-draft-revision-not-boundary-error",
+      "kind": "boundary",
+      "call": {
+        "operation": "patch_line",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "fields": {
+            "currency": "USD"
+          }
+        }
+      },
+      "expected": "draft-mutate"
+    },
+    {
+      "id": "B16-empty-patch",
+      "kind": "boundary",
+      "call": {
+        "operation": "patch_order",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "fields": {}
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B17-unknown-authored-field",
+      "kind": "boundary",
+      "call": {
+        "operation": "patch_line",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "fields": {
+            "discount_override": 5
+          }
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B18-no-read-through-authoring",
+      "kind": "boundary",
+      "call": {
+        "operation": "patch_order",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "fields": {
+            "auto_renewal": true
+          }
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B19-long-admin-label",
+      "kind": "boundary",
+      "call": {
+        "operation": "patch_order",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "fields": {
+            "display_label": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          }
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B20-unicode-character-bound",
+      "kind": "boundary",
+      "call": {
+        "operation": "patch_order",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "fields": {
+            "display_label": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+          }
+        }
+      },
+      "expected": "administrative-edit"
+    },
+    {
+      "id": "B21-no-null-byte",
+      "kind": "boundary",
+      "call": {
+        "operation": "patch_order",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "fields": {
+            "internal_notes": "a\u0000b"
+          }
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B22-required-verdict",
+      "kind": "boundary",
+      "call": {
+        "operation": "reflect_approval",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "verdict": "required",
+          "deciding_authority": "orders-policy:v1"
+        }
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B23-unknown-verdict",
+      "kind": "boundary",
+      "call": {
+        "operation": "reflect_approval",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "verdict": "maybe"
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B24-forbidden-denial-reason",
+      "kind": "boundary",
+      "call": {
+        "operation": "reflect_approval",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "verdict": "granted",
+          "denial_reason": "no"
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B25-missing-authority-is-later-guard",
+      "kind": "boundary",
+      "call": {
+        "operation": "reflect_approval",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "verdict": "required"
+        }
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B26-completed-ack",
+      "kind": "boundary",
+      "call": {
+        "operation": "acknowledge",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "outcome": "completed",
+          "per_line_results": [
+            {
+              "line_id": "22222222-2222-4222-8222-222222222222",
+              "result": "activated",
+              "subscription_id": "44444444-4444-4444-8444-444444444444"
+            }
+          ]
+        }
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B27-completed-forbids-failure",
+      "kind": "boundary",
+      "call": {
+        "operation": "acknowledge",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "outcome": "completed",
+          "per_line_results": [],
+          "failure_reason": "failed"
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B28-unknown-ack-outcome",
+      "kind": "boundary",
+      "call": {
+        "operation": "acknowledge",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "outcome": "approved",
+          "per_line_results": []
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B29-payment-outcome",
+      "kind": "boundary",
+      "call": {
+        "operation": "begin_fulfillment",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "outcome": "pending"
+        }
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B30-no-local-payment-tolerance",
+      "kind": "boundary",
+      "call": {
+        "operation": "begin_fulfillment",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "outcome": "failed",
+          "tolerate_failure": true
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B31-no-caller-acceptance-time",
+      "kind": "boundary",
+      "call": {
+        "operation": "record_acceptance",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "accepted_at": "2026-10-05T00:00:00Z"
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B32-spawn-exact-roster",
+      "kind": "boundary",
+      "call": {
+        "operation": "report_spawn_signal",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "fulfillment_attempt_id": "44444444-4444-4444-8444-444444444444",
+          "receivers": [
+            {
+              "receiver_id": "33333333-3333-4333-8333-333333333333",
+              "lines": [
+                {
+                  "line_id": "22222222-2222-4222-8222-222222222222",
+                  "acceptance_id": "44444444-4444-4444-8444-444444444444",
+                  "terms_digest": "fixture-digest",
+                  "create_key": "c1",
+                  "activate_key": "a1"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B33-no-caller-grant",
+      "kind": "boundary",
+      "call": {
+        "operation": "report_spawn_signal",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "fulfillment_attempt_id": "44444444-4444-4444-8444-444444444444",
+          "receivers": [],
+          "grant_id": "11111111-1111-4111-8111-111111111111"
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B34-page-zero",
+      "kind": "boundary",
+      "call": {
+        "operation": "list",
+        "meta": {},
+        "body": {
+          "page_size": 0
+        }
+      },
+      "expected": "page-size-exceeded"
+    },
+    {
+      "id": "B35-page-max",
+      "kind": "boundary",
+      "call": {
+        "operation": "list",
+        "meta": {},
+        "body": {
+          "page_size": 200
+        }
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B36-page-over-max",
+      "kind": "boundary",
+      "call": {
+        "operation": "list",
+        "meta": {},
+        "body": {
+          "page_size": 201
+        }
+      },
+      "expected": "page-size-exceeded"
+    },
+    {
+      "id": "B37-page-default",
+      "kind": "boundary",
+      "call": {
+        "operation": "list",
+        "meta": {},
+        "body": {}
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B38-no-public-trigger",
+      "kind": "boundary",
+      "call": {
+        "operation": "resume",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "trigger": "acknowledge-completed"
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "E1",
+      "kind": "etag",
+      "input": "\"4\"",
+      "expected": 4
+    },
+    {
+      "id": "E2",
+      "kind": "etag",
+      "input": "\"2147483647\"",
+      "expected": 2147483647
+    },
+    {
+      "id": "E3",
+      "kind": "etag",
+      "input": "\"0\"",
+      "expected": "expected-version-required"
+    },
+    {
+      "id": "E4",
+      "kind": "etag",
+      "input": "W/\"4\"",
+      "expected": "expected-version-required"
+    },
+    {
+      "id": "E5",
+      "kind": "etag",
+      "input": "*",
+      "expected": "expected-version-required"
+    },
+    {
+      "id": "E6",
+      "kind": "etag",
+      "input": "\"4\",\"5\"",
+      "expected": "expected-version-required"
+    },
+    {
+      "id": "E7",
+      "kind": "etag",
+      "input": "\"2147483648\"",
+      "expected": "expected-version-required"
+    },
+    {
+      "id": "E8",
+      "kind": "etag",
+      "input": "4",
+      "expected": "expected-version-required"
+    },
+    {
+      "id": "T1",
+      "kind": "transition",
+      "from": null,
+      "trigger": "create",
+      "expected": {
+        "row": 1,
+        "to": "draft",
+        "event": null,
+        "versioning": "append"
+      }
+    },
+    {
+      "id": "T2",
+      "kind": "transition",
+      "from": "pending_approval",
+      "trigger": "amendment",
+      "expected": {
+        "row": 19,
+        "to": "submitted",
+        "event": "OrderAmended",
+        "versioning": "append"
+      }
+    },
+    {
+      "id": "T3",
+      "kind": "transition",
+      "from": "approved",
+      "trigger": "amendment",
+      "expected": {
+        "row": 20,
+        "to": "submitted",
+        "event": "OrderAmended",
+        "versioning": "append"
+      }
+    },
+    {
+      "id": "T4",
+      "kind": "transition",
+      "from": "on_hold",
+      "trigger": "resume",
+      "expected": {
+        "row": 22,
+        "to": "$pre_hold_state",
+        "event": "OrderResumed",
+        "versioning": "none"
+      }
+    },
+    {
+      "id": "T5",
+      "kind": "transition",
+      "from": "on_hold",
+      "trigger": "force-fail-unreconciled",
+      "expected": {
+        "row": 29,
+        "to": "fulfillment_failed",
+        "event": "OrderFulfillmentFailed",
+        "versioning": "none"
+      }
+    },
+    {
+      "id": "T6",
+      "kind": "transition",
+      "from": "in_fulfillment",
+      "trigger": "report-spawn-signal",
+      "expected": {
+        "row": 12,
+        "to": "in_fulfillment",
+        "event": null,
+        "versioning": "none"
+      }
+    },
+    {
+      "id": "T7",
+      "kind": "transition",
+      "from": "completed",
+      "trigger": "cancel",
+      "expected": null
+    },
+    {
+      "id": "T8",
+      "kind": "transition",
+      "from": "in_fulfillment",
+      "trigger": "expire",
+      "expected": null
+    },
+    {
+      "id": "T9",
+      "kind": "transition",
+      "from": "on_hold",
+      "trigger": "acknowledge-completed",
+      "expected": null
+    },
+    {
+      "id": "T10",
+      "kind": "transition",
+      "from": "approved",
+      "trigger": "draft-mutate",
+      "expected": null
+    },
+    {
+      "id": "R-duplicate-operation",
+      "kind": "registry",
+      "mutation": "duplicate-operation",
+      "expected": "duplicate operation"
+    },
+    {
+      "id": "R-missing-permission",
+      "kind": "registry",
+      "mutation": "missing-permission",
+      "expected": "operation-without-permission"
+    },
+    {
+      "id": "R-unknown-trigger",
+      "kind": "registry",
+      "mutation": "unknown-trigger",
+      "expected": "unknown-trigger"
+    },
+    {
+      "id": "R-unknown-guard-row",
+      "kind": "registry",
+      "mutation": "unknown-guard-row",
+      "expected": "unknown-guard-row"
+    },
+    {
+      "id": "R-unknown-guard-reason",
+      "kind": "registry",
+      "mutation": "unknown-guard-reason",
+      "expected": "unknown-guard-reason"
+    },
+    {
+      "id": "R-duplicate-reason",
+      "kind": "registry",
+      "mutation": "duplicate-reason",
+      "expected": "duplicate reason"
+    },
+    {
+      "id": "R-duplicate-state-trigger",
+      "kind": "registry",
+      "mutation": "duplicate-state-trigger",
+      "expected": "duplicate state-trigger"
+    },
+    {
+      "id": "P-expected-version-required",
+      "kind": "problem",
+      "reason": "expected-version-required",
+      "expected": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+        "title": "Failed precondition",
+        "http_status": 428,
+        "error_domain": "orders-lifecycle.v1",
+        "error_code": "EXPECTED_VERSION_REQUIRED"
+      }
+    },
+    {
+      "id": "P-version-conflict",
+      "kind": "problem",
+      "reason": "version-conflict",
+      "expected": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~",
+        "title": "Aborted",
+        "http_status": 409,
+        "error_domain": "orders-lifecycle.v1",
+        "error_code": "VERSION_CONFLICT"
+      }
+    },
+    {
+      "id": "P-catalog-predicates-unavailable",
+      "kind": "problem",
+      "reason": "catalog-predicates-unavailable",
+      "expected": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
+        "title": "Service unavailable",
+        "http_status": 503,
+        "error_domain": "orders-lifecycle.v1",
+        "error_code": "CATALOG_PREDICATES_UNAVAILABLE"
+      }
+    },
+    {
+      "id": "P-order-not-found",
+      "kind": "problem",
+      "reason": "order-not-found",
+      "expected": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+        "title": "Not found",
+        "http_status": 404,
+        "error_domain": "orders-lifecycle.v1",
+        "error_code": "ORDER_NOT_FOUND"
+      }
+    },
+    {
+      "id": "P-second-approver-required",
+      "kind": "problem",
+      "reason": "second-approver-required",
+      "expected": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+        "title": "Failed precondition",
+        "http_status": 400,
+        "error_domain": "orders-lifecycle.v1",
+        "error_code": "SECOND_APPROVER_REQUIRED"
+      }
+    },
+    {
+      "id": "B39-submit-draft-revision-required",
+      "kind": "boundary",
+      "call": {
+        "operation": "submit",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "k"
+        },
+        "body": {}
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B40-draft-revision-zero",
+      "kind": "boundary",
+      "call": {
+        "operation": "submit",
+        "meta": {
+          "expected_version": 4,
+          "expected_draft_revision": 0,
+          "idempotency_key": "k"
+        },
+        "body": {}
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B41-draft-revision-negative",
+      "kind": "boundary",
+      "call": {
+        "operation": "submit",
+        "meta": {
+          "expected_version": 4,
+          "expected_draft_revision": -1,
+          "idempotency_key": "k"
+        },
+        "body": {}
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B42-draft-revision-bool",
+      "kind": "boundary",
+      "call": {
+        "operation": "patch_order",
+        "meta": {
+          "expected_version": 4,
+          "expected_draft_revision": true,
+          "idempotency_key": "k"
+        },
+        "body": {
+          "fields": {
+            "payer_tenant_id": "11111111-1111-4111-8111-111111111111"
+          }
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B43-correlation-from-context",
+      "kind": "boundary",
+      "call": {
+        "operation": "report_spawn_signal",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "k"
+        },
+        "body": {
+          "fulfillment_attempt_id": "44444444-4444-4444-8444-444444444444",
+          "receivers": [],
+          "correlation_id": "44444444-4444-4444-8444-444444444444"
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B44-proof-absent",
+      "kind": "boundary",
+      "call": {
+        "operation": "list",
+        "meta": {},
+        "body": {}
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B45-proof-valid-read",
+      "kind": "boundary",
+      "call": {
+        "operation": "list",
+        "meta": {},
+        "body": {},
+        "headers": {
+          "x-delegation-proof-ref": [
+            "proof-ref-1"
+          ]
+        }
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B46-proof-valid-create",
+      "kind": "boundary",
+      "call": {
+        "operation": "create",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "resource_tenant_id": "11111111-1111-4111-8111-111111111111",
+          "payer_tenant_id": "11111111-1111-4111-8111-111111111111",
+          "seller_tenant_id": "33333333-3333-4333-8333-333333333333",
+          "category": "gts.cf.bss.orders.category.v1~cf.bss.orders.new_sale.v1"
+        },
+        "headers": {
+          "x-delegation-proof-ref": [
+            "proof-ref-1"
+          ]
+        }
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B47-proof-empty",
+      "kind": "boundary",
+      "call": {
+        "operation": "list",
+        "meta": {},
+        "body": {},
+        "headers": {
+          "x-delegation-proof-ref": [
+            ""
+          ]
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B48-proof-space",
+      "kind": "boundary",
+      "call": {
+        "operation": "create",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "resource_tenant_id": "11111111-1111-4111-8111-111111111111",
+          "payer_tenant_id": "11111111-1111-4111-8111-111111111111",
+          "seller_tenant_id": "33333333-3333-4333-8333-333333333333",
+          "category": "gts.cf.bss.orders.category.v1~cf.bss.orders.new_sale.v1"
+        },
+        "headers": {
+          "x-delegation-proof-ref": [
+            "has space"
+          ]
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B49-proof-oversized",
+      "kind": "boundary",
+      "call": {
+        "operation": "list",
+        "meta": {},
+        "body": {},
+        "headers": {
+          "x-delegation-proof-ref": [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          ]
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B50-proof-max",
+      "kind": "boundary",
+      "call": {
+        "operation": "list",
+        "meta": {},
+        "body": {},
+        "headers": {
+          "x-delegation-proof-ref": [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          ]
+        }
+      },
+      "expected": "boundary-pass"
+    },
+    {
+      "id": "B51-proof-duplicate",
+      "kind": "boundary",
+      "call": {
+        "operation": "create",
+        "meta": {
+          "expected_version": 4,
+          "idempotency_key": "fixture-key"
+        },
+        "body": {
+          "resource_tenant_id": "11111111-1111-4111-8111-111111111111",
+          "payer_tenant_id": "11111111-1111-4111-8111-111111111111",
+          "seller_tenant_id": "33333333-3333-4333-8333-333333333333",
+          "category": "gts.cf.bss.orders.category.v1~cf.bss.orders.new_sale.v1"
+        },
+        "headers": {
+          "x-delegation-proof-ref": [
+            "a",
+            "b"
+          ]
+        }
+      },
+      "expected": "request-invalid"
+    },
+    {
+      "id": "B52-proof-non-ascii",
+      "kind": "boundary",
+      "call": {
+        "operation": "list",
+        "meta": {},
+        "body": {},
+        "headers": {
+          "x-delegation-proof-ref": [
+            "café"
+          ]
+        }
+      },
+      "expected": "request-invalid"
+    }
+  ],
+  "golden_envelopes": [
+    {
+      "id": "wire-missing-version",
+      "kind": "problem",
+      "value": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+        "title": "Failed precondition",
+        "status": 428,
+        "detail": "Expected version is required.",
+        "error_domain": "orders-lifecycle.v1",
+        "error_code": "EXPECTED_VERSION_REQUIRED",
+        "context": {
+          "data": {}
+        }
+      }
+    },
+    {
+      "id": "wire-authorization-race",
+      "kind": "problem",
+      "value": {
+        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~",
+        "title": "Aborted",
+        "status": 409,
+        "detail": "Authorization context changed. Refresh the order before retrying.",
+        "error_domain": "orders-lifecycle.v1",
+        "error_code": "AUTHORIZATION_CONTEXT_CHANGED",
+        "context": {
+          "data": {}
+        }
+      }
+    },
+    {
+      "id": "spawn-result",
+      "kind": "result",
+      "value": {
+        "transition": {
+          "order_id": "11111111-1111-4111-8111-111111111111",
+          "state": "in_fulfillment",
+          "version": 7
+        },
+        "spawn_signal_at": "2026-10-05T12:00:00.123456Z",
+        "grant_id": "44444444-4444-4444-8444-444444444444",
+        "generation": 3
+      },
+      "model": "SpawnSignalResult"
+    },
+    {
+      "id": "selected-null-is-not-default",
+      "kind": "selection",
+      "value": [
+        {
+          "has_catalog_selection": false,
+          "catalog_scope_key": null
+        },
+        {
+          "has_catalog_selection": true,
+          "catalog_scope_key": null
+        },
+        {
+          "has_catalog_selection": true,
+          "catalog_scope_key": "default"
+        }
+      ]
+    },
+    {
+      "id": "wire-amended",
+      "kind": "event",
+      "event_name": "OrderAmended",
+      "value": {
+        "id": "44444444-4444-4444-8444-444444444444",
+        "type": "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.amended.v1~",
+        "tenant_id": "55555555-5555-4555-8555-555555555555",
+        "source": "bss-orders-lifecycle",
+        "subject": "11111111-1111-4111-8111-111111111111",
+        "subject_type": "gts.cf.bss.orders.order.v1~",
+        "occurred_at": "2026-10-05T12:00:00.123457Z",
+        "data": {
+          "orderId": "11111111-1111-4111-8111-111111111111",
+          "orderVersion": 7,
+          "occurredAt": "2026-10-05T12:00:00.123456Z",
+          "correlationId": "44444444-4444-4444-8444-444444444444",
+          "category": "gts.cf.bss.orders.category.v1~cf.bss.orders.new_sale.v1",
+          "resourceTenantId": "11111111-1111-4111-8111-111111111111",
+          "sellerTenantId": "33333333-3333-4333-8333-333333333333",
+          "payerTenantId": "11111111-1111-4111-8111-111111111111",
+          "state": "submitted",
+          "supersedesVersion": 4
+        }
+      }
+    },
+    {
+      "id": "wire-completed",
+      "kind": "event",
+      "event_name": "OrderCompleted",
+      "value": {
+        "id": "44444444-4444-4444-8444-444444444444",
+        "type": "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.completed.v1~",
+        "tenant_id": "55555555-5555-4555-8555-555555555555",
+        "source": "bss-orders-lifecycle",
+        "subject": "11111111-1111-4111-8111-111111111111",
+        "subject_type": "gts.cf.bss.orders.order.v1~",
+        "occurred_at": "2026-10-05T12:00:00.123457Z",
+        "data": {
+          "orderId": "11111111-1111-4111-8111-111111111111",
+          "orderVersion": 7,
+          "occurredAt": "2026-10-05T12:00:00.123456Z",
+          "correlationId": "44444444-4444-4444-8444-444444444444",
+          "category": "gts.cf.bss.orders.category.v1~cf.bss.orders.new_sale.v1",
+          "resourceTenantId": "11111111-1111-4111-8111-111111111111",
+          "sellerTenantId": "33333333-3333-4333-8333-333333333333",
+          "payerTenantId": "11111111-1111-4111-8111-111111111111",
+          "state": "completed",
+          "perLineResults": [
+            {
+              "lineId": "22222222-2222-4222-8222-222222222222",
+              "subscriptionId": "44444444-4444-4444-8444-444444444444"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "wire-submit-request",
+      "kind": "request",
+      "operation": "submit",
+      "expected_boundary": "boundary-pass",
+      "value": {
+        "headers": {
+          "If-Match": "\"7\"",
+          "Idempotency-Key": "submit-fixture"
+        },
+        "body": {
+          "expected_draft_revision": 0
+        }
+      }
+    },
+    {
+      "id": "wire-administrative-patch-request",
+      "kind": "request",
+      "operation": "patch_order",
+      "expected_boundary": "administrative-edit",
+      "value": {
+        "headers": {
+          "If-Match": "\"7\"",
+          "Idempotency-Key": "edit-fixture"
+        },
+        "body": {
+          "fields": {
+            "display_label": "Renouvellement été",
+            "external_reference": null
+          }
+        }
+      }
+    }
+  ]
+}

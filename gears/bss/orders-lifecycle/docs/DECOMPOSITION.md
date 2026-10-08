@@ -17,7 +17,18 @@
   - [2.8 Reads and Authorization - HIGH](#28-reads-and-authorization---high)
 - [3. Feature Dependencies](#3-feature-dependencies)
   - [3.1 Upstream and release prerequisites](#31-upstream-and-release-prerequisites)
+  - [3.2 Selected reconciliation fixes and delivery sequence](#32-selected-reconciliation-fixes-and-delivery-sequence)
 - [4. Contract address index](#4-contract-address-index)
+  - [R04 implementation work (D-190; not yet delivered)](#r04-implementation-work-d-190-not-yet-delivered)
+  - [R05 implementation work (D-191; not yet delivered)](#r05-implementation-work-d-191-not-yet-delivered)
+  - [R06 implementation work (D-192; not yet delivered)](#r06-implementation-work-d-192-not-yet-delivered)
+  - [R07 implementation dependency — billing-terms producer (D-193)](#r07-implementation-dependency--billing-terms-producer-d-193)
+  - [R08 implementation dependency — service authentication and grants (D-194)](#r08-implementation-dependency--service-authentication-and-grants-d-194)
+  - [R09 implementation dependency — diagnostic contract and mapping (D-195)](#r09-implementation-dependency--diagnostic-contract-and-mapping-d-195)
+  - [R10 implementation dependency — revision reference lifetime (D-196)](#r10-implementation-dependency--revision-reference-lifetime-d-196)
+  - [R11 implementation dependency — Rating exact-binding evaluation (D-197)](#r11-implementation-dependency--rating-exact-binding-evaluation-d-197)
+  - [R13 implementation dependency — commercial authorities (D-199)](#r13-implementation-dependency--commercial-authorities-d-199)
+  - [R14 implementation dependency — integrate the existing event platform (D-200)](#r14-implementation-dependency--integrate-the-existing-event-platform-d-200)
 
 <!-- /toc -->
 
@@ -862,22 +873,25 @@ one `p1` obligation; delivery phases express sequencing rather than weakening pr
 **Phase 1's successful submit path has open upstream prerequisites.** The gate fails closed
 on an unevaluable input ([`ADR/0003`](ADR/0003-cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate.md)).
 The PriceBook target is ADR-0008 / D-150–D-168. Pricing's resolve, pinned-price and plan reads
-are built and golden-tested on the inspected branch; what Orders needs from Pricing is the
-`PricingReadV1` trait over those reads, a `bss-orders.system` subject with `plan:read` and
-`price:read` (the D-424 pattern), and the residual purchase verdict for market applicability
-(D-160, D-161); from Products, a SKU read grant for that subject. The activation deadline is
-derived locally from the stored bindings and a seller-scoped Orders setting (D-162, round 2). Rating has adopted PriceBook but its pre-purchase/TCV adapter is pending. Subscriptions
-has adopted period bindings; it still needs the pinned comparison at activation over the ordinary
-resolve (D-162), the SUB-G1 key answer for a PriceBook line and the SUB-O5 count amendment (D-163),
+and the typed `PricingReadV1` provider exist on reviewed main (D-187). Orders still needs its
+own SDK adapter and [required evidence conformance](DESIGN.md#contract-03-pricing-read-mapping),
+authenticated seller-scoped Orders service provisioning and explicit least-privilege grants
+(the D-194 call matrix), and the proposed nonbinding Pricing assessment with shared admission rules
+(D-189); from Products, a SKU read grant for that subject. D-191 assigns the issued deadline to
+Pricing receipts; authorized seller-policy discovery/resolution and deadline conformance remain
+missing implementation prerequisites. No Orders-local formula may override D-190 price protection. Rating has adopted PriceBook but its pre-purchase/TCV
+adapter is pending. Subscriptions needs the D-190 committed-receipt/hold/fresh-eligibility handoff,
+D-192 frozen first-period mapping implementation, D-193 pre-subscription billing-terms resolver, the SUB-G1 key answer and the SUB-O5 count amendment (D-163),
 `order_compensation` (SUB-O1), the order reference (SUB-O2), the start instant (SUB-O10) and atomic
 activation (`…-upreq-overlap-activation-atomicity`). That last ask is a **release gate** (D-180):
 until Subscriptions agrees and delivers it, subscription-side cardinality is advisory at order time
-and the submit/activation path is not production-ready. SKU protection is inherited from the revision's references (D-164); the only Products/
-Pricing ask is that the release report counts in-flight orders. Workflow needs complete topology and
+and the submit/activation path is not production-ready. SKU protection is inherited from the revision's references (D-164); D-196 assigns future release coordination to Pricing, with durable admission closure, drain and fenced Orders/Subscriptions usage proof. Current revision release remains deferred; a count query alone does not authorize release. D-194
+service authorization is a separate prerequisite. Workflow needs complete topology and
 the approval/payment owner contracts. The reciprocal amendments specify the missing shapes.
 
-`activation_deadline` needs a finite Product-owned acceptance interval; an unset policy cannot be
-replaced by state TTLs, and the deadline is an early check, not the admission authority. Optional
+`activation_deadline` copies the selected receipt’s finite `hold_until` (D-191); no Orders interval
+or state TTL replaces it. Pricing seller-policy resolution/discovery remains missing, and a
+deadline pass is only an early check, not admission authority. Optional
 totals and renewal-as-hold fallbacks are forbidden. Account Management payer-profile, Contracts and
 platform event/authorization prerequisites remain open. Capture/engine development against doubles
 may proceed, but successful production submit/activation requires producer implementation,
@@ -887,9 +901,11 @@ The counterpart asks are registered one by one in [`UPSTREAM_REQS.md`](UPSTREAM_
 upstream ask is never equated with an implemented seam.
 
 Phase 0/1 is the correctness core and is a prerequisite for everything else. Its event-producing
-runtime is additionally blocked until the Event Broker implementation exists: [docs/GEARS.md](../../../../docs/GEARS.md)
-currently records “SDK landed — impl crate TODO”. Startup must prepare all event types, resolve the
-managed chained producer and start the toolkit outbox workers before readiness. Capture and local
+runtime uses the existing Event Broker implementation and managed producer (D-200); the
+SDK-only platform inventory statement is stale. Production readiness still requires real provider
+integration, all event registrations, root identity/grants, partition validation and proven recovery.
+Startup must prepare all event types, resolve the managed chained producer and start toolkit outbox
+workers before readiness. Capture and local
 transition tests can proceed against an `EventBrokerApi` double; production event traffic cannot.
 The four `p1` non-functional guarantees — audit completeness, zero duplicate effects, transition
 latency and recoverability — are properties of the Engine, so no slice can be accepted before it
@@ -902,6 +918,73 @@ Additional upstream contracts, unresolved product decisions and acceptance evide
 tracked in [UPSTREAM_REQS.md](UPSTREAM_REQS.md), [DECISIONS.md](DECISIONS.md), and each
 feature’s canonical contract references. A double permits local development; it does not satisfy
 a production dependency. No feature may mark itself implemented merely because its document exists.
+
+### 3.2 Selected reconciliation fixes and delivery sequence
+
+Agent-ready breakdown: [implementation handoff](implementation/README.md), [review and dispositions](implementation/REVIEW.md), and [source coverage inventory](implementation/COVERAGE.md). The six detailed plans contain 70 work packages with owner dependencies and completion evidence; stage numbers do not delay early upstream provider work.
+
+On 2026-10-05 the user selected A for R01–R10 and authorized the best recommendation
+for all remaining findings. R11–R14 also select A. These are **selected design contracts**,
+not completed implementation checkboxes or evidence of another team's deployment/signoff.
+The finding IDs below refer to the Pricing/Products reconciliation, not the older
+hyphenated review-wave IDs in DECISIONS.
+
+| Finding / decision | Selected fix | Delivery owner / remaining work |
+|---|---|---|
+| R01 / D-187 | Adapt the existing typed Pricing reads | Orders: SDK adapter, selection/evidence mapping and real-provider tests |
+| R02 / D-188 | Reserve commercial versions before remote acceptance | Orders: durable attempts, immutable retries, receipt recovery and fenced final commit |
+| R03 / D-189 | Nonbinding assessment for Preview | Pricing: shared evaluator/read API; Orders: Preview adapter without acceptance side effects |
+| R04 / D-190 | Honor accepted prices through receipt/hold handoff | Subscriptions + Workflow: committed receipt, hold, fresh eligibility and receiver admission |
+| R05 / D-191 | Pricing owns the commercial deadline | Pricing: seller-policy discovery/resolution; Orders: exact receipt deadline projection |
+| R06 / D-192 | Freeze the complete accepted commercial inputs | Orders + Subscriptions + Rating: lossless schema-2 codec and downstream mapping |
+| R07 / D-193 | Subscriptions resolves billing terms before purchase | Subscriptions: authorized resolver, policy provenance and exact period mapping |
+| R08 / D-194 | Use authenticated service principals and explicit grants | Platform + owners: identities, seller-scoped permissions and denial tests |
+| R09 / D-195 | Version diagnostics and verify complete coverage | Pricing + Orders: producer profile, mapping registry and honest partial-failure diagnostics |
+| R10 / D-196 | Pricing coordinates safe reference release | Pricing + Orders + Subscriptions: admission closure, drain, fenced usage proof; retain references until delivered |
+| R11 / D-197 | Rating evaluates exact bindings and all money | Rating: purchase evaluation, labelled horizons/TCV and supported-profile conformance |
+| R12 / D-198 | Reserve receiver capacity and fence activation attempts | Subscriptions + Workflow + Orders: pending/active slots, barriers, cancellation and uncertain-outcome reconciliation |
+| R13 / D-199 | Keep commercial facts with their owning providers | Account Management + Contracts + Payments + Workflow: typed facts, permissions and scope-specific readiness |
+| R14 / D-200 | Integrate the existing broker and transactional outbox | Orders + Platform: schema registration, atomic enqueue, readiness and delivery/recovery evidence |
+
+**Implementation batches.** These refine the existing feature phases, not replace them.
+Each batch may contain multiple reviewable PRs; owner-provider work can proceed in parallel.
+
+1. **Contracts and fixtures.** Fix SDK/profile versions, schemas, canonical digests, supported
+   term/model scope, authority and error mappings for D-189/D-191/D-193/D-195/D-197/D-199.
+   Record actual provider/grant readiness in UPSTREAM_REQS. Create shared receipt, terms,
+   total and activation fixtures. Exit: executable contract fixtures and explicit owner
+   dependencies; a double is labelled as such.
+2. **Orders foundation and capture.** Implement scoped persistence, authorization, transition
+   engine, audit/idempotency and draft capture. Include D-188 attempt/version storage and
+   D-198 operational barrier storage in the migration plan. Integrate D-200 using the
+   existing producer/outbox in the same transaction. Exit: refusal/rollback, retry,
+   concurrent execution and lost-ack tests; no externally exposed write bypasses authorization.
+3. **Provider delivery and gate adapters.** Build the missing Pricing assessment/policy,
+   Subscriptions terms and Rating evaluation providers; wire D-187/D-194 adapters and
+   D-195 diagnostics. Implement Preview first against these nonbinding contracts, then
+   submit using D-188/D-192. Exit: complete diagnostics, no Preview acceptance writes,
+   exact evaluated-versus-accepted input equality and recovery after partial multi-line
+   acceptance. Production successful submit requires its real providers and grants.
+4. **Versioning and commercial preconditions.** Implement amendment, current-version
+   customer consent, approval and payment outcomes against D-199 owners. Exit: old
+   receipts/verdicts/consent cannot authorize a replacement version; pending payment
+   survives restart and outages never become tolerated business failure.
+5. **Fulfillment and lifecycle controls.** Deliver the D-190/D-192 handoff with D-198
+   receiver slots/fences before enabling activation. Implement Workflow compensation,
+   post-spawn hold/cancel barriers, expiry and existing recovery workers together.
+   Exit: concurrent admissions respect capacity, revoked attempts cannot newly commit
+   activation, and ambiguous provisioning retains its capacity and recovery obligation.
+   Exercise the explicitly documented force-fail-with-unknown-compensation exception.
+6. **Read surfaces and release evidence.** Finish authorized reads/history and exclusions;
+   run the full provider-backed lifecycle corpus, isolation tests, failure injection,
+   delivery recovery and latency checks. D-196 cleanup may remain disabled with references
+   retained; enabling release requires its separate closure/drain/zero-holder conformance.
+   No feature is marked delivered solely from local doubles or specification completion.
+
+Start runtime implementation with batch 1's contract fixtures and batch 2's foundation;
+assign the missing owner providers in parallel. The production release gates in §3.1 and
+UPSTREAM_REQS remain binding throughout.
+
 
 ## 4. Contract address index
 
@@ -1071,3 +1154,123 @@ explicit cross-contract citations name their namespace. These addresses are not 
 | 08 §4.4 | [Delegation proof (normative)](DESIGN.md#contract-08-4-4) |
 | 08 §4.5 | [Policy values](DESIGN.md#contract-08-4-5) |
 | 08 §5 | [Traceability](features/08-read-and-authz.md#contract-08-5) |
+
+
+**D-188 implementation prerequisite:** Foundation delivers engine-owned durable attempts, allocation high-water, execution-generation idempotency/fencing, bounded recovery and sparse-history schemas before Gate-and-pin issues Pricing commands. Capture supplies immutable draft snapshots; Gate/Versioning persist exact receipt links only in the final commercial transaction. Workflow/Reads consume exact versions and explicit predecessors. The [D-188 failure matrix](DESIGN.md#contract-01-commercial-attempt) is a required completion gate; no runtime delivery is asserted. R03 follows D-189; R04 follows D-190; D-191/R06/R12 remain separate release prerequisites.
+
+
+**D-189 implementation prerequisite:** Pricing owns the proposed assessment SDK/provider,
+shared commercial evaluator and seller-scoped assessment authorization. Gate-and-pin consumes
+that capability through the Orders port alongside the D-187 typed reads and composes one
+assessment for Preview/submit/amendment. Preview does not depend on or invoke D-188 attempts;
+only committing commands use them. Delivery requires the [D-189 conformance scenarios](DESIGN.md#contract-03-nonbinding-assessment),
+including no commercial artifacts, complete independent diagnostics, missing-term TCV withholding,
+least-privilege access and authoritative rejection after a changed observation. The upstream
+assessment remains missing, and D-192 encoding/downstream mapping and the D-190/D-191 activation/hold/deadline implementation stay open.
+
+### R04 implementation work (D-190; not yet delivered)
+
+- [ ] Gate/Versioning persist selected committed receipt identities/digests through D-188; no hold at submit.
+- [ ] Read/Authorization exposes exact version receipt links under finite authorized order scope.
+- [ ] Subscriptions owns immutable hold input, idempotent retry, fresh eligibility and receiver admission fencing; Workflow passes exact committed version/attempt.
+- [ ] Workflow implements explicit receiver reason mappings, preserving market-divergence and separating expiry/closure from transport/authorization failures and delivers compensation/unknown-outcome recovery.
+- [ ] Deliver [D-190 cross-service conformance](DESIGN.md#contract-03-accepted-price-activation); D-191 validity/policy integration, D-192 snapshot mapping implementation and R12 concrete atomic admission/recovery block production activation.
+
+### R05 implementation work (D-191; not yet delivered)
+
+- [ ] Pricing: deliver the [seller-policy discovery/resolution contract](DESIGN.md#contract-03-commercial-deadline), immutable per-seller policy versions and authorized read grants. The current deployment-wide default does not fulfill seller-specific policy.
+- [ ] Orders adapter/Gate/Versioning: stage assessment without an issued deadline, freeze discovered policy versions in D-188 attempts, then validate returned receipts and copy per-line `hold_until` verbatim before commit. Remove the local interval/end-date calculation.
+- [ ] Reads/Preview: expose committed per-line deadline provenance; Preview carries no issued deadline and marks any optional forecast nonbinding/unavailable as appropriate.
+- [ ] Workflow/Subscriptions: compare each planned activation against selected receipt windows, use fresh Pricing eligibility and retain R12 admission/recovery as a separate prerequisite; never refresh validity on replay or hold/resume.
+- [ ] Deliver the D-191 boundary, policy-race, seller authorization, mixed-deadline, Preview and unchanged-replay conformance scenarios before claiming completion.
+
+
+### R06 implementation work (D-192; not yet delivered)
+
+- [ ] Foundation/Gate/Versioning: implement Orders schema-2 lossless complete-receipt encoding, original digest preservation, immutable query/link validation and final-commit selection under D-188. Explicitly retire the listed legacy provenance/matrix fields; retain required business-fact checks.
+- [ ] Read/Authorization: expose exact committed receipt evidence only through the authorized order/version; separate optional current display/diagnostic projections from accepted commercial facts.
+- [ ] Subscriptions/Rating: deliver the [upstream adoption requirement](UPSTREAM_REQS.md#r06-downstream-adoption-requirement-d-192-not-delivered), first-period materialization and broader Rating-owned snapshot composition; no receipt-only claim of a complete billable snapshot.
+- [ ] Deliver [D-192 conformance](DESIGN.md#contract-03-frozen-commercial-snapshot), including complete BillingTerms, exact serialization, descriptor/meter drift, hold mismatch, missing real inputs and replay. Existing Pricing test source is evidence, not integration completion; R12 remains open.
+
+
+### R07 implementation dependency — billing-terms producer (D-193)
+
+- [ ] `p1` — Subscriptions delivers the proposed SafeRead SDK/provider and authorized immutable
+  policy resolution in `…-upreq-pre-subscription-billing-terms`; existing Pricing validation is
+  not a terms producer. Policy source/precedence and grants must be agreed upstream.
+- [ ] `p1` — Capture retains calendar-unit/rolling intent; Gate adapts exact invoice-period Term
+  and BillingTerms, validates canonical digest and freezes query inputs through D-188/D-192.
+- [ ] `p1` — Preview preserves missing-term diagnostics/TCV withholding without commercial writes;
+  acceptance requires complete terms. Prove supported anchors/cycles/models, retry stability and
+  delayed activation/period geometry with actual Subscriptions/Pricing/Rating providers.
+
+The [D-193 contract and conformance](DESIGN.md#contract-03-billing-terms-resolution) is a production
+acceptance dependency, not a claim that the docs-only Subscriptions gear now has a resolver.
+
+
+### R08 implementation dependency — service authentication and grants (D-194)
+
+- [ ] Platform AuthN/AuthZ provisions separate seller-scoped Orders/Subscriptions ordinary service
+  principals; wire authenticated contexts rather than handcrafted system subjects. Track
+  `cpt-cf-bss-orders-lifecycle-upreq-commercial-service-provisioning` as a phase-1 release gate.
+- [ ] Apply the [D-194 call matrix](DESIGN.md#contract-08-commercial-service-authorization) to
+  adapter/provider integration: Orders acceptance create/read, Subscriptions hold/read, required
+  catalog/Products reads; no implicit reference writes or Orders hold grant.
+- [ ] Coordinate read permissions with delivery of D-189 assessment, D-191 policy and D-193 terms.
+  Preview requires no acceptance-create/hold authority. Keep original buyer/proposed-payer checks
+  before foreign-party calls and final commit.
+- [ ] Persist authenticated commercial principal identity with D-188 attempts; validate stable
+  identity through refresh/rotation, changed-principal reconciliation, revocation and stale workers.
+- [ ] Pass real-provider positive/negative grant tests, seller isolation, unauthorized payer use,
+  no impersonation and no leakage on denial/outage. Existing code paths are not deployed grants.
+
+### R09 implementation dependency — diagnostic contract and mapping (D-195)
+
+- [ ] Deliver the [D-195 Pricing-owned profile/results and Orders mapping registry](DESIGN.md#contract-03-diagnostic-mapping)
+  alongside D-189 assessment; verify authoritative roster and independent expected coverage.
+- [ ] Implement lossless producer subresults, mapping/profile/applicability metadata, tagged nullable
+  selection identity and schema constraints; preserve stable Orders reasons and public allowlists.
+- [ ] Apply blocking-only primary-error selection and optional-context TCV withholding consistently
+  across assessment, persistence, REST and exact idempotent replay.
+- [ ] Pass complete/malformed/partial coverage, multi-failure, many-to-one mapping, null/default
+  collision, redaction, bounded deadline and registry-upgrade replay tests. Runtime work remains open.
+
+### R10 implementation dependency — revision reference lifetime (D-196)
+
+- [ ] Agree and deliver the [Pricing-coordinated closure/drain contract](DESIGN.md#contract-03-revision-reference-protection)
+  with Orders and Subscriptions; keep existing revision references until this protocol is proven.
+- [ ] Add authorized, seller/revision-scoped usage reporting and durable admission-generation
+  acknowledgements. Include potentially committable D-188 attempts, nonterminal committed versions
+  and durable receiver handoff; separate commercial holders from historical/orphan evidence.
+- [ ] Coordinate final commit/recovery checks with the closure generation; persist release work in
+  Pricing's durable recovery protocol. No Orders Products-reference writer or direct DB read is added.
+- [ ] Prove concurrent submit/amendment versus closure, unknown command outcomes, process restart,
+  stale/denied reports, activation handoff and duplicate release. Track R12 activation fencing as a
+  separate dependency. No automated revision release may ship based solely on a zero usage count.
+
+### R11 implementation dependency — Rating exact-binding evaluation (D-197)
+
+- [ ] Publish and implement the [D-197 Rating SDK/provider](DESIGN.md#contract-03-rating-purchase-evaluation), supported profile and authorized grants; no Rating runtime exists yet.
+- [ ] Integrate exact selected bindings and D-193 terms, frozen D-188 input/results and receipt equality; Orders performs no money arithmetic.
+- [ ] Implement nullable uncommitted usage amounts, one order TCV carrier and labelled finite/rolling/mixed basis in storage and reads.
+- [ ] Run the contract's real-provider boundary/replay/authorization/Preview fixtures; development doubles cannot satisfy production readiness. Tax remains separate.
+
+
+**D-198 production gate:** Foundation implements staged receiver controls and recovery; Workflow integrates complete receiver pause/revoke inventory evidence; Subscriptions implements capacity reservation at async intent admission and shared-generation confirmation fencing. Hold/ordinary terminal effective commits wait for the barrier, with the explicit D-182 unknown exception. Canonical resource-dimensional key adoption, SDKs/grants, all-writer capacity and failure/race conformance remain unchecked; local Orders doubles or passing Pricing hold tests do not satisfy this gate. [Normative protocol](DESIGN.md#contract-06-activation-admission).
+
+### R13 implementation dependency — commercial authorities (D-199)
+
+- [ ] Implement the [owner readiness matrix](DESIGN.md#contract-05-commercial-owner-readiness): payer profile/delegation, Contracts, Payments authorization and Workflow approval/fulfillment providers with explicit schemas, grants and freshness.
+- [ ] Preserve Pricing receipt/customer consent/approval separation and D-175 adapter trust boundary; bind each relevant decision to current version.
+- [ ] Test real-provider refusal/outage/stale-version behavior and durable pending payment recovery before enabling affected production paths; no guessed facts or mock-based readiness.
+
+### R14 implementation dependency — integrate the existing event platform (D-200)
+
+- [ ] Deliver the [D-200 integration checklist](DESIGN.md#contract-01-event-platform-integration)
+  using existing EventBrokerApi/DbProducer/toolkit facilities, same-transaction enqueue and post-commit Wake.
+- [ ] Register eleven event types/subject/topic, configure root identity/grants and routing/partitions,
+  and verify runtime readiness. The broker implementation and initial cursor-retry behavior exist.
+- [ ] Record deployed SDK evidence and empty-cache transient recovery regression; deliver supported
+  producer dead-letter republication, shared operator tooling, runbook and monitoring evidence.
+- [ ] Pass real-provider lost-response/restart/recovery/security tests and D-186 consumer conformance;
+  broker acceptance does not establish downstream completion. All integration tasks remain open.

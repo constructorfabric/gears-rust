@@ -68,13 +68,16 @@ refuse admission rather than fall back to old APIs or substitute local commercia
 - Keep immutable version reads and bounded event projections; full expanded pins are not duplicated in events.
 - Preserve existing state transitions; expiry during fulfillment follows compensation, not a new expiry edge.
 
+**Current reconciliation (2026-10-05):** D-187/D-188/D-189 supersede the historical read/receipt/assessment assumptions below. [D-190](../DESIGN.md#contract-03-accepted-price-activation) replaces the initial pinned comparison with committed receipt selection, Subscriptions-owned hold, fresh eligibility and fenced admission. D-191 policy/deadline implementation, R06 frozen-binding mapping and R12 concrete recovery remain release prerequisites. [D-194](../DESIGN.md#contract-08-commercial-service-authorization) supersedes the custom Orders system-subject construction with authenticated service principals and explicit grants. The following dated rationale is retained as history.
+
 **Amended 2026-09-30 (D-159–D-168).** Where a seam already exists on `16705a243`, the contracts
 above are pulled onto it rather than replaced by a new one:
 
 - `OrderPin` nests `items[].chains[]` exactly as resolve answers the matrix (D-159); the six
   catalog predicates that the existing reads can answer are consumed through `PricingReadV1` over
   those reads, and only the residual verdict remains an ask (D-161).
-- Pricing access is the D-424 pattern, a `bss-orders.system` subject in the seller tenant (D-160).
+- Historical D-160 used a custom Orders system subject in the seller tenant; D-194 supersedes
+  that construction with platform-authenticated service principals and explicit PDP grants.
 - Initial acceptance is verified by a pinned comparison at activation: Subscriptions sends the
   accepted bindings as pins to the ordinary resolve and refuses when a consumed slot's price moved;
   no new resolve mode, receipt or clock agreement (D-162, amended in round 2). The deadline is a

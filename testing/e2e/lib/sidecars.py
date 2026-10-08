@@ -67,6 +67,20 @@ def timescaledb_tag() -> str:
     return os.environ.get(ENV_TIMESCALEDB_TAG, "").strip() or TIMESCALEDB_TAG
 
 
+# The PostgreSQL pin, mirrored from libs/test-containers/src/lib.rs (`postgres()`,
+# POSTGRES_TAG, ENV_POSTGRES_TAG): the image the Rust PostgreSQL integration suites run, so a
+# self-managed E2E lane (bss-orders-lifecycle) exercises the same major. The Rust test
+# `e2e_sidecar_pins_the_same_postgres_image` fails the build if any of the three drifts.
+POSTGRES_IMAGE = "postgres"
+POSTGRES_TAG = "18-alpine"
+ENV_POSTGRES_TAG = "GEARS_TEST_PG_TAG"
+
+
+def postgres_tag() -> str:
+    """Effective PostgreSQL tag, honoring GEARS_TEST_PG_TAG (empty means the pin)."""
+    return os.environ.get(ENV_POSTGRES_TAG, "").strip() or POSTGRES_TAG
+
+
 # The ClickHouse pin, mirrored from libs/test-containers/src/lib.rs (CLICKHOUSE_IMAGE,
 # CLICKHOUSE_TAG, ENV_CLICKHOUSE_TAG). Split into repo + tag rather than one composed
 # literal so the environment override below can reach this lane too; the Rust test
@@ -576,6 +590,70 @@ class TimescaleDbSidecar(_DockerSidecar):
         if probe.returncode == 0 and probe.stdout.strip() == "1":
             return True, ""
         return False, (probe.stderr or probe.stdout).strip()
+
+
+class PostgresSidecar(_DockerSidecar):
+    """A throwaway PostgreSQL container with a dynamically mapped host port.
+
+    The image is the workspace's pinned `postgres` major (POSTGRES_IMAGE/`postgres_tag()`),
+    the one every Rust PostgreSQL integration suite runs, so a self-managed E2E lane proves
+    its migrations and role grants against the same server the unit lane validated. The
+    container's superuser is `postgres`; suites provision their own restricted logins through
+    `psql` and hand the gear only those.
+    """
+
+    IMAGE = f"{POSTGRES_IMAGE}:{postgres_tag()}"
+    LABEL = f"{LABEL_KEY}=postgres"
+    CONTAINER_PORT = "5432/tcp"
+
+    DB_USER = "postgres"
+    DB_PASSWORD = "postgres"
+    DB_NAME = "postgres"
+
+    name = "postgres"
+
+    def _env_args(self) -> list[str]:
+        return [
+            "-e", f"POSTGRES_USER={self.DB_USER}",
+            "-e", f"POSTGRES_PASSWORD={self.DB_PASSWORD}",
+            "-e", f"POSTGRES_DB={self.DB_NAME}",
+        ]
+
+    def _probe(self) -> tuple[bool, str]:
+        """A real query over the container's own TCP listener (see TimescaleDbSidecar)."""
+        probe = subprocess.run(
+            ["docker", "exec", "-e", f"PGPASSWORD={self.DB_PASSWORD}",
+             self.container_id,
+             "psql", "-h", "127.0.0.1", "-p", "5432",
+             "-U", self.DB_USER, "-d", self.DB_NAME,
+             "-tAc", "select 1"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if probe.returncode == 0 and probe.stdout.strip() == "1":
+            return True, ""
+        return False, (probe.stderr or probe.stdout).strip()
+
+    def psql(self, sql: str, *, db: str | None = None, user: str | None = None,
+             password: str | None = None) -> str:
+        """Run `sql` through the container's `psql` and return its trimmed `-tA` output.
+
+        Used by suites to provision roles and databases and to read persisted side effects
+        (what the HTTP surface must not disclose) straight from the store. Raises on a SQL
+        error so a provisioning mistake fails the session setup rather than a later test.
+        """
+        if self.container_id is None:
+            raise RuntimeError("PostgresSidecar.start() has not run")
+        result = subprocess.run(
+            ["docker", "exec", "-i", "-e", f"PGPASSWORD={password or self.DB_PASSWORD}",
+             self.container_id,
+             "psql", "-h", "127.0.0.1", "-p", "5432",
+             "-U", user or self.DB_USER, "-d", db or self.DB_NAME,
+             "-v", "ON_ERROR_STOP=1", "-tA"],
+            input=sql, capture_output=True, text=True, timeout=60, check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"psql failed: {result.stderr.strip()}\n--- sql ---\n{sql}")
+        return result.stdout.strip()
 
 
 class ClickHouseSidecar(_DockerSidecar):

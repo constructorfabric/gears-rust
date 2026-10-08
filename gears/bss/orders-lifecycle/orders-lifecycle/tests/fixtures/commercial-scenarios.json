@@ -1,0 +1,397 @@
+{
+  "format_version": 1,
+  "scenarios": [
+    {
+      "id": "self-service-published",
+      "sales_path": "self_service",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000000a"
+      },
+      "catalog": "published",
+      "terms": [
+        "finite"
+      ],
+      "charge_kinds": [
+        "recurring"
+      ],
+      "line_count": 1,
+      "owner": "available",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-188",
+        "D-195"
+      ],
+      "package": "S3-13",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "authorized caller owns resource and payer; authoritative market; finite pin"
+    },
+    {
+      "id": "partner-delegated",
+      "sales_path": "partner_placed",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000000a"
+      },
+      "catalog": "published",
+      "terms": [
+        "finite"
+      ],
+      "charge_kinds": [
+        "recurring"
+      ],
+      "line_count": 1,
+      "owner": "available",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-194",
+        "D-199"
+      ],
+      "package": "S3-13",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "PDP validates current delegated authority; provider service identity is not buyer proof"
+    },
+    {
+      "id": "third-party-payer",
+      "sales_path": "self_service",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000001e"
+      },
+      "catalog": "published",
+      "terms": [
+        "finite"
+      ],
+      "charge_kinds": [
+        "recurring"
+      ],
+      "line_count": 1,
+      "owner": "available",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-194",
+        "D-199"
+      ],
+      "package": "S3-13",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "authorize all three axes including proposed payer; read payer market"
+    },
+    {
+      "id": "catalog-scheduled",
+      "sales_path": "self_service",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000000a"
+      },
+      "catalog": "scheduled",
+      "terms": [
+        "finite"
+      ],
+      "charge_kinds": [
+        "recurring"
+      ],
+      "line_count": 1,
+      "owner": "available",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-189",
+        "D-190"
+      ],
+      "package": "S3-13/S5-07",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "assess at requested activation date, not wall clock publication alone"
+    },
+    {
+      "id": "catalog-superseded",
+      "sales_path": "self_service",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000000a"
+      },
+      "catalog": "superseded",
+      "terms": [
+        "finite"
+      ],
+      "charge_kinds": [
+        "recurring"
+      ],
+      "line_count": 1,
+      "owner": "available",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-189",
+        "D-190"
+      ],
+      "package": "S3-13/S5-07",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "preserve held selection; ordinary successor does not invalidate a receipt"
+    },
+    {
+      "id": "catalog-closed",
+      "sales_path": "self_service",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000000a"
+      },
+      "catalog": "closed",
+      "terms": [
+        "finite"
+      ],
+      "charge_kinds": [
+        "recurring"
+      ],
+      "line_count": 1,
+      "owner": "available",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-189",
+        "D-190"
+      ],
+      "package": "S3-13/S5-07",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "fresh receiver check refuses explicit closure and compensates before failure acknowledgement"
+    },
+    {
+      "id": "catalog-retired",
+      "sales_path": "self_service",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000000a"
+      },
+      "catalog": "retired",
+      "terms": [
+        "finite"
+      ],
+      "charge_kinds": [
+        "recurring"
+      ],
+      "line_count": 1,
+      "owner": "available",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-189",
+        "D-190"
+      ],
+      "package": "S3-13/S5-07",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "no new sale; receiver mapping must distinguish retirement from expiry"
+    },
+    {
+      "id": "rolling-usage",
+      "sales_path": "self_service",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000000a"
+      },
+      "catalog": "published",
+      "terms": [
+        "rolling"
+      ],
+      "charge_kinds": [
+        "usage"
+      ],
+      "line_count": 1,
+      "owner": "available",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-193",
+        "D-197"
+      ],
+      "package": "S3-13",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "unknown future usage is not zero or fabricated TCV"
+    },
+    {
+      "id": "mixed-terms-charges",
+      "sales_path": "self_service",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000000a"
+      },
+      "catalog": "published",
+      "terms": [
+        "finite",
+        "rolling"
+      ],
+      "charge_kinds": [
+        "recurring",
+        "one_time",
+        "usage"
+      ],
+      "line_count": 3,
+      "owner": "available",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-193",
+        "D-197"
+      ],
+      "package": "S3-13",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "line-specific cycles; one order TCV carrier; withheld estimate where input is insufficient"
+    },
+    {
+      "id": "max-200-lines",
+      "sales_path": "self_service",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000000a"
+      },
+      "catalog": "published",
+      "terms": [
+        "finite"
+      ],
+      "charge_kinds": [
+        "recurring"
+      ],
+      "line_count": 200,
+      "owner": "available",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-188",
+        "D-192"
+      ],
+      "package": "S3-13",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "complete unique roster, 200-line bound; separately enforce whole-version 1 MiB bound"
+    },
+    {
+      "id": "over-200-lines",
+      "sales_path": "self_service",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000000a"
+      },
+      "catalog": "published",
+      "terms": [
+        "finite"
+      ],
+      "charge_kinds": [
+        "recurring"
+      ],
+      "line_count": 201,
+      "owner": "available",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-192"
+      ],
+      "package": "S3-12",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "boundary rejects before remote mutation"
+    },
+    {
+      "id": "owner-unavailable",
+      "sales_path": "self_service",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000000a"
+      },
+      "catalog": "published",
+      "terms": [
+        "finite"
+      ],
+      "charge_kinds": [
+        "recurring"
+      ],
+      "line_count": 1,
+      "owner": "unavailable",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-189",
+        "D-197",
+        "D-199"
+      ],
+      "package": "S3-13",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "Preview may withhold optional context; submit defers/fails closed and creates no fabricated evidence"
+    },
+    {
+      "id": "default-dimension-not-literal-default",
+      "sales_path": "self_service",
+      "axes": {
+        "seller": "00000000-0000-0000-0000-000000000014",
+        "resource": "00000000-0000-0000-0000-00000000000a",
+        "payer": "00000000-0000-0000-0000-00000000000a"
+      },
+      "catalog": "published",
+      "terms": [
+        "finite"
+      ],
+      "charge_kinds": [
+        "recurring"
+      ],
+      "line_count": 1,
+      "owner": "available",
+      "dimension_values": [
+        null,
+        "default"
+      ],
+      "requirements": [
+        "D-195"
+      ],
+      "package": "S3-13",
+      "venue": "owner SDK + authenticated submit integration",
+      "runtime_evidence": "pending",
+      "expected": "native None and literal default remain distinct evaluation identities"
+    }
+  ]
+}

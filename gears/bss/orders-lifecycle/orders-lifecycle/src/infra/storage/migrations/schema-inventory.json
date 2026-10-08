@@ -1,0 +1,2880 @@
+{
+  "physical_prefix": "bss_orders__",
+  "postgres_minimum": 15,
+  "schema_owner": "migrations/*.sql; this inventory is generated",
+  "tables": [
+    {
+      "name": "order",
+      "physical": "bss_orders__order",
+      "content_owner": "engine",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-order"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "aggregate",
+      "scope": "PDP: current resource/seller/payer AND standard order ID",
+      "columns": [
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "order_number",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "category",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "resource_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "audit_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "payer_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "seller_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "initiating_actor",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "sales_path",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "contract_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "state_entered_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "current_version",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "version_allocation_high_water",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "draft_revision",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "pre_hold_state",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "resume_count",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "amendment_count",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "fulfillment_control_generation",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "fulfillment_control_pending",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "spawn_signal_at",
+          "type": "timestamptz",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "authorization_failure_tolerated_at",
+          "type": "timestamptz",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "compensation_evidence",
+          "type": "jsonb",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "audit_sequence",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "order_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__order": "PRIMARY KEY (order_id)",
+        "ck_bss_orders__order__0": "CHECK (state IN ('draft','submitted','pending_approval','approved','in_fulfillment','on_hold','completed','rejected','cancelled','fulfillment_failed','expired'))",
+        "ck_bss_orders__order__1": "CHECK (pre_hold_state IS NULL OR pre_hold_state IN ('draft','submitted','pending_approval','approved','in_fulfillment','on_hold','completed','rejected','cancelled','fulfillment_failed','expired'))",
+        "ck_bss_orders__order__2": "CHECK (pre_hold_state IS NULL OR state = 'on_hold')",
+        "ck_bss_orders__order__3": "CHECK (sales_path IN ('self_service','partner_placed'))",
+        "ck_bss_orders__order__4": "CHECK (current_version >= 1 AND current_version <= version_allocation_high_water)",
+        "ck_bss_orders__order__5": "CHECK (draft_revision >= 0 AND resume_count >= 0 AND amendment_count >= 0 AND fulfillment_control_generation >= 0 AND audit_sequence >= 0)",
+        "ck_bss_orders__order__6": "CHECK (length(order_number) BETWEEN 1 AND 128)",
+        "fk_bss_orders__order__current": "FOREIGN KEY (order_id,current_version) REFERENCES bss_orders__order_version(order_id,version) DEFERRABLE INITIALLY DEFERRED",
+        "fk_bss_orders__order__control": "FOREIGN KEY (fulfillment_control_pending,order_id) REFERENCES bss_orders__fulfillment_control(control_id,order_id) DEFERRABLE INITIALLY DEFERRED",
+        "ck_bss_orders__order__compensation": "CHECK (bss_orders__compensation_valid(compensation_evidence) IS TRUE)"
+      },
+      "indexes": {
+        "uq_bss_orders__order__0": "UNIQUE (seller_tenant_id,order_number)",
+        "idx_bss_orders__order__0": "(resource_tenant_id,state,state_entered_at)",
+        "idx_bss_orders__order__1": "(seller_tenant_id,state,state_entered_at,order_id)",
+        "idx_bss_orders__order__2": "(state,state_entered_at,order_id)",
+        "idx_bss_orders__order__3": "(state,created_at,order_id)",
+        "idx_bss_orders__order__4": "(resource_tenant_id,created_at,order_id)",
+        "idx_bss_orders__order__5": "(seller_tenant_id,created_at,order_id)",
+        "idx_bss_orders__order__6": "(resource_tenant_id,state,created_at,order_id)",
+        "idx_bss_orders__order__7": "(seller_tenant_id,state,created_at,order_id)",
+        "idx_bss_orders__order__8": "(payer_tenant_id,created_at,order_id)",
+        "idx_bss_orders__order__9": "(payer_tenant_id,state,created_at,order_id)",
+        "idx_bss_orders__order__10": "(contract_id,created_at,order_id)",
+        "idx_bss_orders__order__11": "(audit_tenant_id,order_id)"
+      },
+      "triggers": [
+        "CREATE TRIGGER bss_orders__order_fixed BEFORE UPDATE ON bss_orders__order FOR EACH ROW EXECUTE FUNCTION bss_orders__update_guard('category,resource_tenant_id,payer_tenant_id,contract_id,state,state_entered_at,current_version,version_allocation_high_water,draft_revision,pre_hold_state,resume_count,amendment_count,fulfillment_control_generation,fulfillment_control_pending,spawn_signal_at,authorization_failure_tolerated_at,compensation_evidence,audit_sequence');",
+        "CREATE TRIGGER bss_orders__order_delete BEFORE DELETE ON bss_orders__order FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__order_validate BEFORE UPDATE ON bss_orders__order FOR EACH ROW EXECUTE FUNCTION bss_orders__aggregate_guard();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__order TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__order TO bss_orders_business;",
+        "GRANT UPDATE (category,resource_tenant_id,payer_tenant_id,contract_id,state,state_entered_at,current_version,version_allocation_high_water,draft_revision,pre_hold_state,resume_count,amendment_count,fulfillment_control_generation,fulfillment_control_pending,spawn_signal_at,authorization_failure_tolerated_at,compensation_evidence,audit_sequence) ON bss_orders__order TO bss_orders_runtime, bss_orders_business;",
+        "GRANT SELECT ON bss_orders__order TO bss_orders_verifier, bss_orders_checkpoint;",
+        "GRANT SELECT ON bss_orders__order TO bss_orders_discovery, bss_orders_maintenance;",
+        "GRANT SELECT ON bss_orders__order TO bss_orders_private;"
+      ]
+    },
+    {
+      "name": "order_version",
+      "physical": "bss_orders__order_version",
+      "content_owner": "versioning",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-order-version"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "append",
+      "scope": "current parent",
+      "columns": [
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "version",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "supersedes_version",
+          "type": "integer",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "market_currency",
+          "type": "char(3)",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "market_region",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "payer_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "category",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "contract_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "actor",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "actor_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "reason",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "amendment_reason",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "order_id",
+        "version"
+      ],
+      "constraints": {
+        "pk_bss_orders__order_version": "PRIMARY KEY (order_id,version)",
+        "ck_bss_orders__order_version__0": "CHECK (version > 0)",
+        "ck_bss_orders__order_version__1": "CHECK ((version = 1 AND supersedes_version IS NULL AND reason = 'create') OR (version > 1 AND supersedes_version IS NOT NULL AND supersedes_version > 0 AND supersedes_version < version AND reason IN ('submit','amendment')))",
+        "ck_bss_orders__order_version__2": "CHECK ((reason = 'amendment' AND amendment_reason IS NOT NULL AND length(amendment_reason) BETWEEN 1 AND 4096) OR (reason <> 'amendment' AND amendment_reason IS NULL))",
+        "fk_bss_orders__order_version__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__order_version__1": "FOREIGN KEY (order_id,supersedes_version) REFERENCES bss_orders__order_version(order_id,version)"
+      },
+      "indexes": {},
+      "triggers": [
+        "CREATE TRIGGER bss_orders__order_version_immutable BEFORE UPDATE ON bss_orders__order_version FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__order_version_delete BEFORE DELETE ON bss_orders__order_version FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__order_version TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__order_version TO bss_orders_business;"
+      ]
+    },
+    {
+      "name": "order_line_identity",
+      "physical": "bss_orders__order_line_identity",
+      "content_owner": "capture",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-order-line-identity"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "append",
+      "scope": "current parent",
+      "columns": [
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "line_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "order_id",
+        "line_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__order_line_identity": "PRIMARY KEY (order_id,line_id)",
+        "fk_bss_orders__order_line_identity__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)"
+      },
+      "indexes": {
+        "idx_bss_orders__order_line_identity__0": "(order_id,created_at,line_id)"
+      },
+      "triggers": [
+        "CREATE TRIGGER bss_orders__order_line_identity_immutable BEFORE UPDATE ON bss_orders__order_line_identity FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__order_line_identity_delete BEFORE DELETE ON bss_orders__order_line_identity FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__order_line_identity TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__order_line_identity TO bss_orders_business;"
+      ]
+    },
+    {
+      "name": "commercial_attempt",
+      "physical": "bss_orders__commercial_attempt",
+      "content_owner": "engine",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-commercial-attempt"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "attempt",
+      "scope": "current parent; private recovery authority",
+      "columns": [
+        {
+          "name": "attempt_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "candidate_version",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "previous_committed_version",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "idempotency_execution_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "operation",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "principal_scope",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "request_fingerprint",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "prepared_draft_revision",
+          "type": "bigint",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "proposed_arrangement",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "authorization_fact_fingerprint",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "original_principal",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "proof_reference",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "line_requests",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "date_policy_basis",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "commercial_subject_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "commercial_subject_type",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "commercial_subject_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "owner_token",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "fencing_generation",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "lease_until",
+          "type": "timestamptz",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "receipt_results",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "terminal_at",
+          "type": "timestamptz",
+          "nullable": true,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "attempt_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__commercial_attempt": "PRIMARY KEY (attempt_id)",
+        "ck_bss_orders__commercial_attempt__0": "CHECK (operation IN ('submit','amendment'))",
+        "ck_bss_orders__commercial_attempt__1": "CHECK (status IN ('prepared','running','committed','refused','abandoned'))",
+        "ck_bss_orders__commercial_attempt__2": "CHECK (candidate_version > previous_committed_version AND previous_committed_version > 0)",
+        "ck_bss_orders__commercial_attempt__3": "CHECK (fencing_generation >= 0)",
+        "ck_bss_orders__commercial_attempt__4": "CHECK (prepared_draft_revision IS NULL OR prepared_draft_revision >= 0)",
+        "ck_bss_orders__commercial_attempt__5": "CHECK ((operation = 'submit') = (prepared_draft_revision IS NOT NULL))",
+        "ck_bss_orders__commercial_attempt__6": "CHECK ((status IN ('prepared','running') AND lease_until IS NOT NULL AND terminal_at IS NULL) OR (status IN ('committed','refused','abandoned') AND lease_until IS NULL AND terminal_at IS NOT NULL))",
+        "ck_bss_orders__commercial_attempt__7": "CHECK (jsonb_typeof(line_requests) = 'object' AND jsonb_typeof(receipt_results) = 'object')",
+        "fk_bss_orders__commercial_attempt__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__commercial_attempt__1": "FOREIGN KEY (order_id,previous_committed_version) REFERENCES bss_orders__order_version(order_id,version)",
+        "uq_bss_orders__commercial_attempt__execution": "UNIQUE(attempt_id,idempotency_execution_id,order_id)",
+        "ck_bss_orders__commercial_attempt__inputs": "CHECK (jsonb_typeof(proposed_arrangement)='object' AND jsonb_typeof(original_principal)='object' AND jsonb_typeof(date_policy_basis)='object')"
+      },
+      "indexes": {
+        "uq_bss_orders__commercial_attempt__0": "UNIQUE (order_id,candidate_version)",
+        "uq_bss_orders__commercial_attempt__1": "UNIQUE (idempotency_execution_id)",
+        "uq_bss_orders__commercial_attempt__2": "UNIQUE (attempt_id,order_id,candidate_version)",
+        "idx_bss_orders__commercial_attempt__0": "(status,lease_until,attempt_id)"
+      },
+      "triggers": [
+        "CREATE CONSTRAINT TRIGGER bss_orders__attempt_execution AFTER INSERT OR UPDATE ON bss_orders__commercial_attempt DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bss_orders__execution_link();",
+        "CREATE TRIGGER bss_orders__commercial_attempt_fixed BEFORE UPDATE ON bss_orders__commercial_attempt FOR EACH ROW EXECUTE FUNCTION bss_orders__update_guard('status,owner_token,fencing_generation,lease_until,receipt_results,terminal_at');",
+        "CREATE TRIGGER bss_orders__commercial_attempt_delete BEFORE DELETE ON bss_orders__commercial_attempt FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__commercial_attempt_validate BEFORE UPDATE ON bss_orders__commercial_attempt FOR EACH ROW EXECUTE FUNCTION bss_orders__execution_guard();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__commercial_attempt TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__commercial_attempt TO bss_orders_private;",
+        "GRANT UPDATE (status,owner_token,fencing_generation,lease_until,receipt_results,terminal_at) ON bss_orders__commercial_attempt TO bss_orders_runtime, bss_orders_private;",
+        "GRANT SELECT ON bss_orders__commercial_attempt TO bss_orders_discovery, bss_orders_maintenance;",
+        "GRANT SELECT ON bss_orders__commercial_attempt, bss_orders__fulfillment_control TO bss_orders_business;"
+      ]
+    },
+    {
+      "name": "order_line",
+      "physical": "bss_orders__order_line",
+      "content_owner": "capture",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-order-line"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "append",
+      "scope": "current parent",
+      "columns": [
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "version",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "line_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "commercial_attempt_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "pricing_acceptance_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "pricing_request_digest",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "pricing_terms_digest",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "plan_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "plan_revision_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "selected_items",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "currency",
+          "type": "char(3)",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "contract_effective_date",
+          "type": "date",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "service_activation_date",
+          "type": "date",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "acceptance_due_date",
+          "type": "date",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "term_duration",
+          "type": "interval",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "term_kind",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "authored_term",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "billing_cycle",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "order_pin",
+          "type": "jsonb",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "overlap_scope_key",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "date_policy_switch_state",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "order_id",
+        "version",
+        "line_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__order_line": "PRIMARY KEY (order_id,version,line_id)",
+        "ck_bss_orders__order_line__0": "CHECK (billing_cycle IN ('month','year'))",
+        "ck_bss_orders__order_line__1": "CHECK (currency ~ '^[A-Z]{3}$')",
+        "ck_bss_orders__order_line__2": "CHECK ((commercial_attempt_id IS NULL AND pricing_acceptance_id IS NULL AND pricing_request_digest IS NULL AND pricing_terms_digest IS NULL AND order_pin IS NULL) OR (commercial_attempt_id IS NOT NULL AND pricing_acceptance_id IS NOT NULL AND pricing_request_digest IS NOT NULL AND pricing_terms_digest IS NOT NULL AND order_pin IS NOT NULL AND overlap_scope_key IS NOT NULL))",
+        "ck_bss_orders__order_line__3": "CHECK (term_duration > interval '0')",
+        "fk_bss_orders__order_line__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__order_line__1": "FOREIGN KEY (order_id,version) REFERENCES bss_orders__order_version(order_id,version)",
+        "fk_bss_orders__order_line__2": "FOREIGN KEY (order_id,line_id) REFERENCES bss_orders__order_line_identity(order_id,line_id)",
+        "fk_bss_orders__order_line__3": "FOREIGN KEY (commercial_attempt_id,order_id,version) REFERENCES bss_orders__commercial_attempt(attempt_id,order_id,candidate_version)",
+        "ck_bss_orders__order_line__term_intent": "CHECK (bss_orders__term_valid(term_kind,term_duration,authored_term,billing_cycle))",
+        "ck_bss_orders__order_line__dates": "CHECK ( service_activation_date IS NOT NULL AND acceptance_due_date IS NOT NULL AND bss_orders__date_snapshot_valid(date_policy_switch_state))"
+      },
+      "indexes": {},
+      "triggers": [
+        "CREATE CONSTRAINT TRIGGER bss_orders__line_attempt AFTER INSERT ON bss_orders__order_line DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bss_orders__line_attempt();",
+        "CREATE TRIGGER bss_orders__order_line_immutable BEFORE UPDATE ON bss_orders__order_line FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__order_line_delete BEFORE DELETE ON bss_orders__order_line FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__order_line TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__order_line TO bss_orders_business;"
+      ]
+    },
+    {
+      "name": "draft_content",
+      "physical": "bss_orders__draft_content",
+      "content_owner": "capture",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-draft-content"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "draft",
+      "scope": "current parent",
+      "columns": [
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "line_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "plan_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "plan_revision_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "selected_items",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "currency",
+          "type": "char(3)",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "contract_effective_date",
+          "type": "date",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "service_activation_date",
+          "type": "date",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "acceptance_due_date",
+          "type": "date",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "term_duration",
+          "type": "interval",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "term_kind",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "authored_term",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "billing_cycle",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "order_id",
+        "line_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__draft_content": "PRIMARY KEY (order_id,line_id)",
+        "ck_bss_orders__draft_content__0": "CHECK (billing_cycle IN ('month','year'))",
+        "ck_bss_orders__draft_content__1": "CHECK (currency ~ '^[A-Z]{3}$')",
+        "fk_bss_orders__draft_content__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__draft_content__1": "FOREIGN KEY (order_id,line_id) REFERENCES bss_orders__order_line_identity(order_id,line_id)",
+        "ck_bss_orders__draft_content__term": "CHECK (term_duration > interval '0')",
+        "ck_bss_orders__draft_content__term_intent": "CHECK (bss_orders__term_valid(term_kind,term_duration,authored_term,billing_cycle))"
+      },
+      "indexes": {},
+      "triggers": [
+        "CREATE TRIGGER bss_orders__draft_content_fixed BEFORE UPDATE ON bss_orders__draft_content FOR EACH ROW EXECUTE FUNCTION bss_orders__update_guard('plan_id,plan_revision_id,selected_items,currency,contract_effective_date,service_activation_date,acceptance_due_date,term_duration,billing_cycle,term_kind,authored_term');",
+        "CREATE TRIGGER bss_orders__draft_content_delete BEFORE DELETE ON bss_orders__draft_content FOR EACH ROW EXECUTE FUNCTION bss_orders__working_guard('draft');",
+        "CREATE TRIGGER bss_orders__draft_content_state BEFORE INSERT OR UPDATE ON bss_orders__draft_content FOR EACH ROW EXECUTE FUNCTION bss_orders__working_guard('draft');"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__draft_content TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__draft_content TO bss_orders_business;",
+        "GRANT UPDATE (plan_id,plan_revision_id,selected_items,currency,contract_effective_date,service_activation_date,acceptance_due_date,term_duration,billing_cycle,term_kind,authored_term) ON bss_orders__draft_content TO bss_orders_runtime, bss_orders_business;",
+        "GRANT DELETE ON bss_orders__draft_content TO bss_orders_runtime, bss_orders_business;"
+      ]
+    },
+    {
+      "name": "order_admin",
+      "physical": "bss_orders__order_admin",
+      "content_owner": "capture",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-administrative-content"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "admin",
+      "scope": "current parent",
+      "columns": [
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "external_reference",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "display_label",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "internal_notes",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "updated_by",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "order_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__order_admin": "PRIMARY KEY (order_id)",
+        "ck_bss_orders__order_admin__0": "CHECK (external_reference IS NULL OR length(external_reference) <= 1024)",
+        "ck_bss_orders__order_admin__1": "CHECK (display_label IS NULL OR length(display_label) <= 256)",
+        "ck_bss_orders__order_admin__2": "CHECK (internal_notes IS NULL OR length(internal_notes) <= 4096)",
+        "fk_bss_orders__order_admin__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)"
+      },
+      "indexes": {},
+      "triggers": [
+        "CREATE TRIGGER bss_orders__order_admin_fixed BEFORE UPDATE ON bss_orders__order_admin FOR EACH ROW EXECUTE FUNCTION bss_orders__update_guard('external_reference,display_label,internal_notes,updated_by,updated_at');",
+        "CREATE TRIGGER bss_orders__order_admin_delete BEFORE DELETE ON bss_orders__order_admin FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__order_admin_state BEFORE INSERT OR UPDATE ON bss_orders__order_admin FOR EACH ROW EXECUTE FUNCTION bss_orders__working_guard('admin');"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__order_admin TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__order_admin TO bss_orders_business;",
+        "GRANT UPDATE (external_reference,display_label,internal_notes,updated_by,updated_at) ON bss_orders__order_admin TO bss_orders_runtime, bss_orders_business;"
+      ]
+    },
+    {
+      "name": "order_line_admin",
+      "physical": "bss_orders__order_line_admin",
+      "content_owner": "capture",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-administrative-content"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "admin",
+      "scope": "current parent",
+      "columns": [
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "line_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "external_reference",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "display_label",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "internal_notes",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "updated_by",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "order_id",
+        "line_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__order_line_admin": "PRIMARY KEY (order_id,line_id)",
+        "ck_bss_orders__order_line_admin__0": "CHECK (external_reference IS NULL OR length(external_reference) <= 1024)",
+        "ck_bss_orders__order_line_admin__1": "CHECK (display_label IS NULL OR length(display_label) <= 256)",
+        "ck_bss_orders__order_line_admin__2": "CHECK (internal_notes IS NULL OR length(internal_notes) <= 4096)",
+        "fk_bss_orders__order_line_admin__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__order_line_admin__1": "FOREIGN KEY (order_id,line_id) REFERENCES bss_orders__order_line_identity(order_id,line_id)"
+      },
+      "indexes": {},
+      "triggers": [
+        "CREATE TRIGGER bss_orders__order_line_admin_fixed BEFORE UPDATE ON bss_orders__order_line_admin FOR EACH ROW EXECUTE FUNCTION bss_orders__update_guard('external_reference,display_label,internal_notes,updated_by,updated_at');",
+        "CREATE TRIGGER bss_orders__order_line_admin_delete BEFORE DELETE ON bss_orders__order_line_admin FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__order_line_admin_state BEFORE INSERT OR UPDATE ON bss_orders__order_line_admin FOR EACH ROW EXECUTE FUNCTION bss_orders__working_guard('admin');"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__order_line_admin TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__order_line_admin TO bss_orders_business;",
+        "GRANT UPDATE (external_reference,display_label,internal_notes,updated_by,updated_at) ON bss_orders__order_line_admin TO bss_orders_runtime, bss_orders_business;"
+      ]
+    },
+    {
+      "name": "resolved_total",
+      "physical": "bss_orders__resolved_total",
+      "content_owner": "gate-and-pin",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-resolved-total"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "append",
+      "scope": "current parent",
+      "columns": [
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "version",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "scope",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "line_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "currency",
+          "type": "char(3)",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "assessment_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "currency_minor_digits",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "rounding_policy",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "exclusions",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "item_breakdown",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "recurring_by_cycle",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "amount_status",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "amount_basis",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "period_evidence",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "gross_minor",
+          "type": "bigint",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "net_minor",
+          "type": "bigint",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "discount_minor",
+          "type": "bigint",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "promotion_ref",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "charge_kind",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "tcv_minor",
+          "type": "bigint",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "tcv_basis",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "tcv_evidence",
+          "type": "jsonb",
+          "nullable": true,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "order_id",
+        "version",
+        "scope",
+        "line_id",
+        "charge_kind"
+      ],
+      "constraints": {
+        "pk_bss_orders__resolved_total": "PRIMARY KEY (order_id,version,scope,line_id,charge_kind)",
+        "ck_bss_orders__resolved_total__0": "CHECK (scope IN ('line','order'))",
+        "ck_bss_orders__resolved_total__1": "CHECK (charge_kind IN ('recurring','usage','one_time'))",
+        "ck_bss_orders__resolved_total__2": "CHECK (amount_status IN ('committed','uncommitted_usage'))",
+        "ck_bss_orders__resolved_total__3": "CHECK ((scope='order') = (line_id='00000000-0000-0000-0000-000000000000'))",
+        "ck_bss_orders__resolved_total__4": "CHECK (currency_minor_digits BETWEEN 0 AND 9)",
+        "ck_bss_orders__resolved_total__5": "CHECK ((charge_kind='usage' AND amount_status='uncommitted_usage' AND gross_minor IS NULL AND net_minor IS NULL AND discount_minor IS NULL) OR (charge_kind <> 'usage' AND amount_status='committed' AND gross_minor IS NOT NULL AND net_minor IS NOT NULL AND discount_minor IS NOT NULL))",
+        "ck_bss_orders__resolved_total__6": "CHECK ((scope='order' AND charge_kind='recurring' AND tcv_minor IS NOT NULL AND tcv_basis IS NOT NULL AND tcv_basis IN ('finite_term','rolling_annualized','mixed') AND tcv_evidence IS NOT NULL) OR ((scope<>'order' OR charge_kind<>'recurring') AND tcv_minor IS NULL AND tcv_basis IS NULL AND tcv_evidence IS NULL))",
+        "fk_bss_orders__resolved_total__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__resolved_total__1": "FOREIGN KEY (order_id,version) REFERENCES bss_orders__order_version(order_id,version)"
+      },
+      "indexes": {},
+      "triggers": [
+        "CREATE TRIGGER bss_orders__total_line BEFORE INSERT ON bss_orders__resolved_total FOR EACH ROW EXECUTE FUNCTION bss_orders__total_line_link();",
+        "CREATE TRIGGER bss_orders__resolved_total_immutable BEFORE UPDATE ON bss_orders__resolved_total FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__resolved_total_delete BEFORE DELETE ON bss_orders__resolved_total FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__resolved_total TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__resolved_total TO bss_orders_business;"
+      ]
+    },
+    {
+      "name": "inflight_overlap_claim",
+      "physical": "bss_orders__inflight_overlap_claim",
+      "content_owner": "gate-and-pin",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-inflight-overlap-claim"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "claim",
+      "scope": "current parent plus complete authorized proposed arrangement",
+      "columns": [
+        {
+          "name": "claim_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "payer_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "resource_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "overlap_scope_key",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "version",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "claimed_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "released_at",
+          "type": "timestamptz",
+          "nullable": true,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "claim_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__inflight_overlap_claim": "PRIMARY KEY (claim_id)",
+        "ck_bss_orders__inflight_overlap_claim__0": "CHECK (version > 0)",
+        "ck_bss_orders__inflight_overlap_claim__1": "CHECK (released_at IS NULL OR released_at >= claimed_at)",
+        "fk_bss_orders__inflight_overlap_claim__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)"
+      },
+      "indexes": {
+        "uq_bss_orders__inflight_overlap_claim__0": "UNIQUE (payer_tenant_id,resource_tenant_id,overlap_scope_key) WHERE released_at IS NULL",
+        "idx_bss_orders__inflight_overlap_claim__0": "(order_id) WHERE released_at IS NULL"
+      },
+      "triggers": [
+        "CREATE TRIGGER bss_orders__inflight_overlap_claim_fixed BEFORE UPDATE ON bss_orders__inflight_overlap_claim FOR EACH ROW EXECUTE FUNCTION bss_orders__update_guard('released_at');",
+        "CREATE TRIGGER bss_orders__inflight_overlap_claim_delete BEFORE DELETE ON bss_orders__inflight_overlap_claim FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__inflight_overlap_claim_validate BEFORE UPDATE ON bss_orders__inflight_overlap_claim FOR EACH ROW EXECUTE FUNCTION bss_orders__claim_guard();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__inflight_overlap_claim TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__inflight_overlap_claim TO bss_orders_business;",
+        "GRANT UPDATE (released_at) ON bss_orders__inflight_overlap_claim TO bss_orders_runtime, bss_orders_business;"
+      ]
+    },
+    {
+      "name": "transition_audit",
+      "physical": "bss_orders__transition_audit",
+      "content_owner": "engine",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-transition-audit"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "audit",
+      "scope": "current parent for resolved reads; trusted subject tenant for unresolved; audit namespace for verifier",
+      "columns": [
+        {
+          "name": "audit_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "hash_version",
+          "type": "smallint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "audit_tenant_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "subject_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "resource_tenant_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "requested_order_ref",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "sequence",
+          "type": "bigint",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "prev_hash",
+          "type": "bytea",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "entry_hash",
+          "type": "bytea",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "from_state",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "to_state",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "trigger",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "outcome",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "actor",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "actor_class",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "delegation_proof_ref",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "reason",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "caller_reason",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "force_request_observation",
+          "type": "jsonb",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "changed_field",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "prior_value",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "new_value",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "idempotency_key",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "correlation_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "version",
+          "type": "integer",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "audit_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__transition_audit": "PRIMARY KEY (audit_id)",
+        "ck_bss_orders__transition_audit__0": "CHECK (outcome IN ('committed','refused'))",
+        "ck_bss_orders__transition_audit__1": "CHECK (actor_class IN ('system','service','user'))",
+        "ck_bss_orders__transition_audit__2": "CHECK (hash_version IN (1,2,3))",
+        "ck_bss_orders__transition_audit__3": "CHECK (octet_length(entry_hash)=32 AND (prev_hash IS NULL OR octet_length(prev_hash)=32))",
+        "ck_bss_orders__transition_audit__4": "CHECK (from_state IS NULL OR from_state IN ('draft','submitted','pending_approval','approved','in_fulfillment','on_hold','completed','rejected','cancelled','fulfillment_failed','expired'))",
+        "ck_bss_orders__transition_audit__5": "CHECK (to_state IS NULL OR to_state IN ('draft','submitted','pending_approval','approved','in_fulfillment','on_hold','completed','rejected','cancelled','fulfillment_failed','expired'))",
+        "ck_bss_orders__transition_audit__6": "CHECK ((outcome='committed' AND audit_tenant_id IS NOT NULL AND resource_tenant_id IS NOT NULL AND order_id IS NOT NULL AND sequence IS NOT NULL AND prev_hash IS NOT NULL AND to_state IS NOT NULL AND version IS NOT NULL AND version > 0 AND ((trigger='create' AND sequence=1 AND version=1 AND from_state IS NULL AND to_state='draft') OR (trigger<>'create' AND from_state IS NOT NULL AND sequence>1))) OR (outcome='refused' AND sequence IS NULL AND prev_hash IS NULL AND caller_reason IS NULL))",
+        "ck_bss_orders__transition_audit__7": "CHECK (order_id IS NOT NULL OR (audit_tenant_id IS NULL AND resource_tenant_id IS NULL AND from_state IS NULL AND to_state IS NULL AND version IS NULL))",
+        "ck_bss_orders__transition_audit__8": "CHECK (order_id IS NULL OR requested_order_ref IS NULL OR order_id=requested_order_ref)",
+        "ck_bss_orders__transition_audit__9": "CHECK (hash_version<>1 OR caller_reason IS NULL)",
+        "ck_bss_orders__transition_audit__10": "CHECK (hash_version=3 OR force_request_observation IS NULL)",
+        "ck_bss_orders__transition_audit__11": "CHECK (caller_reason IS NULL OR length(caller_reason) BETWEEN 1 AND 4096)",
+        "ck_bss_orders__transition_audit__12": "CHECK (outcome <> 'committed' OR reason=trigger)",
+        "ck_bss_orders__transition_audit__13": "CHECK (outcome <> 'committed' OR trigger <> 'replace-fulfillment-grant' OR (from_state='in_fulfillment' AND to_state='in_fulfillment'))",
+        "fk_bss_orders__transition_audit__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "ck_bss_orders__transition_audit__observation": "CHECK ( (force_request_observation IS NULL OR (hash_version=3 AND outcome='refused' AND order_id IS NOT NULL AND trigger='force-fail-unreconciled' AND reason='second-approver-required' AND from_state IS NOT NULL AND to_state=from_state AND version IS NOT NULL AND bss_orders__observation_valid(force_request_observation,from_state,version))) AND (hash_version<>3 OR outcome<>'refused' OR trigger<>'force-fail-unreconciled' OR reason<>'second-approver-required' OR force_request_observation IS NOT NULL))",
+        "ck_bss_orders__transition_audit__tokens": "CHECK ( outcome<>'committed' OR trigger IN ('create','draft-mutate','administrative-edit','submit','cancel','auto-void','reflect-approval-required','reflect-approval-not-required','reflect-approval-granted','reflect-approval-denied','begin-fulfillment','report-spawn-signal','acknowledge-completed','acknowledge-failed','cancel-workflow-mediated','amendment','hold','resume','expire','record-acceptance','force-fail-unreconciled','replace-fulfillment-grant'))",
+        "ck_bss_orders__transition_audit__actor": "CHECK (actor ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')",
+        "ck_bss_orders__transition_audit__admin": "CHECK ( (outcome='committed' AND trigger='administrative-edit' AND changed_field IS NOT NULL AND prior_value IS DISTINCT FROM new_value) OR ((outcome<>'committed' OR trigger<>'administrative-edit') AND changed_field IS NULL AND prior_value IS NULL AND new_value IS NULL))",
+        "ck_bss_orders__transition_audit__resolved": "CHECK ( (trigger='create' OR requested_order_ref IS NOT NULL) AND (outcome<>'refused' OR order_id IS NULL OR (audit_tenant_id IS NOT NULL AND resource_tenant_id IS NOT NULL AND from_state IS NOT NULL AND to_state IS NOT NULL AND from_state=to_state AND version IS NOT NULL AND version>0)))",
+        "ck_bss_orders__audit_trigger": "CHECK (trigger IN ('create','draft-mutate','administrative-edit','submit','cancel','auto-void','reflect-approval-required','reflect-approval-not-required','reflect-approval-granted','reflect-approval-denied','begin-fulfillment','report-spawn-signal','acknowledge-completed','acknowledge-failed','cancel-workflow-mediated','amendment','hold','resume','expire','record-acceptance','force-fail-unreconciled','replace-fulfillment-grant'))"
+      },
+      "indexes": {
+        "uq_bss_orders__transition_audit__0": "UNIQUE (order_id,sequence)",
+        "uq_bss_orders__transition_audit__1": "UNIQUE (audit_id,order_id,version,outcome)",
+        "idx_bss_orders__transition_audit__0": "(order_id,created_at,audit_id)",
+        "idx_bss_orders__transition_audit__1": "(created_at) WHERE outcome='refused'",
+        "idx_bss_orders__transition_audit__2": "(subject_tenant_id,requested_order_ref,created_at,audit_id)",
+        "idx_bss_orders__transition_audit__3": "(audit_tenant_id,order_id,sequence) WHERE outcome='committed'"
+      },
+      "triggers": [
+        "CREATE TRIGGER bss_orders__transition_audit_immutable BEFORE UPDATE ON bss_orders__transition_audit FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__transition_audit_delete BEFORE DELETE ON bss_orders__transition_audit FOR EACH ROW EXECUTE FUNCTION bss_orders__retention_guard();",
+        "CREATE TRIGGER bss_orders__audit_v3 BEFORE INSERT ON bss_orders__transition_audit FOR EACH ROW EXECUTE FUNCTION bss_orders__audit_writer();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__transition_audit TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__transition_audit TO bss_orders_private;",
+        "GRANT SELECT, DELETE ON bss_orders__transition_audit TO bss_orders_retention;",
+        "GRANT SELECT ON bss_orders__transition_audit TO bss_orders_verifier, bss_orders_checkpoint;"
+      ]
+    },
+    {
+      "name": "audit_checkpoint",
+      "physical": "bss_orders__audit_checkpoint",
+      "content_owner": "audit worker",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-audit-checkpoint"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "checkpoint",
+      "scope": "immutable audit namespace; checkpoint writer",
+      "columns": [
+        {
+          "name": "audit_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "checkpoint_sequence",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "format_version",
+          "type": "smallint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "captured_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "member_count",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "prev_checkpoint_hash",
+          "type": "bytea",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "checkpoint_hash",
+          "type": "bytea",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "audit_tenant_id",
+        "checkpoint_sequence"
+      ],
+      "constraints": {
+        "pk_bss_orders__audit_checkpoint": "PRIMARY KEY (audit_tenant_id,checkpoint_sequence)",
+        "ck_bss_orders__audit_checkpoint__0": "CHECK (checkpoint_sequence>0 AND member_count>=0)",
+        "ck_bss_orders__audit_checkpoint__1": "CHECK (format_version=1)",
+        "ck_bss_orders__audit_checkpoint__2": "CHECK (octet_length(prev_checkpoint_hash)=32 AND octet_length(checkpoint_hash)=32)"
+      },
+      "indexes": {},
+      "triggers": [
+        "CREATE CONSTRAINT TRIGGER bss_orders__checkpoint_complete AFTER INSERT ON bss_orders__audit_checkpoint DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bss_orders__checkpoint_complete();",
+        "CREATE TRIGGER bss_orders__audit_checkpoint_immutable BEFORE UPDATE ON bss_orders__audit_checkpoint FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__audit_checkpoint_delete BEFORE DELETE ON bss_orders__audit_checkpoint FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__audit_checkpoint TO bss_orders_checkpoint;",
+        "GRANT SELECT ON bss_orders__audit_checkpoint TO bss_orders_verifier;"
+      ]
+    },
+    {
+      "name": "audit_checkpoint_member",
+      "physical": "bss_orders__audit_checkpoint_member",
+      "content_owner": "audit worker",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-audit-checkpoint-member"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "checkpoint",
+      "scope": "immutable audit namespace; deliberately no live-order FK",
+      "columns": [
+        {
+          "name": "audit_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "checkpoint_sequence",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "audit_sequence",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "entry_hash",
+          "type": "bytea",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "audit_tenant_id",
+        "checkpoint_sequence",
+        "order_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__audit_checkpoint_member": "PRIMARY KEY (audit_tenant_id,checkpoint_sequence,order_id)",
+        "ck_bss_orders__audit_checkpoint_member__0": "CHECK (audit_sequence>0)",
+        "ck_bss_orders__audit_checkpoint_member__1": "CHECK (octet_length(entry_hash)=32)",
+        "fk_bss_orders__audit_checkpoint_member__header": "FOREIGN KEY (audit_tenant_id,checkpoint_sequence) REFERENCES bss_orders__audit_checkpoint(audit_tenant_id,checkpoint_sequence) DEFERRABLE INITIALLY DEFERRED"
+      },
+      "indexes": {},
+      "triggers": [
+        "CREATE CONSTRAINT TRIGGER bss_orders__checkpoint_member_complete AFTER INSERT ON bss_orders__audit_checkpoint_member DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bss_orders__checkpoint_complete();",
+        "CREATE TRIGGER bss_orders__audit_checkpoint_member_immutable BEFORE UPDATE ON bss_orders__audit_checkpoint_member FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__audit_checkpoint_member_delete BEFORE DELETE ON bss_orders__audit_checkpoint_member FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__audit_checkpoint_member TO bss_orders_checkpoint;",
+        "GRANT SELECT ON bss_orders__audit_checkpoint_member TO bss_orders_verifier;"
+      ]
+    },
+    {
+      "name": "fulfillment_grant",
+      "physical": "bss_orders__fulfillment_grant",
+      "content_owner": "engine",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-fulfillment-grant"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "append",
+      "scope": "current parent; engine-only append",
+      "columns": [
+        {
+          "name": "grant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "order_version",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "fulfillment_attempt_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "generation",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "roster_receipt_digest",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "roster",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "authority_fact_digest",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "predecessor_grant_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "execution_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "audit_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "audit_outcome",
+          "type": "text",
+          "nullable": false,
+          "extra": "DEFAULT 'committed'"
+        }
+      ],
+      "pk": [
+        "grant_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__fulfillment_grant": "PRIMARY KEY (grant_id)",
+        "ck_bss_orders__fulfillment_grant__0": "CHECK (generation>0)",
+        "ck_bss_orders__fulfillment_grant__1": "CHECK (audit_outcome='committed')",
+        "ck_bss_orders__fulfillment_grant__2": "CHECK (jsonb_typeof(roster)='array')",
+        "ck_bss_orders__fulfillment_grant__3": "CHECK (predecessor_grant_id IS NULL OR predecessor_grant_id<>grant_id)",
+        "fk_bss_orders__fulfillment_grant__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__fulfillment_grant__1": "FOREIGN KEY (order_id,order_version) REFERENCES bss_orders__order_version(order_id,version)",
+        "fk_bss_orders__fulfillment_grant__3": "FOREIGN KEY (audit_id,order_id,order_version,audit_outcome) REFERENCES bss_orders__transition_audit(audit_id,order_id,version,outcome) DEFERRABLE INITIALLY DEFERRED",
+        "fk_bss_orders__fulfillment_grant__2": "FOREIGN KEY (predecessor_grant_id,order_id) REFERENCES bss_orders__fulfillment_grant(grant_id,order_id)"
+      },
+      "indexes": {
+        "uq_bss_orders__fulfillment_grant__0": "UNIQUE (order_id,generation)",
+        "uq_bss_orders__fulfillment_grant__1": "UNIQUE (grant_id,order_id)"
+      },
+      "triggers": [
+        "CREATE CONSTRAINT TRIGGER bss_orders__grant_audit AFTER INSERT ON bss_orders__fulfillment_grant DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bss_orders__grant_link();",
+        "CREATE CONSTRAINT TRIGGER bss_orders__grant_source AFTER INSERT ON bss_orders__fulfillment_grant DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bss_orders__grant_source();",
+        "CREATE TRIGGER bss_orders__fulfillment_grant_immutable BEFORE UPDATE ON bss_orders__fulfillment_grant FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__fulfillment_grant_delete BEFORE DELETE ON bss_orders__fulfillment_grant FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__fulfillment_grant TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__fulfillment_grant TO bss_orders_private;"
+      ]
+    },
+    {
+      "name": "fulfillment_control",
+      "physical": "bss_orders__fulfillment_control",
+      "content_owner": "engine",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-fulfillment-control"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "control",
+      "scope": "current parent; private recovery authority",
+      "columns": [
+        {
+          "name": "control_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "idempotency_execution_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "operation",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "request_fingerprint",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "expected_version",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "fulfillment_attempt_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "generation",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "original_actor",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "proof_reference",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "authorization_fact_fingerprint",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "roster",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "roster_digest",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "owner_token",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "fencing_generation",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "lease_until",
+          "type": "timestamptz",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "receiver_commands",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "receiver_evidence",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "error_classification",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "terminal_at",
+          "type": "timestamptz",
+          "nullable": true,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "control_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__fulfillment_control": "PRIMARY KEY (control_id)",
+        "ck_bss_orders__fulfillment_control__0": "CHECK (operation IN ('hold','cancel-workflow-mediated','acknowledge-failed','force-fail-unreconciled'))",
+        "ck_bss_orders__fulfillment_control__1": "CHECK (status IN ('prepared','awaiting','barrier_ready','settled','refused','abandoned'))",
+        "ck_bss_orders__fulfillment_control__2": "CHECK (generation>0 AND fencing_generation>=0)",
+        "ck_bss_orders__fulfillment_control__3": "CHECK ((status IN ('prepared','awaiting','barrier_ready') AND terminal_at IS NULL AND lease_until IS NOT NULL) OR (status IN ('settled','refused','abandoned') AND terminal_at IS NOT NULL AND lease_until IS NULL))",
+        "ck_bss_orders__fulfillment_control__4": "CHECK (jsonb_typeof(receiver_commands)='object' AND jsonb_typeof(receiver_evidence)='object')",
+        "fk_bss_orders__fulfillment_control__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__fulfillment_control__1": "FOREIGN KEY (order_id,expected_version) REFERENCES bss_orders__order_version(order_id,version)",
+        "uq_bss_orders__fulfillment_control__execution": "UNIQUE(control_id,idempotency_execution_id,order_id)",
+        "ck_bss_orders__fulfillment_control__inputs": "CHECK (jsonb_typeof(original_actor)='object' AND jsonb_typeof(roster)='array')"
+      },
+      "indexes": {
+        "uq_bss_orders__fulfillment_control__0": "UNIQUE (idempotency_execution_id)",
+        "uq_bss_orders__fulfillment_control__1": "UNIQUE (control_id,order_id)",
+        "uq_bss_orders__fulfillment_control__2": "UNIQUE (order_id) WHERE status IN ('prepared','awaiting','barrier_ready')",
+        "idx_bss_orders__fulfillment_control__0": "(status,lease_until,control_id)"
+      },
+      "triggers": [
+        "CREATE CONSTRAINT TRIGGER bss_orders__control_execution AFTER INSERT OR UPDATE ON bss_orders__fulfillment_control DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bss_orders__execution_link();",
+        "CREATE TRIGGER bss_orders__fulfillment_control_fixed BEFORE UPDATE ON bss_orders__fulfillment_control FOR EACH ROW EXECUTE FUNCTION bss_orders__update_guard('status,owner_token,fencing_generation,lease_until,receiver_commands,receiver_evidence,error_classification,terminal_at');",
+        "CREATE TRIGGER bss_orders__fulfillment_control_delete BEFORE DELETE ON bss_orders__fulfillment_control FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__fulfillment_control_validate BEFORE UPDATE ON bss_orders__fulfillment_control FOR EACH ROW EXECUTE FUNCTION bss_orders__execution_guard();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__fulfillment_control TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__fulfillment_control TO bss_orders_private;",
+        "GRANT UPDATE (status,owner_token,fencing_generation,lease_until,receiver_commands,receiver_evidence,error_classification,terminal_at) ON bss_orders__fulfillment_control TO bss_orders_runtime, bss_orders_private;",
+        "GRANT SELECT ON bss_orders__fulfillment_control TO bss_orders_discovery, bss_orders_maintenance;",
+        "GRANT SELECT ON bss_orders__commercial_attempt, bss_orders__fulfillment_control TO bss_orders_business;"
+      ]
+    },
+    {
+      "name": "idempotency",
+      "physical": "bss_orders__idempotency",
+      "content_owner": "engine",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-idempotency"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "registry",
+      "scope": "trusted principal_scope + operation/key + execution ID",
+      "columns": [
+        {
+          "name": "operation",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "principal_scope",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "idempotency_key",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "request_fingerprint",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "execution_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "attempt_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "fulfillment_control_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "owner_token",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "fencing_generation",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "lease_expires_at",
+          "type": "timestamptz",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "outcome",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "outcome_reason",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "audit_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "settled_response",
+          "type": "jsonb",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "operation",
+        "principal_scope",
+        "idempotency_key"
+      ],
+      "constraints": {
+        "pk_bss_orders__idempotency": "PRIMARY KEY (operation,principal_scope,idempotency_key)",
+        "ck_bss_orders__idempotency__0": "CHECK (status IN ('in_flight','settled'))",
+        "ck_bss_orders__idempotency__1": "CHECK (outcome IS NULL OR outcome IN ('success','refused'))",
+        "ck_bss_orders__idempotency__2": "CHECK (fencing_generation>=0)",
+        "ck_bss_orders__idempotency__3": "CHECK (attempt_id IS NULL OR fulfillment_control_id IS NULL)",
+        "ck_bss_orders__idempotency__4": "CHECK (operation='create' OR order_id IS NOT NULL)",
+        "ck_bss_orders__idempotency__5": "CHECK (operation<>'create' OR ((status='settled' AND outcome='success' AND order_id IS NOT NULL) OR ((status='in_flight' OR outcome='refused') AND order_id IS NULL)))",
+        "ck_bss_orders__idempotency__6": "CHECK ((status='in_flight' AND lease_expires_at IS NOT NULL AND outcome IS NULL AND outcome_reason IS NULL AND audit_id IS NULL AND settled_response IS NULL) OR (status='settled' AND lease_expires_at IS NULL AND outcome IS NOT NULL AND settled_response IS NOT NULL AND settled_response->'formatVersion'='1'::jsonb))",
+        "ck_bss_orders__idempotency__7": "CHECK (expires_at>created_at)",
+        "ck_bss_orders__idempotency__8": "CHECK (outcome<>'refused' OR outcome_reason IS NOT NULL)",
+        "fk_bss_orders__idempotency__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__idempotency__1": "FOREIGN KEY (attempt_id) REFERENCES bss_orders__commercial_attempt(attempt_id)",
+        "fk_bss_orders__idempotency__2": "FOREIGN KEY (fulfillment_control_id) REFERENCES bss_orders__fulfillment_control(control_id)",
+        "ck_bss_orders__idempotency__response": "CHECK ( status<>'settled' OR (jsonb_typeof(settled_response)='object' AND settled_response ? 'formatVersion' AND (settled_response->'formatVersion'='1'::jsonb) IS TRUE))",
+        "fk_bss_orders__idempotency__attempt_execution": "FOREIGN KEY(attempt_id,execution_id,order_id) REFERENCES bss_orders__commercial_attempt(attempt_id,idempotency_execution_id,order_id)",
+        "fk_bss_orders__idempotency__control_execution": "FOREIGN KEY(fulfillment_control_id,execution_id,order_id) REFERENCES bss_orders__fulfillment_control(control_id,idempotency_execution_id,order_id)"
+      },
+      "indexes": {
+        "uq_bss_orders__idempotency__0": "UNIQUE (execution_id)",
+        "idx_bss_orders__idempotency__0": "(expires_at)"
+      },
+      "triggers": [
+        "CREATE CONSTRAINT TRIGGER bss_orders__settlement_audit AFTER INSERT OR UPDATE ON bss_orders__idempotency DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bss_orders__settlement_link();",
+        "CREATE CONSTRAINT TRIGGER bss_orders__registry_execution AFTER INSERT OR UPDATE ON bss_orders__idempotency DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bss_orders__execution_link();",
+        "CREATE TRIGGER bss_orders__idempotency_fixed BEFORE UPDATE ON bss_orders__idempotency FOR EACH ROW EXECUTE FUNCTION bss_orders__update_guard('order_id,status,attempt_id,fulfillment_control_id,owner_token,fencing_generation,lease_expires_at,outcome,outcome_reason,audit_id,settled_response');",
+        "CREATE TRIGGER bss_orders__idempotency_delete BEFORE DELETE ON bss_orders__idempotency FOR EACH ROW EXECUTE FUNCTION bss_orders__registry_guard();",
+        "CREATE TRIGGER bss_orders__idempotency_validate BEFORE UPDATE ON bss_orders__idempotency FOR EACH ROW EXECUTE FUNCTION bss_orders__registry_guard();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__idempotency TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__idempotency TO bss_orders_private;",
+        "GRANT UPDATE (order_id,status,attempt_id,fulfillment_control_id,owner_token,fencing_generation,lease_expires_at,outcome,outcome_reason,audit_id,settled_response) ON bss_orders__idempotency TO bss_orders_runtime, bss_orders_private;",
+        "GRANT DELETE ON bss_orders__idempotency TO bss_orders_runtime, bss_orders_private;",
+        "GRANT SELECT ON bss_orders__idempotency TO bss_orders_discovery, bss_orders_maintenance;",
+        "GRANT DELETE ON bss_orders__idempotency TO bss_orders_maintenance;"
+      ]
+    },
+    {
+      "name": "line_fulfillment",
+      "physical": "bss_orders__line_fulfillment",
+      "content_owner": "workflow-seam",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-line-fulfillment"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "projection",
+      "scope": "current parent",
+      "columns": [
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "line_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "version",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "subscription_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "transition_request_ref",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "order_id",
+        "line_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__line_fulfillment": "PRIMARY KEY (order_id,line_id)",
+        "ck_bss_orders__line_fulfillment__0": "CHECK (status IN ('created','activated','failed'))",
+        "fk_bss_orders__line_fulfillment__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__line_fulfillment__1": "FOREIGN KEY (order_id,line_id) REFERENCES bss_orders__order_line_identity(order_id,line_id)",
+        "fk_bss_orders__line_fulfillment__2": "FOREIGN KEY (order_id,version) REFERENCES bss_orders__order_version(order_id,version)",
+        "fk_bss_orders__line_fulfillment__3": "FOREIGN KEY (order_id,version,line_id) REFERENCES bss_orders__order_line(order_id,version,line_id)"
+      },
+      "indexes": {
+        "uq_bss_orders__line_fulfillment__0": "UNIQUE (order_id,subscription_id) WHERE subscription_id IS NOT NULL"
+      },
+      "triggers": [
+        "CREATE TRIGGER bss_orders__line_fulfillment_fixed BEFORE UPDATE ON bss_orders__line_fulfillment FOR EACH ROW EXECUTE FUNCTION bss_orders__update_guard('version,status,subscription_id,transition_request_ref,updated_at');",
+        "CREATE TRIGGER bss_orders__line_fulfillment_delete BEFORE DELETE ON bss_orders__line_fulfillment FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__line_fulfillment TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__line_fulfillment TO bss_orders_business;",
+        "GRANT UPDATE (version,status,subscription_id,transition_request_ref,updated_at) ON bss_orders__line_fulfillment TO bss_orders_runtime, bss_orders_business;"
+      ]
+    },
+    {
+      "name": "acceptance",
+      "physical": "bss_orders__acceptance",
+      "content_owner": "preconditions",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-acceptance"
+      ],
+      "migration": "01_schema.sql",
+      "mutation": "append",
+      "scope": "current parent",
+      "columns": [
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "accepted_version",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "accepted_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "recorded_by",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "recording_path",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "requirement_source",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "order_id",
+        "accepted_version"
+      ],
+      "constraints": {
+        "pk_bss_orders__acceptance": "PRIMARY KEY (order_id,accepted_version)",
+        "ck_bss_orders__acceptance__0": "CHECK (recording_path IN ('self_service','partner_placed'))",
+        "ck_bss_orders__acceptance__1": "CHECK (requirement_source IN ('contract','seller','platform_default','volunteered'))",
+        "ck_bss_orders__acceptance__2": "CHECK (accepted_version>1)",
+        "fk_bss_orders__acceptance__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__acceptance__1": "FOREIGN KEY (order_id,accepted_version) REFERENCES bss_orders__order_version(order_id,version)"
+      },
+      "indexes": {},
+      "triggers": [
+        "CREATE TRIGGER bss_orders__acceptance_immutable BEFORE UPDATE ON bss_orders__acceptance FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__acceptance_delete BEFORE DELETE ON bss_orders__acceptance FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__acceptance TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__acceptance TO bss_orders_business;"
+      ]
+    },
+    {
+      "name": "date_policy",
+      "physical": "bss_orders__date_policy",
+      "content_owner": "capture promotion",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-date-policy"
+      ],
+      "migration": "02_schema.sql",
+      "mutation": "date_policy",
+      "scope": "deployment policy IDs; no business authority",
+      "columns": [
+        {
+          "name": "policy_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "resource_tenant_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "service_activation_required",
+          "type": "boolean",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "acceptance_due_required",
+          "type": "boolean",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "revision",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "policy_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__date_policy": "PRIMARY KEY (policy_id)",
+        "ck_bss_orders__date_policy__0": "CHECK (revision>0)"
+      },
+      "indexes": {
+        "uq_bss_orders__date_policy__0": "UNIQUE ((true)) WHERE resource_tenant_id IS NULL",
+        "uq_bss_orders__date_policy__1": "UNIQUE (resource_tenant_id) WHERE resource_tenant_id IS NOT NULL"
+      },
+      "triggers": [
+        "CREATE TRIGGER bss_orders__date_namespace BEFORE INSERT OR UPDATE OR DELETE ON bss_orders__date_policy FOR EACH ROW EXECUTE FUNCTION bss_orders__policy_namespace();",
+        "CREATE TRIGGER bss_orders__date_policy_fixed BEFORE UPDATE ON bss_orders__date_policy FOR EACH ROW EXECUTE FUNCTION bss_orders__update_guard('service_activation_required,acceptance_due_required,revision,updated_at');",
+        "CREATE TRIGGER bss_orders__date_policy_delete BEFORE DELETE ON bss_orders__date_policy FOR EACH ROW EXECUTE FUNCTION bss_orders__policy_guard();",
+        "CREATE TRIGGER bss_orders__date_policy_validate BEFORE UPDATE ON bss_orders__date_policy FOR EACH ROW EXECUTE FUNCTION bss_orders__policy_guard();"
+      ],
+      "grants": [
+        "GRANT SELECT ON bss_orders__date_policy TO bss_orders_runtime, bss_orders_business, bss_orders_maintenance;",
+        "GRANT SELECT, INSERT ON bss_orders__date_policy TO bss_orders_policy;",
+        "GRANT UPDATE (service_activation_required,acceptance_due_required,revision,updated_at) ON bss_orders__date_policy TO bss_orders_policy;",
+        "GRANT DELETE ON bss_orders__date_policy TO bss_orders_policy;"
+      ]
+    },
+    {
+      "name": "gate_outcome",
+      "physical": "bss_orders__gate_outcome",
+      "content_owner": "gate-and-pin",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-gate-outcome"
+      ],
+      "migration": "03_schema.sql",
+      "mutation": "diagnostic",
+      "scope": "trusted subject tenant and run ID; private inspection",
+      "columns": [
+        {
+          "name": "outcome_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "run_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "subject_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "subject_id",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "resource_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "seller_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "payer_tenant_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "correlation_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "version",
+          "type": "integer",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "line_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "predicate",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "item_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "has_catalog_selection",
+          "type": "boolean",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "catalog_scope_key",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "verdict",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "reason",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "mapping_version",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "applicability",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "producer_results",
+          "type": "jsonb",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "upstream_detail",
+          "type": "jsonb",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "evaluated_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "outcome_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__gate_outcome": "PRIMARY KEY (outcome_id)",
+        "ck_bss_orders__gate_outcome__0": "CHECK (verdict IN ('passed','failed','unevaluable'))",
+        "ck_bss_orders__gate_outcome__1": "CHECK (applicability IN ('required','tcv-only','preview-forecast'))",
+        "ck_bss_orders__gate_outcome__2": "CHECK (verdict='passed' OR reason IS NOT NULL)",
+        "ck_bss_orders__gate_outcome__3": "CHECK (has_catalog_selection OR catalog_scope_key IS NULL)",
+        "ck_bss_orders__gate_outcome__4": "CHECK (line_id IS NOT NULL OR (item_id IS NULL AND NOT has_catalog_selection AND catalog_scope_key IS NULL))",
+        "ck_bss_orders__gate_outcome__5": "CHECK (NOT has_catalog_selection OR item_id IS NOT NULL)",
+        "ck_bss_orders__gate_outcome__6": "CHECK (order_id IS NOT NULL OR version IS NULL)",
+        "fk_bss_orders__gate_outcome__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__gate_outcome__1": "FOREIGN KEY (order_id,version) REFERENCES bss_orders__order_version(order_id,version)"
+      },
+      "indexes": {
+        "uq_bss_orders__gate_outcome__0": "UNIQUE (run_id,line_id,predicate,item_id,has_catalog_selection,catalog_scope_key) NULLS NOT DISTINCT",
+        "idx_bss_orders__gate_outcome__0": "(evaluated_at) WHERE order_id IS NULL",
+        "idx_bss_orders__gate_outcome__1": "(order_id)"
+      },
+      "triggers": [
+        "CREATE TRIGGER bss_orders__gate_outcome_immutable BEFORE UPDATE ON bss_orders__gate_outcome FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__gate_outcome_delete BEFORE DELETE ON bss_orders__gate_outcome FOR EACH ROW EXECUTE FUNCTION bss_orders__retention_guard();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__gate_outcome TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__gate_outcome TO bss_orders_private;",
+        "GRANT SELECT, DELETE ON bss_orders__gate_outcome TO bss_orders_retention;"
+      ]
+    },
+    {
+      "name": "policy_election",
+      "physical": "bss_orders__policy_election",
+      "content_owner": "preconditions promotion",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-policy-election"
+      ],
+      "migration": "04_schema.sql",
+      "mutation": "election",
+      "scope": "deployment policy IDs; no business authority",
+      "columns": [
+        {
+          "name": "policy_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "election",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "scope",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "scope_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "elected",
+          "type": "boolean",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "elected_by",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "elected_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "policy_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__policy_election": "PRIMARY KEY (policy_id)",
+        "ck_bss_orders__policy_election__0": "CHECK (election IN ('tolerate_authorization_failure','acceptance_required'))",
+        "ck_bss_orders__policy_election__1": "CHECK (scope IN ('platform','seller'))",
+        "ck_bss_orders__policy_election__2": "CHECK ((scope='platform' AND scope_id IS NULL) OR (scope='seller' AND scope_id IS NOT NULL))"
+      },
+      "indexes": {
+        "uq_bss_orders__policy_election__0": "UNIQUE (election,scope,scope_id) NULLS NOT DISTINCT"
+      },
+      "triggers": [
+        "CREATE TRIGGER bss_orders__policy_election_fixed BEFORE UPDATE ON bss_orders__policy_election FOR EACH ROW EXECUTE FUNCTION bss_orders__update_guard('elected,elected_by,elected_at');",
+        "CREATE TRIGGER bss_orders__policy_election_delete BEFORE DELETE ON bss_orders__policy_election FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();"
+      ],
+      "grants": [
+        "GRANT SELECT ON bss_orders__policy_election TO bss_orders_runtime, bss_orders_business, bss_orders_maintenance;",
+        "GRANT SELECT, INSERT ON bss_orders__policy_election TO bss_orders_policy;",
+        "GRANT UPDATE (elected,elected_by,elected_at) ON bss_orders__policy_election TO bss_orders_policy;"
+      ]
+    },
+    {
+      "name": "approval_reflection",
+      "physical": "bss_orders__approval_reflection",
+      "content_owner": "workflow-seam",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-approval-reflection"
+      ],
+      "migration": "04_schema.sql",
+      "mutation": "append",
+      "scope": "current parent",
+      "columns": [
+        {
+          "name": "reflection_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "version",
+          "type": "integer",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "verdict_kind",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "verdict",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "deciding_authority",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "denial_reason",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "correlation_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "reflected_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "reflection_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__approval_reflection": "PRIMARY KEY (reflection_id)",
+        "ck_bss_orders__approval_reflection__0": "CHECK ((verdict_kind='requirement' AND verdict IN ('required','not_required')) OR (verdict_kind='gate_outcome' AND verdict IN ('granted','denied')))",
+        "ck_bss_orders__approval_reflection__1": "CHECK ((verdict='denied') = (denial_reason IS NOT NULL))",
+        "fk_bss_orders__approval_reflection__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "fk_bss_orders__approval_reflection__1": "FOREIGN KEY (order_id,version) REFERENCES bss_orders__order_version(order_id,version)"
+      },
+      "indexes": {
+        "uq_bss_orders__approval_reflection__0": "UNIQUE (order_id,version,verdict_kind)"
+      },
+      "triggers": [
+        "CREATE TRIGGER bss_orders__approval_reflection_immutable BEFORE UPDATE ON bss_orders__approval_reflection FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__approval_reflection_delete BEFORE DELETE ON bss_orders__approval_reflection FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__approval_reflection TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__approval_reflection TO bss_orders_business;"
+      ]
+    },
+    {
+      "name": "state_ttl_policy",
+      "physical": "bss_orders__state_ttl_policy",
+      "content_owner": "hold-and-expiry promotion",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-state-ttl-policy"
+      ],
+      "migration": "05_schema.sql",
+      "mutation": "ttl_policy",
+      "scope": "deployment policy IDs; no business authority",
+      "columns": [
+        {
+          "name": "policy_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "scope",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "seller_tenant_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "ttl_duration",
+          "type": "interval",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "provisional",
+          "type": "boolean",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "policy_revision",
+          "type": "bigint",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "updated_by",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "policy_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__state_ttl_policy": "PRIMARY KEY (policy_id)",
+        "ck_bss_orders__state_ttl_policy__0": "CHECK (scope IN ('platform','seller'))",
+        "ck_bss_orders__state_ttl_policy__1": "CHECK (state IN ('draft','submitted','pending_approval','approved','on_hold'))",
+        "ck_bss_orders__state_ttl_policy__2": "CHECK ((scope='platform' AND seller_tenant_id IS NULL) OR (scope='seller' AND seller_tenant_id IS NOT NULL AND ttl_duration IS NOT NULL AND NOT provisional))",
+        "ck_bss_orders__state_ttl_policy__3": "CHECK (ttl_duration IS NULL OR ttl_duration > interval '0')",
+        "ck_bss_orders__state_ttl_policy__4": "CHECK (policy_revision>0)"
+      },
+      "indexes": {
+        "uq_bss_orders__state_ttl_policy__0": "UNIQUE (scope,seller_tenant_id,state) NULLS NOT DISTINCT"
+      },
+      "triggers": [
+        "CREATE TRIGGER bss_orders__ttl_namespace BEFORE INSERT OR UPDATE OR DELETE ON bss_orders__state_ttl_policy FOR EACH ROW EXECUTE FUNCTION bss_orders__policy_namespace();",
+        "CREATE TRIGGER bss_orders__state_ttl_policy_fixed BEFORE UPDATE ON bss_orders__state_ttl_policy FOR EACH ROW EXECUTE FUNCTION bss_orders__update_guard('ttl_duration,provisional,policy_revision,updated_by,updated_at');",
+        "CREATE TRIGGER bss_orders__state_ttl_policy_delete BEFORE DELETE ON bss_orders__state_ttl_policy FOR EACH ROW EXECUTE FUNCTION bss_orders__policy_guard();",
+        "CREATE TRIGGER bss_orders__state_ttl_policy_validate BEFORE UPDATE ON bss_orders__state_ttl_policy FOR EACH ROW EXECUTE FUNCTION bss_orders__policy_guard();"
+      ],
+      "grants": [
+        "GRANT SELECT ON bss_orders__state_ttl_policy TO bss_orders_runtime, bss_orders_business, bss_orders_maintenance;",
+        "GRANT SELECT, INSERT ON bss_orders__state_ttl_policy TO bss_orders_policy;",
+        "GRANT UPDATE (ttl_duration,provisional,policy_revision,updated_by,updated_at) ON bss_orders__state_ttl_policy TO bss_orders_policy;",
+        "GRANT DELETE ON bss_orders__state_ttl_policy TO bss_orders_policy;"
+      ]
+    },
+    {
+      "name": "read_access_log",
+      "physical": "bss_orders__read_access_log",
+      "content_owner": "read-and-authz",
+      "source_ids": [
+        "cpt-cf-bss-orders-lifecycle-dbtable-read-access-log"
+      ],
+      "migration": "06_schema.sql",
+      "mutation": "read_log",
+      "scope": "trusted actor; private inspection",
+      "columns": [
+        {
+          "name": "access_id",
+          "type": "uuid",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "order_id",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "requested_order_ref",
+          "type": "uuid",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "actor",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "actor_class",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "operation",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "outcome",
+          "type": "text",
+          "nullable": false,
+          "extra": ""
+        },
+        {
+          "name": "refusal_reason",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "internal_refusal_detail",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "delegation_proof_ref",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "accessed_at",
+          "type": "timestamptz",
+          "nullable": false,
+          "extra": ""
+        }
+      ],
+      "pk": [
+        "access_id"
+      ],
+      "constraints": {
+        "pk_bss_orders__read_access_log": "PRIMARY KEY (access_id)",
+        "ck_bss_orders__read_access_log__0": "CHECK (actor_class IN ('system','service','user'))",
+        "ck_bss_orders__read_access_log__1": "CHECK (outcome IN ('served','refused'))",
+        "ck_bss_orders__read_access_log__2": "CHECK ((outcome='refused') = (refusal_reason IS NOT NULL))",
+        "ck_bss_orders__read_access_log__3": "CHECK (internal_refusal_detail IS NULL OR (outcome='refused' AND refusal_reason='order-not-found' AND internal_refusal_detail IN ('delegation-proof-required','delegation-proof-invalid')))",
+        "ck_bss_orders__read_access_log__4": "CHECK (order_id IS NULL OR (requested_order_ref IS NOT NULL AND order_id=requested_order_ref))",
+        "fk_bss_orders__read_access_log__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
+        "ck_bss_orders__read_access_log__actor": "CHECK (actor ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')"
+      },
+      "indexes": {
+        "idx_bss_orders__read_access_log__0": "(accessed_at)",
+        "idx_bss_orders__read_access_log__1": "(order_id,accessed_at)",
+        "idx_bss_orders__read_access_log__2": "(requested_order_ref,accessed_at)"
+      },
+      "triggers": [
+        "CREATE TRIGGER bss_orders__read_access_log_immutable BEFORE UPDATE ON bss_orders__read_access_log FOR EACH ROW EXECUTE FUNCTION bss_orders__immutable();",
+        "CREATE TRIGGER bss_orders__read_access_log_delete BEFORE DELETE ON bss_orders__read_access_log FOR EACH ROW EXECUTE FUNCTION bss_orders__retention_guard();"
+      ],
+      "grants": [
+        "GRANT SELECT, INSERT ON bss_orders__read_access_log TO bss_orders_runtime;",
+        "GRANT SELECT, INSERT ON bss_orders__read_access_log TO bss_orders_private;",
+        "GRANT SELECT, DELETE ON bss_orders__read_access_log TO bss_orders_retention;"
+      ]
+    }
+  ],
+  "guard_functions": {
+    "bss_orders__immutable": "CREATE FUNCTION bss_orders__immutable() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN RAISE EXCEPTION 'Orders evidence is immutable' USING ERRCODE='42501'; END $$;",
+    "bss_orders__update_guard": "CREATE FUNCTION bss_orders__update_guard() RETURNS trigger LANGUAGE plpgsql AS $$\nDECLARE allowed text[] := string_to_array(TG_ARGV[0], ',');\nBEGIN\n    IF (to_jsonb(OLD) - allowed) IS DISTINCT FROM (to_jsonb(NEW) - allowed) THEN\n        RAISE EXCEPTION 'immutable Orders input' USING ERRCODE='23514';\n    END IF;\n    RETURN NEW;\nEND $$;",
+    "bss_orders__aggregate_guard": "CREATE FUNCTION bss_orders__aggregate_guard() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n    IF NEW.current_version < OLD.current_version OR NEW.version_allocation_high_water < OLD.version_allocation_high_water\n       OR NEW.draft_revision < OLD.draft_revision OR NEW.resume_count < OLD.resume_count\n       OR NEW.amendment_count < OLD.amendment_count OR NEW.audit_sequence < OLD.audit_sequence\n       OR NEW.fulfillment_control_generation < OLD.fulfillment_control_generation THEN\n        RAISE EXCEPTION 'Orders counter cannot decrease' USING ERRCODE='23514';\n    END IF;\n    IF (OLD.spawn_signal_at IS NOT NULL AND NEW.spawn_signal_at IS DISTINCT FROM OLD.spawn_signal_at)\n       OR (OLD.authorization_failure_tolerated_at IS NOT NULL AND NEW.authorization_failure_tolerated_at IS DISTINCT FROM OLD.authorization_failure_tolerated_at)\n       OR (OLD.state <> 'draft' AND NEW.resource_tenant_id <> OLD.resource_tenant_id) THEN\n        RAISE EXCEPTION 'immutable Orders fact' USING ERRCODE='23514';\n    END IF;\n    RETURN NEW;\nEND $$;",
+    "bss_orders__claim_guard": "CREATE FUNCTION bss_orders__claim_guard() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n    IF OLD.released_at IS NOT NULL OR NEW.released_at IS NULL THEN\n        RAISE EXCEPTION 'claim may only be released once' USING ERRCODE='23514';\n    END IF;\n    RETURN NEW;\nEND $$;",
+    "bss_orders__working_guard": "CREATE FUNCTION bss_orders__working_guard() RETURNS trigger LANGUAGE plpgsql AS $$\nDECLARE target uuid; s text;\nBEGIN\n    IF TG_OP='DELETE' THEN target := OLD.order_id; ELSE target := NEW.order_id; END IF;\n    SELECT state INTO STRICT s FROM bss_orders__order WHERE order_id=target FOR UPDATE;\n    IF TG_ARGV[0]='draft' THEN\n        -- Final submit removes membership in the same transaction after appending the snapshot.\n        IF s <> 'draft' AND NOT (TG_OP='DELETE' AND s='submitted') THEN\n            RAISE EXCEPTION 'draft membership is closed' USING ERRCODE='23514';\n        END IF;\n    ELSIF s IN ('completed','rejected','cancelled','fulfillment_failed','expired') THEN\n        RAISE EXCEPTION 'administrative content is terminal' USING ERRCODE='23514';\n    END IF;\n    IF TG_OP='DELETE' THEN RETURN OLD; END IF;\n    RETURN NEW;\nEND $$;",
+    "bss_orders__retention_guard": "CREATE FUNCTION bss_orders__retention_guard() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n    IF NOT pg_has_role(current_user,'bss_orders_retention','MEMBER') THEN\n        RAISE EXCEPTION 'Orders retention role required' USING ERRCODE='42501';\n    END IF;\n    IF TG_TABLE_NAME='bss_orders__transition_audit' THEN\n        IF OLD.outcome='refused' AND OLD.created_at < clock_timestamp()-interval '90 days' THEN RETURN OLD; END IF;\n    ELSIF TG_TABLE_NAME='bss_orders__gate_outcome' THEN\n        IF OLD.order_id IS NULL AND OLD.evaluated_at < clock_timestamp()-interval '7 days' THEN RETURN OLD; END IF;\n    ELSIF TG_TABLE_NAME='bss_orders__read_access_log' THEN\n        IF OLD.accessed_at < clock_timestamp()-interval '90 days' THEN RETURN OLD; END IF;\n    END IF;\n    RAISE EXCEPTION 'Orders retention window or evidence class forbids deletion' USING ERRCODE='42501';\nEND $$;",
+    "bss_orders__registry_guard": "CREATE FUNCTION bss_orders__registry_guard() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n    IF TG_OP='DELETE' THEN\n        IF OLD.expires_at > clock_timestamp() OR (OLD.status='in_flight' AND OLD.lease_expires_at > clock_timestamp()) THEN\n            RAISE EXCEPTION 'live idempotency generation' USING ERRCODE='23514';\n        END IF;\n        IF EXISTS(SELECT 1 FROM bss_orders__commercial_attempt WHERE attempt_id=OLD.attempt_id AND status IN ('prepared','running'))\n           OR EXISTS(SELECT 1 FROM bss_orders__fulfillment_control WHERE control_id=OLD.fulfillment_control_id AND status IN ('prepared','awaiting','barrier_ready')) THEN\n            RAISE EXCEPTION 'unresolved execution must survive retention' USING ERRCODE='23514';\n        END IF;\n        RETURN OLD;\n    END IF;\n    IF OLD.status='settled' OR NEW.fencing_generation<OLD.fencing_generation\n       OR (OLD.attempt_id IS NOT NULL AND NEW.attempt_id IS DISTINCT FROM OLD.attempt_id)\n       OR (OLD.fulfillment_control_id IS NOT NULL AND NEW.fulfillment_control_id IS DISTINCT FROM OLD.fulfillment_control_id)\n       OR (OLD.order_id IS NOT NULL AND NEW.order_id IS DISTINCT FROM OLD.order_id)\n       OR (NEW.owner_token IS DISTINCT FROM OLD.owner_token AND NEW.fencing_generation<=OLD.fencing_generation) THEN\n        RAISE EXCEPTION 'immutable registry settlement or stale fence' USING ERRCODE='23514';\n    END IF;\n    RETURN NEW;\nEND $$;",
+    "bss_orders__execution_guard": "CREATE FUNCTION bss_orders__execution_guard() RETURNS trigger LANGUAGE plpgsql AS $$\nDECLARE old_results jsonb; new_results jsonb;\nBEGIN\n    IF OLD.status IN ('committed','settled','refused','abandoned') OR NEW.fencing_generation<OLD.fencing_generation\n       OR (NEW.owner_token<>OLD.owner_token AND NEW.fencing_generation<=OLD.fencing_generation) THEN\n        RAISE EXCEPTION 'terminal execution or stale ownership fence' USING ERRCODE='23514';\n    END IF;\n    IF TG_TABLE_NAME='bss_orders__commercial_attempt' THEN\n        old_results := OLD.receipt_results; new_results := NEW.receipt_results;\n        IF OLD.status='running' AND NEW.status='prepared' THEN RAISE EXCEPTION 'execution cannot regress' USING ERRCODE='23514'; END IF;\n    ELSE\n        old_results := OLD.receiver_evidence; new_results := NEW.receiver_evidence;\n        IF EXISTS(SELECT 1 FROM jsonb_each(OLD.receiver_commands) e WHERE NEW.receiver_commands->e.key IS DISTINCT FROM e.value) THEN RAISE EXCEPTION 'command identity changed' USING ERRCODE='23514'; END IF;\n        IF (OLD.status='awaiting' AND NEW.status='prepared') OR (OLD.status='barrier_ready' AND NEW.status IN ('prepared','awaiting')) THEN RAISE EXCEPTION 'control cannot regress' USING ERRCODE='23514'; END IF;\n    END IF;\n    -- Top-level first results are immutable, including arrays and nested objects; @> alone\n    -- would permit adding fields inside an already recorded receipt.\n    IF EXISTS(SELECT 1 FROM jsonb_each(old_results) e WHERE new_results->e.key IS DISTINCT FROM e.value) THEN\n        RAISE EXCEPTION 'first result cannot be rewritten' USING ERRCODE='23514';\n    END IF;\n    RETURN NEW;\nEND $$;",
+    "bss_orders__observation_valid": "CREATE FUNCTION bss_orders__observation_valid(j jsonb,s text,v integer) RETURNS boolean\nLANGUAGE plpgsql IMMUTABLE AS $$\nBEGIN\n    IF j IS NULL THEN RETURN true; END IF;\n    IF jsonb_typeof(j)<>'object' OR NOT j ?& ARRAY['audit_sequence','state','version']\n       OR j-ARRAY['audit_sequence','state','version'] <> '{}'::jsonb\n       OR jsonb_typeof(j->'audit_sequence')<>'number' OR jsonb_typeof(j->'version')<>'number'\n       OR jsonb_typeof(j->'state')<>'string' THEN RETURN false; END IF;\n    RETURN COALESCE((j->>'audit_sequence') ~ '^[1-9][0-9]*$' AND (j->>'audit_sequence')::numeric <= 9223372036854775807\n       AND (j->>'version') ~ '^[1-9][0-9]*$' AND (j->>'version')::numeric<=2147483647\n       AND j->>'state'=s AND (j->>'version')::numeric=v, false);\nEXCEPTION WHEN OTHERS THEN RETURN false;\nEND $$;",
+    "bss_orders__audit_writer": "CREATE FUNCTION bss_orders__audit_writer() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n    IF NOT (SELECT rolsuper FROM pg_roles WHERE rolname=current_user) AND (pg_has_role(current_user,'bss_orders_runtime','MEMBER') OR pg_has_role(current_user,'bss_orders_private','MEMBER')) THEN\n        IF NEW.hash_version<>3 THEN RAISE EXCEPTION 'new audit writers require v3' USING ERRCODE='23514'; END IF;\n    END IF;\n    RETURN NEW;\nEND $$;",
+    "bss_orders__grant_link": "CREATE FUNCTION bss_orders__grant_link() RETURNS trigger LANGUAGE plpgsql AS $$\nDECLARE a bss_orders__transition_audit; p bss_orders__fulfillment_grant;\nBEGIN\n    SELECT * INTO STRICT a FROM bss_orders__transition_audit WHERE audit_id=NEW.audit_id;\n    IF a.outcome<>'committed' OR a.order_id<>NEW.order_id OR a.version<>NEW.order_version\n       OR a.trigger NOT IN ('report-spawn-signal','resume','replace-fulfillment-grant')\n       OR a.to_state<>'in_fulfillment' THEN\n        RAISE EXCEPTION 'grant requires its originating committed writer audit' USING ERRCODE='23514';\n    END IF;\n    IF NEW.predecessor_grant_id IS NOT NULL THEN\n        SELECT * INTO STRICT p FROM bss_orders__fulfillment_grant WHERE grant_id=NEW.predecessor_grant_id;\n        IF p.order_id<>NEW.order_id OR p.generation>=NEW.generation THEN\n            RAISE EXCEPTION 'invalid grant predecessor' USING ERRCODE='23514';\n        END IF;\n        -- D-198/D-201: a successor replaces the current grant only; no fork or skipped head.\n        IF EXISTS(SELECT 1 FROM bss_orders__fulfillment_grant g WHERE g.order_id=NEW.order_id\n                  AND g.grant_id<>NEW.grant_id AND g.generation>p.generation) THEN\n            RAISE EXCEPTION 'grant predecessor is not the current grant' USING ERRCODE='23514';\n        END IF;\n    ELSIF a.trigger<>'report-spawn-signal' THEN\n        RAISE EXCEPTION 'successor grant requires predecessor' USING ERRCODE='23514';\n    ELSIF EXISTS(SELECT 1 FROM bss_orders__fulfillment_grant g WHERE g.order_id=NEW.order_id AND g.grant_id<>NEW.grant_id) THEN\n        RAISE EXCEPTION 'first dispatch grant already issued' USING ERRCODE='23514';\n    END IF;\n    RETURN NEW;\nEND $$;",
+    "bss_orders__total_line_link": "CREATE FUNCTION bss_orders__total_line_link() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n    IF NEW.scope='line' AND NOT EXISTS(SELECT 1 FROM bss_orders__order_line_identity WHERE order_id=NEW.order_id AND line_id=NEW.line_id) THEN\n        RAISE EXCEPTION 'missing line identity for total' USING ERRCODE='23503';\n    END IF;\n    RETURN NEW;\nEND $$;",
+    "bss_orders__policy_guard": "CREATE FUNCTION bss_orders__policy_guard() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n    IF TG_OP='DELETE' THEN\n        IF TG_TABLE_NAME='bss_orders__date_policy' THEN\n            IF OLD.resource_tenant_id IS NULL THEN RAISE EXCEPTION 'platform date policy is permanent' USING ERRCODE='42501'; END IF;\n        ELSIF OLD.scope='platform' THEN\n            RAISE EXCEPTION 'platform TTL row is permanent' USING ERRCODE='42501';\n        END IF;\n        RETURN OLD;\n    END IF;\n    IF TG_TABLE_NAME='bss_orders__date_policy' THEN\n        IF NEW.revision<=OLD.revision THEN RAISE EXCEPTION 'date revision must advance' USING ERRCODE='23514'; END IF;\n    ELSIF NEW.policy_revision<=OLD.policy_revision THEN\n        RAISE EXCEPTION 'TTL revision must advance' USING ERRCODE='23514';\n    END IF;\n    RETURN NEW;\nEND $$;",
+    "bss_orders__term_valid": "CREATE FUNCTION bss_orders__term_valid(k text, d interval, j jsonb, cycle text) RETURNS boolean\nLANGUAGE plpgsql IMMUTABLE AS $$\nDECLARE expected interval;\nBEGIN\n    IF jsonb_typeof(j)<>'object' THEN RETURN false; END IF;\n    IF k IN ('missing','rolling') THEN RETURN d IS NULL AND j=jsonb_build_object('kind',k); END IF;\n    -- A draft may leave the cycle unauthored (02 \u00a74.1): a period count then keeps its authored\n    -- intent with no interval, which is derived once the cycle is authored.\n    IF k='finite' AND cycle IS NULL AND j->>'kind'='periods' THEN\n        RETURN d IS NULL AND j-ARRAY['kind','count']='{}'::jsonb AND j ? 'count'\n          AND jsonb_typeof(j->'count')='number' AND (j->>'count') ~ '^[1-9][0-9]*$' AND (j->>'count')::numeric<=4294967295;\n    END IF;\n    IF k<>'finite' OR d IS NULL OR d<=interval '0' THEN RETURN false; END IF;\n    IF j->>'kind'='periods' AND j-ARRAY['kind','count']='{}'::jsonb AND j ? 'count'\n       AND jsonb_typeof(j->'count')='number' AND (j->>'count') ~ '^[1-9][0-9]*$' AND (j->>'count')::numeric<=4294967295 THEN\n        expected := ((j->>'count') || CASE WHEN cycle='month' THEN ' months' ELSE ' years' END)::interval;\n    ELSIF j->>'kind'='calendar' AND j ?& ARRAY['kind','years','months','days','microseconds']\n       AND j-ARRAY['kind','years','months','days','microseconds']='{}'::jsonb THEN\n        IF EXISTS(SELECT 1 FROM jsonb_each(j-'kind') e WHERE jsonb_typeof(e.value)<>'number' OR e.value::text !~ '^[0-9]+$') THEN RETURN false; END IF;\n        expected := make_interval(years=>(j->>'years')::integer, months=>(j->>'months')::integer, days=>(j->>'days')::integer)\n          + ((j->>'microseconds') || ' microseconds')::interval;\n    ELSE RETURN false;\n    END IF;\n    -- Interval '=' treats 1 month and 30 days as equal. Compare each stored component.\n    RETURN extract(year FROM d)=extract(year FROM expected) AND extract(month FROM d)=extract(month FROM expected)\n       AND extract(day FROM d)=extract(day FROM expected) AND extract(hour FROM d)=extract(hour FROM expected)\n       AND extract(minute FROM d)=extract(minute FROM expected) AND extract(second FROM d)=extract(second FROM expected);\nEXCEPTION WHEN OTHERS THEN RETURN false;\nEND $$;",
+    "bss_orders__date_snapshot_valid": "CREATE FUNCTION bss_orders__date_snapshot_valid(j jsonb) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$\nBEGIN\n    IF jsonb_typeof(j)<>'object'\n       OR NOT j ?& ARRAY['service_activation_required','acceptance_due_required','scope','resource_tenant_id','policy_id','revision']\n       OR j-ARRAY['service_activation_required','acceptance_due_required','scope','resource_tenant_id','policy_id','revision']<>'{}'::jsonb\n       OR jsonb_typeof(j->'service_activation_required')<>'boolean' OR jsonb_typeof(j->'acceptance_due_required')<>'boolean'\n       OR jsonb_typeof(j->'policy_id')<>'string' OR jsonb_typeof(j->'revision')<>'number'\n       OR (j->>'revision') !~ '^[1-9][0-9]*$' OR (j->>'revision')::numeric>9223372036854775807 THEN\n        RETURN false;\n    END IF;\n    RETURN COALESCE(CASE j->>'scope'\n        WHEN 'platform_default' THEN j->'resource_tenant_id'='null'::jsonb\n            AND (j->>'policy_id')::uuid='00000000-0000-0000-0000-000000000121'::uuid\n        WHEN 'resource_tenant' THEN jsonb_typeof(j->'resource_tenant_id')='string'\n            AND (j->>'resource_tenant_id')::uuid<>'00000000-0000-0000-0000-000000000000'::uuid\n            AND (j->>'policy_id')::uuid<>'00000000-0000-0000-0000-000000000121'::uuid\n        ELSE false END, false);\nEXCEPTION WHEN OTHERS THEN RETURN false;\nEND $$;",
+    "bss_orders__compensation_valid": "CREATE FUNCTION bss_orders__compensation_valid(j jsonb) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$\nDECLARE a jsonb; item jsonb;\nBEGIN\n    IF j IS NULL THEN RETURN true; END IF;\n    IF jsonb_typeof(j)<>'object' OR NOT j ?& ARRAY['drafts_voided','activated_rolled_back','activation_dispatched','at_sale_facts_emitted','no_active_subscription_remains']\n       OR jsonb_typeof(j->'drafts_voided')<>'array' OR jsonb_typeof(j->'activated_rolled_back')<>'array'\n       OR jsonb_typeof(j->'activation_dispatched')<>'boolean' THEN RETURN false; END IF;\n    FOR item IN SELECT value FROM jsonb_array_elements((j->'drafts_voided') || (j->'activated_rolled_back')) LOOP\n        IF jsonb_typeof(item)<>'string' OR (item #>> '{}') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN RETURN false; END IF;\n    END LOOP;\n    IF NOT j ? 'operator_attestation' THEN\n        RETURN j-ARRAY['drafts_voided','activated_rolled_back','activation_dispatched','at_sale_facts_emitted','no_active_subscription_remains']='{}'::jsonb\n          AND jsonb_typeof(j->'at_sale_facts_emitted')='boolean' AND jsonb_typeof(j->'no_active_subscription_remains')='boolean';\n    END IF;\n    IF j-ARRAY['drafts_voided','activated_rolled_back','activation_dispatched','at_sale_facts_emitted','no_active_subscription_remains','operator_attestation']<>'{}'::jsonb\n       OR j->'activation_dispatched'<>'true'::jsonb OR j->'at_sale_facts_emitted'<>'\"unknown\"'::jsonb\n       OR j->'no_active_subscription_remains'<>'\"unknown\"'::jsonb THEN RETURN false; END IF;\n    a:=j->'operator_attestation';\n    IF jsonb_typeof(a)<>'object' OR NOT a ?& ARRAY['requested_by','request_audit_id','requested_at','approved_by']\n       OR a-ARRAY['requested_by','request_audit_id','requested_at','approved_by']<>'{}'::jsonb THEN RETURN false; END IF;\n    FOR item IN SELECT value FROM jsonb_each(a-'requested_at') LOOP\n        IF jsonb_typeof(item)<>'string' OR (item #>> '{}') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN RETURN false; END IF;\n    END LOOP;\n    RETURN COALESCE(jsonb_typeof(a->'requested_at')='string' AND (a->>'requested_at')::timestamptz IS NOT NULL AND a->>'requested_by'<>a->>'approved_by',false);\nEXCEPTION WHEN OTHERS THEN RETURN false;\nEND $$;",
+    "bss_orders__settlement_link": "CREATE FUNCTION bss_orders__settlement_link() RETURNS trigger LANGUAGE plpgsql AS $$\nDECLARE a bss_orders__transition_audit;\nBEGIN\n    IF NEW.status<>'settled' THEN RETURN NEW; END IF;\n    SELECT * INTO a FROM bss_orders__transition_audit WHERE audit_id=NEW.audit_id;\n    IF NOT FOUND OR (NEW.outcome='success' AND a.outcome<>'committed') OR (NEW.outcome='refused' AND a.outcome<>'refused')\n       OR a.order_id IS DISTINCT FROM NEW.order_id THEN\n        RAISE EXCEPTION 'settlement requires its originating audit' USING ERRCODE='23503';\n    END IF;\n    RETURN NEW;\nEND $$;",
+    "bss_orders__policy_namespace": "CREATE FUNCTION bss_orders__policy_namespace() RETURNS trigger LANGUAGE plpgsql AS $$\nDECLARE r bigint; s text; is_default boolean;\nBEGIN\n    IF TG_TABLE_NAME='bss_orders__date_policy' THEN\n        IF TG_OP='DELETE' THEN is_default:=OLD.resource_tenant_id IS NULL; ELSE is_default:=NEW.resource_tenant_id IS NULL; END IF;\n        IF is_default THEN IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END IF;\n        SELECT revision INTO STRICT r FROM bss_orders__date_policy WHERE resource_tenant_id IS NULL FOR UPDATE;\n        IF TG_OP<>'DELETE' THEN\n            IF NEW.revision<=r THEN RAISE EXCEPTION 'date override revision must exceed namespace high water' USING ERRCODE='23514'; END IF;\n            r:=NEW.revision;\n        END IF;\n        UPDATE bss_orders__date_policy SET revision=r+1,updated_at=clock_timestamp() WHERE resource_tenant_id IS NULL;\n    ELSE\n        IF TG_OP='DELETE' THEN is_default:=OLD.scope='platform';s:=OLD.state; ELSE is_default:=NEW.scope='platform';s:=NEW.state; END IF;\n        IF is_default THEN IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; END IF;\n        SELECT policy_revision INTO STRICT r FROM bss_orders__state_ttl_policy WHERE scope='platform' AND state=s FOR UPDATE;\n        UPDATE bss_orders__state_ttl_policy SET policy_revision=r+1,updated_at=clock_timestamp() WHERE scope='platform' AND state=s;\n    END IF;\n    IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;\nEND $$;",
+    "bss_orders__grant_source": "CREATE FUNCTION bss_orders__grant_source() RETURNS trigger LANGUAGE plpgsql AS $$\nDECLARE o bss_orders__order;\nBEGIN\n SELECT * INTO STRICT o FROM bss_orders__order WHERE order_id=NEW.order_id;\n IF o.current_version<>NEW.order_version OR o.state<>'in_fulfillment' OR o.spawn_signal_at IS NULL\n    OR o.fulfillment_control_pending IS NOT NULL OR o.fulfillment_control_generation<>NEW.generation THEN\n    RAISE EXCEPTION 'grant requires current admitted fulfillment source' USING ERRCODE='23514';\n END IF;\n RETURN NEW;\nEND $$;",
+    "bss_orders__checkpoint_complete": "CREATE FUNCTION bss_orders__checkpoint_complete() RETURNS trigger LANGUAGE plpgsql AS $$\nDECLARE expected bigint; actual bigint;\nBEGIN\n SELECT member_count INTO STRICT expected FROM bss_orders__audit_checkpoint WHERE audit_tenant_id=NEW.audit_tenant_id AND checkpoint_sequence=NEW.checkpoint_sequence;\n SELECT count(*) INTO actual FROM bss_orders__audit_checkpoint_member WHERE audit_tenant_id=NEW.audit_tenant_id AND checkpoint_sequence=NEW.checkpoint_sequence;\n IF expected<>actual THEN RAISE EXCEPTION 'checkpoint header/member cardinality mismatch' USING ERRCODE='23514'; END IF;\n RETURN NEW;\nEND $$;",
+    "bss_orders__execution_link": "CREATE FUNCTION bss_orders__execution_link() RETURNS trigger LANGUAGE plpgsql AS $$\nDECLARE marker bss_orders__idempotency; a bss_orders__commercial_attempt; c bss_orders__fulfillment_control; execution uuid;\nBEGIN\n IF TG_TABLE_NAME='bss_orders__idempotency' THEN execution:=NEW.execution_id;\n ELSE execution:=NEW.idempotency_execution_id; END IF;\n SELECT * INTO marker FROM bss_orders__idempotency WHERE execution_id=execution;\n IF NOT FOUND THEN RAISE EXCEPTION 'execution requires its owning registry generation' USING ERRCODE='23503'; END IF;\n IF marker.attempt_id IS NOT NULL THEN\n   SELECT * INTO STRICT a FROM bss_orders__commercial_attempt WHERE attempt_id=marker.attempt_id;\n   IF a.idempotency_execution_id<>marker.execution_id OR a.order_id IS DISTINCT FROM marker.order_id\n     OR a.operation<>marker.operation OR a.principal_scope<>marker.principal_scope OR a.request_fingerprint<>marker.request_fingerprint\n     OR a.owner_token IS DISTINCT FROM marker.owner_token OR a.fencing_generation<>marker.fencing_generation THEN\n      RAISE EXCEPTION 'commercial execution identity/fence mismatch' USING ERRCODE='23514';\n   END IF;\n   IF (a.status IN ('prepared','running')) IS DISTINCT FROM (marker.status='in_flight') THEN\n      RAISE EXCEPTION 'commercial execution settlement mismatch' USING ERRCODE='23514';\n   END IF;\n   IF a.status='committed' AND (marker.outcome<>'success' OR NOT EXISTS(SELECT 1 FROM bss_orders__order_version WHERE order_id=a.order_id AND version=a.candidate_version)) THEN\n      RAISE EXCEPTION 'committed attempt requires selected commercial version' USING ERRCODE='23514';\n   END IF;\n ELSIF marker.fulfillment_control_id IS NOT NULL THEN\n   SELECT * INTO STRICT c FROM bss_orders__fulfillment_control WHERE control_id=marker.fulfillment_control_id;\n   IF c.idempotency_execution_id<>marker.execution_id OR c.order_id IS DISTINCT FROM marker.order_id\n      OR c.operation<>marker.operation OR c.request_fingerprint<>marker.request_fingerprint\n      OR c.owner_token IS DISTINCT FROM marker.owner_token OR c.fencing_generation<>marker.fencing_generation\n      OR (c.status IN ('prepared','awaiting','barrier_ready')) IS DISTINCT FROM (marker.status='in_flight') THEN\n       RAISE EXCEPTION 'control execution identity/fence mismatch' USING ERRCODE='23514';\n   END IF;\n ELSIF TG_TABLE_NAME<>'bss_orders__idempotency' THEN\n   RAISE EXCEPTION 'registry must link its execution' USING ERRCODE='23514';\n END IF;\n RETURN NEW;\nEND $$;",
+    "bss_orders__line_attempt": "CREATE FUNCTION bss_orders__line_attempt() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n IF NEW.commercial_attempt_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM bss_orders__commercial_attempt WHERE attempt_id=NEW.commercial_attempt_id AND status='committed') THEN\n   RAISE EXCEPTION 'reserved-only receipt cannot become a commercial line' USING ERRCODE='23514';\n END IF;\n RETURN NEW;\nEND $$;"
+  },
+  "platform_schema_owners": [
+    "event_broker_sdk::producer_registration_migrations",
+    "toolkit_db::outbox::outbox_migrations"
+  ],
+  "role_binding_migration": "08_roles.sql",
+  "compatibility": [
+    "PostgreSQL interval select_as=text/save_as=interval; calendar units retained",
+    "D-193 term_kind/authored_term distinguish missing, rolling and finite; term_duration nullable only when tagged missing/rolling",
+    "D-201 v1/v2 retained; runtime writers require v3",
+    "Idempotency audit linkage validated at deferred settlement; no lifetime FK that could prevent refused-audit retention",
+    "Date policy permanent default is the scope revision high-water; tenant deletion/recreation cannot reset it"
+  ]
+}
