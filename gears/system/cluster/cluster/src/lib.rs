@@ -31,19 +31,20 @@
 //! deliberate, and carries the citation it was decided against.
 //!
 //! - **`api/grpc/` is a directory**, where `09:132` prescribes a single
-//!   `src/grpc_server.rs`. No file by that name exists anywhere in the repo; the only
-//!   other out-of-process gear (`examples/oop-gears/calculator/`) also uses an `api/grpc/`
-//!   directory. `S4` adds `api/rest/` beside it, which is `02:39`'s shape.
+//!   `src/grpc_server.rs`. No file by that name exists in the repo, and
+//!   `api-contracts` (the gRPC opt-in example) keeps its server in a single
+//!   `src/api/grpc.rs` — this gear is the only one that splits it into a
+//!   directory, earning it with five services plus subscription state and sweep.
+//!   `S4` adds `api/rest/` beside it, which is `02:39`'s shape.
 //! - **No `infra/`.** This gear owns no store — a backend's persistence belongs to the
-//!   plugin implementing it. `calculator` and `nodes-registry` ship without one too.
+//!   plugin implementing it. `api-contracts` and `nodes-registry` ship without one too.
 //! - **[`defaults`] is an unprecedented module name** (no other gear has one). Kept
 //!   because it is DESIGN §3.11's own term for what it holds — the "implement cache
 //!   only, get all three primitives" backends — and because it is a public path that
 //!   plugins' conformance tests import.
-//! - **The binary lives in this crate** (`main.rs` + `[[bin]]`), per `09:133` and
-//!   matching `calculator`. `users-info`'s separate `-server` crate is the in-process
-//!   pattern. Unlike `calculator`, the `[[bin]]` carries no `required-features` — see
-//!   the note on it in `Cargo.toml`.
+//! - **The binary lives in this crate** (`main.rs` + `[[bin]]`), per `09:133`.
+//!   `users-info`'s separate `-server` crate is the in-process pattern. The
+//!   `[[bin]]` carries no `required-features` — see the note on it in `Cargo.toml`.
 //! - **A third crate, `cluster-conformance`**, exists where every other gear has two
 //!   plus plugins. It is the only `*conformance*` crate in the repo. It is dev-dep-only
 //!   and path-only, and it operationalizes `cpt-cf-clst-nfr-cross-backend-stability`:

@@ -137,7 +137,7 @@ class RepositoryMakeTests(unittest.TestCase):
         self.assertLess(result.stdout.index("Code safety checks:"), result.stdout.index("Main targets:"))
         # Parameter values come from the make variables the targets use; library parameters first.
         parameters = result.stdout[result.stdout.index("Parameters"):]
-        for text in ('LANE="<lane> ..."', "oagw-db", "PRESET=<preset>", "oop-example", "DB=<db>", "GEAR=<gear>"):
+        for text in ('LANE="<lane> ..."', "oagw-db", "PRESET=<preset>", "fips", "DB=<db>", "GEAR=<gear>"):
             self.assertIn(text, parameters)
         self.assertLess(parameters.index("GEAR=<gear>"), parameters.index('LANE="<lane> ..."'))
 

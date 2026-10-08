@@ -323,6 +323,16 @@ jobs:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/oop.xml -o junit_suite_name=e2e-oop"
         run: tools/scripts/with_rust_annotations.sh make e2e-oop
 
+      # Self-managed OoP self-hosted (host-spawn) suite: boots the real
+      # `config/oop-self-hosted.yaml` host. It reuses the canonical ports the
+      # `e2e-oop` cluster holds, so it runs as its own step/target after that one
+      # has fully torn down (sequential steps never overlap).
+      - name: Run OoP self-hosted E2E tests
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/oop-self-hosted.xml -o junit_suite_name=e2e-oop-self-hosted"
+        run: tools/scripts/with_rust_annotations.sh make e2e-oop-self-hosted
+
       # Self-managed suite (launcher: pytest): its own server binary. The whole
       # suite runs on the in-process memory backend; the `backend_sensitive`
       # tests run again on PostgreSQL (a container, so the second step needs a

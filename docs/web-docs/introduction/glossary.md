@@ -14,7 +14,7 @@ A quick reference for the terms used across these docs.
 - **Multi-tenancy** — many customers (tenants) share the same infrastructure while their data stays isolated.
 - **Entitlement / licensing** — the features or limits a tenant or user is allowed to use, checked per request.
 - **Usage metering** — measuring usage such as API calls, compute, storage, or tokens; used for quotas and billing.
-- **Deployment shape / profile** — how the system is deployed: single-node, multi-node over gRPC, or containers on Kubernetes (and cloud/hybrid/edge/on-prem/air-gapped variants).
+- **Deployment shape / profile** — how the system is deployed: single-node (all gears in one process), self-hosted (a `HostRuntime` process runs some gears in-process and spawns selected gears as REST-first OoP workers), or Kubernetes-native (gears as containerized services). gRPC remains available as an opt-in transport in all distributed profiles.
 - **FIPS 140-3 / GDPR / HIPAA / SOC 2 / ISO 27001** — security, crypto, and data-protection standards or certifications often relevant to XaaS products.
 
 ## Gears core model
