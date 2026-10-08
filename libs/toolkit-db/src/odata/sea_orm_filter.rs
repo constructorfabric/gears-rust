@@ -716,7 +716,7 @@ where
         }
     }
 
-    crate::odata::core::check_cursor_filter(query)?;
+    toolkit_odata::check_cursor_filter(query)?;
 
     let mut s = select.inner;
 
@@ -777,12 +777,13 @@ where
         rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     }
 
-    // Build cursors
+    // Build cursors, stamped with the hash the next request is checked against
+    let filter_hash = query.effective_filter_hash();
     let next_cursor = if is_backward || has_more {
         build_cursor_from_rows::<E, F, M>(
             &rows,
             &effective_order,
-            query.filter_hash.as_deref(),
+            filter_hash.as_deref(),
             "fwd",
             true,
         )?
@@ -795,7 +796,7 @@ where
             build_cursor_from_rows::<E, F, M>(
                 &rows,
                 &effective_order,
-                query.filter_hash.as_deref(),
+                filter_hash.as_deref(),
                 "bwd",
                 false,
             )?
@@ -806,7 +807,7 @@ where
         build_cursor_from_rows::<E, F, M>(
             &rows,
             &effective_order,
-            query.filter_hash.as_deref(),
+            filter_hash.as_deref(),
             "bwd",
             false,
         )?
