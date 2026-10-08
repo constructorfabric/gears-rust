@@ -1,8 +1,8 @@
 //! Who a registry call is made for (D17).
 //!
-//! Every entry point names its caller: the local client by the contract it serves, REST by
-//! the credential its route authenticated. P0 reads it nowhere — no tenant scope, no
-//! recorded principal (C2/C6) — so P1 adds the policy without touching a signature.
+//! Local clients identify callers by contract; REST uses the authenticated credential.
+//! P0 applies no tenant scope or principal recording (C2/C6). Passing context now
+//! lets P1 add policy without changing signatures.
 
 use toolkit_macros::domain_model;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};

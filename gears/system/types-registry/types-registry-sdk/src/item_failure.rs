@@ -2,9 +2,8 @@
 //! `FailedPrecondition` violation 0 carries reason/key/message; later violations carry
 //! `context.<name>`/value/empty description. Unknown reasons and context round-trip unchanged.
 //!
-//! [`reason`] is the wire vocabulary of an item's `reason` and [`AdmissionFailureReason`] its
-//! typed view (ADR 0005 rule 4): the registry persists, emits and labels metrics with these
-//! codes, and the SDK dispatches on them.
+//! [`reason`] defines codes used in storage, errors and metrics;
+//! [`AdmissionFailureReason`] provides typed dispatch (ADR 0005 rule 4).
 
 use std::collections::BTreeMap;
 
@@ -344,9 +343,9 @@ impl AdmissionFailure {
 
     /// Decodes exactly what [`Self::into_canonical`] produces; `None` for any other shape.
     ///
-    /// The entity resource type, a primary violation naming the resource, and context
-    /// violations with empty descriptions and distinct names are all required, so a
-    /// parent-not-registered or registration-policy refusal never reads as an item failure.
+    /// Requires the entity resource type, a primary violation naming that resource,
+    /// and distinct context names with empty descriptions. Other precondition shapes
+    /// (parent or policy refusals) are rejected.
     #[must_use]
     pub fn from_canonical(error: &CanonicalError) -> Option<Self> {
         let CanonicalError::FailedPrecondition {

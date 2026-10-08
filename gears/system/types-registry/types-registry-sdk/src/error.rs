@@ -2,14 +2,11 @@
 //!
 //! # Opt-in convenience, not the contract
 //!
-//! Per [ADR 0005][adr] every trait boundary — [`PlatformTypesRegistryApi`] and the
-//! legacy [`TypesRegistryClient`] — is `Result<_, CanonicalError>`, and so is every
-//! per-item failure inside an operation. [`TypesRegistryError`] is an **opt-in**
-//! typed view over that envelope for consumers that want flat dispatch on what
-//! types-registry emits. It is *not* part of the trait contract: adding a variant is
-//! non-breaking, and the single authoritative AIP-193 classification lives in the
-//! impl crate's `From<DomainError> for CanonicalError` ladder (`api::error`) — this
-//! projection only reads the finished `CanonicalError`.
+//! [ADR 0005][adr] requires [`CanonicalError`] at API trait boundaries (including
+//! [`PlatformTypesRegistryApi`]) and in item failures. [`TypesRegistryError`] is an
+//! opt-in typed view; adding a variant does not change the contract.
+//! The implementation's `api::error` ladder owns
+//! AIP-193 classification; this projection only decodes its result.
 //!
 //! The conversion is infallible (`From<CanonicalError>`). Anything types-registry does
 //! not emit, or emits in a shape this build does not recognize, falls through to
@@ -37,11 +34,9 @@
 //! Legacy rows belong to [`TypesRegistryClient`], which T31 deletes together with them.
 //!
 //! Resource-scoped variants ([`TypesRegistryError::NotFound`] /
-//! [`TypesRegistryError::AlreadyExists`]) carry the raw `resource_type`; project it
-//! with [`crate::gts::Resource::from_wire`]. The type-schema-vs-instance distinction
-//! is intentionally **not** modeled: it is redundant with the method the caller
-//! invoked and with the `~` suffix of the `gts_id`, and the canonical boundary
-//! classifies both kinds identically (ADR 0005 single-classification).
+//! [`TypesRegistryError::AlreadyExists`]) carry `resource_type`; decode it with
+//! [`crate::gts::Resource::from_wire`]. Type Schemas and Instances share the same
+//! error classification; the called method and identifier suffix distinguish them.
 //!
 //! `FailedPrecondition` carries three distinct shapes, each with its own decoder:
 //! [`TypesRegistryError::ParentNotRegistered`] (legacy,
@@ -53,11 +48,9 @@
 //!
 //! # Refusals from the `ToolKit` layer
 //!
-//! Some REST refusals are made by `ToolKit`'s extractors before the registry sees the
-//! request. Their codes are `ToolKit`'s vocabulary, not this SDK's, and they arrive as
-//! [`TypesRegistryError::Validation`] with [`ValidationReason::Unknown`]. The projection
-//! keeps neither the HTTP status nor the `resource_type` (`ToolKit`'s own, on the
-//! [`CanonicalError`]), so match on `field` and `reason`:
+//! `ToolKit` extractors can refuse a request before registry dispatch. Their codes
+//! become [`TypesRegistryError::Validation`] with [`ValidationReason::Unknown`].
+//! Match on `field` and `reason`: this projection omits HTTP status and resource type.
 //!
 //! | `field` | `reason` | HTTP | when |
 //! |---|---|---|---|

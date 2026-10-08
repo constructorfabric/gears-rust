@@ -1,7 +1,6 @@
 //! Types Registry SDK
 //!
-//! This crate provides the public API for the `types-registry` gear. It carries two surfaces
-//! until T31 moves every consumer onto the new one.
+//! Public API for `types-registry`, with a legacy surface until the T31 cutover.
 //!
 //! **New surface** (SPEC §10.1, D15):
 //! - [`PlatformTypesRegistryApi`] — the platform toolkit contract; [`PlatformTypesRegistryApiExt`]
@@ -9,11 +8,10 @@
 //! - [`TypesRegistryApi`] — the tenant toolkit contract, entity reads only;
 //!   [`TypesRegistryApiExt`] — the same read helpers over it
 //! - [`ext`] says which contract a client resolves and which helpers it imports
-//! - [`models`] — the serde-free request, entity and operation models: [`Entity`] as the
-//!   contract carries it, and the kind-typed [`TypeSchema`] / [`Instance`] the read helpers
-//!   return
-//! - [`PlatformTypesRegistryApiExt::reconcile_entities_and_await`] — bring the registry to
-//!   explicitly supplied documents; [`Reconciliation`] and [`ReconcileOutcome`] report it
+//! - [`models`] — serde-free requests, operations and [`Entity`] snapshots;
+//!   read helpers return kind-typed [`TypeSchema`] / [`Instance`]
+//! - [`PlatformTypesRegistryApiExt::reconcile_entities_and_await`] — reconcile explicit
+//!   documents, returning [`Reconciliation`] and per-identifier [`ReconcileOutcome`]s
 //!
 //! **Old surface** (`legacy`, deleted in T31 with no shim; re-exported at the crate root):
 //! - `TypesRegistryClient` trait for inter-gear communication. Per

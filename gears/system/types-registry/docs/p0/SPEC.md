@@ -4,16 +4,12 @@ Derived from [DESIGN.md](../DESIGN.md), [PRD.md](../PRD.md), [database.sql](../d
 P0 is a scope cut of Product P1, not a separate design: every decision below either
 implements a DESIGN clause or records an explicit, named deviation from one.
 
-Status: **approved**, including the P19/P20 read-scope revisions, the P22 out-of-process
-revision (D11, D15–D17; decision and rationale in [`plan.md`](./plan.md) P22) and the P23
-publication-ordering revision (D18–D22, C12–C13; rationale in [`plan.md`](./plan.md) P23)
-and the P25 one-plane-per-route revision (D17, D20; rationale in [`plan.md`](./plan.md) P25),
-plus the P26 early-client scheduling revision (accepted and consolidated 2026-10-07: T26–T42, D11's dependent configured entities, §8.4's early handoff).
-The live execution
-artifacts are [`plan.md`](./plan.md) and [`todo.md`](./todo.md); where this document and
-the plan disagree on *ordering*, the plan
-wins (it supersedes §15 — see `plan.md` P1). Where they disagree on a *decision*, that is a
-bug in this document: report it rather than picking one.
+Status: **approved**, including P19/P20 read scope, P22 out-of-process operation
+(D11, D15–D17), P23 publication ordering (D18–D22, C12–C13), P25 one plane per route
+(D17, D20), and P26 early clients (accepted/consolidated 2026-10-07: T26–T42,
+D11 dependent configured entities, §8.4 handoff). Rationale is in [`plan.md`](./plan.md).
+The live execution artifacts are that plan and [`todo.md`](./todo.md). The plan
+supersedes §15's ordering (P1); conflicting decisions must be reported as spec bugs.
 
 ---
 
@@ -439,26 +435,20 @@ bytes modulo eight. Partitions run concurrently; `entity_write_order` still seri
 entity commits. Retries block only their partition. Changing the count requires recreating
 the disposable dev/test outbox; live repartitioning is unsupported.
 
-**Where it runs.** Startup order is repositories → outbox worker → seeding → await
-the seed operations → client publication. The outbox starts first because acceptance
-enqueues inside its own transaction and there is nowhere to enqueue before it is
-bound. Terminal is not enough to publish: `system_failure` and a refused candidate
-are terminal too, so startup requires every seed item to be `succeeded` or
-`unchanged`, and any `failed` item fails boot. The stateful entry point stops the
-retained `OutboxHandle` on runtime cancellation. Starting during `init()` means the
-worker is live before any gear's post-wiring publication runs, in process or not (D16).
+**Startup order:** repositories → outbox worker → seeding → await seed operations
+→ client publication. The worker must be bound before acceptance enqueues in its
+transaction. Every seed item must be `succeeded` or `unchanged`; terminal failures
+(including `system_failure`) fail boot. Runtime cancellation stops the retained
+`OutboxHandle`. Starting in `init()` ensures admission is available before any
+post-wiring publication, local or remote (D16).
 
-**Two seed sources, one pass.** Until T37, seeding covers (1) all process-linked toolkit-gts
-inventory, including other gears' declarations, and (2) the operator-configured
-`cfg.entities` from the deployment YAML — identities whose GTS identifiers are
-deployment-specific and cannot be expressed as gear-owned inventory items (e.g. the
-platform-root tenant type whose identity is chosen by the operator). Both sources are submitted
-together in a single pass; an invalid or oversized combined seed set fails startup
-loudly. The combined set must fit `limits.batch_candidates` and the other admission limits;
-there is no silent truncation or split that could separate a candidate from its dependency.
-Admission orders the combined candidate graph. T31 verifies the real deployment inventory
-and the over-limit refusal before publishing the client. This startup set is collected from
-the binary, not by scanning the entity table; C4 remains closed.
+**Two seed sources, one pass.** Until T37, seed all process-linked toolkit-gts
+inventory and operator `cfg.entities` from YAML. The latter supports deployment-specific
+identifiers, such as an operator-chosen platform-root tenant type. Submit both in
+one graph-ordered pass within `limits.batch_candidates` and other admission limits;
+invalid or oversized sets fail startup, with no truncation or dependency-separating
+split. T31 verifies the real inventory and over-limit refusal before publishing the
+client. Collection uses the binary's inventory, never an entity-table scan (C4).
 
 Process-wide collection is transitional (D11). Each declaring gear publishes its own
 crates after wiring (D16), and once all of them do, T37 narrows source (1) to the registry's
@@ -798,17 +788,13 @@ These are composition and output bounds. The repository's separate 512-entity st
 guard still bounds database loading, and `gts-rust` constructs the resolved value before its
 canonical byte size can be checked; the byte limit is not an allocator-level memory cap.
 
-Deletion has its own short protocol, and it opens the same way: a transaction whose **first
-statement** claims the `entity_write_order` row, then the positive `expected_resource_version`
-precondition, the recheck that the target is `ACTIVE` at that version with no direct
-registered dependents, `DELETED`, the version increment, the outcome. The claim is not
-optional and it is not merely early — a deletion whose recheck runs before it is a
-check-then-act on state that can still move, which is the failure the recheck exists to
-prevent. After the claim and before the precondition, deletion runs the same stamp check
-as step 1a (D18): another name is `publisher_mismatch`, a lower `publisher_version` is
-`superseded`, and an equal or higher one — or any on an unclaimed row — proceeds and writes
-the tombstone and the new stamp in one transaction. Nothing deletes an entity because a newer
-manifest no longer declares it.
+Deletion's first transaction statement claims `entity_write_order`. Then check the
+publisher stamp (step 1a, D18), the positive `expected_resource_version`, and that
+the target is `ACTIVE` with no direct registered dependents. Commit `DELETED`, the
+version increment, outcome and stamp together. Reads before the claim would make
+the recheck race with other writers. Another publisher yields `publisher_mismatch`;
+a lower version yields `superseded`; equal/higher versions and unclaimed rows proceed.
+Manifest omissions never delete entities.
 
 **Dry Run predicts the whole batch without entity-state writes.** Run the same checks in
 dependency order over one read-only snapshot plus earlier successful candidates' virtual
@@ -997,34 +983,28 @@ The standalone binary needs `DynBearerAuthenticator` in ClientHub, via
 without it tenant routes must return canonical `401` before dispatch.
 Authentication grants no authorization (C2, C6, C8).
 
-**Early client handoff (P26, P27).** T24a–T27a provide both API transports and their resolving
-clients, T28 the specified platform cache and T29 the generic post-wiring, supervision and
-readiness prerequisites. T30 runs isolated registry and consumer application processes, plus
-the master host's `DirectoryService` as an explicit prerequisite process, using real
-resolution and the existing publisher. Its development bearer authenticator validates signed
-tokens independently of registry plugin discovery and is recorded as development-only. A
-`publish = false` harness package owns the feature-gated pilot bins and test, and
-`make test-types-registry-pilot` runs inside `make ci`; no gear crate depends on the harness.
-The pilot registry seeds registry and base types through admission, never consumer
-inventory. Both start orders, late dependencies, invalid declarations, readiness, local/REST
-parity and restart must pass before handoff.
+**Early client handoff (P26, P27).** T24a–T27a supply both transports and resolving
+clients, T28 the platform cache, and T29 post-wiring supervision/readiness. T30 runs
+isolated registry and consumer processes plus the master `DirectoryService`, with
+real resolution and publication. The development-only bearer authenticator validates
+signed tokens independently of plugin discovery. A `publish = false` harness owns
+feature-gated bins/tests; `make test-types-registry-pilot` is part of `make ci`, and
+gears never depend on the harness. Registry/base seeds use admission and exclude
+consumer inventory. Handoff requires both start orders, late dependencies, invalid
+declarations, readiness, local/REST parity and restart tests.
 
-**First real gear (P26).** After the atomic cutover (T31/T32), T34 assigns publishers
-(including a deployment's child tenant types, which stay registry `cfg.entities`) and adds the
-post-wiring path for configured entities whose dependency lies outside the inline seed set.
-T35 moves real Account Management and its static IdP plugin after wiring; T36 migrates AM's
-host prerequisites and runs AM against a registry in another process with the production
-`AuthNResolverBearerAuthenticator`, in the topology T27 recorded (a linked topology is
-verified by T38 after the pull ends). Checkpoint 8A requires an Active root and authenticated
+**First real gear (P26).** After T31/T32's atomic cutover, T34 assigns publishers
+and adds post-wiring publication for configured entities with external seed dependencies
+(child tenant types remain registry `cfg.entities`). T35 moves AM and static IdP after
+wiring; T36 migrates AM's host prerequisites and proves a remote registry with production
+`AuthNResolverBearerAuthenticator` in T27's topology. T38 verifies the linked topology
+if selected, after the pull ends. Checkpoint 8A requires an Active root, authenticated
 child-tenant create/read in local and remote hosts, delayed prerequisites, configuration
-change and restart, and green embedded AM e2e. The root binding stays fatal in AM's `init`;
-a registry refusal of the root type holds readiness without failing boot (D21), a pending
-registry prerequisite is waited for rather than failed, and business, database or IdP saga
-failures keep the existing `bootstrap.strict` policy. RG's sealed,
-init-only bootstrap surface is not exposed after wiring. The composition shares production
-domain, adapters and runtime and adds no admission fork or feature switch to an existing host.
-Automatic collection, the remaining fleet and the publisher guard follow; no mixed-version
-deployment guarantee is made before Checkpoint 9.
+change, restart and green embedded AM e2e. Root binding remains fatal in AM's `init`;
+registry refusal/delay holds readiness, while saga failures retain `bootstrap.strict`.
+RG's sealed bootstrap stays init-only. The composition reuses production domain,
+adapters and runtime without admission forks or host switches. Collection, fleet
+migration and the publisher guard follow; mixed-version safety starts at Checkpoint 9.
 
 #### Declarations and publication
 
@@ -1441,19 +1421,15 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
 }
 ```
 
-The mutation and operation types are DESIGN's, not renamed. `register_entities` and
-`delete_entities` return the operation **as read**, not as received (D19): each adapter
-submits, then calls `get_operation` and returns its result. The receipt — `operation_id`,
-`status`, `replayed` — has no items, and a terminal replay (`200`) carries a terminal status
-with no items, so no adapter ever builds `RegistrationOperation { items: [] }` from it. If
-the read fails after an accepted submit, the error carries the `operation_id` and the caller
-retries under the same key, which replays. The REST adapter keeps `Retry-After` as its own
-polling hint for reconciliation and publication, falling back to an SDK default; the
-semantic models carry neither it nor `replayed`. Reconciliation's submit/poll step holds one monotonic
-deadline across submit and polling, honours cancellation, and on timeout names the
-`operation_id` — a timeout never cancels the accepted write. `IdempotencyKey` is a trait parameter, not a
-transport detail: the REST client sends it as the `Idempotency-Key` header, which the v2 route
-requires and which widens `toolkit-http`'s POST retry beyond its always-retry triggers such as `429`.
+Mutations return DESIGN's operation types **as read** through `get_operation` (D19).
+Receipts (`operation_id`, `status`, `replayed`) lack items even on terminal `200`
+replay, so adapters must not synthesize an empty successful operation. A failed
+read after acceptance names `operation_id`; retrying the same key replays.
+REST handles `Retry-After` with an SDK fallback; semantic models omit it and `replayed`.
+Reconciliation uses one monotonic submit/poll deadline, honours cancellation and names
+the operation on timeout; accepted writes continue. `IdempotencyKey` is a trait
+parameter sent as the required `Idempotency-Key` header, enabling `toolkit-http`
+POST retries beyond always-retry cases such as `429`.
 
 `BatchGetEntitiesRequest` carries one `Projection` for all keys, `ListEntitiesRequest` carries it for discovery,
 and the single-read extension helpers pass it to `batch_get_entities`. The SDK exposes typed
@@ -1468,40 +1444,33 @@ existing `EntityKind` vocabulary. Omitted fields mean no restriction, except `li
 which defaults to `Active`; the server
 applies the same filter before either projected items or cursors are produced (§10.2).
 
-**Reconciliation takes explicitly supplied desired documents (T24).** It batch-reads
-their identifiers with `content` selected, compares authored canonical bytes exactly (there is no
-content digest to shortcut it), supplies the read `resource_version` for
-updates, and returns `UpToDate` without submitting if nothing differs. Otherwise it submits
-bounded batches and polls to terminal outcomes, with bounded retries for missing dependencies
-and a deadline. One idempotency key covers retries of an identical submission and its polling;
-a new cycle — a re-read that changes candidates or preconditions — takes a new key (ADR-0012).
-`already_exists` and `precondition_failed` caused by a concurrent publisher of the same content
-lead to a re-read, not a failure. It never discovers inventory or deletes records absent from
-the supplied set. Its submit/poll step is crate-private; a caller that needs its own
-preconditions or key composes `register_entities` and `get_operation`, and a deletion is one
-`delete_entities` call. Until T41 a `superseded` or `publisher_mismatch` item is an ordinary
-`Rejected` outcome: the registry emits neither before T40, so the SDK carries no separate
-superseded outcome or liveness re-read yet.
+**Reconciliation (T24).** Batch-read explicit desired identifiers with `content`,
+compare canonical authored bytes (no digest), and use the observed `resource_version`
+for updates. Return `UpToDate` without submitting when all match; otherwise submit
+bounded batches and poll under a deadline, retrying missing dependencies.
+Identical submission/poll retries share a key; re-read cycles use new keys (ADR-0012).
+Concurrent `already_exists`/`precondition_failed` outcomes trigger re-reads. No inventory
+is discovered or omitted entity deleted. Submit/poll is crate-private; custom keys
+or preconditions use `register_entities` + `get_operation`, and deletion uses
+`delete_entities`. Until T41, `superseded`/`publisher_mismatch` map to `Rejected`:
+the registry emits them only from T40, so separate supersession/liveness handling
+is deferred.
 
-**Publication is reconciliation run for a gear (D16).** It is written in T29, with its first
-caller; until then the SDK carries no publisher, publication status or supervision. `publish_gts` matches the publisher
-signature `toolkit` defines (T29), so a gear's `gts(crates = …, publisher = …)` attribute can name
-it. It takes the `ClientHub` (from which it resolves `dyn PlatformTypesRegistryApi`), the
-publishing gear's name and version as text, captured in the publishing crate (D18) and parsed
-into a `PublisherContext` inside `publish_gts` (an invalid version settles every identifier as
-rejected), the documents
-gathered from the `gts_declarations()` of the crates the gear lists, and a cancellation token.
-It runs reconciliation in a supervised background task —
-never inside `init()`, where a remote client is not wired yet — with backoff across cycles, and
-returns a status handle: *pending*, *admitted*, *rejected* or *superseded*, with per-identifier
-reasons; *superseded*, with a liveness re-read, arrives in T41. The gear composes the handle
-into its readiness under its policy (D21). A permanently rejected or superseded candidate stops retrying; a new cycle never raises its own version or
-reads one from the registry. From T41 reconciliation **always submits**, equal documents
-included, so the registry sees and confirms a higher version (D18); the
-`UpToDate`/no-`POST` contract above holds only until then. Explicit registration callers and
-configuration-built Instances call the same helper directly from `post_wiring` in T35–T37,
-passing their own `PublisherContext`; a shared SDK helper forwards a context and never builds
-one. Gear names in diagnostics are not identity or authority.
+**Publication (D16, T29).** `publish_gts` matches toolkit's T29 publisher signature
+for `gts(crates = …, publisher = …)`; SDK publication, status and supervision are
+added in T29. It resolves `dyn PlatformTypesRegistryApi` from
+ClientHub and takes declarations from those crates, a cancellation token, and the
+publishing gear's name/version captured at the call site (D18). It parses
+`PublisherContext`; an invalid version rejects every identifier. Publication runs
+as supervised post-wiring work with backoff across cycles, since remote clients
+are unavailable in `init`. Its status handle reports
+pending/admitted/rejected/superseded with per-identifier reasons and
+contributes readiness (D21). Terminal rejected/superseded outcomes stop retrying;
+cycles never infer or raise the publisher version. T41 adds supersession liveness
+reads and makes reconciliation submit even equal documents to confirm versions;
+the no-POST `UpToDate` contract holds until then. T35–T37 explicit/configuration-built
+registrations use the same helper from `post_wiring`. Shared helpers forward the
+caller’s context; diagnostic gear names grant no authority.
 
 **Convenience read helpers are `PlatformTypesRegistryApiExt` methods** over `batch_get_entities` and
 `list_entities`, keeping the contract minimal and object-safe while preserving the call shapes

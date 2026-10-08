@@ -1062,11 +1062,10 @@ O5 (bootstrap publishers) remains assigned to T36; O6 is P1.
 
 ### P24. Platform-only is enforced on every host, the gateway included
 
-**Decision.** T25's `.platform_only()` was first built as P22/P23 specified: enforced on the
-gear's own listener only, and treated by api-gateway as a plain required bearer. That made the
-route's name promise more than Profile 1 delivered — any tenant bearer could mutate through the
-gateway (C8) until T48 refused it in the handler. T25 was reworked so the variant binds every
-host:
+**Decision.** T25 initially enforced `.platform_only()` only on the gear listener;
+api-gateway treated it as bearer-required. This let tenant bearers mutate through
+the gateway (C8) until T48's handler check. T25 was reworked to enforce platform
+authentication on every host:
 
 - api-gateway resolves a platform-only route to its own requirement: a presented bearer is
   validated but not required, and a gate shared with `oop_serve` (`caller_plane_middleware`)
@@ -1079,13 +1078,12 @@ host:
 - The either-plane axis was unchanged here, and P25 then removed it: a route serves one
   plane, and `.platform_only()` became `.platform_authenticated()`.
 
-**Consequences.** D20 and C6/C8 now read "a tenant bearer cannot mutate on any host". Profile 1
-e2e mutates through the gateway with a platform token, so `config/e2e-local.yaml` configures
-the gateway's `internal_auth: shared_secret` and the tests send `X-ToolKit-Internal-Token` —
-that lands with T26, which moves the registry's mutation routes onto the variant. The
-proxy still routes by path, not method: a platform-only method sharing a path with a published
-read is forwarded bearer-only and refused by the registry's listener; method-aware proxy routing
-is a separate follow-up.
+**Consequences.** D20/C6/C8 prohibit tenant-bearer mutations on every host. T26
+moves mutation routes and Profile 1 e2e callers together; `config/e2e-local.yaml` enables
+gateway `internal_auth: shared_secret`, and callers send `X-ToolKit-Internal-Token`.
+Proxy routing is still path-based: a platform method sharing a published read's
+path is forwarded bearer-only and refused at the registry. Method-aware proxying
+remains separate work.
 
 ### P25. One plane per route: a platform route set and a tenant read set
 
@@ -1105,22 +1103,19 @@ removed before any route used it.
   `/types-registry/v1/...` and can be exposed through the gateway like any tenant route. P0
   authenticates only; authorization arrives with the PDP (C6).
 
-**Why.** ADR-0008 gives a request exactly one plane, and toolkit's contract codegen already
-picks the plane per method from the context type. A route that admitted either plane needed a
-second extractor (`ValidatedCaller`), a gateway special case and a handler that did not know
-whose call it served. Two route sets cost duplicated read routes and a second SDK trait, and buy
-an unambiguous plane per handler, a registry listener whose platform half can later move to the
-separate platform listener ADR-0008 asks for (C8) without a path change, and tenant reads that
-work through the Profile 3 edge, which strips the internal token.
+**Why.** ADR-0008 assigns each request one plane; contract codegen already selects
+it from the context type. Either-plane routes required `ValidatedCaller`, gateway
+special handling and ambiguous handlers. Separate APIs add read routes and a trait,
+but give each handler one plane, support tenant reads through the token-stripping
+Profile 3 edge, and allow a future separate platform listener (C8) without path changes.
 
-**What T25 changed.** `.platform_authenticated()` replaces `.platform_only()`;
-`OperationSpec::auth_plane: AuthPlane { Tenant, Platform }` replaces `platform_plane`;
-`RouteAuth::Platform` and `platform_route_middleware` replace the either-plane variants, the
-gate and `ValidatedCaller`, and handlers read `Extension<PlatformSecurityContext>` or
-`Extension<SecurityContext>` directly. `#[toolkit::rest_contract]` now registers every
-`PlatformSecurityContext` method with `.platform_authenticated()` instead of `.anonymous()`,
-and refuses `#[anonymous]` on one; `authz-resolver`'s `evaluate` is the only such route today
-and moves from an unauthenticated route to a platform one.
+**T25 changes.** `.platform_authenticated()` replaces `.platform_only()`;
+`OperationSpec::auth_plane: AuthPlane { Tenant, Platform }` replaces `platform_plane`.
+`RouteAuth::Platform`, `platform_route_middleware` and direct context extensions
+replace either-plane variants, their gate and `ValidatedCaller`.
+`#[toolkit::rest_contract]` registers platform-context methods as platform-authenticated
+and rejects `#[anonymous]` on them. The only current method, authz-resolver's
+`evaluate`, moves from anonymous to platform authentication.
 
 **Paths through the cutover.** The legacy v1 routes hold `GET /types-registry/v1/entities` and
 `GET /types-registry/v1/entities/{gts_id}` until T30, so the tenant reads cannot take `/v1/`
@@ -1146,13 +1141,12 @@ it. The tenant reads are the three entity reads — exact, `batchGet` and discov
 
 ### P26. Both clients early, Account Management as the first real gear, a consolidated queue
 
-**Accepted 2026-10-07; consolidated the same day.** The first P26 draft split the remaining
-work into 39 micro-tasks (T26–T64) across Phases 7A, 7B, 8 and 9 with five internal
-checkpoints. It was too granular. This revision keeps its decisions and every acceptance
-criterion but regroups them into **17 feature-sized tasks, T26–T42, in three phases**,
-with Phases 1–6 as the granularity reference: a task is one verifiable feature outcome, and
-its technical steps are the commits it lists, not separate tasks. P26 supersedes P23's queue,
-not its correctness, authentication, cache, cutover or publisher-ordering guarantees.
+**Accepted 2026-10-07; consolidated the same day.** The 39-task draft (T26–T64,
+Phases 7A/7B/8/9, five internal checkpoints) was too granular. P26 groups it into
+**17 feature tasks, T26–T42, across three phases**, preserving every decision and
+acceptance criterion. As in Phases 1–6, each task delivers one verifiable outcome;
+technical steps are commits. P26 replaces P23's queue while retaining its correctness,
+authentication, cache, cutover and publisher-ordering guarantees.
 
 **Required P0 outcome.** Every gear uses the persistent registry; types-registry runs out of
 process; both the platform and the tenant API have usable local and REST clients early;
@@ -1174,61 +1168,53 @@ authentication prerequisites; mixed-version rollout support stays in P0 and come
 - **Phase 9 (T39–T42).** T39 publisher state, T40 commit-time ordering, T41 every writer sends
   and `publisher` is required, T42 the mixed-version proof → **Checkpoint 9**.
 
-**Why Account Management comes after the cutover, not before it.** AM's prerequisites —
-resource-group, authz-resolver, tenant-resolver, its IdP plugin — read the registry in the same
-host. Proving AM on the new client before T31 would mean either moving those gears one by one,
-with old and new traits serving one host (the shim P23 rejected), or AM writing the database
-while its peers read the in-memory catalogue. Neither preserves one data source. So T31 moves
-every gear, AM included, in one atomic step — AM's first use of the new client, exercised by
-its e2e suite at T32 — and AM is then the first gear to leave the startup barrier (T35) and to
-run against a registry in another process (T36), before the remaining fleet (T37). The
-pre-cutover client handoff runs on an isolated pilot instead (T30).
+**Why AM follows the cutover.** Its host prerequisites (resource-group,
+authz-resolver, tenant-resolver and IdP) also read the registry. Moving AM first
+would require a legacy shim or leave AM writing the database while peers read the
+in-memory catalogue. T31 therefore switches every gear atomically; T32 verifies
+AM's new client through e2e. AM then leaves the startup barrier in T35 and runs
+with a remote registry in T36, before the remaining fleet (T37). The isolated
+T30 pilot provides the earlier client handoff.
 
-**Isolation of the pilot.** The pilot registry owns a separate database and seeds only its
-control-plane and base types through the real outbox admission path; it does not link or pull
-consumer declarations. Both clients read the same database-backed service; the remote consumer
-has no local fallback. The existing embedded host stays on its legacy catalogue until T31. No
-dual-write, legacy shim, admission fork or production feature switch is introduced. It is a
-reusable development/integration composition, not a second registry implementation.
+**Pilot isolation.** Its registry uses a separate database and real outbox admission
+for control-plane/base types, without linking or pulling consumer declarations.
+Local and REST clients share the database service; remote consumers have no fallback.
+The embedded host retains the legacy catalogue until T31. The pilot reuses production
+code without dual writes, shims, admission forks or production feature switches.
 
-**Pilot build and CI.** A `publish = false` package
-`cf-gears-types-registry-pilot` (`testing/fixtures/types-registry-pilot/`) holds the feature-gated
-`pilot_registry` / `pilot_consumer` bins and the pilot test, all with
-`required-features = ["pilot-fixtures"]`; `CARGO_BIN_EXE_*` gives cargo/nextest reproducible
-paths. Bin imports are normal optional dependencies — bin targets cannot see dev-dependencies.
-The harness depends on gear crates (AM from T36); no gear crate depends on the harness and the
-registry never depends on AM, so no Cargo cycle forms and no fixture dependency enters a gear.
-`make test-types-registry-pilot` joins `make ci` and the CI workflow, so every checkpoint gate
-runs the pilot rather than silently skipping a feature-gated test.
+**Pilot build and CI.** The `publish = false` package `cf-gears-types-registry-pilot`
+(`testing/fixtures/types-registry-pilot/`) owns `pilot_registry`, `pilot_consumer` and
+the test, gated by `required-features = ["pilot-fixtures"]`. `CARGO_BIN_EXE_*` provides
+cargo/nextest paths. Bin imports use optional normal dependencies; dev-dependencies
+are unavailable to bins. Only the harness depends on gear crates (AM from T36);
+no gear depends on the harness, and the registry never depends on AM.
+`make test-types-registry-pilot` is included in `make ci` and the CI workflow so
+checkpoint gates run the pilot.
 
-**Topology and authentication.** The pilot has two application processes
-plus the master host's `DirectoryService`, an explicit prerequisite process. Until T36 its
-tenant plane uses an independent signed-token development authenticator, recorded as a
-development-only limitation. T27 decides the production linked/remote authn-resolver topology
-and records it in SPEC §8.4. T36 must run `AuthNResolverBearerAuthenticator` over the real
-authn-resolver, with its plugin published after wiring, for both the AM host and the remote
-registry's tenant plane; the pilot keeps authn-resolver out of the registry process so the
-registry still links no consumer. If production uses the linked topology, T38 verifies it
-once T37 has ended the pull. The development authenticator never satisfies Checkpoint 8A.
+**Topology and authentication.** The pilot runs registry and consumer application
+processes plus the master host's `DirectoryService`. Until T36 it uses an independent
+signed-token development authenticator. T27 records the production linked/remote
+topology in SPEC §8.4. T36 uses `AuthNResolverBearerAuthenticator` with the real
+authn-resolver and its post-wiring plugin for both AM and the remote registry's
+tenant plane. The pilot keeps authn-resolver outside the registry process; T38
+verifies a production linked topology after T37 ends the pull. Development auth
+never satisfies Checkpoint 8A.
 
-**Child tenant types.** Tenant create/read needs a non-root tenant type.
-AM owns its configured root type; a deployment's child tenant types stay registry-owned
-`cfg.entities`. A configured entity whose dependency is not in the registry's inline seed set
-cannot be seeded inline — the pilot's case now and every registry's after T37 — so T34 adds
-the D11 post-wiring path before AM's proof: types-registry publishes such an item after wiring
-with its own context, retrying until the dependency (AM's base type) is admitted; the registry's
-readiness does not wait for it, only its consumers do. T37's end of the pull reuses the path.
+**Child tenant types.** AM owns its configured root type; deployment-specific child
+types remain registry `cfg.entities`. T34 adds post-wiring publication for configured
+entities whose dependencies are outside the inline seed set, as in the pilot and
+all registries after T37. The registry publishes them with its own context and
+retries until dependencies such as AM's base type are admitted. Only consumers
+wait for these items; registry readiness does not. T37 reuses this path.
 
-**Root binding versus root-type refusal.** The root binding — the stored
-root's `tenant_type_uuid` against the configured root type, read from AM's own database — stays
-checked in `init` and lifecycle-fatal regardless of `bootstrap.strict`. A registry refusal of
-the configured root type happens after wiring, so it follows D21: AM stays not ready with a
-terminal status naming the identifier and reason, bootstrap does not run, and the process does
-not exit. A delayed registry only holds readiness and is never a saga failure. Business,
-database or IdP failures of the saga itself keep today's `bootstrap.strict` policy
-(`handle_bootstrap_failure`): fatal when strict, logged and skipped otherwise. Resource Group's `ResourceGroupTypeBootstrap`
-stays init-only, sealed and without REST: its type registration uses RG's own database, so it
-remains in AM's `init`.
+**Root binding and bootstrap failures.** AM's stored root `tenant_type_uuid` must
+match its configured type; this check stays lifecycle-fatal in `init`, regardless
+of `bootstrap.strict`. Post-wiring root-type refusal instead holds readiness,
+reports identifier/reason and prevents bootstrap without exiting (D21). A delayed
+registry holds readiness and is not a saga failure. Business, database and IdP
+saga failures retain `handle_bootstrap_failure`: fatal when strict, logged/skipped
+otherwise. RG's sealed, init-only `ResourceGroupTypeBootstrap` remains in AM's
+`init`, using RG's own database and exposing no REST surface.
 
 **e2e windows.** T26 and T27 move routes and their e2e callers in the same commit, so the
 async-surface suite stays green through Checkpoint 7A — the draft's T27–T32 route/auth red
@@ -1239,12 +1225,10 @@ API. The SDK's `PublisherContext` is required from T24, but adapters forward it 
 and the guard is required in T41. The early handoff promises no mixed-version mutation safety;
 final P0 deployment requires Checkpoint 9.
 
-**Not scheduled — optional later work, not approved here.** A generic multi-gear harness
-beyond the types-registry pilot; co-hosting the directory service inside the pilot consumer
-(allowed only after its lifecycle ordering is verified); method-aware gateway proxy routing
-(P24 follow-up); a toolkit-contract codegen extension that would replace the hand-written REST
-clients; a tenant-API client cache (P0 specifies none). The separate platform listener,
-authorization and workload-bound publisher identity remain P1.
+**Unscheduled work.** A generic multi-gear harness, directory co-hosting in the pilot
+consumer (requires verified lifecycle ordering), method-aware gateway proxying (P24), contract codegen
+for these REST clients, and a tenant client cache are not approved here. A separate
+platform listener, authorization and workload-bound publisher identity remain P1.
 
 **Renumbering.** Only unfinished tasks change IDs; completed evidence is preserved. A
 reference to the pre-P26 REST task (T26) means T26+T27; to the pre-P26 pilot (T35) means T30.
@@ -1272,23 +1256,18 @@ reference to the pre-P26 REST task (T26) means T26+T27; to the pre-P26 pilot (T3
 The draft's internal Checkpoints 7A.1–7A.5 are retired; Checkpoints 7A, 7, 8A, 8 and 9 remain,
 each with the full gate.
 
-**Planning horizon.** Later tasks keep full acceptance criteria now. Change the queue only for
-a demonstrated correctness, security or compatibility blocker, recording the invariant and the
-smallest affected task. Convenience refactors and new features do not expand a gate.
-*Amended by P27:* the queue may also be regrouped for review packaging when no criterion is
-dropped and no checkpoint gate moves, and an additive feature may enter a task's acceptance
-criteria only through a numbered plan decision that names it and leaves every checkpoint gate
-unchanged.
+**Planning horizon (amended by P27).** Keep later acceptance criteria complete.
+Queue changes require a demonstrated correctness, security or compatibility blocker,
+with its invariant and smallest affected task recorded, or review regrouping that
+preserves criteria and checkpoint gates. Additive features require a numbered plan
+decision and unchanged gates; convenience refactors do not expand them.
 
 ### P27. Every trait and local client in one pull request; T25 lands on its own
 
-**Accepted 2026-10-08.** A regrouping for review, not a correctness change: no acceptance
-criterion of P26 is dropped, and no checkpoint gate moves. It amends P26's planning horizon,
-which allowed queue changes only for a correctness, security or compatibility blocker and
-barred new features: P27 is neither, so the horizon now also admits review regrouping, and
-an additive feature named by a plan decision. This decision names exactly one —
-`TypesRegistryApiExt` in T24a. It extends T24a's acceptance criteria, not Checkpoint 7A or
-any later gate.
+**Accepted 2026-10-08.** P27 regroups work for review without dropping P26 criteria
+or moving checkpoint gates. It amends the planning horizon to allow such regrouping
+and additive features named in a plan decision. The sole addition is
+`TypesRegistryApiExt` in T24a; Checkpoint 7A and later gates stay unchanged.
 
 - **T25 is its own toolkit pull request.** The platform-authenticated axis touches only
   toolkit and api-gateway, and nothing before T26's route move uses it, so it is reviewed by

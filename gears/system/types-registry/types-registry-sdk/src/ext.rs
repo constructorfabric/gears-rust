@@ -1,6 +1,5 @@
-//! Helper methods over the two contracts (SPEC §10.1). They are not part of either
-//! contract's IR and need no registration: each trait is blanket-implemented, so
-//! importing it adds its methods to the client.
+//! Helpers over both contracts (SPEC §10.1), outside contract IR. Blanket
+//! implementations make the methods available by importing the extension trait.
 //!
 //! # Which one a client uses
 //!
@@ -20,10 +19,8 @@
 //!     .await?;
 //! ```
 //!
-//! A client that implements both contracts (the local client, the test fake) has each
-//! helper name twice once both traits are imported: call it through a typed trait object
-//! or with UFCS (`TypesRegistryApiExt::get_type_schema(&client, …)`). A `dyn` client
-//! implements one contract, so it never meets that ambiguity.
+//! With both traits imported, dual-contract clients have ambiguous helper names.
+//! Use a typed trait object or UFCS (`TypesRegistryApiExt::get_type_schema(&client, …)`).
 //!
 //! Identifier kind checks are local; a UUID of the other kind is `NotFound`.
 
@@ -70,18 +67,16 @@ pub const MAX_LIST_PAGES: usize = 1_000;
 /// them, including this trait's own `DeadlineExceeded` and `Cancelled`.
 #[async_trait]
 pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
-    /// Reconcile `desired` under `options` (SPEC §10.1): absent identifiers are submitted as
-    /// creations, differing ones as updates, so content drift is an update, not a conflict.
-    /// Safe to call on every start; it never deletes what `desired` omits.
+    /// Reconcile `desired` under `options` (SPEC §10.1): create absent identifiers and
+    /// update differing content. Safe on every start; omitted identifiers are never deleted.
     ///
-    /// [`Reconciliation::UpToDate`] means every document already matched and nothing was
-    /// submitted. `Ok(Reconciled(..))` does not mean the whole set was admitted: it may hold
-    /// `Rejected` (e.g. an incompatible Type Schema change) and `Pending` outcomes, including
-    /// those left when the deadline or the passes run out.
+    /// [`Reconciliation::UpToDate`] means all documents matched without submission.
+    /// `Ok(Reconciled(..))` may include `Rejected` (e.g. incompatible changes) or `Pending`
+    /// outcomes, including those left by deadline or pass exhaustion.
     ///
-    /// Cancellation or dropping the future loses in-flight keys while accepted writes
-    /// continue; a later call recovers through re-reads and preconditions. Prefer the token
-    /// and `options.deadline` to an outer timeout.
+    /// Cancellation or dropping loses in-flight keys; accepted writes continue. A later
+    /// call recovers through reads and preconditions. Prefer the token and `options.deadline`
+    /// over an outer timeout.
     ///
     /// # Errors
     /// `InvalidArgument` for an unrepresentable deadline, `Cancelled` on cancellation. Registry failures are per-identifier

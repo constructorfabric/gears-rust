@@ -8,10 +8,9 @@
 //!
 //! # Domain, not transport
 //!
-//! The page position is a stored `gts_id` — [`DiscoveryQuery::after`] — and the
-//! token is how the registry hands it out: which query it binds is a pagination rule,
-//! so it lives here and every adapter passes the token through as it is. Refusals are
-//! [`ServiceError`]s; the API ladder turns them into canonical errors.
+//! Tokens bind the stored `gts_id` position ([`DiscoveryQuery::after`]) to its query.
+//! Adapters pass them through unchanged; the API ladder maps [`ServiceError`] refusals
+//! to canonical errors.
 //!
 //! # What the cursor binds
 //!

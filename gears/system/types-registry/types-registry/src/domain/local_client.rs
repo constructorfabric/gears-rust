@@ -1,7 +1,7 @@
 //! In-process platform and tenant APIs over `RegistryService` (SPEC §10.1, D15, D17).
-//! Shares the cursor encoding and errors with REST; validators are the domain tokens. Outbox mutations read back accepted
-//! operations; failures return Aborted with `operation_id` for same-key replay (D19).
-//! Contexts stay unvalidated with no principal (C2); publisher reaches the service at T45/Phase 9.
+//! Shares REST cursors/errors and domain validator tokens. Mutations read back accepted
+//! operations; read failures return Aborted with `operation_id` for same-key replay (D19).
+//! Contexts are unvalidated and record no principal (C2); publisher forwarding is Phase 9.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -365,10 +365,9 @@ fn corrupt(
     CanonicalError::internal("the registry could not represent a stored value").create()
 }
 
-/// The condition an SDK validator states: the domain's token text, bounded like a key.
-/// Bytes that are not UTF-8 cannot be a token this registry issued, so the condition is
-/// unusable and the read proceeds unconditionally (DESIGN §3.3) — after the bound, so an
-/// oversized value is refused whatever it holds.
+/// SDK validator bytes become a domain token, bounded like a key. Oversized values
+/// are refused first; non-UTF-8 values cannot be issued tokens and cause an
+/// unconditional read (DESIGN §3.3).
 fn condition(validator: &sdk::Validator) -> Result<Option<IfNoneMatch>, CanonicalError> {
     let bytes = validator.as_bytes();
     if bytes.len() > MAX_KEY_LEN {
