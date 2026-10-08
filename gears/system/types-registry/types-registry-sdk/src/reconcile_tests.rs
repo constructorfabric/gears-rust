@@ -80,6 +80,22 @@ fn reason(outcome: &ReconcileOutcome) -> String {
         .map_or_else(|| format!("{error:?}"), |f| f.reason.as_wire().to_owned())
 }
 
+/// Waits, boundedly, for the spawned reconciliation's first submission; a task that ends
+/// before submitting fails the test instead of leaving it polling forever.
+async fn first_submission<T>(fake: &FakePlatformRegistry, task: &tokio::task::JoinHandle<T>) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while fake.submissions().is_empty() {
+            assert!(
+                !task.is_finished(),
+                "reconciliation ended before its first submission"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reconciliation submits within the bound");
+}
+
 fn keys(submissions: &[(IdempotencyKey, RegisterEntitiesRequest)]) -> Vec<String> {
     submissions
         .iter()
@@ -143,9 +159,7 @@ async fn a_dependency_published_later_is_picked_up_on_the_next_pass_under_a_new_
         let fake = Arc::clone(&fake);
         tokio::spawn(async move { run(&fake, desired).await })
     };
-    while fake.submissions().is_empty() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    first_submission(&fake, &task).await;
 
     fake.seed(BASE, json!({}));
 
@@ -488,9 +502,7 @@ async fn an_equal_identifier_changed_after_settling_is_not_reread_or_resubmitted
         let fake = Arc::clone(&fake);
         tokio::spawn(async move { run(&fake, desired).await })
     };
-    while fake.submissions().is_empty() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    first_submission(&fake, &task).await;
 
     fake.seed(A, json!({ "changed": "by someone else" }));
     fake.seed(BASE, json!({}));
@@ -855,4 +867,177 @@ async fn the_pause_between_passes_is_capped_and_an_oversized_initial_one_clamped
     let (elapsed, _) =
         time_pending_passes(2, Duration::from_secs(10), Duration::from_secs(1)).await;
     assert!(elapsed <= Duration::from_secs(1), "{elapsed:?}");
+}
+
+// ---- cancellation -----------------------------------------------------------
+
+/// A reconciliation the test can cancel, with a pause between passes long enough to land in.
+fn spawn_cancellable(
+    fake: &Arc<FakePlatformRegistry>,
+    desired: Vec<(String, Value)>,
+) -> (
+    CancellationToken,
+    tokio::task::JoinHandle<Result<Reconciliation, CanonicalError>>,
+) {
+    let cancel = CancellationToken::new();
+    let options = ReconcileOptions {
+        retry_backoff: Duration::from_secs(3600),
+        retry_backoff_max: Duration::from_secs(3600),
+        deadline: Duration::from_secs(36_000),
+        ..options()
+    };
+    let task = {
+        let (fake, cancel) = (Arc::clone(fake), cancel.clone());
+        tokio::spawn(async move {
+            reconcile(&*fake, &ctx(), &publisher(), &desired, &options, &cancel).await
+        })
+    };
+    (cancel, task)
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_a_blocked_read_ends_reconciliation_as_cancelled_without_submitting() {
+    let fake = Arc::new(FakePlatformRegistry::new());
+    fake.delay_reads(Duration::from_secs(3600));
+    let (cancel, task) = spawn_cancellable(&fake, vec![doc(A)]);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(fake.batch_reads(), 1, "the read has started and is blocked");
+
+    cancel.cancel();
+
+    let result = task.await.expect("joins");
+    assert!(
+        matches!(result, Err(CanonicalError::Cancelled { .. })),
+        "{result:?}"
+    );
+    assert!(fake.submissions().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_the_pause_between_passes_ends_reconciliation_without_another_submission() {
+    let fake = Arc::new(FakePlatformRegistry::new().completing_after(0));
+    let (cancel, task) = spawn_cancellable(
+        &fake,
+        vec![(A.to_owned(), json!({ "x-fake-depends-on": BASE }))],
+    );
+    first_submission(&fake, &task).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let reads = fake.batch_reads();
+
+    cancel.cancel();
+    // Would let a second pass through, had the pause not ended on cancellation.
+    fake.seed(BASE, json!({}));
+
+    let result = task.await.expect("joins");
+    assert!(
+        matches!(result, Err(CanonicalError::Cancelled { .. })),
+        "{result:?}"
+    );
+    assert_eq!(
+        fake.submissions().len(),
+        1,
+        "no pass after the cancellation"
+    );
+    assert_eq!(fake.batch_reads(), reads, "nor its read");
+}
+
+// ---- exactly one outcome per candidate --------------------------------------
+
+mod cover {
+    use gts::GtsId;
+
+    use super::*;
+    use crate::models::{CandidateStatus, RegisterItem, RegistrationItemResult};
+    use crate::reconcile::cover;
+
+    fn candidate(id: &str) -> RegisterItem {
+        RegisterItem {
+            gts_id: GtsId::try_new(id).expect("valid identifier"),
+            content: json!({}),
+            expected_resource_version: None,
+            force: false,
+        }
+    }
+
+    fn succeeded(id: &str) -> RegistrationItemResult {
+        RegistrationItemResult {
+            gts_id: GtsId::try_new(id).expect("valid identifier"),
+            status: CandidateStatus::Succeeded,
+            resource_version: Some(1),
+            error: None,
+        }
+    }
+
+    fn outcome_of(decided: &[(GtsId, ReconcileOutcome)], id: &str) -> ReconcileOutcome {
+        decided
+            .iter()
+            .find(|(gts_id, _)| gts_id.id() == id)
+            .map(|(_, outcome)| outcome.clone())
+            .expect("every submitted candidate has an outcome")
+    }
+
+    #[test]
+    fn a_candidate_reported_twice_stays_pending_and_its_neighbour_settles() {
+        let decided = cover(
+            &[candidate(A), candidate(B)],
+            vec![succeeded(A), succeeded(A), succeeded(B)],
+        );
+
+        assert_eq!(decided.len(), 2);
+        assert!(
+            matches!(
+                outcome_of(&decided, A),
+                ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(_))
+            ),
+            "a duplicate report is not an admission"
+        );
+        assert!(matches!(
+            outcome_of(&decided, B),
+            ReconcileOutcome::Admitted
+        ));
+    }
+
+    #[test]
+    fn an_unrequested_report_is_ignored_and_settles_nothing() {
+        let decided = cover(
+            &[candidate(A), candidate(B)],
+            vec![succeeded(B), succeeded(C)],
+        );
+
+        assert_eq!(
+            decided.iter().map(|(id, _)| id.id()).collect::<Vec<_>>(),
+            [A, B],
+            "only the submitted candidates, each once"
+        );
+        assert!(matches!(
+            outcome_of(&decided, A),
+            ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(_))
+        ));
+        assert!(matches!(
+            outcome_of(&decided, B),
+            ReconcileOutcome::Admitted
+        ));
+    }
+}
+
+#[test]
+fn revalidation_exhaustion_is_a_conflict_the_next_pass_retries() {
+    use crate::item_failure::AdmissionFailureReason;
+    use crate::models::CandidateStatus;
+
+    let error = AdmissionFailure::new(
+        AdmissionFailureReason::RevalidationExhausted,
+        "concurrent writers kept moving the dependency vector",
+    )
+    .into_canonical(A);
+
+    let outcome = super::classify(CandidateStatus::Failed, Some(error));
+
+    assert!(
+        matches!(
+            outcome,
+            ReconcileOutcome::Pending(ReconcilePendingCause::Conflict(_))
+        ),
+        "{outcome:?}"
+    );
 }

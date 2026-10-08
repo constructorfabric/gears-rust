@@ -122,3 +122,95 @@ fn a_typed_selection_is_the_one_its_field_names_parse_to() {
         assert_eq!(typed.canonical(), parsed.canonical(), "{projection:?}");
     }
 }
+
+mod item_failures {
+    use sdk::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason, context};
+
+    use super::super::item_parts;
+    use super::*;
+    use crate::domain::admission::{StoredFailure, UnreadableFailure};
+    use crate::domain::enums::OperationItemStatus;
+    use crate::domain::key::EntityKey;
+    use crate::domain::registry_service::OperationItemRecord;
+
+    const ID: &str = "gts.cf.core.events.test.v1~";
+
+    fn stored(reason: &str) -> StoredFailure {
+        StoredFailure {
+            reason: reason.to_owned(),
+            message: "refused".to_owned(),
+            dependency_id: None,
+            dependency_kind: None,
+            error_code: None,
+            operation_id: None,
+        }
+    }
+
+    /// Through the adapter and back: what an SDK caller decodes from the item error.
+    fn decoded(failure: Result<StoredFailure, UnreadableFailure>) -> AdmissionFailure {
+        let item = OperationItemRecord {
+            key: EntityKey::GtsId(ID.to_owned()),
+            status: OperationItemStatus::Failed,
+            resource_version: None,
+            error: Some(failure),
+        };
+        let (_, _, _, error) = item_parts(item, Uuid::from_u128(1)).expect("representable");
+        AdmissionFailure::from_canonical(&error.expect("a failed item carries its error"))
+            .expect("an admission failure")
+    }
+
+    #[test]
+    fn a_stored_failure_forwards_its_reason_message_and_every_context_entry() {
+        let failure = decoded(Ok(StoredFailure {
+            dependency_id: Some("gts.cf.core.events.base.v1~".to_owned()),
+            dependency_kind: Some("type_schema".to_owned()),
+            error_code: Some("storage_timeout".to_owned()),
+            ..stored(Reason::DependencyNotFound.as_wire())
+        }));
+
+        assert_eq!(failure.reason, Reason::DependencyNotFound);
+        assert_eq!(failure.message, "refused");
+        assert_eq!(
+            failure.context(context::DEPENDENCY_ID),
+            Some("gts.cf.core.events.base.v1~")
+        );
+        assert_eq!(
+            failure.context(context::DEPENDENCY_KIND),
+            Some("type_schema")
+        );
+        assert_eq!(
+            failure.context(context::DIAGNOSTIC_CODE),
+            Some("storage_timeout")
+        );
+    }
+
+    #[test]
+    fn absent_context_is_not_invented() {
+        let failure = decoded(Ok(stored(Reason::PreconditionFailed.as_wire())));
+
+        assert_eq!(failure.reason, Reason::PreconditionFailed);
+        assert!(failure.context.is_empty(), "{:?}", failure.context);
+    }
+
+    #[test]
+    fn a_reason_this_build_does_not_know_survives_as_written() {
+        let failure = decoded(Ok(stored("added_by_a_newer_writer")));
+
+        assert_eq!(
+            failure.reason,
+            Reason::Unknown("added_by_a_newer_writer".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_unreadable_record_discloses_only_its_reason() {
+        let failure = decoded(Err(UnreadableFailure {
+            reason: Reason::UnparsablePayload,
+            cause: "expected value at line 1 column 1: {\"secret\"".to_owned(),
+        }));
+
+        assert_eq!(failure.reason, Reason::UnparsablePayload);
+        assert_eq!(failure.message, "the recorded failure could not be read");
+        assert!(failure.context.is_empty(), "{:?}", failure.context);
+    }
+}

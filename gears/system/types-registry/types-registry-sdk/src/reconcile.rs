@@ -611,13 +611,42 @@ fn classify(status: CandidateStatus, error: Option<CanonicalError>) -> Reconcile
                 | Reason::MissingPredecessor => {
                     ReconcileOutcome::Pending(ReconcilePendingCause::Dependency(error))
                 }
-                Reason::AlreadyExists | Reason::PreconditionFailed => {
+                // Revalidation exhaustion is contention with concurrent writers, not a verdict
+                // on the document (SPEC §8.4): the next pass re-reads and resubmits.
+                Reason::AlreadyExists | Reason::PreconditionFailed | Reason::RevalidationExhausted => {
                     ReconcileOutcome::Pending(ReconcilePendingCause::Conflict(error))
                 }
                 Reason::SystemFailure => {
                     ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(error))
                 }
-                _ => ReconcileOutcome::Rejected(error),
+                Reason::ActivationWriteSetExceeded
+                | Reason::BaselineUnresolvable
+                | Reason::CompatibilityUndecidable
+                | Reason::DependencyDeleted
+                | Reason::DependentInvalid
+                | Reason::DialectChanged
+                | Reason::EntityDeleted
+                | Reason::FamilyKindConflict
+                | Reason::HasRegisteredDependents
+                | Reason::FamilyShapeConflict
+                | Reason::IncompatibleWithBaseline
+                | Reason::InstanceOfMajorZero
+                | Reason::InvalidDocument
+                | Reason::InvalidIdentifier
+                | Reason::InvalidSchema
+                | Reason::InvalidValue
+                | Reason::NotActive
+                | Reason::PublisherMismatch
+                | Reason::ResolutionClosureExceeded
+                | Reason::ResolvedDocumentTooLarge
+                | Reason::StableDerivesFromMajorZero
+                | Reason::StableRefsMajorZero
+                | Reason::Superseded
+                | Reason::UnparsablePayload
+                | Reason::UnreadableVersion
+                | Reason::UnrecognizedPayload
+                // A reason this build does not know is not retried on a guess.
+                | Reason::Unknown(_) => ReconcileOutcome::Rejected(error),
             }
         }
     }

@@ -1,4 +1,8 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "integration tests: a failed fixture or assertion step is a test failure"
+)]
 //! The local tenant API (SPEC §10.1, D17): the platform's reads under a tenant context.
 //!
 //! Every answer is compared with the platform answer to the same request on the same

@@ -1,4 +1,8 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "integration tests: a failed fixture or assertion step is a test failure"
+)]
 //! Real local platform API and database/outbox admission (SPEC §10.1, D15, D19).
 
 use std::sync::Arc;

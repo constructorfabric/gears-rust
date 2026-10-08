@@ -174,6 +174,31 @@ impl DomainError {
     }
 }
 
+/// What only the local client refuses: after an accepted submit (D19), and where an SDK
+/// value cannot reach the service. The API ladder writes each one's wire form.
+#[domain_model]
+#[derive(Error, Debug)]
+pub enum LocalClientError {
+    /// The submit was accepted, but its operation could not be read back.
+    #[error("operation {operation_id} was accepted, but {why}")]
+    ReadBackFailed {
+        operation_id: uuid::Uuid,
+        why: &'static str,
+    },
+    /// The read-back operation is of the other kind.
+    #[error("operation {operation_id} was read back as an operation of the other kind")]
+    WrongKind { operation_id: uuid::Uuid },
+    /// The read-back operation has no SDK representation.
+    #[error("operation {operation_id} could not be represented")]
+    Unrepresentable { operation_id: uuid::Uuid },
+    /// No operation has this id.
+    #[error("no operation with id {operation_id}")]
+    OperationNotFound { operation_id: uuid::Uuid },
+    /// An `expected_resource_version` above any version the registry issues.
+    #[error("{version} is not a resource version this registry issues")]
+    VersionOutOfRange { key: String, version: u64 },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

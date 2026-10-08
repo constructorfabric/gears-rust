@@ -7,7 +7,7 @@ use types_registry_sdk::{field, precondition, reason};
 use crate::domain::admission::acceptance::{AcceptanceError, MAX_IDEMPOTENCY_KEY};
 use crate::domain::admission::worker::WorkerError;
 use crate::domain::error::DomainError;
-use crate::domain::local_client::LocalClientError;
+use crate::domain::error::LocalClientError;
 use crate::domain::registry_service::{MAX_BATCH_GET_KEYS, MAX_KEY_LEN, ServiceError};
 use crate::domain::selection::{EntityField, SelectionError};
 

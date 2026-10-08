@@ -26,6 +26,7 @@ use crate::domain::enums::{
     EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus, OperationKind,
     OperationStatus,
 };
+use crate::domain::error::LocalClientError;
 use crate::domain::key::EntityKey;
 use crate::domain::registry_service::{
     BatchGetItem, DiscoveryQuery, EntityLookup, EntityRecord, MAX_KEY_LEN, OperationItemRecord,
@@ -57,9 +58,14 @@ impl LocalClient {
             Ok(Some(record)) => Ok(record),
             Ok(None) => Err(read_back_failed(operation_id, "it could not be found")),
             Err(e) => {
+                let cause = e.cause_kind();
+                // The ladder logs the underlying failure, redacted as for any request; the
+                // caller still gets the operation-scoped Aborted.
+                let error = CanonicalError::from(e);
                 tracing::warn!(
                     %operation_id,
-                    cause = e.cause_kind(),
+                    cause,
+                    %error,
                     "types_registry could not read back an accepted operation"
                 );
                 Err(read_back_failed(operation_id, "the read failed"))
@@ -93,7 +99,7 @@ impl LocalClient {
             .await
             .map_err(CanonicalError::from)?;
 
-        let mut lookups = HashMap::with_capacity(results.len());
+        let mut answered = Vec::with_capacity(results.len());
         for (key, lookup) in results {
             let Some(asked_key) = asked.remove(&key) else {
                 tracing::error!(unexpected_key = ?key, "types_registry batch read answered a key it was not asked");
@@ -102,8 +108,15 @@ impl LocalClient {
                 )
                 .create());
             };
-            lookups.insert(asked_key, lookup_from(lookup)?);
+            answered.push((asked_key, lookup));
         }
+        let lookups = convert(selection, answered, |answered| {
+            answered
+                .into_iter()
+                .map(|(key, lookup)| Ok((key, lookup_from(lookup)?)))
+                .collect::<Result<HashMap<_, _>, CanonicalError>>()
+        })
+        .await?;
         Ok(sdk::BatchGetEntitiesResponse(lookups))
     }
 
@@ -139,15 +152,31 @@ impl LocalClient {
             .map(|after| cursor::encode(after, &Binding::from(&discovery)))
             .transpose()?
             .map(sdk::Cursor::from_token);
-        Ok(sdk::ListEntitiesResponse {
-            items: page
-                .items
-                .into_iter()
-                .map(snapshot_from)
-                .collect::<Result<_, _>>()?,
-            next,
+        let items = convert(discovery.selection, page.items, |records| {
+            records.into_iter().map(snapshot_from).collect()
         })
+        .await?;
+        Ok(sdk::ListEntitiesResponse { items, next })
     }
+}
+
+/// Selected documents are reparsed into JSON trees, which is as heavy as the service's own
+/// row conversion, so it leaves the executor the same way; document-free answers stay inline.
+async fn convert<T, R>(
+    selection: FieldSelection,
+    input: T,
+    to_sdk: impl FnOnce(T) -> Result<R, CanonicalError> + Send + 'static,
+) -> Result<R, CanonicalError>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+{
+    if !selection.selects_any_document() {
+        return to_sdk(input);
+    }
+    tokio::task::spawn_blocking(move || to_sdk(input))
+        .await
+        .map_err(|e| CanonicalError::from(ServiceError::Blocking(e)))?
 }
 
 #[async_trait]
@@ -303,31 +332,6 @@ impl TypesRegistryApi for LocalClient {
 }
 
 // ---- errors -----------------------------------------------------------------
-
-/// What only the local client refuses: after an accepted submit (D19), and where an SDK
-/// value cannot reach the service. The API ladder writes each one's wire form.
-#[domain_model]
-#[derive(Debug, thiserror::Error)]
-pub enum LocalClientError {
-    /// The submit was accepted, but its operation could not be read back.
-    #[error("operation {operation_id} was accepted, but {why}")]
-    ReadBackFailed {
-        operation_id: Uuid,
-        why: &'static str,
-    },
-    /// The read-back operation is of the other kind.
-    #[error("operation {operation_id} was read back as an operation of the other kind")]
-    WrongKind { operation_id: Uuid },
-    /// The read-back operation has no SDK representation.
-    #[error("operation {operation_id} could not be represented")]
-    Unrepresentable { operation_id: Uuid },
-    /// No operation has this id.
-    #[error("no operation with id {operation_id}")]
-    OperationNotFound { operation_id: Uuid },
-    /// An `expected_resource_version` above any version the registry issues.
-    #[error("{version} is not a resource version this registry issues")]
-    VersionOutOfRange { key: String, version: u64 },
-}
 
 /// Aborted read-back after acceptance; names the operation for same-key replay.
 fn read_back_failed(operation_id: Uuid, why: &'static str) -> CanonicalError {
