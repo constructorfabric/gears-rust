@@ -46,7 +46,7 @@ inventory = { workspace = true }
 serde = { workspace = true }
 utoipa = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 aws-lc-rs = { workspace = true }

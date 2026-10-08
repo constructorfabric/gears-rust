@@ -21,8 +21,8 @@
 pub mod api;
 pub mod gts;
 pub mod models;
-pub mod reason;
 pub mod person_types;
+pub mod reason;
 
 pub use api::ConstructClientV1;
 pub use models::RecordOutcome;
