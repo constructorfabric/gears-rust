@@ -87,7 +87,8 @@ payload, because the fact carries its own origin.
    names the fact. It is the plain key the model writes (`cpt-cf-construct-principle-model-never-sees-ids`) -
    `inst-fact-property`
 3. [ ] - `p1` - A property whose value is an object (an entry such as a job or a skill) carries the fact's fields. A
-   plan step that changes one property changes one field of that object - `inst-fact-fields`
+   plan step adds, replaces or removes the whole value: a change to one field is a replace of the fact -
+   `inst-fact-fields`
 4. [ ] - `p1` - The payload is closed: an unknown property is refused, and a new property is a backward-compatible
    change of the type - `inst-fact-closed`
 
