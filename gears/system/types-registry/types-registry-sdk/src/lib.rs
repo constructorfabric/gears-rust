@@ -12,8 +12,8 @@
 //! - [`models`] — the serde-free request, entity and operation models: [`Entity`] as the
 //!   contract carries it, and the kind-typed [`TypeSchema`] / [`Instance`] the read helpers
 //!   return
-//! - [`publication`] — per-gear publication: [`publish_gts`], [`reconcile()`], the
-//!   publication status and its supervised task
+//! - [`PlatformTypesRegistryApiExt::reconcile_entities_and_await`] — bring the registry to
+//!   explicitly supplied documents; [`Reconciliation`] and [`ReconcileOutcome`] report it
 //!
 //! **Old surface** (`legacy`, deleted in T31 with no shim; re-exported at the crate root):
 //! - `TypesRegistryClient` trait for inter-gear communication. Per
@@ -56,8 +56,8 @@ pub mod gts;
 pub mod item_failure;
 pub mod models;
 pub mod precondition;
-pub mod publication;
 pub mod reason;
+mod reconcile;
 
 /// An in-memory `PlatformTypesRegistryApi` for consumer and SDK tests.
 #[cfg(any(test, feature = "test-util"))]
@@ -78,18 +78,10 @@ pub use models::{
     EntityFilter, EntityKey, EntityKind, EntityLookup, FieldSelection, IdempotencyKey, Instance,
     JsonDocument, LifecycleFilter, LifecycleStatus, ListEntitiesRequest, ListEntitiesResponse,
     Operation, OperationStatus, Origin, PageRequest, Projection, Provenance, PublisherContext,
-    PublisherVersion, RegisterEntitiesRequest, RegisterItem, RegistrationItemResult,
-    RegistrationOperation, TypeSchema, Validator,
+    PublisherVersion, PublisherVersionError, RegisterEntitiesRequest, RegisterItem,
+    RegistrationItemResult, RegistrationOperation, TypeSchema, Validator,
 };
-pub use publication::publish::{PublishOptions, publish_gts, publish_gts_with};
-pub use publication::reconcile::{
-    Liveness, Outcome, PendingCause, ReconcileOptions, Reconciliation, reconcile,
-};
-pub use publication::supervised::{Supervised, SupervisedStatus, TaskExit};
-pub use publication::{
-    GtsDeclaration, PendingReason, PublicationState, PublicationStatus, PublisherVersionError,
-    RejectionReason, SupersededEntity,
-};
+pub use reconcile::{ReconcileOptions, ReconcileOutcome, ReconcilePendingCause, Reconciliation};
 
 // The old surface, deleted in T31 (see `legacy`). Re-exported at the crate root and, for
 // its mock, at `testing`.

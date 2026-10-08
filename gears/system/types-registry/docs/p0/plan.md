@@ -1373,9 +1373,9 @@ T6 config ───────────────────────�
                    │
         ─── Phase 7: both clients, isolated handoff, persistent registry (P26) ───
                    │
-        T23 publisher status/version/supervision (complete)
+        T23 publisher version (complete; status/supervision moved to T29)
                    ▼
-        T24 platform contract + local + reconciliation/publication (complete)
+        T24 platform contract + local + reconciliation (complete; publish_gts moved to T29)
                    ▼
         T24a tenant contract + TypesRegistryApiExt + tenant local client (P27)
                    ▼
@@ -1492,8 +1492,8 @@ exists. From T7 onward the graph is vertical.
 **Checkpoint 6**
 
 ### Phase 7 — Both clients, an isolated handoff, and every gear on the persistent registry
-- T23: Toolkit — publisher signature and publication status (complete)
-- T24: `PlatformTypesRegistryApi` contract, models, local client, reconciliation and publication (complete)
+- T23: Toolkit — publisher signature and publication status (complete; the unused status and supervision were removed, T29 writes them)
+- T24: `PlatformTypesRegistryApi` contract, models, local client, reconciliation and publication (complete; the unused `publish_gts` was removed, T29 writes it)
 - T24a: `TypesRegistryApi` tenant contract, its extension helpers and local client
 - T25: Toolkit — a platform-authenticated auth axis; one plane per route (own pull request; open until merged)
 - T26: Platform API over REST
@@ -1647,7 +1647,7 @@ survives (T32, P12).** All 20 success criteria of SPEC §16; `make ci`,
 | 0.12.0 semantics reject a currently-admitted schema in another gear | **High** — breaks unrelated gears | T1 is first and is its own commit; full re-validation sweep before any registry code |
 | Database bootstrap regresses platform boot or exceeds admission limits | **High** — all linked declarations seed before consumers initialize | T31 tests the combined inventory + configuration set, dependency ordering, repeat startup and limit refusal; keep one bounded batch and verify quickstart/e2e configurations (P18) |
 | Removing the old trait breaks ~50 call sites in 20+ gears | **High** | Split by gear group; new trait exists and is tested (T24) before the first consumer moves; `cargo test --workspace` gates each migration task |
-| An existing explicit registrant fails during startup | Medium | Registration leaves `init()`: T24's `publish_gts` runs after wiring with bounded retries per cycle and backoff across them, and the gear reports not ready — naming the identifier and reason — instead of failing boot (P22) |
+| An existing explicit registrant fails during startup | Medium | Registration leaves `init()`: T29's `publish_gts` runs after wiring with bounded retries per cycle and backoff across them, and the gear reports not ready — naming the identifier and reason — instead of failing boot (P22) |
 | A consumer calls the registry from `init()` — registration **or** a read | **High** — works in Profile 1, fails out of process because the remote client is wired after every `init` | T31 audits every init-time call site, not only the ~13 `register` sites; T35–T37 move each to the post-wiring hook or a lazy first use. T36 and T38 run with types-registry in another process which is what makes a missed site fail |
 | A startup phase after `init` depends on the old barrier — oagw's `post_init` → tenant-resolver plugin selection, account-management's bootstrap | **High** — boot race in Profile 1 once configuration-built plugin instances publish after wiring; boot failure out of process | T31's audit lists every registry-dependent step in `post_init`, `start`, sagas and first plugin selection; T35–T37 move each to a supervised task that waits for its prerequisite; T34 stops `GtsPluginSelector` caching while an instance of the same contract and vendor is invisible (D21) |
 | An older release rewrites what a newer one published — rollback, restart or a delayed outbox operation | **High** once every gear publishes at startup | Per-entity publisher stamp checked at commit before the precondition (D18, T40); tests cover delayed operations and partial admission (T42) |

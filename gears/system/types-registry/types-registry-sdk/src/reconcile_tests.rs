@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 
-use super::{Liveness, Outcome, PendingCause, ReconcileOptions, Reconciliation, reconcile};
+use super::{ReconcileOptions, ReconcileOutcome, ReconcilePendingCause, Reconciliation, reconcile};
 use crate::item_failure::AdmissionFailure;
 use crate::models::{IdempotencyKey, PublisherContext, RegisterEntitiesRequest};
 use crate::testing_platform::{FakePlatformRegistry, ReadFault};
@@ -58,24 +58,23 @@ async fn run_with(
     .expect("reconciles")
 }
 
-fn outcomes(result: Reconciliation) -> BTreeMap<String, Outcome> {
+fn outcomes(result: Reconciliation) -> BTreeMap<String, ReconcileOutcome> {
     match result {
         Reconciliation::Reconciled(outcomes) => outcomes,
         Reconciliation::UpToDate => panic!("expected outcomes, got UpToDate"),
     }
 }
 
-fn reason(outcome: &Outcome) -> String {
+fn reason(outcome: &ReconcileOutcome) -> String {
     let error = match outcome {
-        Outcome::Rejected(e)
-        | Outcome::Superseded { error: e, .. }
-        | Outcome::Pending(
-            PendingCause::Dependency(e)
-            | PendingCause::Conflict(e)
-            | PendingCause::Unavailable(e)
-            | PendingCause::Refused(e),
+        ReconcileOutcome::Rejected(e)
+        | ReconcileOutcome::Pending(
+            ReconcilePendingCause::Dependency(e)
+            | ReconcilePendingCause::Conflict(e)
+            | ReconcilePendingCause::Unavailable(e)
+            | ReconcilePendingCause::Refused(e),
         ) => e,
-        Outcome::Admitted => return "admitted".to_owned(),
+        ReconcileOutcome::Admitted => return "admitted".to_owned(),
     };
     AdmissionFailure::from_canonical(error)
         .map_or_else(|| format!("{error:?}"), |f| f.reason.as_wire().to_owned())
@@ -107,7 +106,7 @@ async fn only_supplied_documents_are_reconciled() {
 
     let outcomes = outcomes(run(&fake, vec![doc(A)]).await);
 
-    assert!(matches!(outcomes[A], Outcome::Admitted));
+    assert!(matches!(outcomes[A], ReconcileOutcome::Admitted));
     assert_eq!(outcomes.len(), 1);
     let submitted: Vec<String> = fake
         .submissions()
@@ -129,7 +128,7 @@ async fn an_update_carries_the_read_version_and_the_callers_publisher() {
 
     let outcomes = outcomes(run(&fake, vec![doc(A)]).await);
 
-    assert!(matches!(outcomes[A], Outcome::Admitted));
+    assert!(matches!(outcomes[A], ReconcileOutcome::Admitted));
     let submissions = fake.submissions();
     assert_eq!(submissions[0].1.items[0].expected_resource_version, Some(1));
     assert_eq!(submissions[0].1.publisher, publisher());
@@ -152,7 +151,7 @@ async fn a_dependency_published_later_is_picked_up_on_the_next_pass_under_a_new_
 
     let outcomes = outcomes(task.await.expect("joins"));
     assert!(
-        matches!(outcomes[A], Outcome::Admitted),
+        matches!(outcomes[A], ReconcileOutcome::Admitted),
         "{:?}",
         outcomes[A]
     );
@@ -170,7 +169,7 @@ async fn a_concurrent_publisher_of_identical_content_ends_admitted_through_a_re_
     let outcomes = outcomes(run(&fake, vec![(id, content)]).await);
 
     assert!(
-        matches!(outcomes[A], Outcome::Admitted),
+        matches!(outcomes[A], ReconcileOutcome::Admitted),
         "{:?}",
         outcomes[A]
     );
@@ -188,7 +187,7 @@ async fn two_publishers_of_identical_content_both_end_admitted() {
             Reconciliation::UpToDate => {}
             Reconciliation::Reconciled(outcomes) => {
                 assert!(
-                    matches!(outcomes[A], Outcome::Admitted),
+                    matches!(outcomes[A], ReconcileOutcome::Admitted),
                     "{:?}",
                     outcomes[A]
                 );
@@ -206,7 +205,7 @@ async fn a_conflict_re_reads_and_retries_with_the_new_precondition_and_a_new_key
     let outcomes = outcomes(run(&fake, vec![doc(A)]).await);
 
     assert!(
-        matches!(outcomes[A], Outcome::Admitted),
+        matches!(outcomes[A], ReconcileOutcome::Admitted),
         "{:?}",
         outcomes[A]
     );
@@ -225,7 +224,7 @@ async fn a_lost_receipt_is_recovered_under_the_same_key_and_request() {
     let outcomes = outcomes(run(&fake, vec![doc(A)]).await);
 
     assert!(
-        matches!(outcomes[A], Outcome::Admitted),
+        matches!(outcomes[A], ReconcileOutcome::Admitted),
         "{:?}",
         outcomes[A]
     );
@@ -253,7 +252,7 @@ async fn a_permanently_invalid_document_is_rejected_and_not_retried() {
         .await,
     );
 
-    assert!(matches!(outcomes[A], Outcome::Rejected(_)));
+    assert!(matches!(outcomes[A], ReconcileOutcome::Rejected(_)));
     assert_eq!(reason(&outcomes[A]), "invalid_schema");
     assert_eq!(fake.submissions().len(), 1);
 }
@@ -268,7 +267,11 @@ async fn a_synchronously_refused_batch_is_bisected_and_every_payload_has_its_own
     let outcomes = outcomes(run(&fake, desired).await);
 
     assert_eq!(outcomes.len(), 5);
-    assert!(outcomes.values().all(|o| matches!(o, Outcome::Admitted)));
+    assert!(
+        outcomes
+            .values()
+            .all(|o| matches!(o, ReconcileOutcome::Admitted))
+    );
     let mut by_key: BTreeMap<String, Vec<RegisterEntitiesRequest>> = BTreeMap::new();
     for (key, request) in fake.submissions() {
         by_key
@@ -323,10 +326,10 @@ async fn later_batches_proceed_when_an_earlier_one_waits_on_a_dependency() {
         .await,
     );
 
-    assert!(matches!(outcomes[B], Outcome::Admitted));
+    assert!(matches!(outcomes[B], ReconcileOutcome::Admitted));
     assert!(matches!(
         outcomes[A],
-        Outcome::Pending(PendingCause::Dependency(_))
+        ReconcileOutcome::Pending(ReconcilePendingCause::Dependency(_))
     ));
     assert_eq!(reason(&outcomes[A]), "dependency_not_found");
 }
@@ -337,7 +340,10 @@ async fn invalid_input_alone_is_reported_not_up_to_date() {
 
     let outcomes = outcomes(run(&fake, vec![("not-an-id".to_owned(), json!({}))]).await);
 
-    assert!(matches!(outcomes["not-an-id"], Outcome::Rejected(_)));
+    assert!(matches!(
+        outcomes["not-an-id"],
+        ReconcileOutcome::Rejected(_)
+    ));
     assert!(fake.submissions().is_empty());
 }
 
@@ -355,8 +361,11 @@ async fn an_equal_document_beside_a_rejected_one_is_reported_with_it() {
         .await,
     );
 
-    assert!(matches!(outcomes[A], Outcome::Admitted));
-    assert!(matches!(outcomes["not-an-id"], Outcome::Rejected(_)));
+    assert!(matches!(outcomes[A], ReconcileOutcome::Admitted));
+    assert!(matches!(
+        outcomes["not-an-id"],
+        ReconcileOutcome::Rejected(_)
+    ));
 }
 
 #[tokio::test]
@@ -376,8 +385,8 @@ async fn an_identifier_declared_twice_differently_is_rejected_and_identical_twin
         .await,
     );
 
-    assert!(matches!(outcomes[A], Outcome::Rejected(_)));
-    assert!(matches!(outcomes[B], Outcome::Admitted));
+    assert!(matches!(outcomes[A], ReconcileOutcome::Rejected(_)));
+    assert!(matches!(outcomes[B], ReconcileOutcome::Admitted));
     let submitted: usize = fake.submissions().iter().map(|(_, r)| r.items.len()).sum();
     assert_eq!(submitted, 1);
 }
@@ -389,47 +398,6 @@ async fn nothing_desired_is_up_to_date() {
         run(&fake, Vec::new()).await,
         Reconciliation::UpToDate
     ));
-}
-
-#[tokio::test(start_paused = true)]
-async fn superseded_liveness_comes_from_a_read_after_the_outcome() {
-    let fake = FakePlatformRegistry::new();
-    fake.seed(A, json!({ "newer": true }));
-    fake.seed(B, json!({ "newer": true }));
-
-    let outcomes = outcomes(
-        run(
-            &fake,
-            vec![
-                (A.to_owned(), json!({ "x-fake-superseded": true })),
-                (
-                    B.to_owned(),
-                    json!({ "x-fake-superseded": true, "x-fake-superseded-deletes": true }),
-                ),
-            ],
-        )
-        .await,
-    );
-
-    assert!(matches!(
-        outcomes[A],
-        Outcome::Superseded {
-            liveness: Liveness::Live,
-            ..
-        }
-    ));
-    assert!(
-        matches!(
-            outcomes[B],
-            Outcome::Superseded {
-                liveness: Liveness::Deleted,
-                ..
-            }
-        ),
-        "a deletion committed with the outcome is seen: {:?}",
-        outcomes[B]
-    );
-    assert_eq!(fake.submissions().len(), 1, "never resubmitted");
 }
 
 #[tokio::test]
@@ -468,7 +436,7 @@ async fn an_unreachable_registry_leaves_identifiers_pending_unavailable() {
 
     assert!(matches!(
         outcomes[A],
-        Outcome::Pending(PendingCause::Unavailable(_))
+        ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(_))
     ));
 }
 
@@ -491,13 +459,13 @@ async fn an_equal_identifier_settles_at_once_and_a_later_read_failure_cannot_dow
     );
 
     assert!(
-        matches!(outcomes[A], Outcome::Admitted),
+        matches!(outcomes[A], ReconcileOutcome::Admitted),
         "{:?}",
         outcomes[A]
     );
     assert!(matches!(
         outcomes[B],
-        Outcome::Pending(PendingCause::Unavailable(_))
+        ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(_))
     ));
     let submitted: Vec<String> = fake
         .submissions()
@@ -528,8 +496,8 @@ async fn an_equal_identifier_changed_after_settling_is_not_reread_or_resubmitted
     fake.seed(BASE, json!({}));
 
     let outcomes = outcomes(task.await.expect("joins"));
-    assert!(matches!(outcomes[A], Outcome::Admitted));
-    assert!(matches!(outcomes[B], Outcome::Admitted));
+    assert!(matches!(outcomes[A], ReconcileOutcome::Admitted));
+    assert!(matches!(outcomes[B], ReconcileOutcome::Admitted));
     assert!(
         fake.submissions()
             .iter()
@@ -551,7 +519,10 @@ async fn an_incomplete_read_submits_nothing() {
         let outcomes = outcomes(run_with(&fake, vec![doc(A)], &options).await);
 
         assert!(
-            matches!(outcomes[A], Outcome::Pending(PendingCause::Unavailable(_))),
+            matches!(
+                outcomes[A],
+                ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(_))
+            ),
             "{fault:?}: {:?}",
             outcomes[A]
         );
@@ -560,35 +531,24 @@ async fn an_incomplete_read_submits_nothing() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn another_publishers_entity_is_rejected_not_superseded() {
+async fn another_publishers_entity_is_rejected() {
     let fake = FakePlatformRegistry::new();
     fake.seed(A, json!({ "theirs": true }));
-    fake.seed(B, json!({ "newer": true }));
 
     let outcomes = outcomes(
         run(
             &fake,
-            vec![
-                (A.to_owned(), json!({ "x-fake-publisher-mismatch": true })),
-                (B.to_owned(), json!({ "x-fake-superseded": true })),
-            ],
+            vec![(A.to_owned(), json!({ "x-fake-publisher-mismatch": true }))],
         )
         .await,
     );
 
     assert!(
-        matches!(outcomes[A], Outcome::Rejected(_)),
+        matches!(outcomes[A], ReconcileOutcome::Rejected(_)),
         "{:?}",
         outcomes[A]
     );
     assert_eq!(reason(&outcomes[A]), "publisher_mismatch");
-    assert!(matches!(
-        outcomes[B],
-        Outcome::Superseded {
-            liveness: Liveness::Live,
-            ..
-        }
-    ));
 }
 
 #[tokio::test(start_paused = true)]
@@ -613,7 +573,7 @@ async fn an_oversized_backoff_is_capped_by_the_deadline() {
 
     assert!(started.elapsed() <= Duration::from_secs(5));
     assert!(
-        matches!(outcomes[A], Outcome::Pending(_)),
+        matches!(outcomes[A], ReconcileOutcome::Pending(_)),
         "{:?}",
         outcomes[A]
     );
@@ -633,9 +593,10 @@ async fn a_completed_operation_reporting_no_items_keeps_every_identifier_pending
 
     assert_eq!(outcomes.len(), 2, "every desired identifier is retained");
     assert!(
-        outcomes
-            .values()
-            .all(|o| matches!(o, Outcome::Pending(PendingCause::Unavailable(_)))),
+        outcomes.values().all(|o| matches!(
+            o,
+            ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(_))
+        )),
         "{outcomes:?}"
     );
 }
@@ -657,11 +618,11 @@ async fn no_batch_is_posted_once_the_budget_is_spent() {
         1,
         "the second outlives the budget, the third never starts"
     );
-    assert!(matches!(outcomes[A], Outcome::Admitted));
+    assert!(matches!(outcomes[A], ReconcileOutcome::Admitted));
     for id in [B, C] {
         assert!(matches!(
             outcomes[id],
-            Outcome::Pending(PendingCause::Unavailable(_))
+            ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(_))
         ));
     }
 }
@@ -678,7 +639,7 @@ async fn a_zero_budget_reconciliation_submits_nothing() {
 
     assert!(matches!(
         outcomes[A],
-        Outcome::Pending(PendingCause::Unavailable(_))
+        ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(_))
     ));
     assert!(fake.submissions().is_empty());
     assert_eq!(fake.batch_reads(), 0);
@@ -699,7 +660,10 @@ async fn transport_retries_stop_at_their_bound_under_one_key() {
     let outcomes = outcomes(run_with(&fake, vec![doc(A)], &one_pass()).await);
 
     assert!(
-        matches!(outcomes[A], Outcome::Pending(PendingCause::Unavailable(_))),
+        matches!(
+            outcomes[A],
+            ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(_))
+        ),
         "{:?}",
         outcomes[A]
     );
@@ -723,7 +687,7 @@ async fn an_internal_failure_is_retried_under_the_same_key() {
     let outcomes = outcomes(run_with(&fake, vec![doc(A)], &one_pass()).await);
 
     assert!(
-        matches!(outcomes[A], Outcome::Admitted),
+        matches!(outcomes[A], ReconcileOutcome::Admitted),
         "{:?}",
         outcomes[A]
     );
@@ -747,7 +711,7 @@ async fn a_refusal_of_the_call_is_submitted_once_and_stays_pending_as_refused() 
     assert!(
         matches!(
             outcomes[A],
-            Outcome::Pending(PendingCause::Refused(
+            ReconcileOutcome::Pending(ReconcilePendingCause::Refused(
                 CanonicalError::Unauthenticated { .. }
             ))
         ),
@@ -782,33 +746,33 @@ fn every_exact_reason_maps_to_its_outcome() {
         reason::MISSING_PREDECESSOR,
     ] {
         assert!(
-            matches!(failed(r), Outcome::Pending(PendingCause::Dependency(_))),
+            matches!(
+                failed(r),
+                ReconcileOutcome::Pending(ReconcilePendingCause::Dependency(_))
+            ),
             "{r}"
         );
     }
     for r in [reason::ALREADY_EXISTS, reason::PRECONDITION_FAILED] {
         assert!(
-            matches!(failed(r), Outcome::Pending(PendingCause::Conflict(_))),
+            matches!(
+                failed(r),
+                ReconcileOutcome::Pending(ReconcilePendingCause::Conflict(_))
+            ),
             "{r}"
         );
     }
     assert!(matches!(
         failed(reason::SYSTEM_FAILURE),
-        Outcome::Pending(PendingCause::Unavailable(_))
-    ));
-    assert!(matches!(
-        failed(reason::SUPERSEDED),
-        Outcome::Superseded {
-            liveness: Liveness::Unverified,
-            ..
-        }
+        ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(_))
     ));
     for r in [
+        reason::SUPERSEDED,
         reason::PUBLISHER_MISMATCH,
         "invalid_schema",
         "future_reason",
     ] {
-        assert!(matches!(failed(r), Outcome::Rejected(_)), "{r}");
+        assert!(matches!(failed(r), ReconcileOutcome::Rejected(_)), "{r}");
     }
 }
 
@@ -819,20 +783,20 @@ fn malformed_or_undecided_items_map_to_their_outcome() {
 
     assert!(matches!(
         classify(CandidateStatus::Failed, None),
-        Outcome::Rejected(CanonicalError::Internal { .. })
+        ReconcileOutcome::Rejected(CanonicalError::Internal { .. })
     ));
     for status in [CandidateStatus::Pending, CandidateStatus::Running] {
         assert!(
             matches!(
                 classify(status, None),
-                Outcome::Pending(PendingCause::Unavailable(_))
+                ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(_))
             ),
             "{status:?}"
         );
     }
     for status in [CandidateStatus::Succeeded, CandidateStatus::Unchanged] {
         assert!(
-            matches!(classify(status, None), Outcome::Admitted),
+            matches!(classify(status, None), ReconcileOutcome::Admitted),
             "{status:?}"
         );
     }
@@ -860,7 +824,7 @@ async fn time_pending_passes(passes: u32, backoff: Duration, max: Duration) -> (
     );
     assert!(matches!(
         outcomes[A],
-        Outcome::Pending(PendingCause::Dependency(_))
+        ReconcileOutcome::Pending(ReconcilePendingCause::Dependency(_))
     ));
     (started.elapsed(), fake.batch_reads())
 }
@@ -891,30 +855,4 @@ async fn the_pause_between_passes_is_capped_and_an_oversized_initial_one_clamped
     let (elapsed, _) =
         time_pending_passes(2, Duration::from_secs(10), Duration::from_secs(1)).await;
     assert!(elapsed <= Duration::from_secs(1), "{elapsed:?}");
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_superseded_entity_the_re_read_does_not_find_is_deleted() {
-    let fake = FakePlatformRegistry::new();
-
-    let outcomes = outcomes(
-        run(
-            &fake,
-            vec![(A.to_owned(), json!({ "x-fake-superseded": true }))],
-        )
-        .await,
-    );
-
-    assert!(
-        matches!(
-            outcomes[A],
-            Outcome::Superseded {
-                liveness: Liveness::Deleted,
-                ..
-            }
-        ),
-        "a successful read that finds nothing is not unverified: {:?}",
-        outcomes[A]
-    );
-    assert_eq!(fake.submissions().len(), 1, "never resubmitted");
 }

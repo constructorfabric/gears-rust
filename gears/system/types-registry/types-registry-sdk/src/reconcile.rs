@@ -66,40 +66,23 @@ pub enum Reconciliation {
     UpToDate,
     /// Per-identifier outcomes when work was submitted or remains undecided; keys retain caller
     /// spelling.
-    Reconciled(BTreeMap<String, Outcome>),
+    Reconciled(BTreeMap<String, ReconcileOutcome>),
 }
 
 /// One desired identifier's outcome.
 #[derive(Debug, Clone)]
-pub enum Outcome {
+pub enum ReconcileOutcome {
     /// Registered, or already present with the desired content.
     Admitted,
     /// Terminal refusal; decode registry reasons with [`AdmissionFailure::from_canonical`].
     Rejected(CanonicalError),
-    /// Newer release of the same publisher: never resubmit; re-read liveness after the outcome.
-    /// Other publishers yield `Rejected`.
-    Superseded {
-        error: CanonicalError,
-        liveness: Liveness,
-    },
     /// Not settled by this call.
-    Pending(PendingCause),
-}
-
-/// Whether a superseded entity is live, as read after its outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Liveness {
-    /// The entity is active.
-    Live,
-    /// The entity is a tombstone, or the read found nothing.
-    Deleted,
-    /// The read failed; a caller must not treat the entity as live.
-    Unverified,
+    Pending(ReconcilePendingCause),
 }
 
 /// Why an identifier is still pending.
 #[derive(Debug, Clone)]
-pub enum PendingCause {
+pub enum ReconcilePendingCause {
     /// Something it depends on is not registered yet.
     Dependency(CanonicalError),
     /// A concurrent writer changed it; the next pass re-reads.
@@ -110,15 +93,7 @@ pub enum PendingCause {
     Refused(CanonicalError),
 }
 
-impl PendingCause {
-    /// The error behind this cause.
-    #[must_use]
-    pub fn error(&self) -> &CanonicalError {
-        match self {
-            Self::Dependency(e) | Self::Conflict(e) | Self::Unavailable(e) | Self::Refused(e) => e,
-        }
-    }
-
+impl ReconcilePendingCause {
     /// Transport/availability failure maps to Unavailable; other call failures to Refused.
     pub(crate) fn of(error: CanonicalError) -> Self {
         if transport_failure(&error) {
@@ -129,7 +104,7 @@ impl PendingCause {
     }
 }
 
-impl Outcome {
+impl ReconcileOutcome {
     /// Whether another call could change this outcome.
     #[must_use]
     pub fn is_settled(&self) -> bool {
@@ -137,13 +112,8 @@ impl Outcome {
     }
 }
 
-/// Reconcile desired documents under `publisher`. Cancellation or dropping loses in-flight
-/// keys while accepted writes continue; later calls recover through re-reads/preconditions.
-/// Prefer the token and options deadline to an outer timeout.
-///
-/// # Errors
-/// `InvalidArgument` for an unrepresentable deadline; `Cancelled` on cancellation.
-/// Registry failures are per-identifier outcomes.
+/// Reconcile desired documents under `publisher`; callers reach it through
+/// `PlatformTypesRegistryApiExt::reconcile_entities_and_await`, which documents it.
 pub async fn reconcile<'d, A, I>(
     api: &A,
     ctx: &PlatformSecurityContext,
@@ -181,7 +151,11 @@ where
                 "reconciliation retries the unsettled identifiers"
             );
             if let Err(e) = pause(wait, call.deadline, cancel).await? {
-                mark_unsettled(&wanted, &mut outcomes, &PendingCause::Unavailable(e));
+                mark_unsettled(
+                    &wanted,
+                    &mut outcomes,
+                    &ReconcilePendingCause::Unavailable(e),
+                );
                 break;
             }
             backoff = backoff.saturating_mul(2).min(options.retry_backoff_max);
@@ -191,7 +165,7 @@ where
             Ok(current) => current,
             Err(e) if matches!(e, CanonicalError::Cancelled { .. }) => return Err(e),
             Err(e) => {
-                mark_unsettled(&wanted, &mut outcomes, &PendingCause::of(e));
+                mark_unsettled(&wanted, &mut outcomes, &ReconcilePendingCause::of(e));
                 break;
             }
         };
@@ -206,8 +180,7 @@ where
         let decided = call
             .submit_all(candidates, options.batch_size.get())
             .await?;
-        let liveness = call.superseded_liveness(&decided).await?;
-        record(decided, liveness.as_ref(), &mut wanted, &mut outcomes);
+        record(decided, &mut wanted, &mut outcomes);
         if wanted.is_empty() {
             break;
         }
@@ -216,13 +189,17 @@ where
     // Whatever stopped the passes, nothing desired leaves without an outcome.
     for key in wanted.keys() {
         outcomes.entry(key.clone()).or_insert_with(|| {
-            Outcome::Pending(PendingCause::Unavailable(
+            ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(
                 CanonicalError::internal("reconciliation ended before this identifier was decided")
                     .create(),
             ))
         });
     }
-    if !submitted && outcomes.values().all(|o| matches!(o, Outcome::Admitted)) {
+    if !submitted
+        && outcomes
+            .values()
+            .all(|o| matches!(o, ReconcileOutcome::Admitted))
+    {
         return Ok(Reconciliation::UpToDate);
     }
     Ok(Reconciliation::Reconciled(outcomes))
@@ -256,13 +233,13 @@ async fn pause(
 /// resubmission/downgrade.
 fn compare(
     wanted: &mut Wanted<'_>,
-    outcomes: &mut BTreeMap<String, Outcome>,
+    outcomes: &mut BTreeMap<String, ReconcileOutcome>,
     current: &HashMap<String, Current>,
 ) -> Vec<RegisterItem> {
     let mut candidates = Vec::new();
     wanted.retain(|key, (id, content)| match current.get(key) {
         Some(found) if found.lifecycle == LifecycleStatus::Active && found.content == **content => {
-            outcomes.insert(key.clone(), Outcome::Admitted);
+            outcomes.insert(key.clone(), ReconcileOutcome::Admitted);
             false
         }
         found => {
@@ -279,30 +256,13 @@ fn compare(
 }
 
 /// Record decisions and remove settled identifiers.
-/// No liveness read means unverified; a successful read omitting a key means `NotFound`/deleted.
 fn record(
-    decided: Vec<(GtsId, Outcome)>,
-    liveness: Option<&HashMap<String, Current>>,
+    decided: Vec<(GtsId, ReconcileOutcome)>,
     wanted: &mut Wanted<'_>,
-    outcomes: &mut BTreeMap<String, Outcome>,
+    outcomes: &mut BTreeMap<String, ReconcileOutcome>,
 ) {
     for (id, outcome) in decided {
         let key = id.id().to_owned();
-        let outcome = match outcome {
-            Outcome::Superseded { error, .. } => Outcome::Superseded {
-                error,
-                liveness: match liveness {
-                    None => Liveness::Unverified,
-                    Some(read) => match read.get(&key) {
-                        Some(found) if found.lifecycle != LifecycleStatus::Deleted => {
-                            Liveness::Live
-                        }
-                        Some(_) | None => Liveness::Deleted,
-                    },
-                },
-            },
-            other => other,
-        };
         if outcome.is_settled() {
             wanted.remove(&key);
         }
@@ -321,7 +281,7 @@ struct Current {
 /// Reject invalid identifiers and conflicting duplicates before transport.
 fn validate<'d>(
     desired: impl IntoIterator<Item = &'d (String, JsonDocument)>,
-) -> (Wanted<'d>, BTreeMap<String, Outcome>) {
+) -> (Wanted<'d>, BTreeMap<String, ReconcileOutcome>) {
     let mut wanted: Wanted<'d> = BTreeMap::new();
     let mut outcomes = BTreeMap::new();
     let mut conflicting = Vec::new();
@@ -346,7 +306,7 @@ fn validate<'d>(
                         crate::field::INVALID_GTS_ID,
                     )
                     .create();
-                outcomes.insert(raw.clone(), Outcome::Rejected(error));
+                outcomes.insert(raw.clone(), ReconcileOutcome::Rejected(error));
                 continue;
             }
         };
@@ -367,7 +327,7 @@ fn validate<'d>(
                 crate::field::VALIDATION_FAILED,
             )
             .create();
-        outcomes.insert(id, Outcome::Rejected(error));
+        outcomes.insert(id, ReconcileOutcome::Rejected(error));
     }
     (wanted, outcomes)
 }
@@ -375,11 +335,11 @@ fn validate<'d>(
 /// Every identifier still wanted is unsettled; record the latest cause.
 fn mark_unsettled(
     wanted: &Wanted<'_>,
-    outcomes: &mut BTreeMap<String, Outcome>,
-    cause: &PendingCause,
+    outcomes: &mut BTreeMap<String, ReconcileOutcome>,
+    cause: &ReconcilePendingCause,
 ) {
     for key in wanted.keys() {
-        outcomes.insert(key.clone(), Outcome::Pending(cause.clone()));
+        outcomes.insert(key.clone(), ReconcileOutcome::Pending(cause.clone()));
     }
 }
 
@@ -454,43 +414,12 @@ impl<A: PlatformTypesRegistryApi + ?Sized> Call<'_, A> {
         Ok(current)
     }
 
-    /// Re-read superseded liveness after its outcome; None means read failure.
-    async fn superseded_liveness(
-        &self,
-        decided: &[(GtsId, Outcome)],
-    ) -> Result<Option<HashMap<String, Current>>, CanonicalError> {
-        let superseded: Vec<&GtsId> = decided
-            .iter()
-            .filter(|(_, o)| matches!(o, Outcome::Superseded { .. }))
-            .map(|(id, _)| id)
-            .collect();
-        if superseded.is_empty() {
-            return Ok(Some(HashMap::new()));
-        }
-        let count = superseded.len();
-        let first = superseded[0].id().to_owned();
-        match self.read(superseded.into_iter()).await {
-            Ok(read) => Ok(Some(read)),
-            Err(e) if matches!(e, CanonicalError::Cancelled { .. }) => Err(e),
-            Err(e) => {
-                tracing::warn!(
-                    gear = %self.publisher.name,
-                    superseded = count,
-                    first_gts_id = %first,
-                    %e,
-                    "could not verify whether superseded entities are live"
-                );
-                Ok(None)
-            }
-        }
-    }
-
     /// Submit bounded batches, bisect synchronous refusals, and return every candidate’s outcome.
     async fn submit_all(
         &self,
         candidates: Vec<RegisterItem>,
         batch_size: usize,
-    ) -> Result<Vec<(GtsId, Outcome)>, CanonicalError> {
+    ) -> Result<Vec<(GtsId, ReconcileOutcome)>, CanonicalError> {
         let mut decided = Vec::with_capacity(candidates.len());
         let mut queue: Vec<Vec<RegisterItem>> = Vec::new();
         let mut rest = candidates.into_iter().peekable();
@@ -511,18 +440,18 @@ impl<A: PlatformTypesRegistryApi + ?Sized> Call<'_, A> {
                     decided.extend(
                         batch
                             .into_iter()
-                            .map(|c| (c.gts_id, Outcome::Rejected(error.clone()))),
+                            .map(|c| (c.gts_id, ReconcileOutcome::Rejected(error.clone()))),
                     );
                 }
                 Submitted::Unavailable(error, batch) => {
                     if matches!(error, CanonicalError::Cancelled { .. }) {
                         return Err(error);
                     }
-                    let cause = PendingCause::of(error);
+                    let cause = ReconcilePendingCause::of(error);
                     decided.extend(
                         batch
                             .into_iter()
-                            .map(|c| (c.gts_id, Outcome::Pending(cause.clone()))),
+                            .map(|c| (c.gts_id, ReconcileOutcome::Pending(cause.clone()))),
                     );
                 }
             }
@@ -594,7 +523,7 @@ fn incomplete_read(id: &GtsId, why: &str) -> CanonicalError {
 }
 
 enum Submitted {
-    Decided(Vec<(GtsId, Outcome)>),
+    Decided(Vec<(GtsId, ReconcileOutcome)>),
     /// A synchronous refusal of the whole batch, which is handed back.
     Refused(CanonicalError, Vec<RegisterItem>),
     /// Undecided call: unavailable, refused, expired or cancelled; returns the batch.
@@ -606,8 +535,8 @@ enum Submitted {
 fn cover(
     submitted: &[RegisterItem],
     items: Vec<crate::models::RegistrationItemResult>,
-) -> Vec<(GtsId, Outcome)> {
-    let mut reported: HashMap<String, Vec<Outcome>> = HashMap::new();
+) -> Vec<(GtsId, ReconcileOutcome)> {
+    let mut reported: HashMap<String, Vec<ReconcileOutcome>> = HashMap::new();
     for item in items {
         reported
             .entry(item.gts_id.id().to_owned())
@@ -625,7 +554,7 @@ fn cover(
                         reported = found.map_or(0, |o| o.len()),
                         "a completed operation did not report this candidate exactly once"
                     );
-                    Outcome::Pending(PendingCause::Unavailable(
+                    ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(
                         CanonicalError::internal(
                             "the registry's operation did not report a submitted candidate exactly once",
                         )
@@ -638,7 +567,7 @@ fn cover(
         .collect()
 }
 
-/// Transport/registry availability failures retain [`PendingCause::Unavailable`].
+/// Transport/registry availability failures retain [`ReconcilePendingCause::Unavailable`].
 fn transport_failure(error: &CanonicalError) -> bool {
     retryable(error)
         || matches!(
@@ -659,11 +588,11 @@ fn retryable(error: &CanonicalError) -> bool {
 }
 
 /// The outcome policy, keyed by the exact reason (SPEC §10.1).
-fn classify(status: CandidateStatus, error: Option<CanonicalError>) -> Outcome {
+fn classify(status: CandidateStatus, error: Option<CanonicalError>) -> ReconcileOutcome {
     match status {
-        CandidateStatus::Succeeded | CandidateStatus::Unchanged => Outcome::Admitted,
+        CandidateStatus::Succeeded | CandidateStatus::Unchanged => ReconcileOutcome::Admitted,
         CandidateStatus::Pending | CandidateStatus::Running => {
-            Outcome::Pending(PendingCause::Unavailable(
+            ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(
                 CanonicalError::internal("a completed operation left a candidate undecided")
                     .create(),
             ))
@@ -673,23 +602,22 @@ fn classify(status: CandidateStatus, error: Option<CanonicalError>) -> Outcome {
                 CanonicalError::internal("a failed candidate carried no error").create()
             });
             let Some(failure) = AdmissionFailure::from_canonical(&error) else {
-                return Outcome::Rejected(error);
+                return ReconcileOutcome::Rejected(error);
             };
             match failure.reason {
                 Reason::DependencyNotFound
                 | Reason::BlockedByDependency
                 | Reason::BlockedByPredecessor
-                | Reason::MissingPredecessor => Outcome::Pending(PendingCause::Dependency(error)),
-                Reason::AlreadyExists | Reason::PreconditionFailed => {
-                    Outcome::Pending(PendingCause::Conflict(error))
+                | Reason::MissingPredecessor => {
+                    ReconcileOutcome::Pending(ReconcilePendingCause::Dependency(error))
                 }
-                Reason::SystemFailure => Outcome::Pending(PendingCause::Unavailable(error)),
-                // Supersession applies only within one publisher; other ownership is refused (D18).
-                Reason::Superseded => Outcome::Superseded {
-                    error,
-                    liveness: Liveness::Unverified,
-                },
-                _ => Outcome::Rejected(error),
+                Reason::AlreadyExists | Reason::PreconditionFailed => {
+                    ReconcileOutcome::Pending(ReconcilePendingCause::Conflict(error))
+                }
+                Reason::SystemFailure => {
+                    ReconcileOutcome::Pending(ReconcilePendingCause::Unavailable(error))
+                }
+                _ => ReconcileOutcome::Rejected(error),
             }
         }
     }

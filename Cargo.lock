@@ -4531,14 +4531,12 @@ dependencies = [
 name = "cf-gears-types-registry-sdk"
 version = "0.3.9"
 dependencies = [
- "anyhow",
  "async-trait",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-contract",
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-security",
- "futures-util",
  "gts",
  "parking_lot",
  "proptest",

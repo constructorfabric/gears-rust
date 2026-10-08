@@ -14,9 +14,7 @@ This crate defines the transport-agnostic interface for the Types Registry gear:
 ### `PlatformTypesRegistryApi` (P0, replaces `TypesRegistryClient` at T31)
 
 - **`PlatformTypesRegistryApi`** — platform contract: batch reads, discovery, registration, deletion and operation reads. Mutations return read-back operations.
-- **`PlatformTypesRegistryApiExt`** — kind-narrowed reads, paginated lists, single deletion and cancellable submit/poll under one deadline.
-- **`reconcile`** — reconciles explicit documents; returns `UpToDate` without submitting equal content.
-- **`publish_gts`** — supervised publisher for `gts(publisher = …)` (T33), with per-identifier status. Call after wiring, never from `init()`.
+- **`PlatformTypesRegistryApiExt`** — kind-narrowed reads, paginated lists and `reconcile_entities_and_await`: brings the registry to explicit documents (creates absent, updates differing, returns `UpToDate` without submitting when all match) and reports a `ReconcileOutcome` per identifier.
 - **`AdmissionFailure`** — lossless item-error reason, message and context.
 - **`testing_platform::FakePlatformRegistry`** (`test-util`) — in-memory test implementation.
 

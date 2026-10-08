@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use gts::{GtsId, GtsIdPattern, GtsTypeId};
+use gts::{GtsId, GtsIdPattern, GtsInstanceId};
 use serde_json::json;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::gts_id;
@@ -93,8 +93,8 @@ fn id(s: &str) -> GtsId {
     GtsId::try_new(s).expect("valid identifier")
 }
 
-fn type_id(s: &str) -> GtsTypeId {
-    GtsTypeId::try_new(s).expect("a Type Schema identifier")
+fn instance_id(s: &str) -> GtsInstanceId {
+    GtsInstanceId::try_new(s).expect("an Instance identifier")
 }
 
 fn publisher() -> PublisherContext {
@@ -646,35 +646,67 @@ async fn a_failed_deletion_read_back_is_recovered_by_the_same_key() {
 }
 
 #[tokio::test]
-async fn register_entities_and_await_completes_through_the_local_client_and_the_outbox() {
-    use types_registry_sdk::PlatformTypesRegistryApiExt;
+async fn reconcile_entities_and_await_creates_then_updates_drift_through_a_dyn_client() {
+    use types_registry_sdk::{
+        PlatformTypesRegistryApiExt, ReconcileOptions, ReconcileOutcome, Reconciliation,
+    };
 
     let h = harness().await;
     let api: Arc<dyn PlatformTypesRegistryApi> = Arc::new(LocalClient::new(Arc::clone(&h.service)));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let reconcile = |desired: Vec<(String, serde_json::Value)>| {
+        let api = Arc::clone(&api);
+        let cancel = cancel.clone();
+        async move {
+            api.reconcile_entities_and_await(
+                &ctx(),
+                &publisher(),
+                &desired,
+                &ReconcileOptions::default(),
+                &cancel,
+            )
+            .await
+            .expect("reconciles")
+        }
+    };
+    let admitted = |run: Reconciliation| {
+        let Reconciliation::Reconciled(outcomes) = run else {
+            panic!("work was submitted: {run:?}");
+        };
+        assert!(
+            outcomes
+                .values()
+                .all(|o| matches!(o, ReconcileOutcome::Admitted)),
+            "{outcomes:?}"
+        );
+    };
 
-    let operation = api
-        .register_entities_and_await(
+    admitted(
+        reconcile(vec![
+            (CF_TYPE.to_owned(), schema(CF_TYPE)),
+            (CF_INSTANCE.to_owned(), json!({ "name": "first" })),
+        ])
+        .await,
+    );
+
+    // The same identifier with other content is an update, not a conflict.
+    admitted(reconcile(vec![(CF_INSTANCE.to_owned(), json!({ "name": "second" }))]).await);
+    let instance = api
+        .get_instance(
             &ctx(),
-            IdempotencyKey::new("k-await").unwrap(),
-            register(vec![create(CF_TYPE, schema(CF_TYPE))]),
-            std::time::Duration::from_secs(10),
-            &tokio_util::sync::CancellationToken::new(),
+            &instance_id(CF_INSTANCE),
+            Projection::Select(FieldSelection::with(&[EntityField::Content])),
         )
         .await
-        .expect("completes");
-
-    assert_eq!(operation.status, OperationStatus::Completed);
-    assert_eq!(operation.items[0].status, CandidateStatus::Succeeded);
-    let snapshot = api
-        .get_type_schema(&ctx(), &type_id(CF_TYPE), Projection::Default)
-        .await
         .expect("reads back");
-    assert_eq!(snapshot.type_id, type_id(CF_TYPE));
+    assert_eq!(instance.content, Some(json!({ "name": "second" })));
 }
 
 #[tokio::test]
 async fn reconciliation_through_the_local_client_admits_then_reports_up_to_date() {
-    use types_registry_sdk::{Outcome, ReconcileOptions, Reconciliation, reconcile};
+    use types_registry_sdk::{
+        PlatformTypesRegistryApiExt, ReconcileOptions, ReconcileOutcome, Reconciliation,
+    };
 
     let h = harness().await;
     let desired = vec![
@@ -683,7 +715,7 @@ async fn reconciliation_through_the_local_client_admits_then_reports_up_to_date(
     ];
     let cancel = tokio_util::sync::CancellationToken::new();
 
-    let first = reconcile(
+    let first = PlatformTypesRegistryApiExt::reconcile_entities_and_await(
         &h.client,
         &ctx(),
         &publisher(),
@@ -697,11 +729,13 @@ async fn reconciliation_through_the_local_client_admits_then_reports_up_to_date(
         panic!("the first run submits");
     };
     assert!(
-        outcomes.values().all(|o| matches!(o, Outcome::Admitted)),
+        outcomes
+            .values()
+            .all(|o| matches!(o, ReconcileOutcome::Admitted)),
         "{outcomes:?}"
     );
 
-    let second = reconcile(
+    let second = PlatformTypesRegistryApiExt::reconcile_entities_and_await(
         &h.client,
         &ctx(),
         &publisher(),

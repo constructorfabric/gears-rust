@@ -1,16 +1,17 @@
 //! Serde-free P0 models (SPEC §10.1, DESIGN §3.3); REST DTOs are separate.
 //! Flat documents avoid parent graphs (P5); ownership, availability and federation are P1.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroU8;
+use std::str::FromStr;
 
 use gts::{GtsId, GtsIdPattern, GtsIdSegment, GtsInstanceId, GtsTypeId};
 use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
 use uuid::Uuid;
-
-pub use crate::publication::{PublisherContext, PublisherVersion};
 
 /// One authored or materialized JSON document.
 pub type JsonDocument = serde_json::Value;
@@ -537,6 +538,103 @@ impl IdempotencyKey {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Publisher `SemVer` precedence: prereleases count; build metadata affects display only.
+/// Length is bounded by [`Self::MAX_LEN`]. Use the publishing crate’s `CARGO_PKG_VERSION` (D18).
+#[derive(Debug, Clone)]
+pub struct PublisherVersion(semver::Version);
+
+impl PublisherVersion {
+    /// Maximum version-text bytes, checked before parsing to bound untrusted input.
+    pub const MAX_LEN: usize = 128;
+}
+
+/// Why a [`PublisherVersion`] was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PublisherVersionError {
+    /// The input exceeds [`PublisherVersion::MAX_LEN`] bytes.
+    #[error("publisher version is {len} bytes long, more than the {max} allowed")]
+    TooLong { len: usize, max: usize },
+    /// The input is not a valid `SemVer` 2.0.0 version.
+    #[error("publisher version is not valid SemVer: {message}")]
+    Invalid { message: String },
+}
+
+impl FromStr for PublisherVersion {
+    type Err = PublisherVersionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() > Self::MAX_LEN {
+            return Err(PublisherVersionError::TooLong {
+                len: s.len(),
+                max: Self::MAX_LEN,
+            });
+        }
+        semver::Version::parse(s)
+            .map(Self)
+            .map_err(|e| PublisherVersionError::Invalid {
+                message: e.to_string(),
+            })
+    }
+}
+
+impl TryFrom<&str> for PublisherVersion {
+    type Error = PublisherVersionError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl fmt::Display for PublisherVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq for PublisherVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for PublisherVersion {}
+
+impl PartialOrd for PublisherVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PublisherVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.cmp_precedence(&other.0)
+    }
+}
+
+impl Hash for PublisherVersion {
+    // Ignore build metadata, matching cmp_precedence; destructuring detects added fields.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let semver::Version {
+            major,
+            minor,
+            patch,
+            pre,
+            build: _,
+        } = &self.0;
+        major.hash(state);
+        minor.hash(state);
+        patch.hash(state);
+        pre.hash(state);
+    }
+}
+
+/// Publishing gear and its own `CARGO_PKG_VERSION` (SPEC D18); shared helpers only forward it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PublisherContext {
+    pub name: String,
+    pub version: PublisherVersion,
 }
 
 /// Required request-level publisher/version (D18); adapters send it from T45.

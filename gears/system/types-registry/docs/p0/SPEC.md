@@ -122,7 +122,7 @@ correctness core, not scope.
 | D13 | **P0 field projection on all three reads** (plan P19) | An absent `$select` means the same document-free managed metadata set on exact read, `batchGet` and discovery. P0 selects only fields it can answer; documents are flat and individually selectable. One normalized set drives SQL retrieval, cursor identity, T22d validators and T28 cache keys (§10.2) |
 | D14 | **Discovery filters by `pattern`, `depth`, `kind` and `lifecycle_status`, all exact SQL before `LIMIT`** (plan P20) | `depth` is an inclusive maximum GTS chain length; `kind` is `type_schema` or `instance`; `lifecycle_status` defaults to `active`. Admission materializes `entity.chain_depth` and one `entity_gts_segment` row per parsed segment; the repository compiles the `gts-rust`-parsed pattern into one join per constrained segment and fetches `limit + 1`, so only the last page is short. The cursor binds the filters so continuation cannot splice different result sets (§8.2, §10.2) |
 | D15 | **The SDK is an OoP toolkit contract** (P22) | `PlatformTypesRegistryApi` takes `PlatformSecurityContext` on every method; semantic models are serde-free with separate wire DTOs. A hand-written REST client preserves required headers/statuses and uses runtime helpers plus `DirectoryResolvingClient`; the server uses `OperationBuilder`. Every profile resolves the same ClientHub trait (§8.4, §10.1). |
-| D16 | **Per-crate declarations, published by the owning gear after wiring** (P22) | `declare_gts_inventory!()` / `gts_declarations()` replace global inventory. `gts(crates = […], publisher = …)` records ownership and gathers declarations in the post-wiring hook. The named publisher reconciles in the background and gates readiness. Toolkit defines the signature and a generic `ReadinessStatus` without naming the SDK; `PublicationStatus`, `PublisherContext` and `PublisherVersion` live in `types-registry-sdk`, which implements `ReadinessStatus` for its status, and `toolkit-gts` stays free of publication types (T23, T29). Linking publishes nothing; collectors avoid GTS version splits (§8.4). |
+| D16 | **Per-crate declarations, published by the owning gear after wiring** (P22) | `declare_gts_inventory!()` / `gts_declarations()` replace global inventory. `gts(crates = […], publisher = …)` records ownership and gathers declarations in the post-wiring hook. The named publisher reconciles in the background and gates readiness. Toolkit defines the signature and a generic `ReadinessStatus` without naming the SDK; `PublisherContext` and `PublisherVersion` are write-request models in `types-registry-sdk`; `publish_gts` and its `PublicationStatus` join them in T29, where the SDK implements `ReadinessStatus` for the status, and `toolkit-gts` stays free of publication types (T23, T29). Linking publishes nothing; collectors avoid GTS version splits (§8.4). |
 | D17 | **One plane per route** (P22, P25) | Platform API: full operations under `/types-registry/platform/v1/`, `.platform_authenticated()`, validated internal token on every host. Tenant API: three entity reads under `/types-registry/v1/` (`/v2/` until T32), `.authenticated()`, validated bearer with per-hop revalidation. Every presented credential must be validated; an unavailable plane fails closed. No route accepts either plane. Principal recording and authorization remain C2/C6; listener separation remains C8 (§8.4). |
 | D18 | **Commit-time per-entity publisher ordering; required `publisher`** (P23) | Global mutations require `publisher: { name, version }`; missing metadata is `400` before acceptance. Gears supply their own name and `CARGO_PKG_VERSION`, without override. Under `entity_write_order`, before preconditions and on both `unchanged` paths: another name → `publisher_mismatch`; lower SemVer → `superseded`; equal/higher → admission and CAS; higher identical content → metadata-only confirmation. Success claims unclaimed rows (empty version, placeholder name). Content/stamp commit atomically; confirmation changes no revision, resource version, timestamp, artifact or validator. Input comes only from local/platform callers and is cooperative, not attested (C3/C11). Rename, field and guard land in T39–T42 without activation or adoption machinery (§8.4). |
 | D19 | **SDK mutations return a read-back operation** (P23) | Both adapters submit then call `get_operation`: receipts lack items, including terminal replays, and cannot represent success. Read-back errors carry `operation_id` for same-key replay. REST handles `Retry-After` internally with an SDK fallback; operation models are unchanged. |
@@ -1368,7 +1368,7 @@ change, so the two never serve existing embedded consumers side by side and no s
 is written (plan P23/P26). The early T30 pilot uses an isolated registry composition
 and database with the new APIs only; it does not migrate an existing embedded consumer.
 Registrations stay synchronous inside `init` through the local client — the reconciliation
-helper, not bare `register_entities_and_await`, so a changed configuration-built Instance updates rather
+helper (`reconcile_entities_and_await`), not a bare `register_entities`, so a changed configuration-built Instance updates rather
 than collides — until T35–T37 move them after wiring. Consumers keep `deps = [types_registry]`
 until then, because the init order is built from `deps` and `#[consumes]` wiring runs after
 every `init`.
@@ -1427,18 +1427,14 @@ pub trait PlatformTypesRegistryApi: Send + Sync {
 /// `dyn PlatformTypesRegistryApi`. Not part of the contract, so not part of its IR.
 #[async_trait]
 pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
-    /// A one-item `delete_entities`, sent as a one-item `:batchDelete` because the
-    /// single-key route carries no publisher.
-    async fn delete_entity(&self, ctx: &PlatformSecurityContext, key: IdempotencyKey,
-        entity: DeleteItem, publisher: PublisherContext, dry_run: bool)
-        -> Result<DeletionOperation, CanonicalError>;
-
-    /// Submits, polls to terminality at the pace the receipt's `Retry-After` sets,
-    /// and returns per-identifier outcomes. The async contract made ergonomic; not
-    /// a second protocol.
-    async fn register_entities_and_await(&self, ctx: &PlatformSecurityContext, key: IdempotencyKey,
-        request: RegisterEntitiesRequest, deadline: Duration)
-        -> Result<RegistrationOperation, CanonicalError>;
+    /// Reconciliation (below): creates absent identifiers, updates differing ones, leaves
+    /// matching ones, and returns per-identifier `ReconcileOutcome`s. The one write helper:
+    /// there is no public bare submit-and-poll, no free `reconcile` function and no
+    /// deletion helper.
+    async fn reconcile_entities_and_await(&self, ctx: &PlatformSecurityContext,
+        publisher: &PublisherContext, desired: &[(String, JsonDocument)],
+        options: &ReconcileOptions, cancel: &CancellationToken)
+        -> Result<Reconciliation, CanonicalError>;
 
     // get_type_schema, get_instance, batch_get_type_schemas, batch_get_instances, their
     // _by_uuid variants, list_type_schemas, list_instances — see below.
@@ -1452,8 +1448,8 @@ submits, then calls `get_operation` and returns its result. The receipt — `ope
 with no items, so no adapter ever builds `RegistrationOperation { items: [] }` from it. If
 the read fails after an accepted submit, the error carries the `operation_id` and the caller
 retries under the same key, which replays. The REST adapter keeps `Retry-After` as its own
-polling hint for `register_entities_and_await` and publication, falling back to an SDK default; the
-semantic models carry neither it nor `replayed`. `register_entities_and_await` holds one monotonic
+polling hint for reconciliation and publication, falling back to an SDK default; the
+semantic models carry neither it nor `replayed`. Reconciliation's submit/poll step holds one monotonic
 deadline across submit and polling, honours cancellation, and on timeout names the
 `operation_id` — a timeout never cancels the accepted write. `IdempotencyKey` is a trait parameter, not a
 transport detail: the REST client sends it as the `Idempotency-Key` header, which the v2 route
@@ -1481,19 +1477,25 @@ and a deadline. One idempotency key covers retries of an identical submission an
 a new cycle — a re-read that changes candidates or preconditions — takes a new key (ADR-0012).
 `already_exists` and `precondition_failed` caused by a concurrent publisher of the same content
 lead to a re-read, not a failure. It never discovers inventory or deletes records absent from
-the supplied set. `register_entities_and_await` is the submit/poll primitive; reconciliation adds
-read/compare above it.
+the supplied set. Its submit/poll step is crate-private; a caller that needs its own
+preconditions or key composes `register_entities` and `get_operation`, and a deletion is one
+`delete_entities` call. Until T41 a `superseded` or `publisher_mismatch` item is an ordinary
+`Rejected` outcome: the registry emits neither before T40, so the SDK carries no separate
+superseded outcome or liveness re-read yet.
 
-**Publication is reconciliation run for a gear (D16).** `publish_gts` matches the publisher
+**Publication is reconciliation run for a gear (D16).** It is written in T29, with its first
+caller; until then the SDK carries no publisher, publication status or supervision. `publish_gts` matches the publisher
 signature `toolkit` defines (T29), so a gear's `gts(crates = …, publisher = …)` attribute can name
-it. It takes the `ClientHub` (from which it resolves `dyn PlatformTypesRegistryApi`), a
-`PublisherContext { name, version }` captured in the publishing crate (D18), the documents
+it. It takes the `ClientHub` (from which it resolves `dyn PlatformTypesRegistryApi`), the
+publishing gear's name and version as text, captured in the publishing crate (D18) and parsed
+into a `PublisherContext` inside `publish_gts` (an invalid version settles every identifier as
+rejected), the documents
 gathered from the `gts_declarations()` of the crates the gear lists, and a cancellation token.
 It runs reconciliation in a supervised background task —
 never inside `init()`, where a remote client is not wired yet — with backoff across cycles, and
 returns a status handle: *pending*, *admitted*, *rejected* or *superseded*, with per-identifier
-reasons. The gear composes the handle into its readiness under its policy (D21). A permanently
-rejected or superseded candidate stops retrying; a new cycle never raises its own version or
+reasons; *superseded*, with a liveness re-read, arrives in T41. The gear composes the handle
+into its readiness under its policy (D21). A permanently rejected or superseded candidate stops retrying; a new cycle never raises its own version or
 reads one from the registry. From T41 reconciliation **always submits**, equal documents
 included, so the registry sees and confirms a higher version (D18); the
 `UpToDate`/no-`POST` contract above holds only until then. Explicit registration callers and
@@ -1908,9 +1910,8 @@ gears/system/types-registry/
 │   ├── ext.rs                            NEW  PlatformTypesRegistryApiExt and TypesRegistryApiExt: helpers
 │   │                                          composed from the contracts
 │   ├── models.rs                         NEW  P0 models per §10.1 — no serde
-│   ├── publication/                      NEW  per-gear publication: `mod.rs` the publication status,
-│   │                                          `publish.rs` `publish_gts`, `reconcile.rs` reconciliation,
-│   │                                          `supervised.rs` the supervised publisher task
+│   ├── reconcile.rs                      NEW  reconciliation behind `reconcile_entities_and_await`; T29 adds
+│   │                                          `publish_gts` and its publication status beside it
 │   ├── error.rs                          TypesRegistryError, the opt-in projection of CanonicalError (ADR 0005)
 │   ├── field.rs, reason.rs, gts.rs,      its wire vocabulary; `item_failure.rs` is the per-item failure
 │   │   precondition.rs, item_failure.rs       (`AdmissionFailure`) inside an operation

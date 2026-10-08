@@ -217,3 +217,131 @@ mod narrowed {
         assert_eq!(Instance::try_from(materialized.clone()), Err(materialized));
     }
 }
+
+// ---- publisher version ----------------------------------------------------------
+
+/// Publisher version precedence (SPEC D18).
+mod publisher_version {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    use crate::models::{PublisherVersion, PublisherVersionError};
+
+    fn v(s: &str) -> PublisherVersion {
+        s.parse().expect("valid publisher version")
+    }
+
+    fn hash_of(version: &PublisherVersion) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        version.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn numeric_components_compare_as_numbers_not_strings() {
+        assert!(v("0.2.0") < v("0.10.0"));
+    }
+
+    #[test]
+    fn a_prerelease_precedes_its_release() {
+        assert!(v("1.0.0-rc.1") < v("1.0.0"));
+        assert!(v("1.0.0-alpha") < v("1.0.0-alpha.1"));
+    }
+
+    #[test]
+    fn build_metadata_does_not_count_for_equality_ordering_or_hashing() {
+        let a = v("1.0.0+a");
+        let b = v("1.0.0+b");
+
+        assert_eq!(a, b);
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn display_keeps_the_declared_text_including_build_metadata() {
+        assert_eq!(v("1.2.3-rc.1+build.7").to_string(), "1.2.3-rc.1+build.7");
+    }
+
+    #[test]
+    fn invalid_semver_is_refused() {
+        for input in ["", "1.0", "v1.0.0", "1.0.0 ", "01.0.0", "latest"] {
+            assert!(
+                matches!(
+                    input.parse::<PublisherVersion>(),
+                    Err(PublisherVersionError::Invalid { .. })
+                ),
+                "{input:?} must be refused as invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn input_at_the_length_bound_is_accepted_and_above_it_refused() {
+        let at_bound = format!(
+            "1.0.0-{}",
+            "a".repeat(PublisherVersion::MAX_LEN - "1.0.0-".len())
+        );
+        assert_eq!(at_bound.len(), PublisherVersion::MAX_LEN);
+        assert!(at_bound.parse::<PublisherVersion>().is_ok());
+
+        let above = format!("{at_bound}a");
+        assert_eq!(
+            above.parse::<PublisherVersion>(),
+            Err(PublisherVersionError::TooLong {
+                len: PublisherVersion::MAX_LEN + 1,
+                max: PublisherVersion::MAX_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn try_from_enforces_the_same_rules_as_parse() {
+        assert_eq!(PublisherVersion::try_from("1.0.0"), Ok(v("1.0.0")));
+        assert!(
+            PublisherVersion::try_from("x".repeat(PublisherVersion::MAX_LEN + 1).as_str()).is_err()
+        );
+    }
+
+    proptest::proptest! {
+        /// Eq iff Ord is Equal; equal precedence hashes equally, regardless of build metadata.
+        #[test]
+        fn eq_ord_and_hash_agree(
+            a in version_text(),
+            b in version_text(),
+        ) {
+            use std::hash::BuildHasher as _;
+
+            let (a, b) = (v(&a), v(&b));
+            let hasher = std::collections::hash_map::RandomState::new();
+            proptest::prop_assert_eq!(a == b, a.cmp(&b) == std::cmp::Ordering::Equal);
+            if a == b {
+                proptest::prop_assert_eq!(hasher.hash_one(&a), hasher.hash_one(&b));
+            }
+        }
+    }
+
+    /// Small `SemVer` space with prereleases/build metadata makes equal-precedence pairs common.
+    fn version_text() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        (
+            0_u64..3,
+            0_u64..3,
+            0_u64..3,
+            proptest::option::of(prop_oneof!["alpha", "rc\\.1", "rc\\.2", "1"]),
+            proptest::option::of(prop_oneof!["a", "b", "sha\\.1"]),
+        )
+            .prop_map(|(major, minor, patch, pre, build)| {
+                let mut text = format!("{major}.{minor}.{patch}");
+                if let Some(pre) = pre {
+                    text.push('-');
+                    text.push_str(&pre);
+                }
+                if let Some(build) = build {
+                    text.push('+');
+                    text.push_str(&build);
+                }
+                text
+            })
+    }
+}

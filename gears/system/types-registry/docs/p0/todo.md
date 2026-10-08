@@ -2480,6 +2480,10 @@ moved from toolkit to SDK `supervised.rs`. `spawn_supervised` is crate-private;
 `Supervised`, `SupervisedStatus` and `TaskExit` remain public for returned handles.
 The unused toolkit publisher signature, test and re-exports were removed; the SDK
 imports `tokio_util` directly. T33 adds only generic readiness/supervision to toolkit.
+`PublisherContext`, `PublisherVersion` and `PublisherVersionError` later moved to `models.rs`:
+they are fields of the write requests, not publication state. The publication status,
+`supervised.rs` and their tests were then **removed** as unused before their first caller;
+T29 writes them under its own contract (the T23 code is in `c5f491cc8`, `TR-SDK/src/publication/`).
 The checked criteria below retain the initial implementation record.
 
 **Acceptance criteria:**
@@ -2522,6 +2526,29 @@ consumer API migration; adapters send publisher only from T39.
 
 *(Task numbers in T24 follow P26; before P26 they were T26, T32, T29, T37/T38 and T45, and
 T47 for the always-submit change below, now T41.)*
+
+**After review:** the public `register_entities_and_await` helper is gone. No consumer needs
+caller-supplied preconditions or keys, and the bare primitive is a trap for "declare on every
+start": a creation of an existing identifier is `already_exists` even for identical content.
+Its place in `PlatformTypesRegistryApiExt` is `reconcile_entities_and_await`, the method form
+of the reconciliation helper; the submit/poll step stays crate-private (`await_registration`)
+and keeps its deadline, polling and cancellation tests. Callers that need their own
+preconditions compose `register_entities` and `get_operation`.
+
+**After review, unused surface removed** (the removed code is in `c5f491cc8`):
+- `publish_gts` / `publish_gts_with` / `PublishOptions`, the publication status and the
+  supervised task had no caller; T29 writes them with its hook and readiness contract.
+- `reconcile` moved to `TR-SDK/src/reconcile.rs` and became crate-private; the public entry is
+  `reconcile_entities_and_await`. `Outcome` and `PendingCause` are `ReconcileOutcome` and
+  `ReconcilePendingCause`; the `GtsDeclaration` alias is gone (`&[(String, JsonDocument)]`).
+- `ReconcileOutcome::Superseded` and `Liveness` (the post-outcome liveness re-read) are gone:
+  the registry emits `superseded` only from T40, so before then it could not occur. A
+  `superseded` item is an ordinary `Rejected` until T41 restores the variant.
+- `PlatformTypesRegistryApiExt::delete_entity` had no caller: a deletion is one
+  `delete_entities` call. The fake lost its `deletions()`, `hang_read`, `panic_on_submit` and
+  `x-fake-superseded*` hooks with their last users.
+
+The checked criteria below retain the initial implementation record.
 
 **Acceptance criteria:**
 - [x] `PlatformTypesRegistryApi` is declared with `#[toolkit::contract(gear = "types-registry", version = "v1")]` and compiles: the `Api` suffix, `Result<_, CanonicalError>` on every method, `#[idempotency(..)]` per SPEC §10.1
@@ -2919,8 +2946,10 @@ in P0; visibility and Context-Tenant dimensions remain fixed until P1 tenancy.
 without REST must be able to publish after wiring and gate `/readyz` on it (SPEC D16, D21).
 This task gives every gear that lifecycle, moves supervision into toolkit without publication
 semantics, and connects the SDK's publication status to readiness. It needs neither per-crate
-collectors nor the `gts(…)` attribute: explicit declarations through `publish_gts` (T24) are
-enough, which is what the T30 pilot uses.
+collectors nor the `gts(…)` attribute: explicit declarations through `publish_gts` are
+enough, which is what the T30 pilot uses. `publish_gts`, its publication status and the
+supervised task are **written here**, over `reconcile_entities_and_await`: T23/T24's versions
+were removed unused (see T24's *After review*), and `c5f491cc8` has them to start from.
 
 Commits inside the task: (1) the hook; (2) generic supervision moved from the SDK; (3) readiness
 contributions and the publisher entry.
@@ -2931,21 +2960,21 @@ contributions and the publisher entry.
 - [ ] `docs/toolkit_unified_system/08_lifecycle_stateful_tasks.md` names the hook in both lifecycle paths
 
 **Acceptance criteria — supervision and readiness:**
-- [ ] **Toolkit knows no publication semantics (T23, revised):** `toolkit` gains a generic `ReadinessStatus` trait — `is_ready()` and `is_terminal()` — and the supervised-task helper, moved with its tests from `types-registry-sdk/src/supervised.rs` (its `SupervisedStatus` folds into or extends the trait); the SDK keeps its handle/status API through a bridge and implements the trait for `PublicationStatus` (`is_ready` = today's `satisfies_readiness`). Toolkit never names `PublicationStatus`, `PublisherContext` or `PublisherVersion`; `toolkit-gts` stays free of publication types
+- [ ] **Toolkit knows no publication semantics (T23, revised):** `toolkit` gains a generic `ReadinessStatus` trait — `is_ready()` and `is_terminal()` — and the supervised-task helper with its tests (T23's SDK `supervised.rs` in `c5f491cc8` is the starting point; its `SupervisedStatus` folds into or extends the trait); the SDK adds `publish_gts` and `PublicationStatus` and implements the trait for it (`is_ready`: every identifier admitted). Toolkit never names `PublicationStatus`, `PublisherContext` or `PublisherVersion`; `toolkit-gts` stays free of publication types
 - [ ] Construction, poll and drop panics and early exit settle the status; child cancellation, explicit join, detach-on-handle-drop and terminal reporting keep T23's semantics. A task spawned from the hook uses this helper, not only a `CancellationToken`, and is joined on shutdown and on failed startup
 - [ ] A gear without `RestApiCapability` can contribute a readiness check that `/readyz` aggregates; a gear with it composes the same contribution into its `healthcheck()`. A contribution is registered before the first readiness probe can run and is cancelled on shutdown with the rest of the healthcheck registry
-- [ ] Readiness from a publisher's status is **`Required` only** in P0: toolkit holds the gear's readiness until `is_ready()`, then latches it. What counts as ready stays in the SDK: pending, rejected and a superseded deleted entity are not; admitted and a superseded live entity are, the latter with a warning and a metric emitted by the publisher. `ReportOnly`, a runtime override and optional consumption are P1 (SPEC D21)
+- [ ] Readiness from a publisher's status is **`Required` only** in P0: toolkit holds the gear's readiness until `is_ready()`, then latches it. What counts as ready stays in the SDK: pending and rejected are not; admitted is. The superseded states arrive with T41. `ReportOnly`, a runtime override and optional consumption are P1 (SPEC D21)
 - [ ] **Publisher contract:** the publisher receives the caller's name and version as text, the declarations as `(String, serde_json::Value)`, the `ClientHub` and a cancellation token, and returns `Supervised<S>` for any `S: ReadinessStatus`; it is reached through a generic `toolkit` helper, so no fn-pointer type names a status. `publish_gts` parses the version into `PublisherVersion`; an invalid version settles every identifier as rejected and names the gear
 
 **Verification:**
 - [ ] Toolkit tests: the hook runs once per gear after wiring, in both lifecycle paths; the default hook changes nothing
 - [ ] Toolkit tests with a test `ReadinessStatus`, for a REST and a non-REST gear: not ready holds `/readyz` at `503`; ready releases it and stays released after the status regresses; a contribution exists before the first probe
 - [ ] Toolkit test: a panicking spawned task reports a terminal status and is joined on shutdown and on failed startup
-- [ ] SDK tests for the publication matrix: pending and rejected are not ready; a superseded deleted entity is not; a superseded live entity is, and `publish_gts` emits the warning and the metric with the stored and offered versions; admitted is. Caller-version parsing tests
+- [ ] SDK tests for the publication matrix: pending and rejected are not ready; admitted is. Caller-version parsing tests
 - [ ] `cargo test -p cf-gears-toolkit -p cf-gears-types-registry-sdk --all-features`; both crates build together, catching re-export or type-identity drift; affected runtime targets build
 
 **Dependencies:** T28 (queue order); T23, T24 (complete)
-**Files likely touched:** `libs/toolkit/src/{lib,contracts,supervised}.rs`, `libs/toolkit/src/runtime/host_runtime.rs`, `libs/toolkit/src/healthcheck/`, `TR-SDK/src/{supervised,publication,publish,lib}.rs`, focused tests, `docs/toolkit_unified_system/08_lifecycle_stateful_tasks.md`
+**Files likely touched:** `libs/toolkit/src/{lib,contracts,supervised}.rs`, `libs/toolkit/src/runtime/host_runtime.rs`, `libs/toolkit/src/healthcheck/`, `TR-SDK/src/{publish,lib}.rs` (new `publish.rs`), focused tests, `docs/toolkit_unified_system/08_lifecycle_stateful_tasks.md`
 **Scope:** L — three commits as listed
 
 ---
@@ -3065,7 +3094,7 @@ removed — it remains the deployment-time escape hatch for identities no gear c
 - [ ] **Every consumer moves onto the new SDK in this task**, mechanically. The assignment is derived by grep: every crate that references `TypesRegistryClient`, declares GTS entities or calls `toolkit_gts::inventory::submit!` is listed, and the grep is recorded (~30 crates)
 - [ ] Each consumer declares `#[consumes(contract = PlatformTypesRegistryApi, from = "types-registry", …)]` **and keeps `deps = [types_registry]`**: the init order is built from `deps` (`libs/toolkit/src/registry.rs:560`), and `#[consumes]` wiring runs only after every `init`, so a consumer that still calls the registry in `init` needs the registry initialized first and resolves the local client from the `ClientHub` directly. Phase 8 drops each gear's `deps` together with its last startup call
 - [ ] Read sites move mechanically: T24's extension helpers keep the call shapes, so a read migration is a `use` change, the context argument, and field reads where a computed method was used. The plural reads gain a `batch_` prefix (`get_type_schemas` → `batch_get_type_schemas` and so on), after the contract's `batch_get_entities`. Two further exceptions. Identifiers are typed: a site holding a string wraps it with `GtsTypeId::try_new` / `GtsInstanceId::try_new`, and a literal with `GtsTypeId::new(gts_id!(…))` (`gts_id!` checks it at compile time but yields `&str`). The plural reads (`batch_get_type_schemas`, `batch_get_instances`, their `_by_uuid` variants) answer `Result<HashMap<_, Option<_>>, CanonicalError>`: a site handles the failed call explicitly and reads absence as `None` — `settings-service`'s `declaration/service.rs`, which drops per-key errors, and `account-management`'s `checker.rs`, which sniffs them for transport faults, are rewritten accordingly. No consumer recomputes effective artifacts locally (D3)
-- [ ] Every `register(...)` site becomes **synchronous reconciliation** through the local client — T24's helper: batch-read, compare, `expected_resource_version` for differing entities, submit, wait — still inside `init`, under one bounded deadline. Plain `register_entities_and_await` is not enough: after a configuration-built Instance changes, the next start would submit a creation for an existing entity. Every item outcome is handled; `RegisterResult::ensure_all_ok` is gone and no site treats `pending` as success. Each site passes its gear's own `PublisherContext`; nothing sends it before T39. `rate-provider-sdk`'s shared `register_rate_provider_plugin` moves with it
+- [ ] Every `register(...)` site becomes **synchronous reconciliation** through the local client — T24's helper: batch-read, compare, `expected_resource_version` for differing entities, submit, wait — still inside `init`, under one bounded deadline. `PlatformTypesRegistryApiExt::reconcile_entities_and_await` is that helper; a bare `register_entities` is not enough: after a configuration-built Instance changes, the next start would submit a creation for an existing entity. Content drift becomes an update; sites that used to fail on drift (Account Management's root type, settings-service's setting types) accept that change. Every item outcome is handled; `RegisterResult::ensure_all_ok` is gone and no site treats `pending` as success. Each site passes its gear's own `PublisherContext`; nothing sends it before T39. `rate-provider-sdk`'s shared `register_rate_provider_plugin` moves with it
 - [ ] Where a materialized `effective_*` field differs from what the deleted client-side method returned, the **materialized value is accepted** — the difference is the old approximation being wrong (unresolved non-parent `$ref`, trait-default order), and `gts-rust` is authoritative. A failing assertion is updated to the new value, never "fixed" back
 - [ ] `TypesRegistryClient`, its models (`RegisterResult`, `RegisterSummary`, `TypeSchemaQuery`, `InstanceQuery`, `GtsTypeSchema`, `GtsInstance`) and `testing::MockTypesRegistryClient` are deleted — the whole `TR-SDK/src/legacy/` directory and the legacy block in `TR-SDK/src/lib.rs`; `types-registry-sdk` exports only the new surface. `GtsTypeId` / `GtsInstanceId` stay as root re-exports of `gts`. `precondition.rs` and `TypesRegistryError::ParentNotRegistered` are checked: if only the old `register` pre-check emits them, they go too, and crate docs and comments stop naming the old trait
 - [ ] With the legacy `testing` module gone, `TR-SDK/src/testing_platform.rs` becomes `testing.rs`, so the in-memory `PlatformTypesRegistryApi` is `types_registry_sdk::testing` like every other SDK's test support; consumers' test imports move with it
@@ -3530,6 +3559,7 @@ Every P0 mutation is global and platform-plane, so after this task no write bypa
 **Acceptance criteria:**
 - [ ] Reconciliation always submits, equal documents included, so the registry sees and confirms a higher version; the `UpToDate`/no-`POST` shortcut is gone from the platform helper. Retries of an identical submission reuse one key, a new cycle takes a new one
 - [ ] `superseded` and `publisher_mismatch` are terminal and diagnosable, with the stored and the offered value; a new cycle never raises its own version or reads one from the registry
+- [ ] `ReconcileOutcome` regains a `Superseded` variant, separate from `Rejected`, with a liveness re-read after the outcome (live, deleted, or unverified when the read fails); `PublicationStatus` gains superseded-live (ready, with a warning and a metric carrying both versions) and superseded-deleted (not ready). T24 removed the first version as unreachable before T40; `c5f491cc8` has it
 - [ ] The registry's own writes carry its own context: its control-plane types, the base types it seeds and `cfg.entities`, inline and after wiring, are published as `types-registry` with the registry crate's version (SPEC §17 O5)
 - [ ] Every other writer in the workspace — e2e helpers, fixtures, the pilot, scripts and examples that `POST` or delete — sends a `publisher`; a grep over request bodies finds none without it
 - [ ] A lost submit or `get_operation` response keeps the operation identity; deadline and cancellation hold; a panicking or exiting task is observed
@@ -3539,12 +3569,12 @@ Every P0 mutation is global and platform-plane, so after this task no write bypa
 - [ ] Operator documentation names the field, the owner rule — an operator editing another publisher's entity gets `publisher_mismatch` — and that reverting content takes a newer version
 
 **Verification:**
-- [ ] SDK tests and real-adapter flows — all-equal documents confirmed, repeated startup, delayed dependency batches, `superseded` without a retry storm
+- [ ] SDK tests and real-adapter flows — all-equal documents confirmed, repeated startup, delayed dependency batches, `superseded` without a retry storm; the readiness matrix for superseded live and deleted
 - [ ] API tests — a request without `publisher` on each route, the removed route returning `404`/`405`
 - [ ] `make e2e-local` green with every request carrying a publisher
 
 **Dependencies:** T40
-**Files likely touched:** `TR-SDK/src/publication/{reconcile,mod,publish}.rs`, `TR/src/domain/seeding.rs`, `TR/src/api/rest/{dto,routes,handlers}.rs`, `TR/src/domain/local_client.rs`, `TR/src/domain/admission/publication.rs`, SDK and API tests, e2e helpers, operator docs
+**Files likely touched:** `TR-SDK/src/{reconcile,publish}.rs`, `TR/src/domain/seeding.rs`, `TR/src/api/rest/{dto,routes,handlers}.rs`, `TR/src/domain/local_client.rs`, `TR/src/domain/admission/publication.rs`, SDK and API tests, e2e helpers, operator docs
 **Scope:** L — writers first, then the requirement as its own commit
 
 ---

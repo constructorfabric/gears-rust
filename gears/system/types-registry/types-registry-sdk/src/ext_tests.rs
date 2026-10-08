@@ -11,9 +11,9 @@ use uuid::Uuid;
 use super::PlatformTypesRegistryApiExt;
 use crate::contract::PlatformTypesRegistryApi;
 use crate::models::{
-    CandidateStatus, DeleteItem, EntityKey, EntityKind, FieldSelection, IdempotencyKey,
-    ListEntitiesRequest, OperationStatus, PageRequest, Projection, PublisherContext,
-    RegisterEntitiesRequest, RegisterItem,
+    CandidateStatus, EntityKind, FieldSelection, IdempotencyKey, ListEntitiesRequest,
+    OperationStatus, PageRequest, Projection, PublisherContext, RegisterEntitiesRequest,
+    RegisterItem, RegistrationOperation,
 };
 use crate::testing_platform::{FakePlatformRegistry, ReadFault};
 
@@ -60,21 +60,32 @@ fn key(k: &str) -> IdempotencyKey {
     IdempotencyKey::new(k).expect("valid key")
 }
 
+/// Reconciliation's submit-and-poll step under a budget from now.
+async fn submit_and_await<A: PlatformTypesRegistryApi + ?Sized>(
+    api: &A,
+    key: IdempotencyKey,
+    request: RegisterEntitiesRequest,
+    budget: Duration,
+    cancel: &CancellationToken,
+) -> Result<RegistrationOperation, CanonicalError> {
+    let deadline = super::deadline_from_now(budget)?;
+    super::await_registration(api, &ctx(), key, request, deadline, cancel).await
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_consumer_round_trips_submit_poll_and_read_through_the_trait() {
     let api: Arc<dyn PlatformTypesRegistryApi> =
         Arc::new(FakePlatformRegistry::new().completing_after(3));
 
-    let operation = api
-        .register_entities_and_await(
-            &ctx(),
-            key("k"),
-            register_one(TYPE, json!({ "type": "object" })),
-            Duration::from_secs(30),
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("completes");
+    let operation = submit_and_await(
+        &*api,
+        key("k"),
+        register_one(TYPE, json!({ "type": "object" })),
+        Duration::from_secs(30),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("completes");
 
     assert_eq!(operation.status, OperationStatus::Completed);
     assert_eq!(operation.items[0].status, CandidateStatus::Succeeded);
@@ -93,16 +104,15 @@ async fn a_consumer_round_trips_submit_poll_and_read_through_the_trait() {
 async fn an_operation_nothing_drains_fails_on_its_deadline_naming_the_operation() {
     let fake = Arc::new(FakePlatformRegistry::new().completing_after(u32::MAX));
 
-    let error = fake
-        .register_entities_and_await(
-            &ctx(),
-            key("k"),
-            register_one(TYPE, json!({})),
-            Duration::from_secs(5),
-            &CancellationToken::new(),
-        )
-        .await
-        .expect_err("never completes");
+    let error = submit_and_await(
+        &*fake,
+        key("k"),
+        register_one(TYPE, json!({})),
+        Duration::from_secs(5),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("never completes");
 
     assert!(
         matches!(error, CanonicalError::DeadlineExceeded { .. }),
@@ -120,16 +130,15 @@ async fn an_operation_nothing_drains_fails_on_its_deadline_naming_the_operation(
 async fn an_unrepresentable_deadline_is_refused_before_any_submit() {
     let fake = FakePlatformRegistry::new();
 
-    let error = fake
-        .register_entities_and_await(
-            &ctx(),
-            key("k"),
-            register_one(TYPE, json!({})),
-            Duration::MAX,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect_err("refused");
+    let error = submit_and_await(
+        &fake,
+        key("k"),
+        register_one(TYPE, json!({})),
+        Duration::MAX,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("refused");
 
     assert!(
         matches!(error, CanonicalError::InvalidArgument { .. }),
@@ -146,8 +155,8 @@ async fn cancellation_stops_waiting_without_cancelling_the_write() {
         let fake = Arc::clone(&fake);
         let cancel = cancel.clone();
         tokio::spawn(async move {
-            fake.register_entities_and_await(
-                &ctx(),
+            submit_and_await(
+                &*fake,
                 key("k"),
                 register_one(TYPE, json!({})),
                 Duration::from_secs(3600),
@@ -511,8 +520,8 @@ async fn polls_back_off_from_the_initial_interval_to_the_cap() {
     let fake = Arc::new(FakePlatformRegistry::new().completing_after(u32::MAX));
     let budget = Duration::from_secs(10);
 
-    fake.register_entities_and_await(
-        &ctx(),
+    submit_and_await(
+        &*fake,
         key("k-poll"),
         register_one(TYPE, json!({})),
         budget,
@@ -549,71 +558,20 @@ async fn a_list_helper_refuses_a_query_for_the_other_kind() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn delete_entity_is_a_one_item_deletion_forwarding_its_arguments() {
-    for dry_run in [false, true] {
-        let fake = FakePlatformRegistry::new();
-        fake.seed(TYPE, json!({}));
-        let item = DeleteItem {
-            key: EntityKey::from(id(TYPE)),
-            expected_resource_version: 1,
-        };
-
-        let accepted = fake
-            .delete_entity(&ctx(), key("k-del"), item.clone(), publisher(), dry_run)
-            .await
-            .expect("accepted");
-
-        assert_eq!(accepted.items.len(), 1, "dry_run={dry_run}");
-        assert_eq!(accepted.items[0].entity_key, item.key, "dry_run={dry_run}");
-        let deletions = fake.deletions();
-        assert_eq!(deletions.len(), 1, "dry_run={dry_run}: one call, one item");
-        let (sent_key, request) = &deletions[0];
-        assert_eq!(sent_key.as_str(), "k-del");
-        assert_eq!(request.dry_run, dry_run, "dry_run is forwarded as given");
-        assert_eq!(request.publisher, publisher(), "the publisher is forwarded");
-        assert_eq!(
-            request.items,
-            std::slice::from_ref(&item),
-            "the item is forwarded"
-        );
-
-        let completed = fake
-            .get_operation(&ctx(), accepted.operation_id)
-            .await
-            .expect("polls");
-        assert!(
-            matches!(
-                completed,
-                crate::models::Operation::Deletion(ref op)
-                    if op.status == OperationStatus::Completed
-                        && op.items[0].status == CandidateStatus::Succeeded
-            ),
-            "dry_run={dry_run}: {completed:?}"
-        );
-        assert_eq!(
-            fake.content(TYPE).is_none(),
-            !dry_run,
-            "dry_run={dry_run}: only a real deletion removes the entity"
-        );
-    }
-}
-
-#[tokio::test(start_paused = true)]
 async fn a_slow_submit_spends_the_one_budget_and_the_deadline_still_names_the_operation() {
     let fake = Arc::new(FakePlatformRegistry::new().completing_after(u32::MAX));
     fake.delay_submits(Duration::from_secs(3));
     let started = tokio::time::Instant::now();
 
-    let error = fake
-        .register_entities_and_await(
-            &ctx(),
-            key("k"),
-            register_one(TYPE, json!({})),
-            Duration::from_secs(5),
-            &CancellationToken::new(),
-        )
-        .await
-        .expect_err("never completes");
+    let error = submit_and_await(
+        &*fake,
+        key("k"),
+        register_one(TYPE, json!({})),
+        Duration::from_secs(5),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("never completes");
 
     assert_eq!(
         started.elapsed(),
@@ -636,16 +594,15 @@ async fn a_submit_that_never_answers_returns_by_the_deadline() {
     fake.delay_submits(Duration::from_secs(3600));
     let started = tokio::time::Instant::now();
 
-    let error = fake
-        .register_entities_and_await(
-            &ctx(),
-            key("k"),
-            register_one(TYPE, json!({})),
-            Duration::from_secs(5),
-            &CancellationToken::new(),
-        )
-        .await
-        .expect_err("times out");
+    let error = submit_and_await(
+        &fake,
+        key("k"),
+        register_one(TYPE, json!({})),
+        Duration::from_secs(5),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("times out");
 
     assert_eq!(started.elapsed(), Duration::from_secs(5));
     assert!(matches!(error, CanonicalError::DeadlineExceeded { .. }));
@@ -658,16 +615,15 @@ async fn a_poll_that_never_answers_returns_by_the_deadline_naming_the_operation(
     fake.delay_polls(Duration::from_secs(3600));
     let started = tokio::time::Instant::now();
 
-    let error = fake
-        .register_entities_and_await(
-            &ctx(),
-            key("k"),
-            register_one(TYPE, json!({})),
-            Duration::from_secs(5),
-            &CancellationToken::new(),
-        )
-        .await
-        .expect_err("times out");
+    let error = submit_and_await(
+        &*fake,
+        key("k"),
+        register_one(TYPE, json!({})),
+        Duration::from_secs(5),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("times out");
 
     assert_eq!(started.elapsed(), Duration::from_secs(5));
     assert!(matches!(error, CanonicalError::DeadlineExceeded { .. }));
@@ -683,16 +639,15 @@ async fn a_poll_that_never_answers_returns_by_the_deadline_naming_the_operation(
 async fn a_spent_budget_submits_nothing_even_to_an_instant_registry() {
     let fake = FakePlatformRegistry::new();
 
-    let error = fake
-        .register_entities_and_await(
-            &ctx(),
-            key("k"),
-            register_one(TYPE, json!({})),
-            Duration::ZERO,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect_err("no budget");
+    let error = submit_and_await(
+        &fake,
+        key("k"),
+        register_one(TYPE, json!({})),
+        Duration::ZERO,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("no budget");
 
     assert!(
         matches!(error, CanonicalError::DeadlineExceeded { .. }),

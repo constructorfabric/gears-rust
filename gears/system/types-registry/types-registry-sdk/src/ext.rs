@@ -44,12 +44,12 @@ use crate::contract::TypesRegistryApi;
 use crate::field;
 use crate::gts::{OperationResource, TypeResource};
 use crate::models::{
-    BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, DeleteEntitiesRequest,
-    DeleteItem, DeletionOperation, Entity, EntityField, EntityKey, EntityKind, EntityLookup,
-    FieldSelection, IdempotencyKey, Instance, ListEntitiesRequest, ListEntitiesResponse,
-    OperationStatus, Projection, PublisherContext, RegisterEntitiesRequest, RegistrationOperation,
-    TypeSchema,
+    BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, Entity, EntityField,
+    EntityKey, EntityKind, EntityLookup, FieldSelection, IdempotencyKey, Instance, JsonDocument,
+    ListEntitiesRequest, ListEntitiesResponse, OperationStatus, Projection, PublisherContext,
+    RegisterEntitiesRequest, RegistrationOperation, TypeSchema,
 };
+use crate::reconcile::{ReconcileOptions, Reconciliation, reconcile};
 
 /// Batch-read key ceiling (SPEC C10); larger reads are split.
 pub const MAX_BATCH_GET_KEYS: usize = 100;
@@ -70,46 +70,31 @@ pub const MAX_LIST_PAGES: usize = 1_000;
 /// them, including this trait's own `DeadlineExceeded` and `Cancelled`.
 #[async_trait]
 pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
-    /// One-item delete batch; the single-key route carries no publisher.
+    /// Reconcile `desired` under `options` (SPEC §10.1): absent identifiers are submitted as
+    /// creations, differing ones as updates, so content drift is an update, not a conflict.
+    /// Safe to call on every start; it never deletes what `desired` omits.
+    ///
+    /// [`Reconciliation::UpToDate`] means every document already matched and nothing was
+    /// submitted. `Ok(Reconciled(..))` does not mean the whole set was admitted: it may hold
+    /// `Rejected` (e.g. an incompatible Type Schema change) and `Pending` outcomes, including
+    /// those left when the deadline or the passes run out.
+    ///
+    /// Cancellation or dropping the future loses in-flight keys while accepted writes
+    /// continue; a later call recovers through re-reads and preconditions. Prefer the token
+    /// and `options.deadline` to an outer timeout.
     ///
     /// # Errors
-    /// As [`PlatformTypesRegistryApi::delete_entities`].
-    async fn delete_entity(
+    /// `InvalidArgument` for an unrepresentable deadline, `Cancelled` on cancellation. Registry failures are per-identifier
+    /// [`ReconcileOutcome`](crate::ReconcileOutcome)s.
+    async fn reconcile_entities_and_await(
         &self,
         ctx: &PlatformSecurityContext,
-        key: IdempotencyKey,
-        entity: DeleteItem,
-        publisher: PublisherContext,
-        dry_run: bool,
-    ) -> Result<DeletionOperation, CanonicalError> {
-        self.delete_entities(
-            ctx,
-            key,
-            DeleteEntitiesRequest {
-                items: vec![entity],
-                dry_run,
-                publisher,
-            },
-        )
-        .await
-    }
-
-    /// Submit and poll with exponential backoff under one deadline. Accepted writes continue
-    /// after timeout/cancellation; timeout names `operation_id`, cancellation requires key replay.
-    ///
-    /// # Errors
-    /// `InvalidArgument` for an unrepresentable deadline; submit/poll errors; `DeadlineExceeded`
-    /// or `Cancelled`.
-    async fn register_entities_and_await(
-        &self,
-        ctx: &PlatformSecurityContext,
-        key: IdempotencyKey,
-        request: RegisterEntitiesRequest,
-        deadline: Duration,
+        publisher: &PublisherContext,
+        desired: &[(String, JsonDocument)],
+        options: &ReconcileOptions,
         cancel: &CancellationToken,
-    ) -> Result<RegistrationOperation, CanonicalError> {
-        let deadline = deadline_from_now(deadline)?;
-        await_registration(self, ctx, key, request, deadline, cancel).await
+    ) -> Result<Reconciliation, CanonicalError> {
+        reconcile(self, ctx, publisher, desired, options, cancel).await
     }
 
     /// Projected Type Schema by identifier.
@@ -636,7 +621,7 @@ fn list_default(kind: EntityKind) -> FieldSelection {
     }
 }
 
-/// Submit and poll under one deadline; shared by `register_entities_and_await` and reconciliation.
+/// Submit and poll under one deadline; reconciliation's submit step.
 pub(crate) async fn await_registration<A: PlatformTypesRegistryApi + ?Sized>(
     api: &A,
     ctx: &PlatformSecurityContext,

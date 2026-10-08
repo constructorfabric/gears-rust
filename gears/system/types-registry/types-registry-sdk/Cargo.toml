@@ -53,17 +53,14 @@ toolkit-security = { workspace = true }
 time = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
-anyhow = { workspace = true }
 # `PublisherVersion`: SemVer parsing and precedence.
 semver = { workspace = true }
-# `spawn_supervised`: one unwind boundary around a publisher's worker.
-futures-util = { workspace = true }
 tokio-util = { workspace = true }
-# Jittered backoff of reconciliation passes, transport retries and publish cycles.
+# Jittered backoff of reconciliation passes and transport retries.
 rand = { workspace = true }
 
 [dev-dependencies]
-# Paused-clock tests of `register_entities_and_await`'s deadline and polling.
+# Paused-clock tests of the submit/poll deadline and polling.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 # Round-trip and consistency properties of the SDK's codecs and orderings.
 proptest = { workspace = true }

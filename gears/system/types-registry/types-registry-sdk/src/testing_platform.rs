@@ -1,7 +1,7 @@
 //! In-memory fixture for both contracts, with delayed completion and idempotency replay (`test-util`).
-//! Document hooks simulate invalid schemas, dependencies, supersession and publisher mismatch;
-//! use `x-fake-invalid`, `x-fake-depends-on`, `x-fake-superseded`, `x-fake-publisher-mismatch`.
-//! request hooks simulate failures, delays, panics, missing results and concurrent writes.
+//! Document hooks simulate invalid schemas, dependencies and publisher mismatch;
+//! use `x-fake-invalid`, `x-fake-depends-on`, `x-fake-publisher-mismatch`.
+//! Request hooks simulate failures, delays, missing results and concurrent writes.
 //! Equal content is unchanged; writes advance versions; dry runs use a discarded copy.
 //! Type Schema materializations are synthetic; Instances have none.
 
@@ -69,7 +69,6 @@ struct State {
     operations: HashMap<Uuid, FakeOperation>,
     keys: HashMap<String, (String, Uuid)>,
     submissions: Vec<(IdempotencyKey, RegisterEntitiesRequest)>,
-    deletions: Vec<(IdempotencyKey, DeleteEntitiesRequest)>,
     /// Errors the next submissions fail with, in order, before being accepted.
     submit_failures: Vec<CanonicalError>,
     /// Writes another publisher makes just before the next registration.
@@ -81,13 +80,11 @@ pub struct FakePlatformRegistry {
     polls_to_complete: u32,
     max_batch: usize,
     lose_read_backs: AtomicU32,
-    panic_on_submit: AtomicBool,
     batch_reads: AtomicU32,
     submit_delay: Mutex<std::time::Duration>,
     poll_delay: Mutex<std::time::Duration>,
     read_fault: Mutex<ReadFault>,
     drop_operation_items: AtomicBool,
-    hang_read: AtomicU32,
     polls: AtomicU32,
     repeat_list_cursor: AtomicBool,
 }
@@ -124,13 +121,11 @@ impl FakePlatformRegistry {
             polls_to_complete: 1,
             max_batch: 100,
             lose_read_backs: AtomicU32::new(0),
-            panic_on_submit: AtomicBool::new(false),
             batch_reads: AtomicU32::new(0),
             submit_delay: Mutex::new(std::time::Duration::ZERO),
             poll_delay: Mutex::new(std::time::Duration::ZERO),
             read_fault: Mutex::new(ReadFault::None),
             drop_operation_items: AtomicBool::new(false),
-            hang_read: AtomicU32::new(0),
             polls: AtomicU32::new(0),
             repeat_list_cursor: AtomicBool::new(false),
         }
@@ -149,21 +144,10 @@ impl FakePlatformRegistry {
             .extend(std::iter::repeat_n(error.clone(), count));
     }
 
-    /// Every deletion submitted, accepted or replayed, in order.
-    #[must_use]
-    pub fn deletions(&self) -> Vec<(IdempotencyKey, DeleteEntitiesRequest)> {
-        self.state.lock().deletions.clone()
-    }
-
     /// How many `get_operation` calls were made.
     #[must_use]
     pub fn polls(&self) -> u32 {
         self.polls.load(Ordering::SeqCst)
-    }
-
-    /// The `n`th `batch_get_entities` call (1-based) never answers.
-    pub fn hang_read(&self, n: u32) {
-        self.hang_read.store(n, Ordering::SeqCst);
     }
 
     /// Completed operations report no items.
@@ -208,11 +192,6 @@ impl FakePlatformRegistry {
     /// The next `count` accepted submissions fail their read back.
     pub fn lose_read_backs(&self, count: u32) {
         self.lose_read_backs.store(count, Ordering::SeqCst);
-    }
-
-    /// Every later submission panics.
-    pub fn panic_on_submit(&self) {
-        self.panic_on_submit.store(true, Ordering::SeqCst);
     }
 
     /// Stores an active entity directly, at version 1.
@@ -347,32 +326,6 @@ fn decide(entities: &mut BTreeMap<String, Stored>, candidate: &Candidate) -> Out
             content,
             expected,
         } => {
-            if content.get("x-fake-superseded") == Some(&serde_json::Value::Bool(true)) {
-                if content.get("x-fake-superseded-deletes") == Some(&serde_json::Value::Bool(true))
-                    && let Some(stored) = entities.get_mut(gts_id.id())
-                {
-                    stored.lifecycle = LifecycleStatus::Deleted;
-                    stored.resource_version += 1;
-                }
-                let (status, version, failure) =
-                    failed(Reason::Superseded, "a newer release owns this entity");
-                let versions = content
-                    .get("x-fake-superseded-versions")
-                    .and_then(serde_json::Value::as_str);
-                return (
-                    status,
-                    version,
-                    failure.map(|f| match versions {
-                        Some("missing") => f,
-                        Some("invalid") => f
-                            .with_context(context::STORED_VERSION, "nine")
-                            .with_context(context::OFFERED_VERSION, "1.0.0"),
-                        _ => f
-                            .with_context(context::STORED_VERSION, "9.0.0")
-                            .with_context(context::OFFERED_VERSION, "1.0.0"),
-                    }),
-                );
-            }
             if content.get("x-fake-publisher-mismatch") == Some(&serde_json::Value::Bool(true)) {
                 return failed(
                     Reason::PublisherMismatch,
@@ -533,14 +486,11 @@ fn validator(stored: &Stored) -> Validator {
 
 impl FakePlatformRegistry {
     /// The batch read both contracts serve, with its faults and counter.
-    async fn read_batch(
+    fn read_batch(
         &self,
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
         let call = self.batch_reads.fetch_add(1, Ordering::SeqCst) + 1;
-        if self.hang_read.load(Ordering::SeqCst) == call {
-            std::future::pending::<()>().await;
-        }
         let fault = *self.read_fault.lock();
         if matches!(fault, ReadFault::FailFrom(n) if call >= n)
             || matches!(fault, ReadFault::FailOnly(n) if call == n)
@@ -640,7 +590,7 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
         _ctx: &PlatformSecurityContext,
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
-        self.read_batch(request).await
+        self.read_batch(request)
     }
 
     async fn list_entities(
@@ -657,10 +607,6 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
         key: IdempotencyKey,
         request: RegisterEntitiesRequest,
     ) -> Result<RegistrationOperation, CanonicalError> {
-        assert!(
-            !self.panic_on_submit.load(Ordering::SeqCst),
-            "the fake registry was told to panic"
-        );
         let delay = *self.submit_delay.lock();
         if !delay.is_zero() {
             toolkit::tokio::time::sleep(delay).await;
@@ -723,10 +669,6 @@ impl PlatformTypesRegistryApi for FakePlatformRegistry {
         key: IdempotencyKey,
         request: DeleteEntitiesRequest,
     ) -> Result<DeletionOperation, CanonicalError> {
-        self.state
-            .lock()
-            .deletions
-            .push((key.clone(), request.clone()));
         let fingerprint = format!("{:?}", (&request.items, request.dry_run));
         let dry_run = request.dry_run;
         let candidates = request
@@ -766,7 +708,7 @@ impl TypesRegistryApi for FakePlatformRegistry {
         _ctx: &SecurityContext,
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
-        self.read_batch(request).await
+        self.read_batch(request)
     }
 
     async fn list_entities(
