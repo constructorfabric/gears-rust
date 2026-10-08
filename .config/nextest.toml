@@ -13,3 +13,17 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'package(cf-gears-quota-enforcement-storage-plugin)'
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# CI profile: every run writes target/nextest/ci/junit.xml, which the CI jobs
+# upload and .github/workflows/test-report.yml publishes as GitHub Check Runs.
+# The default profile's overrides above still apply under this profile.
+[profile.ci]
+# Report every failing test in one run, not just the first.
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
+store-success-output = false
+store-failure-output = true
+# Requires nextest >= 0.9.143 (see NEXTEST_MIN_VERSION in the Makefile).
+report-skipped = "ignored"
