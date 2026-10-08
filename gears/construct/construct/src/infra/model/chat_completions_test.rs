@@ -25,14 +25,12 @@ const TOOL_CALLS: &str = include_str!("fixtures/chat_tool_calls.json");
 const STRUCTURED: &str = include_str!("fixtures/chat_structured.json");
 const CONTENT_FILTER: &str = include_str!("fixtures/chat_content_filter.json");
 
-/// Seen by the fake gateway: where the request went and its JSON body.
 #[derive(Default)]
 struct Sent {
     uri: String,
     body: Value,
 }
 
-/// An OAGW client that answers every proxied request with one canned status and body.
 struct FakeGateway {
     status: StatusCode,
     body: String,

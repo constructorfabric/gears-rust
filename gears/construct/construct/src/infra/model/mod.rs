@@ -1,5 +1,3 @@
-//! The model client adapters. Configuration picks one.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,8 +10,6 @@ pub mod chat_completions;
 #[cfg(test)]
 mod chat_completions_test;
 
-/// The model client the configuration names.
-///
 /// @cpt-dod:cpt-cf-construct-dod-model-client-config:p1
 #[must_use]
 pub fn model_client(config: &ModelConfig, hub: Arc<ClientHub>) -> Arc<dyn ModelClient> {

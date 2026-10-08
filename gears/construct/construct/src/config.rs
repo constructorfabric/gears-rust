@@ -6,18 +6,13 @@ use uuid::Uuid;
 /// that wants new subjects to start with personalization off sets it to false.
 pub const DEFAULT_PERSONALIZATION: bool = true;
 
-/// Default for the time one model call may take, in milliseconds.
 pub const DEFAULT_MODEL_TIMEOUT_MS: u64 = 30_000;
 
-/// Which model service Construct calls, and how. Exactly one adapter is used.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "adapter", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelConfig {
-    /// The `OpenAI` chat completions API, through an OAGW upstream.
     ChatCompletions {
-        /// The OAGW upstream alias the requests go to.
         upstream_alias: String,
-        /// The model name sent in each request.
         model: String,
         #[serde(default = "default_model_timeout_ms")]
         timeout_ms: u64,
@@ -38,7 +33,6 @@ pub struct ConstructConfig {
     /// connector on.
     #[serde(default)]
     pub connectors_off: Vec<Uuid>,
-    /// The model service. Without it, nothing that needs a model can run.
     #[serde(default)]
     pub model: Option<ModelConfig>,
 }

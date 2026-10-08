@@ -1,9 +1,3 @@
-//! [`ModelClient`] over the `OpenAI` chat completions API, sent through OAGW.
-//!
-//! It works with any server that speaks that API: `OpenAI`, Azure, `vLLM`, Ollama,
-//! `LiteLLM`. The request is not streamed. Errors name the HTTP status or the
-//! broken part of the answer, never the prompt or the answer's text.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,9 +16,6 @@ use crate::domain::model_client::{
     ToolCall, ToolSpec, Usage,
 };
 
-/// The chat completions adapter. The OAGW client is resolved from `ClientHub`
-/// on each call, so the gear does not depend on the start order.
-///
 /// @cpt-dod:cpt-cf-construct-dod-model-client-chat-completions:p1
 pub struct ChatCompletionsModel {
     hub: Arc<ClientHub>,
