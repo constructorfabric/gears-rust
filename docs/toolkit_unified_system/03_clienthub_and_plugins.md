@@ -5,25 +5,25 @@
 The **ClientHub** provides type-safe client resolution for inter-gear communication. It supports both in-process and remote clients:
 
 - **In-process clients** — direct function calls within the same process
-- **Remote clients** — gRPC clients for OoP gears (resolved via DirectoryClient)
+- **Remote clients** — REST clients for OoP gears (resolved via DirectoryClient); gRPC is an opt-in transport
 - **Scoped clients** — multiple implementations of the same interface keyed by scope (for plugins)
 
 ### Client types
 
 - **`*-sdk` crate** defines the trait & types exposed to other gears.
 - **Gear crate** implements a local adapter that implements the SDK trait for in-process communication.
-- **gRPC clients** implement the same SDK trait for remote communication.
+- **Remote clients** implement the same SDK trait over REST (default) or gRPC (opt-in).
 - Consumers resolve the typed client from ClientHub by interface type (+ optional scope).
 
 ## In-Process vs Remote Clients
 
 | Aspect       | In-Process              | Remote (OoP)               |
 |--------------|-------------------------|----------------------------|
-| Transport    | Direct call             | gRPC                       |
+| Transport    | Direct call             | REST (default; gRPC opt-in) |
 | Latency      | Nanoseconds             | Milliseconds               |
 | Isolation    | Shared process          | Separate process           |
 | Contract     | Trait in `*-sdk/` crate | Trait in `*-sdk/` crate    |
-| Registration | `ClientHub::register()` | DirectoryClient + gRPC client + `ClientHub::register()` |
+| Registration | `ClientHub::register()` | Runtime-wired resolving client |
 
 ## Publish in `init` (provider gear)
 
@@ -421,7 +421,7 @@ match ctx.client_hub().get::<dyn MyGearApi>() {
 
 - **SDK traits**: Define in `*-sdk` crate, require `Send + Sync + 'static`.
 - **Local adapters**: Implement SDK trait in gear crate, register in `init()`.
-- **gRPC clients**: Use `toolkit_transport_grpc::client` utilities (`connect_with_stack`, `connect_with_retry`).
+- **gRPC clients (opt-in transport)**: Use `toolkit_transport_grpc::client` utilities (`connect_with_stack`, `connect_with_retry`).
 - **Plugins**: Use `ClientScope::gts_id()` for instance IDs; register scoped clients.
 - **Error handling**: Convert domain errors to SDK errors and to `Problem` for REST.
 - **Testing**: Register mock clients in tests using the same trait.
@@ -433,4 +433,4 @@ match ctx.client_hub().get::<dyn MyGearApi>() {
 - [ ] Register client in `init()`: `ctx.client_hub().register::<dyn Trait>(api)`.
 - [ ] Consume client: `ctx.client_hub().get::<dyn Trait>()?`.
 - [ ] For plugins: use `ClientScope::gts_id()` and `register_scoped()`.
-- [ ] For OoP: use gRPC client utilities and register both local and remote clients.
+- [ ] For OoP: the gear serves REST via `oop_http`; gRPC client utilities apply only to opt-in gRPC contracts.

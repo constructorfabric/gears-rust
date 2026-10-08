@@ -1,6 +1,6 @@
 ---
 title: Examples
-description: Worked, runnable example gears in the framework repository — a full gear, out-of-process gRPC gears, and provider/plugin patterns.
+description: Worked, runnable example gears in the framework repository — a full gear, out-of-process REST gears, and provider/plugin patterns.
 sidebar:
   label: Examples
   order: 15
@@ -12,14 +12,18 @@ Every pattern in this section maps to runnable code in the framework repository.
 
 - **`examples/toolkit/users-info/`** — the complete gear followed by [Build your first gear](../your-first-gear/) and [Gear anatomy](../gear-anatomy/): an SDK, a domain service with authorization, secure multi-tenant persistence, a REST surface with OData, and runtime wiring.
 
-## Out-of-process gears (gRPC)
+## Out-of-process gears (REST-first)
 
-- **`examples/oop-gears/calculator/`** — a gear that runs in-process or out-of-process behind the same SDK trait, selected by config. See [Run a gear out-of-process](../out-of-process/).
-- **`examples/oop-gears/calculator-gateway/`** — a gateway in front of the out-of-process calculator.
+- **`examples/toolkit/hello/`** — a minimal gear that can run in-process or as a REST-first OoP worker, selected by config.
+- **`examples/toolkit/api-contracts/`** — a provider/consumer pair demonstrating inter-gear REST contract calls across the OoP boundary. See [Run a gear out-of-process](../out-of-process/).
+
+## Out-of-process gears (gRPC opt-in)
+
+- **`docs/toolkit_unified_system/09_oop_grpc_sdk_pattern.md`** — the gRPC SDK pattern for gears that opt in to gRPC transport.
 
 ## Object-oriented / composition patterns
 
-- **`examples/oop-gears/`** — composition patterns showing gears calling gears through `ClientHub`. See [SDK contracts and ClientHub](../../concepts/sdk-and-clienthub/).
+- **`examples/toolkit/api-contracts/`** — composition patterns showing gears calling gears through `ClientHub` and over the OoP boundary. See [SDK contracts and ClientHub](../../concepts/sdk-and-clienthub/).
 
 ## Toolkit feature examples
 

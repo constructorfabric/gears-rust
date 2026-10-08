@@ -235,7 +235,7 @@ pub enum DomainError {
 - [ ] Register client in `init()`: `ctx.client_hub().register::<dyn Trait>(api)`
 - [ ] Consume client: `ctx.client_hub().get::<dyn Trait>()?`
 - [ ] For plugins: use `ClientScope::gts_id()` and `register_scoped()`
-- [ ] For OoP: use gRPC client utilities and register both local and remote clients
+- [ ] For OoP: the gear serves REST via `oop_http`; gRPC client utilities apply only to opt-in gRPC contracts
 
 ### Client registration template
 
@@ -288,17 +288,29 @@ pub fn spawn_background_task(cancel: CancellationToken) {
 
 ## Out-of-Process (OoP) Gears
 
-### Checklist
+OoP gears are REST-first: the worker serves HTTP, registers with the directory, and uses the same base trait through a
+local adapter or generated REST client. gRPC is opt-in — see `09_oop_grpc_sdk_pattern.md`.
 
-- [ ] Create `*-sdk` crate with API trait, types, gRPC client, and wiring helpers
+### Checklist (REST-first)
+
+- [ ] Create `*-sdk` crate with a base API trait and transport-neutral types
+- [ ] Define its `#[toolkit::rest_contract]` projection and enable the generated REST client
+- [ ] Declare the dependency on each consuming gear with `#[toolkit::consumes(...)]`
+- [ ] Implement REST routes via OperationBuilder (`register_rest`)
+- [ ] Build a worker binary that calls `run_oop_with_options` (template below)
+- [ ] Add an `oop_http` section to the worker's config file
+- [ ] Set `runtime.type: oop` (with `execution.executable_path` + `args: ["--config", ...]`) in the host config — see `config/oop-self-hosted.yaml`
+- [ ] Use `CancellationToken` for coordinated shutdown
+- [ ] Test with the gear running as a standalone process
+
+### gRPC opt-in checklist
+
 - [ ] Define `.proto` file and generate gRPC stubs in SDK
 - [ ] Implement gRPC server in gear crate
 - [ ] Use `toolkit_transport_grpc::client` utilities for connections
-- [ ] Register both local and remote clients in gear
-- [ ] Use `CancellationToken` for coordinated shutdown
 - [ ] Test with mock gRPC servers
 
-### SDK wiring template
+### SDK wiring template (gRPC opt-in)
 
 ```rust
 // In SDK crate

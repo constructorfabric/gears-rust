@@ -21,7 +21,7 @@ ModKit. Each Gear:
 - **Is discovered at link time** via `inventory` and initialized in dependency
   order by the runtime.
 - **Composes with other Gears** through the typed `ClientHub` (in-process) or
-  gRPC SDKs (out-of-process / remote Gears).
+  typed SDK clients (out-of-process / remote Gears: REST by default, gRPC opt-in).
 - **Can be extended by plugins** — built-in plugins (compiled in) or external
   plugins (separate crates with their own API handler, business logic, and DB).
 - **Can extend it's API data schema** through GTS schema extensions.
@@ -246,5 +246,5 @@ Plugin discovery and scoped clients are covered in
 - **Errors (RFC-9457)** — `05_errors_rfc9457.md`
 - **OData / pagination / $select / $filter** — `07_odata_pagination_select_filter.md`
 - **Database patterns (SecureConn, transactions, repos)** — `11_database_patterns.md`
-- **Out-of-Process / gRPC / SDK pattern** — `09_oop_grpc_sdk_pattern.md`
+- **Out-of-Process / opt-in gRPC SDK pattern** — `09_oop_grpc_sdk_pattern.md`
 - **Platform gear inventory & high-level architecture** — `docs/MODULES.md`, `docs/ARCHITECTURE_MANIFEST.md`

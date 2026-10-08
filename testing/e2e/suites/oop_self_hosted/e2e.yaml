@@ -1,0 +1,12 @@
+# Self-hosted (Profile 2 host-spawn) E2E suite — self-managed.
+#
+# Covers the host-side half of the OoP machinery: `runtime.type: oop` in the
+# host config drives process spawn, and host shutdown stops the spawned child.
+# Each test boots a throwaway flight-control using the real
+# `config/oop-self-hosted.yaml` — the same config `make oop-example` demos.
+#
+# Sibling of `testing/e2e/suites/oop` (manual launch / Profile 3-shaped path).
+# Run via `make e2e-oop-self-hosted`; it needs the canonical ports the `oop`
+# session cluster holds while running.
+suite: oop_self_hosted
+launcher: pytest

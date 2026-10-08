@@ -24,7 +24,7 @@ COMMA := ,
 EXAMPLE_SERVER_BIN ?= cf-gears-example-server
 EXAMPLE_SERVER_DEBUG_BINARY ?= target/debug/$(EXAMPLE_SERVER_BIN)
 EXAMPLE_SERVER_MANIFEST ?= apps/cf-gears-example-server/Cargo.toml
-EXAMPLE_SERVER_FEATURE_EXCLUDES ?= default fips k8s otel oop-example timescaledb-usage-collector clickhouse-usage-collector magika graph-storage quota-enforcement
+EXAMPLE_SERVER_FEATURE_EXCLUDES ?= default fips k8s otel timescaledb-usage-collector clickhouse-usage-collector magika graph-storage quota-enforcement
 EXAMPLE_SERVER_ALL_FEATURES := $(strip $(shell cargo gears ls features --manifest $(EXAMPLE_SERVER_MANIFEST) 2>/dev/null))
 EXAMPLE_SERVER_FEATURES ?= $(subst $(SPACE),$(COMMA),$(filter-out $(EXAMPLE_SERVER_FEATURE_EXCLUDES),$(EXAMPLE_SERVER_ALL_FEATURES)))
 EXAMPLE_SERVER_FEATURE_ARGS ?= $(if $(EXAMPLE_SERVER_FEATURES),--features $(EXAMPLE_SERVER_FEATURES),)
@@ -1092,7 +1092,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-usage-collector-timescaledb e2e-usage-collector-clickhouse e2e-event-broker e2e-oop
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-usage-collector-timescaledb e2e-usage-collector-clickhouse e2e-event-broker e2e-oop e2e-oop-self-hosted e2e-oop-build
 
 E2E_TARGET ?=
 # E2E selectors for `make e2e-local`:
@@ -1204,20 +1204,32 @@ e2e-event-broker: py-env
 
 # Out-of-process (loopback) E2E: boots flight-control + OoP gears as local
 # processes (no Kubernetes) and asserts the cross-process seams. Self-managed:
-# its conftest builds the binaries and owns the process lifecycle, so it runs
-# pytest directly (not via run_e2e.py). `timeout_func_only` keeps the per-test
+# the suite conftests own the process lifecycle, so it runs pytest directly
+# (not via run_e2e.py). `timeout_func_only` keeps the per-test
 # timeout from counting the heavy fixture setup (build + boot + route sync), and
 # the 30s per-test cap (vs pytest.ini's default) leaves headroom for the
 # lifecycle tests' process stop/start + polling while still failing fast.
 ## Run the out-of-process (loopback, no-k8s) E2E suite
-e2e-oop: py-env
+e2e-oop: e2e-oop-build
+	OOP_E2E=1 $(PYTHON) -m pytest testing/e2e/suites/oop \
+		-o timeout_func_only=true --timeout=30 -vv
+
+## Run the OoP self-hosted (host-spawn) E2E suite
+# Separate target/suite: it boots the real `config/oop-self-hosted.yaml`, which
+# needs the canonical ports (8087/50051/9091) the `e2e-oop` cluster holds while
+# running — so it must run in its own pytest invocation.
+e2e-oop-self-hosted: e2e-oop-build
+	OOP_E2E=1 $(PYTHON) -m pytest testing/e2e/suites/oop_self_hosted \
+		-o timeout_func_only=true --timeout=30 -vv
+
+# Shared binary build for both OoP e2e suites
+e2e-oop-build: py-env
 	$(call print_target_banner)
 	cargo build -p cf-gears-flight-control --bin flight-control
 	cargo build -p hello --features oop_module --bin hello-oop
 	cargo build -p cf-api-contracts --features oop_module --bin api-contracts-oop
 	cargo build -p cf-api-contracts-consumer --features oop_module --bin api-contracts-consumer-oop
-	OOP_E2E=1 $(PYTHON) -m pytest testing/e2e/suites/oop \
-		-o timeout_func_only=true --timeout=30 -vv
+
 
 # -------- Code coverage --------
 
@@ -1468,11 +1480,12 @@ fips:
 	$(call print_target_banner)
 	cargo run --bin cf-gears-example-server --features fips,static-authn,static-authz,single-tenant,static-credstore,otel -- --config config/quickstart.yaml run
 
-## Run server with out-of-process example gear
+## Run flight-control with a spawned hello OoP worker (self-hosted shape)
 oop-example:
 	$(call print_target_banner)
-	cargo build -p calculator --features oop_gear
-	cargo run --bin cf-gears-example-server --features oop-example,users-info-example,static-authn,static-authz,static-tenants,static-credstore -- --config config/quickstart.yaml run
+	cargo build -p cf-gears-flight-control --bin flight-control
+	cargo build -p hello --features oop_module --bin hello-oop
+	cargo run -p cf-gears-flight-control --bin flight-control -- --config config/oop-self-hosted.yaml run
 
 # Run all quality checks
 check: fmt cfs-validate docker-pins clippy lychee security dylint gts-docs test

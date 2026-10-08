@@ -22,7 +22,8 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 | Plugins, scoped clients, GTS | `03_clienthub_and_plugins.md` | `docs/TOOLKIT_PLUGINS.md` |
 | Errors, RFC-9457 Problem | `05_errors_rfc9457.md` | |
 | Lifecycle, background tasks, cancellation | `08_lifecycle_stateful_tasks.md` | |
-| Out-of-Process / gRPC / SDK pattern | `09_oop_grpc_sdk_pattern.md` | |
+| Out-of-Process gears (REST-first) | `10_checklists_and_templates.md` (§ Out-of-Process (OoP) Gears) | `docs/web-docs/build-with-gears/out-of-process.md` |
+| Opt-in gRPC OoP SDK pattern | `09_oop_grpc_sdk_pattern.md` | |
 | Domain model macro, DDD enforcement | `02_gear_layout_and_sdk_pattern.md` (§ Domain types) | Architecture lint DE0309 (via `cargo gears lint`) |
 | Quick checklists, templates | `10_checklists_and_templates.md` | |
 | Unit & integration testing (philosophy, patterns, infrastructure) | `12_unit_testing.md` | |
@@ -57,7 +58,7 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 - `06_authn_authz_secure_orm.md` – AuthN/AuthZ integration, PolicyEnforcer PEP pattern, pep_prop mapping, SecureConn, Scopable derive, CRUD authorization patterns.
 - `07_odata_pagination_select_filter.md` – OData $filter/$orderby/$select, pagination, macro usage, field projection.
 - `08_lifecycle_stateful_tasks.md` – WithLifecycle, cancellation tokens, stateful gear patterns.
-- `09_oop_grpc_sdk_pattern.md` – Out-of-Process gears, gRPC, SDK pattern for OoP, client utilities.
+- `09_oop_grpc_sdk_pattern.md` – OoP gears are REST-first; this doc covers the opt-in gRPC SDK pattern and client utilities.
 - `10_checklists_and_templates.md` – Quick checklists per task, minimal code templates.
 - `11_database_patterns.md` – DBRunner/SecureTx executors, transactions, repository pattern, database migrations.
 - `12_unit_testing.md` – Philosophy, reliability principles, infrastructure, assert patterns, naming, priority matrix for unit/integration tests.
