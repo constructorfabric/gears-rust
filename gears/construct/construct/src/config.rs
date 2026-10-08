@@ -17,6 +17,11 @@ pub enum ModelConfig {
         #[serde(default = "default_model_timeout_ms")]
         timeout_ms: u64,
     },
+    LlmGateway {
+        model: String,
+        #[serde(default = "default_model_timeout_ms")]
+        timeout_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -105,19 +110,28 @@ mod tests {
     }
 
     #[test]
-    fn the_chat_completions_model_is_read_with_a_default_timeout() {
-        let config = parse(serde_json::json!({
-            "model": { "adapter": "chat_completions", "upstream_alias": "llm.example", "model": "fact-planner" },
-        }))
-        .expect("a model config");
-        assert_eq!(
-            config.model,
-            Some(ModelConfig::ChatCompletions {
-                upstream_alias: "llm.example".to_owned(),
-                model: "fact-planner".to_owned(),
-                timeout_ms: DEFAULT_MODEL_TIMEOUT_MS,
-            })
-        );
+    fn each_model_adapter_is_read_with_a_default_timeout() {
+        let cases = [
+            (
+                serde_json::json!({ "adapter": "chat_completions", "upstream_alias": "llm.example", "model": "fact-planner" }),
+                ModelConfig::ChatCompletions {
+                    upstream_alias: "llm.example".to_owned(),
+                    model: "fact-planner".to_owned(),
+                    timeout_ms: DEFAULT_MODEL_TIMEOUT_MS,
+                },
+            ),
+            (
+                serde_json::json!({ "adapter": "llm_gateway", "model": "fact-planner" }),
+                ModelConfig::LlmGateway {
+                    model: "fact-planner".to_owned(),
+                    timeout_ms: DEFAULT_MODEL_TIMEOUT_MS,
+                },
+            ),
+        ];
+        for (model, expected) in cases {
+            let config = parse(serde_json::json!({ "model": model })).expect("a model config");
+            assert_eq!(config.model, Some(expected));
+        }
     }
 
     #[test]
@@ -133,6 +147,13 @@ mod tests {
             }))
             .is_err(),
             "typo in a model key"
+        );
+        assert!(
+            parse(serde_json::json!({
+                "model": { "adapter": "llm_gateway", "upstream_alias": "a", "model": "m" },
+            }))
+            .is_err(),
+            "the gateway takes no upstream"
         );
     }
 

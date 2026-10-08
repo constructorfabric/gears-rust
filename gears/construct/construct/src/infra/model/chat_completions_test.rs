@@ -14,12 +14,9 @@ use uuid::Uuid;
 
 use super::chat_completions::ChatCompletionsModel;
 use super::model_client;
+use super::test_requests::{context, planner_request, verdict_request};
 use crate::config::ModelConfig;
-use crate::domain::model_client::{
-    AnswerKind, Message, ModelClient, ModelError, ModelOutput, ModelRequest, ToolCall, ToolSpec,
-    Usage,
-};
-use crate::test_support::context_in;
+use crate::domain::model_client::{ModelClient, ModelError, ModelOutput, ToolCall, Usage};
 
 const TOOL_CALLS: &str = include_str!("fixtures/chat_tool_calls.json");
 const STRUCTURED: &str = include_str!("fixtures/chat_structured.json");
@@ -166,50 +163,6 @@ fn model_behind(gateway: Arc<FakeGateway>) -> ChatCompletionsModel {
         "fact-planner".to_owned(),
         Duration::from_millis(200),
     )
-}
-
-fn context() -> SecurityContext {
-    context_in(Uuid::new_v4())
-}
-
-fn planner_request() -> ModelRequest {
-    ModelRequest {
-        messages: vec![
-            Message::System("Decide how the record changes the profile.".to_owned()),
-            Message::User("1. work_history: Acme, teacher".to_owned()),
-            Message::Assistant {
-                text: None,
-                tool_calls: vec![ToolCall {
-                    id: "call_1".to_owned(),
-                    name: "replace".to_owned(),
-                    arguments: json!({ "value_number": 1 }),
-                }],
-            },
-            Message::ToolResult {
-                call_id: "call_1".to_owned(),
-                content: "replaced value 1".to_owned(),
-            },
-        ],
-        tools: vec![ToolSpec {
-            name: "add".to_owned(),
-            description: "Add a fact.".to_owned(),
-            parameters: json!({ "type": "object", "properties": { "property": { "type": "string" } } }),
-        }],
-        answer: AnswerKind::Text,
-        max_output_tokens: Some(512),
-    }
-}
-
-fn verdict_request() -> ModelRequest {
-    ModelRequest {
-        messages: vec![Message::User("Check the values.".to_owned())],
-        tools: vec![],
-        answer: AnswerKind::Structured {
-            name: "verdict".to_owned(),
-            schema: json!({ "type": "object", "properties": { "verdict": { "type": "string" } } }),
-        },
-        max_output_tokens: None,
-    }
 }
 
 #[tokio::test]

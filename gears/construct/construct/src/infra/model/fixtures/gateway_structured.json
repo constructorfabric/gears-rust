@@ -1,0 +1,68 @@
+{
+  "id": "resp_68e4f1c2a9d08190b3c5e7f91d2a4b6c",
+  "object": "response",
+  "created_at": 1759823112,
+  "completed_at": 1759823114,
+  "status": "completed",
+  "incomplete_details": null,
+  "model": "gpt-4.1-mini-2025-04-14",
+  "instructions": null,
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_68e4f1c3c2d08190c4e6a8b0d2f4a6c8",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"verdict\":\"allow\",\"kind\":\"health\"}",
+          "annotations": []
+        }
+      ]
+    }
+  ],
+  "error": null,
+  "tools": [],
+  "tool_choice": "auto",
+  "truncation": "disabled",
+  "parallel_tool_calls": true,
+  "text": {
+    "format": {
+      "type": "json_schema",
+      "name": "verdict",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "verdict": {
+            "type": "string"
+          }
+        }
+      },
+      "strict": true
+    }
+  },
+  "top_p": 1.0,
+  "presence_penalty": 0.0,
+  "frequency_penalty": 0.0,
+  "top_logprobs": 0,
+  "temperature": 1.0,
+  "reasoning": {},
+  "usage": {
+    "input_tokens": 212,
+    "output_tokens": 14,
+    "total_tokens": 226,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  },
+  "max_output_tokens": null,
+  "max_tool_calls": null,
+  "service_tier": "default",
+  "metadata": null,
+  "safety_identifier": null,
+  "prompt_cache_key": null
+}

@@ -2460,6 +2460,7 @@ dependencies = [
  "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
  "cf-gears-construct-sdk",
+ "cf-gears-llm-gateway-sdk",
  "cf-gears-oagw-sdk",
  "cf-gears-settings-service-sdk",
  "cf-gears-toolkit",

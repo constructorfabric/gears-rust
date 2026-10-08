@@ -1,0 +1,75 @@
+{
+  "id": "resp_68e4f1c2a9d08190b3c5e7f91d2a4b6c",
+  "object": "response",
+  "created_at": 1759823112,
+  "completed_at": 1759823114,
+  "status": "completed",
+  "incomplete_details": null,
+  "model": "gpt-4.1-mini-2025-04-14",
+  "instructions": null,
+  "output": [
+    {
+      "type": "function_call",
+      "id": "fc_68e4f1c3b1a88190a2d4c6e8f0b2d4f6",
+      "status": "completed",
+      "call_id": "call_Qm2xY7nR4tVb8kLs1pZc0dEf",
+      "name": "replace",
+      "arguments": "{\"value_number\":1,\"value\":{\"work_history\":{\"organization\":\"Acme\",\"title\":\"School principal\"}}}"
+    },
+    {
+      "type": "function_call",
+      "id": "fc_68e4f1c3b1b48190b5e7f9a1c3e5a7b9",
+      "status": "completed",
+      "call_id": "call_Hj5wK2mN9pRt3vXy6aBc4dFg",
+      "name": "add",
+      "arguments": "{\"property\":\"skills\",\"value\":{\"name\":\"Curriculum design\"}}"
+    }
+  ],
+  "error": null,
+  "tools": [
+    {
+      "type": "function",
+      "name": "add",
+      "description": "Add a fact.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "property": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "truncation": "disabled",
+  "parallel_tool_calls": true,
+  "text": {
+    "format": {
+      "type": "text"
+    }
+  },
+  "top_p": 1.0,
+  "presence_penalty": 0.0,
+  "frequency_penalty": 0.0,
+  "top_logprobs": 0,
+  "temperature": 1.0,
+  "reasoning": {},
+  "usage": {
+    "input_tokens": 1843,
+    "output_tokens": 96,
+    "total_tokens": 1939,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  },
+  "max_output_tokens": 512,
+  "max_tool_calls": null,
+  "service_tier": "default",
+  "metadata": null,
+  "safety_identifier": null,
+  "prompt_cache_key": null
+}

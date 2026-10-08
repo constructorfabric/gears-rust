@@ -30,6 +30,7 @@ authz-resolver = { workspace = true }
 settings-service-sdk = { workspace = true }
 
 oagw-sdk = { workspace = true }
+llm-gateway-sdk = { package = "cf-gears-llm-gateway-sdk", version = "0.1.11", path = "../../llm-gateway/llm-gateway-sdk" }
 http = { workspace = true }
 bytes = { workspace = true }
 
