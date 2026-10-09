@@ -1,0 +1,48 @@
+name: Helm Charts
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'deploy/helm/**'
+      - 'apps/**/deploy/helm/**'
+      - 'examples/**/deploy/helm/**'
+      - 'gears/**/deploy/helm/**'
+      - '.github/workflows/helm.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: helm-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  helm_lint_template:
+    name: Helm Lint & Template
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Helm
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: helm
+
+      - name: Resolve chart dependencies
+        run: bash deploy/helm/update-helm-deps.sh
+
+      - name: Helm lint (library, umbrella, and all gear charts)
+        run: |
+          gear_charts=$(grep -rlE --include=Chart.yaml \
+            '^[[:space:]]*-[[:space:]]*name:[[:space:]]*toolkit-common' \
+            apps examples gears | grep -v '/charts/' | xargs -r -n1 dirname)
+          helm lint deploy/helm/toolkit-common deploy/helm/toolkit-platform $gear_charts
+
+      - name: Helm template (umbrella presets)
+        run: |
+          helm template demo deploy/helm/toolkit-platform >/dev/null
+          helm template demo deploy/helm/toolkit-platform \
+            -f deploy/helm/toolkit-platform/values-dev.yaml >/dev/null

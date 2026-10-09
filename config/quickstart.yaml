@@ -233,6 +233,22 @@ gears:
       # one. See the plugin README for a worked rule set.
       grants: []
 
+  # Requires --features admission-control.
+  # Admission gate for platform operations (gears/system/admission-control).
+  # `engine` is omitted on purpose: with no engine configured the gate refuses
+  # every operation with could-not-run. Add `engine: { vendor: "<vendor>" }`
+  # (optionally `instance_id: "<GTS instance id>"`) once an engine plugin is
+  # linked; a configured engine that cannot be resolved fails startup.
+  # Refusals are published best-effort to the event broker when one is linked
+  # (dropped otherwise). Timeouts are in milliseconds; unknown keys fail
+  # startup.
+  admission-control:
+    config:
+      engine_timeout_ms: 100
+      max_properties: 256
+      max_context_bytes: 65536
+      event_queue_capacity: 1024
+
   account-management:
     database:
       server: "sqlite_users"
@@ -499,9 +515,8 @@ gears:
       sidecar_base_url: "http://localhost:8099"
       storage_root: "./.file-storage-data"
       signing_key_seed: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      # Quickstart exercises the production default: sweep the orphan/expired
-      # backlog in the background.
-      enable_background_sweep: true
+      # dev only
+      finalize_internal_secret: "dev-file-storage-internal-secret"
 
   # File parser gear configuration (no database needed)
   file-parser:

@@ -16,15 +16,8 @@ use crate::infra::signed_url::{Op, UploadConstraints};
 use crate::infra::storage::store::IdempotencyInsert;
 
 impl FileService {
-    // ── policy enforcement helpers ────────────────────────────────────────────
-
-    /// Resolve the effective policy for a given `(tenant_id, owner_id)` pair
-    /// using an internal (`allow_all`) scope — callers have already been
-    /// authorized for the file operation; this is a preflight check only.
-    ///
-    /// @cpt-cf-file-storage-fr-allowed-types-policy
-    /// @cpt-cf-file-storage-fr-size-limits-policy
-    /// @cpt-cf-file-storage-fr-metadata-limits
+    /// Effective policy for `(tenant_id, owner_id)` under an `allow_all` scope; callers
+    /// are already authorized for the file operation.
     pub(super) async fn get_effective_policy_internal(
         &self,
         tenant_id: Uuid,
@@ -47,19 +40,10 @@ impl FileService {
         ))
     }
 
-    /// Run a quota preflight check for `additional_bytes` of new storage.
+    /// Quota preflight using `effective_max_bytes.unwrap_or(1)` as a pessimistic size.
     ///
-    /// Passes `effective_max_bytes.unwrap_or(1)` as the pessimistic upper bound:
-    /// if the maximum allowed size would bust the quota, we deny early.
-    ///
-    /// **Fail-closed**: if the quota client returns an error, the error is
-    /// propagated and the request is denied. A failing quota service is safer
-    /// than silently allowing unbounded storage growth.
-    ///
-    /// `op` labels the caller (`"create_file"` / `"presign_version"`) for the
-    /// `quota_denied` metric (P2 1.8 remediation).
-    ///
-    /// @cpt-cf-file-storage-fr-storage-quota
+    /// Fail-closed: a quota client error denies the request. `op` labels the
+    /// `quota_denied` metric.
     pub(super) async fn check_quota(
         &self,
         tenant_id: Uuid,
@@ -69,11 +53,8 @@ impl FileService {
     ) -> Result<(), DomainError> {
         use crate::infra::external_clients::QuotaDecision;
         let Some(qc) = &self.quota_client else {
-            return Ok(()); // no quota client configured — permissive
+            return Ok(()); // no quota client configured
         };
-        // Use the effective max as the pessimistic size estimate. If no max is
-        // configured (unlimited policy), pass 1 as a token check that any new
-        // storage at all is permitted.
         let additional_bytes = effective_max_bytes.unwrap_or(1);
         match qc
             .check_storage_quota(
@@ -92,13 +73,8 @@ impl FileService {
         }
     }
 
-    // ── create + presign ─────────────────────────────────────────────────────
-
     /// `POST /files`: create a file and presign the first content upload.
     /// An optional `idempotency_key` deduplicates retried requests.
-    ///
-    /// @cpt-cf-file-storage-fr-upload-idempotency
-    /// @cpt-cf-file-storage-fr-audit-trail
     #[tracing::instrument(skip_all)]
     pub async fn create_file(
         &self,
@@ -110,11 +86,7 @@ impl FileService {
         let owner_id = new.owner_id;
         let owner_kind_str = new.owner_kind.as_str().to_owned();
 
-        // @cpt-cf-file-storage-fr-upload-idempotency
-        // Canonicalize the current request into a comparable hash up front —
-        // both the replay-comparison path (below) and the fresh-insert path
-        // (further down) must hash the exact same encoding of the same
-        // request, so this is computed exactly once.
+        // Computed once: the replay comparison and the fresh insert must use the same hash.
         let initial_meta: Vec<(String, String)> = new
             .custom_metadata
             .iter()
@@ -129,27 +101,16 @@ impl FileService {
             &initial_meta,
         );
 
-        // @cpt-cf-file-storage-fr-upload-idempotency
-        // Authorize the write BEFORE consulting any stored idempotency
-        // record. The idempotency lookup used to run first and return early
-        // with a live signed upload URL — a caller whose WRITE grant was
-        // revoked (or was never authorized) could still replay a stored
-        // ticket. Every replay must now clear the caller's *current* grants,
-        // exactly like a fresh request would.
+        // Authorize BEFORE consulting the idempotency record, so a replay (which returns a
+        // live signed URL) always clears the caller's current grants.
         Self::validate_gts_type(&new.gts_file_type)?;
         let _scope = self
             .authorizer
             .authorize(ctx, actions::WRITE, &new.gts_file_type, None)
             .await?;
 
-        // @cpt-cf-file-storage-fr-upload-idempotency
-        // Now that the caller is authorized, consult the idempotency store.
-        // The stored record is bound to the subject that created it
-        // (`subject_id`); a caller can never surface another caller's ticket
-        // by reusing/guessing their `(owner_kind, owner_id, key)` tuple —
-        // a subject mismatch is treated as `Forbidden` rather than silently
-        // falling through to a fresh create (which would otherwise race the
-        // still-live row on insert).
+        // The record is bound to its creating `subject_id`; a mismatch is `Forbidden`
+        // (not a fresh create, which would race the still-live row on insert).
         if let Some(ref key) = idempotency_key {
             let now = OffsetDateTime::now_utc();
             if let Some(record) = self
@@ -160,12 +121,7 @@ impl FileService {
                 if record.subject_id != ctx.subject_id() {
                     return Err(DomainError::Forbidden);
                 }
-                // @cpt-cf-file-storage-fr-upload-idempotency
-                // P2 remediation 2.1: a retried request with the same key but
-                // a materially different body (owner, name, gts_file_type,
-                // mime_type, custom_metadata) must never silently replay the
-                // original ticket — that would surface a response for a
-                // request the caller never actually made.
+                // Same key with a different body must not replay the original ticket.
                 if record.request_hash != request_hash {
                     return Err(DomainError::conflict(
                         "idempotency key reused with a different request body",
@@ -182,19 +138,12 @@ impl FileService {
             }
         }
 
-        // @cpt-cf-file-storage-fr-allowed-types-policy
-        // @cpt-cf-file-storage-fr-size-limits-policy
-        // @cpt-cf-file-storage-fr-metadata-limits
-        // @cpt-cf-file-storage-fr-storage-quota
-        // @cpt-dod:cpt-cf-file-storage-dod-policy-enforcement-wiring:p1
         let policy = self
             .get_effective_policy_internal(tenant_id, owner_id)
             .await?;
 
-        // Validate allowed mime types.
         PolicyResolver::check_allowed_mime(&policy, &new.mime_type)?;
 
-        // Compute effective size ceiling and validate initial metadata.
         let backend = self.backends.default_backend();
         let effective_max = PolicyResolver::compute_effective_max_bytes(
             &policy,
@@ -202,11 +151,8 @@ impl FileService {
             backend.capabilities().max_size_bytes,
         );
 
-        // Validate initial custom metadata against limits (`initial_meta` was
-        // already collected above, for `request_hash`).
         PolicyResolver::check_metadata_limits(&policy, &initial_meta)?;
 
-        // Quota preflight — pessimistic: check whether max allowed size fits quota.
         self.check_quota(tenant_id, owner_id, effective_max, "create_file")
             .await?;
 
@@ -216,7 +162,6 @@ impl FileService {
         let backend_id = backend.id().to_owned();
         let backend_path = Self::backend_path(file_id, version_id);
 
-        // @cpt-cf-file-storage-fr-audit-trail
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -224,7 +169,6 @@ impl FileService {
             serde_json::json!({ "version_id": version_id, "gts_file_type": new.gts_file_type }),
         );
 
-        // @cpt-cf-file-storage-fr-file-events
         let event = Some(Self::make_file_event(
             tenant_id,
             owner_id,
@@ -233,9 +177,8 @@ impl FileService {
             serde_json::json!({ "version_id": version_id, "gts_file_type": new.gts_file_type }),
         ));
 
-        // Sign the upload URL up front — `sign_url` has no DB dependency, so the
-        // ticket (and the idempotency replay body derived from it) can be built
-        // before the create transaction and persisted atomically within it.
+        // `sign_url` has no DB dependency, so the ticket and the idempotency replay body
+        // are built first and persisted atomically in the create transaction.
         let upload_url = self.sign_url(
             Op::Put,
             &VersionRef {
@@ -256,10 +199,7 @@ impl FileService {
             upload_url,
         };
 
-        // @cpt-cf-file-storage-fr-upload-idempotency
-        // Build the idempotency row so the create transaction persists it in the
-        // same commit as the file — a committed create always leaves a replay
-        // record behind, so a retry with the same key never creates a 2nd file.
+        // Persisted in the same commit as the file, so a retry never creates a second file.
         let idempotency = idempotency_key.as_ref().map(|key| {
             let response_body = serde_json::to_string(&IdempotencyTicket {
                 file_id: ticket.file_id,
@@ -300,8 +240,7 @@ impl FileService {
             )
             .await?;
 
-        // @cpt-cf-file-storage-fr-usage-reporting
-        // Fire-and-forget: report +1 file to usage collector.
+        // Fire-and-forget usage report.
         self.report_usage(UsageDelta {
             tenant_id,
             owner_id,
@@ -313,8 +252,7 @@ impl FileService {
         Ok(ticket)
     }
 
-    /// `POST /files/{id}/versions`: presign a new content version on an existing
-    /// file (the upload's bytes will be bound via `bind`).
+    /// `POST /files/{id}/versions`: presign a new content version (bound later via `bind`).
     pub async fn presign_version(
         &self,
         ctx: &SecurityContext,
@@ -327,16 +265,13 @@ impl FileService {
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
             .await?;
 
-        // Reuse the current version's mime as the declared type placeholder.
+        // The current version's mime stands in as the declared type.
         let mime_type = self
             .store
             .current_version_mime(&file)
             .await?
             .unwrap_or_else(|| "application/octet-stream".to_owned());
 
-        // @cpt-cf-file-storage-fr-allowed-types-policy
-        // @cpt-cf-file-storage-fr-size-limits-policy
-        // @cpt-cf-file-storage-fr-storage-quota
         let tenant_id = ctx.subject_tenant_id();
         let owner_id = file.owner_id;
         let policy = self

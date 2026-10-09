@@ -1,31 +1,16 @@
-//! OpenTelemetry-backed metrics for the file-storage gear (P2 1.8 remediation).
+//! OpenTelemetry-backed implementation of the domain-owned `FileStorageMetricsPort`.
 //!
-//! Mirrors `gears/mini-chat/mini-chat/src/infra/metrics.rs`: wraps
-//! `opentelemetry::metrics::{Counter, Histogram}` instruments obtained from a
-//! `Meter`, and implements the domain-owned [`FileStorageMetricsPort`] (DIP —
-//! the domain names the port, this module is the sole infra adapter).
+//! `FileStorageMetricsMeter` is used by both the control-plane gear and the sidecar binary,
+//! each with its own `Meter` (separate OS processes).
 //!
-//! [`FileStorageMetricsMeter`] is shared by both processes that make up this
-//! gear:
-//! - the control-plane gear (`gear.rs`, one `Meter` obtained via
-//!   `opentelemetry::global::meter_with_scope` at `init()`);
-//! - the sidecar binary (`bin/sidecar.rs`'s `main()`, its own `Meter`
-//!   instance — a separate OS process owns its own global `MeterProvider`
-//!   registration; standing up an `OTel` exporter for the sidecar process is
-//!   out of scope for this step, see the note in `bin/sidecar.rs`).
-//!
-//! ## `_total` suffix
-//!
-//! Counter instrument names intentionally omit the `_total` suffix from
-//! Prometheus metric names, matching mini-chat's convention — the
-//! `opentelemetry-prometheus` exporter appends `_total` automatically.
+//! Counter names omit the `_total` suffix: the `opentelemetry-prometheus` exporter appends it.
 
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 
 use crate::domain::ports::FileStorageMetricsPort;
 
-/// OpenTelemetry-backed implementation of [`FileStorageMetricsPort`].
+/// OpenTelemetry-backed `FileStorageMetricsPort`.
 pub struct FileStorageMetricsMeter {
     operation: Counter<u64>,
     backend_error: Counter<u64>,
@@ -41,8 +26,7 @@ pub struct FileStorageMetricsMeter {
 }
 
 impl FileStorageMetricsMeter {
-    /// Create all instruments. `prefix` is prepended to every metric name
-    /// (e.g. `"file_storage"`), matching mini-chat's convention.
+    /// Create all instruments; `prefix` (e.g. `"file_storage"`) is prepended to every name.
     #[must_use]
     pub fn new(meter: &Meter, prefix: &str) -> Self {
         Self {
@@ -166,15 +150,8 @@ impl FileStorageMetricsPort for FileStorageMetricsMeter {
     }
 }
 
-/// No-op implementation of [`FileStorageMetricsPort`].
-///
-/// The default for `FileService`/`MultipartService`/`SidecarState` so every
-/// existing construction call site (the ~40 across the integration-test
-/// suite, plus the sidecar's `test_state()`/`test_download_state()` helpers)
-/// keeps compiling unchanged. Production wiring opts into the real
-/// [`FileStorageMetricsMeter`] via `.with_metrics(...)` (control plane,
-/// `gear.rs`) or by populating `SidecarState::metrics` directly (sidecar,
-/// `bin/sidecar.rs::main`).
+/// No-op `FileStorageMetricsPort`, the default for the services and `SidecarState`;
+/// production wiring opts into `FileStorageMetricsMeter`.
 pub struct NoopMetrics;
 
 impl FileStorageMetricsPort for NoopMetrics {

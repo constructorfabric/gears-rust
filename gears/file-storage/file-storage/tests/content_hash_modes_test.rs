@@ -1,19 +1,4 @@
-//! ADR-0006 content-hash-modes acceptance criteria (§6).
-//!
-//! Proves the multipart offset-manifest composite mode end-to-end:
-//!   - AC2: `complete_multipart` issues **no** `GetObject`/re-read of the
-//!     assembled object (request-counting wrapper backend).
-//!   - AC3: a client-side re-verification helper (split at manifest offsets,
-//!     rehash, rebuild, compare to `root`) succeeds on real content and fails
-//!     when any byte in any part is tampered with.
-//!   - AC4: `migrate_backend` verifies a `multipart-composite-sha256` version
-//!     from object bytes + the stored `version_hash_manifest` row ALONE, with
-//!     the `multipart_upload_parts` rows deleted first.
-//!
-//! The manifest wire-format acceptance criterion (AC1) is proven by the
-//! `hash_mode` unit tests (`src/infra/content/hash_mode_tests.rs`); the
-//! `whole-sha256` finalize-time client-claim rejection (AC7) is proven by
-//! `tests/finalize_test.rs`.
+//! ADR-0006 acceptance tests for the multipart offset-manifest composite hash mode.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -48,9 +33,7 @@ use file_storage_sdk::{ByteRange, NewFile, OwnerKind};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
-/// A `StorageBackend` decorator that counts whole-object reads (`get` /
-/// `get_stream`) so a test can assert the ADR-0006 "no re-read at complete"
-/// invariant. Every other method delegates unchanged to the inner backend.
+/// Backend decorator counting whole-object reads (`get`/`get_stream`); other methods delegate.
 struct CountingBackend {
     inner: Arc<dyn StorageBackend>,
     reads: Arc<AtomicUsize>,
@@ -89,18 +72,12 @@ impl StorageBackend for CountingBackend {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.get_stream(path).await
     }
-    // Not counted: a bounded range read is not a "whole-object read" (see the
-    // struct doc comment above) -- unlike `get`/`get_stream`, it never
-    // re-reads the entire assembled object, so it is not what AC2 guards
-    // against. Without this override the trait's *default* `get_range`
-    // (`full = self.get(path).await?`) would dispatch back through this
-    // wrapper's counted `get` and inflate the counter for what is, on every
-    // real backend (`LocalFsBackend`, `S3Backend`), a small native
-    // range-limited fetch. P2 remediation item 1.10 added exactly this call
-    // (a bounded MIME-sniff prefix read) to `complete_multipart_upload`,
-    // after this file's AC2 was written to prove "no whole-object re-read".
+    // Not counted: a bounded range read (MIME-sniff prefix) is not a whole-object read.
     async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
         self.inner.get_range(path, range).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
     }
     async fn delete(&self, path: &str) -> Result<(), DomainError> {
         self.inner.delete(path).await
@@ -215,10 +192,8 @@ fn new_file() -> NewFile {
     }
 }
 
-/// Drive a full multipart upload (via the multipart service) using two 5 MiB
-/// parts + a small tail, simulating the sidecar's `upload_part` +
-/// `upsert_multipart_part` callbacks. Returns `(file_id, version_id,
-/// upload_id, plan, full_bytes)`.
+/// Drive a full multipart upload via the service (two 5 MiB parts plus a small tail),
+/// simulating the sidecar callbacks.
 #[allow(clippy::type_complexity)]
 async fn drive_multipart(
     svc: &FileService,
@@ -292,8 +267,6 @@ async fn drive_multipart(
     (file_id, plan.version_id, plan.upload_id, plan, full)
 }
 
-// ── AC2: no GetObject / re-read at complete time ──────────────────────────
-
 #[tokio::test]
 async fn complete_multipart_issues_no_object_reread() {
     let db = build_db_with_dsn().await.0;
@@ -307,8 +280,6 @@ async fn complete_multipart_issues_no_object_reread() {
     let (file_id, version_id, upload_id, _plan, _full) =
         drive_multipart(&svc, &msvc, &store, &backend, &ctx).await;
 
-    // Snapshot the whole-object-read counter, complete, and assert the
-    // completion step re-read the assembled object ZERO times.
     let before = reads.load(Ordering::SeqCst);
     msvc.complete_multipart_upload(&ctx, file_id, upload_id, None)
         .await
@@ -319,7 +290,6 @@ async fn complete_multipart_issues_no_object_reread() {
         "complete_multipart must not GetObject/re-read the assembled object (ADR-0006)"
     );
 
-    // Sanity: the version really did land as multipart-composite.
     let version = store
         .get_version(file_id, version_id)
         .await
@@ -336,8 +306,6 @@ async fn complete_multipart_issues_no_object_reread() {
         "a multipart-composite version must have a manifest row"
     );
 }
-
-// ── AC3: client-side re-verification succeeds; tamper fails ───────────────
 
 #[tokio::test]
 async fn client_reverification_succeeds_and_detects_tampering() {
@@ -364,8 +332,6 @@ async fn client_reverification_succeeds_and_detects_tampering() {
         .unwrap()
         .unwrap();
 
-    // Independent client re-verification: split at manifest offsets, rehash,
-    // rebuild, compare to root — succeeds against the real content.
     Store::verify_content_hash(
         &full,
         HashMode::MultipartCompositeSha256,
@@ -374,7 +340,6 @@ async fn client_reverification_succeeds_and_detects_tampering() {
     )
     .expect("re-verification must succeed on untampered content");
 
-    // Flip a single byte in the FIRST part — verification must now fail.
     let mut tampered = full.clone();
     tampered[10] ^= 0xff;
     let err = Store::verify_content_hash(
@@ -386,7 +351,6 @@ async fn client_reverification_succeeds_and_detects_tampering() {
     .expect_err("a tampered first part must fail re-verification");
     assert!(matches!(err, DomainError::HashMismatch { .. }));
 
-    // Flip a byte in the LAST (tail) part too — also detected.
     let mut tampered_tail = full.clone();
     let last = tampered_tail.len() - 1;
     tampered_tail[last] ^= 0xff;
@@ -401,13 +365,10 @@ async fn client_reverification_succeeds_and_detects_tampering() {
         "a tampered tail part must fail re-verification"
     );
 
-    // Independent cross-check that root == sha256(manifest) using the parser.
     let parsed = Manifest::from_wire_string(&manifest).unwrap();
     assert_eq!(parsed.root().as_slice(), version.hash_value.as_slice());
     assert_eq!(hash::sha256(manifest.as_bytes()), version.hash_value);
 }
-
-// ── AC4: migrate_backend verifies from manifest row alone ─────────────────
 
 #[tokio::test]
 async fn migrate_backend_verifies_multipart_composite_without_parts_rows() {
@@ -425,9 +386,7 @@ async fn migrate_backend_verifies_multipart_composite_without_parts_rows() {
         .await
         .unwrap();
 
-    // Delete the multipart-session part rows: migrate_backend's verification
-    // must NOT depend on them (ADR-0006 §4 — the manifest is the durable,
-    // self-contained record).
+    // `migrate_backend` verification must not depend on the part rows.
     let conn = Database::connect(&dsn).await.expect("raw connect");
     let deleted = conn
         .execute_raw(Statement::from_string(
@@ -441,10 +400,7 @@ async fn migrate_backend_verifies_multipart_composite_without_parts_rows() {
         "the test must actually delete the part rows it is proving are unnecessary"
     );
 
-    // `create_file` pre-registers an initial (never-finalized) pending version
-    // alongside the multipart-composite one; migrate_backend only operates on
-    // non-versioned files (exactly one version), so drop the leftover pending
-    // row, leaving just the completed multipart-composite version.
+    // Drop the leftover pending version from `create_file`: `migrate_backend` needs exactly one.
     conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "DELETE FROM file_versions WHERE status = 'pending'".to_owned(),
@@ -452,14 +408,10 @@ async fn migrate_backend_verifies_multipart_composite_without_parts_rows() {
     .await
     .expect("delete leftover pending version");
 
-    // Migrate mem -> mem2. Internally re-reads the object bytes, fetches the
-    // version_hash_manifest row, and verifies via split-rehash-rebuild — with
-    // no multipart_upload_parts rows in existence.
     svc.migrate_backend(&ctx, file_id, "mem2")
         .await
         .expect("migrate must verify from object bytes + manifest row alone");
 
-    // The version now points at the destination backend and still verifies.
     let version = store
         .get_version(file_id, version_id)
         .await

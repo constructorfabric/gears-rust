@@ -1,0 +1,10 @@
+apiVersion: v2
+name: hello
+description: Deploys the hello gear.
+type: application
+version: 0.1.0
+appVersion: "dev"
+dependencies:
+  - name: toolkit-common
+    version: 0.1.0
+    repository: "file://../../../../../../deploy/helm/toolkit-common"

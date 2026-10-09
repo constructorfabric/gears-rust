@@ -1,14 +1,11 @@
 //! `SeaORM` entity for the `version_hash_manifest` table (ADR-0006).
 //!
-//! One row per `multipart-composite-sha256` version — the durable,
-//! self-contained record (offsets + per-part SHA-256 digests) that lets a
-//! client or `migrate_backend` independently re-verify `hash_value` without
-//! any dependency on `multipart_upload_parts` surviving past the multipart
-//! session's own lifecycle. No row exists for `whole-sha256` versions.
+//! One row per `multipart-composite-sha256` version: a self-contained record
+//! (offsets + per-part SHA-256 digests) to re-verify `hash_value` independently of
+//! `multipart_upload_parts`. No row exists for `whole-sha256` versions.
 //!
-//! No `tenant_id` column: reached through the parent `file_versions` row
-//! (FK, `ON DELETE CASCADE`), so tenant scoping is enforced there, not
-//! re-declared here — mirrors `file_version.rs`'s own rationale.
+//! No `tenant_id` column: tenant scoping is on the parent `file_versions` row
+//! (FK, `ON DELETE CASCADE`).
 
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;

@@ -571,12 +571,7 @@ testing/e2e/logs/
 # END Constructor Studio
 *.backup*
 .cf-studio/config/kits/sdlc/*
-.cf-studio/.cache/explore/*
-.cf-studio/.cache/decisions.jsonl
-.cf-studio/.cache/decisions.jsonl.1
-.cf-studio/.cache/decisions.jsonl.lock
-.cf-studio/.cache/doc-index/
-.cf-studio/.cache/planning/*
+.cf-studio/.cache
 
 # code-ranker reports
 .code-ranker/
@@ -589,3 +584,7 @@ testing/e2e/logs/
 
 # Local reports from the toolkit-pr-review skill (never committed)
 /REVIEW_*.md
+
+# Helm chart artifacts (never committed)
+*.tgz
+Chart.lock

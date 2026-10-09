@@ -1,30 +1,5 @@
-//! P2 initial migration — all P2 schema in one step.
-//!
-//! Combines every P2 milestone's DDL into a single migration so P2 ships as
-//! one atomic schema bump on top of the P1 baseline. Tables (in FK order):
-//!   - `policies`: per-tenant / per-user policy body (allowed types, size
-//!     limits, metadata limits, enabled event types). Body is JSONB/text.
-//!   - `retention_rules`: per-tenant / per-user / per-file retention criteria.
-//!   - `multipart_uploads`: in-flight multipart upload sessions.
-//!   - `multipart_upload_parts`: individual parts within a session.
-//!   - `idempotency_keys`: deduplication keys for POST /files.
-//!   - `audit_outbox`: transactional-outbox rows for the audit trail.
-//!   - `events_outbox`: transactional-outbox rows for file events.
-//!
-//! Mirrors the P2 section of `gears/file-storage/docs/migration.sql`; table
-//! names are flat (unqualified) -- consistent with P1 and the `SeaORM` entity
-//! `table_name` attributes.
-//!
-//! @cpt-cf-file-storage-fr-allowed-types-policy
-//! @cpt-cf-file-storage-fr-size-limits-policy
-//! @cpt-cf-file-storage-fr-metadata-limits
-//! @cpt-cf-file-storage-fr-retention-policies
-//! @cpt-cf-file-storage-fr-multipart-upload
-//! @cpt-cf-file-storage-fr-upload-idempotency
-//! @cpt-cf-file-storage-fr-audit-trail
-//! @cpt-cf-file-storage-nfr-audit-completeness
-//! @cpt-dod:cpt-cf-file-storage-dod-audit-trail-schema:p2
-//! @cpt-cf-file-storage-fr-file-events
+//! Policies, retention rules, multipart uploads (+ parts), idempotency keys, and
+//! the audit/events transactional outboxes, in FK order. Table names are flat.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;

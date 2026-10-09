@@ -10,21 +10,9 @@ mod m20260706_000002_idempotency_request_hash;
 mod m20260706_000003_policies_unique_scope;
 mod m20260707_000001_content_hash_modes;
 
-/// File-storage migrator. P1 ships the initial control-plane metadata tables;
-/// P2 adds the policy store, retention rules, multipart uploads + idempotency
-/// keys, and the audit + file-events transactional outboxes in one step.
-/// P2-multipart-coordinator adds the plan columns (`declared_size`, `part_size`)
-/// to `multipart_uploads` for the server-authoritative parts-plan model.
-/// P2-remediation-0.10 adds `subject_id` to `idempotency_keys` so a replay can
-/// be bound to the authenticated caller, not just the request-body owner.
-/// P2-remediation-2.1 adds `request_hash` to `idempotency_keys` so a replay
-/// can be bound to the request body that created it, not just the caller.
-/// P2-remediation-2.4 adds two partial unique indexes on `policies` so at
-/// most one row can exist per `(tenant_id, scope, scope_owner_id)`, closing
-/// the upsert delete-then-insert race.
-/// ADR-0006 adds `hash_mode`/`part_count` to `file_versions` and the new
-/// `version_hash_manifest` table for the multipart offset-manifest composite
-/// content-hash mode.
+/// File-storage migrator: control-plane tables, policy/retention/multipart/idempotency/outbox
+/// tables, multipart plan columns, idempotency `subject_id` and `request_hash`, unique
+/// policy-scope indexes, and content-hash modes (`hash_mode`, `version_hash_manifest`).
 pub struct Migrator;
 
 #[async_trait::async_trait]

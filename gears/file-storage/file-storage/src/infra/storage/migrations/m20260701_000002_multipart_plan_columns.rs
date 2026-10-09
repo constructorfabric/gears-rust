@@ -1,18 +1,6 @@
-//! Server-authoritative multipart-coordinator schema delta.
-//!
-//! Adds the plan columns to `multipart_uploads` that the server-authoritative
-//! multipart model requires (FEATURE `multipart-coordinator`, §6):
-//!
-//! - `declared_size bigint NOT NULL` — the gated total; allows `complete` and
-//!   resume to verify actual-vs-declared without re-summing parts.
-//! - `part_size bigint NOT NULL` — the server-chosen plan unit; together with
-//!   `declared_size` this reconstitutes the full plan for resume without a
-//!   per-part plan table.
-//!
-//! `version_id` was already present in the P2-initial migration
-//! (`m20260701_000001_p2_initial`).
-//!
-//! @cpt-cf-file-storage-fr-multipart-upload
+//! Adds `declared_size` (gated total, so `complete` can check actual-vs-declared
+//! without re-summing parts) and `part_size` (server-chosen part size; reconstitutes
+//! the parts plan for resume) to `multipart_uploads`.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;

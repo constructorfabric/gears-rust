@@ -1,8 +1,6 @@
 use super::*;
 
-// Minimal PNG signature (8-byte magic).
 const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-// %PDF-1.4 header.
 const PDF_MAGIC: &[u8] = b"%PDF-1.4\n";
 
 #[test]

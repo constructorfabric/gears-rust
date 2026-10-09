@@ -1,0 +1,42 @@
+[package]
+name = "cf-gears-admission-control-sdk"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SDK for the admission-control gear: admission API, engine plugin contract, shared types"
+keywords = ["constructorfabric", "cf-gears", "admission-control"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+name = "admission_control_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Serialization / core
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+# GTS types (`schemars` is required by the `gts_type_schema` expansion)
+gts = { workspace = true }
+schemars = { workspace = true }
+toolkit-gts = { workspace = true }
+
+# ToolKit dependencies
+toolkit-canonical-errors = { workspace = true }
+toolkit-security = { workspace = true }
+
+# The broker's topic base type + derived event-type schema helper.
+event-broker-sdk = { workspace = true }
+
+[dev-dependencies]
+# Validates serialized refusal events against the generated `data` schema.
+jsonschema = { workspace = true }

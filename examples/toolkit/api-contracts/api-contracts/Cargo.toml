@@ -12,7 +12,7 @@ publish = false
 [features]
 default = []
 # OpenTelemetry in generated clients: W3C traceparent propagation + RED metrics.
-otel = ["api-contracts-sdk/otel"]
+otel = ["toolkit/otel", "api-contracts-sdk/otel"]
 grpc-client = [
     "api-contracts-sdk/grpc-client",
     "toolkit-contract/grpc-client",

@@ -68,6 +68,7 @@ magika = ["file_parser/magika"]
 bss-products = ["dep:bss_products"]
 bss-pricing = ["dep:bss_pricing", "bss-products"]
 bss-approvals = ["dep:bss_approvals"]
+admission-control = ["dep:admission-control"]
 
 [dependencies]
 mimalloc = { workspace = true }
@@ -147,6 +148,9 @@ cluster = { package = "cf-gears-cluster", path = "../../gears/system/cluster/clu
 bss_pricing = { package = "cf-gears-bss-pricing", path = "../../gears/bss/pricing/pricing", optional = true }
 bss_products = { package = "cf-gears-bss-products", path = "../../gears/bss/products/products", optional = true }
 bss_approvals = { package = "cf-gears-bss-approvals", path = "../../gears/bss/approvals/approvals", optional = true }
+
+# Optional Admission Control gear
+admission-control = { package = "cf-gears-admission-control", path = "../../gears/system/admission-control/admission-control", optional = true }
 
 # Optional example module
 users-info = { path = "../../examples/toolkit/users-info/users-info", optional = true }

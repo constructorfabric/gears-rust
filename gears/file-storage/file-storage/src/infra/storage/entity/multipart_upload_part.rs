@@ -1,7 +1,7 @@
 //! `SeaORM` entity for the `multipart_upload_parts` table.
 //!
-//! Composite PK: `(upload_id, part_number)`. No `tenant_id` — queried via the
-//! parent `multipart_uploads` row; all queries use `AccessScope::allow_all()`.
+//! Composite PK: `(upload_id, part_number)`. No `tenant_id`; queries go via the
+//! parent `multipart_uploads` row with `AccessScope::allow_all()`.
 
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;

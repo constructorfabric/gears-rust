@@ -1,0 +1,85 @@
+# Development preset. Ensure dev images are available, then:
+#   bash deploy/helm/update-helm-deps.sh
+#   helm install demo deploy/helm/toolkit-platform -f deploy/helm/toolkit-platform/values-dev.yaml
+
+global:
+  opentelemetry:
+    enabled: false
+    exporterKind: otlp_grpc
+    endpoint: "http://otel-collector:4317"
+
+flight-control:
+  enabled: true
+  fullnameOverride: flight-control
+  image:
+    registry: ghcr.io
+    repository: constructorfabric/flight-control
+    tag: "dev"
+    pullPolicy: IfNotPresent
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+    hosts:
+      - host: flight-control.local
+        paths:
+          - path: /
+            pathType: Prefix
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 4Gi
+
+hello:
+  enabled: true
+  fullnameOverride: hello
+  image:
+    registry: ghcr.io
+    repository: constructorfabric/hello
+    tag: "dev"
+    pullPolicy: IfNotPresent
+  directoryEndpoint: "http://flight-control:50051"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 1Gi
+
+api-contracts:
+  enabled: true
+  fullnameOverride: api-contracts
+  image:
+    registry: ghcr.io
+    repository: constructorfabric/api-contracts
+    tag: "dev"
+    pullPolicy: IfNotPresent
+  directoryEndpoint: "http://flight-control:50051"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 1Gi
+
+api-contracts-consumer:
+  enabled: true
+  fullnameOverride: api-contracts-consumer
+  image:
+    registry: ghcr.io
+    repository: constructorfabric/api-contracts-consumer
+    tag: "dev"
+    pullPolicy: IfNotPresent
+  directoryEndpoint: "http://flight-control:50051"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 1Gi

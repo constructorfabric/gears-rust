@@ -120,5 +120,7 @@ use bss_products as _;
 #[cfg(feature = "bss-pricing")]
 use bss_pricing as _;
 
+#[cfg(feature = "admission-control")]
+use admission_control as _;
 #[cfg(feature = "bss-approvals")]
 use bss_approvals as _;

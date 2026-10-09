@@ -1,6 +1,5 @@
 use super::*;
 
-// SHA-256("") and SHA-256("abc") are well-known fixed vectors.
 const EMPTY_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const ABC_HEX: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 

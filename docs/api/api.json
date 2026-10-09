@@ -2893,7 +2893,7 @@
             "type": "string"
           },
           "idempotency_key": {
-            "description": "Optional idempotency key for deduplication of retried requests.\nWithin the same `(owner_kind, owner_id)`, a retry with the same key\nreturns the original response without creating a new file.\n\n@cpt-cf-file-storage-fr-upload-idempotency",
+            "description": "Optional idempotency key: within the same `(owner_kind, owner_id)`, a retry with\nthe same key returns the original response without creating a new file.",
             "type": [
               "string",
               "null"
@@ -4626,7 +4626,7 @@
         "type": "object"
       },
       "EffectivePolicyDto": {
-        "description": "Effective policy response: the most-restrictive combination of tenant ⊕ user.\n\n@cpt-cf-file-storage-usecase-configure-policy",
+        "description": "Effective policy response: the most-restrictive combination of tenant ⊕ user.",
         "properties": {
           "allowed_mime_types": {
             "description": "Intersection of allowed mime types from all levels (`null` = all types permitted).",
@@ -6774,10 +6774,10 @@
         "type": "object"
       },
       "InitiateMultipartReq": {
-        "description": "Request to initiate a multipart upload (`POST /files/{id}/multipart`).\n\nThe server returns a server-authoritative parts plan with one signed sidecar\nURL per part (FEATURE §3, §4; DESIGN §4.6).\n\n@cpt-cf-file-storage-fr-multipart-upload\n@cpt-cf-file-storage-fr-size-limits-policy\n@cpt-cf-file-storage-fr-storage-quota",
+        "description": "Request to initiate a multipart upload (`POST /files/{id}/multipart`).\n\nThe server answers with a parts plan containing one signed upload URL per part.",
         "properties": {
           "concurrency": {
-            "description": "Advisory hint for upload concurrency; does not change the parts plan\n(FEATURE §3).",
+            "description": "Advisory upload concurrency; does not change the parts plan.",
             "format": "int32",
             "minimum": 0,
             "type": [
@@ -6790,13 +6790,13 @@
             "type": "string"
           },
           "declared_size": {
-            "description": "Declared total file size in bytes.\n\n**Required** (per DESIGN §4.6 \"server-authoritative\" model). The control\nplane validates this value against the effective policy size limit and the\nstorage quota at initiate time — exactly as single-part upload does — so\nthat an oversized upload is rejected before any bytes are transferred.\n\n@cpt-cf-file-storage-fr-size-limits-policy\n@cpt-cf-file-storage-fr-storage-quota",
+            "description": "Declared total file size in bytes. Validated against the effective policy size\nlimit and the storage quota up front, so an oversized upload is rejected before\nany bytes are transferred.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
           "preferred_part_size": {
-            "description": "Client hint for the preferred part size in bytes. The server may override\nit to satisfy the backend's minimum part size requirements (FEATURE §3).",
+            "description": "Preferred part size in bytes (hint); the server may override it to meet the\nbackend's minimum part size.",
             "format": "int64",
             "minimum": 0,
             "type": [
@@ -7915,7 +7915,7 @@
         "type": "object"
       },
       "MigrateBackendReq": {
-        "description": "Request to migrate a file's content to a different storage backend.\n\n@cpt-cf-file-storage-fr-backend-migration",
+        "description": "Request to migrate a file's content to a different storage backend.",
         "properties": {
           "target_backend_id": {
             "description": "The id of the target backend to migrate the file's content to.",
@@ -8242,7 +8242,7 @@
         ]
       },
       "MissingPartDto": {
-        "description": "One part not yet uploaded (item 3.4).\n\n`upload_url` is present only while the session is still `in_progress` and\nunexpired; a terminal or expired session omits it.\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "description": "One part not yet uploaded.\n\n`upload_url` is present only while the session is `in_progress` and unexpired.",
         "properties": {
           "offset": {
             "format": "int64",
@@ -8340,10 +8340,10 @@
         "type": "string"
       },
       "MultipartCompleteDto": {
-        "description": "Response of `POST /files/{id}/multipart/{upload_id}/complete` (item 3.3).\n\nCarries everything the ADR-0006 assembly step already computes — the\nbound version id, its size, and the composite content hash — instead of\nthe previous bare `204 No Content`. `manifest` lets a client independently\nre-verify the composite hash (`docs/features/content-hash-modes.md`\n§\"Client-Side Manifest Re-Verification\") without a second round-trip.\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "description": "Response of `POST /files/{id}/multipart/{upload_id}/complete`: the bound version,\nits size, and the composite content hash. `manifest` lets a client re-verify the hash.",
         "properties": {
           "content_hash": {
-            "description": "Hex-encoded ADR-0006 composite root (`sha256(manifest)`).",
+            "description": "Hex-encoded composite hash (`sha256` of the manifest).",
             "type": "string"
           },
           "hash_algorithm": {
@@ -8355,7 +8355,7 @@
             "type": "string"
           },
           "manifest": {
-            "description": "Wire-format manifest text (`Manifest::to_wire_string`).",
+            "description": "Part manifest text the composite hash is computed over.",
             "type": "string"
           },
           "part_count": {
@@ -8383,7 +8383,7 @@
         "type": "object"
       },
       "MultipartPartPlanDto": {
-        "description": "One part in the server-authoritative parts plan.\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "description": "One part in the parts plan.",
         "properties": {
           "offset": {
             "description": "Byte offset of this part within the final assembled object.",
@@ -8417,7 +8417,7 @@
         "type": "object"
       },
       "MultipartPlanDto": {
-        "description": "Server-authoritative parts plan returned by `POST /files/{id}/multipart`.\n\nThe client `PUT`s each part's bytes to its `upload_url`; the sidecar\nenforces the `size` claim before writing any bytes (FEATURE §4).\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "description": "Parts plan returned by `POST /files/{id}/multipart`.\n\nThe client `PUT`s each part to its `upload_url`; the size is enforced before any\nbytes are written.",
         "properties": {
           "expires_at": {
             "description": "Expiry of all per-part URLs (RFC 3339).",
@@ -8425,7 +8425,7 @@
             "type": "string"
           },
           "part_hash_algorithm": {
-            "description": "Hash algorithm used for per-part hashes (`\"SHA-256\"` in P2).",
+            "description": "Hash algorithm used for per-part hashes (`\"SHA-256\"`).",
             "type": "string"
           },
           "part_size": {
@@ -8461,7 +8461,7 @@
         "type": "object"
       },
       "MultipartStatusDto": {
-        "description": "Response of `GET /files/{id}/multipart/{upload_id}` — introspect/resume\n(item 3.4).\n\nMirrors [`crate::domain::multipart::MultipartUploadStatus`]. `received`\ncovers parts already reported by the sidecar; `missing` covers the rest,\neach carrying a fresh resume `upload_url` when the session can still be\nresumed (`in_progress` and unexpired) — a terminal or expired session\nreports state and part accounting only, with no URLs to act on.\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "description": "Response of `GET /files/{id}/multipart/{upload_id}`.\n\n`received` lists uploaded parts; `missing` the rest, each with a fresh resume\n`upload_url` only while the session is `in_progress` and unexpired.",
         "properties": {
           "created_at": {
             "format": "date-time",
@@ -10309,7 +10309,7 @@
         "type": "object"
       },
       "PolicyBodyDto": {
-        "description": "Policy body in requests and responses.\n\n@cpt-cf-file-storage-fr-allowed-types-policy\n@cpt-cf-file-storage-fr-size-limits-policy\n@cpt-cf-file-storage-fr-metadata-limits",
+        "description": "Policy body in requests and responses.",
         "properties": {
           "allowed_mime_types": {
             "description": "Allowed MIME types for upload (empty = all types permitted at this level).",
@@ -16005,7 +16005,7 @@
         "type": "object"
       },
       "ReceivedPartDto": {
-        "description": "One already-uploaded part (`GET /files/{id}/multipart/{upload_id}`, item 3.4).\n\n@cpt-cf-file-storage-fr-multipart-upload",
+        "description": "One already-uploaded part (`GET /files/{id}/multipart/{upload_id}`).",
         "properties": {
           "part_number": {
             "format": "int32",
@@ -17799,7 +17799,7 @@
         "type": "object"
       },
       "RetentionRuleBodyDto": {
-        "description": "Retention rule body in requests and responses.\n\n@cpt-cf-file-storage-fr-retention-policies",
+        "description": "Retention rule body in requests and responses.",
         "properties": {
           "age": {
             "oneOf": [
@@ -20903,7 +20903,7 @@
         "type": "object"
       },
       "TransferOwnershipReq": {
-        "description": "Request to transfer ownership of a file (`POST /files/{id}/transfer`).\n\n@cpt-cf-file-storage-fr-ownership-transfer",
+        "description": "Request to transfer ownership of a file (`POST /files/{id}/transfer`).",
         "properties": {
           "new_owner_id": {
             "description": "New owner UUID.",
@@ -22235,7 +22235,7 @@
         "type": "object"
       },
       "VersionDto": {
-        "description": "One content version (`GET /files/{id}/versions`).\n\nWire shape documented in `docs/api.md` (`hash_mode`/`part_count`/`manifest`\nfields, ADR-0006).\n\n@cpt-dod:cpt-cf-file-storage-dod-content-hash-modes-docs:p2",
+        "description": "One content version (`GET /files/{id}/versions`).",
         "properties": {
           "created_at": {
             "format": "date-time",
@@ -22248,7 +22248,7 @@
             "type": "string"
           },
           "hash_mode": {
-            "description": "ADR-0006 content-hash mode: `\"whole-sha256\"` (`hash` is\n`sha256(object bytes)`) or `\"multipart-composite-sha256\"` (`hash` is\n`sha256(manifest)`, the offset-manifest composite root).",
+            "description": "Hash mode: `\"whole-sha256\"` (`hash` is `sha256` of the object bytes) or\n`\"multipart-composite-sha256\"` (`hash` is `sha256` of the part manifest).",
             "type": "string"
           },
           "is_current": {
@@ -22258,7 +22258,7 @@
             "type": "string"
           },
           "part_count": {
-            "description": "Number of parts for a `multipart-composite-sha256` version; omitted\n(`null`) for `whole-sha256`.",
+            "description": "Number of parts for `multipart-composite-sha256`; omitted for `whole-sha256`.",
             "format": "int32",
             "type": [
               "integer",
@@ -27052,7 +27052,7 @@
     },
     "/api/file-storage/v1/files/{file_id}/versions/{version_id}/finalize": {
       "post": {
-        "description": "Called by the sidecar after a successful PUT to mark the version `available`. Authorized by the signed upload token (fs-token) — no user JWT required. Requires internal credential (x-fs-internal-token) when configured (P2 0.1).",
+        "description": "Called by the sidecar after a successful PUT to mark the version `available`. Authorized by the signed upload token (fs-token) — no user JWT required. Requires the internal credential (x-fs-internal-token).",
         "operationId": "file_storage.finalize_version",
         "parameters": [
           {
@@ -27124,7 +27124,7 @@
     },
     "/api/file-storage/v1/files/{file_id}/versions/{version_id}/multipart/{upload_id}/parts/{part_number}/report": {
       "post": {
-        "description": "Called by the sidecar after a successful part write to record the part's backend ETag, hash, and size so `complete` can assemble from real reported parts. Authorized by the signed upload token (fs-token) — no user JWT required. Requires internal credential (x-fs-internal-token) when configured (P2 0.1).",
+        "description": "Called by the sidecar after a successful part write to record the part's backend ETag, hash, and size so `complete` can assemble from real reported parts. Authorized by the signed upload token (fs-token) — no user JWT required. Requires the internal credential (x-fs-internal-token).",
         "operationId": "file_storage.report_multipart_part",
         "parameters": [
           {

@@ -1,15 +1,7 @@
-//! Unit tests for the P2-M2 write-path enforcement helpers now on `PolicyResolver`.
-//!
-//! These tests exercise the pure logic helpers (`mime_allowed`,
-//! `check_allowed_mime`, `compute_effective_max_bytes`,
-//! `check_metadata_limits`) without requiring a database or HTTP stack.
-
 use crate::domain::error::DomainError;
 use crate::domain::policy::{EffectivePolicy, MetadataLimits, MimeSizeOverride, PolicyResolver};
 use crate::domain::service::content_verb;
 use crate::infra::signed_url::Op;
-
-// ── helpers ────────────────────────────────────────────────────────────────────
 
 fn open_policy() -> EffectivePolicy {
     EffectivePolicy {
@@ -72,8 +64,6 @@ fn policy_with_meta_limits(
     }
 }
 
-// ── mime_allowed ───────────────────────────────────────────────────────────────
-
 #[test]
 fn mime_allowed_exact_match() {
     assert!(PolicyResolver::mime_allowed(
@@ -115,8 +105,6 @@ fn mime_allowed_multiple_patterns_any_match() {
     ));
 }
 
-// ── check_allowed_mime ─────────────────────────────────────────────────────────
-
 #[test]
 fn check_allowed_mime_no_restriction_permits_all() {
     let policy = open_policy();
@@ -147,8 +135,6 @@ fn check_allowed_mime_empty_list_rejects_all() {
     assert!(matches!(err, DomainError::PolicyMimeNotAllowed { .. }));
 }
 
-// ── compute_effective_max_bytes ────────────────────────────────────────────────
-
 #[test]
 fn compute_effective_max_bytes_no_restrictions_returns_none() {
     let policy = open_policy();
@@ -166,12 +152,10 @@ fn compute_effective_max_bytes_policy_global_wins() {
 #[test]
 fn compute_effective_max_bytes_backend_ceiling_wins_over_policy() {
     let mut policy = policy_with_global_max(10_000_000);
-    // backend max is more restrictive
     let result =
         PolicyResolver::compute_effective_max_bytes(&policy, "image/jpeg", Some(5_000_000));
     assert_eq!(result, Some(5_000_000));
 
-    // policy max is more restrictive than backend
     policy.max_bytes = Some(2_000_000);
     let result =
         PolicyResolver::compute_effective_max_bytes(&policy, "image/jpeg", Some(5_000_000));
@@ -200,8 +184,6 @@ fn compute_effective_max_bytes_per_mime_takes_min_with_global() {
     let result = PolicyResolver::compute_effective_max_bytes(&policy, "image/jpeg", None);
     assert_eq!(result, Some(200_000));
 }
-
-// ── check_metadata_limits ──────────────────────────────────────────────────────
 
 #[test]
 fn check_metadata_limits_no_limits_permits_any() {
@@ -274,19 +256,13 @@ fn check_metadata_limits_empty_entries_always_ok() {
     assert!(PolicyResolver::check_metadata_limits(&policy, &[]).is_ok());
 }
 
-// ── P2 2.13: `sign_url`'s op → sidecar-path-segment mapping ─────────────────
-
 #[test]
 fn sign_url_rejects_or_correctly_maps_multipart_part() {
-    // `Op::MultipartPart` has no correct two-segment mapping under
-    // `/api/file-storage-data/v1/{verb}/{file}/{version}` — the real sidecar
-    // route for a part is `/api/file-storage-data/v1/multipart/{file}/{version}/parts/{part}`,
-    // which `MultipartService` mints directly. `sign_url` must reject it
-    // rather than mint a URL that would 404 against the sidecar.
+    // `Op::MultipartPart` has no two-segment mapping; `sign_url` must reject it
+    // rather than mint a URL that would 404 on the sidecar.
     let err = content_verb(Op::MultipartPart).unwrap_err();
     assert!(matches!(err, DomainError::InternalError), "got {err:?}");
 
-    // The two verbs `sign_url` is actually used for must still map correctly.
     assert_eq!(content_verb(Op::Get).unwrap(), "download");
     assert_eq!(content_verb(Op::Put).unwrap(), "upload");
 }

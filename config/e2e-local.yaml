@@ -550,8 +550,8 @@ gears:
       # Value is a 32-byte base64url-encoded seed (43 chars without padding).
       # SHARED with the sidecar via FS_SIDECAR_PUBLIC_KEY (lifecycle conftest).
       signing_key_seed: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-      # Shared-server e2e run — no non-deterministic background activity.
-      enable_background_sweep: false
+      # dev only
+      finalize_internal_secret: "dev-file-storage-internal-secret"
 
   oagw:
     config:
