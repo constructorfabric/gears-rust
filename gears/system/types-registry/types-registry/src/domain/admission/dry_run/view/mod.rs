@@ -21,6 +21,7 @@ use time::OffsetDateTime;
 use tokio::sync::{Mutex, MutexGuard};
 use toolkit_db::DbTx;
 use toolkit_db::secure::{AccessScope, ScopeError};
+use toolkit_macros::domain_model;
 
 use crate::domain::enums::LifecycleStatus;
 use crate::domain::ports::{EntityRow, Stores};
@@ -30,6 +31,7 @@ use overlay::{GraphView, Overlay};
 
 /// One dry-run pass's view of the registry: the snapshot underneath, plus what
 /// the pass has decided so far.
+#[domain_model]
 pub struct AdmissionView {
     base: Arc<dyn Stores>,
     state: Mutex<Overlay>,
@@ -41,6 +43,7 @@ pub struct AdmissionView {
 /// edit what is inside. That is the tentative layer, expressed as the only two
 /// operations it has. Restoring it is atomic, because it replaces the overlay
 /// whole rather than replaying an undo list that could stop halfway.
+#[domain_model]
 #[derive(Debug)]
 pub struct CandidateLayer(Overlay);
 

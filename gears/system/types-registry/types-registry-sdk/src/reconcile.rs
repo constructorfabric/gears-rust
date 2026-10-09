@@ -15,14 +15,14 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 
 use crate::contract::PlatformTypesRegistryApi;
-use crate::ext::{MAX_BATCH_GET_KEYS, await_registration, bounded, deadline_from_now, jittered};
 use crate::gts::TypeResource;
 use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason};
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetItem, CandidateStatus, EntityField, EntityKey, EntityLookup,
-    FieldSelection, IdempotencyKey, JsonDocument, LifecycleStatus, Origin, Projection,
-    PublisherContext, RegisterEntitiesRequest, RegisterItem,
+    FieldSelection, IdempotencyKey, JsonDocument, LifecycleStatus, MAX_BATCH_GET_KEYS, Origin,
+    Projection, PublisherContext, RegisterEntitiesRequest, RegisterItem,
 };
+use crate::submit::{await_registration, bounded, deadline_from_now, jittered};
 
 /// How a submitted batch is retried at the transport level, key and request unchanged.
 const TRANSPORT_ATTEMPTS: u32 = 3;

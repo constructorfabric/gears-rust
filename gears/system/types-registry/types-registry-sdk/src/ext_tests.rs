@@ -68,8 +68,8 @@ async fn submit_and_await<A: PlatformTypesRegistryApi + ?Sized>(
     budget: Duration,
     cancel: &CancellationToken,
 ) -> Result<RegistrationOperation, CanonicalError> {
-    let deadline = super::deadline_from_now(budget)?;
-    super::await_registration(api, &ctx(), key, request, deadline, cancel).await
+    let deadline = crate::submit::deadline_from_now(budget)?;
+    crate::submit::await_registration(api, &ctx(), key, request, deadline, cancel).await
 }
 
 #[tokio::test(start_paused = true)]

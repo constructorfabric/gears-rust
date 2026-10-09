@@ -102,6 +102,9 @@ impl From<EntityKey> for BatchGetItem {
     }
 }
 
+/// Batch-read key ceiling (SPEC C10); larger reads are split.
+pub const MAX_BATCH_GET_KEYS: usize = 100;
+
 /// A batch read: every key answered under one projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchGetEntitiesRequest {

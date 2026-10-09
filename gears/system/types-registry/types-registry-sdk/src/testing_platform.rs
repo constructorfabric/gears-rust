@@ -539,7 +539,7 @@ impl FakePlatformRegistry {
         if fault == ReadFault::DropAnswers {
             return Ok(BatchGetEntitiesResponse(HashMap::new()));
         }
-        if request.items.is_empty() || request.items.len() > crate::ext::MAX_BATCH_GET_KEYS {
+        if request.items.is_empty() || request.items.len() > crate::models::MAX_BATCH_GET_KEYS {
             return Err(TypeResource::invalid_argument()
                 .with_field_violation(
                     field::ITEMS_FIELD,

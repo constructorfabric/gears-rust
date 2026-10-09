@@ -56,6 +56,7 @@ pub mod models;
 pub mod precondition;
 pub mod reason;
 mod reconcile;
+mod submit;
 
 /// An in-memory `PlatformTypesRegistryApi` for consumer and SDK tests.
 #[cfg(any(test, feature = "test-util"))]

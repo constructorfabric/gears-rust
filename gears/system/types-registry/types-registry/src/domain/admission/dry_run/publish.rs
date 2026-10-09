@@ -12,6 +12,7 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use toolkit_db::DBProvider;
 use toolkit_db::secure::AccessScope;
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use super::super::errors::{ItemFailure, WorkerError};
@@ -58,6 +59,7 @@ impl PublishWrite {
 ///
 /// A `false` is the ordinary overlapping-pass outcome: the item was already
 /// terminal, so its stored outcome stands and this pass reports that instead.
+#[domain_model]
 pub(super) struct Published {
     pub recorded: Vec<bool>,
 }
@@ -221,6 +223,7 @@ fn published_refusal(
 
 /// The reportable half of a published prediction, without the failure the caller
 /// already holds.
+#[domain_model]
 pub(super) struct PublishedOutcome {
     pub status: OperationItemStatus,
     pub gts_uuid: Option<Uuid>,

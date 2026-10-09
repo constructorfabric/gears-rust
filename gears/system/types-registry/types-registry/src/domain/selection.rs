@@ -110,6 +110,7 @@ impl FieldSelection {
     }
 
     /// Build from validated typed fields plus mandatory fields; no parsing needed.
+    #[must_use]
     pub fn from_fields(fields: impl IntoIterator<Item = EntityField>) -> Self {
         Self(
             fields

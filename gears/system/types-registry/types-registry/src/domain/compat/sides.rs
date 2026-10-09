@@ -2,12 +2,15 @@
 //! Explicit constructors identify each side; no `From<&Value>` or `Deref`.
 
 use serde_json::Value;
+use toolkit_macros::domain_model;
 
 /// The **old** side: the definition a candidate is measured against.
+#[domain_model]
 #[derive(Clone, Copy, Debug)]
 pub struct BaselineDoc<'a>(&'a Value);
 
 /// The **new** side: the document under admission.
+#[domain_model]
 #[derive(Clone, Copy, Debug)]
 pub struct CandidateDoc<'a>(&'a Value);
 
