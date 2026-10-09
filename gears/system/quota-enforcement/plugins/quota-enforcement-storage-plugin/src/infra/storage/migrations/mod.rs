@@ -4,6 +4,7 @@
 //! their own prefix. Later features append their tables here.
 
 use sea_orm_migration::MigratorTrait;
+use sea_orm_migration::prelude::{DbErr, SchemaManager};
 use toolkit_db::outbox::outbox_migrations_with_prefix;
 
 mod m0001_foundation;
@@ -17,6 +18,20 @@ mod m0006_idempotency_stripes;
 /// `qe_outbox_incoming`, ...). The toolkit joins prefix and suffix with an
 /// underscore, so the prefix ends in `outbox`, not in `_`.
 pub const OUTBOX_TABLE_PREFIX: &str = "qe_outbox";
+
+const MYSQL_NOT_SUPPORTED: &str = "quota-enforcement-storage-plugin: MySQL is not supported; \
+    this migration set targets PostgreSQL and SQLite";
+
+/// Refuse a backend the migrations do not target.
+fn ensure_supported(manager: &SchemaManager) -> Result<(), DbErr> {
+    if matches!(
+        manager.get_database_backend(),
+        sea_orm::DatabaseBackend::MySql
+    ) {
+        return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned()));
+    }
+    Ok(())
+}
 
 /// Migrator for the storage plugin schema.
 pub struct Migrator;
