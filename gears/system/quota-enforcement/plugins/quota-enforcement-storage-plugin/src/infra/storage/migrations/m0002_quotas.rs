@@ -9,131 +9,60 @@
 //! the in-flight counter of allocation Quotas, one row per allocation Quota,
 //! created with it; consumption counters arrive with consumption-operations.
 //! `qe_operation_log` records who did what to which Quota.
-//!
-//! `SQLite` has no `UUID`, `TIMESTAMPTZ`, or `BIGINT` types: `SeaORM` stores
-//! `Uuid` as canonical `TEXT`, `OffsetDateTime` as ISO-8601 `TEXT`, and every
-//! integer as `INTEGER`.
 
 use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_orm::ConnectionTrait;
 
-const MYSQL_NOT_SUPPORTED: &str = "quota-enforcement-storage-plugin: MySQL is not supported; \
-    this migration set targets PostgreSQL and SQLite";
+use super::ensure_supported;
 
-/// Drop order: children before `qe_quotas`.
-const TABLES: [&str; 3] = [
-    "qe_quota_allocation_counters",
-    "qe_operation_log",
-    "qe_quotas",
-];
+#[derive(DeriveIden)]
+pub(super) enum QeQuotas {
+    Table,
+    Id,
+    TenantId,
+    ProjectionType,
+    SubjectId,
+    Metric,
+    QuotaType,
+    Period,
+    EnforcementMode,
+    Cap,
+    NotificationThresholds,
+    ValidityStart,
+    ValidityEnd,
+    FailOpenHint,
+    Metadata,
+    Source,
+    Status,
+    ConstraintContractType,
+    ConstraintContractVersion,
+    RecordVersion,
+    CreatedAt,
+    UpdatedAt,
+}
 
-const POSTGRES: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS qe_quotas ( \
-        id UUID PRIMARY KEY, \
-        tenant_id UUID NOT NULL, \
-        projection_type TEXT NOT NULL, \
-        subject_id TEXT NOT NULL, \
-        metric TEXT NOT NULL, \
-        quota_type TEXT NOT NULL, \
-        period TEXT NULL, \
-        enforcement_mode TEXT NOT NULL, \
-        cap BIGINT NULL CHECK (cap IS NULL OR cap >= 0), \
-        notification_thresholds TEXT NOT NULL, \
-        validity_start TIMESTAMPTZ NULL, \
-        validity_end TIMESTAMPTZ NULL, \
-        fail_open_hint BOOLEAN NOT NULL, \
-        metadata TEXT NOT NULL, \
-        source TEXT NOT NULL, \
-        status TEXT NOT NULL CHECK (status IN ('active', 'deactivated')), \
-        constraint_contract_type TEXT NOT NULL, \
-        constraint_contract_version INTEGER NOT NULL, \
-        record_version INTEGER NOT NULL CHECK (record_version >= 1), \
-        created_at TIMESTAMPTZ NOT NULL, \
-        updated_at TIMESTAMPTZ NOT NULL \
-    );",
-    "CREATE INDEX IF NOT EXISTS idx_qe_quotas_tenant_status_metric \
-        ON qe_quotas (tenant_id, status, metric, id);",
-    "CREATE INDEX IF NOT EXISTS idx_qe_quotas_tenant_subject \
-        ON qe_quotas (tenant_id, projection_type, subject_id, id);",
-    "CREATE INDEX IF NOT EXISTS idx_qe_quotas_status_metric_projection \
-        ON qe_quotas (status, metric, projection_type, cap);",
-    "CREATE TABLE IF NOT EXISTS qe_quota_allocation_counters ( \
-        quota_id UUID PRIMARY KEY REFERENCES qe_quotas(id) ON DELETE RESTRICT, \
-        tenant_id UUID NOT NULL, \
-        in_flight BIGINT NOT NULL CHECK (in_flight >= 0), \
-        record_version INTEGER NOT NULL CHECK (record_version >= 1), \
-        updated_at TIMESTAMPTZ NOT NULL \
-    );",
-    "CREATE TABLE IF NOT EXISTS qe_operation_log ( \
-        id UUID PRIMARY KEY, \
-        tenant_id UUID NOT NULL, \
-        quota_id UUID NULL, \
-        operation TEXT NOT NULL, \
-        actor_subject_id UUID NOT NULL, \
-        actor_subject_type TEXT NULL, \
-        record_version INTEGER NULL, \
-        detail TEXT NOT NULL, \
-        occurred_at TIMESTAMPTZ NOT NULL \
-    );",
-    "CREATE INDEX IF NOT EXISTS idx_qe_operation_log_occurred \
-        ON qe_operation_log (occurred_at);",
-    "CREATE INDEX IF NOT EXISTS idx_qe_operation_log_tenant_quota \
-        ON qe_operation_log (tenant_id, quota_id, occurred_at);",
-];
+#[derive(DeriveIden)]
+pub(super) enum QeQuotaAllocationCounters {
+    Table,
+    QuotaId,
+    TenantId,
+    InFlight,
+    RecordVersion,
+    UpdatedAt,
+}
 
-const SQLITE: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS qe_quotas ( \
-        id TEXT PRIMARY KEY NOT NULL, \
-        tenant_id TEXT NOT NULL, \
-        projection_type TEXT NOT NULL, \
-        subject_id TEXT NOT NULL, \
-        metric TEXT NOT NULL, \
-        quota_type TEXT NOT NULL, \
-        period TEXT NULL, \
-        enforcement_mode TEXT NOT NULL, \
-        cap INTEGER NULL CHECK (cap IS NULL OR cap >= 0), \
-        notification_thresholds TEXT NOT NULL, \
-        validity_start TEXT NULL, \
-        validity_end TEXT NULL, \
-        fail_open_hint BOOLEAN NOT NULL, \
-        metadata TEXT NOT NULL, \
-        source TEXT NOT NULL, \
-        status TEXT NOT NULL CHECK (status IN ('active', 'deactivated')), \
-        constraint_contract_type TEXT NOT NULL, \
-        constraint_contract_version INTEGER NOT NULL, \
-        record_version INTEGER NOT NULL CHECK (record_version >= 1), \
-        created_at TEXT NOT NULL, \
-        updated_at TEXT NOT NULL \
-    );",
-    "CREATE INDEX IF NOT EXISTS idx_qe_quotas_tenant_status_metric \
-        ON qe_quotas (tenant_id, status, metric, id);",
-    "CREATE INDEX IF NOT EXISTS idx_qe_quotas_tenant_subject \
-        ON qe_quotas (tenant_id, projection_type, subject_id, id);",
-    "CREATE INDEX IF NOT EXISTS idx_qe_quotas_status_metric_projection \
-        ON qe_quotas (status, metric, projection_type, cap);",
-    "CREATE TABLE IF NOT EXISTS qe_quota_allocation_counters ( \
-        quota_id TEXT PRIMARY KEY NOT NULL REFERENCES qe_quotas(id) ON DELETE RESTRICT, \
-        tenant_id TEXT NOT NULL, \
-        in_flight INTEGER NOT NULL CHECK (in_flight >= 0), \
-        record_version INTEGER NOT NULL CHECK (record_version >= 1), \
-        updated_at TEXT NOT NULL \
-    );",
-    "CREATE TABLE IF NOT EXISTS qe_operation_log ( \
-        id TEXT PRIMARY KEY NOT NULL, \
-        tenant_id TEXT NOT NULL, \
-        quota_id TEXT NULL, \
-        operation TEXT NOT NULL, \
-        actor_subject_id TEXT NOT NULL, \
-        actor_subject_type TEXT NULL, \
-        record_version INTEGER NULL, \
-        detail TEXT NOT NULL, \
-        occurred_at TEXT NOT NULL \
-    );",
-    "CREATE INDEX IF NOT EXISTS idx_qe_operation_log_occurred \
-        ON qe_operation_log (occurred_at);",
-    "CREATE INDEX IF NOT EXISTS idx_qe_operation_log_tenant_quota \
-        ON qe_operation_log (tenant_id, quota_id, occurred_at);",
-];
+#[derive(DeriveIden)]
+enum QeOperationLog {
+    Table,
+    Id,
+    TenantId,
+    QuotaId,
+    Operation,
+    ActorSubjectId,
+    ActorSubjectType,
+    RecordVersion,
+    Detail,
+    OccurredAt,
+}
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -141,30 +70,263 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let statements = match manager.get_database_backend() {
-            sea_orm::DatabaseBackend::Postgres => POSTGRES,
-            sea_orm::DatabaseBackend::Sqlite => SQLITE,
-            _ => return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned())),
-        };
-        let conn = manager.get_connection();
-        for sql in statements {
-            conn.execute_unprepared(sql).await?;
-        }
+        ensure_supported(manager)?;
+        Box::pin(create_quotas(manager)).await?;
+        create_allocation_counters(manager).await?;
+        create_operation_log(manager).await?;
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        if matches!(
-            manager.get_database_backend(),
-            sea_orm::DatabaseBackend::MySql
-        ) {
-            return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned()));
-        }
-        let conn = manager.get_connection();
-        for table in TABLES {
-            conn.execute_unprepared(&format!("DROP TABLE IF EXISTS {table};"))
-                .await?;
-        }
-        Ok(())
+        ensure_supported(manager)?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(QeQuotaAllocationCounters::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(QeOperationLog::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(Table::drop().table(QeQuotas::Table).if_exists().to_owned())
+            .await
     }
+}
+
+async fn create_quotas(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(QeQuotas::Table)
+                .if_not_exists()
+                .col(ColumnDef::new(QeQuotas::Id).uuid().not_null().primary_key())
+                .col(ColumnDef::new(QeQuotas::TenantId).uuid().not_null())
+                .col(ColumnDef::new(QeQuotas::ProjectionType).text().not_null())
+                .col(ColumnDef::new(QeQuotas::SubjectId).text().not_null())
+                .col(ColumnDef::new(QeQuotas::Metric).text().not_null())
+                .col(ColumnDef::new(QeQuotas::QuotaType).text().not_null())
+                .col(ColumnDef::new(QeQuotas::Period).text().null())
+                .col(ColumnDef::new(QeQuotas::EnforcementMode).text().not_null())
+                .col(
+                    ColumnDef::new(QeQuotas::Cap).big_integer().null().check(
+                        Expr::col(QeQuotas::Cap)
+                            .is_null()
+                            .or(Expr::col(QeQuotas::Cap).gte(0)),
+                    ),
+                )
+                .col(
+                    ColumnDef::new(QeQuotas::NotificationThresholds)
+                        .text()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(QeQuotas::ValidityStart)
+                        .timestamp_with_time_zone()
+                        .null(),
+                )
+                .col(
+                    ColumnDef::new(QeQuotas::ValidityEnd)
+                        .timestamp_with_time_zone()
+                        .null(),
+                )
+                .col(ColumnDef::new(QeQuotas::FailOpenHint).boolean().not_null())
+                .col(ColumnDef::new(QeQuotas::Metadata).text().not_null())
+                .col(ColumnDef::new(QeQuotas::Source).text().not_null())
+                .col(
+                    ColumnDef::new(QeQuotas::Status)
+                        .text()
+                        .not_null()
+                        .check(Expr::col(QeQuotas::Status).is_in(["active", "deactivated"])),
+                )
+                .col(
+                    ColumnDef::new(QeQuotas::ConstraintContractType)
+                        .text()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(QeQuotas::ConstraintContractVersion)
+                        .integer()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(QeQuotas::RecordVersion)
+                        .integer()
+                        .not_null()
+                        .check(Expr::col(QeQuotas::RecordVersion).gte(1)),
+                )
+                .col(
+                    ColumnDef::new(QeQuotas::CreatedAt)
+                        .timestamp_with_time_zone()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(QeQuotas::UpdatedAt)
+                        .timestamp_with_time_zone()
+                        .not_null(),
+                )
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_qe_quotas_tenant_status_metric")
+                .table(QeQuotas::Table)
+                .col(QeQuotas::TenantId)
+                .col(QeQuotas::Status)
+                .col(QeQuotas::Metric)
+                .col(QeQuotas::Id)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_qe_quotas_tenant_subject")
+                .table(QeQuotas::Table)
+                .col(QeQuotas::TenantId)
+                .col(QeQuotas::ProjectionType)
+                .col(QeQuotas::SubjectId)
+                .col(QeQuotas::Id)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_qe_quotas_status_metric_projection")
+                .table(QeQuotas::Table)
+                .col(QeQuotas::Status)
+                .col(QeQuotas::Metric)
+                .col(QeQuotas::ProjectionType)
+                .col(QeQuotas::Cap)
+                .to_owned(),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn create_allocation_counters(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(QeQuotaAllocationCounters::Table)
+                .if_not_exists()
+                .col(
+                    ColumnDef::new(QeQuotaAllocationCounters::QuotaId)
+                        .uuid()
+                        .not_null()
+                        .primary_key(),
+                )
+                .col(
+                    ColumnDef::new(QeQuotaAllocationCounters::TenantId)
+                        .uuid()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(QeQuotaAllocationCounters::InFlight)
+                        .big_integer()
+                        .not_null()
+                        .check(Expr::col(QeQuotaAllocationCounters::InFlight).gte(0)),
+                )
+                .col(
+                    ColumnDef::new(QeQuotaAllocationCounters::RecordVersion)
+                        .integer()
+                        .not_null()
+                        .check(Expr::col(QeQuotaAllocationCounters::RecordVersion).gte(1)),
+                )
+                .col(
+                    ColumnDef::new(QeQuotaAllocationCounters::UpdatedAt)
+                        .timestamp_with_time_zone()
+                        .not_null(),
+                )
+                .foreign_key(
+                    ForeignKey::create()
+                        .from(
+                            QeQuotaAllocationCounters::Table,
+                            QeQuotaAllocationCounters::QuotaId,
+                        )
+                        .to(QeQuotas::Table, QeQuotas::Id)
+                        .on_delete(ForeignKeyAction::Restrict),
+                )
+                .to_owned(),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn create_operation_log(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    manager
+        .create_table(
+            Table::create()
+                .table(QeOperationLog::Table)
+                .if_not_exists()
+                .col(
+                    ColumnDef::new(QeOperationLog::Id)
+                        .uuid()
+                        .not_null()
+                        .primary_key(),
+                )
+                .col(ColumnDef::new(QeOperationLog::TenantId).uuid().not_null())
+                .col(ColumnDef::new(QeOperationLog::QuotaId).uuid().null())
+                .col(ColumnDef::new(QeOperationLog::Operation).text().not_null())
+                .col(
+                    ColumnDef::new(QeOperationLog::ActorSubjectId)
+                        .uuid()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(QeOperationLog::ActorSubjectType)
+                        .text()
+                        .null(),
+                )
+                .col(
+                    ColumnDef::new(QeOperationLog::RecordVersion)
+                        .integer()
+                        .null(),
+                )
+                .col(ColumnDef::new(QeOperationLog::Detail).text().not_null())
+                .col(
+                    ColumnDef::new(QeOperationLog::OccurredAt)
+                        .timestamp_with_time_zone()
+                        .not_null(),
+                )
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_qe_operation_log_occurred")
+                .table(QeOperationLog::Table)
+                .col(QeOperationLog::OccurredAt)
+                .to_owned(),
+        )
+        .await?;
+    manager
+        .create_index(
+            Index::create()
+                .if_not_exists()
+                .name("idx_qe_operation_log_tenant_quota")
+                .table(QeOperationLog::Table)
+                .col(QeOperationLog::TenantId)
+                .col(QeOperationLog::QuotaId)
+                .col(QeOperationLog::OccurredAt)
+                .to_owned(),
+        )
+        .await?;
+
+    Ok(())
 }
