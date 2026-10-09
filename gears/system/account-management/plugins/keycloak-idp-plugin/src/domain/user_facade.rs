@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use account_management_sdk::idp_user::{
     IdpDeprovisionUserRequest, IdpListUsersRequest, IdpProvisionUserRequest, IdpUpdateUserRequest,
-    IdpUser, IdpUserAttribute, IdpUserFilterField, IdpUserPatch,
+    IdpUser, IdpUserAttribute, IdpUserFilterField, IdpUserPagination, IdpUserPatch,
 };
 use credstore_sdk::SecretRef;
 use serde::Deserialize;
@@ -342,7 +342,15 @@ struct UserRep {
 /// Field mapping into [`CursorV1`]:
 ///
 ///   * `k` — the last emitted user's key tuple, one projected string
-///     per key of the effective order (see [`ListUsersOrder`]).
+///     per key of the effective order (see [`ListUsersOrder`]). When
+///     the full tuple would push the cursor past
+///     [`IdpUserPagination::MAX_CURSOR_LEN`] (long profile values
+///     across several keys), the profile values are cut to a common
+///     byte cap and `k` carries one extra trailing element: a mask of
+///     `'0'` / `'1'`, one per key, marking the values that are now
+///     strict prefixes. The `id` value is never cut, so the cursor
+///     still names its row exactly (see
+///     [`UserFacade::list_users_impl`]'s cursor skip).
 ///   * `o` / `s` — the effective order's leading direction and signed
 ///     tokens (e.g. `"+username,+id"`). AM's handler recovers
 ///     `req.order` from `s` on continuation requests and checks it
@@ -360,6 +368,9 @@ struct UserRep {
 struct ListUsersCursor {
     filter_hash: String,
     last_key: Vec<String>,
+    /// Indices into `last_key` whose value is a strict prefix of the
+    /// row's sort value; empty when the tuple is carried in full.
+    truncated: Vec<usize>,
 }
 
 /// Effective `list_users` order, resolved from
@@ -445,6 +456,50 @@ impl ListUsersOrder {
             }
         }
         std::cmp::Ordering::Equal
+    }
+
+    /// Whether `key` is the row `cursor` was issued for: every full
+    /// value equal, every truncated value a prefix. The `id` value is
+    /// never truncated, so at most one row matches.
+    fn matches_cursor(&self, key: &[String], cursor: &ListUsersCursor) -> bool {
+        (0..self.keys.len()).all(|idx| {
+            let value = key.get(idx).map_or("", String::as_str);
+            let stored = cursor.last_key.get(idx).map_or("", String::as_str);
+            if cursor.truncated.contains(&idx) {
+                value.starts_with(stored)
+            } else {
+                value == stored
+            }
+        })
+    }
+
+    /// Whether `key` sorts strictly after the cursor's position, judged
+    /// from the stored values alone. A truncated value only bounds the
+    /// row's real value by a prefix, so a `key` value that extends the
+    /// same prefix cannot be placed: it counts as after (re-emitted
+    /// rather than skipped).
+    fn is_after_cursor(&self, key: &[String], cursor: &ListUsersCursor) -> bool {
+        for (idx, (_, dir)) in self.keys.iter().enumerate() {
+            let value = key.get(idx).map_or("", String::as_str);
+            let stored = cursor.last_key.get(idx).map_or("", String::as_str);
+            let ord = if cursor.truncated.contains(&idx) {
+                if value.len() > stored.len() && value.starts_with(stored) {
+                    return true;
+                }
+                // Equal to the prefix means shorter than the real value.
+                value.cmp(stored).then(std::cmp::Ordering::Less)
+            } else {
+                value.cmp(stored)
+            };
+            let ord = match dir {
+                SortDir::Asc => ord,
+                SortDir::Desc => ord.reverse(),
+            };
+            if !ord.is_eq() {
+                return ord.is_gt();
+            }
+        }
+        false
     }
 
     /// Leading key's direction, pinned in [`CursorV1::o`].
@@ -2037,7 +2092,7 @@ impl UserFacade {
         // under this order and this filter shape. The hash folds in
         // `realm_name`, so a realm-rebinding mid-pagination surfaces
         // here as `invalid cursor` too.
-        let after_key: Option<Vec<String>> = match req.pagination.cursor() {
+        let after: Option<ListUsersCursor> = match req.pagination.cursor() {
             Some(c) => {
                 let cursor = Self::decode_cursor(c, &order)?;
                 if cursor.filter_hash != filter_hash {
@@ -2045,7 +2100,7 @@ impl UserFacade {
                         detail: "invalid cursor".into(),
                     });
                 }
-                Some(cursor.last_key)
+                Some(cursor)
             }
             None => None,
         };
@@ -2149,9 +2204,20 @@ impl UserFacade {
             .collect();
         keyed.sort_by(|(a, _), (b, _)| order.compare(a, b));
 
-        // Skip entries already returned on prior pages (cursor key tuple).
-        if let Some(after) = after_key.as_deref() {
-            keyed.retain(|(key, _)| order.compare(key, after).is_gt());
+        // Skip entries already returned on prior pages. Resume from the
+        // cursor's row by its full current key when the row is still a
+        // member — exact even when the cursor carries truncated values.
+        // If it left the group (or was renamed) between pages, place the
+        // remaining rows against the stored values instead.
+        if let Some(after) = after.as_ref() {
+            let anchor = keyed
+                .iter()
+                .find(|(key, _)| order.matches_cursor(key, after))
+                .map(|(key, _)| key.clone());
+            match anchor {
+                Some(anchor) => keyed.retain(|(key, _)| order.compare(key, &anchor).is_gt()),
+                None => keyed.retain(|(key, _)| order.is_after_cursor(key, after)),
+            }
         }
 
         // Apply optional id-eq filter post-skip.
@@ -2175,15 +2241,9 @@ impl UserFacade {
         // cursor, pinned to the effective order. CursorV1 envelope; the
         // realm_name pinning lives inside `filter_hash`.
         let next_cursor = if has_more {
-            keyed.last().map(|(last_key, _)| {
-                Self::encode_cursor(
-                    &ListUsersCursor {
-                        filter_hash: filter_hash.clone(),
-                        last_key: last_key.clone(),
-                    },
-                    &order,
-                )
-            })
+            keyed
+                .last()
+                .map(|(last_key, _)| Self::bounded_cursor(&filter_hash, last_key, &order))
         } else {
             None
         };
@@ -2707,8 +2767,22 @@ impl UserFacade {
         reason = "CursorV1 has no serialiser-defeating shape; the expect anchors that invariant"
     )]
     fn encode_cursor(cursor: &ListUsersCursor, order: &ListUsersOrder) -> String {
+        let mut k = cursor.last_key.clone();
+        if !cursor.truncated.is_empty() {
+            k.push(
+                (0..order.keys.len())
+                    .map(|idx| {
+                        if cursor.truncated.contains(&idx) {
+                            '1'
+                        } else {
+                            '0'
+                        }
+                    })
+                    .collect(),
+            );
+        }
         CursorV1 {
-            k: cursor.last_key.clone(),
+            k,
             o: order.primary_dir(),
             s: order.odata.to_signed_tokens(),
             f: Some(cursor.filter_hash.clone()),
@@ -2716,6 +2790,57 @@ impl UserFacade {
         }
         .encode()
         .expect("CursorV1 with primitive fields is always serialisable")
+    }
+
+    /// Encode the `next_cursor` for the row keyed `last_key`, keeping
+    /// it within [`IdpUserPagination::MAX_CURSOR_LEN`] — AM rejects a
+    /// longer continuation cursor before it reaches the plugin.
+    ///
+    /// The full key tuple is used when it fits. Otherwise every profile
+    /// value longer than a byte cap is cut to that cap (on a char
+    /// boundary) and marked truncated; the cap is the largest one that
+    /// fits. Encoded length only grows with the cap, and a cap of zero
+    /// leaves the `id` value, the order pin, and the filter hash —
+    /// far below the limit — so the search always lands on a cursor
+    /// that fits.
+    fn bounded_cursor(filter_hash: &str, last_key: &[String], order: &ListUsersOrder) -> String {
+        let encode_capped = |cap: Option<usize>| {
+            let mut key = Vec::with_capacity(last_key.len());
+            let mut truncated = Vec::new();
+            for (idx, (value, (field, _))) in last_key.iter().zip(&order.keys).enumerate() {
+                match cap {
+                    Some(cap) if *field != IdpUserFilterField::Id && value.len() > cap => {
+                        key.push(value[..value.floor_char_boundary(cap)].to_owned());
+                        truncated.push(idx);
+                    }
+                    _ => key.push(value.clone()),
+                }
+            }
+            Self::encode_cursor(
+                &ListUsersCursor {
+                    filter_hash: filter_hash.to_owned(),
+                    last_key: key,
+                    truncated,
+                },
+                order,
+            )
+        };
+        let full = encode_capped(None);
+        if full.len() <= IdpUserPagination::MAX_CURSOR_LEN {
+            return full;
+        }
+        // Binary search for the largest fitting cap: `fits` always
+        // fits, `overflows` never does (it truncates nothing).
+        let (mut fits, mut overflows) = (0, last_key.iter().map(String::len).max().unwrap_or(0));
+        while overflows - fits > 1 {
+            let mid = fits.midpoint(overflows);
+            if encode_capped(Some(mid)).len() <= IdpUserPagination::MAX_CURSOR_LEN {
+                fits = mid;
+            } else {
+                overflows = mid;
+            }
+        }
+        encode_capped(Some(fits))
     }
 
     /// Decode the opaque pagination cursor issued under `order`.
@@ -2729,7 +2854,9 @@ impl UserFacade {
     ///     endpoint, or by a build that pinned `+created_at,+id`), so
     ///     its key tuple is not a position in this walk.
     ///   * `d` is not the forward direction.
-    ///   * `k` doesn't carry exactly one string per order key.
+    ///   * `k` doesn't carry exactly one string per order key, plus at
+    ///     most a truncation mask that marks only profile values (never
+    ///     `id`) and marks at least one.
     ///   * `f` (`filter_hash`) is absent — the plugin always sets one,
     ///     so this is structurally invalid.
     fn decode_cursor(raw: &str, order: &ListUsersOrder) -> Result<ListUsersCursor, PluginError> {
@@ -2740,14 +2867,37 @@ impl UserFacade {
         if cursor.o != order.primary_dir()
             || !order.odata.equals_signed_tokens(&cursor.s)
             || cursor.d != CURSOR_DIRECTION
-            || cursor.k.len() != order.keys.len()
         {
             return Err(invalid());
         }
+        let mut last_key = cursor.k;
+        let truncated = if last_key.len() == order.keys.len() + 1 {
+            let mask = last_key.pop().unwrap_or_default();
+            if mask.len() != order.keys.len() {
+                return Err(invalid());
+            }
+            let mut truncated = Vec::new();
+            for (idx, (flag, (field, _))) in mask.chars().zip(&order.keys).enumerate() {
+                match flag {
+                    '0' => {}
+                    '1' if *field != IdpUserFilterField::Id => truncated.push(idx),
+                    _ => return Err(invalid()),
+                }
+            }
+            if truncated.is_empty() {
+                return Err(invalid());
+            }
+            truncated
+        } else if last_key.len() == order.keys.len() {
+            Vec::new()
+        } else {
+            return Err(invalid());
+        };
         let filter_hash = cursor.f.ok_or_else(invalid)?;
         Ok(ListUsersCursor {
             filter_hash,
-            last_key: cursor.k,
+            last_key,
+            truncated,
         })
     }
 }

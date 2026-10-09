@@ -1323,6 +1323,7 @@ async fn list_users_cursor_filter_mismatch_returns_rejected() {
                 &StringMatcher::Always,
             ),
             last_key: vec!["alice".into(), filter_a.to_string()],
+            truncated: Vec::new(),
         },
         &default_order(),
     );
@@ -1414,6 +1415,7 @@ fn cursor_round_trip_with_tiebreaker() {
             "alice".into(),
             "9c4a6b2e-0000-0000-0000-000000000001".into(),
         ],
+        truncated: Vec::new(),
     };
     let encoded = UserFacade::encode_cursor(&c, &default_order());
     let decoded = UserFacade::decode_cursor(&encoded, &default_order()).expect("decodes");
@@ -1435,6 +1437,7 @@ fn cursor_wire_shape_is_cursor_v1_compatible() {
             "alice".into(),
             "9c4a6b2e-0000-0000-0000-000000000001".into(),
         ],
+        truncated: Vec::new(),
     };
     let encoded = UserFacade::encode_cursor(&c, &default_order());
     let parsed = CursorV1::decode(&encoded).expect("encoded cursor MUST be a valid CursorV1");
@@ -1472,6 +1475,7 @@ fn cursor_order_pin_names_only_allow_listed_fields() {
             &ListUsersCursor {
                 filter_hash: "abc123".into(),
                 last_key: vec![String::new(); order.keys.len()],
+                truncated: Vec::new(),
             },
             &order,
         );
@@ -2052,6 +2056,7 @@ async fn list_users_rejects_cursor_issued_under_other_order() {
                 &StringMatcher::Always,
             ),
             last_key: vec!["alice".into(), Uuid::nil().to_string()],
+            truncated: Vec::new(),
         },
         &default_order(),
     );
@@ -2085,6 +2090,251 @@ async fn list_users_rejects_cursor_issued_under_other_order() {
         matches!(err, PluginError::UserOpRejected { ref detail } if detail == "invalid cursor"),
         "expected UserOpRejected{{ detail == 'invalid cursor' }}, got {err:?}",
     );
+}
+
+/// `ORDER BY display_name, first_name, last_name, id` — every profile
+/// key that can carry a long value, so the full tuple overflows.
+fn long_profile_order() -> ODataOrderBy {
+    ODataOrderBy(
+        ["display_name", "first_name", "last_name"]
+            .into_iter()
+            .map(|field| OrderKey {
+                field: field.into(),
+                dir: SortDir::Asc,
+            })
+            .collect(),
+    )
+    .ensure_tiebreaker("id", SortDir::Asc)
+}
+
+#[test]
+fn bounded_cursor_fits_continuation_limit_for_worst_case_keys() {
+    // Every allow-listed key at once, each profile value 255 four-byte
+    // chars (emoji) or 255 quotes (each JSON-escaped to two bytes): the full
+    // tuple is far past `MAX_CURSOR_LEN`, so values must be cut.
+    let mut keys: Vec<OrderKey> = [
+        "display_name",
+        "first_name",
+        "last_name",
+        "username",
+        "email",
+    ]
+    .into_iter()
+    .map(|field| OrderKey {
+        field: field.into(),
+        dir: SortDir::Desc,
+    })
+    .collect();
+    keys.push(OrderKey {
+        field: "id".into(),
+        dir: SortDir::Asc,
+    });
+    let order = ListUsersOrder::resolve(Some(&ODataOrderBy(keys))).expect("allow-listed order");
+    let id = Uuid::new_v4().to_string();
+    for long in ["\u{1f600}".repeat(255), "\"".repeat(255)] {
+        let last_key = vec![
+            format!("{long} {long}"),
+            long.clone(),
+            long.clone(),
+            long.clone(),
+            long.clone(),
+            id.clone(),
+        ];
+        let encoded = UserFacade::bounded_cursor("abc123", &last_key, &order);
+        IdpUserPagination::new(1, Some(encoded.clone()))
+            .expect("AM must accept the cursor the plugin emits");
+
+        let decoded = UserFacade::decode_cursor(&encoded, &order).expect("decodes");
+        assert_eq!(decoded.filter_hash, "abc123");
+        assert!(!decoded.truncated.is_empty(), "the full tuple does not fit");
+        assert!(!decoded.truncated.contains(&5), "the id value is never cut");
+        assert_eq!(decoded.last_key[5], id);
+        for (stored, full) in decoded.last_key.iter().zip(&last_key) {
+            assert!(full.starts_with(stored.as_str()));
+        }
+    }
+}
+
+#[test]
+fn bounded_cursor_keeps_full_key_when_it_fits() {
+    let last_key = vec!["alice".to_owned(), Uuid::nil().to_string()];
+    let encoded = UserFacade::bounded_cursor("abc123", &last_key, &default_order());
+    assert_eq!(
+        CursorV1::decode(&encoded).expect("valid CursorV1").k,
+        last_key,
+        "no truncation mask on a cursor that fits",
+    );
+}
+
+#[test]
+fn cursor_decode_rejects_malformed_truncation_mask() {
+    // Default order is `(username, id)`: a mask must have one flag per
+    // key, flag only `username`, and flag at least one key.
+    for mask in ["01", "00", "1", "100", "x0"] {
+        let forged = CursorV1 {
+            k: vec!["ali".into(), Uuid::nil().to_string(), mask.into()],
+            o: SortDir::Asc,
+            s: "+username,+id".into(),
+            f: Some("abc123".into()),
+            d: "fwd".into(),
+        }
+        .encode()
+        .expect("forged cursor encodes");
+        let err = UserFacade::decode_cursor(&forged, &default_order())
+            .expect_err("malformed mask rejected");
+        assert!(
+            matches!(err, PluginError::UserOpRejected { .. }),
+            "mask {mask:?}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_users_walks_long_unicode_keys_within_cursor_limit() {
+    // regression: the cursor carried every sort value in full, so long
+    // CJK names across `display_name, first_name, last_name` produced a
+    // ~4.3 KB `next_cursor` that AM's `IdpUserPagination::new` rejects
+    // (`CursorTooLong`, max 4096) — following it returned 400. The rows
+    // differ only in their last character, past the point where the
+    // bounded cursor cuts `display_name`, so page 2+ must resume from
+    // the cursor's row by id rather than by the truncated values.
+    let server = MockServer::start().await;
+    temp_env::async_with_vars([("TEST_REALM_ADMIN_SECRET", Some("ra"))], async move {
+        mount_token_endpoint(&server, "platform").await;
+
+        let group_uuid = Uuid::new_v4();
+        let first_name = "\u{540d}".repeat(255);
+        let ids: Vec<Uuid> = (1..=3)
+            .map(|n| Uuid::parse_str(&format!("ffffffff-0000-0000-0000-00000000000{n}")).unwrap())
+            .collect();
+        // Last chars U+4E00 < U+4E01 < U+4E03 (three CJK numerals);
+        // listed out of order.
+        let members: Vec<serde_json::Value> = [(2, '\u{4e03}'), (0, '\u{4e00}'), (1, '\u{4e01}')]
+            .into_iter()
+            .map(|(idx, last_char)| {
+                serde_json::json!({
+                    "id": ids[idx].to_string(),
+                    "username": format!("user{idx}"),
+                    "firstName": first_name,
+                    "lastName": format!("{}{last_char}", "\u{59d3}".repeat(254)),
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/admin/realms/platform/groups/{group_uuid}/members"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(members))
+            .mount(&server)
+            .await;
+
+        let facade = build_facade(&server);
+        let tenant_id = Uuid::new_v4();
+        let metadata = Some(make_metadata(
+            "platform",
+            RealmBinding::Shared,
+            group_uuid,
+            None,
+        ));
+
+        let first_page = facade
+            .list_users_inner(
+                &build_system_ctx(Uuid::nil()),
+                &list_users_req(
+                    tenant_id,
+                    metadata.clone(),
+                    IdpUserPagination::new(1, None).expect("valid pagination"),
+                    None,
+                )
+                .with_order(long_profile_order()),
+            )
+            .await
+            .expect("page 1");
+        let next = first_page.page_info.next_cursor.expect("more rows remain");
+        assert!(next.len() <= IdpUserPagination::MAX_CURSOR_LEN);
+        assert_eq!(
+            CursorV1::decode(&next).expect("valid CursorV1").k.len(),
+            5,
+            "four key values plus the truncation mask",
+        );
+
+        // `walk_like_am` feeds every cursor through
+        // `IdpUserPagination::new`, which enforces `MAX_CURSOR_LEN`.
+        let (visited, pins) =
+            walk_like_am(&facade, tenant_id, metadata, 1, long_profile_order()).await;
+        assert_eq!(visited, ids, "every member once, in display_name order");
+        assert_eq!(pins, vec!["+display_name,+first_name,+last_name,+id"; 2]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn list_users_truncated_cursor_without_its_row_resumes_from_stored_prefix() {
+    // The cursor's row left the group between pages, so its full key is
+    // gone. Rows clearly before the stored prefix stay skipped; rows
+    // that extend the prefix cannot be placed and are re-emitted rather
+    // than risk being skipped.
+    let server = MockServer::start().await;
+    temp_env::async_with_vars([("TEST_REALM_ADMIN_SECRET", Some("ra"))], async move {
+        mount_token_endpoint(&server, "platform").await;
+
+        let group_uuid = Uuid::new_v4();
+        let before = Uuid::new_v4();
+        let equal_to_prefix = Uuid::new_v4();
+        let extends_a = Uuid::new_v4();
+        let extends_b = Uuid::new_v4();
+        let after = Uuid::new_v4();
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/admin/realms/platform/groups/{group_uuid}/members"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": after.to_string(), "username": "zed"},
+                {"id": extends_b.to_string(), "username": "mmmy"},
+                {"id": before.to_string(), "username": "alice"},
+                {"id": extends_a.to_string(), "username": "mmmx"},
+                {"id": equal_to_prefix.to_string(), "username": "mmm"},
+            ])))
+            .mount(&server)
+            .await;
+
+        let tenant_id = Uuid::new_v4();
+        let cursor = UserFacade::encode_cursor(
+            &ListUsersCursor {
+                filter_hash: UserFacade::filter_hash(
+                    tenant_id,
+                    "platform",
+                    None,
+                    &StringMatcher::Always,
+                ),
+                last_key: vec!["mmm".into(), Uuid::new_v4().to_string()],
+                truncated: vec![0],
+            },
+            &default_order(),
+        );
+
+        let facade = build_facade(&server);
+        let page = facade
+            .list_users_inner(
+                &build_system_ctx(Uuid::nil()),
+                &list_users_req(
+                    tenant_id,
+                    Some(make_metadata(
+                        "platform",
+                        RealmBinding::Shared,
+                        group_uuid,
+                        None,
+                    )),
+                    IdpUserPagination::new(10, Some(cursor)).expect("valid pagination"),
+                    None,
+                ),
+            )
+            .await
+            .expect("continuation succeeds");
+        let ids: Vec<Uuid> = page.items.iter().map(|u| u.id).collect();
+        assert_eq!(ids, vec![extends_a, extends_b, after]);
+    })
+    .await;
 }
 
 // =============================================================================
