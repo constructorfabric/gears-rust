@@ -16,7 +16,6 @@
 - [5. Definitions of Done](#5-definitions-of-done)
   - [Model Interface](#model-interface)
   - [Chat Completions Adapter](#chat-completions-adapter)
-  - [Adapter Chosen by Configuration](#adapter-chosen-by-configuration)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Non-Functional Considerations](#7-non-functional-considerations)
 
@@ -33,7 +32,7 @@
 
 The model client is the one small interface through which Construct calls language models. The planner and the
 sensitive-data checks use it. This document covers the interface and its first adapter, the OpenAI chat completions
-API through OAGW. The LLM gateway adapter follows in a later change, behind the same interface.
+API through OAGW. Building the client from the gear's configuration comes with the change that wires the planner in.
 
 ### 1.2 Purpose
 
@@ -44,7 +43,8 @@ A sensitive-data check needs a structured answer.
 
 **Out of scope**: the prompts, the planner loop and the sensitive-data checks; approving models or endpoints, which
 belongs to the LLM gateway; provisioning the OAGW upstream and its credentials, which the deployment does; the LLM
-gateway adapter, which comes next.
+gateway adapter, which comes when the gateway has an implementation; the configuration key and the factory, which come
+with their first caller.
 
 **Requirements**: `cpt-cf-construct-fr-fact-decisions` (supported, owned by the Planner)
 
@@ -82,22 +82,29 @@ gateway adapter, which comes next.
 3. [ ] - `p1` - It sends one non-streaming POST to `/{upstream_alias}` through OAGW, in the chat completions form:
    tools as functions, a structured answer as `response_format` with a strict JSON schema, the limit as
    `max_completion_tokens` - `inst-call-send`
-4. [ ] - `p1` - The whole call has a timeout from the configuration. Past it, the call fails as a timeout -
+4. [ ] - `p1` - The whole call has the timeout the client is built with. Past it, the call fails as a timeout -
    `inst-call-timeout`
 5. [ ] - `p1` - HTTP 429 and 5xx mean the model service is unavailable; any other non-success status means it refused
    the request - `inst-call-status`
+6. [ ] - `p1` - An OAGW failure is read as the gateway's error kind: a timeout is a timeout; a rate limit or an
+   unavailable upstream is unavailable; every other kind is refused. The error names the kind only, never the
+   gateway's detail - `inst-call-gateway`
 
 ### Read the Chat Completions Answer
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-algo-model-client-read-answer`
 
 1. [ ] - `p1` - A refusal or the `content_filter` finish reason means the model refused - `inst-read-refused`
-2. [ ] - `p1` - Tool calls come back with their arguments parsed as JSON. Arguments that are not JSON make the answer
-   unreadable - `inst-read-tool-calls`
-3. [ ] - `p1` - Otherwise the content is the text, or, for a structured answer, a JSON value - `inst-read-content`
-4. [ ] - `p1` - The usage gives the input and output tokens - `inst-read-usage`
-5. [ ] - `p1` - No error carries the prompt or the answer's text: errors name the status or the broken part only -
-   `inst-read-no-content`
+2. [ ] - `p1` - The `length` finish reason means the answer was cut off, so it is unreadable, never a complete answer
+   - `inst-read-length`
+3. [ ] - `p1` - Tool calls come back with their arguments parsed as JSON. Arguments that are not JSON make the answer
+   unreadable. `"tool_calls": null` is no tool calls - `inst-read-tool-calls`
+4. [ ] - `p1` - Otherwise the content is the text, or, for a structured answer, a JSON value. Empty content is
+   unreadable - `inst-read-content`
+5. [ ] - `p1` - The usage gives the input and output tokens. An answer without usage reports no usage, which is not
+   zero tokens - `inst-read-usage`
+6. [ ] - `p1` - No error carries the prompt, the answer's text or the gateway's detail: errors are fixed texts that
+   name the status, the kind or the broken part only - `inst-read-no-content`
 
 ## 4. States (CDSL)
 
@@ -135,37 +142,18 @@ structured answers, refusals and usage from its answer.
 - Code: `infra::model::chat_completions::ChatCompletionsModel`
 
 **Verified by**: `infra::model::chat_completions_test`, against a fake OAGW client and committed chat completions
-answers: the request form, a structured answer's schema, parsed tool calls and usage, a structured answer, a refusal,
-429, 502 and 400, an unreadable answer, arguments that are not JSON, a timeout, no OAGW client, and no prompt or
-answer text in an error.
-
-### Adapter Chosen by Configuration
-
-- [x] `p1` - **ID**: `cpt-cf-construct-dod-model-client-config`
-
-The system **MUST** choose the adapter by configuration only: `model.adapter` with its own keys. An unknown adapter or
-key **MUST** stop the gear from starting.
-
-**Implements**:
-- `cpt-cf-construct-algo-model-client-call`
-
-**Touches**:
-- Code: `config::ModelConfig`, `infra::model::model_client`
-
-**Verified by**: the config tests `the_chat_completions_model_is_read_with_a_default_timeout` and
-`an_unknown_adapter_or_model_key_is_rejected`, and `the_configured_adapter_calls_the_configured_upstream_and_model`.
+answers.
 
 ## 6. Acceptance Criteria
 
-- [ ] A configured chat completions model answers with text, tool calls or a structured value, and reports the
-      tokens used.
+- [ ] A chat completions model answers with text, tool calls or a structured value, and reports the tokens used when
+      the model service reports them.
 - [ ] A slow, unavailable or refusing model service fails the call with the matching error, without any prompt or
       answer text.
-- [ ] Changing the adapter needs a configuration change only.
 
 ## 7. Non-Functional Considerations
 
 - **Privacy**: the record content and the numbered profile reach the configured model service, which is the
   tenant's sub-processor (PRD). The model client logs and returns neither.
-- **Timeouts**: one timeout per call, 30 seconds by default (`model.timeout_ms`). The planner's caps on rounds and
-  tokens are the planner's.
+- **Timeouts**: one timeout per call, given when the client is built. The planner's caps on rounds and tokens are the
+  planner's.

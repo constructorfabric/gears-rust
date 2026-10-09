@@ -1,4 +1,3 @@
-use std::mem::discriminant;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,13 +7,11 @@ use http::StatusCode;
 use oagw_sdk::{Body, ServiceGatewayClientV1};
 use serde_json::{Value, json};
 use toolkit::client_hub::ClientHub;
-use toolkit_canonical_errors::CanonicalError;
+use toolkit_canonical_errors::{CanonicalError, resource_error};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::chat_completions::ChatCompletionsModel;
-use super::model_client;
-use crate::config::ModelConfig;
 use crate::domain::model_client::{
     AnswerKind, Message, ModelClient, ModelError, ModelOutput, ModelRequest, ToolCall, ToolSpec,
     Usage,
@@ -24,6 +21,10 @@ use crate::test_support::context_in;
 const TOOL_CALLS: &str = include_str!("fixtures/chat_tool_calls.json");
 const STRUCTURED: &str = include_str!("fixtures/chat_structured.json");
 const CONTENT_FILTER: &str = include_str!("fixtures/chat_content_filter.json");
+const PROMPT_MARKER: &str = "1. work_history: Acme, teacher";
+
+#[resource_error("gts.cf.core.oagw.proxy.v1~")]
+struct ProxyError;
 
 #[derive(Default)]
 struct Sent {
@@ -31,30 +32,41 @@ struct Sent {
     body: Value,
 }
 
+type Failure = fn() -> CanonicalError;
+
+enum Answer {
+    Http(StatusCode, String),
+    Failure(Failure),
+}
+
 struct FakeGateway {
-    status: StatusCode,
-    body: String,
+    answer: Answer,
     delay: Duration,
     sent: Mutex<Sent>,
 }
 
 impl FakeGateway {
-    fn answering(status: StatusCode, body: &str) -> Arc<Self> {
+    fn new(answer: Answer, delay: Duration) -> Arc<Self> {
         Arc::new(Self {
-            status,
-            body: body.to_owned(),
-            delay: Duration::ZERO,
+            answer,
+            delay,
             sent: Mutex::default(),
         })
     }
 
+    fn answering(status: StatusCode, body: &str) -> Arc<Self> {
+        Self::new(Answer::Http(status, body.to_owned()), Duration::ZERO)
+    }
+
+    fn failing(failure: Failure) -> Arc<Self> {
+        Self::new(Answer::Failure(failure), Duration::ZERO)
+    }
+
     fn slow() -> Arc<Self> {
-        Arc::new(Self {
-            status: StatusCode::OK,
-            body: STRUCTURED.to_owned(),
-            delay: Duration::from_secs(5),
-            sent: Mutex::default(),
-        })
+        Self::new(
+            Answer::Http(StatusCode::OK, STRUCTURED.to_owned()),
+            Duration::from_secs(5),
+        )
     }
 }
 
@@ -150,10 +162,13 @@ impl ServiceGatewayClientV1 for FakeGateway {
             body: serde_json::from_slice(&bytes).expect("a JSON request"),
         };
         tokio::time::sleep(self.delay).await;
-        Ok(http::Response::builder()
-            .status(self.status)
-            .body(Body::Bytes(Bytes::from(self.body.clone())))
-            .expect("response"))
+        match &self.answer {
+            Answer::Http(status, body) => Ok(http::Response::builder()
+                .status(*status)
+                .body(Body::Bytes(Bytes::from(body.clone())))
+                .expect("response")),
+            Answer::Failure(failure) => Err(failure()),
+        }
     }
 }
 
@@ -176,7 +191,7 @@ fn planner_request() -> ModelRequest {
     ModelRequest {
         messages: vec![
             Message::System("Decide how the record changes the profile.".to_owned()),
-            Message::User("1. work_history: Acme, teacher".to_owned()),
+            Message::User(PROMPT_MARKER.to_owned()),
             Message::Assistant {
                 text: None,
                 tool_calls: vec![ToolCall {
@@ -212,11 +227,28 @@ fn verdict_request() -> ModelRequest {
     }
 }
 
+fn answer(message: &Value, finish_reason: &str) -> String {
+    json!({
+        "choices": [{ "message": message, "finish_reason": finish_reason }],
+        "usage": { "prompt_tokens": 40, "completion_tokens": 5 },
+    })
+    .to_string()
+}
+
+async fn complete(
+    body: &str,
+    request: &ModelRequest,
+) -> Result<crate::domain::model_client::ModelResponse, ModelError> {
+    model_behind(FakeGateway::answering(StatusCode::OK, body))
+        .complete(&context(), request)
+        .await
+}
+
 #[tokio::test]
 async fn the_request_goes_to_the_upstream_in_chat_completions_form() {
     let gateway = FakeGateway::answering(StatusCode::OK, TOOL_CALLS);
     model_behind(gateway.clone())
-        .complete(&context(), planner_request())
+        .complete(&context(), &planner_request())
         .await
         .expect("an answer");
 
@@ -228,7 +260,7 @@ async fn the_request_goes_to_the_upstream_in_chat_completions_form() {
             "model": "fact-planner",
             "messages": [
                 { "role": "system", "content": "Decide how the record changes the profile." },
-                { "role": "user", "content": "1. work_history: Acme, teacher" },
+                { "role": "user", "content": PROMPT_MARKER },
                 {
                     "role": "assistant",
                     "content": null,
@@ -257,7 +289,7 @@ async fn the_request_goes_to_the_upstream_in_chat_completions_form() {
 async fn a_structured_answer_asks_for_a_json_schema() {
     let gateway = FakeGateway::answering(StatusCode::OK, STRUCTURED);
     model_behind(gateway.clone())
-        .complete(&context(), verdict_request())
+        .complete(&context(), &verdict_request())
         .await
         .expect("an answer");
 
@@ -278,8 +310,7 @@ async fn a_structured_answer_asks_for_a_json_schema() {
 
 #[tokio::test]
 async fn tool_calls_come_back_with_parsed_arguments_and_usage() {
-    let answer = model_behind(FakeGateway::answering(StatusCode::OK, TOOL_CALLS))
-        .complete(&context(), planner_request())
+    let answer = complete(TOOL_CALLS, &planner_request())
         .await
         .expect("an answer");
 
@@ -303,17 +334,16 @@ async fn tool_calls_come_back_with_parsed_arguments_and_usage() {
     );
     assert_eq!(
         answer.usage,
-        Usage {
+        Some(Usage {
             input_tokens: 1843,
             output_tokens: 96,
-        }
+        })
     );
 }
 
 #[tokio::test]
 async fn a_structured_answer_comes_back_as_json() {
-    let answer = model_behind(FakeGateway::answering(StatusCode::OK, STRUCTURED))
-        .complete(&context(), verdict_request())
+    let answer = complete(STRUCTURED, &verdict_request())
         .await
         .expect("an answer");
 
@@ -324,55 +354,160 @@ async fn a_structured_answer_comes_back_as_json() {
 }
 
 #[tokio::test]
-async fn a_failed_call_says_why() {
-    let refused = ModelError::Refused(String::new());
-    let unavailable = ModelError::Unavailable(String::new());
-    let bad_answer = ModelError::BadAnswer(String::new());
+async fn a_text_answer_comes_back_as_text() {
+    let body = answer(
+        &json!({ "content": "Nothing changed.", "tool_calls": null }),
+        "stop",
+    );
+
+    let answer = complete(&body, &planner_request())
+        .await
+        .expect("an answer");
+
+    assert_eq!(
+        answer.output,
+        ModelOutput::Text("Nothing changed.".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn an_answer_without_usage_reports_no_usage() {
+    let body =
+        json!({ "choices": [{ "message": { "content": "Done." }, "finish_reason": "stop" }] })
+            .to_string();
+
+    let answer = complete(&body, &planner_request())
+        .await
+        .expect("an answer");
+
+    assert_eq!(answer.usage, None);
+}
+
+#[tokio::test]
+async fn an_unusable_answer_is_rejected_with_its_reason() {
+    let refused = || ModelError::Refused("the model declined to answer".to_owned());
+    let bad = |reason: &str| ModelError::BadAnswer(reason.to_owned());
     let cases = [
-        (StatusCode::OK, CONTENT_FILTER, &refused, "content filter"),
+        (CONTENT_FILTER.to_owned(), planner_request(), refused()),
         (
-            StatusCode::TOO_MANY_REQUESTS,
-            "{}",
-            &unavailable,
-            "rate limited",
-        ),
-        (StatusCode::BAD_GATEWAY, "{}", &unavailable, "upstream down"),
-        (
-            StatusCode::BAD_REQUEST,
-            "{}",
-            &refused,
-            "request not accepted",
+            answer(
+                &json!({ "content": null, "refusal": "I can't help with that." }),
+                "stop",
+            ),
+            planner_request(),
+            refused(),
         ),
         (
-            StatusCode::OK,
-            "not json",
-            &bad_answer,
-            "not a chat completion",
+            answer(&json!({ "content": "Half an ans" }), "length"),
+            planner_request(),
+            bad("the answer was cut off at its token limit"),
         ),
         (
-            StatusCode::OK,
-            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"c","function":{"name":"add","arguments":"{oops"}}]}}]}"#,
-            &bad_answer,
-            "arguments not JSON",
+            json!({ "choices": [] }).to_string(),
+            planner_request(),
+            bad("no choice in the answer"),
+        ),
+        (
+            answer(&json!({ "content": null }), "stop"),
+            planner_request(),
+            bad("the answer has no content"),
+        ),
+        (
+            answer(&json!({ "content": "  " }), "stop"),
+            planner_request(),
+            bad("the answer has no content"),
+        ),
+        (
+            "not json".to_owned(),
+            planner_request(),
+            bad("not a chat completion"),
+        ),
+        (
+            answer(
+                &json!({ "content": null, "tool_calls": [{ "id": "c", "function": { "name": "add", "arguments": "{oops" } }] }),
+                "tool_calls",
+            ),
+            planner_request(),
+            bad("the arguments of tool call 0 are not JSON"),
+        ),
+        (
+            answer(&json!({ "content": "verdict: allow" }), "stop"),
+            verdict_request(),
+            bad("the structured answer is not JSON"),
         ),
     ];
-    for (status, body, expected, case) in cases {
-        let error = model_behind(FakeGateway::answering(status, body))
-            .complete(&context(), planner_request())
-            .await
-            .expect_err(case);
-        assert_eq!(
-            discriminant(&error),
-            discriminant(expected),
-            "{case}: {error:?}"
-        );
+
+    for (body, request, expected) in cases {
+        assert_eq!(complete(&body, &request).await, Err(expected), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn an_http_failure_maps_to_unavailable_or_refused() {
+    let cases = [
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            ModelError::Unavailable("HTTP 429 Too Many Requests".to_owned()),
+        ),
+        (
+            StatusCode::BAD_GATEWAY,
+            ModelError::Unavailable("HTTP 502 Bad Gateway".to_owned()),
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            ModelError::Refused("HTTP 400 Bad Request".to_owned()),
+        ),
+    ];
+
+    for (status, expected) in cases {
+        let got = model_behind(FakeGateway::answering(status, "{}"))
+            .complete(&context(), &planner_request())
+            .await;
+        assert_eq!(got, Err(expected), "{status}");
+    }
+}
+
+#[tokio::test]
+async fn an_oagw_failure_maps_by_its_kind_and_names_only_the_kind() {
+    let cases: [(Failure, ModelError); 4] = [
+        (
+            || ProxyError::deadline_exceeded("too slow").create(),
+            ModelError::Timeout,
+        ),
+        (
+            || CanonicalError::service_unavailable().create(),
+            ModelError::Unavailable("OAGW Unavailable".to_owned()),
+        ),
+        (
+            || {
+                ProxyError::resource_exhausted("too many requests")
+                    .with_quota_violation("proxy", "rate limit")
+                    .create()
+            },
+            ModelError::Unavailable("OAGW RateLimited".to_owned()),
+        ),
+        (
+            || {
+                ProxyError::permission_denied()
+                    .with_reason("NOT_ENTITLED")
+                    .create()
+            },
+            ModelError::Refused("OAGW PermissionDenied".to_owned()),
+        ),
+    ];
+
+    for (failure, expected) in cases {
+        let got = model_behind(FakeGateway::failing(failure))
+            .complete(&context(), &planner_request())
+            .await;
+        assert_eq!(got, Err(expected));
     }
 }
 
 #[tokio::test]
 async fn a_slow_model_times_out() {
     let error = model_behind(FakeGateway::slow())
-        .complete(&context(), verdict_request())
+        .complete(&context(), &verdict_request())
         .await
         .expect_err("too slow");
 
@@ -389,42 +524,39 @@ async fn without_an_oagw_client_the_model_is_unavailable() {
     );
 
     let error = model
-        .complete(&context(), verdict_request())
+        .complete(&context(), &verdict_request())
         .await
         .expect_err("no gateway");
 
-    assert!(matches!(error, ModelError::Unavailable(_)), "{error:?}");
+    assert_eq!(
+        error,
+        ModelError::Unavailable("no OAGW client in ClientHub".to_owned())
+    );
 }
 
 #[tokio::test]
-async fn an_error_never_repeats_the_prompt_or_the_answer() {
-    let error = model_behind(FakeGateway::answering(StatusCode::OK, CONTENT_FILTER))
-        .complete(&context(), planner_request())
-        .await
-        .expect_err("refused");
+async fn an_error_never_repeats_the_prompt_the_answer_or_the_gateway_detail() {
+    let gateway_detail = model_behind(FakeGateway::failing(|| {
+        CanonicalError::internal(format!("upstream rejected: {PROMPT_MARKER}")).create()
+    }))
+    .complete(&context(), &planner_request())
+    .await;
+    let wrong_type = complete(
+        &json!({ "choices": [], "usage": { "prompt_tokens": PROMPT_MARKER, "completion_tokens": 1 } }).to_string(),
+        &planner_request(),
+    )
+    .await;
+    let bad_arguments = complete(
+        &answer(
+            &json!({ "content": null, "tool_calls": [{ "id": "c", "function": { "name": PROMPT_MARKER, "arguments": PROMPT_MARKER } }] }),
+            "tool_calls",
+        ),
+        &planner_request(),
+    )
+    .await;
 
-    let text = error.to_string();
-    assert!(!text.contains("Acme"), "{text}");
-    assert!(!text.contains("Decide how"), "{text}");
-}
-
-#[tokio::test]
-async fn the_configured_adapter_calls_the_configured_upstream_and_model() {
-    let gateway = FakeGateway::answering(StatusCode::OK, STRUCTURED);
-    let hub = Arc::new(ClientHub::new());
-    hub.register::<dyn ServiceGatewayClientV1>(gateway.clone());
-    let config = ModelConfig::ChatCompletions {
-        upstream_alias: "models.internal".to_owned(),
-        model: "planner-large".to_owned(),
-        timeout_ms: 1_000,
-    };
-
-    model_client(&config, hub)
-        .complete(&context(), verdict_request())
-        .await
-        .expect("an answer");
-
-    let sent = gateway.sent.lock().expect("lock");
-    assert_eq!(sent.uri, "/models.internal");
-    assert_eq!(sent.body["model"], "planner-large");
+    for got in [gateway_detail, wrong_type, bad_arguments] {
+        let text = got.expect_err("a failure").to_string();
+        assert!(!text.contains(PROMPT_MARKER), "{text}");
+    }
 }
