@@ -11,6 +11,7 @@ use super::ensure_supported;
 #[derive(DeriveIden)]
 enum QeSchemaMeta {
     Table,
+    Singleton,
     ContractMajor,
     AppliedAt,
 }
@@ -53,11 +54,18 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(QeSchemaMeta::Table)
                     .if_not_exists()
+                    // A fixed key, so the table can hold only one row.
+                    .col(
+                        ColumnDef::new(QeSchemaMeta::Singleton)
+                            .integer()
+                            .not_null()
+                            .primary_key()
+                            .check(Expr::col(QeSchemaMeta::Singleton).eq(1)),
+                    )
                     .col(
                         ColumnDef::new(QeSchemaMeta::ContractMajor)
                             .integer()
-                            .not_null()
-                            .primary_key(),
+                            .not_null(),
                     )
                     .col(
                         ColumnDef::new(QeSchemaMeta::AppliedAt)
