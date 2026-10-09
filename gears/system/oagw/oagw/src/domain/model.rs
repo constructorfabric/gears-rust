@@ -31,6 +31,22 @@ pub enum Scheme {
     Grpc,
 }
 
+impl Scheme {
+    /// The standard port for this scheme: HTTP → 80, everything else → 443.
+    ///
+    /// Single source of truth for scheme-defaulted ports, consumed by the REST
+    /// and provisioning boundary conversions when a port is omitted. Matches
+    /// every variant explicitly so a new scheme fails to compile until its
+    /// default is chosen.
+    #[must_use]
+    pub fn default_port(self) -> u16 {
+        match self {
+            Scheme::Http => 80,
+            Scheme::Https | Scheme::Wss | Scheme::Wt | Scheme::Grpc => 443,
+        }
+    }
+}
+
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
@@ -47,10 +63,7 @@ impl Endpoint {
     /// - HTTPS / WSS / WT / gRPC: 443
     #[must_use]
     pub fn is_standard_port(&self) -> bool {
-        match self.scheme {
-            Scheme::Http => self.port == 80,
-            Scheme::Https | Scheme::Wss | Scheme::Wt | Scheme::Grpc => self.port == 443,
-        }
+        self.port == self.scheme.default_port()
     }
 
     /// The normalized host: brackets stripped (IPv6), lowercased, trailing dots stripped.

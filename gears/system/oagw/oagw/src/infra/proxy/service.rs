@@ -893,6 +893,11 @@ impl DataPlaneService for DataPlaneServiceImpl {
     fn remove_rate_limit_keys_for_route(&self, route_id: Uuid) {
         self.rate_limiter.remove_keys_for_route(route_id);
     }
+
+    fn remove_rate_limit_keys_for_upstream_cascade(&self, upstream_id: Uuid, route_ids: &[Uuid]) {
+        self.rate_limiter
+            .remove_keys_for_upstream_and_routes(upstream_id, route_ids);
+    }
 }
 
 /// Private helpers for the proxy pipeline.
