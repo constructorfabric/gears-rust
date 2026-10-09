@@ -81,7 +81,7 @@ primitive (P2; P1 sinks filter on the tenant arm of `event.scope` themselves).
 
 ### Sink Registration and Event Delivery
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-sink-delivery`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-sink-delivery`
 
 **Actor**: `cpt-cf-quota-enforcement-actor-platform-operator`
 
@@ -96,31 +96,25 @@ primitive (P2; P1 sinks filter on the tenant arm of `event.scope` themselves).
   dead-letter store (P1 has no per-sink dead letter); writes never block
 
 **Steps**:
-1. [ ] - `p1` - Operator registers `QuotaNotificationSinkV1` implementations at deployment - `inst-del-register`
-2. [ ] - `p1` - **IF** no sink is registered at bootstrap - `inst-del-nosink-if`
-   1. [ ] - `p1` - Surface the "no notification sinks registered" telemetry warning and continue serving - `inst-del-nosink-warn`
-3. [ ] - `p1` - A mutating operation commits; its events are already in `notification_outbox` same-tx (I11) - `inst-del-enqueue`
-4. [ ] - `p1` - DB: the `toolkit-db` Outbox processor claims a batch under a DB lease and invokes the QE leased
-   handler with the dispatcher's system-level `SecurityContext` - `inst-del-claim`
-5. [ ] - `p1` - API: the handler fans each event out to every registered sink concurrently, passing the system
-   `SecurityContext`, each call bounded by the per-sink timeout (reference default 2 s) - `inst-del-fanout`
-6. [ ] - `p1` - **IF** any sink answers `Timeout` or `Transient` - `inst-del-retry-if`
-   1. [ ] - `p1` - The handler returns retry; the framework re-delivers the event to **all** sinks later — duplicate
-      delivery is permitted and sinks tolerate it per contract - `inst-del-retry`
-7. [ ] - `p1` - **IF** any sink answers `Permanent`, or `OutboxMessage.attempts` has reached the operator-configured
-   maximum with sinks still transient - `inst-del-reject-if`
-   1. [ ] - `p1` - The handler returns `Reject(reason)`; the framework moves the event to its dead-letter store, which P1 keeps for
-      delivery-failure diagnostics only; P1 defines no replay - `inst-del-dead`
-8. [ ] - `p1` - **IF** every sink answered `Success` - `inst-del-term-if`
-   1. [ ] - `p1` - The handler acks the event - `inst-del-ack`
-9. [ ] - `p1` - **RETURN** delivery is at-least-once: a lease that expires mid-dispatch drops the handler future and
-   another processor re-claims the batch - `inst-del-alo`
+1. [x] - `p1` - Operator registers `QuotaNotificationSinkV1` implementations at deployment - `inst-del-register`
+2. [x] - `p1` - **IF** no sink is registered at bootstrap - `inst-del-nosink-if`
+   1. [x] - `p1` - Surface the "no notification sinks registered" telemetry warning and continue serving - `inst-del-nosink-warn`
+3. [x] - `p1` - A mutating operation commits; its events are already in `notification_outbox` same-tx (I11) - `inst-del-enqueue`
+4. [x] - `p1` - DB: the `toolkit-db` Outbox processor claims a batch under a DB lease and invokes the QE leased handler with the dispatcher's system-level `SecurityContext` - `inst-del-claim`
+5. [x] - `p1` - API: the handler fans each event out to every registered sink concurrently, passing the system `SecurityContext`, each call bounded by the per-sink timeout (reference default 2 s) - `inst-del-fanout`
+6. [x] - `p1` - **IF** any sink answers `Timeout` or `Transient` - `inst-del-retry-if`
+   1. [x] - `p1` - The handler returns retry; the framework re-delivers the event to **all** sinks later — duplicate delivery is permitted and sinks tolerate it per contract - `inst-del-retry`
+7. [x] - `p1` - **IF** any sink answers `Permanent`, or `OutboxMessage.attempts` has reached the operator-configured maximum with sinks still transient - `inst-del-reject-if`
+   1. [x] - `p1` - The handler returns `Reject(reason)`; the framework moves the event to its dead-letter store, which P1 keeps for delivery-failure diagnostics only; P1 defines no replay - `inst-del-dead`
+8. [x] - `p1` - **IF** every sink answered `Success` - `inst-del-term-if`
+   1. [x] - `p1` - The handler acks the event - `inst-del-ack`
+9. [x] - `p1` - **RETURN** delivery is at-least-once: a lease that expires mid-dispatch drops the handler future and another processor re-claims the batch - `inst-del-alo`
 
 ## 3. Processes / Business Logic (CDSL)
 
 ### Leased-Handler Dispatch Cycle
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-dispatcher-singleton`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-dispatcher-singleton`
 
 **Input**: A framework-claimed event batch, the registered sink set, the dispatcher's system-level `SecurityContext`,
 per-sink timeout
@@ -128,33 +122,24 @@ per-sink timeout
 **Output**: Per-event ack or retry returned to the Outbox framework; telemetry updated
 
 **Steps**:
-1. [ ] - `p1` - The `toolkit-db` Outbox processor claims the batch under a DB lease; the handler future is dropped at
-   the cancel point (`lease_duration − ack_headroom`), so an expired holder can never overlap its successor - `inst-disp-claim`
-2. [ ] - `p1` - **FOR EACH** event in the claimed batch - `inst-disp-each`
-   1. [ ] - `p1` - API: `dispatch(ctx_system, event)` to all registered sinks concurrently, each bounded by the
-      per-sink timeout - `inst-disp-fanout`
-3. [ ] - `p1` - **IF** the registered sink set is empty - `inst-disp-nosink-if`
-   1. [ ] - `p1` - **RETURN** ack unprocessed: events are dropped silently per the PRD §11 assumption, behind the
-      bootstrap warning - `inst-disp-nosink`
-4. [ ] - `p1` - **FOR EACH** `(event, sink)` outcome - `inst-disp-outcome`
-   1. [ ] - `p1` - `Success`: record delivered for that sink - `inst-disp-ok`
-   2. [ ] - `p1` - `Timeout` / `Transient`: increment `notification_dispatch_failures_total{sink_id, event_kind}` and
-      mark the event retryable - `inst-disp-transient`
-   3. [ ] - `p1` - `Permanent`: increment the failure counter and mark the event rejected - `inst-disp-perm`
-5. [ ] - `p1` - **IF** any sink answered `Permanent`, or the event is retryable and `OutboxMessage.attempts` has
-   reached the operator-configured maximum - `inst-disp-reject-if`
-   1. [ ] - `p1` - **RETURN** `Reject(reason)`: the framework dead-letters the event; ToolKit itself never stops
-      retrying, so the attempts guard is QE's explicit give-up per the `OutboxMessage.attempts` contract; increment
-      `outbox_rejections_total` by `queue` on this path - `inst-disp-reject`
-6. [ ] - `p1` - **IF** the event is retryable below the maximum - `inst-disp-retry-if`
-   1. [ ] - `p1` - **RETURN** `Retry`: the framework re-delivers to **all** sinks later, duplicates permitted (sinks
-      are idempotent on `event_id`) - `inst-disp-retry`
-7. [ ] - `p1` - **RETURN** ack when every sink answered `Success`; no counter moves on this path
-   (`outbox_rejections_total` increments only on `Reject`) - `inst-disp-ack`
+1. [x] - `p1` - The `toolkit-db` Outbox processor claims the batch under a DB lease; the handler future is dropped at the cancel point (`lease_duration − ack_headroom`), so an expired holder can never overlap its successor - `inst-disp-claim`
+2. [x] - `p1` - **FOR EACH** event in the claimed batch - `inst-disp-each`
+   1. [x] - `p1` - API: `dispatch(ctx_system, event)` to all registered sinks concurrently, each bounded by the per-sink timeout - `inst-disp-fanout`
+3. [x] - `p1` - **IF** the registered sink set is empty - `inst-disp-nosink-if`
+   1. [x] - `p1` - **RETURN** ack unprocessed: events are dropped silently per the PRD §11 assumption, behind the bootstrap warning - `inst-disp-nosink`
+4. [x] - `p1` - **FOR EACH** `(event, sink)` outcome - `inst-disp-outcome`
+   1. [x] - `p1` - `Success`: record delivered for that sink - `inst-disp-ok`
+   2. [x] - `p1` - `Timeout` / `Transient`: increment `notification_dispatch_failures_total{sink_id, event_kind}` and mark the event retryable - `inst-disp-transient`
+   3. [x] - `p1` - `Permanent`: increment the failure counter and mark the event rejected - `inst-disp-perm`
+5. [x] - `p1` - **IF** any sink answered `Permanent`, or the event is retryable and `OutboxMessage.attempts` has reached the operator-configured maximum - `inst-disp-reject-if`
+   1. [x] - `p1` - **RETURN** `Reject(reason)`: the framework dead-letters the event; ToolKit itself never stops retrying, so the attempts guard is QE's explicit give-up per the `OutboxMessage.attempts` contract; increment `outbox_rejections_total` by `queue` on this path - `inst-disp-reject`
+6. [x] - `p1` - **IF** the event is retryable below the maximum - `inst-disp-retry-if`
+   1. [x] - `p1` - **RETURN** `Retry`: the framework re-delivers to **all** sinks later, duplicates permitted (sinks are idempotent on `event_id`) - `inst-disp-retry`
+7. [x] - `p1` - **RETURN** ack when every sink answered `Success`; no counter moves on this path (`outbox_rejections_total` increments only on `Reject`) - `inst-disp-ack`
 
 ### Threshold-Crossed Emission Semantics
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-threshold-emission`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-threshold-emission`
 
 **Input**: Pre/post consumed values of a successful counter mutation, the Quota's `notification_thresholds`, the
 per-`(Quota, period)` highest-crossed marker. This feature owns the shared emission routine; the mutating call sites
@@ -163,40 +148,32 @@ that invoke it land with consumption-operations and lease-operations.
 **Output**: Zero or one `threshold-crossed` outbox event for the mutation
 
 **Steps**:
-1. [ ] - `p1` - **IF** the operation outcome is `Denied` or a canonical error - `inst-thr-denied-if`
-   1. [ ] - `p1` - Emit nothing: counters did not move, so no transition occurred - `inst-thr-none`
-2. [ ] - `p1` - **IF** the mutation settles into a closing period during the settlement window (cross-period lease
-   commit/release/rollback per ADR-0004) - `inst-thr-settle-if`
-   1. [ ] - `p1` - Emit nothing: the settlement-window emit policy is silence; closing-period state rides the
-      `period-rollover` payload alone - `inst-thr-settle-skip`
-3. [ ] - `p1` - Compute the crossed set: thresholds `t` with `pre% < t ≤ post%` that are also strictly above the
-   stored marker (the marker guards against re-emission after credits lower `consumed`) - `inst-thr-compute`
-4. [ ] - `p1` - **IF** the crossed set is empty - `inst-thr-empty-if`
-   1. [ ] - `p1` - Emit nothing - `inst-thr-skip`
-5. [ ] - `p1` - Enqueue exactly one `threshold-crossed` event carrying `crossed_thresholds` ascending and `highest_crossed_threshold`, same-tx with the mutation - `inst-thr-emit`
-6. [ ] - `p1` - DB: advance the stored marker to the highest crossed value; the marker resets at period rollover (I13, owned by consumption-operations) - `inst-thr-marker`
-7. [ ] - `p1` - **RETURN** one event per upward transition, never per threshold and never on repeat readings - `inst-thr-return`
+1. [x] - `p1` - **IF** the operation outcome is `Denied` or a canonical error - `inst-thr-denied-if`
+   1. [x] - `p1` - Emit nothing: counters did not move, so no transition occurred - `inst-thr-none`
+2. [x] - `p1` - **IF** the mutation settles into a closing period during the settlement window (cross-period lease commit/release/rollback per ADR-0004) - `inst-thr-settle-if`
+   1. [x] - `p1` - Emit nothing: the settlement-window emit policy is silence; closing-period state rides the `period-rollover` payload alone - `inst-thr-settle-skip`
+3. [x] - `p1` - Compute the crossed set: thresholds `t` with `pre% < t ≤ post%` that are also strictly above the stored marker (the marker guards against re-emission after credits lower `consumed`) - `inst-thr-compute`
+4. [x] - `p1` - **IF** the crossed set is empty - `inst-thr-empty-if`
+   1. [x] - `p1` - Emit nothing - `inst-thr-skip`
+5. [x] - `p1` - Enqueue exactly one `threshold-crossed` event carrying `crossed_thresholds` ascending and `highest_crossed_threshold`, same-tx with the mutation - `inst-thr-emit`
+6. [x] - `p1` - DB: advance the stored marker to the highest crossed value; the marker resets at period rollover (I13, owned by consumption-operations) - `inst-thr-marker`
+7. [x] - `p1` - **RETURN** one event per upward transition, never per threshold and never on repeat readings - `inst-thr-return`
 
 ## 4. States (CDSL)
 
 ### Outbox Event State Machine
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-state-outbox-event`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-state-outbox-event`
 
 **States**: Enqueued, Delivered, DeadLettered
 
 **Initial State**: Enqueued
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** Enqueued **TO** Delivered **WHEN** the handler acks — every registered sink answered
-   `Success` (or the sink set is empty per the zero-sink drop rule) - `inst-obst-delivered`
-2. [ ] - `p1` - **FROM** Enqueued **TO** Enqueued **WHEN** the handler returns `Retry` on `Timeout`/`Transient`
-   outcomes below the attempts maximum — re-delivery goes to all sinks; duplicates permitted - `inst-obst-retry`
-3. [ ] - `p1` - **FROM** Enqueued **TO** DeadLettered **WHEN** the handler returns `Reject` — any `Permanent` sink
-   outcome, or `OutboxMessage.attempts` at the configured maximum; operators inspect it via the framework
-   `dead_letter_list` / `dead_letter_count` APIs; P1 defines no replay - `inst-obst-dead`
-4. [ ] - `p1` - **FROM** Delivered **TO** Delivered **WHEN** the framework vacuum stage reclaims the row (terminal;
-   physical cleanup only) - `inst-obst-reclaim`
+1. [x] - `p1` - **FROM** Enqueued **TO** Delivered **WHEN** the handler acks — every registered sink answered `Success` (or the sink set is empty per the zero-sink drop rule) - `inst-obst-delivered`
+2. [x] - `p1` - **FROM** Enqueued **TO** Enqueued **WHEN** the handler returns `Retry` on `Timeout`/`Transient` outcomes below the attempts maximum — re-delivery goes to all sinks; duplicates permitted - `inst-obst-retry`
+3. [x] - `p1` - **FROM** Enqueued **TO** DeadLettered **WHEN** the handler returns `Reject` — any `Permanent` sink outcome, or `OutboxMessage.attempts` at the configured maximum; operators inspect it via the framework `dead_letter_list` / `dead_letter_count` APIs; P1 defines no replay - `inst-obst-dead`
+4. [x] - `p1` - **FROM** Delivered **TO** Delivered **WHEN** the framework vacuum stage reclaims the row (terminal; physical cleanup only) - `inst-obst-reclaim`
 
 Dead-letter rows are retained per operator configuration for delivery-failure diagnostics (PRD §6.2 default: 7 days).
 P1 defines no dead-letter replay, since delivery is best-effort by requirement: the framework's `dead_letter_replay`
@@ -207,7 +184,7 @@ sinks, then `dead_letter_resolve` or `dead_letter_reject`) is deferred to P2 alo
 
 ### Sink Plugin Contract
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-sink-contract`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-sink-contract`
 
 The system **MUST** define `QuotaNotificationSinkV1` in the SDK crate — async, two methods (`id() -> &str`,
 `dispatch(ctx: &SecurityContext, event: QuotaEvent) -> Result<(), DispatchError>`, invoked under the dispatcher's
@@ -228,7 +205,7 @@ as `updated`), `event_id`, its scope, target reference, `subject` when applicabl
 
 ### Dispatcher as Outbox Leased Handler
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-dispatcher`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-dispatcher`
 
 The system **MUST** implement the `NotificationDispatcher` as the sole caller of sink `dispatch`, registered as the
 `toolkit-db` Outbox **leased handler** on the QE notification queue: the framework owns batch claiming, lease fencing
@@ -236,6 +213,9 @@ The system **MUST** implement the `NotificationDispatcher` as the sole caller of
 fan-out with a per-sink timeout, per-sink failure isolation, `Retry` on transient outcomes below the
 operator-configured `OutboxMessage.attempts` maximum (duplicates permitted), `Reject` on any `Permanent` outcome or at
 that maximum, and ack only when every sink succeeded — all under the dispatcher's system-level `SecurityContext`.
+Before delivery is enabled, every mutating transaction that enqueues events **MUST** hand the outbox `Wake` of its
+enqueues back to the store, which fires it only after the transaction commits and discards it on rollback or when a
+retry abandons the attempt, so a committed event is picked up at once rather than on the outbox reconciler's next pass.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-dispatcher-singleton`
@@ -251,7 +231,7 @@ that maximum, and ack only when every sink succeeded — all under the dispatche
 
 ### Event Catalog Conformance
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-event-catalog`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-event-catalog`
 
 The system **MUST** deliver all eight catalog kinds — `threshold-crossed`, `period-rollover`, `lease-auto-released`,
 `lease-resolved-by-deactivation`, `quota-changed`, `quota-counter-adjusted`, `quota-rollback-applied`,

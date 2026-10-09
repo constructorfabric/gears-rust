@@ -242,6 +242,12 @@ jobs:
       - name: Run usage-collector E2E tests (TimescaleDB + ClickHouse containers)
         run: make e2e-usage-collector
 
+      # Focused suite: its e2e.yaml adds QE, its storage plugin, the cluster
+      # profile and the GTS catalog to a server of its own, and sets the env
+      # var the suite needs, so `make e2e-local` above skips it.
+      - name: Run quota-enforcement E2E tests (focused server)
+        run: make e2e-local SUITE=quota-enforcement
+
       # Self-managed OoP (loopback, no k8s) suite: builds flight-control + three
       # oop_module gear binaries and orchestrates them as processes itself, so it
       # bypasses run_e2e.py and runs via its own target.

@@ -1595,6 +1595,11 @@ per operation kind:
 - `rollback` **MUST** fingerprint the same authorized, catalogue-mapped attribution as the debit it reverses, which the
   caller supplies and the system re-authorizes, so its scope coincides with the original's however many Quotas that
   debit's plan spanned. An owning Quota is undefined for a multi-Quota plan, so the credit rule cannot serve here.
+- For the three bulk Quota envelopes (`bulk_create_quotas`, `bulk_update_quotas`, `bulk_deactivate_quotas`), which
+  name their target Quotas explicitly and resolve no subjects, the system **MUST** fingerprint the empty subject set, so
+  an envelope key is unique per tenant and bulk operation. A changed item list under the same key is a payload
+  divergence even when it targets other subjects. Authorization and the caller's scope still apply to every item before
+  a stored outcome is returned.
 
 These rules keep the four-component scope `(tenant_id, idempotency_subject_key, operation_type, key)` total across every
 write operation and prevent caller-selected projections from fragmenting an applicable user or tenant scope. P1 does

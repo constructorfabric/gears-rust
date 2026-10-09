@@ -385,6 +385,9 @@ jobs:
       - name: Test postgres-cluster-plugin (pg integration)
         run: make test-cluster-pg
 
+      - name: Test quota-enforcement storage plugin (pg integration)
+        run: make test-quota-enforcement-pg
+
       - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
         # k3s runs in a **privileged** container (testcontainers-modules sets it);
         # GitHub-hosted ubuntu runners permit that. The target uses `cargo test`, not
@@ -989,6 +992,9 @@ jobs:
       #      `test-cluster-pg`.
       #   4. The k8s-cluster-plugin L2/L3 k3s suites. These live behind
       #      `required-features = ["integration"]`.
+      #   5. The quota-enforcement storage plugin's PostgreSQL suites. These
+      #      live behind `#![cfg(feature = "postgres")]`. Keep in sync with
+      #      `test-quota-enforcement-pg`.
       #
       # The per-binary k3s loop (one container per binary, cleaned between —
       # nextest's process-per-test would start ~70 of them) lives in the
@@ -1012,6 +1018,9 @@ jobs:
           cargo llvm-cov nextest --no-report -p cf-postgres-cluster-plugin --features integration --retries 1
           # Pass 4: k8s-cluster-plugin k3s suites
           make coverage-cluster-k8s
+          # Pass 5: quota-enforcement storage plugin PostgreSQL suites (real
+          # Postgres via testcontainers).
+          cargo llvm-cov nextest --no-report -p cf-gears-quota-enforcement-storage-plugin --features postgres
           # Merge into the single report that gets uploaded.
           cargo llvm-cov report --lcov --output-path lcov.info
 
