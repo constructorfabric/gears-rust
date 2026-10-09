@@ -1,778 +1,762 @@
-//! Public models for the `types-registry` gear.
-//!
-//! These are transport-agnostic data structures that define the contract
-//! between the `types-registry` gear and its consumers.
+//! Serde-free P0 models (SPEC §10.1, DESIGN §3.3); REST DTOs are separate.
+//! Flat documents avoid parent graphs (P5); ownership, availability and federation are P1.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use toolkit_gts::GTS_ID_URI_PREFIX;
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroU8;
+use std::str::FromStr;
 
-use gts::{GtsId, GtsIdSegment, GtsInstanceId};
-use serde_json::{Map, Value};
+use gts::{GtsId, GtsIdPattern, GtsIdSegment, GtsInstanceId, GtsTypeId};
+use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
-
-/// SDK-facing GTS type-schema identifier, re-exported from the `gts` crate.
-///
-/// Within the types-registry SDK, schemas are *type-schemas* and their
-/// identifiers are *type ids*.
-pub use gts::GtsTypeId;
 use uuid::Uuid;
 
-use crate::field;
-use crate::gts::TypeResource;
+/// One authored or materialized JSON document.
+pub type JsonDocument = serde_json::Value;
 
-/// Build the in-process `InvalidArgument` canonical error the client-side
-/// `try_new` constructors emit for a malformed / kind-mismatched GTS id.
-///
-/// Mirrors the impl crate's `From<DomainError> for CanonicalError` mapping of
-/// `InvalidGtsId` (field [`field::GTS_ID_FIELD`], reason
-/// [`field::INVALID_GTS_ID`]) so the in-process and REST classifications match.
-/// These constructors never cross a wire boundary (ADR 0005 "Non-Canonical
-/// Methods"); emitting `CanonicalError` keeps the SDK on a single error type
-/// end-to-end (it projects to
-/// [`TypesRegistryError::Validation`](crate::TypesRegistryError::Validation)).
-fn invalid_gts_id_error(message: impl Into<String>) -> CanonicalError {
-    TypeResource::invalid_argument()
-        .with_field_violation(field::GTS_ID_FIELD, message, field::INVALID_GTS_ID)
-        .create()
+// ---- keys and selection -----------------------------------------------------
+
+/// How a caller names one entity: its GTS identifier or its Registry Reference.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum EntityKey {
+    GtsId(GtsId),
+    GtsUuid(Uuid),
 }
 
-/// Returns `true` if `s` is shaped like a type-schema GTS id (ends with `~`).
-///
-/// Type-schema ids and instance ids are lexically distinct in GTS: type-schema
-/// ids end with `~`, instance ids do not. Centralizing the predicate here so
-/// that callers don't sprinkle raw `ends_with('~')` checks across kind-aware
-/// code (`local_client`, mocks, etc.). Pure string predicate — does not parse
-/// or otherwise validate the id.
-///
-// TODO(#1752): drop this helper once `GtsTypeId::try_new` /
-// `GtsInstanceId::try_new` land upstream in `gts-rust`. Callers should
-// consume `&GtsTypeId` / `&GtsInstanceId` directly and the kind invariant
-// becomes a type-system property instead of a runtime predicate.
-#[must_use]
-pub fn is_type_schema_id(s: &str) -> bool {
-    s.ends_with('~')
+impl EntityKey {
+    /// Kind from the identifier’s trailing `~`; Registry References carry no kind.
+    #[must_use]
+    pub fn kind(&self) -> Option<EntityKind> {
+        match self {
+            Self::GtsId(id) => Some(EntityKind::of(id)),
+            Self::GtsUuid(_) => None,
+        }
+    }
 }
 
-/// A registered GTS type-schema (type definition).
-///
-/// In addition to the common fields, the schema-specific extensions
-/// `x-gts-traits-schema` and `x-gts-traits` are extracted into top-level
-/// fields, and the GTS chain parent is pre-resolved into [`Self::parent`]
-/// (Arc-shared, deduplicated by the registry's local-client cache).
-///
-/// Use [`Self::effective_schema`], [`Self::effective_properties`],
-/// [`Self::effective_required`], [`Self::effective_traits`] to inspect the schema
-/// across the inheritance chain without manual walking.
-///
-/// `x-gts-final` / `x-gts-abstract` modifiers are intentionally not surfaced
-/// here yet — support will be added later.
+impl From<GtsId> for EntityKey {
+    fn from(id: GtsId) -> Self {
+        Self::GtsId(id)
+    }
+}
+
+impl From<Uuid> for EntityKey {
+    fn from(uuid: Uuid) -> Self {
+        Self::GtsUuid(uuid)
+    }
+}
+
+impl fmt::Display for EntityKey {
+    /// The canonical spelling: the identifier, or the hyphenated lowercase UUID.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GtsId(id) => id.fmt(f),
+            Self::GtsUuid(uuid) => uuid.hyphenated().fmt(f),
+        }
+    }
+}
+
+/// Opaque freshness token (SPEC §8.5), compared by equality and never recomputed here.
+/// REST strips RFC 9110 entity-tag quotes on receipt and restores them on send;
+/// all clients expose the same token bytes.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Validator(Vec<u8>);
+
+impl Validator {
+    /// Wraps validator bytes received from the registry.
+    #[must_use]
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(bytes.into())
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Validator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Validator")
+            .field(&String::from_utf8_lossy(&self.0))
+            .finish()
+    }
+}
+
+/// One key of a batch read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchGetItem {
+    pub key: EntityKey,
+    /// Makes the read conditional for this key alone; `None` reads it unconditionally.
+    pub if_none_match: Option<Validator>,
+}
+
+impl From<EntityKey> for BatchGetItem {
+    fn from(key: EntityKey) -> Self {
+        Self {
+            key,
+            if_none_match: None,
+        }
+    }
+}
+
+/// Batch-read key ceiling (SPEC C10); larger reads are split.
+pub const MAX_BATCH_GET_KEYS: usize = 100;
+
+/// A batch read: every key answered under one projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchGetEntitiesRequest {
+    pub items: Vec<BatchGetItem>,
+    pub projection: Projection,
+    /// Bypass cache freshness and revalidate (§8.3, T28); transports ignore this SDK-only flag.
+    pub fresh: bool,
+}
+
+/// A selectable or mandatory entity field (SPEC §10.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EntityField {
+    GtsId,
+    GtsUuid,
+    Kind,
+    LifecycleStatus,
+    Origin,
+    Content,
+    ResolvedSchema,
+    EffectiveTraits,
+    EffectiveTraitsSchema,
+    Provenance,
+}
+
+impl EntityField {
+    pub const ALL: [Self; 10] = [
+        Self::GtsId,
+        Self::GtsUuid,
+        Self::Kind,
+        Self::LifecycleStatus,
+        Self::Origin,
+        Self::Content,
+        Self::ResolvedSchema,
+        Self::EffectiveTraits,
+        Self::EffectiveTraitsSchema,
+        Self::Provenance,
+    ];
+
+    /// Present on every snapshot, whatever the selection.
+    pub const MANDATORY: [Self; 4] = [
+        Self::GtsId,
+        Self::GtsUuid,
+        Self::Kind,
+        Self::LifecycleStatus,
+    ];
+
+    /// What [`Projection::Default`] selects: document-free (§10.2).
+    pub const DEFAULT: [Self; 5] = [
+        Self::GtsId,
+        Self::GtsUuid,
+        Self::Kind,
+        Self::LifecycleStatus,
+        Self::Origin,
+    ];
+
+    /// The wire name, as `$select` spells it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::GtsId => "gts_id",
+            Self::GtsUuid => "gts_uuid",
+            Self::Kind => "kind",
+            Self::LifecycleStatus => "lifecycle_status",
+            Self::Origin => "origin",
+            Self::Content => "content",
+            Self::ResolvedSchema => "resolved_schema",
+            Self::EffectiveTraits => "effective_traits",
+            Self::EffectiveTraitsSchema => "effective_traits_schema",
+            Self::Provenance => "provenance",
+        }
+    }
+}
+
+/// Typed selection always containing [`EntityField::MANDATORY`]; empty/unknown sets are impossible.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FieldSelection(BTreeSet<EntityField>);
+
+impl FieldSelection {
+    #[must_use]
+    pub fn light() -> Self {
+        Self(EntityField::MANDATORY.into_iter().collect())
+    }
+
+    /// The mandatory fields plus `fields`.
+    #[must_use]
+    pub fn with(fields: &[EntityField]) -> Self {
+        let mut selection = Self::light();
+        selection.0.extend(fields.iter().copied());
+        selection
+    }
+
+    #[must_use]
+    pub fn full() -> Self {
+        Self(EntityField::ALL.into_iter().collect())
+    }
+
+    #[must_use]
+    pub fn contains(&self, field: EntityField) -> bool {
+        self.0.contains(&field)
+    }
+
+    /// The selected fields in a stable order.
+    pub fn fields(&self) -> impl Iterator<Item = EntityField> + '_ {
+        self.0.iter().copied()
+    }
+}
+
+/// Default and an explicit default selection compare equal via [`Self::normalized`].
+#[derive(Debug, Clone, Default)]
+pub enum Projection {
+    #[default]
+    Default,
+    Select(FieldSelection),
+}
+
+impl Projection {
+    /// The selection this projection asks for.
+    #[must_use]
+    pub fn normalized(&self) -> FieldSelection {
+        match self {
+            Self::Default => FieldSelection::with(&EntityField::DEFAULT),
+            Self::Select(selection) => selection.clone(),
+        }
+    }
+}
+
+impl PartialEq for Projection {
+    fn eq(&self, other: &Self) -> bool {
+        self.normalized() == other.normalized()
+    }
+}
+
+impl Eq for Projection {}
+
+// ---- results ----------------------------------------------------------------
+
+/// Every key's answer, keyed by the key as asked.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BatchGetEntitiesResponse(pub HashMap<EntityKey, EntityLookup>);
+
+/// Per-key answer; P0 has no federation failure. Future variants require a fallback arm.
 #[derive(Debug, Clone, PartialEq)]
-pub struct GtsTypeSchema {
-    /// Deterministic UUID v5 derived from the type id.
-    pub type_uuid: Uuid,
+#[non_exhaustive]
+pub enum EntityLookup {
+    /// `etag` is scoped to the normalized projection, so it changes with it.
+    Found {
+        entity: Box<Entity>,
+        etag: Validator,
+    },
+    /// Matching validator: no snapshot transferred; every non-`NotFound` answer carries an etag.
+    Unchanged { etag: Validator },
+    /// Absent.
+    NotFound,
+}
 
-    /// The full GTS type identifier. Always ends with `~`.
+/// Projected entity with mandatory identity, kind and lifecycle. Documents are stored
+/// materializations (D3): `None` is unselected/inapplicable; `Some(Null)` is selected null.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entity {
+    pub gts_id: GtsId,
+    pub gts_uuid: Uuid,
+    pub kind: EntityKind,
+    pub lifecycle_status: LifecycleStatus,
+    pub origin: Option<Origin>,
+    /// The authored document, whichever kind it is.
+    pub content: Option<JsonDocument>,
+    /// Type Schemas only.
+    pub resolved_schema: Option<JsonDocument>,
+    /// Type Schemas only.
+    pub effective_traits: Option<JsonDocument>,
+    /// Type Schemas only.
+    pub effective_traits_schema: Option<JsonDocument>,
+    pub provenance: Option<Provenance>,
+}
+
+impl Entity {
+    /// The identifier's segments, base first.
+    #[must_use]
+    pub fn segments(&self) -> &[GtsIdSegment] {
+        self.gts_id.segments()
+    }
+}
+
+/// A Type Schema as a kind-narrowed read returns it: [`Entity`] with the kind in the
+/// type. Documents follow the read's projection — `None` is unselected, `Some(Null)` a
+/// selected null — and are the server's materializations (D3); nothing is computed here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeSchema {
     pub type_id: GtsTypeId,
-
-    /// All parsed segments from the GTS ID.
-    pub segments: Vec<GtsIdSegment>,
-
-    /// This type-schema's own raw JSON Schema body.
-    ///
-    /// `allOf[].$ref` references are kept verbatim — use [`Self::effective_schema`]
-    /// to obtain a representation with the parent inlined.
-    pub raw_schema: Value,
-
-    /// This type-schema's own `x-gts-traits` values, if present.
-    pub traits: Option<Value>,
-
-    /// This type-schema's own `x-gts-traits-schema`, if present.
-    pub traits_schema: Option<Value>,
-
-    /// Resolved parent type-schema in the inheritance chain.
-    ///
-    /// `None` for root type-schemas (no parent in the chain) or when the parent
-    /// hasn't been resolved by the producer.
-    pub parent: Option<Arc<GtsTypeSchema>>,
-
-    /// Optional human-readable title (`title` field of the JSON Schema).
-    pub title: Option<String>,
-
-    /// Optional human-readable description.
-    pub description: Option<String>,
+    pub type_uuid: Uuid,
+    pub lifecycle_status: LifecycleStatus,
+    pub origin: Option<Origin>,
+    /// The authored schema.
+    pub content: Option<JsonDocument>,
+    pub resolved_schema: Option<JsonDocument>,
+    pub effective_traits: Option<JsonDocument>,
+    pub effective_traits_schema: Option<JsonDocument>,
+    pub provenance: Option<Provenance>,
 }
 
-impl GtsTypeSchema {
-    /// Constructs a `GtsTypeSchema` from its canonical inputs.
-    ///
-    /// `type_uuid` and `segments` are derived from `type_id` via gts-rust's
-    /// canonical parser — there is only one source of truth (the id string).
-    /// `traits` / `traits_schema` / `title` are extracted from `raw_schema`.
-    /// `parent` is pre-resolved by the caller (typically the local client
-    /// via its type-schema cache); presence/absence of `parent` is enforced
-    /// against the chain shape of `type_id` — a derived id MUST carry its
-    /// parent, a root id MUST NOT — so that
-    /// [`ancestors`](Self::ancestors) / [`effective_schema`](Self::effective_schema)
-    /// always observe a complete chain. A mismatched parent (chain-prefix
-    /// disagreement) is also rejected.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `InvalidArgument` [`CanonicalError`] (reason
-    /// [`field::INVALID_GTS_ID`]) in any of these cases:
-    /// - `type_id` does not end with `~` (looks like an instance id);
-    /// - `type_id` does not parse as a valid GTS identifier;
-    /// - `parent` is `Some(_)` but its `type_id` does not match the chain
-    ///   prefix derived from this `type_id`;
-    /// - `parent` is `Some(_)` but this `type_id` is a root (no chain prefix
-    ///   exists, so the schema cannot have a parent);
-    /// - `parent` is `None` but this `type_id` is derived (its chain prefix
-    ///   is non-empty, so the schema requires its parent to be passed in).
-    pub fn try_new(
-        type_id: GtsTypeId,
-        raw_schema: Value,
-        description: Option<String>,
-        parent: Option<Arc<GtsTypeSchema>>,
-    ) -> Result<Self, CanonicalError> {
-        if !is_type_schema_id(type_id.as_ref()) {
-            return Err(invalid_gts_id_error(format!(
-                "{type_id} does not end with `~`",
-            )));
-        }
-        match (
-            parent.as_ref(),
-            Self::derive_parent_type_id(type_id.as_ref()),
-        ) {
-            (Some(parent_schema), Some(expected)) if expected != parent_schema.type_id => {
-                return Err(invalid_gts_id_error(format!(
-                    "type-schema {type_id} expects parent {expected}, got {}",
-                    parent_schema.type_id,
-                )));
-            }
-            (Some(_), None) => {
-                return Err(invalid_gts_id_error(format!(
-                    "root type-schema {type_id} cannot have a parent",
-                )));
-            }
-            (None, Some(expected)) => {
-                return Err(invalid_gts_id_error(format!(
-                    "derived type-schema {type_id} requires parent {expected}, got None",
-                )));
-            }
-            // (Some, Some) where prefixes match  →  ok
-            // (None, None) — root with no parent  →  ok
-            _ => {}
-        }
-        let parsed =
-            GtsId::try_new(type_id.as_ref()).map_err(|e| invalid_gts_id_error(format!("{e}")))?;
-        let type_uuid = parsed.to_uuid();
-        let segments = parsed.segments().to_vec();
-        let traits = Self::extract_traits(&raw_schema);
-        let traits_schema = Self::extract_traits_schema(&raw_schema);
-        let title = Self::extract_title(&raw_schema);
-        Ok(Self {
-            type_uuid,
-            type_id,
-            segments,
-            raw_schema,
-            traits,
-            traits_schema,
-            parent,
-            title,
-            description,
-        })
-    }
-
-    /// Derives the GTS parent's `type_id` from the parsed GTS chain.
-    ///
-    /// Mirrors gts-rust's chain semantics: for a chained type id like
-    /// `gts.cf.core.events.type.v1~x.commerce.orders.order.v1.0~`, the parent
-    /// is `gts.cf.core.events.type.v1~`. Returns `None` for root (single-segment)
-    /// type-schemas or for ids that don't end with `~`.
-    #[must_use]
-    pub fn derive_parent_type_id(type_id: &str) -> Option<GtsTypeId> {
-        let parsed = GtsId::try_new(type_id).ok()?;
-        if !parsed.is_type() {
-            return None;
-        }
-        parsed.get_type_id().map(|id| GtsTypeId::new(&id))
-    }
-
-    /// Reads `x-gts-traits` from the top level of a schema value.
-    #[must_use]
-    pub fn extract_traits(schema: &Value) -> Option<Value> {
-        schema.get("x-gts-traits").cloned()
-    }
-
-    /// Reads `x-gts-traits-schema` from the top level of a schema value.
-    #[must_use]
-    pub fn extract_traits_schema(schema: &Value) -> Option<Value> {
-        schema.get("x-gts-traits-schema").cloned()
-    }
-
-    /// Collects parent GTS IDs from `allOf[].$ref` (with `gts://` prefix stripped).
-    #[must_use]
-    pub fn extract_allof_refs(schema: &Value) -> Vec<String> {
-        let Some(arr) = schema.get("allOf").and_then(|v| v.as_array()) else {
-            return Vec::new();
-        };
-        arr.iter()
-            .filter_map(|item| item.get("$ref").and_then(|r| r.as_str()))
-            .map(|r| r.strip_prefix(GTS_ID_URI_PREFIX).unwrap_or(r).to_owned())
-            .collect()
-    }
-
-    /// Reads the optional `title` field.
-    #[must_use]
-    pub fn extract_title(schema: &Value) -> Option<String> {
-        schema
-            .get("title")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned)
-    }
-
-    /// Returns the primary segment (first segment in the chain).
-    #[must_use]
-    pub fn primary_segment(&self) -> Option<&GtsIdSegment> {
-        self.segments.first()
-    }
-
-    /// Returns the vendor from the primary segment.
-    #[must_use]
-    pub fn vendor(&self) -> Option<&str> {
-        self.primary_segment().map(GtsIdSegment::vendor)
-    }
-
-    /// Iteration over the inheritance chain (this schema first, then parent,
-    /// then grandparent, ...). Linear walk via [`Self::parent`].
-    #[must_use]
-    pub fn ancestors(&self) -> AncestorIter<'_> {
-        AncestorIter {
-            current: Some(self),
-        }
-    }
-
-    /// Returns this schema's body with the GTS parent's `$ref` inlined where
-    /// it appears in `allOf` (parent body expanded in place). The shape of
-    /// the JSON Schema is preserved — `allOf`, `oneOf`, `anyOf`, `enum`, etc.
-    /// stay valid.
-    ///
-    /// Non-parent `allOf[].$ref` items (mixin references) are left as-is.
-    #[must_use]
-    pub fn effective_schema(&self) -> Value {
-        merge_schema_with_parent(&self.raw_schema, self.parent.as_deref())
-    }
-
-    /// Properties merged across the full chain. This schema wins on key
-    /// collisions; parent fills in inherited keys.
-    #[must_use]
-    pub fn effective_properties(&self) -> BTreeMap<String, Value> {
-        let mut out = self
-            .parent
-            .as_ref()
-            .map_or_else(BTreeMap::new, |p| p.effective_properties());
-        for (k, v) in collect_own_properties(&self.raw_schema) {
-            out.insert(k, v);
-        }
-        out
-    }
-
-    /// `required` field merged across the full chain (de-duplicated, order
-    /// preserved by first occurrence in pre-order walk).
-    #[must_use]
-    pub fn effective_required(&self) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for ancestor in self.ancestors() {
-            for r in collect_own_required(&ancestor.raw_schema) {
-                if seen.insert(r.clone()) {
-                    out.push(r);
-                }
-            }
-        }
-        out
-    }
-
-    /// Trait values merged across the chain.
-    ///
-    /// Resolution order (priority high → low):
-    /// 1. Declared `x-gts-traits` values from `self` and ancestors —
-    ///    rightmost wins, so a leaf's value overrides any parent's.
-    /// 2. Defaults from `x-gts-traits-schema.properties[*].default`
-    ///    declared anywhere in the chain. When two levels both declare a
-    ///    default for the same property, the **deepest** (closest to base)
-    ///    wins — mirroring gts-rust's locking rule that descendants cannot
-    ///    redefine an ancestor's default during schema-trait validation.
-    ///
-    /// Returns `Value::Null` only when neither declared traits nor
-    /// schema-declared defaults exist anywhere in the chain.
-    // TODO(#1723): replace with gts-rust's resolve_schema(...).effective_traits
-    // once that helper is exposed publicly.
-    #[must_use]
-    pub fn effective_traits(&self) -> Value {
-        let mut acc: Map<String, Value> = Map::new();
-        // Phase 1: declared traits. Walk own → ancestors and only insert
-        // when the key is absent so own (rightmost) wins over ancestors.
-        for s in self.ancestors() {
-            if let Some(Value::Object(traits)) = s.traits.as_ref() {
-                for (k, v) in traits {
-                    acc.entry(k.clone()).or_insert_with(|| v.clone());
-                }
-            }
-        }
-        // Phase 2: defaults from x-gts-traits-schema. Walk from deepest
-        // base to leaf so the **earliest** default wins on a given key,
-        // matching the locking semantics gts-rust enforces during
-        // validation. `or_insert_with` on the already-populated map means
-        // declared values still beat defaults.
-        let chain: Vec<&GtsTypeSchema> = self.ancestors().collect();
-        for s in chain.iter().rev() {
-            let Some(traits_schema) = s.traits_schema.as_ref() else {
-                continue;
-            };
-            let Some(Value::Object(props)) = traits_schema.get("properties") else {
-                continue;
-            };
-            for (k, prop) in props {
-                if let Some(default) = prop.get("default") {
-                    acc.entry(k.clone()).or_insert_with(|| default.clone());
-                }
-            }
-        }
-        if acc.is_empty() {
-            Value::Null
-        } else {
-            Value::Object(acc)
-        }
-    }
-
-    /// All `x-gts-traits-schema` blocks collected across the chain, ordered
-    /// from deepest base to this schema. Use to compose the effective trait
-    /// schema (e.g. via `allOf`) when validating trait values.
-    #[must_use]
-    pub fn effective_traits_schema(&self) -> Vec<Value> {
-        // Pre-order is self → ancestors; reverse to get deepest-base-first.
-        let mut out: Vec<Value> = self
-            .ancestors()
-            .filter_map(|s| s.traits_schema.clone())
-            .collect();
-        out.reverse();
-        out
-    }
-}
-
-/// Iterator over a type-schema's inheritance chain (self first, then each
-/// ancestor by following [`GtsTypeSchema::parent`]).
-pub struct AncestorIter<'a> {
-    current: Option<&'a GtsTypeSchema>,
-}
-
-impl<'a> Iterator for AncestorIter<'a> {
-    type Item = &'a GtsTypeSchema;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let curr = self.current.take()?;
-        self.current = curr.parent.as_deref();
-        Some(curr)
-    }
-}
-
-fn collect_own_properties(schema: &Value) -> BTreeMap<String, Value> {
-    let mut out = BTreeMap::new();
-    // Top-level properties.
-    if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
-        for (k, v) in props {
-            out.insert(k.clone(), v.clone());
-        }
-    }
-    // Properties declared inside allOf branches that are NOT pure $refs
-    // (the parent's body comes from `self.parent`). Inline overlays count as "own".
-    if let Some(arr) = schema.get("allOf").and_then(|v| v.as_array()) {
-        for item in arr {
-            // Skip pure-$ref entries (resolved via `parent`).
-            let is_pure_ref = item
-                .as_object()
-                .is_some_and(|m| m.len() == 1 && m.contains_key("$ref"));
-            if is_pure_ref {
-                continue;
-            }
-            if let Some(props) = item.get("properties").and_then(|v| v.as_object()) {
-                for (k, v) in props {
-                    out.insert(k.clone(), v.clone());
-                }
-            }
-        }
-    }
-    out
-}
-
-fn collect_own_required(schema: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Some(req) = schema.get("required").and_then(|v| v.as_array()) {
-        for r in req {
-            if let Some(s) = r.as_str() {
-                out.push(s.to_owned());
-            }
-        }
-    }
-    if let Some(arr) = schema.get("allOf").and_then(|v| v.as_array()) {
-        for item in arr {
-            let is_pure_ref = item
-                .as_object()
-                .is_some_and(|m| m.len() == 1 && m.contains_key("$ref"));
-            if is_pure_ref {
-                continue;
-            }
-            if let Some(req) = item.get("required").and_then(|v| v.as_array()) {
-                for r in req {
-                    if let Some(s) = r.as_str() {
-                        out.push(s.to_owned());
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Returns `schema` with the entry `allOf[i] = {$ref: gts://parent.type_id}`
-/// replaced by the merged body of the GTS parent. Other `allOf` entries
-/// (non-ref overlays, mixin `$ref`s pointing elsewhere) are left as-is.
-/// `$id` and `$schema` are stripped from the inlined parent to keep the
-/// merged document a valid composite schema.
-fn merge_schema_with_parent(schema: &Value, parent: Option<&GtsTypeSchema>) -> Value {
-    let Value::Object(map) = schema else {
-        return schema.clone();
-    };
-    let Some(parent) = parent else {
-        return Value::Object(map.clone());
-    };
-    let mut out = map.clone();
-
-    if let Some(Value::Array(items)) = out.get_mut("allOf").cloned().as_ref() {
-        let mut new_items = Vec::with_capacity(items.len());
-        for item in items {
-            let resolved = if let Some(obj) = item.as_object()
-                && obj.len() == 1
-                && let Some(ref_uri) = obj.get("$ref").and_then(|r| r.as_str())
-                && {
-                    let target = ref_uri.strip_prefix(GTS_ID_URI_PREFIX).unwrap_or(ref_uri);
-                    parent.type_id == target
-                } {
-                let mut merged = parent.effective_schema();
-                if let Value::Object(ref mut m) = merged {
-                    m.remove("$id");
-                    m.remove("$schema");
-                }
-                merged
-            } else {
-                item.clone()
-            };
-            new_items.push(resolved);
-        }
-        out.insert("allOf".to_owned(), Value::Array(new_items));
-    }
-
-    Value::Object(out)
-}
-
-/// A registered GTS instance.
-///
-/// The instance carries an `Arc`-shared reference to its [`GtsTypeSchema`],
-/// pre-resolved by the registry's local client (with full ancestor chain
-/// already linked). Inspect via `instance.type_schema.effective_*` directly.
+/// An Instance as a kind-narrowed read returns it; see [`TypeSchema`]. `type_id` is the
+/// Type Schema it conforms to, named by its own identifier; read that schema with
+/// `get_type_schema`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct GtsInstance {
-    /// Deterministic UUID v5 derived from the GTS ID.
-    pub uuid: Uuid,
-
-    /// The full GTS instance identifier. Never ends with `~`.
+pub struct Instance {
     pub id: GtsInstanceId,
-
-    /// All parsed segments from the GTS ID.
-    pub segments: Vec<GtsIdSegment>,
-
-    /// The full instance object (raw `Value`).
-    pub object: Value,
-
-    /// Resolved type-schema this instance conforms to (Arc-shared with the
-    /// registry's cache).
-    pub type_schema: Arc<GtsTypeSchema>,
-
-    /// Optional description of the entity.
-    pub description: Option<String>,
+    pub uuid: Uuid,
+    pub type_id: GtsTypeId,
+    pub lifecycle_status: LifecycleStatus,
+    pub origin: Option<Origin>,
+    /// The authored document.
+    pub content: Option<JsonDocument>,
+    pub provenance: Option<Provenance>,
 }
 
-impl GtsInstance {
-    /// Constructs a `GtsInstance` from its canonical inputs plus a
-    /// pre-resolved type-schema reference.
-    ///
-    /// `uuid` and `segments` are derived from `id` via gts-rust's canonical
-    /// parser — there is only one source of truth (the id string). `id` must
-    /// NOT end with `~` and must contain at least one `~`. The passed
-    /// `type_schema.type_id` is verified to match the chain prefix derived
-    /// from `id` (everything up to and including the last `~`) so a
-    /// mismatched type-schema can't silently mislabel the instance.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `InvalidArgument` [`CanonicalError`] (reason
-    /// [`field::INVALID_GTS_ID`]) in any of these cases:
-    /// - `id` ends with `~` (looks like a type-schema id);
-    /// - `id` contains no `~` at all (no type-schema chain prefix);
-    /// - `id` does not parse as a valid GTS identifier;
-    /// - `type_schema.type_id` does not match the chain prefix derived from `id`.
-    pub fn try_new(
-        id: GtsInstanceId,
-        object: Value,
-        description: Option<String>,
-        type_schema: Arc<GtsTypeSchema>,
-    ) -> Result<Self, CanonicalError> {
-        if is_type_schema_id(id.as_ref()) {
-            return Err(invalid_gts_id_error(format!(
-                "{id} ends with `~` (looks like a type-schema id)",
-            )));
+impl TryFrom<Entity> for TypeSchema {
+    /// A snapshot of the other kind, handed back unchanged.
+    type Error = Entity;
+
+    fn try_from(snapshot: Entity) -> Result<Self, Self::Error> {
+        if snapshot.kind != EntityKind::TypeSchema || !snapshot.gts_id.is_type() {
+            return Err(snapshot);
         }
-        let derived = Self::derive_type_id(id.as_ref()).ok_or_else(|| {
-            invalid_gts_id_error(format!(
-                "instance id {id} has no type-schema chain (no `~`)"
-            ))
-        })?;
-        if derived != type_schema.type_id {
-            return Err(invalid_gts_id_error(format!(
-                "instance id {id} chain prefix {derived} does not match type-schema {0}",
-                type_schema.type_id
-            )));
-        }
-        let parsed =
-            GtsId::try_new(id.as_ref()).map_err(|e| invalid_gts_id_error(format!("{e}")))?;
-        let uuid = parsed.to_uuid();
-        let segments = parsed.segments().to_vec();
+        let Ok(type_id) = GtsTypeId::try_new(snapshot.gts_id.as_ref()) else {
+            return Err(snapshot);
+        };
         Ok(Self {
-            uuid,
-            id,
-            segments,
-            object,
-            type_schema,
-            description,
+            type_id,
+            type_uuid: snapshot.gts_uuid,
+            lifecycle_status: snapshot.lifecycle_status,
+            origin: snapshot.origin,
+            content: snapshot.content,
+            resolved_schema: snapshot.resolved_schema,
+            effective_traits: snapshot.effective_traits,
+            effective_traits_schema: snapshot.effective_traits_schema,
+            provenance: snapshot.provenance,
         })
     }
+}
 
-    /// `type_id` of the type-schema this instance conforms to. Always ends with `~`.
-    #[must_use]
-    pub fn type_id(&self) -> &GtsTypeId {
-        &self.type_schema.type_id
-    }
+impl TryFrom<Entity> for Instance {
+    /// A snapshot of the other kind, handed back unchanged.
+    type Error = Entity;
 
-    /// Derives the type-schema (parent type) GTS ID from an instance `id`.
-    ///
-    /// Returns the parsed type-schema segment for the instance id.
-    #[must_use]
-    pub fn derive_type_id(id: &str) -> Option<GtsTypeId> {
-        GtsId::try_new(id)
-            .ok()
-            .and_then(|parsed| parsed.get_type_id())
-            .map(|id| GtsTypeId::new(&id))
-    }
-
-    /// Returns the primary segment (first segment in the chain).
-    #[must_use]
-    pub fn primary_segment(&self) -> Option<&GtsIdSegment> {
-        self.segments.first()
-    }
-
-    /// Returns the vendor from the primary segment.
-    #[must_use]
-    pub fn vendor(&self) -> Option<&str> {
-        self.primary_segment().map(GtsIdSegment::vendor)
+    fn try_from(snapshot: Entity) -> Result<Self, Self::Error> {
+        // An Instance has no derived form: a materialization on one is inconsistent data,
+        // refused rather than dropped.
+        if snapshot.kind != EntityKind::Instance
+            || snapshot.gts_id.is_type()
+            || snapshot.resolved_schema.is_some()
+            || snapshot.effective_traits.is_some()
+            || snapshot.effective_traits_schema.is_some()
+        {
+            return Err(snapshot);
+        }
+        let ids = GtsInstanceId::try_new(snapshot.gts_id.as_ref()).ok().zip(
+            snapshot
+                .gts_id
+                .get_type_id()
+                .and_then(|type_id| GtsTypeId::try_new(&type_id).ok()),
+        );
+        let Some((id, type_id)) = ids else {
+            return Err(snapshot);
+        };
+        Ok(Self {
+            id,
+            uuid: snapshot.gts_uuid,
+            type_id,
+            lifecycle_status: snapshot.lifecycle_status,
+            origin: snapshot.origin,
+            content: snapshot.content,
+            provenance: snapshot.provenance,
+        })
     }
 }
 
-/// Result of registering a single GTS entity in a batch operation.
-///
-/// Successful registration carries only the canonical (server-normalized)
-/// GTS id of the persisted entity. Callers that need a typed view of the
-/// registered entity should follow up with [`TypesRegistryClient::get_type_schema`]
-/// / [`TypesRegistryClient::get_instance`] — keeping registration's
-/// responsibility narrow ("did it persist?") and reads' responsibility narrow
-/// ("give me the resolved typed value").
+/// Type Schema or Instance; a GTS identifier's trailing `~` decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EntityKind {
+    TypeSchema,
+    Instance,
+}
+
+impl EntityKind {
+    /// The kind `id` names.
+    #[must_use]
+    pub fn of(id: &GtsId) -> Self {
+        if id.is_type() {
+            Self::TypeSchema
+        } else {
+            Self::Instance
+        }
+    }
+}
+
+/// Entity origin; P0 supports Managed only. External origins will require fallback matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Origin {
+    /// The write precondition and timestamps reconciliation reads.
+    Managed {
+        resource_version: u64,
+        created_at: OffsetDateTime,
+        updated_at: OffsetDateTime,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LifecycleStatus {
+    Active,
+    Deleted,
+}
+
+/// How the current revision was admitted; the sole selectable group (SPEC §10.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    pub gts_spec_version: String,
+    pub gts_impl_version: String,
+    /// `None` only for Instances.
+    pub compat_forced: Option<bool>,
+}
+
+// ---- discovery --------------------------------------------------------------
+
+/// Discovery restrictions; absent fields are unrestricted, except lifecycle defaults to Active.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EntityFilter {
+    pub pattern: Option<GtsIdPattern>,
+    /// Maximum identifier segment count; REST depth rejects zero.
+    pub max_chain_depth: Option<NonZeroU8>,
+    pub kind: Option<EntityKind>,
+    pub lifecycle: LifecycleFilter,
+}
+
+/// Which lifecycle states a page lists; tombstones only on request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum LifecycleFilter {
+    #[default]
+    Active,
+    Deleted,
+    All,
+}
+
+/// Opaque cursor bound to its filter and projection; changed queries cannot resume it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Cursor(String);
+
+impl Cursor {
+    /// Wraps a position received from the registry.
+    #[must_use]
+    pub fn from_token(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Page size and position. `limit: None` takes the registry's default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageRequest {
+    pub limit: Option<u32>,
+    pub cursor: Option<Cursor>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListEntitiesRequest {
+    pub filter: EntityFilter,
+    pub projection: Projection,
+    pub page: PageRequest,
+}
+
+/// One bounded page; `next` is absent on the last one (D12).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListEntitiesResponse {
+    pub items: Vec<Entity>,
+    pub next: Option<Cursor>,
+}
+
+// ---- write path -------------------------------------------------------------
+
+/// Mutation replay key for one identical request (ADR-0012); changed requests need a new key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IdempotencyKey(String);
+
+impl IdempotencyKey {
+    /// Longest key the registry stores.
+    pub const MAX_LEN: usize = 255;
+
+    /// A fresh random key.
+    #[must_use]
+    pub fn generate() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+
+    /// Accept 1..=`Self::MAX_LEN` printable ASCII bytes (0x20..=0x7E), without surrounding spaces.
+    ///
+    /// # Errors
+    /// `InvalidArgument` naming `idempotency_key`.
+    pub fn new(key: impl Into<String>) -> Result<Self, CanonicalError> {
+        let key = key.into();
+        let refusal = if key.is_empty() {
+            Some("an idempotency key must not be empty".to_owned())
+        } else if key.len() > Self::MAX_LEN {
+            Some(format!(
+                "an idempotency key must be at most {} bytes; this one is {}",
+                Self::MAX_LEN,
+                key.len()
+            ))
+        } else if !key.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+            Some("an idempotency key must be printable ASCII".to_owned())
+        } else if key.starts_with(' ') || key.ends_with(' ') {
+            Some("an idempotency key must not start or end with a space".to_owned())
+        } else {
+            None
+        };
+        match refusal {
+            None => Ok(Self(key)),
+            Some(detail) => Err(crate::gts::TypeResource::invalid_argument()
+                .with_field_violation(
+                    crate::field::IDEMPOTENCY_KEY_FIELD,
+                    detail,
+                    crate::field::INVALID_IDEMPOTENCY_KEY,
+                )
+                .create()),
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Publisher `SemVer` precedence: prereleases count; build metadata affects display only.
+/// Length is bounded by [`Self::MAX_LEN`]. Use the publishing crate’s `CARGO_PKG_VERSION` (D18).
 #[derive(Debug, Clone)]
-pub enum RegisterResult {
-    /// Successfully registered.
-    Ok {
-        /// The canonical GTS id of the registered entity.
-        gts_id: String,
-    },
-    /// Failed to register.
-    Err {
-        /// The GTS ID that was attempted, if it could be extracted from the input.
-        gts_id: Option<String>,
-        /// The error that occurred during registration. Project to
-        /// [`TypesRegistryError`](crate::TypesRegistryError) for typed dispatch.
-        error: CanonicalError,
-    },
+pub struct PublisherVersion(semver::Version);
+
+impl PublisherVersion {
+    /// Maximum version-text bytes, checked before parsing to bound untrusted input.
+    pub const MAX_LEN: usize = 128;
 }
 
-impl RegisterResult {
-    /// Returns `true` if the registration was successful.
-    #[must_use]
-    pub const fn is_ok(&self) -> bool {
-        matches!(self, Self::Ok { .. })
-    }
+/// Why a [`PublisherVersion`] was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PublisherVersionError {
+    /// The input exceeds [`PublisherVersion::MAX_LEN`] bytes.
+    #[error("publisher version is {len} bytes long, more than the {max} allowed")]
+    TooLong { len: usize, max: usize },
+    /// The input is not a valid `SemVer` 2.0.0 version.
+    #[error("publisher version is not valid SemVer: {message}")]
+    Invalid { message: String },
+}
 
-    /// Returns `true` if the registration failed.
-    #[must_use]
-    pub const fn is_err(&self) -> bool {
-        matches!(self, Self::Err { .. })
-    }
+impl FromStr for PublisherVersion {
+    type Err = PublisherVersionError;
 
-    /// Converts to `Result<&str, &CanonicalError>` — the success arm
-    /// borrows the canonical `gts_id`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` with a reference to the error if this is a failed registration.
-    pub fn as_result(&self) -> Result<&str, &CanonicalError> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() > Self::MAX_LEN {
+            return Err(PublisherVersionError::TooLong {
+                len: s.len(),
+                max: Self::MAX_LEN,
+            });
+        }
+        semver::Version::parse(s)
+            .map(Self)
+            .map_err(|e| PublisherVersionError::Invalid {
+                message: e.to_string(),
+            })
+    }
+}
+
+impl TryFrom<&str> for PublisherVersion {
+    type Error = PublisherVersionError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl fmt::Display for PublisherVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq for PublisherVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for PublisherVersion {}
+
+impl PartialOrd for PublisherVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PublisherVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.cmp_precedence(&other.0)
+    }
+}
+
+impl Hash for PublisherVersion {
+    // Ignore build metadata, matching cmp_precedence; destructuring detects added fields.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let semver::Version {
+            major,
+            minor,
+            patch,
+            pre,
+            build: _,
+        } = &self.0;
+        major.hash(state);
+        minor.hash(state);
+        patch.hash(state);
+        pre.hash(state);
+    }
+}
+
+/// Publishing gear and its own `CARGO_PKG_VERSION` (SPEC D18); shared helpers only forward it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PublisherContext {
+    pub name: String,
+    pub version: PublisherVersion,
+}
+
+/// Required request-level publisher/version (D18); adapters send it from T45.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegisterEntitiesRequest {
+    pub items: Vec<RegisterItem>,
+    pub dry_run: bool,
+    pub publisher: PublisherContext,
+}
+
+/// One candidate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegisterItem {
+    /// Instance identity may be absent from its document; Type Schema `$id` must be
+    /// `gts://<gts_id>` (SPEC §8.1 step 5).
+    pub gts_id: GtsId,
+    pub content: JsonDocument,
+    /// `Some(v)`: must still be at `v`. `None`: must not exist.
+    pub expected_resource_version: Option<u64>,
+    /// Per-item ADR-0004 cross-minor waiver.
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteEntitiesRequest {
+    pub items: Vec<DeleteItem>,
+    pub dry_run: bool,
+    pub publisher: PublisherContext,
+}
+
+/// Names the target as a read does; the precondition is required.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteItem {
+    pub key: EntityKey,
+    pub expected_resource_version: u64,
+}
+
+/// An operation as read back from the registry, never as built from a receipt (D19).
+#[derive(Debug, Clone)]
+pub enum Operation {
+    Registration(RegistrationOperation),
+    Deletion(DeletionOperation),
+}
+
+impl Operation {
+    #[must_use]
+    pub fn operation_id(&self) -> Uuid {
         match self {
-            Self::Ok { gts_id } => Ok(gts_id),
-            Self::Err { error, .. } => Err(error),
+            Self::Registration(op) => op.operation_id,
+            Self::Deletion(op) => op.operation_id,
         }
     }
 
-    /// Converts into `Result<String, CanonicalError>` — the success arm
-    /// owns the canonical `gts_id`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` with the error if this is a failed registration.
-    pub fn into_result(self) -> Result<String, CanonicalError> {
+    #[must_use]
+    pub fn status(&self) -> OperationStatus {
         match self {
-            Self::Ok { gts_id } => Ok(gts_id),
-            Self::Err { error, .. } => Err(error),
+            Self::Registration(op) => op.status,
+            Self::Deletion(op) => op.status,
         }
     }
-
-    /// Returns the registered `gts_id` if successful, `None` otherwise.
-    #[must_use]
-    pub fn ok(self) -> Option<String> {
-        match self {
-            Self::Ok { gts_id } => Some(gts_id),
-            Self::Err { .. } => None,
-        }
-    }
-
-    /// Returns the error if failed, `None` otherwise.
-    #[must_use]
-    pub fn err(self) -> Option<CanonicalError> {
-        match self {
-            Self::Ok { .. } => None,
-            Self::Err { error, .. } => Some(error),
-        }
-    }
-
-    /// Returns `Ok(())` if all results are successful, or the first error.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first `CanonicalError` encountered in `results`.
-    pub fn ensure_all_ok(results: &[Self]) -> Result<(), CanonicalError> {
-        for result in results {
-            if let Self::Err { error, .. } = result {
-                return Err(error.clone());
-            }
-        }
-        Ok(())
-    }
 }
 
-/// Summary of a batch registration operation.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RegisterSummary {
-    /// Number of successfully registered entities.
-    pub succeeded: usize,
-    /// Number of failed registrations.
-    pub failed: usize,
+#[derive(Debug, Clone)]
+pub struct RegistrationOperation {
+    pub operation_id: Uuid,
+    pub status: OperationStatus,
+    pub items: Vec<RegistrationItemResult>,
 }
 
-impl RegisterSummary {
-    /// Creates a new summary from a slice of register results.
-    #[must_use]
-    pub fn from_results(results: &[RegisterResult]) -> Self {
-        let succeeded = results.iter().filter(|r| r.is_ok()).count();
-        let failed = results.len() - succeeded;
-        Self { succeeded, failed }
-    }
-
-    /// Returns `true` if all registrations succeeded.
-    #[must_use]
-    pub const fn all_succeeded(&self) -> bool {
-        self.failed == 0
-    }
-
-    /// Returns `true` if all registrations failed.
-    #[must_use]
-    pub const fn all_failed(&self) -> bool {
-        self.succeeded == 0
-    }
-
-    /// Returns the total number of items processed.
-    #[must_use]
-    pub const fn total(&self) -> usize {
-        self.succeeded + self.failed
-    }
+#[derive(Debug, Clone)]
+pub struct RegistrationItemResult {
+    pub gts_id: GtsId,
+    pub status: CandidateStatus,
+    pub resource_version: Option<u64>,
+    /// Decode reason/context with
+    /// [`AdmissionFailure::from_canonical`](`crate::AdmissionFailure::from_canonical`).
+    pub error: Option<CanonicalError>,
 }
 
-/// Query parameters for listing GTS type-schemas.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TypeSchemaQuery {
-    /// Optional GTS wildcard pattern (e.g. `gts.acme.*`).
-    pub pattern: Option<String>,
+#[derive(Debug, Clone)]
+pub struct DeletionOperation {
+    pub operation_id: Uuid,
+    pub status: OperationStatus,
+    pub items: Vec<DeletionItemResult>,
 }
 
-impl TypeSchemaQuery {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
-    pub fn with_pattern(mut self, pattern: impl Into<String>) -> Self {
-        self.pattern = Some(pattern.into());
-        self
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.pattern.is_none()
-    }
+#[derive(Debug, Clone)]
+pub struct DeletionItemResult {
+    /// The target's key, in canonical form.
+    pub entity_key: EntityKey,
+    pub status: CandidateStatus,
+    pub resource_version: Option<u64>,
+    /// Decode reason/context with
+    /// [`AdmissionFailure::from_canonical`](`crate::AdmissionFailure::from_canonical`).
+    pub error: Option<CanonicalError>,
 }
 
-/// Query parameters for listing GTS instances.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InstanceQuery {
-    /// Optional GTS wildcard pattern (e.g. `gts.acme.events.user.v1~*`).
-    pub pattern: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OperationStatus {
+    Pending,
+    Running,
+    Completed,
 }
 
-impl InstanceQuery {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CandidateStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Unchanged,
+    Failed,
+}
 
+impl CandidateStatus {
+    /// `Succeeded`, `Unchanged` or `Failed`: the candidate will not change again.
     #[must_use]
-    pub fn with_pattern(mut self, pattern: impl Into<String>) -> Self {
-        self.pattern = Some(pattern.into());
-        self
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.pattern.is_none()
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Unchanged | Self::Failed)
     }
 }
 
 #[cfg(test)]
 #[path = "models_tests.rs"]
-mod tests;
+mod models_tests;

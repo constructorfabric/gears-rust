@@ -1,765 +1,676 @@
-//! Local client implementing the `TypesRegistryClient` trait.
-//!
-//! Owns kind discrimination, recursive parent resolution, and the type-schema /
-//! instance caches — service stays kind-agnostic.
-
-// Local client is a thin adapter between the domain service (kind-agnostic
-// reads/writes) and the infra-layer caches that hold `Arc<GtsTypeSchema>` /
-// `Arc<GtsInstance>`. Exposing those caches via a domain-level trait would
-// just be ceremony — the client owns them by construction.
-#![allow(unknown_lints)]
-#![allow(de0301_no_infra_in_domain)]
+//! In-process platform and tenant APIs over `RegistryService` (SPEC §10.1, D15, D17).
+//! Shares REST cursors/errors and domain validator tokens. Mutations read back accepted
+//! operations; read failures return Aborted with `operation_id` for same-key replay (D19).
+//! Contexts are unvalidated and record no principal (C2); publisher forwarding is Phase 9.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use gts::GtsId;
+use serde_json::value::RawValue;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
-use types_registry_sdk::{
-    GtsInstance, GtsInstanceId, GtsTypeId, GtsTypeSchema, InstanceQuery, RegisterResult,
-    TypeSchemaQuery, TypesRegistryClient, is_type_schema_id,
-};
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
+use types_registry_sdk as sdk;
+use types_registry_sdk::item_failure::AdmissionFailureReason;
+use types_registry_sdk::{AdmissionFailure, PlatformTypesRegistryApi, TypesRegistryApi};
 use uuid::Uuid;
 
-use crate::domain::error::DomainError;
-use crate::domain::model::{GtsEntity, ListQuery};
-use crate::domain::service::TypesRegistryService;
-use crate::infra::cache::{CacheConfig, InMemoryCache, InstanceCache, TypeSchemaCache};
+use crate::domain::admission::{
+    Candidate, DeleteRequest, DeleteTarget, StoredFailure, SubmitRequest, UnreadableFailure,
+};
+use crate::domain::caller::CallerContext;
+use crate::domain::cursor::{self, Binding};
+use crate::domain::enums::{
+    EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus, OperationKind,
+    OperationStatus,
+};
+use crate::domain::error::LocalClientError;
+use crate::domain::key::EntityKey;
+use crate::domain::registry_service::{
+    BatchGetItem, DiscoveryQuery, EntityLookup, EntityRecord, MAX_KEY_LEN, OperationItemRecord,
+    OperationRecord, RegistryService, ServiceError,
+};
+use crate::domain::selection::{EntityField, FieldSelection};
+use crate::domain::validator::{IfNoneMatch, Validator};
 
-/// Build the canonical `InvalidArgument` error this adapter emits for a
-/// malformed / kind-mismatched GTS id, routed through the single
-/// `From<DomainError> for CanonicalError` ladder (field `gts_id`, reason
-/// `INVALID_GTS_ID`). The type-schema-vs-instance distinction the legacy SDK
-/// error carried collapses here per ADR 0005 — the canonical boundary
-/// classifies both kinds identically.
-fn invalid_gts_id_err(message: impl Into<String>) -> CanonicalError {
-    CanonicalError::from(DomainError::invalid_gts_id(message))
-}
-
-/// Local client for the Types Registry gear.
-///
-/// Implements the public [`TypesRegistryClient`] trait by wrapping
-/// [`TypesRegistryService`] and adding kind discrimination, recursive
-/// parent resolution, and TTL-aware caches of `Arc<GtsTypeSchema>` and
-/// `Arc<GtsInstance>` so chain ancestors are deduplicated across calls.
-///
-/// Each cache also internally maintains a `UUID` → canonical `gts_id`
-/// reverse index, populated atomically with every `put`, so `*_by_uuid`
-/// lookups can short-circuit the linear storage scan once a UUID has been
-/// observed. The two caches are independent: a `*_by_uuid` query only
-/// consults the index of its own kind. Cross-kind UUID observations are
-/// not tracked — a kind-mismatch error path costs one extra storage scan,
-/// which we treat as acceptable.
+/// [`PlatformTypesRegistryApi`] and [`TypesRegistryApi`] served from this process's
+/// [`RegistryService`]; the tenant reads are the platform reads.
 #[domain_model]
-pub struct TypesRegistryLocalClient {
-    service: Arc<TypesRegistryService>,
-    type_schemas: TypeSchemaCache,
-    instances: InstanceCache,
+pub struct LocalClient {
+    service: Arc<RegistryService>,
 }
 
-impl TypesRegistryLocalClient {
-    /// Creates a new local client with default cache configurations
-    /// ([`CacheConfig::type_schemas`] and [`CacheConfig::instances`]).
+impl LocalClient {
     #[must_use]
-    pub fn new(service: Arc<TypesRegistryService>) -> Self {
-        Self::with_cache_configs(
-            service,
-            CacheConfig::type_schemas(),
-            CacheConfig::instances(),
-        )
+    pub fn new(service: Arc<RegistryService>) -> Self {
+        Self { service }
     }
 
-    /// Creates a new local client with custom cache configurations.
-    #[must_use]
-    pub fn with_cache_configs(
-        service: Arc<TypesRegistryService>,
-        type_schemas: CacheConfig,
-        instances: CacheConfig,
-    ) -> Self {
-        Self {
-            service,
-            type_schemas: Box::new(InMemoryCache::new(type_schemas)),
-            instances: Box::new(InMemoryCache::new(instances)),
-        }
-    }
-
-    /// Drops every cached type-schema and instance, including each cache's
-    /// internal UUID-index.
-    ///
-    /// Useful after `service.switch_to_ready()` if some entries had been built
-    /// pre-ready with best-effort parents, or as a recovery hatch for tests.
-    pub fn clear_caches(&self) {
-        self.type_schemas.clear();
-        self.instances.clear();
-    }
-
-    /// Cascade-invalidates cached entries when the type-schema with `type_id`
-    /// is being rewritten. Derived type-schemas in [`Self::type_schemas`]
-    /// keep `Arc<GtsTypeSchema>` parents in their chain, and instances in
-    /// [`Self::instances`] embed an `Arc<GtsTypeSchema>` directly — if we
-    /// drop only the rewritten key, dependents continue to return stale
-    /// views. We drop every cached entry whose ancestor chain transitively
-    /// references `type_id`.
-    fn invalidate_type_schema_cascade(&self, type_id: &str) {
-        self.type_schemas
-            .retain(&|s| !s.ancestors().any(|a| a.type_id == type_id));
-        self.instances
-            .retain(&|i| !i.type_schema.ancestors().any(|a| a.type_id == type_id));
-    }
-
-    /// Drops the cached entry for the given type-schema id and any cached
-    /// dependents (derived type-schemas, instances) that transitively
-    /// reference it through their resolved chain. No-op if absent.
-    pub fn invalidate_type_schema(&self, type_id: &str) {
-        self.invalidate_type_schema_cascade(type_id);
-    }
-
-    /// Removes one instance entry from the cache. No-op if absent.
-    pub fn invalidate_instance(&self, id: &str) {
-        self.instances.invalidate(id);
-    }
-
-    /// Returns the type-schema as a fully-resolved `Arc<GtsTypeSchema>` (with
-    /// all ancestors recursively populated). Caches the result.
-    ///
-    /// `type_id` must end with `~` — instance ids are rejected with an
-    /// `InvalidArgument` canonical error (reason `INVALID_GTS_ID`) before any
-    /// storage lookup, since type-schema and instance ids are lexically distinct.
-    fn resolve_type_schema_arc(&self, type_id: &str) -> Result<Arc<GtsTypeSchema>, CanonicalError> {
-        if !is_type_schema_id(type_id) {
-            return Err(invalid_gts_id_err(format!(
-                "{type_id} does not end with `~`",
-            )));
-        }
-        if let Some(cached) = self.type_schemas.get(type_id) {
-            return Ok(cached);
-        }
-        let entity = self.service.get(type_id).map_err(CanonicalError::from)?;
-        let arc = self.build_type_schema_arc(entity)?;
-        self.type_schemas
-            .put(arc.type_id.to_string(), Arc::clone(&arc));
-        Ok(arc)
-    }
-
-    /// Storage-backed resolution for `get_*_by_uuid` cache misses. Skips
-    /// the by-uuid cache check (callers already established the miss);
-    /// fetches the entity from storage by UUID, validates kind, then
-    /// delegates to [`Self::get_type_schema`] so the typed cache absorbs
-    /// the build (and the reverse `uuid → gts_id` index gets populated for
-    /// next time). TODO(#1630): replace the linear scan in
-    /// `service.get_by_uuid` with an indexed lookup.
-    async fn fetch_type_schema_by_uuid_uncached(
+    /// The operation an accepted submit created, read back (D19).
+    async fn read_back(
         &self,
-        type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, CanonicalError> {
-        let entity = self
+        caller: CallerContext<'_>,
+        operation_id: Uuid,
+    ) -> Result<OperationRecord, CanonicalError> {
+        match self.service.operation(caller, operation_id).await {
+            Ok(Some(record)) => Ok(record),
+            Ok(None) => Err(read_back_failed(operation_id, "it could not be found")),
+            Err(e) => {
+                let cause = e.cause_kind();
+                // The ladder logs the underlying failure, redacted as for any request; the
+                // caller still gets the operation-scoped Aborted.
+                let error = CanonicalError::from(e);
+                tracing::warn!(
+                    %operation_id,
+                    cause,
+                    %error,
+                    "types_registry could not read back an accepted operation"
+                );
+                Err(read_back_failed(operation_id, "the read failed"))
+            }
+        }
+    }
+
+    /// The batch read both contracts serve.
+    async fn batch_get(
+        &self,
+        caller: CallerContext<'_>,
+        request: sdk::BatchGetEntitiesRequest,
+    ) -> Result<sdk::BatchGetEntitiesResponse, CanonicalError> {
+        let selection = selection(&request.projection);
+        let mut asked: HashMap<EntityKey, sdk::EntityKey> =
+            HashMap::with_capacity(request.items.len());
+        let mut reads = Vec::with_capacity(request.items.len());
+        for item in request.items {
+            let key = domain_key(&item.key);
+            let if_none_match = match &item.if_none_match {
+                Some(validator) => condition(validator)?,
+                None => None,
+            };
+            asked.entry(key.clone()).or_insert(item.key);
+            reads.push(BatchGetItem { key, if_none_match });
+        }
+
+        let results = self
             .service
-            .get_by_uuid(type_uuid)
+            .batch_get(caller, &reads, selection)
+            .await
             .map_err(CanonicalError::from)?;
-        if !entity.is_type_schema {
-            // The UUID exists but points to an instance — from the
-            // type-schema namespace's perspective, it's not registered.
-            return Err(CanonicalError::from(DomainError::not_found_by_uuid(
-                type_uuid,
-            )));
+
+        let mut answered = Vec::with_capacity(results.len());
+        for (key, lookup) in results {
+            let Some(asked_key) = asked.remove(&key) else {
+                tracing::error!(unexpected_key = ?key, "types_registry batch read answered a key it was not asked");
+                return Err(CanonicalError::internal(
+                    "the registry could not match a batch read result",
+                )
+                .create());
+            };
+            answered.push((asked_key, lookup));
         }
-        let gts_id = entity.gts_id.clone();
-        self.get_type_schema(&gts_id).await
+        let lookups = convert(selection, answered, |answered| {
+            answered
+                .into_iter()
+                .map(|(key, lookup)| Ok((key, lookup_from(lookup)?)))
+                .collect::<Result<HashMap<_, _>, CanonicalError>>()
+        })
+        .await?;
+        Ok(sdk::BatchGetEntitiesResponse(lookups))
     }
 
-    /// Symmetric of [`Self::fetch_type_schema_by_uuid_uncached`] for
-    /// instances.
-    async fn fetch_instance_by_uuid_uncached(
+    /// The discovery page both contracts serve.
+    async fn list(
         &self,
-        uuid: Uuid,
-    ) -> Result<GtsInstance, CanonicalError> {
-        let entity = self
+        caller: CallerContext<'_>,
+        query: sdk::ListEntitiesRequest,
+    ) -> Result<sdk::ListEntitiesResponse, CanonicalError> {
+        let mut discovery = DiscoveryQuery {
+            pattern: query.filter.pattern.as_ref().map(ToString::to_string),
+            after: None,
+            limit: query.page.limit.map(u64::from),
+            kind: query.filter.kind.map(domain_kind),
+            lifecycle: domain_lifecycle(query.filter.lifecycle),
+            max_chain_depth: query.filter.max_chain_depth,
+            selection: selection(&query.projection),
+        };
+        if let Some(position) = &query.page.cursor {
+            let token = cursor::read(position.as_str())?;
+            discovery.after = Some(cursor::resume(&token, &Binding::from(&discovery))?);
+        }
+
+        let page = self
             .service
-            .get_by_uuid(uuid)
+            .discover(caller, &discovery)
+            .await
             .map_err(CanonicalError::from)?;
-        if entity.is_type_schema {
-            // The UUID exists but points to a type-schema — from the
-            // instance namespace's perspective, it's not registered.
-            return Err(CanonicalError::from(DomainError::not_found_by_uuid(uuid)));
-        }
-        let gts_id = entity.gts_id.clone();
-        self.get_instance(&gts_id).await
-    }
 
-    /// Returns the instance as a fully-resolved `Arc<GtsInstance>`. Caches
-    /// the result. Type-schema reference is resolved via the type-schema cache.
-    ///
-    /// `id` must NOT end with `~` — type-schema ids are rejected with an
-    /// `InvalidArgument` canonical error (reason `INVALID_GTS_ID`) before any
-    /// storage lookup.
-    fn resolve_instance_arc(&self, id: &str) -> Result<Arc<GtsInstance>, CanonicalError> {
-        if is_type_schema_id(id) {
-            return Err(invalid_gts_id_err(format!(
-                "{id} ends with `~` (looks like a type-schema id)",
-            )));
-        }
-        if let Some(cached) = self.instances.get(id) {
-            return Ok(cached);
-        }
-        let entity = self.service.get(id).map_err(CanonicalError::from)?;
-        let inst = self.build_instance(entity)?;
-        let arc = Arc::new(inst);
-        self.instances.put(arc.id.to_string(), Arc::clone(&arc));
-        Ok(arc)
-    }
-
-    /// Builds an `Arc<GtsTypeSchema>` from an internal entity, resolving the
-    /// GTS chain parent (derived from the type's own `gts_id`) through the
-    /// type-schema cache. Mirrors gts-rust's chain semantics in
-    /// `validate_schema_chain` — the parent is the type whose id is `gts_id`
-    /// minus the trailing `~`-segment. Mixin `$ref`s in `allOf` (if any) are
-    /// not surfaced as parents — they're left in `schema.schema` for
-    /// `effective_schema()` to observe but pass through.
-    ///
-    /// Does not itself insert into the cache (caller decides).
-    ///
-    // TODO(#1723): once gts-rust exposes a `resolve_schema(gts_id)` helper
-    // returning a fully-resolved view, replace this manual chain walk with
-    // a single delegation.
-    fn build_type_schema_arc(
-        &self,
-        entity: GtsEntity,
-    ) -> Result<Arc<GtsTypeSchema>, CanonicalError> {
-        let parent = if let Some(parent_id) = GtsTypeSchema::derive_parent_type_id(&entity.gts_id) {
-            Some(
-                self.resolve_type_schema_arc(parent_id.as_ref())
-                    .map_err(|e| {
-                        if matches!(e, CanonicalError::NotFound { .. }) {
-                            invalid_gts_id_err(format!(
-                                "type-schema {} references missing parent {parent_id}",
-                                entity.gts_id
-                            ))
-                        } else {
-                            e
-                        }
-                    })?,
-            )
-        } else {
-            None
-        };
-        let type_id = GtsTypeId::new(&entity.gts_id);
-        let schema = GtsTypeSchema::try_new(type_id, entity.content, entity.description, parent)?;
-        Ok(Arc::new(schema))
-    }
-
-    /// Parent existence pre-check used by `register_*` methods in ready
-    /// phase. Returns `Some(error)` if the entity has a parent type-schema
-    /// that is not yet registered; `None` if the entity is a root type-
-    /// schema, has no extractable id, or its parent is registered.
-    ///
-    /// For type-schemas, the parent is the chain prefix (`derive_parent_type_id`).
-    /// For instances, the parent is the declaring type-schema (`derive_type_id`).
-    fn parent_pre_check(&self, gts_id: Option<&str>) -> Option<CanonicalError> {
-        let id = gts_id?;
-        let parent_type_id = if is_type_schema_id(id) {
-            // Type-schema: parent only exists for chained (non-root) ids.
-            GtsTypeSchema::derive_parent_type_id(id)?
-        } else {
-            // Instance: declaring type-schema is required.
-            GtsInstance::derive_type_id(id)?
-        };
-        if self.service.exists(parent_type_id.as_ref()) {
-            None
-        } else {
-            Some(CanonicalError::from(
-                DomainError::ParentTypeSchemaNotRegistered {
-                    parent_type_id: parent_type_id.into_string(),
-                    dependent_id: id.to_owned(),
-                },
-            ))
-        }
-    }
-
-    /// Builds a `GtsInstance` from an internal entity by resolving its
-    /// type-schema through the cache.
-    fn build_instance(&self, entity: GtsEntity) -> Result<GtsInstance, CanonicalError> {
-        if entity.is_type_schema {
-            return Err(invalid_gts_id_err(format!(
-                "{} is a type-schema, not an instance",
-                entity.gts_id,
-            )));
-        }
-        let type_id = GtsInstance::derive_type_id(&entity.gts_id).ok_or_else(|| {
-            invalid_gts_id_err(format!(
-                "instance gts_id {} has no type-schema chain (no `~`)",
-                entity.gts_id
-            ))
-        })?;
-        let type_schema = self.resolve_type_schema_arc(type_id.as_ref())?;
-        let segment = &entity.gts_id[type_id.as_ref().len()..];
-        let instance_id = GtsInstanceId::new(type_id.as_ref(), segment);
-        GtsInstance::try_new(instance_id, entity.content, entity.description, type_schema)
+        let next = page
+            .next_after
+            .as_deref()
+            .map(|after| cursor::encode(after, &Binding::from(&discovery)))
+            .transpose()?
+            .map(sdk::Cursor::from_token);
+        let items = convert(discovery.selection, page.items, |records| {
+            records.into_iter().map(snapshot_from).collect()
+        })
+        .await?;
+        Ok(sdk::ListEntitiesResponse { items, next })
     }
 }
 
-/// Lexicographic comparator for optional GTS ids. `None` (no extractable
-/// id from the input JSON) sorts last, so format-rejection happens at the
-/// end of the batch.
-fn compare_optional_gts_ids(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
-    match (a, b) {
-        (Some(x), Some(y)) => x.cmp(y),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
+/// Selected documents are reparsed into JSON trees, which is as heavy as the service's own
+/// row conversion, so it leaves the executor the same way; document-free answers stay inline.
+async fn convert<T, R>(
+    selection: FieldSelection,
+    input: T,
+    to_sdk: impl FnOnce(T) -> Result<R, CanonicalError> + Send + 'static,
+) -> Result<R, CanonicalError>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+{
+    if !selection.selects_any_document() {
+        return to_sdk(input);
     }
+    tokio::task::spawn_blocking(move || to_sdk(input))
+        .await
+        .map_err(|e| CanonicalError::from(ServiceError::Blocking(e)))?
 }
 
 #[async_trait]
-impl TypesRegistryClient for TypesRegistryLocalClient {
-    async fn register(
+impl PlatformTypesRegistryApi for LocalClient {
+    async fn batch_get_entities(
         &self,
-        entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        // Sort by extracted gts_id so parents register before children within
-        // the same batch (items without an extractable id go to the end —
-        // they'll fail in service.register with InvalidGtsId), but keep the
-        // original index so the returned vec stays positionally aligned with
-        // the caller's input. Caller-side correlation is the only way to
-        // recover identity for items where extract_gts_id returned None.
-        let mut indexed: Vec<(usize, Option<String>, serde_json::Value)> = entities
+        ctx: &PlatformSecurityContext,
+        request: sdk::BatchGetEntitiesRequest,
+    ) -> Result<sdk::BatchGetEntitiesResponse, CanonicalError> {
+        self.batch_get(CallerContext::Platform(ctx), request).await
+    }
+
+    async fn list_entities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        query: sdk::ListEntitiesRequest,
+    ) -> Result<sdk::ListEntitiesResponse, CanonicalError> {
+        self.list(CallerContext::Platform(ctx), query).await
+    }
+
+    async fn register_entities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        key: sdk::IdempotencyKey,
+        request: sdk::RegisterEntitiesRequest,
+    ) -> Result<sdk::RegistrationOperation, CanonicalError> {
+        let candidates = request
+            .items
             .into_iter()
-            .enumerate()
-            .map(|(i, v)| (i, self.service.extract_gts_id(&v), v))
-            .collect();
-        indexed.sort_by(|a, b| compare_optional_gts_ids(a.1.as_deref(), b.1.as_deref()));
+            .map(|item| {
+                let gts_id = item.gts_id.to_string();
+                let expected_resource_version = item
+                    .expected_resource_version
+                    .map(|v| stored_version(&gts_id, v))
+                    .transpose()?;
+                Ok(Candidate {
+                    gts_id,
+                    content: Some(item.content),
+                    expected_resource_version,
+                    force: item.force,
+                })
+            })
+            .collect::<Result<Vec<_>, CanonicalError>>()?;
+        let submit = SubmitRequest {
+            idempotency_key: Some(key.as_str().to_owned()),
+            dry_run: request.dry_run,
+            candidates,
+        };
 
-        let total = indexed.len();
-        let mut slots: Vec<Option<RegisterResult>> = (0..total).map(|_| None).collect();
-        for (orig_idx, gts_id, value) in indexed {
-            // Pre-check parent in ready phase. Skipped in config phase
-            // because temporary storage holds yet-unvalidated chains.
-            if self.service.is_ready()
-                && let Some(err) = self.parent_pre_check(gts_id.as_deref())
-            {
-                slots[orig_idx] = Some(RegisterResult::Err {
-                    gts_id: gts_id.clone(),
-                    error: err,
-                });
-                continue;
-            }
-            let single = self.service.register(vec![value]);
-            if let Some(result) = single.into_iter().next() {
-                // Invalidate caches only after the write commits — evicting
-                // pre-write opens a TOCTOU window where a concurrent reader
-                // can repopulate the cache with the old entity from storage.
-                // Use the canonical persisted id from `RegisterResult::Ok`
-                // rather than the request-extracted `gts_id`: if the service
-                // ever canonicalises an id (whitespace, prefix, casing),
-                // invalidating by the un-canonicalised input would leave the
-                // real cache entry stale. For type-schemas we also
-                // cascade-invalidate dependents whose chain references this id.
-                if let RegisterResult::Ok {
-                    gts_id: persisted_id,
-                } = &result
-                {
-                    if is_type_schema_id(persisted_id) {
-                        self.invalidate_type_schema_cascade(persisted_id);
-                    } else {
-                        self.instances.invalidate(persisted_id);
-                    }
-                }
-                slots[orig_idx] = Some(result);
-            }
-        }
-        Ok(slots.into_iter().map(Option::unwrap).collect())
-    }
-
-    async fn register_type_schemas(
-        &self,
-        type_schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        // See `register` for the sort-then-write-back-by-original-index pattern:
-        // sort lets parents register before children in the batch, but the
-        // returned vec must still line up with the caller's input order.
-        let mut indexed: Vec<(usize, Option<String>, serde_json::Value)> = type_schemas
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| (i, self.service.extract_gts_id(&v), v))
-            .collect();
-        indexed.sort_by(|a, b| compare_optional_gts_ids(a.1.as_deref(), b.1.as_deref()));
-
-        let total = indexed.len();
-        let mut slots: Vec<Option<RegisterResult>> = (0..total).map(|_| None).collect();
-        for (orig_idx, gts_id, value) in indexed {
-            // Missing id: caller invoked the type-schema-typed endpoint, so
-            // we owe a kind-typed error.
-            let Some(ref id) = gts_id else {
-                slots[orig_idx] = Some(RegisterResult::Err {
-                    gts_id: None,
-                    error: invalid_gts_id_err("no GTS id field found in entity"),
-                });
-                continue;
-            };
-            // Kind check: type-schema id must end with `~`.
-            if !is_type_schema_id(id) {
-                slots[orig_idx] = Some(RegisterResult::Err {
-                    gts_id: gts_id.clone(),
-                    error: invalid_gts_id_err(format!("{id} does not end with `~`")),
-                });
-                continue;
-            }
-            // Parent pre-check (ready phase only).
-            if self.service.is_ready()
-                && let Some(err) = self.parent_pre_check(Some(id))
-            {
-                slots[orig_idx] = Some(RegisterResult::Err {
-                    gts_id: gts_id.clone(),
-                    error: err,
-                });
-                continue;
-            }
-            let single = self.service.register(vec![value]);
-            if let Some(result) = single.into_iter().next() {
-                // Cascade-invalidate after the write commits, keyed on the
-                // canonical persisted id from `RegisterResult::Ok` rather
-                // than the request-extracted `id` — see the matching
-                // comment in `register` for the rationale.
-                if let RegisterResult::Ok {
-                    gts_id: persisted_id,
-                } = &result
-                {
-                    self.invalidate_type_schema_cascade(persisted_id);
-                }
-                slots[orig_idx] = Some(result);
-            }
-        }
-        Ok(slots.into_iter().map(Option::unwrap).collect())
-    }
-
-    async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-        let arc = self.resolve_type_schema_arc(type_id)?;
-        Ok((*arc).clone())
-    }
-
-    async fn get_type_schema_by_uuid(
-        &self,
-        type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, CanonicalError> {
-        // Fast path: full cache hit by UUID. (Cache puts populate the
-        // reverse uuid → gts_id index atomically, so anything previously
-        // resolved on the type-schema side is reachable from here.)
-        if let Some(arc) = self.type_schemas.get_by_uuid(type_uuid) {
-            return Ok((*arc).clone());
-        }
-        self.fetch_type_schema_by_uuid_uncached(type_uuid).await
-    }
-
-    async fn get_type_schemas(
-        &self,
-        type_ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-        let mut out = HashMap::with_capacity(type_ids.len());
-
-        // Phase 1: format check + dedup. Format-rejected ids land directly
-        // in the result map; the rest go to phase 2 for cache lookup.
-        let mut to_resolve: Vec<String> = Vec::new();
-        for id in type_ids {
-            if out.contains_key(&id) {
-                continue;
-            }
-            if is_type_schema_id(&id) {
-                to_resolve.push(id);
-            } else {
-                out.insert(
-                    id.clone(),
-                    Err(invalid_gts_id_err(format!("{id} does not end with `~`"))),
-                );
-            }
-        }
-        if to_resolve.is_empty() {
-            return out;
-        }
-
-        // Phase 2: single-lock cache lookup for the whole batch.
-        let key_refs: Vec<&str> = to_resolve.iter().map(String::as_str).collect();
-        let cached = self.type_schemas.get_many(&key_refs);
-        let mut to_build: Vec<String> = Vec::new();
-        for (id, hit) in to_resolve.into_iter().zip(cached) {
-            match hit {
-                Some(arc) => {
-                    out.insert(id, Ok((*arc).clone()));
-                }
-                None => to_build.push(id),
-            }
-        }
-
-        // Phase 3: storage round-trip for misses, batched put back.
-        let mut to_put: Vec<(String, Arc<GtsTypeSchema>)> = Vec::new();
-        for id in to_build {
-            let result = match self.service.get(&id).map_err(CanonicalError::from) {
-                Ok(entity) => match self.build_type_schema_arc(entity) {
-                    Ok(arc) => {
-                        to_put.push((arc.type_id.to_string(), Arc::clone(&arc)));
-                        Ok((*arc).clone())
-                    }
-                    Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
-            };
-            out.insert(id, result);
-        }
-        if !to_put.is_empty() {
-            self.type_schemas.put_many(to_put);
-        }
-
-        out
-    }
-
-    async fn get_type_schemas_by_uuid(
-        &self,
-        type_uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-        // Phase 1: single-lock fast path — fully cached hits come back as
-        // values; misses (uuid never observed, or value evicted) come back
-        // as `None`.
-        let cached = self.type_schemas.get_many_by_uuid(&type_uuids);
-
-        // Phase 2: hits use the cached value; misses go straight to the
-        // storage-backed slow path. TODO(#1630): batch the slow path once
-        // `service.get_by_uuid` supports it.
-        let mut out = HashMap::with_capacity(type_uuids.len());
-        for (uuid, hit) in type_uuids.into_iter().zip(cached) {
-            if out.contains_key(&uuid) {
-                continue;
-            }
-            let result = match hit {
-                Some(arc) => Ok((*arc).clone()),
-                None => self.fetch_type_schema_by_uuid_uncached(uuid).await,
-            };
-            out.insert(uuid, result);
-        }
-        out
-    }
-
-    async fn list_type_schemas(
-        &self,
-        query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-        let entities = self
+        let accepted = self
             .service
-            .list(&ListQuery::from_type_schema_query(query))
+            .submit(
+                CallerContext::Platform(ctx),
+                &submit,
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
             .map_err(CanonicalError::from)?;
-        let mut out = Vec::with_capacity(entities.len());
-        for e in entities {
-            if !e.is_type_schema {
-                return Err(invalid_gts_id_err(format!(
-                    "{} is not a type-schema",
-                    e.gts_id,
-                )));
-            }
-            // Prefer cache to share Arcs with other call sites. Cache puts
-            // also populate the uuid → gts_id index automatically.
-            let gts_id = e.gts_id.clone();
-            let arc = if let Some(cached) = self.type_schemas.get(&gts_id) {
-                cached
-            } else {
-                let built = self.build_type_schema_arc(e)?;
-                self.type_schemas
-                    .put(built.type_id.to_string(), Arc::clone(&built));
-                built
-            };
-            out.push((*arc).clone());
+        let operation_id = accepted.operation_id;
+        match operation_from(
+            self.read_back(CallerContext::Platform(ctx), operation_id)
+                .await?,
+        )
+        .map_err(|e| unrepresentable(operation_id, &e))?
+        {
+            sdk::Operation::Registration(operation) => Ok(operation),
+            sdk::Operation::Deletion(_) => Err(wrong_kind(operation_id)),
         }
-        Ok(out)
     }
 
-    async fn register_instances(
+    async fn delete_entities(
         &self,
-        instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        // See `register` for the sort-then-write-back-by-original-index pattern.
-        let mut indexed: Vec<(usize, Option<String>, serde_json::Value)> = instances
+        ctx: &PlatformSecurityContext,
+        key: sdk::IdempotencyKey,
+        request: sdk::DeleteEntitiesRequest,
+    ) -> Result<sdk::DeletionOperation, CanonicalError> {
+        let targets = request
+            .items
             .into_iter()
-            .enumerate()
-            .map(|(i, v)| (i, self.service.extract_gts_id(&v), v))
-            .collect();
-        indexed.sort_by(|a, b| compare_optional_gts_ids(a.1.as_deref(), b.1.as_deref()));
+            .map(|item| {
+                let key = domain_key(&item.key);
+                let expected_resource_version =
+                    stored_version(&key.to_string(), item.expected_resource_version)?;
+                Ok(DeleteTarget {
+                    key,
+                    expected_resource_version: Some(expected_resource_version),
+                })
+            })
+            .collect::<Result<Vec<_>, CanonicalError>>()?;
+        let delete = DeleteRequest {
+            idempotency_key: Some(key.as_str().to_owned()),
+            dry_run: request.dry_run,
+            targets,
+        };
 
-        let total = indexed.len();
-        let mut slots: Vec<Option<RegisterResult>> = (0..total).map(|_| None).collect();
-        for (orig_idx, gts_id, value) in indexed {
-            // Missing id: the caller invoked the instance-typed endpoint, so
-            // we owe a kind-typed error instead of letting the kind-agnostic
-            // service path infer the wrong variant.
-            let Some(ref id) = gts_id else {
-                slots[orig_idx] = Some(RegisterResult::Err {
-                    gts_id: None,
-                    error: invalid_gts_id_err("no GTS id field found in entity"),
-                });
-                continue;
-            };
-            // Kind check: instance id must NOT end with `~`.
-            if is_type_schema_id(id) {
-                slots[orig_idx] = Some(RegisterResult::Err {
-                    gts_id: gts_id.clone(),
-                    error: invalid_gts_id_err(format!(
-                        "{id} ends with `~` (looks like a type-schema id)",
-                    )),
-                });
-                continue;
-            }
-            // Parent (declaring type-schema) pre-check (ready phase only).
-            if self.service.is_ready()
-                && let Some(err) = self.parent_pre_check(Some(id))
-            {
-                slots[orig_idx] = Some(RegisterResult::Err {
-                    gts_id: gts_id.clone(),
-                    error: err,
-                });
-                continue;
-            }
-            let single = self.service.register(vec![value]);
-            if let Some(result) = single.into_iter().next() {
-                // Invalidate after the write commits, keyed on the canonical
-                // persisted id from `RegisterResult::Ok` rather than the
-                // request-extracted `id` — see the matching comment in
-                // `register` for the rationale.
-                if let RegisterResult::Ok {
-                    gts_id: persisted_id,
-                } = &result
-                {
-                    self.instances.invalidate(persisted_id);
-                }
-                slots[orig_idx] = Some(result);
-            }
-        }
-        Ok(slots.into_iter().map(Option::unwrap).collect())
-    }
-
-    async fn get_instance(&self, id: &str) -> Result<GtsInstance, CanonicalError> {
-        let arc = self.resolve_instance_arc(id)?;
-        Ok((*arc).clone())
-    }
-
-    async fn get_instance_by_uuid(&self, uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
-        // Fast path: full cache hit by UUID.
-        if let Some(arc) = self.instances.get_by_uuid(uuid) {
-            return Ok((*arc).clone());
-        }
-        self.fetch_instance_by_uuid_uncached(uuid).await
-    }
-
-    async fn get_instances(
-        &self,
-        ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
-        let mut out = HashMap::with_capacity(ids.len());
-
-        // Phase 1: format check + dedup.
-        let mut to_resolve: Vec<String> = Vec::new();
-        for id in ids {
-            if out.contains_key(&id) {
-                continue;
-            }
-            if is_type_schema_id(&id) {
-                out.insert(
-                    id.clone(),
-                    Err(invalid_gts_id_err(format!(
-                        "{id} ends with `~` (looks like a type-schema id)",
-                    ))),
-                );
-            } else {
-                to_resolve.push(id);
-            }
-        }
-        if to_resolve.is_empty() {
-            return out;
-        }
-
-        // Phase 2: single-lock cache lookup for the whole batch.
-        let key_refs: Vec<&str> = to_resolve.iter().map(String::as_str).collect();
-        let cached = self.instances.get_many(&key_refs);
-        let mut to_build: Vec<String> = Vec::new();
-        for (id, hit) in to_resolve.into_iter().zip(cached) {
-            match hit {
-                Some(arc) => {
-                    out.insert(id, Ok((*arc).clone()));
-                }
-                None => to_build.push(id),
-            }
-        }
-
-        // Phase 3: storage round-trip for misses, batched put back.
-        let mut to_put: Vec<(String, Arc<GtsInstance>)> = Vec::new();
-        for id in to_build {
-            let result = match self.service.get(&id).map_err(CanonicalError::from) {
-                Ok(entity) => match self.build_instance(entity) {
-                    Ok(inst) => {
-                        let arc = Arc::new(inst);
-                        to_put.push((arc.id.to_string(), Arc::clone(&arc)));
-                        Ok((*arc).clone())
-                    }
-                    Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
-            };
-            out.insert(id, result);
-        }
-        if !to_put.is_empty() {
-            self.instances.put_many(to_put);
-        }
-
-        out
-    }
-
-    async fn get_instances_by_uuid(
-        &self,
-        uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-        // Phase 1: single-lock fast path. Hits come back as values; misses
-        // (uuid never observed, or value evicted) come back as `None`.
-        let cached = self.instances.get_many_by_uuid(&uuids);
-
-        // Phase 2: hits use the cached value; misses go straight to the
-        // storage-backed slow path. TODO(#1630): batch the slow path once
-        // `service.get_by_uuid` supports it.
-        let mut out = HashMap::with_capacity(uuids.len());
-        for (uuid, hit) in uuids.into_iter().zip(cached) {
-            if out.contains_key(&uuid) {
-                continue;
-            }
-            let result = match hit {
-                Some(arc) => Ok((*arc).clone()),
-                None => self.fetch_instance_by_uuid_uncached(uuid).await,
-            };
-            out.insert(uuid, result);
-        }
-        out
-    }
-
-    async fn list_instances(
-        &self,
-        query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, CanonicalError> {
-        let entities = self
+        let accepted = self
             .service
-            .list(&ListQuery::from_instance_query(query))
+            .delete(
+                CallerContext::Platform(ctx),
+                &delete,
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
             .map_err(CanonicalError::from)?;
-        let mut out = Vec::with_capacity(entities.len());
-        for e in entities {
-            // Cache puts populate the uuid → gts_id index automatically.
-            let gts_id = e.gts_id.clone();
-            let arc = if let Some(cached) = self.instances.get(&gts_id) {
-                cached
-            } else {
-                let inst = self.build_instance(e)?;
-                let new_arc = Arc::new(inst);
-                self.instances
-                    .put(new_arc.id.to_string(), Arc::clone(&new_arc));
-                new_arc
-            };
-            out.push((*arc).clone());
+        let operation_id = accepted.operation_id;
+        match operation_from(
+            self.read_back(CallerContext::Platform(ctx), operation_id)
+                .await?,
+        )
+        .map_err(|e| unrepresentable(operation_id, &e))?
+        {
+            sdk::Operation::Deletion(operation) => Ok(operation),
+            sdk::Operation::Registration(_) => Err(wrong_kind(operation_id)),
         }
-        Ok(out)
+    }
+
+    async fn get_operation(
+        &self,
+        ctx: &PlatformSecurityContext,
+        operation_id: Uuid,
+    ) -> Result<sdk::Operation, CanonicalError> {
+        let record = self
+            .service
+            .operation(CallerContext::Platform(ctx), operation_id)
+            .await
+            .map_err(CanonicalError::from)?
+            .ok_or(LocalClientError::OperationNotFound { operation_id })?;
+        operation_from(record)
+    }
+}
+
+/// The tenant reads are the platform's own (D17): the same lookups, encodings and errors.
+///
+/// C2/C6: the context reaches the service as [`CallerContext::Tenant`], which P0 reads
+/// nowhere — no tenant scope, no recorded principal — exactly as with the platform context.
+#[async_trait]
+impl TypesRegistryApi for LocalClient {
+    async fn batch_get_entities(
+        &self,
+        ctx: &SecurityContext,
+        request: sdk::BatchGetEntitiesRequest,
+    ) -> Result<sdk::BatchGetEntitiesResponse, CanonicalError> {
+        self.batch_get(CallerContext::Tenant(ctx), request).await
+    }
+
+    async fn list_entities(
+        &self,
+        ctx: &SecurityContext,
+        query: sdk::ListEntitiesRequest,
+    ) -> Result<sdk::ListEntitiesResponse, CanonicalError> {
+        self.list(CallerContext::Tenant(ctx), query).await
+    }
+}
+
+// ---- errors -----------------------------------------------------------------
+
+/// Aborted read-back after acceptance; names the operation for same-key replay.
+fn read_back_failed(operation_id: Uuid, why: &'static str) -> CanonicalError {
+    LocalClientError::ReadBackFailed { operation_id, why }.into()
+}
+
+/// Wrong-kind read-back names the accepted operation (D19).
+fn wrong_kind(operation_id: Uuid) -> CanonicalError {
+    tracing::error!(%operation_id, "types_registry read back an operation of the other kind");
+    LocalClientError::WrongKind { operation_id }.into()
+}
+
+/// Conversion failure still names the accepted operation.
+fn unrepresentable(operation_id: Uuid, error: &CanonicalError) -> CanonicalError {
+    tracing::error!(%operation_id, %error, "types_registry cannot represent an accepted operation");
+    LocalClientError::Unrepresentable { operation_id }.into()
+}
+
+/// Corrupt stored value, never caller input; log its row/value subject and failure cause.
+fn corrupt(
+    what: &str,
+    subject: &dyn std::fmt::Display,
+    cause: &dyn std::fmt::Display,
+) -> CanonicalError {
+    tracing::error!(
+        what,
+        %subject,
+        %cause,
+        "types_registry local client met an unrepresentable stored value"
+    );
+    CanonicalError::internal("the registry could not represent a stored value").create()
+}
+
+/// SDK validator bytes become a domain token, bounded like a key. Oversized values
+/// are refused first; non-UTF-8 values cannot be issued tokens and cause an
+/// unconditional read (DESIGN §3.3).
+fn condition(validator: &sdk::Validator) -> Result<Option<IfNoneMatch>, CanonicalError> {
+    let bytes = validator.as_bytes();
+    if bytes.len() > MAX_KEY_LEN {
+        return Err(ServiceError::ValidatorTooLong { len: bytes.len() }.into());
+    }
+    Ok(std::str::from_utf8(bytes)
+        .ok()
+        .map(|token| IfNoneMatch::Validators(vec![token.to_owned()])))
+}
+
+/// `u64` precondition to the service's `i64`; above `i64::MAX` cannot exist. Refused in
+/// the ladder's own shape for an unusable `expected_resource_version`.
+fn stored_version(key: &str, version: u64) -> Result<i64, CanonicalError> {
+    i64::try_from(version).map_err(|_| {
+        LocalClientError::VersionOutOfRange {
+            key: key.to_owned(),
+            version,
+        }
+        .into()
+    })
+}
+
+fn sdk_version(version: i64, subject: &dyn std::fmt::Display) -> Result<u64, CanonicalError> {
+    u64::try_from(version).map_err(|e| corrupt("negative resource_version", subject, &e))
+}
+
+// ---- keys, selection, enums --------------------------------------------------
+
+fn domain_key(key: &sdk::EntityKey) -> EntityKey {
+    match key {
+        sdk::EntityKey::GtsId(id) => EntityKey::GtsId(id.to_string()),
+        sdk::EntityKey::GtsUuid(uuid) => EntityKey::Uuid(*uuid),
+    }
+}
+
+fn sdk_key(key: EntityKey) -> Result<sdk::EntityKey, CanonicalError> {
+    match key {
+        EntityKey::GtsId(id) => Ok(sdk::EntityKey::GtsId(gts_id(&id)?)),
+        EntityKey::Uuid(uuid) => Ok(sdk::EntityKey::GtsUuid(uuid)),
+    }
+}
+
+fn gts_id(id: &str) -> Result<GtsId, CanonicalError> {
+    GtsId::try_new(id).map_err(|e| corrupt("stored gts_id", &id.escape_debug(), &e))
+}
+
+/// The typed selection, field by field: no names are spelled and re-parsed.
+fn selection(projection: &sdk::Projection) -> FieldSelection {
+    FieldSelection::from_fields(projection.normalized().fields().map(domain_field))
+}
+
+const fn domain_field(field: sdk::EntityField) -> EntityField {
+    match field {
+        sdk::EntityField::GtsId => EntityField::GtsId,
+        sdk::EntityField::GtsUuid => EntityField::GtsUuid,
+        sdk::EntityField::Kind => EntityField::Kind,
+        sdk::EntityField::LifecycleStatus => EntityField::LifecycleStatus,
+        sdk::EntityField::Origin => EntityField::Origin,
+        sdk::EntityField::Content => EntityField::Content,
+        sdk::EntityField::ResolvedSchema => EntityField::ResolvedSchema,
+        sdk::EntityField::EffectiveTraits => EntityField::EffectiveTraits,
+        sdk::EntityField::EffectiveTraitsSchema => EntityField::EffectiveTraitsSchema,
+        sdk::EntityField::Provenance => EntityField::Provenance,
+    }
+}
+
+const fn domain_kind(kind: sdk::EntityKind) -> EntityKind {
+    match kind {
+        sdk::EntityKind::TypeSchema => EntityKind::TypeSchema,
+        sdk::EntityKind::Instance => EntityKind::Instance,
+    }
+}
+
+const fn sdk_kind(kind: EntityKind) -> sdk::EntityKind {
+    match kind {
+        EntityKind::TypeSchema => sdk::EntityKind::TypeSchema,
+        EntityKind::Instance => sdk::EntityKind::Instance,
+    }
+}
+
+const fn domain_lifecycle(filter: sdk::LifecycleFilter) -> LifecycleFilter {
+    match filter {
+        sdk::LifecycleFilter::Active => LifecycleFilter::Active,
+        sdk::LifecycleFilter::Deleted => LifecycleFilter::Deleted,
+        sdk::LifecycleFilter::All => LifecycleFilter::All,
+    }
+}
+
+const fn sdk_lifecycle(status: LifecycleStatus) -> sdk::LifecycleStatus {
+    match status {
+        LifecycleStatus::Active => sdk::LifecycleStatus::Active,
+        LifecycleStatus::Deleted => sdk::LifecycleStatus::Deleted,
+    }
+}
+
+const fn sdk_operation_status(status: OperationStatus) -> sdk::OperationStatus {
+    match status {
+        OperationStatus::Pending => sdk::OperationStatus::Pending,
+        OperationStatus::Running => sdk::OperationStatus::Running,
+        OperationStatus::Completed => sdk::OperationStatus::Completed,
+    }
+}
+
+const fn sdk_candidate_status(status: OperationItemStatus) -> sdk::CandidateStatus {
+    match status {
+        OperationItemStatus::Pending => sdk::CandidateStatus::Pending,
+        OperationItemStatus::Running => sdk::CandidateStatus::Running,
+        OperationItemStatus::Succeeded => sdk::CandidateStatus::Succeeded,
+        OperationItemStatus::Unchanged => sdk::CandidateStatus::Unchanged,
+        OperationItemStatus::Failed => sdk::CandidateStatus::Failed,
+    }
+}
+
+// ---- reads ------------------------------------------------------------------
+
+/// The domain's validator token (§8.5). RFC 9110 quoting is REST's representation only.
+fn sdk_validator(validator: Validator) -> sdk::Validator {
+    sdk::Validator::from_bytes(validator.encode().into_bytes())
+}
+
+fn lookup_from(lookup: EntityLookup) -> Result<sdk::EntityLookup, CanonicalError> {
+    Ok(match lookup {
+        EntityLookup::Found { record, etag } => sdk::EntityLookup::Found {
+            entity: Box::new(snapshot_from(record)?),
+            etag: sdk_validator(etag),
+        },
+        EntityLookup::Unchanged { etag } => sdk::EntityLookup::Unchanged {
+            etag: sdk_validator(etag),
+        },
+        EntityLookup::NotFound => sdk::EntityLookup::NotFound,
+    })
+}
+
+/// A selected JSON `null` stays `Some(Value::Null)`; `None` stays unselected.
+fn document(
+    raw: Option<Box<RawValue>>,
+    gts_id: &str,
+    field: EntityField,
+) -> Result<Option<sdk::JsonDocument>, CanonicalError> {
+    raw.map(|raw| {
+        serde_json::from_str(raw.get()).map_err(|e| {
+            corrupt(
+                "stored document",
+                &format_args!("{} {}", gts_id.escape_debug(), field.name()),
+                &e,
+            )
+        })
+    })
+    .transpose()
+}
+
+fn snapshot_from(record: EntityRecord) -> Result<sdk::Entity, CanonicalError> {
+    let id = record.gts_id.as_str();
+    Ok(sdk::Entity {
+        gts_id: gts_id(&record.gts_id)?,
+        gts_uuid: record.gts_uuid,
+        kind: sdk_kind(record.kind),
+        lifecycle_status: sdk_lifecycle(record.lifecycle_status),
+        origin: record
+            .origin
+            .map(|origin| {
+                Ok::<_, CanonicalError>(sdk::Origin::Managed {
+                    resource_version: sdk_version(origin.resource_version, &id.escape_debug())?,
+                    created_at: origin.created_at,
+                    updated_at: origin.updated_at,
+                })
+            })
+            .transpose()?,
+        content: document(record.content, id, EntityField::Content)?,
+        resolved_schema: document(record.resolved_schema, id, EntityField::ResolvedSchema)?,
+        effective_traits: document(record.effective_traits, id, EntityField::EffectiveTraits)?,
+        effective_traits_schema: document(
+            record.effective_traits_schema,
+            id,
+            EntityField::EffectiveTraitsSchema,
+        )?,
+        provenance: record.provenance.map(|p| sdk::Provenance {
+            gts_spec_version: p.gts_spec_version,
+            gts_impl_version: p.gts_impl_version,
+            compat_forced: p.compat_forced,
+        }),
+    })
+}
+
+// ---- operations -------------------------------------------------------------
+
+fn operation_from(record: OperationRecord) -> Result<sdk::Operation, CanonicalError> {
+    let operation_id = record.operation_id;
+    let status = sdk_operation_status(record.status);
+    Ok(match record.kind {
+        OperationKind::Registration => sdk::Operation::Registration(sdk::RegistrationOperation {
+            operation_id,
+            status,
+            items: record
+                .items
+                .into_iter()
+                .map(|item| {
+                    let (key, status, resource_version, error) = item_parts(item, operation_id)?;
+                    let sdk::EntityKey::GtsId(gts_id) = key else {
+                        return Err(corrupt(
+                            "registration item keyed by reference",
+                            &operation_id,
+                            &"a registration names its candidates by identifier",
+                        ));
+                    };
+                    Ok(sdk::RegistrationItemResult {
+                        gts_id,
+                        status,
+                        resource_version,
+                        error,
+                    })
+                })
+                .collect::<Result<_, CanonicalError>>()?,
+        }),
+        OperationKind::Deletion => sdk::Operation::Deletion(sdk::DeletionOperation {
+            operation_id,
+            status,
+            items: record
+                .items
+                .into_iter()
+                .map(|item| {
+                    let (entity_key, status, resource_version, error) =
+                        item_parts(item, operation_id)?;
+                    Ok(sdk::DeletionItemResult {
+                        entity_key,
+                        status,
+                        resource_version,
+                        error,
+                    })
+                })
+                .collect::<Result<_, CanonicalError>>()?,
+        }),
+    })
+}
+
+type ItemParts = (
+    sdk::EntityKey,
+    sdk::CandidateStatus,
+    Option<u64>,
+    Option<CanonicalError>,
+);
+
+fn item_parts(item: OperationItemRecord, operation_id: Uuid) -> Result<ItemParts, CanonicalError> {
+    let canonical = item.key.to_string();
+    let error = item
+        .error
+        .map(|stored| item_failure(&item.key, stored, operation_id).into_canonical(&canonical));
+    Ok((
+        sdk_key(item.key)?,
+        sdk_candidate_status(item.status),
+        item.resource_version
+            .map(|v| sdk_version(v, &format_args!("{operation_id} {canonical}")))
+            .transpose()?,
+        error,
+    ))
+}
+
+/// Reversible SDK item failure; expose only the reason of unreadable records, matching REST.
+fn item_failure(
+    key: &EntityKey,
+    stored: Result<StoredFailure, UnreadableFailure>,
+    operation_id: Uuid,
+) -> AdmissionFailure {
+    match stored {
+        Ok(failure) => {
+            let context = [
+                (
+                    sdk::item_failure::context::DEPENDENCY_ID,
+                    failure.dependency_id,
+                ),
+                (
+                    sdk::item_failure::context::DEPENDENCY_KIND,
+                    failure.dependency_kind,
+                ),
+                (
+                    sdk::item_failure::context::DIAGNOSTIC_CODE,
+                    failure.error_code,
+                ),
+            ];
+            context
+                .into_iter()
+                .filter_map(|(name, value)| Some((name, value?)))
+                .fold(
+                    AdmissionFailure::new(
+                        AdmissionFailureReason::from_wire(&failure.reason),
+                        failure.message,
+                    ),
+                    |acc, (name, value)| acc.with_context(name, value),
+                )
+        }
+        Err(unreadable) => {
+            tracing::error!(
+                %operation_id,
+                entity_key = %key,
+                reason = unreadable.reason.as_wire(),
+                cause = %unreadable.cause,
+                "types_registry cannot read a stored item failure"
+            );
+            AdmissionFailure::new(unreadable.reason, "the recorded failure could not be read")
+        }
     }
 }
 
 #[cfg(test)]
 #[path = "local_client_tests.rs"]
-mod tests;
+mod local_client_tests;

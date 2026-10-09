@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
 use uuid::Uuid;
 
-use crate::models::{GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery};
+use super::models::{GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery};
 
 /// Public API trait for the `types-registry` gear.
 ///

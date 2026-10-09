@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use gts::GtsIdSegment;
 use types_registry_sdk::RegisterSummary;
+use types_registry_sdk::item_failure::context;
 
 use crate::domain::admission::{AdmissionFailureReason, StoredFailure, UnreadableFailure};
 use crate::domain::enums::{
@@ -317,7 +318,7 @@ mod tests {
     #[test]
     fn unselected_fields_are_omitted_and_a_selected_null_is_kept() {
         let dto = EntityDto {
-            gts_id: "gts.cf.core.example.type.v1~".to_owned(),
+            gts_id: toolkit_gts::gts_id!("cf.core.example.type.v1~").to_owned(),
             gts_uuid: Uuid::nil(),
             kind: EntityKindDto::TypeSchema,
             origin: None,
@@ -331,7 +332,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(dto).expect("serialize"),
             serde_json::json!({
-                "gts_id": "gts.cf.core.example.type.v1~",
+                "gts_id": toolkit_gts::gts_id!("cf.core.example.type.v1~"),
                 "gts_uuid": Uuid::nil(),
                 "kind": "type_schema",
                 "lifecycle_status": "deleted",
@@ -851,13 +852,7 @@ pub struct SubmitEntityDto {
     pub force: Option<bool>,
 }
 
-/// A submission of one or more entities.
-///
-/// `items` and not `entities`: the operation result, the discovery page and
-/// `Page<T>` all call their array `items`, so this is the house word for "the
-/// array in this envelope". It is also the name v1 does *not* use, which keeps
-/// the T24a promotion a loud break rather than one that turns on the element
-/// shape.
+/// Entity submission envelope; `items` matches operation and page envelopes.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
@@ -1207,7 +1202,7 @@ fn item_error(
                 tracing::error!(
                     %operation_id,
                     entity_key = %key,
-                    reason = unreadable.reason.as_str(),
+                    reason = unreadable.reason.as_wire(),
                     cause = %unreadable.cause,
                     "types_registry cannot read a stored item failure"
                 );
@@ -1248,7 +1243,7 @@ impl OperationItemErrorDto {
     /// Reported by reason; the stored text is never echoed.
     fn unreadable(reason: &AdmissionFailureReason) -> Self {
         Self {
-            reason: reason.as_str().to_owned(),
+            reason: reason.as_wire().to_owned(),
             message: "the recorded failure could not be read".to_owned(),
             context: serde_json::Map::new(),
         }
@@ -1259,9 +1254,9 @@ impl From<StoredFailure> for OperationItemErrorDto {
     /// `operation_id` is not exposed: it is always the enclosing operation.
     fn from(failure: StoredFailure) -> Self {
         let context = [
-            ("dependency_id", failure.dependency_id),
-            ("dependency_kind", failure.dependency_kind),
-            ("diagnostic_code", failure.error_code),
+            (context::DEPENDENCY_ID, failure.dependency_id),
+            (context::DEPENDENCY_KIND, failure.dependency_kind),
+            (context::DIAGNOSTIC_CODE, failure.error_code),
         ]
         .into_iter()
         .filter_map(|(key, value)| Some((key.to_owned(), value?.into())))
@@ -1516,7 +1511,7 @@ pub struct PageInfoDto {
     pub limit: u32,
 }
 
-/// One bounded page of discovery results (SPEC §10.1's `EntityPage`).
+/// One bounded page of discovery results (SPEC §10.1's `ListEntitiesResponse`).
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct EntityPageDto {

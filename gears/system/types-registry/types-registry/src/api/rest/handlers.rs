@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use types_registry_sdk::field;
 
 use axum::Json;
 use axum::extract::{Extension, OriginalUri};
@@ -9,9 +10,9 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use toolkit::api::canonical_prelude::*;
 use toolkit::api::rest::extract;
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::cursor::Binding;
 use super::dto::{
     BatchGetRequest, DeleteEntitiesRequest, DeleteEntityQuery, EntityDto, EntityLookupDto,
     EntityLookupsDto, EntityPageDto, GtsEntityDto, ListEntitiesQuery, ListEntitiesResponse,
@@ -21,6 +22,10 @@ use super::dto::{
 use super::params::{DiscoveryParams, ExactReadSelection, NoQuery};
 use super::paths::V2;
 use crate::domain::admission::{Accepted, Candidate, SubmitRequest};
+// Every v2 route authenticates a bearer today, so every call is a tenant's; T26 moves the
+// platform routes to `.platform_authenticated()` and their calls to `CallerContext::Platform`.
+use crate::domain::caller::CallerContext;
+use crate::domain::cursor::{self, Binding};
 use crate::domain::error::DomainError;
 use crate::domain::registry_service::{
     BatchGetItem, DeleteRequest, DeleteTarget, DiscoveryQuery, EntityKey, EntityLookup,
@@ -116,17 +121,9 @@ pub async fn get_entity(
     Ok(Json(entity.into()))
 }
 
-// ---------------------------------------------------------------------------
-// The database-backed platform-plane handlers (T9)
-// ---------------------------------------------------------------------------
-//
-// Mapping steps only. Every one of these reads a request, calls exactly one domain
-// method, and maps the result — no policy, no existence check and no vocabulary
-// decision lives here, which is what lets a future `api/grpc` adapter reuse the
-// same domain surface (SPEC §8.4). Size bounds checked here only fail early; the
-// domain enforces the same ones for every adapter.
-//
-// The handlers above this line are the pre-database path T27 deletes.
+// Database-backed platform handlers (T9): decode, call one domain method, encode.
+// Domain methods own policy and bounds; adapter checks only fail early.
+// T26 removes the pre-database handlers above.
 
 /// Advisory only: how long a client should wait before its first poll. The
 /// operation may well be terminal sooner — while admission is inline (T21) it
@@ -146,6 +143,7 @@ const IDEMPOTENCY_REPLAYED_HEADER: &str = "idempotency-replayed";
 /// decision — an absent or unusable key is the domain's refusal to make.
 pub async fn submit_entities(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
+    Extension(ctx): Extension<SecurityContext>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     extract::Json(req): extract::Json<SubmitEntitiesRequest>,
@@ -167,7 +165,11 @@ pub async fn submit_entities(
     };
 
     let accepted = service
-        .submit(&request, time::OffsetDateTime::now_utc())
+        .submit(
+            CallerContext::Tenant(&ctx),
+            &request,
+            time::OffsetDateTime::now_utc(),
+        )
         .await
         .map_err(CanonicalError::from)?;
 
@@ -177,6 +179,7 @@ pub async fn submit_entities(
 /// Submit a deletion batch with per-item preconditions (DESIGN §3.3).
 pub async fn batch_delete_entities(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
+    Extension(ctx): Extension<SecurityContext>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     extract::Json(req): extract::Json<DeleteEntitiesRequest>,
@@ -205,7 +208,11 @@ pub async fn batch_delete_entities(
     };
 
     let accepted = service
-        .delete(&request, time::OffsetDateTime::now_utc())
+        .delete(
+            CallerContext::Tenant(&ctx),
+            &request,
+            time::OffsetDateTime::now_utc(),
+        )
         .await
         .map_err(CanonicalError::from)?;
 
@@ -215,6 +222,7 @@ pub async fn batch_delete_entities(
 /// Submit a single deletion through the same [`DeleteRequest`] as batch deletion.
 pub async fn delete_entity(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
+    Extension(ctx): Extension<SecurityContext>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     extract::Path(key): extract::Path<String>,
@@ -236,7 +244,11 @@ pub async fn delete_entity(
     };
 
     let accepted = service
-        .delete(&request, time::OffsetDateTime::now_utc())
+        .delete(
+            CallerContext::Tenant(&ctx),
+            &request,
+            time::OffsetDateTime::now_utc(),
+        )
         .await
         .map_err(CanonicalError::from)?;
 
@@ -336,11 +348,12 @@ fn operation_location(request_path: &str, operation_id: Uuid) -> String {
 /// Poll an operation without caching its caller-specific, changing state.
 pub async fn get_operation(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
+    Extension(ctx): Extension<SecurityContext>,
     extract::Path(operation_id): extract::Path<Uuid>,
 ) -> ApiResult<(HeaderMap, Json<OperationDto>)> {
     let service = require_registry(service)?;
     let record = service
-        .operation(operation_id)
+        .operation(CallerContext::Tenant(&ctx), operation_id)
         .await
         .map_err(CanonicalError::from)?
         .ok_or_else(|| super::error::operation_not_found(operation_id))?;
@@ -360,6 +373,7 @@ fn no_store() -> HeaderMap {
 /// domain's classification, not this handler's.
 pub async fn get_entity_by_key(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
+    Extension(ctx): Extension<SecurityContext>,
     extract::Path(key): extract::Path<String>,
     headers: HeaderMap,
     ExactReadSelection(selection): ExactReadSelection,
@@ -367,7 +381,12 @@ pub async fn get_entity_by_key(
     let service = require_registry(service)?;
     let parsed = EntityKey::parse(&key);
     let lookup = service
-        .lookup(&parsed, selection, super::etag::header_condition(&headers)?)
+        .lookup(
+            CallerContext::Tenant(&ctx),
+            &parsed,
+            selection,
+            super::etag::header_condition(&headers)?,
+        )
         .await
         .map_err(CanonicalError::from)?;
     let (mut response, etag) = match lookup {
@@ -420,6 +439,7 @@ async fn json_body<T: serde::Serialize + Send + 'static>(
 /// must not lose the answers for the others.
 pub async fn batch_get_entities(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
+    Extension(ctx): Extension<SecurityContext>,
     headers: HeaderMap,
     _: NoQuery,
     extract::Json(req): extract::Json<BatchGetRequest>,
@@ -451,7 +471,7 @@ pub async fn batch_get_entities(
             && validator.len() > MAX_KEY_LEN
         {
             return Err(super::error::validator_too_long(
-                super::error::violation_field::IF_NONE_MATCH_ITEM,
+                field::IF_NONE_MATCH_FIELD,
                 validator.len(),
             ));
         }
@@ -468,7 +488,7 @@ pub async fn batch_get_entities(
     }
 
     let results = service
-        .batch_get(&reads, selection)
+        .batch_get(CallerContext::Tenant(&ctx), &reads, selection)
         .await
         .map_err(CanonicalError::from)?;
 
@@ -502,6 +522,7 @@ pub async fn batch_get_entities(
 /// the cursor for the next one (D12).
 pub async fn discover_entities(
     Extension(service): Extension<Option<Arc<RegistryService>>>,
+    Extension(ctx): Extension<SecurityContext>,
     params: DiscoveryParams,
 ) -> ApiResult<Response> {
     let service = require_registry(service)?;
@@ -515,18 +536,18 @@ pub async fn discover_entities(
         selection: params.selection,
     };
     if let Some(cursor) = &params.cursor {
-        query.after = Some(super::cursor::resume(cursor, &Binding::from(&query))?);
+        query.after = Some(cursor::resume(cursor, &Binding::from(&query))?);
     }
 
     let page = service
-        .discover(&query)
+        .discover(CallerContext::Tenant(&ctx), &query)
         .await
         .map_err(CanonicalError::from)?;
 
     let next_cursor = page
         .next_after
         .as_deref()
-        .map(|after| super::cursor::encode(after, &Binding::from(&query)))
+        .map(|after| cursor::encode(after, &Binding::from(&query)))
         .transpose()?;
     let body = EntityPageDto {
         items: page.items.into_iter().map(Into::into).collect(),

@@ -41,24 +41,10 @@ pub fn register_routes(
     service: Arc<TypesRegistryService>,
     registry: Option<Arc<RegistryService>>,
 ) -> Router {
-    // ponytail: ceiling C8 — every P0 operation is platform-plane (`plane = 1`),
-    // but the plane is expressed by the contract and the data, **not enforced by
-    // the transport**: an in-process gear has no inbound platform-identity
-    // validator, api-gateway has no platform listener, and `OperationBuilder`
-    // cannot mark a route platform-only. Mutation routes therefore stay
-    // internal-only (`exposed = false`) until a platform listener can authenticate
-    // a platform principal and a PDP decision is enforced before dispatch.
-    // `.anonymous()` is deliberately **not** used — without a platform identity to
-    // replace the current gate it would be a regression. The upgrade path is a
-    // platform listener with `X-ToolKit-Internal-Token` / `PlatformIdentity` plus a
-    // declarative route marker: toolkit/api-gateway work outside this gear
-    // (SPEC §9 C8, §8.4).
-    //
-    // The v2 routes below are internal-only for a second reason too: v2 is an
-    // interim surface until T24a promotes it onto `V1`. They still register in the
-    // `OpenAPI` document — `exposed` gates gateway visibility, not spec inclusion —
-    // so the contract check sees them. T24a changes the path constant only; it must
-    // not expose mutation routes while ceiling C8 remains open.
+    // C8 remains open: v2 accepts tenant bearers; exposed=false only controls proxy discovery.
+    // T26 moves routes, credentials, fixtures and e2e callers to platform auth atomically.
+    // Platform bypasses the tenant PDP (ADR-0006/0008). Routes remain in OpenAPI; T32 promotes
+    // the tenant reads to V1 and keeps mutations unexposed while C8 remains open.
 
     router = register_v1(router, openapi);
     router = register_submit(router, openapi);
@@ -98,17 +84,8 @@ fn etag_header() -> ResponseHeaderSpec {
 
 /// The pre-database v1 contract, verbatim from `main` (T9a).
 fn register_v1(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
-    // -----------------------------------------------------------------------
-    // v1 — the pre-database contract, unchanged from `main`
-    // -----------------------------------------------------------------------
-    //
-    // Every v1 route is served by `TypesRegistryService` from the in-memory
-    // repository, and no v1 route touches `RegistryService`. That separation is
-    // the point of T9a rather than an implementation detail: T9 repointed these
-    // two routes at the database, which changed `POST /v1/entities`'s request
-    // body under its existing callers and left `oagw` and `account-management`
-    // writing to the database while resolving from process memory. The database
-    // path has no consumer until T24 (SPEC §10.2, `plan.md` P12).
+    // Legacy v1 uses only the in-memory TypesRegistryService. Until T26, consumers must read
+    // and write the same store; routing v1 writes to RegistryService would break that invariant.
 
     // POST /types-registry/v1/entities - Register GTS entities
     router = OperationBuilder::post(format!("{V1}/entities"))
@@ -178,14 +155,8 @@ fn register_v1(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     router
 }
 
-// -----------------------------------------------------------------------
-// v2 — the database-backed async surface (T9)
-// -----------------------------------------------------------------------
-//
-// Interim: T24a promotes these onto v1 once the in-memory path is deleted.
-// They are internal-only — no `.exposed()`, so the gateway does not publish
-// the surface (see the ceiling-C8 note above). The path promotion does not
-// change that posture for mutations.
+// Database-backed v2 (T9); T32 promotes the tenant reads to v1. No .exposed(): gateway discovery
+// excludes it, including mutations after promotion (see C8 above).
 
 /// `POST {V2}/entities` (D10).
 fn register_submit(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {

@@ -3,6 +3,7 @@
 use toolkit_db::DbError;
 use toolkit_db::secure::ScopeError;
 use toolkit_macros::domain_model;
+use types_registry_sdk::item_failure::dependency_kind;
 use uuid::Uuid;
 
 use super::AdmissionFailureReason;
@@ -162,9 +163,9 @@ impl From<DependencyEdge> for FailureDependency {
 /// The payload token for a known dependency kind.
 const fn wire_kind(kind: DependencyKind) -> &'static str {
     match kind {
-        DependencyKind::Derivation => "base",
-        DependencyKind::InstanceOf => "conforming_type",
-        DependencyKind::SchemaRef => "ref",
+        DependencyKind::Derivation => dependency_kind::BASE,
+        DependencyKind::InstanceOf => dependency_kind::CONFORMING_TYPE,
+        DependencyKind::SchemaRef => dependency_kind::REF,
     }
 }
 
@@ -234,7 +235,7 @@ impl ItemFailure {
     pub fn to_payload(&self) -> Result<String, serde_json::Error> {
         let dependency = self.dependency.as_ref();
         StoredFailure {
-            reason: self.reason.as_str().to_owned(),
+            reason: self.reason.as_wire().to_owned(),
             message: self.message.clone(),
             dependency_id: dependency.map(|d| d.target.clone()),
             dependency_kind: dependency.map(|d| d.kind.clone()),
@@ -294,7 +295,7 @@ impl StoredFailure {
     #[must_use]
     pub fn system_failure(operation_id: Uuid, error_code: &str) -> Self {
         Self {
-            reason: AdmissionFailureReason::SystemFailure.as_str().to_owned(),
+            reason: AdmissionFailureReason::SystemFailure.as_wire().to_owned(),
             message: "admission could not complete because of a system failure".to_owned(),
             dependency_id: None,
             dependency_kind: None,
@@ -381,6 +382,19 @@ mod tests {
             contention.transient(),
             "a closure read that failed on contention must be retried, not dead-lettered",
         );
+    }
+
+    /// Every edge kind is written as the SDK's typed value, never as an unknown one.
+    #[test]
+    fn every_dependency_kind_is_written_in_the_sdk_vocabulary() {
+        use types_registry_sdk::item_failure::DependencyKind as Sdk;
+        for (kind, expected) in [
+            (DependencyKind::Derivation, Sdk::Base),
+            (DependencyKind::InstanceOf, Sdk::ConformingType),
+            (DependencyKind::SchemaRef, Sdk::Ref),
+        ] {
+            assert_eq!(Sdk::from_wire(wire_kind(kind)), expected, "{kind:?}");
+        }
     }
 
     /// Each writer serializes [`StoredFailure`], so the reader gets back every field.

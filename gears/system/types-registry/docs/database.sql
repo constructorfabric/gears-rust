@@ -50,7 +50,15 @@ CREATE TABLE types_registry__version_family (
 -- operation_item. Worker delivery state lives in ToolKit-owned outbox tables.
 --
 -- `idempotency_scope_hash` covers plane, tenant, and principal without placing a
--- nullable tenant column in the unique key. `request_fingerprint` includes dry_run.
+-- nullable tenant column in the unique key. `request_fingerprint` includes dry_run
+-- and the publisher.
+--
+-- `publisher_name` / `publisher_version` are the request-level publisher of a
+-- platform-plane mutation: the actual registrant, an opaque name the registry
+-- gives no meaning, and its own SemVer version, stored at acceptance so the worker
+-- reads them back rather than deriving them. The API requires them on every
+-- platform-plane mutation; NULL remains only on operations accepted before the
+-- publication-state migration. Both or neither; never on the tenant plane.
 CREATE TABLE types_registry__operation (
     id                       uuid         NOT NULL,
     kind                     smallint     NOT NULL, -- 1 registration, 2 deletion
@@ -62,6 +70,8 @@ CREATE TABLE types_registry__operation (
     idempotency_key          varchar(255) NOT NULL,
     idempotency_scope_hash   bytea        NOT NULL,
     request_fingerprint      bytea        NOT NULL,
+    publisher_name           varchar(1024) NULL,
+    publisher_version        varchar(256)  NULL,
     -- 1 pending, 2 running, 3 completed. Outcomes remain on operation_item.
     status                   smallint     NOT NULL,
     created_at               timestamptz  NOT NULL,
@@ -81,6 +91,11 @@ CREATE TABLE types_registry__operation (
     ),
     CONSTRAINT ck_tr_operation_status CHECK (
         status IN (1, 2, 3)
+    ),
+    CONSTRAINT ck_tr_operation_publisher CHECK (
+        (publisher_name IS NULL AND publisher_version IS NULL)
+        OR
+        (publisher_name IS NOT NULL AND publisher_version IS NOT NULL AND plane = 1)
     ),
     CONSTRAINT ck_tr_operation_state CHECK (
         (status = 1                                  -- pending
@@ -135,6 +150,10 @@ CREATE TABLE types_registry__operation_item (
     compat_forced             boolean       NOT NULL DEFAULT false,
     -- 1 pending, 2 running, 3 succeeded, 4 unchanged, 5 failed.
     -- Status describes progress and outcome; error_payload describes failure causes.
+    -- A candidate superseded by a newer publisher_version is `failed` with reason
+    -- `superseded` and the stored and offered versions in its context. A higher
+    -- version over identical content is `unchanged` plus a metadata-only stamp
+    -- confirmation, never a revision.
     status                    smallint      NOT NULL,
     request_payload           text          NULL,
     result_revision_no        integer       NULL,
@@ -216,9 +235,18 @@ CREATE TABLE types_registry__operation_item (
 -- `gts_uuid`, `entity_kind` and `chain_depth` (`GtsId::segments().len()`) are
 -- identifier-derived but materialized for portable lookup, constraints and
 -- discovery filters. The write path verifies them and the ownership projection,
--- which is copied from version_family for scoped, join-free reads. `owning_gear` is
--- caller-declared attribution, never authority; it is required for global entities
--- and optional for tenant-owned entities.
+-- which is copied from version_family for scoped, join-free reads.
+--
+-- `publisher_name` + `publisher_version` form the publisher stamp (DESIGN §3.2,
+-- Publication ordering): the actual registrant and the SemVer version it last
+-- published or confirmed. `publisher_name` is caller-declared, never authority; it
+-- is required for global entities and unused for tenant-owned ones. NULL
+-- publisher_version marks an unclaimed row, written before the publication-state
+-- migration, whose `publisher_name` is still a placeholder; the first publication
+-- carrying a publisher claims it. The version is canonical text compared in the
+-- domain by SemVer precedence under the entity_write_order claim, never by string
+-- order. A metadata-only confirmation moves the stamp and neither resource_version
+-- nor updated_at.
 --
 -- resource_version starts at 1 and advances on committed entity-state changes,
 -- including deletion. Content revision_no advances only when new authored content
@@ -233,7 +261,8 @@ CREATE TABLE types_registry__entity (
     family_id                bigint        NOT NULL,
     ownership_scope          smallint      NOT NULL, -- 1 global, 2 tenant
     owner_tenant_id          uuid          NULL,
-    owning_gear              varchar(1024) NULL,
+    publisher_name           varchar(1024) NULL,
+    publisher_version        varchar(256)  NULL,
     lifecycle_status         smallint      NOT NULL, -- 1 active, 2 deleted
     resource_version         bigint        NOT NULL,
     deleted_at               timestamptz   NULL,
@@ -253,7 +282,7 @@ CREATE TABLE types_registry__entity (
     CONSTRAINT ck_tr_entity_owner CHECK (
         (ownership_scope = 1                          -- global
             AND owner_tenant_id IS NULL
-            AND owning_gear IS NOT NULL)
+            AND publisher_name IS NOT NULL)
         OR
         (ownership_scope = 2                          -- tenant
             AND owner_tenant_id IS NOT NULL)
@@ -264,7 +293,12 @@ CREATE TABLE types_registry__entity (
         (lifecycle_status = 2 AND deleted_at IS NOT NULL) -- deleted
     ),
     CONSTRAINT ck_tr_entity_resource_version
-        CHECK (resource_version >= 1)
+        CHECK (resource_version >= 1),
+    -- A stamp needs a global publisher.
+    CONSTRAINT ck_tr_entity_publisher CHECK (
+        publisher_version IS NULL
+        OR (ownership_scope = 1 AND publisher_name IS NOT NULL)
+    )
 );
 
 -- Covers exact family enumeration without identifier-pattern matching.

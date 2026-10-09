@@ -145,7 +145,7 @@ The gear follows the canonical DDD-light layout of [`02_gear_layout_and_sdk_patt
 
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
-| SDK (`types-registry-sdk/`) | The public API surface consumers link and resolve through the typed ClientHub: `TypesRegistryClient` and `PlatformTypesRegistryClient`, transport-agnostic models, canonical errors. A separate crate rather than a layer of the gear, which is what lets a consumer depend on the contract without depending on the implementation | Rust traits and plain models; no serde, no HTTP types, no REST DTOs |
+| SDK (`types-registry-sdk/`) | Public ClientHub contracts (`TypesRegistryApi`, `PlatformTypesRegistryApi`), `…Ext` helpers, models and canonical errors; consumers depend on the contract without the implementation | Rust traits and plain models; no serde, HTTP types or REST DTOs |
 | Presentation (`api/rest/`) | Authenticated REST surface for management, discovery, resolution, validation, and operations; DTOs with OpenAPI schemas | Axum via ToolKit `OperationBuilder`, utoipa, RFC-9457 problem details |
 | Domain (`domain/`) | Admission and compatibility, revision and concurrency control, identity and reference resolution, dependency and deletion safety, availability evaluation, federation routing, query assistance, built-in control-plane validators | Rust, `gts-rust` for all GTS semantics |
 | Infrastructure (`infra/`) | Authoritative persistence, operation and idempotency store, tenant hierarchy client, Registry Source Plugin clients | SeaORM through the secure ORM layer over SQLite / PostgreSQL / MySQL, ToolKit scoped ClientHub, `tenant-resolver` SDK |
@@ -256,7 +256,7 @@ Reverse-impact queries use a repository-owned recursive CTE over `dependency`, b
 
 - [ ] `p2` - **ID**: `cpt-cf-types-registry-constraint-boot-path`
 
-Because every other gear may depend on it, anything Types Registry waits for during startup is something the platform waits for. It publishes ready when its own storage is ready and its own seed set has been admitted, has no notion of an expected registration set, and never blocks on a registrant. Registrants retry and gate their own readiness.
+Types Registry becomes ready when its storage and seed set are ready; it never waits for registrants or an expected registration set. Registrants retry in the background and gate only their own readiness (§3.3, *Inventory and startup reconciliation*). Standalone deployments require high availability (§4); replicas share only the database.
 
 **ADRs**: `cpt-cf-types-registry-adr-write-path-admission-protocol`
 
@@ -296,7 +296,7 @@ A managed GTS Identifier names a logical entity that is mutable when major-only 
 
 | Entity | Description | Schema |
 |---|---|---|
-| Registry Entity | One admitted managed GTS Identifier, of kind Type Schema or registered Instance. Carries identity, ownership, the owning gear, lifecycle, and the `resource_version` that write preconditions test. Survives deletion as the tombstone that keeps a previously issued reference resolvable | `entity`, plus the kind-specific current-state row `type_schema` or `instance` |
+| Registry Entity | One admitted managed GTS Identifier, of kind Type Schema or registered Instance. Carries identity, ownership, the publisher, lifecycle, and the `resource_version` that write preconditions test. Survives deletion as the tombstone that keeps a previously issued reference resolvable | `entity`, plus the kind-specific current-state row `type_schema` or `instance` |
 | Revision | One immutable admitted definition or value, with the specification and implementation versions in force at its admission | `type_schema_revision`, `instance_revision` |
 | Version Family | The set of Version Successors of one another, named by the family key of ADR-0004. Holds an ownership scope and nothing else | `version_family` |
 | Dependency | A direct edge between two Registry Entities: `$ref`, immediate derivation base, or Instance conformance. An `x-gts-ref` target is not one. Nothing transitive is stored | `dependency` |
@@ -351,7 +351,7 @@ erDiagram
 
 Four of these carry an invariant worth stating outright, because none of them is enforced by the relationship alone.
 
-**A Version Family fixes ownership before its first member.** Admission creates or locks the family row before admitting a member, preventing concurrent first registrations under different owners. Entity owner columns are a SecureORM projection maintained under that lock because a composite foreign key would not cover the nullable global scope. `owning_gear` remains mutable per-entity attribution; family ownership is write-once and controls visibility.
+**A Version Family fixes ownership before its first member.** Admission creates or locks the family row before admitting a member, preventing concurrent first registrations under different owners. Entity owner columns are a SecureORM projection maintained under that lock because a composite foreign key would not cover the nullable global scope. `publisher_name` is per-entity attribution, fixed once claimed (§3.2, *Publication ordering*); family ownership is write-once and controls visibility.
 
 **An Instance records one Type Schema revision:** the exact revision that admitted its value, on the immutable revision row. The number is not public. Which revision last revalidated the value is not stored, because a schema revision cannot become current while an affected Instance would become invalid (ADR-0005, ADR-0006) and ADR-0015 forbids an Instance on a v0 schema, so a current value is valid against its schema's current revision by invariant rather than by record.
 
@@ -464,7 +464,7 @@ Three ordering invariants are load-bearing:
   release boundary: the release that introduces the check is the first
   to persist an entity, so no stored edge predates it (ADR-0015).
 
-The request fingerprint covers the canonical body, operation kind, authorization scope, owner, optimistic preconditions, and each `force` flag. The key identifies that request and is scoped to authorization scope, owning tenant, and principal. A matching replay returns the stored operation without reading entity state (`202` while active, `200` when terminal); another fingerprint under the same key returns `409 Conflict`. A new reconciliation uses a new key.
+The request fingerprint covers the canonical body, operation kind, authorization scope, owner, optimistic preconditions, each `force` flag and the request-level `publisher`. The key identifies that request and is scoped to authorization scope, owning tenant, and principal. A matching replay returns the stored operation without reading entity state (`202` while active, `200` when terminal); another fingerprint under the same key returns `409 Conflict`. A new reconciliation uses a new key.
 
 A dry run applies the same checks to the whole batch over one read snapshot and an overlay of prior successful candidates' changes. Entity writes and write-order claims stay virtual. After releasing the snapshot, the worker publishes outcomes in a short transaction. The mode participates in the request fingerprint and is stored on candidate rows for `ck_tr_operation_item_state`. Predictions reserve nothing; §3.3 defines their result fields.
 
@@ -493,7 +493,7 @@ The end-to-end flow this pipeline drives — read, reconcile, submit, dispatch, 
 
 Operation status reports progress only: `pending`, `running`, or `completed`, with `completed` meaning every item is terminal. Per-candidate status carries the outcome: `pending`, `running`, `succeeded`, `unchanged`, or `failed`, keyed by exact GTS Identifier. Outcomes are not aggregated onto the operation (`cpt-cf-types-registry-principle-derive-not-store`).
 
-A status distinguishes effects; a structured reason distinguishes causes. `succeeded` committed an entity-state change, or in Dry Run passed every check and predicts one; `unchanged` proved an update equal to current authored content without a revision or `resource_version` increment; `failed` produced no change. `unchanged` is valid only for an update; create and delete have no redundant-success branch, as constrained in the candidate row and enforced by the worker.
+`succeeded` commits a change (or predicts one in Dry Run); `unchanged` confirms equal authored content without a revision or `resource_version` increment, possibly advancing the publisher stamp; `failed` changes nothing. `superseded` is a failure reason, not a status. Only updates can be `unchanged`; create and delete have no redundant-success branch.
 
 The vocabulary has no cancellation or expiry state. Leases are redelivered, and a stalled operation past its timeout completes with unfinished items `failed`. A dependency-blocked candidate is likewise `failed`, with `blocked_by_dependency` or `blocked_by_predecessor` identifying the cause rather than adding a `blocked` status.
 
@@ -592,6 +592,34 @@ Shape and contiguity are keyed lookups, not scans. There is no revision-reservat
 
 The commit-time predecessor recheck handles concurrent delete-and-purge: during validation the new candidate does not yet pin its baseline. Absence is retryable, like a not-yet-registered base, and is not a caller-precondition failure. The predecessor is excluded from both the dependency vector and `dependency`; storing that edge would forbid deletion of `v1.0~` while `v1.1~` exists, contrary to ADR-0008.
 
+##### Publication ordering
+
+- [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-publication-ordering`
+
+Compare-and-swap orders writes, not releases. Publication ordering prevents an older release, restart or queued operation from restoring content published by a newer release.
+
+Each global entity stores the registrant's **publisher stamp**: opaque `publisher_name` and SemVer `publisher_version` (gear name/crate version for ToolKit gears). Platform mutations require `publisher { name, version }`, stored on the operation, included in its fingerprint and read for every candidate. Missing publisher is refused before acceptance. Tenant mutations reject publisher input and store no stamp.
+
+Inside the commit transaction, after the `entity_write_order` claim and **before** the caller's precondition, the stored stamp decides:
+
+| Incoming `publisher_version` vs stored | Authored content | Outcome |
+|---|---|---|
+| Lower | any | `failed` with reason `superseded`; nothing written |
+| Equal | identical | `unchanged` |
+| Equal | different | ordinary admission, CAS and compatibility; content and stamp commit together |
+| Higher | identical | `unchanged` plus a metadata-only confirmation of the stamp |
+| Higher | different | ordinary admission; content and stamp commit together |
+
+`superseded` carries `stored_version` and `offered_version`. Comparison uses SemVer precedence (prerelease counts, build metadata does not); a different publisher yields `publisher_mismatch`. Under the write-order claim, check the stamp before preconditions and any final refusal, including compatibility or tombstone refusal, and on both `unchanged` paths. Metadata-only confirmation changes no revision, `resource_version`, `updated_at`, artifact or validator, including for minor-bearing Type Schemas (ADR-0004). Failed, refused and dry-run candidates never advance the stamp; deletion commits tombstone and stamp together.
+
+Required publisher metadata prevents unversioned bypasses. Equal-version updates support configuration-built Instances without a rebuild, but differently configured replicas of one release may overwrite each other. Per-entity stamps allow partial admission; older releases may still create identifiers absent from newer publications. Manifest omissions never delete entities.
+
+There is no override of `publisher_version`. Reverting content takes a newer release; a hotfix on an older line is released above the last published version. A rolled-back binary is `superseded`, and the registry is not rewound.
+
+The stamp is declared, not attested; it coordinates cooperating publishers and grants no authority. P1 binds names through a deployment allow-list over the full validated `PlatformIdentity`; `peer_name()` loses service-account namespace. Unauthorized names are refused before acceptance; one identity may host several publishers, and SPIFFE can attest versions. Pre-stamp rows (empty version, placeholder name) remain **unclaimed** until successful publication or confirmation, without inferring ownership from GTS namespaces. Every database writer must check the stamp.
+
+**Schema authority.** Global validation uses current major-only registry content within cache freshness rules; decoding and serialization remain the consumer’s code. BACKWARD compatibility protects older writers; supporting older readers is the publisher’s release obligation. Pinning a release requires revision-addressed reads or resolved snapshots: immutable authored minors may still resolve moving major-only references.
+
 ##### Tenant-plane authorization
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-registration-authority`
@@ -676,7 +704,7 @@ Three absences are deliberate. `purge` has no permission because the grant-free 
 
 Under `cpt-cf-adr-two-plane-auth`, `PlatformSecurityContext` never reaches the tenant `PolicyEnforcer`; `cpt-cf-adr-platform-plane-auth` makes these handlers AuthZ-exempt. `InternalAuthMiddleware` authenticates the workload using an `X-ToolKit-Internal-Token` service-account token initially and mTLS SPIFFE identity later, producing `PlatformIdentity`.
 
-Consequently, any authenticated platform workload may author, revise, or delete any global entity. `owning_gear` is attribution, not authority. Per-gear narrowing belongs to external workload policy over `PlatformIdentity`; mutations remain audited. Purge additionally exists only where deployment policy enables it (ADR-0013).
+Consequently, any authenticated platform workload may author, revise, or delete any global entity. `publisher_name` is attribution, not authority. Per-publisher narrowing is registry-side workload policy over the validated `PlatformIdentity` — the allow-list from identity to permitted `publisher_name` values (*Publication ordering*) — never a PDP decision; mutations remain audited. Purge additionally exists only where deployment policy enables it (ADR-0013).
 
 ##### Registration policy
 
@@ -1098,6 +1126,8 @@ ItemError {
 |---|---|
 | `dependency_not_found`, `dependency_deleted` | `dependency_id`, `dependency_kind` (`base`, `conforming_type`, `ref`; open set) |
 | `system_failure` | `diagnostic_code` (open set) |
+| `superseded` | `stored_version`, `offered_version` — a newer `publisher_version` already holds the entity, so nothing was written (§3.2, *Publication ordering*) |
+| `publisher_mismatch` | `stored_publisher`, `offered_publisher` — another `publisher_name` holds the entity, so nothing was written (§3.2, *Publication ordering*) |
 | other current reasons | `{}` (currently) |
 
 Results preserve request order. A registration result names its identifier; a deletion result echoes its key, a GTS Identifier or a `gts_uuid`, whether or not it named an entity. A `gts_uuid` accepted in any UUID spelling is echoed lowercase and hyphenated: the operation stores the classified key, and a replay under another spelling of it is the same operation. `:batchGet` echoes a `gts_uuid` the same way, so every `entity_key` a response carries follows one rule. Real `succeeded` and `unchanged` results also contain `resource_version`.
@@ -1217,6 +1247,7 @@ The `fr-type-query-assistance` filter forms map as follows:
 |---|---|---|
 | `items[]` | body | Each the authored GTS JSON plus an optional `expected_resource_version` — present, the entity must still be at that version; absent, it must not exist, and `0` is rejected — and an optional `force` waiving the cross-minor compatibility check for that candidate alone (ADR-0004), rejected where the deployment has not enabled the waiver (§3.8) or where the candidate has no such check to waive. Non-empty, at most 100 |
 | `dry_run` | body | Runs the whole check sequence and commits nothing. Defaults to false |
+| `publisher` | body | Required on the platform plane: `{ "name", "version" }` — the actual registrant and its own SemVer version, applying to every item. It orders publications per entity (§3.2, *Publication ordering*). Refused on the tenant plane |
 
 On the tenant plane the owner is derived from the `SecurityContext` and is never a body field; on the platform plane every candidate is global, because there is no tenant context to derive an owner from.
 
@@ -1226,6 +1257,7 @@ On the tenant plane the owner is derived from the `SecurityContext` and is never
 |---|---|---|
 | `items[]` | body | Each names one entity in `entity_key` and carries a required positive `expected_resource_version`; deletion only targets an entity the caller read, so `must_not_exist` has no meaningful delete case |
 | `dry_run` | body | As above. Defaults to false |
+| `publisher` | body | As on `POST /entities`; the version must be no lower than the stamp |
 
 ```jsonc
 {
@@ -1251,6 +1283,8 @@ The single-entity spelling: one item's worth of `:batchDelete`, with the item sp
 | `dry_run` | query | As above. Defaults to false |
 | `Idempotency-Key` | request header | Required, exactly as on the batch routes |
 
+This spelling carries no `publisher`, so it is a tenant-plane route only; on the platform plane a deletion goes through `:batchDelete`.
+
 **The precondition is not `If-Match`,** even though one entity would fit in one header. `If-None-Match` on the read of this same resource already carries a *validator* — projection-scoped, and including `resolution_fingerprint`, which the caller's write precondition deliberately excludes (the worker's drift check includes it). Putting a `resource_version` in `If-Match` would give one resource two unrelated token vocabularies in two conditional headers, and a caller that reasonably fed the `ETag` back into `If-Match` would be refused for a reason the shape does not explain. So `If-Match` is not merely unused here: it is **refused** if sent on either deletion route, rather than ignored, because a caller that sent one believes the request is conditional in the RFC 9110 §13.1.1 sense — and it is not, per the next paragraph. `expected_resource_version` is the same name the batch body uses, taken from the entity body rather than from any response header.
 
 **A precondition failure stays asynchronous.** The split is by mistake class, not by route:
@@ -1269,7 +1303,7 @@ No parameters. The operation is returned with every per-candidate result known s
 
 #### Operator purge job contract
 
-Purge is a platform maintenance-job entry point outside both OpenAPI documents and outside `PlatformTypesRegistryClient`. The deployment's operator/job mechanism authenticates a `PlatformSecurityContext` and invokes the Purge Job component directly; ordinary gears cannot link or call this contract.
+Purge is a platform maintenance-job entry point outside both OpenAPI documents and outside `PlatformTypesRegistryApi`. The deployment's operator/job mechanism authenticates a `PlatformSecurityContext` and invokes the Purge Job component directly; ordinary gears cannot link or call this contract.
 
 The input is a GTS `pattern` and `dry_run`, which defaults to **true**. Selecting a Type Schema necessarily selects every conforming Instance because the Instance identifier begins with its schema's, allowing the job to remove Instances first. The synchronous report gives matched, eligible, and skipped counts satisfying `matched = eligible + skipped` and, for each identifier, `gts_id`, `gts_uuid`, owner on Dry Run, and either `released` or a skip reason: not `DELETED`, registered dependent, or higher minor still admitted. ADR-0013 permits releasing only a suffix of a major's minors; exact middle purges name the blocking higher minors.
 
@@ -1280,9 +1314,9 @@ The job performs local database work only: no hook, resolution, plugin call, ope
 The SDK is the transport-agnostic contract crate. It exposes plain Rust models and canonical errors, contains no Axum, HTTP status, or REST DTO types, and keeps the security context as the first argument. Tenant and platform authority remain distinct at the type level:
 
 ```rust
-#[async_trait]
-pub trait TypesRegistryClient: Send + Sync {
-    /// The one required read. Single and kind-narrowed reads are provided
+#[toolkit::contract(gear = "types-registry", version = "v1")]
+pub trait TypesRegistryApi: Send + Sync {
+    /// The one required read. Single and kind-narrowed reads are extension
     /// methods over it, so the trait stays object-safe for `ClientHub`.
     /// `tenant_id` is the Context Tenant the availability verdict is
     /// evaluated for; `None` means the subject's own tenant. Naming a
@@ -1291,52 +1325,29 @@ pub trait TypesRegistryClient: Send + Sync {
         &self,
         ctx: &SecurityContext,
         tenant_id: Option<TenantId>,
-        request: BatchGet,
-    ) -> Result<EntityLookups, CanonicalError>;
+        request: BatchGetEntitiesRequest,
+    ) -> Result<BatchGetEntitiesResponse, CanonicalError>;
 
     async fn list_entities(
         &self,
         ctx: &SecurityContext,
         tenant_id: Option<TenantId>,
-        query: EntityQuery,
-    ) -> Result<EntityPage, CanonicalError>;
-
-    /// Provided, not required: pages `list_entities` under `$select=gts_uuid`,
-    /// `lifecycle_status=active` and `availability=available`, which `ExpansionFilter` fixes rather than
-    /// accepting from the caller, until the continuation is absent. More than 1000
-    /// distinct references fails with `QUERY_EXPANSION_LIMIT_EXCEEDED`; that or
-    /// any page failure exposes no partial set. The result is complete with
-    /// respect to the traversal, not to an instant.
-    async fn expand_type_filter(
-        &self,
-        ctx: &SecurityContext,
-        tenant_id: Option<TenantId>,
-        filter: ExpansionFilter,
-    ) -> Result<ConcreteReferenceSet, CanonicalError> { /* … */ }
+        request: ListEntitiesRequest,
+    ) -> Result<ListEntitiesResponse, CanonicalError>;
 
     async fn register_entities(
         &self,
         ctx: &SecurityContext,
         key: IdempotencyKey,
-        request: RegisterEntities,
+        request: RegisterEntitiesRequest,
     ) -> Result<RegistrationOperation, CanonicalError>;
 
     async fn delete_entities(
         &self,
         ctx: &SecurityContext,
         key: IdempotencyKey,
-        request: DeleteEntities,
+        request: DeleteEntitiesRequest,
     ) -> Result<DeletionOperation, CanonicalError>;
-
-    /// Provided, not required: a one-item `delete_entities`, mirroring
-    /// `DELETE /entities/{entity_key}`. One deletion model, two spellings.
-    async fn delete_entity(
-        &self,
-        ctx: &SecurityContext,
-        key: IdempotencyKey,
-        entity: DeleteItem,
-        dry_run: bool,
-    ) -> Result<DeletionOperation, CanonicalError> { /* … */ }
 
     async fn get_operation(
         &self,
@@ -1345,23 +1356,23 @@ pub trait TypesRegistryClient: Send + Sync {
     ) -> Result<Operation, CanonicalError>;
 }
 
-#[async_trait]
-pub trait PlatformTypesRegistryClient: Send + Sync {
+#[toolkit::contract(gear = "types-registry", version = "v1")]
+pub trait PlatformTypesRegistryApi: Send + Sync {
     // Reads span every tenant. `tenant_id` names the Context Tenant an
     // availability verdict is evaluated for; there is no default here.
     async fn batch_get_entities(
         &self,
         ctx: &PlatformSecurityContext,
         tenant_id: Option<TenantId>,
-        request: BatchGet,
-    ) -> Result<EntityLookups, CanonicalError>;
+        request: BatchGetEntitiesRequest,
+    ) -> Result<BatchGetEntitiesResponse, CanonicalError>;
 
     async fn list_entities(
         &self,
         ctx: &PlatformSecurityContext,
         tenant_id: Option<TenantId>,
-        query: EntityQuery,
-    ) -> Result<EntityPage, CanonicalError>;
+        request: ListEntitiesRequest,
+    ) -> Result<ListEntitiesResponse, CanonicalError>;
 
     // Creates global entities only — a consequence of the plane, not a
     // separate rule, so the name does not repeat it.
@@ -1369,24 +1380,15 @@ pub trait PlatformTypesRegistryClient: Send + Sync {
         &self,
         ctx: &PlatformSecurityContext,
         key: IdempotencyKey,
-        request: RegisterEntities,
+        request: RegisterEntitiesRequest,
     ) -> Result<RegistrationOperation, CanonicalError>;
 
     async fn delete_entities(
         &self,
         ctx: &PlatformSecurityContext,
         key: IdempotencyKey,
-        request: DeleteEntities,
+        request: DeleteEntitiesRequest,
     ) -> Result<DeletionOperation, CanonicalError>;
-
-    /// Provided, as on the tenant trait.
-    async fn delete_entity(
-        &self,
-        ctx: &PlatformSecurityContext,
-        key: IdempotencyKey,
-        entity: DeleteItem,
-        dry_run: bool,
-    ) -> Result<DeletionOperation, CanonicalError> { /* … */ }
 
     async fn get_operation(
         &self,
@@ -1394,6 +1396,34 @@ pub trait PlatformTypesRegistryClient: Send + Sync {
         operation_id: Uuid,
     ) -> Result<Operation, CanonicalError>;
 }
+
+/// Blanket-implemented for every `T: TypesRegistryApi + ?Sized`, `dyn` included.
+/// Not part of the contract, so not part of its IR: a default body on the
+/// contract trait would make the method optional.
+#[async_trait]
+pub trait TypesRegistryApiExt: TypesRegistryApi {
+    /// Pages `list_entities` under `$select=gts_uuid`, `lifecycle_status=active`
+    /// and `availability=available`, which `ExpansionFilter` fixes rather than
+    /// accepting from the caller, until the continuation is absent. More than 1000
+    /// distinct references fails with `QUERY_EXPANSION_LIMIT_EXCEEDED`; that or
+    /// any page failure exposes no partial set. The result is complete with
+    /// respect to the traversal, not to an instant.
+    async fn expand_type_filter(&self, ctx: &SecurityContext, tenant_id: Option<TenantId>,
+        filter: ExpansionFilter) -> Result<ConcreteReferenceSet, CanonicalError>;
+
+    /// A one-item `delete_entities`, mirroring `DELETE /entities/{entity_key}`.
+    /// One deletion model, two spellings.
+    async fn delete_entity(&self, ctx: &SecurityContext, key: IdempotencyKey,
+        entity: DeleteItem, dry_run: bool) -> Result<DeletionOperation, CanonicalError>;
+
+    // get_type_schema, get_instance and the other single and kind-narrowed reads.
+}
+
+/// The platform counterpart, blanket-implemented the same way; it adds
+/// `reconcile_entities_and_await`, the method form of the reconciliation helper
+/// that `publish_gts` runs.
+#[async_trait]
+pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi { /* … */ }
 ```
 
 ##### Models
@@ -1403,7 +1433,7 @@ pub trait PlatformTypesRegistryClient: Send + Sync {
 
 pub enum EntityKey { GtsId(GtsId), GtsUuid(Uuid) }
 
-pub struct BatchGet {
+pub struct BatchGetEntitiesRequest {
     pub items: Vec<BatchGetItem>,
     pub projection: Projection,
     /// SDK-only: bypasses the cache window and revalidates every key.
@@ -1427,7 +1457,7 @@ pub enum Projection {
 
 // ---- results ------------------------------------------------------------
 
-pub struct EntityLookups(pub HashMap<EntityKey, EntityLookup>);
+pub struct BatchGetEntitiesResponse(pub HashMap<EntityKey, EntityLookup>);
 
 pub enum EntityLookup {
     /// `etag` is metadata outside `$select`, but is scoped to the normalized
@@ -1504,7 +1534,7 @@ pub struct Validator(Vec<u8>);
 /// Managed-only admission provenance: how the current revision was admitted.
 /// `compat_forced`: false when no waiver applied, true when it did, and None
 /// only for Instances. Safe multi-minor upgrades inspect every crossed minor.
-/// The internal `owning_gear` attribution is not a member (see `owning_gear`).
+/// The internal `publisher_name` attribution is not a member (see `publisher_name`).
 pub struct Provenance {
     pub gts_spec_version: String,
     pub gts_impl_version: String,
@@ -1516,7 +1546,7 @@ pub struct Provenance {
 /// Shared discovery filter; pattern plus depth expresses hierarchy and family.
 pub struct EntityFilter {
     pub pattern: Option<GtsIdPattern>,
-    pub max_chain_depth: Option<u8>,
+    pub max_chain_depth: Option<NonZeroU8>,
     pub kind: Option<EntityKind>,
     pub lifecycle: LifecycleFilter,
     pub origin: Option<OriginFilter>,        // Managed | External
@@ -1533,29 +1563,42 @@ pub enum LifecycleFilter { #[default] Active, Deleted, All }
 /// Available, and is tenant-only; therefore it exposes no lifecycle, availability or scope.
 pub struct ExpansionFilter {
     pub pattern: GtsIdPattern,
-    pub max_chain_depth: Option<u8>,
+    pub max_chain_depth: Option<NonZeroU8>,
     pub kind: Option<EntityKind>,
     pub origin: Option<OriginFilter>,
 }
 
-pub struct EntityQuery {
+pub struct ListEntitiesRequest {
     pub filter: EntityFilter,
     pub projection: Projection,
     pub page: PageRequest,
 }
 
-pub struct EntityPage { pub items: Vec<EntitySnapshot>, pub next: Option<Cursor> }
+pub struct ListEntitiesResponse { pub items: Vec<EntitySnapshot>, pub next: Option<Cursor> }
 
 /// Deduplicated, unordered, complete, ≤1000; never truncated or cached.
 pub struct ConcreteReferenceSet { pub references: Vec<Uuid> }
 
 // ---- write path ---------------------------------------------------------
 
-pub struct RegisterEntities { pub items: Vec<RegisterItem>, pub dry_run: bool }
+/// The actual registrant and its own version — never the crate that declares
+/// the Rust struct, never the SDK's version. Captured at the call site or by the
+/// gear attribute; a shared helper only forwards it. No override.
+pub struct PublisherContext { pub name: String, pub version: PublisherVersion /* SemVer */ }
 
-pub struct DeleteEntities {
+/// `publisher` is request-level: one publisher and one version per request,
+/// required on the platform plane (see *Publication ordering*). The tenant-plane
+/// trait has its own request types without it.
+pub struct RegisterEntitiesRequest {
+    pub items: Vec<RegisterItem>,
+    pub dry_run: bool,
+    pub publisher: PublisherContext,
+}
+
+pub struct DeleteEntitiesRequest {
     pub items: Vec<DeleteItem>,
     pub dry_run: bool,
+    pub publisher: PublisherContext,
 }
 
 /// `EntityKey` rather than `GtsId`: deletion names an entity the same way a
@@ -1583,6 +1626,11 @@ pub enum Operation {
     Deletion(DeletionOperation),
 }
 
+/// `register_entities` / `delete_entities` return the operation **as read**:
+/// an adapter submits, then calls `get_operation`. The `202`/`200` receipt has
+/// no items, and a terminal replay has a terminal status with none, so an
+/// operation built from a receipt would report vacuous success. A failed read
+/// after an accepted submit carries the `operation_id`; a same-key retry replays.
 pub struct RegistrationOperation {
     pub operation_id: Uuid,
     pub status: OperationStatus,
@@ -1617,7 +1665,7 @@ pub struct DeletionItemResult {
 
 Platform reads cross tenant visibility for diagnostics; the PDP is not substituted. Both planes use `EntitySnapshot`: `owned_by_context_tenant` exists only with a Context Tenant, while owning tenant is absent from SDK snapshots and appears only in the separate operator purge report defined by ADR-0013. Platform availability is present only when `tenant_id` is supplied; tenant calls default it to the subject tenant.
 
-`cpt-cf-types-registry-fr-registration-authority` and `cpt-cf-adr-platform-plane-auth` separate planes by listener and context type, not path prefix. The same `PlatformTypesRegistryClient` signature supports embedded or remote use without exposing credentials. Callers are authenticated workloads; humans act through jobs.
+`cpt-cf-types-registry-fr-registration-authority` and `cpt-cf-adr-platform-plane-auth` separate planes by listener and context type, not path prefix. The same `PlatformTypesRegistryApi` signature supports embedded or remote use without exposing credentials. Callers are authenticated workloads; humans act through jobs.
 
 ##### Read results
 
@@ -1669,7 +1717,7 @@ Callers selecting effective documents should also select `origin` to see whether
 
 No authored-content digest is selectable: reconciliation selects `content` and compares canonical bytes. Caller/registry `gts-rust` skew may cause a benign false mismatch; submission then terminates `unchanged`.
 
-SDK selection uses field constants and a value projection with `light()`, `with(&[…])`, and `full()`. A type parameter would break object-safe `hub.get::<dyn TypesRegistryClient>()`.
+SDK selection uses field constants and a value projection with `light()`, `with(&[…])`, and `full()`. A type parameter would break object-safe `hub.get::<dyn TypesRegistryApi>()`.
 
 Projection changes naturally cause validator mismatch and a full result. Inapplicable fields are absent; `kind` disambiguates them.
 
@@ -1683,9 +1731,9 @@ Availability is also a read and is in the default set. Tenant-plane `tenant_id` 
 
 Visibility always uses the subject; availability uses the Context Tenant. Mixing them would let an ancestor disclose a descendant's private contracts by naming it.
 
-##### Provided methods
+##### Extension methods
 
-`batch_get_entities` is the only required exact-read primitive; single reads and the kind-narrowed `get_type_schema` / `get_instance` are provided methods over it, which keeps the trait object-safe for `hub.get::<dyn TypesRegistryClient>()`. `delete_entity` stands in the same relation to `delete_entities`, for the same reason and with the same consequence: one implementation to get right per plane.
+Single and kind-narrowed reads compose `batch_get_entities`; `delete_entity` composes `delete_entities`. Helpers live on `…Ext` traits because contract default bodies denote optional methods. The API stays object-safe for `hub.get::<dyn TypesRegistryApi>()`, with one primitive implementation per plane.
 
 Kind narrowing costs no round trip: the kind is the trailing `~` of the identifier, so `get_type_schema` given an Instance identifier fails locally. Callers compare only canonical authored content when deciding whether a definition needs registration; dependency-derived effective content is not part of content equality.
 
@@ -1731,7 +1779,7 @@ Revalidation is demand-driven, with no timer. One batch serves fresh entries loc
 
 Failed revalidation propagates the error and never extends the window (`cpt-cf-types-registry-principle-fail-closed`).
 
-When registration or deletion terminates successfully, each returned identifier/UUID pair invalidates all local variants of that entity, not only the projection used by the mutation workflow. A mutation may also refresh effective projections of dependants that are absent from the operation result; their SDK entries remain bounded by the ordinary window, and callers requiring an authoritative dependent projection use `fresh`. No claim is made that a client can infer those indirect keys from a target-only mutation result.
+Successful terminal mutations invalidate every cached projection of each returned identifier/UUID pair. A per-entity generation prevents earlier reads from refilling invalidated entries. Metadata-only publisher confirmation invalidates nothing. Indirect dependants absent from the result retain the normal freshness window; use `fresh` for an authoritative dependent projection.
 
 ##### Known ceiling
 
@@ -1746,6 +1794,7 @@ Content duplicates across Context Tenants even when only availability and owners
 - a deleted entity is not served as available past the window;
 - an expired entry whose revalidation fails is not served at all;
 - a terminal `register_entities` or `delete_entities` drops the affected entries, so the next read reflects the mutation with no window elapsing;
+- a read that started before that terminal outcome does not refill the entry when it completes;
 - a batch read of cached and expired keys issues exactly one conditional `batchGet`, carrying validators only for the expired ones;
 - a validator or snapshot obtained under one projection, subject visibility context, or Context Tenant is never presented under another.
 
@@ -1753,29 +1802,27 @@ Content duplicates across Context Tenants even when only availability and owners
 
 - [ ] `p2` - **ID**: `cpt-cf-types-registry-tech-inventory-registration`
 
-A gear declares Type Schemas and well-known Instances through `#[gts_type_schema(...)]` and `gts_instance!` link-time inventory. The SDK filters records by `owning_gear` and reconciles them, replacing the current registry-side process-wide pull with a per-gear push that works across processes. Types Registry's own control-plane types use the same admission path, without privileged seeding.
+Declaring crates use `#[gts_type_schema(...)]` / `gts_instance!` and call `toolkit_gts::declare_gts_inventory!()` once to expose plain-data `gts_declarations()`. The owning gear lists its crates and publisher in `#[toolkit::gear(…, gts(crates = [crate, some_sdk], publisher = types_registry_sdk::publish_gts))]`. The macro records ownership and publishes those declarations after wiring with the gear’s `PublisherContext`; configuration-built Instances use the same hook. Linking a crate publishes nothing, and incompatible `toolkit-gts` versions cannot hide declarations.
 
 The SDK provides the reconciliation workflow for gear startup:
 
 1. batch-get every desired exact identifier;
-2. omit authored content equal to the corresponding current snapshot;
+2. omit authored content equal to the corresponding current snapshot — **except on the platform plane**, where every call carries a `PublisherContext` and every document is submitted so that a higher version can be confirmed (§3.2, *Publication ordering*);
 3. leave `expected_resource_version` unset for missing entities and set it from the read for differing ones;
 4. return `UpToDate` without a POST when no candidates remain — this, and not a server-side inline response, is where the no-op is handled;
 5. otherwise submit once with one idempotency key, poll the operation, and return the terminal per-GTS-ID result.
 
-One generated idempotency key spans retries and polling for an invocation. Cross-process-loss resumption requires the caller to persist it; a new cycle rereads and generates another. Each gear gates only its own readiness.
+One generated idempotency key spans retries and polling for an invocation. Cross-process-loss resumption requires the caller to persist it; a new cycle rereads and generates another. A `superseded` or permanently rejected candidate stops retrying; a new cycle never raises its own version.
 
-vNext replaces `register(Vec<Value>) -> Vec<RegisterResult>` without compatibility adapters, sequential local loops, or kind-specific duplicates. It removes internal-service inventory seeding and **ready mode**, whose `post_init` global barrier conflicts with `cpt-cf-types-registry-fr-two-phase-init` and `cpt-cf-types-registry-constraint-boot-path`.
+Publication is supervised, starts after wiring and never blocks startup. Per-identifier status is *pending*, *admitted*, *rejected* or *superseded*. P0 readiness is `Required`: admitted and superseded-live satisfy it; superseded-deleted holds it. Admitted is sticky. Supersession emits a warning and metric; supporting newer contracts on older readers is the release’s N−1 obligation. `ReportOnly` and runtime overrides are P1. Registry-dependent work in `init`, `post_init`, `start` and bootstrap runs in supervised tasks awaiting prerequisites. Plugin selection is not cached while a locally registered instance of the same contract/vendor remains invisible.
 
-##### `owning_gear`
+vNext replaces `register(Vec<Value>) -> Vec<RegisterResult>` without compatibility adapters, sequential local loops or kind-specific duplicates, and removes internal inventory seeding and **ready mode** (`cpt-cf-types-registry-fr-two-phase-init`, `cpt-cf-types-registry-constraint-boot-path`). Inline seeds contain only registry control-plane types, `toolkit-gts` bases and configured entities whose dependencies are in that set. Configured entities depending on other gears publish after wiring to avoid a cold-database bootstrap cycle.
 
-Each gear submits only inventory records whose `owning_gear` matches its generated `MODULE_NAME`. This prevents process-global collectors—including linked `toolkit-gts` base types—from causing unauthorized submissions. The value is persisted on the entity.
+##### `publisher_name`
 
-`toolkit-gts` base types default to `types-registry` ownership, allowing its federation control-plane type and base to be dependency-ordered in one batch. `owning_gear` is mutable across revisions, so a later dedicated owner can replace the default.
+`publisher_name` is the actual registrant, taken from `publisher.name` on first claim and fixed thereafter; another publisher gets `publisher_mismatch`. Together with `publisher_version` it forms the stamp (§3.2). Types Registry publishes its own types, seeds and configured entities under its own name/version. GTS namespaces never imply an owner.
 
-`owning_gear` is unverifiable caller-declared attribution, never authorization, visibility, or a second ownership axis. It is required globally, optional for tenant-owned entities, absent externally, and answers whom to contact about a contract.
-
-The REST input and enforcement of `owning_gear` are P1 work alongside platform-plane authorization; P0 accepts no `owning_gear` field. Exposing it on reads is P1 work too, designed together with the ownership view: P0 persists the attribution on the entity for that upgrade, but no P0 read, SDK snapshot or `provenance` group returns it, and P0 defines no ownership group.
+`publisher_name` is attribution, not authorization or visibility, until workload policy binds it to identity. It is required globally, unused for tenant-owned entities and absent externally. Publisher name/version remain absent from reads, SDK snapshots and `provenance` until the ownership view is designed.
 
 ##### Platform identifiers and the lint
 
@@ -2218,6 +2265,7 @@ The reference schema supports the write protocol without reading revision histor
 | Kind exclusivity | the same locked read, over `entity.gts_id` of any one family member through `idx_tr_entity_family` |
 | Per-major shape, and contiguity of a candidate minor | keyed lookups on `uq_tr_entity_gts_id` for `vM~`, `vM.0~`, and `vM.(n-1)~`; no column stores any of them, and the last is re-asked inside the commit transaction |
 | A waived cross-minor compatibility check | `type_schema_revision.compat_forced`, the one fact of ADR-0004's profile that is not derivable |
+| Publication order per entity | `entity.publisher_name` + `entity.publisher_version` (canonical SemVer text, compared in the domain by SemVer precedence under the `entity_write_order` claim, never by string order); the request's publisher on `operation.publisher_name` / `operation.publisher_version`, read back by the worker; a superseded candidate's versions in its `error_payload` context |
 | Durable at-least-once dispatch and multi-pod lease | ToolKit outbox tables, linked by an operation-UUID-only message |
 
 Update commit compares `entity.resource_version` with `expected_resource_version` and increments it atomically with revision insertion, current-state and dependency updates, dependant refreshes, and item completion. Those dependant refreshes change effective artifacts and fingerprints without advancing the dependants' `resource_version`. Create requires unique canonical identifier and absent precondition; deletion requires a positive version. Database checks constrain result-field combinations, but cannot prove cross-table meaning. The application transaction therefore enforces that a revision row exists only for a non-Dry-Run `succeeded` registration item, belongs to that item, and matches its reported revision. The `instance` current pointer needs no such rule, because it carries no second reference to reconcile with the pointed `instance_revision`. Repository-specific code implements these invariants, compare-and-swap, and lock ordering consistently across SQLite, PostgreSQL, and MySQL.
@@ -2231,6 +2279,10 @@ Types Registry scales as identical replicas over one authoritative database per 
 Each replica exposes tenant REST on the authenticated business listener and workload-authenticated platform REST on a separate listener (`cpt-cf-adr-platform-plane-auth`: service-account token initially, mTLS SPIFFE later). Listener separation makes `cpt-cf-types-registry-fr-registration-authority` structural.
 
 The leased ToolKit outbox gives multi-pod exclusion without leader election. Database-only authority makes each committed mutation visible on every replica's first post-commit read (`cpt-cf-types-registry-nfr-multi-pod-correctness`).
+
+Standalone registry deployments require **at least two replicas with a disruption budget** (`cpt-cf-types-registry-constraint-boot-path`); replicas share the database. Consumers need a reachable registry to become ready, and in-memory SDK caches fail closed after their freshness window, so offline restart is unsupported.
+
+Publication ordering (§3.2) binds only replicas that run it. A rollout that introduces it, or any later change to its semantics, upgrades and drains every replica writing to the database before it takes effect; rolling the registry back below that release is not supported.
 
 #### Gear configuration
 

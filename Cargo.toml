@@ -722,6 +722,10 @@ percent-encoding = "2"
 # Regex for env expansion
 regex = "1.10"
 
+# SemVer parsing and precedence for publisher versions (`types-registry-sdk`).
+# Already in the tree through `rustc_version` / `cargo_metadata`.
+semver = "1.0"
+
 # CLI and terminal output
 glob = "0.3"
 supports-color = "3"

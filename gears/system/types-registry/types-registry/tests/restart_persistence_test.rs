@@ -75,7 +75,7 @@ async fn submit_admitted(
     request: &SubmitRequest,
     now: OffsetDateTime,
 ) -> Result<Accepted, ServiceError> {
-    let accepted = svc.submit(request, now).await?;
+    let accepted = svc.submit(common::caller(), request, now).await?;
     if !accepted.terminal() {
         svc.admit(accepted.operation_id, now).await?;
     }
@@ -203,7 +203,7 @@ async fn a_schema_and_instance_survive_database_reopen() {
 
         for operation_id in [accepted_schema.operation_id, accepted_instance.operation_id] {
             let op = svc
-                .operation(operation_id)
+                .operation(common::caller(), operation_id)
                 .await
                 .expect("read operation")
                 .expect("the operation exists");
@@ -256,12 +256,17 @@ async fn a_schema_and_instance_survive_database_reopen() {
     // current-state branch and two separate tables.
     let svc = service(&db);
     let schema_by_id = svc
-        .entity(&EntityKey::parse(CF_TYPE), FieldSelection::full())
+        .entity(
+            common::caller(),
+            &EntityKey::parse(CF_TYPE),
+            FieldSelection::full(),
+        )
         .await
         .expect("read by identifier")
         .expect("the schema survived");
     let schema_by_uuid = svc
         .entity(
+            common::caller(),
             &EntityKey::parse(&schema_uuid.to_string()),
             FieldSelection::full(),
         )
@@ -269,7 +274,11 @@ async fn a_schema_and_instance_survive_database_reopen() {
         .expect("read by Registry Reference")
         .expect("the schema survived");
     let instance_by_id = svc
-        .entity(&EntityKey::parse(CF_INSTANCE), FieldSelection::full())
+        .entity(
+            common::caller(),
+            &EntityKey::parse(CF_INSTANCE),
+            FieldSelection::full(),
+        )
         .await
         .expect("read Instance by identifier")
         .expect("the Instance survived");
@@ -321,7 +330,7 @@ async fn a_schema_and_instance_survive_database_reopen() {
         (instance_operation_id, CF_INSTANCE),
     ] {
         let op = svc
-            .operation(operation_id)
+            .operation(common::caller(), operation_id)
             .await
             .expect("read operation")
             .expect("the operation survived");
@@ -362,7 +371,11 @@ async fn a_nonterminal_operation_survives_reopen_and_completes_when_admitted() {
     let accepted_id = {
         let db = test_db_file(&path).await;
         let accepted = service(&db)
-            .submit(&submission("resume-key", CF_TYPE, authored.clone()), BOOT)
+            .submit(
+                common::caller(),
+                &submission("resume-key", CF_TYPE, authored.clone()),
+                BOOT,
+            )
             .await
             .expect("accepted");
         assert!(!accepted.replayed);
@@ -389,7 +402,11 @@ async fn a_nonterminal_operation_survives_reopen_and_completes_when_admitted() {
     let db = test_db_file(&path).await;
     let svc = service(&db);
     let replay = svc
-        .submit(&submission("resume-key", CF_TYPE, authored.clone()), BOOT)
+        .submit(
+            common::caller(),
+            &submission("resume-key", CF_TYPE, authored.clone()),
+            BOOT,
+        )
         .await
         .expect("the retry is accepted");
 
@@ -408,7 +425,7 @@ async fn a_nonterminal_operation_survives_reopen_and_completes_when_admitted() {
         .expect("a redelivery admits the operation acceptance left behind");
 
     let op = svc
-        .operation(accepted_id)
+        .operation(common::caller(), accepted_id)
         .await
         .expect("read operation")
         .expect("the operation exists");
@@ -416,7 +433,11 @@ async fn a_nonterminal_operation_survives_reopen_and_completes_when_admitted() {
     assert_eq!(op.items[0].resource_version, Some(1));
 
     let entity = svc
-        .entity(&EntityKey::parse(CF_TYPE), FieldSelection::full())
+        .entity(
+            common::caller(),
+            &EntityKey::parse(CF_TYPE),
+            FieldSelection::full(),
+        )
         .await
         .expect("read")
         .expect("admission registered the entity");
@@ -490,7 +511,10 @@ async fn an_entity_without_its_current_state_is_reported_as_corrupt() {
             (CF_TYPE, "no current Type Schema state"),
             (CF_INSTANCE, "no current Instance state"),
         ] {
-            match svc.entity(&EntityKey::parse(gts_id), selection).await {
+            match svc
+                .entity(common::caller(), &EntityKey::parse(gts_id), selection)
+                .await
+            {
                 Err(ServiceError::CorruptDocument(detail)) => {
                     assert!(detail.contains(expected), "unexpected detail: {detail}");
                 }

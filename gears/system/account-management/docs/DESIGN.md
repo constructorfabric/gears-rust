@@ -1071,7 +1071,7 @@ The AM-owned contract is configured independently from the optional bootstrap sa
 
 Registration occurs while Types Registry is in configuration mode. Its existing system `post_init` ready transition semantically validates the complete staged catalogue before AM's stateful bootstrap starts, after which ordinary AM reads use the same process-local `TypesRegistryClient` as every other consumer. Consequently, the platform-root schema is not duplicated under `types-registry.config.entities` in quickstart or E2E configuration.
 
-**Interim limitation (#4627):** this registration is process-local, not durable, and it does not coordinate replicas. A read after the ready transition proves only that the local in-memory catalogue contains the schema; it does not prove persistence. Durable create-if-absent/fail-on-drift behavior, restart proof, and cross-replica tests belong to the Types Registry P0 SDK and consumer cutover (T23–T26).
+**Interim limitation (#4627):** this registration is process-local, not durable, and it does not coordinate replicas. A read after the ready transition proves only that the local in-memory catalogue contains the schema; it does not prove persistence. Durable create-if-absent/fail-on-drift behavior, restart proof, and cross-replica tests belong to the Types Registry P0 SDK and consumer cutover (T23–T29).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

@@ -4499,6 +4499,7 @@ dependencies = [
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-security",
  "cf-gears-toolkit-utils",
  "cf-gears-types-registry-sdk",
  "chrono",
@@ -4531,11 +4532,22 @@ name = "cf-gears-types-registry-sdk"
 version = "0.3.9"
 dependencies = [
  "async-trait",
+ "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
  "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-security",
  "gts",
+ "parking_lot",
+ "proptest",
+ "rand 0.10.1",
+ "semver",
  "serde_json",
  "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 

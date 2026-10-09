@@ -1,22 +1,13 @@
-//! Domain layer for the Types Registry gear.
+//! Domain layer: database and legacy in-memory paths coexist until T31.
 //!
-//! # Two paths live here at once, and three pairs of names collide
-//!
-//! P0 builds a database-backed path beside the pre-P0 in-memory one and cuts over
-//! at T24–T30, so until then both are present under confusingly close names:
-//!
-//! | new (keep) | legacy (goes at T24–T30) | what the pair is |
+//! | Database | Legacy | Responsibility |
 //! |---|---|---|
-//! | [`ports`] | [`repo`] | the persistence seam |
-//! | [`registry_service`] | [`service`] | the domain surface transports call |
-//! | [`enums`] + the row types in [`ports`] | [`model`] | the domain's own vocabulary |
+//! | [`ports`] | [`repo`] | Persistence |
+//! | [`registry_service`] | [`service`] | Domain API |
+//! | [`enums`] + [`ports`] rows | [`model`] | Domain vocabulary |
+//! | [`local_client`] | [`legacy_local_client`] | In-process SDK client |
 //!
-//! # One concept per file until a concept earns a directory
-//!
-//! [`admission`] is a directory because the operation pipeline has six modules.
-//! The grouping axis is the concept — which is also the table in `database.sql` —
-//! never "these are all pure functions"; `docs/p0/todo.md` records why a
-//! `rules/`-style bucket was rejected.
+//! Group modules by concept. [`admission`] has a directory for its six-module pipeline.
 
 // ---------------------------------------------------------------------------
 // The database-backed path (P0)
@@ -26,14 +17,20 @@
 pub mod admission;
 // Materialized effective artifacts and the resolution fingerprint (SPEC D3).
 pub mod artifacts;
+// Who a call is made for, by plane (D17); P0 passes it through unread (C2/C6).
+pub mod caller;
 // Compatibility against one baseline: which definition, and the verdict (ADR-0003).
 pub mod compat;
+// The discovery page token: its envelope and the query it binds (D12).
+pub mod cursor;
 // The three direct dependency edge kinds, extracted from authored content and the identifier.
 pub mod dependency;
 // Version-family key derivation and the three family rules.
 pub mod family;
 // How a caller names one entity: GTS identifier or Registry Reference.
 pub mod key;
+// The in-process platform and tenant clients over `registry_service` (SPEC §10.1, D17).
+pub mod local_client;
 // The transient `gts-rust` store, one per admission unit (SPEC D2, §8.2).
 pub mod gts_store;
 // The registration-policy allowlist (DESIGN §3.2, SPEC §10.3).
@@ -57,25 +54,15 @@ pub mod validator;
 pub mod enums;
 pub mod error;
 
-// ---------------------------------------------------------------------------
-// LEGACY — the pre-P0 in-memory path, deleted at T24-T30
-// ---------------------------------------------------------------------------
-//
-// `repo`/`GtsRepository` (with `InMemoryGtsRepository` and the `switch_to_ready`
-// ready-mode split) goes at T24; `service` with it; `model` follows
-// `TypesRegistryClient` at T26 (D6) and the cache retyping at T30.
-//
-// Nothing new should reference these three: a read that needs the database goes
-// through `ports`, a transport that needs the domain through `registry_service`.
+// Legacy: repo, service and model retire with the old client and its cache at T31.
+// New callers use ports and registry_service.
 
 pub mod model;
 pub mod repo;
 pub mod service;
 
-// === LOCAL CLIENT ===
-// Survives the cutover but is retyped onto `EntitySnapshot` at T30, when the old
-// models go.
-pub mod local_client;
+// The old `TypesRegistryClient` over the in-memory path; deleted with it at T31.
+pub mod legacy_local_client;
 
 pub use error::DomainError;
 pub use repo::GtsRepository;

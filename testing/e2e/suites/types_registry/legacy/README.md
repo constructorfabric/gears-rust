@@ -13,7 +13,7 @@ submit-then-poll tests live one level up, in the suite root
 under `fixtures/`).
 
 The directory is named `legacy`, not `v1`, on purpose: the async API is served
-at `v2` today and takes over `v1` at cutover (T24a), so a version-based name
+at `v2` today and takes over `v1` at cutover (T27), so a version-based name
 would become wrong.
 
 ## What is in here
@@ -47,7 +47,7 @@ Delete `legacy/` once **both** are true:
    outcomes, error shapes, debug logging — has moved into the scenario-backed
    tests in the suite root. The four scenarios `TR-REG-001..004` that exist today
    cover registration only and do **not** replace these checks.
-2. The synchronous v1 API itself is retired (T24a cutover, then removal), so
+2. The synchronous v1 API itself is retired (T27 cutover, then removal), so
    nothing is left for these tests to exercise.
 
 Until then, treat the files as frozen: fix them only when the old API's own
