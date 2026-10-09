@@ -13,8 +13,11 @@ use crate::utils::{parse_path_attribute, parse_string_attribute, validate_path};
 
 /// Configuration for #[`grpc_client`] attribute
 pub struct GrpcClientConfig {
+    /// Path to the API trait the generated client implements.
     pub api: Path,
+    /// Path to the generated tonic client type.
     pub tonic: String,
+    /// Optional gRPC package name.
     #[allow(dead_code)]
     pub package: Option<String>,
 }

@@ -64,7 +64,9 @@ const MAX_TOKEN_TTL: Duration = Duration::from_hours(24);
 #[domain_model]
 #[derive(Debug, Clone)]
 pub enum SecretSource {
+    /// Pre-resolved static secret taken from configuration.
     Inline(SecretString),
+    /// Reference to a per-realm secret resolved through the credential store.
     OpenBaoRef(SecretRef),
 }
 

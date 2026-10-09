@@ -38,6 +38,7 @@ impl<'a> Record<'a> {
         RecordTarget { queue, partition }
     }
 
+    /// Splits the record into its queue name, item and optional trace context.
     pub(crate) fn into_parts(self) -> (&'a str, RecordItem<'a>, Option<&'a str>) {
         (self.queue, self.item, self.trace)
     }
@@ -143,6 +144,7 @@ impl<'a> Records<'a> {
         self.queue
     }
 
+    /// Splits the batch record into its queue name, items and optional trace context.
     pub(crate) fn into_parts(self) -> (&'a str, Vec<RecordItem<'a>>, Option<&'a str>) {
         (self.queue, self.items, self.trace)
     }

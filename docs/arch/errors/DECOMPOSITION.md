@@ -195,9 +195,9 @@ Update all documentation to reflect the canonical error architecture. Can run in
 
 #### 6.3 Checklists
 
-- [ ] 6.3.1 Update `docs/checklists/DESIGN.md` — update error handling architecture checklist
-- [ ] 6.3.2 Update `docs/checklists/FEATURE.md` — update security error handling and error handling completeness
-- [ ] 6.3.3 Update `docs/checklists/CODING.md` — update explicit error handling standards
+- [ ] 6.3.1 Update `studio-kit-gears/artifacts/DESIGN/checklist.md` — update error handling architecture checklist
+- [ ] 6.3.2 Update `studio-kit-gears/artifacts/FEATURE/checklist.md` — update security error handling and error handling completeness
+- [ ] 6.3.3 Update `studio-kit-gears/codebase/checklist.md` — update explicit error handling standards
 
 ---
 

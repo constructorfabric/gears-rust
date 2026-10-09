@@ -16,6 +16,7 @@ pub struct Migration;
 // Postgres variant — canonical production schema (bss-qualified DDL).
 // ---------------------------------------------------------------------------
 
+/// Ordered Postgres DDL statements creating the journal tables (bss-qualified schema).
 pub(crate) const PG_UP_STATEMENTS: &[&str] = &[
     // --- journal_entry (append-only truth header) ---
     "CREATE TABLE bss.ledger_journal_entry (

@@ -16,6 +16,7 @@ pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 200;
 
 /// The list query, after the HTTP layer has parsed it.
+#[toolkit_macros::domain_model]
 #[derive(Debug, Clone, Default)]
 pub struct ListParams {
     /// Unit state.
@@ -37,6 +38,7 @@ pub struct ListParams {
 }
 
 /// A list call the sources can answer.
+#[toolkit_macros::domain_model]
 #[derive(Debug, Clone)]
 pub struct PreparedList {
     /// The narrowing sent to every source.

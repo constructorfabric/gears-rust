@@ -50,7 +50,9 @@ use crate::support::{append_segment, parent_module};
 
 /// Parsed `#[toolkit::consumes(...)]` attribute.
 pub struct ConsumesAttr {
+    /// Path of the contract trait being consumed.
     pub contract: Path,
+    /// Name of the providing gear (the `from = "..."` argument).
     pub from: String,
     /// Optional override for the resolving-client path.
     ///

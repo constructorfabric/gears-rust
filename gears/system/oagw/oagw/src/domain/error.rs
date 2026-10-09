@@ -8,16 +8,27 @@ use super::repo::RepositoryError;
 #[domain_model]
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DomainError {
+    /// The requested entity does not exist.
     #[error("{entity} not found: {id}")]
-    NotFound { entity: &'static str, id: Uuid },
+    NotFound {
+        /// Kind of entity looked up (for example `upstream` or `route`).
+        entity: &'static str,
+        /// ID that was not found.
+        id: Uuid,
+    },
 
+    /// A uniqueness constraint was violated.
     #[error("{entity} conflict on {resource}: {detail}")]
     Conflict {
+        /// Kind of entity involved.
         entity: &'static str,
+        /// Name of the conflicting resource (for example the alias).
         resource: String,
+        /// Human-readable description of the conflict.
         detail: String,
     },
 
+    /// The request failed validation.
     #[error("validation [{field}/{reason}]: {detail}")]
     Validation {
         /// Field path the violation is about (e.g. `"content-length"`,
@@ -28,25 +39,50 @@ pub enum DomainError {
         /// Stable, machine-readable code for the violation
         /// (e.g. `"INVALID_GTS_FORMAT"`, `"WS_UPGRADE_REQUIRES_GET"`).
         reason: &'static str,
+        /// Human-readable explanation of the failure.
         detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
         instance: String,
     },
 
+    /// The target upstream exists but is disabled.
     #[error("upstream '{alias}' is disabled")]
-    UpstreamDisabled { alias: String },
+    UpstreamDisabled {
+        /// Alias of the disabled upstream.
+        alias: String,
+    },
 
+    /// Unexpected internal failure.
     #[error("internal: {message}")]
-    Internal { message: String },
+    Internal {
+        /// Description of the failure (not necessarily safe to expose to clients).
+        message: String,
+    },
 
+    /// A multi-endpoint upstream was called without a target host header.
     #[error("target host header required for multi-endpoint upstream")]
-    MissingTargetHost { instance: String },
+    MissingTargetHost {
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// The target host header is malformed.
     #[error("invalid target host header format")]
-    InvalidTargetHost { instance: String },
+    InvalidTargetHost {
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// The target host header names a host that is not an endpoint of the upstream.
     #[error("{detail}")]
-    UnknownTargetHost { detail: String, instance: String },
+    UnknownTargetHost {
+        /// Human-readable explanation of the failure.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// Authentication towards the upstream failed.
     #[error("[{reason}] {detail}")]
     AuthenticationFailed {
         /// Stable, machine-readable subcategory of the failure
@@ -55,25 +91,46 @@ pub enum DomainError {
         /// `unauthenticated.reason` field so clients can branch
         /// programmatically without parsing `detail`.
         reason: &'static str,
+        /// Human-readable explanation of the failure.
         detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
         instance: String,
     },
 
+    /// The request or response body exceeds the allowed size.
     #[error("{detail}")]
-    PayloadTooLarge { detail: String, instance: String },
+    PayloadTooLarge {
+        /// Human-readable explanation of the failure.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// A rate limit was exceeded.
     #[error("{detail}")]
     RateLimitExceeded {
+        /// Human-readable explanation of the failure.
         detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
         instance: String,
+        /// Seconds the caller should wait before retrying, when known.
         retry_after_secs: Option<u64>,
+        /// Configured bucket capacity, when known.
         limit: Option<u64>,
+        /// Tokens remaining in the bucket, when known.
         remaining: Option<u64>,
+        /// Unix epoch timestamp at which the bucket will be full again, when known.
         reset_epoch: Option<u64>,
     },
 
+    /// A secret referenced by the upstream auth config could not be found at request time.
     #[error("{detail}")]
-    SecretNotFound { detail: String, instance: String },
+    SecretNotFound {
+        /// Human-readable explanation of the failure.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
     /// A management-plane `secret_ref` did not resolve to an accessible
     /// secret — not provisioned yet, or not shared with the tenant. A state
@@ -84,26 +141,59 @@ pub enum DomainError {
     /// request-time [`DomainError::SecretNotFound`] which is a server-side
     /// config failure (500).
     #[error("{detail}")]
-    SecretRefNotAccessible { detail: String, instance: String },
+    SecretRefNotAccessible {
+        /// Human-readable explanation of the failure.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// The upstream returned an invalid or failing response.
     #[error("{detail}")]
-    DownstreamError { detail: String, instance: String },
+    DownstreamError {
+        /// Human-readable explanation of the failure.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// The upstream violated the protocol (e.g. malformed HTTP).
     #[error("{detail}")]
-    ProtocolError { detail: String, instance: String },
+    ProtocolError {
+        /// Human-readable explanation of the failure.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// Connecting to the upstream timed out.
     #[error("{detail}")]
-    ConnectionTimeout { detail: String, instance: String },
+    ConnectionTimeout {
+        /// Human-readable explanation of the failure.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// The upstream did not respond within the request timeout.
     #[error("{detail}")]
-    RequestTimeout { detail: String, instance: String },
+    RequestTimeout {
+        /// Human-readable explanation of the failure.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
     /// A guard plugin rejected the request with a specific status and error code.
     #[error("guard rejected: {detail}")]
     GuardRejected {
+        /// HTTP status code chosen by the guard plugin.
         status: u16,
+        /// Machine-readable error code chosen by the guard plugin.
         error_code: String,
+        /// Human-readable explanation of the failure.
         detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
         instance: String,
         /// Optional identifier of the resource the rejection refers to.
         /// Lets the REST mapping route 404/409 rejections to canonical
@@ -114,29 +204,75 @@ pub enum DomainError {
 
     /// CORS: the request origin is not in the allowed origins list.
     #[error("CORS origin not allowed: {origin}")]
-    CorsOriginNotAllowed { origin: String, instance: String },
+    CorsOriginNotAllowed {
+        /// The rejected `Origin` header value.
+        origin: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
     /// CORS: the request method is not in the allowed methods list.
     #[error("CORS method not allowed: {method}")]
-    CorsMethodNotAllowed { method: String, instance: String },
+    CorsMethodNotAllowed {
+        /// The rejected request method.
+        method: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// The upstream response stream was aborted mid-transfer.
     #[error("{detail}")]
-    StreamAborted { detail: String, instance: String },
+    StreamAborted {
+        /// Human-readable explanation of the failure.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// The upstream link is unavailable (e.g. no healthy endpoint or connection refused).
     #[error("{detail}")]
-    LinkUnavailable { detail: String, instance: String },
+    LinkUnavailable {
+        /// Human-readable explanation of the failure.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// The circuit breaker for the upstream is open.
     #[error("{detail}")]
-    CircuitBreakerOpen { detail: String, instance: String },
+    CircuitBreakerOpen {
+        /// Human-readable explanation of the failure.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// The connection was idle for longer than the idle timeout.
     #[error("{detail}")]
-    IdleTimeout { detail: String, instance: String },
+    IdleTimeout {
+        /// Human-readable explanation of the failure.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
 
+    /// A referenced plugin is not registered.
     #[error("plugin not found: {gts_id}: {detail}")]
-    PluginNotFound { gts_id: String, detail: String },
+    PluginNotFound {
+        /// GTS ID of the missing plugin.
+        gts_id: String,
+        /// Human-readable explanation of the failure.
+        detail: String,
+    },
 
+    /// The plugin cannot be removed because it is still referenced.
     #[error("plugin in use: {gts_id}: {detail}")]
-    PluginInUse { gts_id: String, detail: String },
+    PluginInUse {
+        /// GTS ID of the plugin in use.
+        gts_id: String,
+        /// Human-readable explanation of the failure.
+        detail: String,
+    },
 
     /// The request was denied by the authorization policy.
     #[error("access forbidden [{reason}]: {detail}")]
@@ -150,16 +286,19 @@ pub enum DomainError {
         /// `permission_denied.reason` field — clients branch on
         /// this, not on `detail`.
         reason: String,
+        /// Human-readable explanation of the failure.
         detail: String,
     },
 }
 
 impl DomainError {
+    /// Construct a [`DomainError::NotFound`] for the given entity kind and ID.
     #[must_use]
     pub fn not_found(entity: &'static str, id: Uuid) -> Self {
         Self::NotFound { entity, id }
     }
 
+    /// Construct a [`DomainError::Conflict`] for the given entity kind, resource and detail.
     #[must_use]
     pub fn conflict(
         entity: &'static str,
@@ -204,6 +343,7 @@ impl DomainError {
         }
     }
 
+    /// Construct a [`DomainError::UpstreamDisabled`] for the given upstream alias.
     #[must_use]
     pub fn upstream_disabled(alias: impl Into<String>) -> Self {
         Self::UpstreamDisabled {
@@ -211,6 +351,7 @@ impl DomainError {
         }
     }
 
+    /// Construct a [`DomainError::Internal`] with the given message.
     #[must_use]
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal {

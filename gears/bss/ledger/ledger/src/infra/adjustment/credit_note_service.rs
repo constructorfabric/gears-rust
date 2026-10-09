@@ -955,6 +955,7 @@ pub(crate) struct PreparedCreditNote {
 /// ([`CreditNoteHandler::apply_in_txn`]): the posted (or idempotently replayed)
 /// credit-note entry id.
 pub(crate) struct CompositeCreditNoteOutcome {
+    /// Id of the credit-note journal entry that was posted or idempotently replayed.
     pub entry_id: Uuid,
 }
 

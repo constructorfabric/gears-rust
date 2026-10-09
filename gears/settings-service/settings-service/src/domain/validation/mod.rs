@@ -17,6 +17,7 @@ pub mod guards;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
 
@@ -24,6 +25,7 @@ use crate::domain::error::DomainError;
 ///
 /// Tooling matches on `code`, never on `message`; `field` is a JSON pointer
 /// below `value`, so a fault in a nested position names the position.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldViolation {
     /// Where in the value the fault lies: `value` for the whole, `value/a/0`
@@ -43,6 +45,7 @@ pub struct FieldViolation {
 /// value that could not be cached or audited has no shape worth checking.
 /// And a value past the leaf cap is answered with the faults found so far,
 /// the leaf-bound trait rules not run.
+#[domain_model]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ValidationResult {
     /// Empty when the value was accepted.
@@ -87,6 +90,7 @@ impl ValidationResult {
 // Three flags mirror three boolean traits of the vocabulary; a state enum would
 // invent a relationship between `secret`, `multiline` and `regex` that the
 // traits do not have.
+#[domain_model]
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TraitSet {
@@ -115,6 +119,7 @@ pub struct TraitSet {
 /// spells a trait wrongly must not be read as if it had left it out: `secret`
 /// decides whether a value is stored in clear, and a misspelt `true` would
 /// store a credential as public data.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MalformedTrait {
     /// The trait's name in `x-gts-traits`, or the block's own name when the

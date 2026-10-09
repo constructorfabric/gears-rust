@@ -290,7 +290,7 @@ pub trait PricingReadV1: Send + Sync {
     ) -> Result<RevisionRef, CanonicalError>;
 }
 
-#[toolkit_canonical_errors::resource_error("gts.cf.bss.pricing.plan.v1~")]
+#[toolkit_canonical_errors::resource_error(gts_id!("cf.bss.pricing.plan.v1~"))]
 struct PlanResource;
 /// A priced cell cannot be projected into a complete commercial binding.
 #[derive(Debug, thiserror::Error)]

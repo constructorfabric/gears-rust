@@ -26,22 +26,36 @@ use crate::support::{append_segment, parent_module};
 
 /// Parsed `#[toolkit::provides(...)]` attribute.
 pub struct ProvidesAttr {
+    /// Path of the contract trait being provided.
     pub contract: Path,
+    /// Path of the factory function building the local (in-process) implementation.
     pub local: Path,
+    /// Transports the contract is exposed over; defaults to local only.
     pub transports: Vec<Transport>,
+    /// Optional override for the generated REST client type path.
     pub rest_client: Option<Path>,
+    /// Optional override for the generated gRPC client type path.
     pub grpc_client: Option<Path>,
+    /// Optional override for the path of the function returning the contract IR.
     pub ir_fn: Option<Path>,
+    /// Optional override for the path of the REST binding function.
     pub rest_binding_fn: Option<Path>,
+    /// Optional override for the path of the gRPC binding function.
     pub grpc_binding_fn: Option<Path>,
+    /// Optional config key under which the provider's transport settings are read.
     pub config_key: Option<String>,
+    /// Optional list of policy expressions applied to the provided contract.
     pub policies: Option<Vec<Expr>>,
 }
 
+/// Transport over which a provided contract can be reached.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
+    /// In-process call through the local factory.
     Local,
+    /// Remote call over REST.
     Rest,
+    /// Remote call over gRPC.
     Grpc,
 }
 

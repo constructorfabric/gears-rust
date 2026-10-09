@@ -786,7 +786,8 @@ mod tests {
 
     const NIL: uuid::Uuid = uuid::Uuid::nil();
 
-    const MEMBERSHIP_TYPE: &str = "gts.cf.core.rg.type.v1~example.core.rg.member.v1~";
+    const MEMBERSHIP_TYPE: &str =
+        toolkit_gts::gts_id!("cf.core.rg.type.v1~example.core.rg.member.v1~");
 
     fn one(filter: ScopeFilter) -> AccessScope {
         AccessScope::from_constraints(vec![ScopeConstraint::new(vec![filter])])

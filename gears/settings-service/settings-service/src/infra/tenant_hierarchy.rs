@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tenant_resolver_sdk::{
     BarrierMode, GetAncestorsOptions, GetDescendantsOptions, IsAncestorOptions, TenantId,
-    TenantResolverClient, TenantResolverError,
+    TenantResolverClient, TenantResolverError, TenantStatus,
 };
 use toolkit::ClientHub;
 use toolkit_security::SecurityContext;
@@ -104,17 +104,22 @@ impl TenantHierarchy for HubTenantHierarchy {
 
     async fn subtree(&self, tenant: Uuid, budget: usize) -> Result<Subtree, DomainError> {
         let client = self.client()?;
-        // Bounded on the request as far as the SDK allows — by depth. There is
-        // no count and no cursor on `get_descendants`, so a wide tree still
-        // comes back whole, and the budget is applied to what arrived.
+        // Bounded on the request as far as the SDK allows — by depth and by
+        // status. There is no count and no cursor on `get_descendants`, so a
+        // wide tree still comes back whole, and the budget is applied to what
+        // arrived. The statuses are the tenants still administered: a
+        // suspended one keeps its values and comes back, a soft-deleted one is
+        // a tombstone kept for its retention window, neither administered nor
+        // read, and counting it against the budget refused every search at
+        // platform scope on a stand whose suites delete the tenants they create.
         let response = client
             .get_descendants(
                 &SecurityContext::anonymous(),
                 TenantId(tenant),
                 &GetDescendantsOptions {
+                    status: vec![TenantStatus::Active, TenantStatus::Suspended],
                     barrier_mode: BarrierMode::Respect,
                     max_depth: Some(SUBTREE_DEPTH_CEILING),
-                    ..GetDescendantsOptions::default()
                 },
             )
             .await

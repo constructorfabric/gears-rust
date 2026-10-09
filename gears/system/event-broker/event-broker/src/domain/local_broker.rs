@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use toolkit::domain_model;
 
 use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
@@ -69,6 +70,7 @@ use crate::domain::streaming::frames::{
 const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// In-process [`EventBrokerApi`] over the real ingest and delivery services.
+#[domain_model]
 pub struct LocalBroker {
     ingest: Arc<dyn IngestService>,
     delivery: Arc<dyn DeliveryService>,

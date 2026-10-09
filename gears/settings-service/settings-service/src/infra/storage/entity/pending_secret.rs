@@ -33,6 +33,7 @@ pub struct Model {
     pub expires_at: OffsetDateTime,
 }
 
+/// Relations of the `pending_secret` entity (none).
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {}
 

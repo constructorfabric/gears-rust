@@ -18,9 +18,15 @@ use super::dsn::{is_memory_dsn, split_sqlite_dsn};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SqliteDatabaseLocation {
     /// In-memory database (`sqlite::memory:`, `mode=memory`, …).
-    Memory { identity: String },
+    Memory {
+        /// Identifier distinguishing this in-memory database from others.
+        identity: String,
+    },
     /// File-backed database.
-    File { path: PathBuf },
+    File {
+        /// Filesystem path of the database file.
+        path: PathBuf,
+    },
 }
 
 /// Classify a `SQLite` DSN into memory vs file location.

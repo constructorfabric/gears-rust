@@ -11,6 +11,7 @@
 //! the admissibility rules cannot drift between them (ADR-0003).
 
 use std::collections::BTreeMap;
+use toolkit_macros::domain_model;
 
 use toolkit_odata::ODataQuery;
 use toolkit_odata::SortDir;
@@ -22,6 +23,7 @@ use crate::domain::ontology::ScalarKind;
 pub const COLUMN_FIELDS: [&str; 4] = ["node_key", "name", "created_at", "updated_at"];
 
 /// The field a term of the plan reads.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FieldRef {
     NodeKey,
@@ -66,6 +68,7 @@ impl FieldRef {
 }
 
 /// A comparison literal, already checked against the field's kind.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Scalar {
     Str(String),
@@ -77,6 +80,7 @@ pub enum Scalar {
     DateTime(String),
 }
 
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpOp {
     Eq,
@@ -87,6 +91,7 @@ pub enum CmpOp {
     Le,
 }
 
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextOp {
     Contains,
@@ -95,6 +100,7 @@ pub enum TextOp {
 }
 
 /// The filter, resolved.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Predicate {
     Compare {
@@ -116,6 +122,7 @@ pub enum Predicate {
     Not(Box<Predicate>),
 }
 
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderTerm {
     pub field: FieldRef,
@@ -123,6 +130,7 @@ pub struct OrderTerm {
 }
 
 /// One projection, resolved and admitted.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
     pub filter: Option<Predicate>,
@@ -153,6 +161,7 @@ fn predicate_reads_payload(predicate: &Predicate) -> bool {
 /// Why a query could not be planned. Always a caller error — the message
 /// names the offending identifier and the admitted alternatives, which is
 /// what makes it actionable (PRD § fr-tabular-projection).
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct PlanError(pub String);

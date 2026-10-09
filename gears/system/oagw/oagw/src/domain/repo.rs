@@ -11,14 +11,25 @@ use uuid::Uuid;
 #[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryError {
+    /// The requested entity does not exist (for the tenant).
     #[error("{entity} not found: {id}")]
-    NotFound { entity: &'static str, id: Uuid },
+    NotFound {
+        /// Kind of entity looked up (for example `upstream` or `route`).
+        entity: &'static str,
+        /// ID that was not found.
+        id: Uuid,
+    },
+    /// A uniqueness constraint was violated.
     #[error("{entity} conflict on {resource}: {detail}")]
     Conflict {
+        /// Kind of entity involved (for example `upstream` or `route`).
         entity: &'static str,
+        /// Name of the conflicting resource (for example the alias).
         resource: String,
+        /// Human-readable description of the conflict.
         detail: String,
     },
+    /// Unexpected storage failure.
     #[error("internal: {0}")]
     #[allow(dead_code)]
     Internal(String),

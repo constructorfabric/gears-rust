@@ -573,7 +573,8 @@ OData errors are defined in `toolkit_odata::Error` (aliased as `ODataError` in `
 | `InvalidFilter(String)` | Malformed `$filter` expression | 400 |
 | `InvalidOrderByField(String)` | Unsupported `$orderby` field | 400 |
 | `InvalidCursor` / `CursorInvalid*` | Malformed or expired cursor | 400 |
-| `OrderMismatch` | Cursor/query order conflict | 400 |
+| `OrderWithCursor` | `$orderby` sent together with a `cursor` (the cursor fixes the order) | 400 |
+| `OrderMismatch` | Server-derived order differs from the cursor's (`validate_cursor_against`) | 400 |
 | `FilterMismatch` | Cursor/query filter conflict | 400 |
 | `InvalidLimit` | Invalid page size parameter (`$top`, alias `limit`) | 400 |
 | `Db(String)` | Database error (logged, generic message returned) | 500 |

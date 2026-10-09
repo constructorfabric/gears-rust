@@ -47,6 +47,7 @@ fn etag_of(model: &category::Model) -> ETag {
 }
 // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-precondition:p1:inst-gf-precond-2
 
+/// Converts a stored category row to the domain type, failing if its key no longer parses.
 pub(crate) fn to_domain(model: category::Model) -> Result<Category, DomainError> {
     let etag = etag_of(&model);
     Ok(Category {

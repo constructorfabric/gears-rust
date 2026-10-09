@@ -9,26 +9,29 @@ use std::sync::Arc;
 use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::{Json, extract::Extension};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use toolkit::api::canonical_prelude::*;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
-
-use crate::api::rest::routes::ConcreteService;
-use chrono::{DateTime, Utc};
-
-use crate::domain::error::DomainError;
-use crate::domain::repo::{IssueState, ListingDirection, ListingFilter, ListingSort, PageWindow};
-use crate::domain::validate::{validate_commit_sha, validate_repo_path};
 use url::form_urlencoded;
 
+use crate::api::rest::routes::ConcreteService;
+use crate::domain::error::DomainError;
+use crate::domain::repo::{
+    IssueState, ListingDirection, ListingFilter, ListingSort, PageWindow, RepoRunStatus,
+};
+use crate::domain::scope::{CollectionMode, ScopeConfig, SyncScope};
+use crate::domain::validate::{validate_commit_sha, validate_repo_path};
+
 use super::dto::{
-    AuthenticatedUserDto, BranchDto, CheckRunDto, CheckRunsPageDto, CommentDto, CommitCommentDto,
-    CommitDto, CommitFileDto, CommitStatsDto, CommitStatusDto, ContributorDto, DeploymentDto,
-    GithubMirrorHealthDto, IssueDto, IssueEventDto, IssueReactionDto, IssueTimelineEventDto,
-    LabelDto, MilestoneDto, PullRequestDto, PullRequestFileDto, ReleaseDto, RepoDto,
-    ReviewCommentDto, ReviewDto, ReviewThreadDto, SyncSummaryDto, TagDto, WorkflowJobDto,
-    WorkflowJobsPageDto, WorkflowRunDto, WorkflowRunsPageDto,
+    AuthenticatedUserDto, BranchDto, CacheClearedDto, CheckRunDto, CheckRunsPageDto, CommentDto,
+    CommitCommentDto, CommitDto, CommitFileDto, CommitStatsDto, CommitStatusDto, ContributorDto,
+    DeploymentDto, GithubMirrorHealthDto, IssueDto, IssueEventDto, IssueReactionDto,
+    IssueTimelineEventDto, LabelDto, MilestoneDto, PullRequestDto, PullRequestFileDto, ReleaseDto,
+    RepoDto, RepoSyncStatusDto, ResumeAcceptedDto, ResumeFailureDto, ReviewCommentDto, ReviewDto,
+    ReviewThreadDto, SyncAcceptedDto, SyncSessionDto, TagDto, WorkflowJobDto, WorkflowJobsPageDto,
+    WorkflowRunDto, WorkflowRunsPageDto,
 };
 
 const DEFAULT_PER_PAGE: u64 = 30;
@@ -42,15 +45,147 @@ const MAX_PER_PAGE: u64 = 100;
 /// response-header size.
 const MAX_FILTER_VALUE: usize = 64;
 
-/// GitHub-style pagination query (`?page=2&per_page=50`), plus the `state`
-/// filter the issue and pull listings accept.
+/// `?force=true` bypasses the HTTP cache (PRD §5.2 force mode): every request
+/// goes out without its stored validator, so nothing is served from cache.
+///
+/// The remaining fields narrow what the run collects (PRD §5.4, §5.19). Any
+/// field left out keeps the gear's configured default, and `include`
+/// restricts the object types to exactly the ones named.
+#[derive(Debug, Default, Deserialize)]
+pub struct SyncQuery {
+    /// Bypass the HTTP cache and re-read the whole repository from GitHub.
+    pub force: Option<bool>,
+    /// Comma-separated object types to collect, e.g.
+    /// `issues,pull_requests,commits`. Omit to collect the configured set.
+    pub include: Option<String>,
+    /// `all` / `open` / `none` for workflow runs and CI checks.
+    pub actions_scope: Option<String>,
+    /// `all` / `open` / `none` for reactions.
+    pub reactions_scope: Option<String>,
+    /// `all` / `open` / `none` for timeline events.
+    pub timeline_scope: Option<String>,
+    /// RFC3339 instant; closed issues and pull requests older than this are
+    /// not collected.
+    pub since: Option<String>,
+}
+
+impl SyncQuery {
+    /// The scope this request asks for, or `None` to use the gear's default.
+    ///
+    /// # Errors
+    /// `Validation` when a mode or an object type does not parse.
+    fn scope(&self, default: ScopeConfig) -> Result<Option<ScopeConfig>, DomainError> {
+        if self.include.is_none()
+            && self.actions_scope.is_none()
+            && self.reactions_scope.is_none()
+            && self.timeline_scope.is_none()
+        {
+            return Ok(None);
+        }
+
+        let mut scope = default;
+        if let Some(include) = self.include.as_deref() {
+            scope.objects = objects_from_include(include)?;
+        }
+        if let Some(mode) = self.actions_scope.as_deref() {
+            scope.collection.actions = CollectionMode::parse(mode)?;
+        }
+        if let Some(mode) = self.reactions_scope.as_deref() {
+            scope.collection.reactions = CollectionMode::parse(mode)?;
+        }
+        if let Some(mode) = self.timeline_scope.as_deref() {
+            scope.collection.timeline = CollectionMode::parse(mode)?;
+        }
+        Ok(Some(scope))
+    }
+
+    /// # Errors
+    /// `Validation` when `since` is not an RFC3339 instant.
+    fn since(&self) -> Result<Option<DateTime<Utc>>, DomainError> {
+        let Some(raw) = self.since.as_deref() else {
+            return Ok(None);
+        };
+        DateTime::parse_from_rfc3339(raw)
+            .map(|at| Some(at.with_timezone(&Utc)))
+            .map_err(|e| DomainError::Validation {
+                field: "since".to_owned(),
+                message: format!("`{raw}` is not an RFC3339 instant: {e}"),
+            })
+    }
+}
+
+/// Build an object scope enabling exactly the comma-separated types named.
+fn objects_from_include(include: &str) -> Result<SyncScope, DomainError> {
+    let mut scope = SyncScope::none();
+    for raw in include.split(',') {
+        let name = raw.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        match name.as_str() {
+            "issues" => scope.issues = true,
+            "pull_requests" | "pulls" => scope.pull_requests = true,
+            "commits" => scope.commits = true,
+            "releases" => scope.releases = true,
+            "branches" => scope.branches = true,
+            "labels" => scope.labels = true,
+            "milestones" => scope.milestones = true,
+            "github_actions" | "actions" => scope.github_actions = true,
+            "contributors" => scope.contributors = true,
+            "security" => scope.security = true,
+            other => {
+                return Err(DomainError::Validation {
+                    field: "include".to_owned(),
+                    message: format!("unknown object type `{other}`"),
+                });
+            }
+        }
+    }
+    Ok(scope)
+}
+
+/// `?owner=X` clears everything mirrored for that owner; `?repo=owner/name`
+/// narrows it to one repository.
+#[derive(Debug, Default, Deserialize)]
+pub struct CacheClearQuery {
+    /// Owner whose mirrored data is cleared.
+    pub owner: Option<String>,
+    /// `owner/name` of the one repository to clear; takes precedence over `owner`.
+    pub repo: Option<String>,
+}
+
+/// `?repo=owner/name` narrows a resume to one repository; omitting it resumes
+/// every repository the caller's tenant left `in_progress`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ResumeQuery {
+    /// `owner/name` of the one repository to resume.
+    pub repo: Option<String>,
+    /// Run each resumed sync in force mode.
+    pub force: Option<bool>,
+}
+
+/// `?status=in_progress` narrows a run-status listing.
+#[derive(Debug, Default, Deserialize)]
+pub struct RunStatusQuery {
+    /// Run status to keep: `in_progress` or `complete`.
+    pub status: Option<String>,
+}
+
+/// GitHub-style pagination query (`?page=2&per_page=50`), plus the `state`,
+/// `sort`, `direction` and `since` filters the issue and pull listings accept.
 #[derive(Debug, Deserialize)]
 pub struct GithubPageQuery {
+    /// 1-based page number; defaults to the first page.
     pub page: Option<u64>,
+    /// Page size; defaults to 30 and is capped at 100.
     pub per_page: Option<u64>,
+    /// Issue/pull state filter: `open` (default when omitted), `closed`, or `all`.
     pub state: Option<String>,
+    /// Sort key (e.g. `updated`) for the listings that support ordering.
     pub sort: Option<String>,
+    /// Sort direction (`asc` or `desc`) for the listings that support ordering.
     pub direction: Option<String>,
+    /// Only issues and pulls updated at or after this ISO-8601 timestamp (validated against `MAX_FILTER_VALUE`).
     pub since: Option<String>,
 }
 
@@ -270,6 +405,7 @@ fn respond_counted<D>(
 // The signature must be `async` for axum's `Handler` impl even though the
 // status read is synchronous.
 #[allow(clippy::unused_async)]
+/// Reports the mirror's status and health.
 pub async fn health(
     Extension(svc): Extension<Arc<ConcreteService>>,
 ) -> ApiResult<JsonBody<GithubMirrorHealthDto>> {
@@ -277,6 +413,7 @@ pub async fn health(
     Ok(Json(status.into()))
 }
 
+/// Lists mirrored repositories, filtered and paged through `OData` query options.
 pub async fn list_repos(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -286,16 +423,37 @@ pub async fn list_repos(
     Ok(Json(page.map_items(RepoDto::from)))
 }
 
+/// Syncs one repository from GitHub into the mirror and returns a summary of what changed.
 pub async fn sync_repository(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
     Path((owner, name)): Path<(String, String)>,
-) -> ApiResult<JsonBody<SyncSummaryDto>> {
+    Query(query): Query<SyncQuery>,
+) -> ApiResult<(StatusCode, JsonBody<SyncAcceptedDto>)> {
     validate_repo_path(&owner, &name)?;
-    let summary = svc.sync_repository(&ctx, &owner, &name).await?;
-    Ok(Json(summary.into()))
+    let scope = query.scope(svc.default_scope())?;
+    let since = query.since()?;
+    let queued = svc
+        .enqueue_sync(
+            &ctx,
+            &owner,
+            &name,
+            scope,
+            query.force.unwrap_or(false),
+            since,
+        )
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SyncAcceptedDto {
+            session_id: queued.session_id.to_string(),
+            repository: format!("{owner}/{name}"),
+            status: queued.status.into(),
+        }),
+    ))
 }
 
+/// Serves `GET /repos/{owner}/{name}/issues` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_issues(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -317,6 +475,7 @@ pub async fn list_issues(
     ))
 }
 
+/// Serves `GET /repos/{owner}/{name}/issues/{number}/comments` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_comments(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -333,6 +492,7 @@ pub async fn list_comments(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/pulls` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_pull_requests(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -354,6 +514,7 @@ pub async fn list_pull_requests(
     ))
 }
 
+/// Serves `GET /repos/{owner}/{name}/pulls/{number}/reviews` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_reviews(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -370,6 +531,7 @@ pub async fn list_reviews(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/pulls/{number}/comments` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_review_comments(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -386,6 +548,7 @@ pub async fn list_review_comments(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/pulls/{number}/files` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_pull_request_files(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -402,6 +565,7 @@ pub async fn list_pull_request_files(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/commits` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_commits(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -429,6 +593,7 @@ pub async fn list_commits(
     ))
 }
 
+/// Serves `GET /repos/{owner}/{name}/branches` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_branches(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -445,6 +610,7 @@ pub async fn list_branches(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/tags` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_tags(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -461,6 +627,7 @@ pub async fn list_tags(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/releases` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_releases(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -477,6 +644,7 @@ pub async fn list_releases(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/milestones` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_milestones(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -493,6 +661,7 @@ pub async fn list_milestones(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/labels` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_labels(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -509,6 +678,7 @@ pub async fn list_labels(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/contributors` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_contributors(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -525,6 +695,7 @@ pub async fn list_contributors(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/actions/runs` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_workflow_runs(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -551,6 +722,7 @@ pub async fn list_workflow_runs(
     ))
 }
 
+/// Lists the files touched by a commit, with GitHub-style pagination.
 pub async fn list_commit_files(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -565,6 +737,7 @@ pub async fn list_commit_files(
     Ok(Json(page.map_items(CommitFileDto::from)))
 }
 
+/// Lists the review threads of a pull request, with GitHub-style pagination.
 pub async fn list_review_threads(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -578,6 +751,7 @@ pub async fn list_review_threads(
     Ok(Json(page.map_items(ReviewThreadDto::from)))
 }
 
+/// Returns one mirrored repository.
 pub async fn get_repo(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -588,6 +762,7 @@ pub async fn get_repo(
     Ok(Json(repo.into()))
 }
 
+/// Returns one mirrored issue by number.
 pub async fn get_issue(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -598,6 +773,7 @@ pub async fn get_issue(
     Ok(Json(issue.into()))
 }
 
+/// Returns one mirrored pull request by number.
 pub async fn get_pull_request(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -608,6 +784,7 @@ pub async fn get_pull_request(
     Ok(Json(pull.into()))
 }
 
+/// Returns one mirrored commit by SHA.
 pub async fn get_commit(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -631,6 +808,7 @@ pub async fn get_commit(
     Ok(Json(body))
 }
 
+/// Serves `GET /repos/{owner}/{name}/commits/{sha}/comments` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_commit_comments(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -648,6 +826,7 @@ pub async fn list_commit_comments(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/issues/{number}/events` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_issue_events(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -664,6 +843,7 @@ pub async fn list_issue_events(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/issues/{number}/reactions` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_issue_reactions(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -680,6 +860,7 @@ pub async fn list_issue_reactions(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/issues/{number}/timeline` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_issue_timeline(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -696,6 +877,7 @@ pub async fn list_issue_timeline(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/deployments` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_deployments(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -712,6 +894,7 @@ pub async fn list_deployments(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/pulls/{number}/commits` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_pull_request_commits(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -728,6 +911,7 @@ pub async fn list_pull_request_commits(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/commits/{sha}/statuses` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_commit_statuses(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -745,6 +929,7 @@ pub async fn list_commit_statuses(
     Ok(respond(&page, &path, GithubPage::convert(items)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/actions/runs/{run_id}/jobs` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_workflow_jobs(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -763,6 +948,7 @@ pub async fn list_workflow_jobs(
     Ok((headers, Json(WorkflowJobsPageDto { total_count, jobs })))
 }
 
+/// Serves `GET /repos/{owner}/{name}/commits/{sha}/check-runs` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_check_runs(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -813,4 +999,111 @@ pub async fn list_user_repos(
     let page = query.normalized()?;
     let items = svc.list_repos_page(&ctx, page.window()).await?;
     Ok(respond(&page, "/user/repos", GithubPage::convert(items)))
+}
+
+/// `GET` one sync session by id.
+pub async fn get_sync_session(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path(id): Path<uuid::Uuid>,
+) -> ApiResult<JsonBody<SyncSessionDto>> {
+    let session = svc.get_session(&ctx, id).await?;
+    Ok(Json(SyncSessionDto::from(session)))
+}
+
+/// List the caller's sync sessions, with `OData` filtering and paging.
+pub async fn list_sync_sessions(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    OData(query): OData,
+) -> ApiResult<JsonPage<SyncSessionDto>> {
+    let page: Page<_> = svc.list_sessions(&ctx, &query).await?;
+    Ok(Json(page.map_items(SyncSessionDto::from)))
+}
+
+/// Re-queue the syncs the caller's tenant left `in_progress`, reporting the
+/// repositories that could not be queued.
+pub async fn resume_syncs(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Query(query): Query<ResumeQuery>,
+) -> ApiResult<(StatusCode, JsonBody<ResumeAcceptedDto>)> {
+    let outcome = svc
+        .resume_incomplete_syncs(&ctx, query.repo.as_deref(), query.force.unwrap_or(false))
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ResumeAcceptedDto {
+            resumed: outcome.session_ids.len(),
+            session_ids: outcome
+                .session_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            failed: outcome
+                .refused
+                .into_iter()
+                .map(|refused| ResumeFailureDto {
+                    repository: refused.repository,
+                    error: refused.error.public_text(),
+                })
+                .collect(),
+        }),
+    ))
+}
+
+/// List per-repository sync run status, optionally narrowed by `?status=`.
+pub async fn list_repo_sync_status(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    OData(query): OData,
+    Query(filter): Query<RunStatusQuery>,
+) -> ApiResult<JsonPage<RepoSyncStatusDto>> {
+    let status = filter
+        .status
+        .as_deref()
+        .map(|raw| {
+            raw.parse::<RepoRunStatus>()
+                .map_err(|_| DomainError::Validation {
+                    field: "status".to_owned(),
+                    message: format!("`{raw}` is not one of `in_progress`, `complete`"),
+                })
+        })
+        .transpose()?;
+    let page: Page<_> = svc.list_repo_sync_status(&ctx, &query, status).await?;
+    Ok(Json(page.map_items(RepoSyncStatusDto::from)))
+}
+
+/// Clear mirrored data for one owner or one repository.
+pub async fn clear_cache(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Query(query): Query<CacheClearQuery>,
+) -> ApiResult<JsonBody<CacheClearedDto>> {
+    let (owner, name) = match (&query.repo, &query.owner) {
+        (Some(slug), _) => {
+            let (owner, name) = slug
+                .split_once('/')
+                .ok_or_else(|| DomainError::Validation {
+                    field: "repo".to_owned(),
+                    message: format!("`{slug}` is not an owner/name slug"),
+                })?;
+            (owner.to_owned(), Some(name.to_owned()))
+        }
+        (None, Some(owner)) => (owner.clone(), None),
+        (None, None) => {
+            return Err(DomainError::Validation {
+                field: "owner".to_owned(),
+                message: "give `owner` or `repo`; clearing every tenant's cache is not offered"
+                    .to_owned(),
+            }
+            .into());
+        }
+    };
+
+    let entries_removed = svc.clear_cache(&ctx, &owner, name.as_deref()).await?;
+    Ok(Json(CacheClearedDto {
+        scope: name.map_or_else(|| owner.clone(), |name| format!("{owner}/{name}")),
+        entries_removed,
+    }))
 }

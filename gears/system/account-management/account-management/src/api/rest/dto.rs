@@ -302,6 +302,7 @@ pub struct UserDto {
 
 impl UserDto {
     #[must_use]
+    /// Build a [`UserDto`] from an IdP-sourced user record.
     pub(crate) fn from_idp_user(user: IdpUser) -> Self {
         Self {
             id: user.id,
@@ -566,6 +567,7 @@ pub struct TenantDto {
 
 impl TenantDto {
     #[must_use]
+    /// Build a [`TenantDto`] from an SDK [`Tenant`] value.
     pub(crate) fn from_sdk_tenant(tenant: Tenant) -> Self {
         Self {
             id: tenant.id.0,

@@ -10,6 +10,7 @@
 //! ever reaches a `LIKE` pattern.
 
 use std::collections::BTreeMap;
+use toolkit_macros::domain_model;
 
 use graph_storage_sdk::models::{EffectiveTraits, GtsTypeId, TypeKind};
 use gts::{GtsId, GtsIdPattern};
@@ -86,6 +87,7 @@ const KNOWN_EXTENSIONS: [&str; 5] = [
 ];
 
 /// Everything registration derives from one schema.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeDescriptor {
     pub type_id: GtsTypeId,
@@ -104,6 +106,7 @@ pub struct TypeDescriptor {
 /// The scalar type of one declared `index` path, taken from the type's own
 /// schema. The extraction expression, the comparison semantics and the cursor
 /// codec all depend on it: `'10' < '9'` as text, `10 > 9` as a number.
+#[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScalarKind {
     String,
@@ -142,6 +145,7 @@ impl ScalarKind {
 }
 
 /// One declared `index` path with its resolved kind.
+#[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexedPath {
     /// JSON pointer from the node document root, e.g. `/payload/severity`.
@@ -654,6 +658,7 @@ pub fn matches_any_pattern(candidate: &str, patterns: &[String]) -> Result<bool,
 /// ancestor resolvable through its `gts://` references, so validating the
 /// leaf validates the whole chain (each `allOf` branch evaluates
 /// independently).
+#[domain_model]
 pub struct ChainValidator {
     validator: jsonschema::Validator,
 }
@@ -986,18 +991,26 @@ mod tests {
     /// platform's behaviour, not ours, so they are pinned here.
     #[test]
     fn a_pattern_admits_what_derives_from_it_and_nothing_else() {
-        let commit =
-            "gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~acme.scm._.commit.v1~";
+        let commit = toolkit_gts::gts_id!(
+            "cf.core.graph.node.v1~cf.core.graph.reference_node.v1~acme.scm._.commit.v1~"
+        );
 
         assert_eq!(
-            matches_any_pattern(commit, &["gts.cf.core.graph.node.v1~".to_owned()]).ok(),
+            matches_any_pattern(
+                commit,
+                &[toolkit_gts::gts_id!("cf.core.graph.node.v1~").to_owned()]
+            )
+            .ok(),
             Some(true),
             "the base every node type derives from admits them all"
         );
         assert_eq!(
             matches_any_pattern(
                 commit,
-                &["gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~".to_owned()]
+                &[
+                    toolkit_gts::gts_id!("cf.core.graph.node.v1~cf.core.graph.owned_node.v1~")
+                        .to_owned()
+                ]
             )
             .ok(),
             Some(false),

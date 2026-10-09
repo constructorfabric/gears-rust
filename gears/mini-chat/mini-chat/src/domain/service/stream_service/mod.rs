@@ -77,6 +77,7 @@ fn turn_tx_error(e: toolkit_db::DbError) -> StreamError {
 }
 
 /// Quota preflight computed for a retry/edit before its mutation commits.
+#[domain_model]
 pub struct MutationPreflight {
     computed: super::quota_service::PreflightComputed,
     pf: PreflightResult,
@@ -2703,7 +2704,7 @@ mod tests {
         let ctx = SecurityContext::builder()
             .subject_id(user_id)
             .subject_tenant_id(tenant_id)
-            .subject_type("gts.cf.core.security.subject_user.v1~")
+            .subject_type(toolkit_gts::gts_id!("cf.core.security.subject_user.v1~"))
             .build()
             .expect("security context");
         let (tx, mut rx) = mpsc::channel(32);

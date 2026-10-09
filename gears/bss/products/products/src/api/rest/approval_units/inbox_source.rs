@@ -42,8 +42,7 @@ use toolkit_security::SecurityContext;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use super::{ApiState, UnitCountsQuery, g, require_authenticated};
-use crate::authz::{actions, resource_types};
+use super::{ApiState, UnitCountsQuery, require_authenticated};
 use crate::domain::approvals::ApprovalKind;
 use crate::infra::storage::repo::{UnitListField, UnitListMapping, submission_order};
 
@@ -187,13 +186,9 @@ impl ApprovalSourceV1 for ProductsApprovalSource {
             });
         }
         let ctx = require_authenticated(Some(Extension(ctx.clone())))?;
-        let scope = g::scope(
-            &self.enforcer,
-            &ctx,
-            &resource_types::APPROVAL_UNIT,
-            actions::READ,
-        )
-        .await?;
+        // The read grant and the two flag grants are asked at once (one PDP round trip).
+        let (scope, approve_scope, submit_scope) =
+            super::unit_read_scopes(&self.enforcer, &ctx).await?;
         let filter = super::narrowing(
             q.narrowing.state.as_deref(),
             q.narrowing.kind.as_deref(),
@@ -210,8 +205,6 @@ impl ApprovalSourceV1 for ProductsApprovalSource {
             Some(after) => page.with_cursor(keyset_cursor(after, direction)?),
             None => page.with_order(submission_order(direction)),
         };
-        let approve_scope = g::grant_scope(&self.enforcer, &ctx, actions::APPROVE).await?;
-        let submit_scope = g::grant_scope(&self.enforcer, &ctx, actions::SUBMIT).await?;
         let list = super::page_of(
             &self.state,
             scope,

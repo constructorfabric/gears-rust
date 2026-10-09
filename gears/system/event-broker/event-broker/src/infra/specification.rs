@@ -444,10 +444,12 @@ mod tests {
     use crate::test_support::type_registry::{derived_event_type, event_base_schema};
     use sea_orm_migration::MigratorTrait;
 
-    const TOPIC_ID: &str = "gts.cf.core.events.topic.v1~example.eb.t1.topic.v1";
-    const EVENT_TYPE_ID: &str = "gts.cf.core.events.event.v1~example.eb.t1.foo.v1~";
-    const SUBJECT_TYPE: &str = "gts.example.eb.t1.subject.v1~";
-    const SQLITE_BACKEND: &str = "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~";
+    const TOPIC_ID: &str = toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.t1.topic.v1");
+    const EVENT_TYPE_ID: &str =
+        toolkit_gts::gts_id!("cf.core.events.event.v1~example.eb.t1.foo.v1~");
+    const SUBJECT_TYPE: &str = toolkit_gts::gts_id!("example.eb.t1.subject.v1~");
+    const SQLITE_BACKEND: &str =
+        toolkit_gts::gts_id!("cf.core.events.backend.v1~cf.core.backend.sqlite.v1~");
 
     /// A topic instance carrying exactly what its base type declares - the
     /// partition count is not among them, and a document that named one would
@@ -517,7 +519,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_topic_instance_resolves_with_the_settings_configuration_gives_it() {
-        let cfg = config(&json!({ "gts.cf.core.events.topic.v1~": { "partitions": 4 } }));
+        let cfg = config(
+            &json!({ toolkit_gts::gts_id!("cf.core.events.topic.v1~"): { "partitions": 4 } }),
+        );
         let manager = manager_with(vec![topic_document(TOPIC_ID)], Vec::new(), &cfg).await;
 
         let topic = manager
@@ -660,7 +664,9 @@ mod tests {
             MockTypesRegistryClient::new()
                 .with_instances(vec![make_test_instance(TOPIC_ID, topic_document(TOPIC_ID))]),
         );
-        let ingest_config = config(&json!({ "gts.cf.core.events.topic.v1~": { "partitions": 4 } }));
+        let ingest_config = config(
+            &json!({ toolkit_gts::gts_id!("cf.core.events.topic.v1~"): { "partitions": 4 } }),
+        );
         super::bulk_load(&client, &db, &ingest_config)
             .await
             .expect("the ingest role loads");
@@ -680,9 +686,10 @@ mod tests {
         let cfg = config(&json!({}));
         let manager = manager_with(Vec::new(), Vec::new(), &cfg).await;
 
-        let missing =
-            GtsInstanceId::try_new("gts.cf.core.events.topic.v1~example.eb.missing.topic.v1")
-                .unwrap();
+        let missing = GtsInstanceId::try_new(toolkit_gts::gts_id!(
+            "cf.core.events.topic.v1~example.eb.missing.topic.v1"
+        ))
+        .unwrap();
         assert!(manager.get_topic(&missing).await.is_none());
     }
 
@@ -718,9 +725,10 @@ mod tests {
         let cfg = config(&json!({}));
         let manager = manager_with(Vec::new(), Vec::new(), &cfg).await;
 
-        let missing =
-            GtsInstanceId::try_new("gts.cf.core.events.topic.v1~example.eb.missing.topic.v1")
-                .unwrap();
+        let missing = GtsInstanceId::try_new(toolkit_gts::gts_id!(
+            "cf.core.events.topic.v1~example.eb.missing.topic.v1"
+        ))
+        .unwrap();
         let err = manager
             .resolve_topic_id(&missing)
             .await

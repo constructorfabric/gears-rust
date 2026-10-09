@@ -13,7 +13,9 @@ use crate::infra::workers::upload_reaper::UploadReaperDeps;
 
 /// Worker configs captured in `init()` and consumed by `start()`.
 pub struct WorkerConfigs {
+    /// Config for the orphan-turn watchdog worker.
     pub(crate) orphan_watchdog: OrphanWatchdogConfig,
+    /// Config for the upload reaper worker.
     pub(crate) upload_reaper: UploadReaperConfig,
 }
 

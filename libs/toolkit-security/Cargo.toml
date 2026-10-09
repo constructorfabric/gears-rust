@@ -41,6 +41,7 @@ sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+toolkit-gts = { package = "cf-gears-toolkit-gts", path = "../toolkit-gts" }
 trybuild = { workspace = true }
 # "test-util" enables `start_paused`, which lets the backend-timeout tests run
 # on virtual time instead of spending the real deadline waiting.

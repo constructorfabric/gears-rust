@@ -656,6 +656,7 @@ impl StringMatcher {
     }
 }
 
+/// Keycloak-backed user operations (provision / deprovision / update / list) within a tenant.
 #[domain_model]
 pub struct UserFacade {
     cfg: UserFacadeConfig,
@@ -669,6 +670,8 @@ pub struct UserFacade {
 }
 
 impl UserFacade {
+    /// Construct the facade over the Keycloak admin-client factory, metadata codec and
+    /// segregated metric ports.
     #[must_use]
     pub fn new(
         cfg: UserFacadeConfig,

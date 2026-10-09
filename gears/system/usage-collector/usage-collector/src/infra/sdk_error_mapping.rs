@@ -22,9 +22,11 @@ use usage_collector_sdk::{USAGE_RECORD_RESOURCE, USAGE_TYPE_RESOURCE, UsageColle
 //   - UsageTypeResource → catalog REST surface (create / get / list / delete)
 //   - UsageRecordResource → ingestion REST surface (create / deactivate)
 
+/// Resource marker for the `UsageType` catalog REST surface in canonical errors.
 #[resource_error(gts_id!("cf.core.uc.usage_type.v1~"))]
 pub(crate) struct UsageTypeResource;
 
+/// Resource marker for the `UsageRecord` ingestion REST surface in canonical errors.
 #[resource_error(gts_id!("cf.core.uc.usage_record.v1~"))]
 pub(crate) struct UsageRecordResource;
 

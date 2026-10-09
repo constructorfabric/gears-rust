@@ -51,6 +51,9 @@ impl From<DomainError> for CanonicalError {
             DomainError::NotFound => RepositoryError::not_found("Repo not found")
                 .with_resource("repository")
                 .create(),
+            DomainError::SessionNotFound => RepositoryError::not_found("Sync session not found")
+                .with_resource("sync_session")
+                .create(),
             DomainError::Validation { field, message } => RepositoryError::invalid_argument()
                 .with_field_violation(field, message, "VALIDATION_ERROR")
                 .create(),
@@ -63,6 +66,24 @@ impl From<DomainError> for CanonicalError {
             DomainError::Conflict(msg) => RepositoryError::already_exists(msg)
                 .with_resource("repository")
                 .create(),
+            // Not an internal failure: the mirror stopped the work on purpose,
+            // on shutdown or on a cancel, and the same request will go through
+            // once a process is up again. Its own text is already caller-safe,
+            // so the caller is told what happened instead of being handed the
+            // fixed internal message.
+            DomainError::Cancelled => CanonicalError::service_unavailable()
+                .with_detail(DomainError::Cancelled.public_text())
+                .create(),
+            DomainError::Unavailable {
+                message,
+                retry_after_secs,
+            } => {
+                let unavailable = CanonicalError::service_unavailable().with_detail(message);
+                match retry_after_secs {
+                    Some(seconds) => unavailable.with_retry_after_seconds(seconds).create(),
+                    None => unavailable.create(),
+                }
+            }
             DomainError::Forbidden(msg) => {
                 tracing::warn!(msg = %redacted(&msg), "github-mirror access forbidden");
                 RepositoryError::not_found("Repo not found or not accessible")
@@ -130,12 +151,26 @@ mod tests {
             status_of(DomainError::Conflict("sync already running".to_owned())),
             409
         );
+        assert_eq!(status_of(DomainError::Cancelled), 503);
         assert_eq!(status_of(DomainError::internal("boom")), 500);
         assert_eq!(
             status_of(DomainError::Database(toolkit_db::DbError::InvalidConfig(
                 "bad dsn".to_owned()
             ))),
             500
+        );
+    }
+
+    #[test]
+    fn a_cancelled_run_says_so_rather_than_reading_as_a_failure() {
+        let body = body_of(DomainError::Cancelled);
+        assert!(
+            body.contains("interrupted before it finished"),
+            "a caller that retries needs to know the work was stopped: {body}"
+        );
+        assert!(
+            !body.contains(INTERNAL_DETAIL),
+            "a deliberate stop must not read as an internal failure: {body}"
         );
     }
 

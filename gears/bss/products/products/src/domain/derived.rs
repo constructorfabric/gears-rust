@@ -371,6 +371,7 @@ pub fn wrap_candidate(current: Option<&str>, proposed: Option<&str>) -> bool {
 }
 
 /// A usage ref and the unit stored beside it.
+#[domain_model]
 #[derive(Clone, Copy)]
 pub struct RefUnit<'a> {
     pub usage_type_ref: Option<&'a str>,
@@ -405,6 +406,7 @@ pub fn pin_refuses(current: Option<&str>, proposed: Option<&str>, wrap: bool) ->
 }
 
 /// The metering a published usage SKU's change is judged on (P-D-258).
+#[domain_model]
 #[derive(Clone, Copy)]
 pub struct Metering<'a> {
     /// The SKU's type is usage.

@@ -616,7 +616,7 @@ Large features start with **specs that live alongside the code**:
 - **FEATURE** — flows, algorithms, states, requirements
 - **UPSTREAM_REQS** — incoming technical requirements from other gears
 
-> Templates in `docs/spec-templates/`. Every gear is well documented.
+> Templates in `studio-kit-gears/artifacts/`. Every gear is well documented.
 
 ---
 
