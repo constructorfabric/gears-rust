@@ -1,3 +1,5 @@
+//! Named tasks under one cancellation token, joined on shutdown.
+
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};

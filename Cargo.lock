@@ -4123,6 +4123,7 @@ dependencies = [
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-sea-orm-pgq",
  "cf-gears-toolkit-security",
+ "cf-gears-toolkit-taskward",
  "cf-gears-toolkit-utils",
  "chrono",
  "criterion",
@@ -4415,6 +4416,19 @@ dependencies = [
 [[package]]
 name = "cf-gears-toolkit-stable-hash"
 version = "0.1.0"
+
+[[package]]
+name = "cf-gears-toolkit-taskward"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "futures-util",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "cf-gears-toolkit-trace-context"

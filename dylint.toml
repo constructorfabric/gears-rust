@@ -44,6 +44,7 @@ excluded_paths = [
     "libs/toolkit-sdk",
     "libs/toolkit-security",
     "libs/toolkit-transport-grpc",
+    "libs/toolkit-taskward",
     "libs/toolkit-utils",
     "libs/system-sdks",
 

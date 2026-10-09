@@ -1,3 +1,5 @@
+//! A timer as a wakeup source.
+
 use std::sync::Arc;
 use std::time::Duration;
 

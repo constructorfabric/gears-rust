@@ -1,4 +1,11 @@
 // Created: 2026-04-07 by Constructor Tech
+//! Scenario-based tests demonstrating worker infrastructure behaviour in
+//! realistic settings. Each test tells a story — the name describes the
+//! situation, the body shows how the worker handles it.
+//!
+//! All tests use `start_paused = true` (tokio virtual time) so durations
+//! are realistic (hours, seconds) yet tests complete instantly.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -6,14 +13,10 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::outbox::taskward::action::{Directive, WorkerAction};
-use crate::outbox::taskward::bulkhead::{
-    BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit,
+use toolkit_taskward::{
+    BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit, Directive, PacingConfig,
+    PanicPolicy, TaskSet, TracingListener, WorkerAction, WorkerBuilder, poker,
 };
-use crate::outbox::taskward::listener::TracingListener;
-use crate::outbox::taskward::pacing::PacingConfig;
-use crate::outbox::taskward::poker::poker;
-use crate::outbox::taskward::task::{PanicPolicy, WorkerBuilder};
 
 // ---- Scenario: Long-interval worker reschedules immediately when work
 //      exceeds the polling interval ----
@@ -396,7 +399,7 @@ async fn parallel_workers_share_semaphore_and_notifier() {
     let max_concurrent = Arc::new(AtomicU32::new(0));
     let current_concurrent = Arc::new(AtomicU32::new(0));
 
-    let mut task_set = crate::outbox::taskward::task_set::TaskSet::new(cancel.clone());
+    let mut task_set = TaskSet::new(cancel.clone());
 
     // Spawn 4 workers, all sharing the same notifier and semaphore.
     for id in 0..4 {
@@ -623,7 +626,7 @@ async fn panicking_worker_does_not_kill_siblings() {
         .pacing(PacingConfig::default())
         .build(good_action);
 
-    let mut task_set = crate::outbox::taskward::task_set::TaskSet::new(cancel.clone());
+    let mut task_set = TaskSet::new(cancel.clone());
     task_set.spawn("bad", bad_worker.run());
     task_set.spawn("good", good_worker.run());
 

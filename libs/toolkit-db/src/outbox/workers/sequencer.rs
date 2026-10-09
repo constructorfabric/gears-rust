@@ -8,10 +8,10 @@ use super::super::Outbox;
 use super::super::dialect::AllocSql;
 use super::super::prioritizer::SharedPrioritizer;
 use super::super::store::OutboxStore;
-use super::super::taskward::{Directive, WorkerAction};
 use super::super::types::{OutboxError, SequencerConfig};
 use crate::Db;
 use crate::contention::is_retryable_contention;
+use toolkit_taskward::{Directive, WorkerAction};
 
 /// Report emitted by a sequencer execution cycle.
 #[derive(Debug, Clone)]

@@ -14,9 +14,9 @@ use tracing::debug;
 
 use super::super::statements::OutboxStatements;
 use super::super::store::OutboxStore;
-use super::super::taskward::{Directive, WorkerAction};
 use super::super::types::OutboxError;
 use crate::Db;
+use toolkit_taskward::{Directive, WorkerAction};
 
 /// How long each kind of finished trace row is kept.
 #[derive(Debug, Clone, Copy)]

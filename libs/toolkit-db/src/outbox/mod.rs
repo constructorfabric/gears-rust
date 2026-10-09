@@ -71,7 +71,7 @@
 //! than a few large ones rather than dearer - the notifier issues no query
 //! while nothing is outstanding.
 //!
-//! Channels are [`taskward::poker`] for a timer, a `Notify` per partition
+//! Channels are [`toolkit_taskward::poker`] for a timer, a `Notify` per partition
 //! where the listener's identity *is* the subject, and a bare `Notify` where
 //! the wakeup says nothing. Adding another is the expected move. The
 //! prioritizer is not one of these: it decides *which partition next* for the
@@ -224,8 +224,6 @@ mod store;
 mod strategy;
 mod subscription;
 mod tables;
-#[doc(hidden)]
-pub mod taskward;
 mod trace;
 mod transaction;
 mod types;

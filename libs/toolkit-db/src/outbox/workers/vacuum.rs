@@ -6,9 +6,9 @@ use tracing::{debug, warn};
 
 use super::super::statements::OutboxStatements;
 use super::super::store::OutboxStore;
-use super::super::taskward::{Directive, WorkerAction};
 use super::super::types::OutboxError;
 use crate::Db;
+use toolkit_taskward::{Directive, WorkerAction};
 
 /// Page size for the dirty-partition cursor.
 const DIRTY_PAGE_SIZE: usize = 64;

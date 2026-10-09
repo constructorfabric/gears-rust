@@ -1,3 +1,5 @@
+//! Pace of back-to-back passes while an action keeps returning `Proceed`.
+
 use std::time::Duration;
 
 /// Adaptive pacing configuration for the worker loop.

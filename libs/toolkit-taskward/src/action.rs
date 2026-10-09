@@ -1,3 +1,9 @@
+//! One pass of work, and what the worker does after it.
+//!
+//! A [`WorkerAction`] runs a single unit of work; the [`Directive`] it returns
+//! tells the worker loop whether to run again at once, wait for a wakeup, or
+//! wait up to a deadline.
+
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;

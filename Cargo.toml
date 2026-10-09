@@ -78,6 +78,7 @@ members = [
     "libs/toolkit-node-info",
     "libs/toolkit-stable-hash",
     "libs/toolkit-transport-grpc",
+    "libs/toolkit-taskward",
     "libs/toolkit-utils",
     "libs/ai/toolkit-onnx-runtime",
     "libs/rustls-corecrypto-provider",
@@ -341,6 +342,7 @@ toolkit-sdk = { package = "cf-gears-toolkit-sdk", version = "0.7.13", path = "li
 toolkit-security = { package = "cf-gears-toolkit-security", version = "0.11.0", path = "libs/toolkit-security" }
 toolkit-stable-hash = { package = "cf-gears-toolkit-stable-hash", version = "0.1.0", path = "libs/toolkit-stable-hash" }
 toolkit-transport-grpc = { package = "cf-gears-toolkit-transport-grpc", version = "0.9.0", path = "libs/toolkit-transport-grpc" }
+toolkit-taskward = { package = "cf-gears-toolkit-taskward", version = "0.1.0", path = "libs/toolkit-taskward" }
 toolkit-utils = { package = "cf-gears-toolkit-utils", version = "0.7.2", path = "libs/toolkit-utils" }
 toolkit-onnx-runtime = { package = "cf-gears-toolkit-onnx-runtime", version = "0.1.0", path = "libs/ai/toolkit-onnx-runtime" }
 rustls-corecrypto-provider = { package = "cf-gears-rustls-corecrypto-provider", version = "0.1.3", path = "libs/rustls-corecrypto-provider" }

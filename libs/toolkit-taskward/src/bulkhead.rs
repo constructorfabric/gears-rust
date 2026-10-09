@@ -1,3 +1,9 @@
+//! Admission to a pass: a concurrency permit and an error backoff floor.
+//!
+//! A [`Bulkhead`] gates every pass behind its [`ConcurrencyLimit`] and, after
+//! consecutive failures, holds the worker back for an interval that grows per
+//! [`BackoffConfig`] until a pass succeeds.
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -85,9 +91,10 @@ pub struct BulkheadConfig {
 
 /// Fused concurrency gate + error-driven backoff.
 ///
-/// The worker loop calls [`acquire`] before every `execute()` and
-/// [`escalate`]/[`reset`] after, based on the action result.
-/// [`min_interval`] returns the current error-backoff floor.
+/// The worker loop calls [`acquire`](Self::acquire) before every `execute()`
+/// and [`escalate`](Self::escalate)/[`reset`](Self::reset) after, based on the
+/// action result. [`min_interval`](Self::min_interval) returns the current
+/// error-backoff floor.
 pub struct Bulkhead {
     name: String,
     semaphore: ConcurrencyLimit,

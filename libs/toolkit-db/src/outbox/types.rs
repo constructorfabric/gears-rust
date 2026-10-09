@@ -584,7 +584,7 @@ impl WorkerTuning {
     }
 }
 
-impl From<&WorkerTuning> for super::taskward::PacingConfig {
+impl From<&WorkerTuning> for toolkit_taskward::PacingConfig {
     fn from(t: &WorkerTuning) -> Self {
         Self {
             min_interval: t.min_interval,
@@ -594,7 +594,7 @@ impl From<&WorkerTuning> for super::taskward::PacingConfig {
     }
 }
 
-impl From<WorkerTuning> for super::taskward::PacingConfig {
+impl From<WorkerTuning> for toolkit_taskward::PacingConfig {
     fn from(t: WorkerTuning) -> Self {
         Self::from(&t)
     }
