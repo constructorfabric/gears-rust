@@ -6,6 +6,19 @@ use uuid::Uuid;
 /// that wants new subjects to start with personalization off sets it to false.
 pub const DEFAULT_PERSONALIZATION: bool = true;
 
+pub const DEFAULT_MODEL_TIMEOUT_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "adapter", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelConfig {
+    ChatCompletions {
+        upstream_alias: String,
+        model: String,
+        #[serde(default = "default_model_timeout_ms")]
+        timeout_ms: u64,
+    },
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConstructConfig {
@@ -20,6 +33,8 @@ pub struct ConstructConfig {
     /// connector on.
     #[serde(default)]
     pub connectors_off: Vec<Uuid>,
+    #[serde(default)]
+    pub model: Option<ModelConfig>,
 }
 
 impl Default for ConstructConfig {
@@ -27,12 +42,17 @@ impl Default for ConstructConfig {
         Self {
             personalization_default: DEFAULT_PERSONALIZATION,
             connectors_off: Vec::new(),
+            model: None,
         }
     }
 }
 
 fn default_personalization() -> bool {
     DEFAULT_PERSONALIZATION
+}
+
+fn default_model_timeout_ms() -> u64 {
+    DEFAULT_MODEL_TIMEOUT_MS
 }
 
 #[cfg(test)]
@@ -52,6 +72,7 @@ mod tests {
         .expect("an empty config is valid");
         assert!(config.personalization_default);
         assert!(config.connectors_off.is_empty());
+        assert!(config.model.is_none());
     }
 
     #[test]
@@ -81,6 +102,38 @@ mod tests {
     fn a_connector_that_is_not_a_uuid_is_rejected() {
         assert!(parse(serde_json::json!({ "connectors_off": ["  "] })).is_err());
         assert!(parse(serde_json::json!({ "connectors_off": ["connector-a"] })).is_err());
+    }
+
+    #[test]
+    fn the_chat_completions_model_is_read_with_a_default_timeout() {
+        let config = parse(serde_json::json!({
+            "model": { "adapter": "chat_completions", "upstream_alias": "llm.example", "model": "fact-planner" },
+        }))
+        .expect("a model config");
+        assert_eq!(
+            config.model,
+            Some(ModelConfig::ChatCompletions {
+                upstream_alias: "llm.example".to_owned(),
+                model: "fact-planner".to_owned(),
+                timeout_ms: DEFAULT_MODEL_TIMEOUT_MS,
+            })
+        );
+    }
+
+    #[test]
+    fn an_unknown_adapter_or_model_key_is_rejected() {
+        assert!(
+            parse(serde_json::json!({ "model": { "adapter": "telepathy", "model": "x" } }))
+                .is_err(),
+            "unknown adapter"
+        );
+        assert!(
+            parse(serde_json::json!({
+                "model": { "adapter": "chat_completions", "upstream_alias": "a", "model": "m", "temprature": 0 },
+            }))
+            .is_err(),
+            "typo in a model key"
+        );
     }
 
     #[test]
