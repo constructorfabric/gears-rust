@@ -33,7 +33,7 @@ How a chosen option is recorded and pinned by a test is described in
 [`14_db_behavior_testing.md`, How to run an audit](../../toolkit_unified_system/14_db_behavior_testing.md#how-to-run-an-audit).
 Rules with no exception are in
 [`14_db_behavior_testing.md`, Rules](../../toolkit_unified_system/14_db_behavior_testing.md#rules)
-(the R1-R12 and T1-T5 links below point there) and are not repeated here. Examples use the fictional `Cat` /
+(the R1-R11 and T1-T5 links below point there) and are not repeated here. Examples use the fictional `Cat` /
 `Kitten` entities.
 
 ## Check-then-act invariants
@@ -79,11 +79,13 @@ to re-check. SQLite has no row locks.
 aborts grow with contention and transaction length, and a writer that can break the predicate is covered only if it
 runs `SERIALIZABLE` too.
 
-**Advisory lock.** The toolkit `LockManager` gives mutual exclusion per key, such as one sweep or job at a time, not
-per row. It takes session-level locks that never wait (`pg_try_advisory_lock` on PostgreSQL, `GET_LOCK(name, 0)` on
-MySQL) on one pinned connection per process; if that connection dies, every key it held is released at once. A writer
-that skips the lock is not stopped. On SQLite the locks are marker files in the OS cache directory, so they coordinate
-only processes on one host.
+**Advisory lock.** `Db::lock(gear, key)` and `Db::try_lock(gear, key, LockConfig)` give mutual exclusion per key, such
+as one sweep or job at a time, not per row. `lock` makes one attempt and fails with `AlreadyHeld` when the key is taken;
+`try_lock` retries with the backoff in its `LockConfig` and returns `None` if it does not get the key. They take
+session-level locks whose SQL never waits (`pg_try_advisory_lock` on PostgreSQL, `GET_LOCK(name, 0)` on MySQL) on a
+lazily opened pool of one connection per `Db` handle, shared by its clones; if that connection dies, every key it held
+is released at once. A writer that skips the lock is not stopped. On SQLite the locks are marker files in the OS cache
+directory, so they coordinate only processes on one host.
 
 **Accept the race.** The pre-check stays with nothing behind it: violations happen under concurrency and need
 detection and repair. The cost is whatever a violation breaks, from nothing for a UX hint to money, authorization or
@@ -140,9 +142,11 @@ Anomalies need overlapping transactions, so with little concurrency all levels g
 
 A transaction that can abort (a deadlock, `40001` under `SERIALIZABLE`) either retries or reports the abort.
 
-**Retry.** `transaction_with_retry` absorbs the abort by re-running the whole closure: more latency and repeated
-work, extra load exactly when contention is high, and the closure has to satisfy
+**Retry.** `transaction_with_retry` absorbs the abort by re-running the whole closure: more latency and repeated work,
+extra load exactly when contention is high, and the closure has to satisfy
 [R1](../../toolkit_unified_system/14_db_behavior_testing.md#r1-a-retried-closure-is-safe-to-run-again) and
+[R2](../../toolkit_unified_system/14_db_behavior_testing.md#r2-the-retry-can-fire).
+On MySQL it also retries lock wait timeouts (error 1205), for the reason given in
 [R2](../../toolkit_unified_system/14_db_behavior_testing.md#r2-the-retry-can-fire).
 
 ```rust
@@ -164,7 +168,7 @@ sees the error; a caller that owns a wider operation can retry all of it.
   and gives up that serialization.
 - **MySQL.** InnoDB FK checks take shared locks on the parent, so an `Update` lock serializes child inserts too; the
   usable lock types are in
-  [R9](../../toolkit_unified_system/14_db_behavior_testing.md#r9-on-mysql-only-update-and-share-locks).
+  [R8](../../toolkit_unified_system/14_db_behavior_testing.md#r8-on-mysql-only-update-and-share-locks).
 - **SQLite** has no row locks
   ([T4](../../toolkit_unified_system/14_db_behavior_testing.md#t4-lock--and-type-dependent-behaviour-is-tested-on-a-real-server-engine))
   and allows one writer per database at a time. A writer that finds the database locked waits up to the busy timeout
@@ -231,7 +235,16 @@ skipped rows, so deep pages slow down, and writes between requests shift pages (
 these costs stay small.
 
 **Keyset.** "Rows after this key" costs the same on every page and is stable under writes; it needs a unique stable
-key and a cursor encoding and cannot jump to page N. The OData layer uses it and refuses `$skip`.
+key and a cursor encoding and cannot jump to page N.
+
+The platform's default is keyset pages without a total
+([`07_odata_pagination_select_filter.md`, Unsupported system query options](../../toolkit_unified_system/07_odata_pagination_select_filter.md#unsupported-system-query-options)),
+enforced by the shared OData layer. Exceptions with their own query types:
+
+- legacy: the chat-engine message search (`$skip`, `total_count`) and the OAGW upstream and route lists
+  (`limit`/`offset`);
+- GitHub API compatibility: the github-mirror GitHub-compatible routes (`page`/`per_page`, a `Link` header, and
+  `total_count` in some responses).
 
 Both need a total order
 ([R5](../../toolkit_unified_system/14_db_behavior_testing.md#r5-a-paginated-query-has-a-total-order)), because rows
@@ -245,11 +258,21 @@ constraint caps them without paging, and paging caps them at the price of a diff
 
 ## Counting and existence
 
-Pages carry no total
-([`07_odata_pagination_select_filter.md`, Unsupported system query options](../../toolkit_unified_system/07_odata_pagination_select_filter.md#unsupported-system-query-options));
-existence is
-[R6](../../toolkit_unified_system/14_db_behavior_testing.md#r6-existence-is-checked-with-limit-1). When a number is
-needed:
+Pages built by the shared OData layer carry no total; the exceptions are under [Pagination](#pagination).
+
+**Existence with `LIMIT 1`.** `.one(..)` stops at the first match, and loads every column of that row.
+
+**Existence with `COUNT(*) > 0`.** Reads every match to answer yes or no. By a unique key both forms touch one row and
+cost the same; on a loose predicate `COUNT` reads the whole matching set.
+
+```rust
+let exists = CatEntity::find().filter(cat::Column::Name.eq(name))
+    .secure().scope_with(&scope).one(runner).await?.is_some();          // LIMIT 1
+let exists = CatEntity::find().filter(cat::Column::Name.eq(name))
+    .secure().scope_with(&scope).count(runner).await? > 0;             // COUNT(*)
+```
+
+When a number is needed:
 
 **Exact `COUNT(*)`** reads every matching row, so its cost grows with the matching set, and the number can change
 before the caller uses it.
@@ -278,8 +301,11 @@ list can switch the plan to a scan. An `UPDATE` or `DELETE` over the list locks 
 **Ways to stay under the cap.**
 
 - A validated input limit keeps one statement but becomes part of the API.
-- Chunking against `max_bind_params_for(runner)` with headroom handles any size with several statements. They see one
-  snapshot only inside one transaction at `REPEATABLE READ` or above; at `READ COMMITTED` each chunk sees its own.
+- Chunking against `max_bind_params_for(runner)` handles any size with several statements, as long as the headroom
+  covers the other predicates: the scope's filter binds at least one parameter per tenant, group or ancestor id in the
+  scope, so a wide scope takes a large share of the budget. The statements are atomic together only inside one
+  transaction, and see one snapshot only at `REPEATABLE READ` or above; at `READ COMMITTED` each chunk sees its own. For
+  inserts the toolkit's `secure_insert_many` chunks by itself and also checks every row against the scope.
 - On PostgreSQL an array parameter (`= ANY($1)`) binds the whole list as one parameter, with dialect-specific code
   and tests.
 - A temporary table works on every backend: insert the list into it and join. Filling it is itself a multi-row
@@ -287,8 +313,8 @@ list can switch the plan to a scan. An `UPDATE` or `DELETE` over the list locks 
   so the fill and the query run in one transaction, which keeps them on one connection.
 
 ```rust
-const RESERVED: usize = 2; // illustrative: the binds of the other predicates, including the scope's tenant filter
-let step = max_bind_params_for(runner) - RESERVED;
+// headroom for the other predicates, including the scope's filter
+let step = max_bind_params_for(runner) / 2;
 for chunk in ids.chunks(step) {
     rows.extend(CatEntity::find().filter(cat::Column::Id.is_in(chunk.iter().copied()))
         .secure().scope_with(&scope).all(runner).await?);
@@ -362,9 +388,10 @@ PostgreSQL 11 a column with a constant default), others rewrite the table under 
 MySQL decides per operation whether it runs instantly, in place, or by copying the table. A statement that rewrites or
 scans is short on a small table and an outage on a large one. On PostgreSQL a plain `CREATE INDEX` blocks writes for
 the whole build, and `CREATE INDEX CONCURRENTLY` cannot run through the toolkit runner, which wraps `up()` in a
-transaction. SQLite rebuilds and `down()` are rules:
-[R11](../../toolkit_unified_system/14_db_behavior_testing.md#r11-a-sqlite-table-rebuild-keeps-its-child-rows) and
-[R12](../../toolkit_unified_system/14_db_behavior_testing.md#r12-down-says-what-it-does).
+transaction. That transaction is best-effort: on MySQL each DDL statement commits implicitly, so the statements of one
+migration are not atomic together there. SQLite rebuilds and `down()` are rules:
+[R10](../../toolkit_unified_system/14_db_behavior_testing.md#r10-a-sqlite-table-rebuild-keeps-its-child-rows) and
+[R11](../../toolkit_unified_system/14_db_behavior_testing.md#r11-down-says-what-it-does).
 
 ## Unreadable stored values
 
