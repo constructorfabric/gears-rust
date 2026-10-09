@@ -1,0 +1,7 @@
+[gear]
+name = "Admission Control"
+description = "Admission gate for platform operations, backed by one optional pluggable admission engine."
+category = "core-platform-integration"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

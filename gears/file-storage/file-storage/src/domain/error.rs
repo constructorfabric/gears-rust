@@ -94,8 +94,6 @@ pub enum DomainError {
     MultipartPartsMissing { upload_id: Uuid, missing: Vec<u32> },
 
     /// 409 — backend migration was requested for a versioned file (>1 version).
-    ///
-    /// @cpt-cf-file-storage-fr-backend-migration
     #[error("File {file_id} has multiple versions and cannot be migrated between backends")]
     VersionedFileMigrationNotSupported { file_id: Uuid },
 }
@@ -239,8 +237,6 @@ impl DomainError {
     }
 
     /// 409 — the file has multiple versions and cannot be migrated between backends.
-    ///
-    /// @cpt-cf-file-storage-fr-backend-migration
     #[must_use]
     pub fn versioned_file_migration_not_supported(file_id: Uuid) -> Self {
         Self::VersionedFileMigrationNotSupported { file_id }

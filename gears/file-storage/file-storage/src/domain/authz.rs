@@ -1,14 +1,8 @@
 //! Authorization abstraction for the control plane.
 //!
-//! The service depends only on this trait, not on the Authorization Service
-//! directly. Two implementations exist:
-//!
-//! - [`TenantOnlyAuthorizer`] — enforces tenant-boundary only
-//!   (`cpt-cf-file-storage-fr-tenant-boundary`); used in tests and as a safe
-//!   default. Every query is scoped to the caller's tenant.
-//! - `PolicyEnforcerAuthorizer` (M8, `infra::authz`) — delegates per-type access
-//!   decisions to the platform Authorization Service over
-//!   `gts.cf.fstorage.file.type.v1~` (`cpt-cf-file-storage-fr-authorization`).
+//! `TenantOnlyAuthorizer` enforces the tenant boundary only (tests, safe default);
+//! `PolicyEnforcerAuthorizer` (`infra::authz`) delegates per-type decisions to the
+//! platform Authorization Service over `gts.cf.fstorage.file.type.v1~`.
 
 use async_trait::async_trait;
 use toolkit_security::{AccessScope, SecurityContext};
@@ -16,20 +10,15 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 
-/// Actions checked against a file's GTS type (PRD §5.2).
+/// Actions checked against a file's GTS type.
 pub mod actions {
     pub const READ: &str = "read";
     pub const WRITE: &str = "write";
     pub const DELETE: &str = "delete";
-    /// Cross-owner / tenant-wide policy & retention-rule administration.
+    /// Cross-owner / tenant-wide policy and retention-rule administration.
     ///
-    /// Distinct from `WRITE` so the PDP can grant ordinary file access without
-    /// also granting the ability to read/mutate another subject's policy or
-    /// retention rules. Authorized via the same resource type
-    /// (`file_storage.file`, see module docs) with a distinct action string —
-    /// contained to this gear, no new PDP resource type required. If the
-    /// platform later grows a shared tenant-admin scope, swap this string for
-    /// that action; the ownership-comparison call sites are unaffected.
+    /// Distinct from `WRITE` so ordinary file access does not grant access to another
+    /// subject's policy or retention rules; same resource type, distinct action.
     pub const ADMIN_POLICY: &str = "admin_policy";
 }
 

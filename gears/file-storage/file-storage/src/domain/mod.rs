@@ -1,10 +1,7 @@
 //! Domain layer (control plane): errors, authorization, services, local client.
 //!
-//! The control-plane services orchestrate persistence directly over the
-//! tenant-scoped SecureORM repositories, so this layer legitimately names
-//! `toolkit_db` runner/provider types and the `infra` repositories — the same
-//! accepted pattern as the resource-group gear. DE0301 is therefore allowed
-//! module-wide here.
+//! Services work directly over the tenant-scoped `SecureORM` repositories, so this
+//! layer names `toolkit_db` and `infra` types; DE0301 is allowed module-wide.
 #![allow(unknown_lints)]
 #![allow(de0301_no_infra_in_domain)]
 
@@ -23,3 +20,4 @@ pub mod policy;
 pub mod policy_service;
 pub mod ports;
 pub mod service;
+pub(crate) mod storage_layout;

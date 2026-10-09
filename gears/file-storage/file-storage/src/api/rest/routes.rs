@@ -1,6 +1,5 @@
-//! Control-plane route registration via `OperationBuilder`
-//! (`cpt-cf-file-storage-fr-rest-api`). This surface is JSON-only and never
-//! carries file content — bytes move over signed URLs against the sidecar.
+//! Control-plane route registration via `OperationBuilder`. JSON-only: file bytes
+//! move over signed URLs against the sidecar.
 
 use std::sync::Arc;
 
@@ -40,17 +39,9 @@ pub(crate) fn register_routes(
     policy_service: Arc<PolicyService>,
     finalize_auth: Arc<handlers::FinalizeAuth>,
 ) -> Router {
-    // ── Data-plane finalize (s2s, token-authenticated) ──────────────────────
-    // This endpoint is NOT authenticated via the end-user JWT middleware; the
-    // signed upload token is the sole authorization.
-    //
-    // Registered as `.anonymous()` so the api-gateway's route-policy does NOT
-    // require a user JWT for this path (the fs-token carries the authorization).
-    // The Verifier extension is added to the whole router at the bottom.
-    //
-    // P2 0.1 remaining: `finalize_auth` layers an optional interim
-    // gear-local shared-secret second factor on top of the fs-token for
-    // both routes below (see `handlers::FinalizeAuth`'s doc comment).
+    // s2s finalize/report-part: `.anonymous()` so the gateway does not require a user
+    // JWT; the signed fs-token plus the internal credential (`handlers::FinalizeAuth`)
+    // are the authorization.
     let verifier: Arc<Verifier> = Arc::new(service.verifier());
     router = OperationBuilder::post(format!(
         "{BASE}/files/{{file_id}}/versions/{{version_id}}/finalize"
@@ -61,7 +52,7 @@ pub(crate) fn register_routes(
     .description(
         "Called by the sidecar after a successful PUT to mark the version `available`. \
          Authorized by the signed upload token (fs-token) \u{2014} no user JWT required. \
-         Requires internal credential (x-fs-internal-token) when configured (P2 0.1).",
+         Requires the internal credential (x-fs-internal-token).",
     )
     .tag(API_TAG)
     .path_param("file_id", "File UUID")
@@ -73,11 +64,6 @@ pub(crate) fn register_routes(
     .error_500(openapi)
     .register(router, openapi);
 
-    // ── Data-plane report-part (s2s, token-authenticated) ───────────────────
-    // Same trust model as finalize above: the signed `multipart_part` token is
-    // the sole authorization, no user JWT required (P2 0.2 group B — the
-    // "report part" callback that closes the structural gap where nothing
-    // ever populated `multipart_upload_parts` in a real deployment).
     router = OperationBuilder::post(format!(
         "{BASE}/files/{{file_id}}/versions/{{version_id}}/multipart/{{upload_id}}/parts/{{part_number}}/report"
     ))
@@ -88,7 +74,7 @@ pub(crate) fn register_routes(
         "Called by the sidecar after a successful part write to record the part's backend \
          ETag, hash, and size so `complete` can assemble from real reported parts. \
          Authorized by the signed upload token (fs-token) \u{2014} no user JWT required. \
-         Requires internal credential (x-fs-internal-token) when configured (P2 0.1).",
+         Requires the internal credential (x-fs-internal-token).",
     )
     .tag(API_TAG)
     .path_param("file_id", "File UUID")
@@ -102,7 +88,6 @@ pub(crate) fn register_routes(
     .error_500(openapi)
     .register(router, openapi);
 
-    // POST /files — create + presign upload
     router = OperationBuilder::post(format!("{BASE}/files"))
         .operation_id("file_storage.create_file")
         .authenticated()
@@ -118,7 +103,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // POST /files/{id}/versions — presign a new version
     router = OperationBuilder::post(format!("{BASE}/files/{{id}}/versions"))
         .operation_id("file_storage.presign_version")
         .authenticated()
@@ -134,7 +118,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // POST /files/{id}/bind — bind/rebind content pointer (If-Match)
     router = OperationBuilder::post(format!("{BASE}/files/{{id}}/bind"))
         .operation_id("file_storage.bind")
         .authenticated()
@@ -151,15 +134,12 @@ pub(crate) fn register_routes(
         .error_404(openapi)
         // 409: the target version's upload is not finalized yet.
         .error_409(openapi)
-        // 400: the If-Match / CAS precondition failed (or is required and absent).
-        // `FailedPrecondition` collapses to 400 by house convention
-        // (toolkit-canonical-errors has no 412 variant; see AM's
-        // `failed_precondition` → 400 mapping for precedent).
+        // 400: If-Match / CAS precondition failed or is absent (`FailedPrecondition`
+        // maps to 400; there is no 412 canonical variant).
         .error_400(openapi)
         .error_500(openapi)
         .register(router, openapi);
 
-    // GET /files/{id}/download-url — issue a signed download URL
     router = OperationBuilder::get(format!("{BASE}/files/{{id}}/download-url"))
         .operation_id("file_storage.download_url")
         .authenticated()
@@ -176,7 +156,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // GET /files/{id}/versions — list versions
     router = OperationBuilder::get(format!("{BASE}/files/{{id}}/versions"))
         .operation_id("file_storage.list_versions")
         .authenticated()
@@ -194,7 +173,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // DELETE /files/{id}/versions/{version_id} — delete a version
     router = OperationBuilder::delete(format!("{BASE}/files/{{id}}/versions/{{version_id}}"))
         .operation_id("file_storage.delete_version")
         .authenticated()
@@ -263,10 +241,7 @@ pub(crate) fn register_routes(
         .error_401(openapi)
         .error_403(openapi)
         .error_404(openapi)
-        // 400: If-Match absent or does not match the current content ETag.
-        // `FailedPrecondition` collapses to 400 by house convention
-        // (toolkit-canonical-errors has no 412 variant; see AM's
-        // `failed_precondition` → 400 mapping for precedent).
+        // 400: If-Match absent or mismatched (see `bind`).
         .error_400(openapi)
         .error_500(openapi)
         .register(router, openapi);
@@ -290,7 +265,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // GET /storages — backend discovery
     router = OperationBuilder::get(format!("{BASE}/storages"))
         .operation_id("file_storage.list_storages")
         .authenticated()
@@ -304,7 +278,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // GET /storages/{id} — one backend
     router = OperationBuilder::get(format!("{BASE}/storages/{{id}}"))
         .operation_id("file_storage.get_storage")
         .authenticated()
@@ -320,9 +293,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // ── Policy endpoints (P2-M1) — cpt-cf-file-storage-usecase-configure-policy
-
-    // GET /policy — fetch own policy for a scope
     router = OperationBuilder::get(format!("{BASE}/policy"))
         .operation_id("file_storage.get_policy")
         .authenticated()
@@ -347,7 +317,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // PUT /policy — upsert policy for a scope
     router = OperationBuilder::put(format!("{BASE}/policy"))
         .operation_id("file_storage.set_policy")
         .authenticated()
@@ -363,7 +332,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // GET /policy/effective — compute effective policy
     router = OperationBuilder::get(format!("{BASE}/policy/effective"))
         .operation_id("file_storage.get_effective_policy")
         .authenticated()
@@ -386,7 +354,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // GET /retention-rules — list retention rules
     router = OperationBuilder::get(format!("{BASE}/retention-rules"))
         .operation_id("file_storage.list_retention_rules")
         .authenticated()
@@ -404,7 +371,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // POST /retention-rules — create a retention rule
     router = OperationBuilder::post(format!("{BASE}/retention-rules"))
         .operation_id("file_storage.create_retention_rule")
         .authenticated()
@@ -424,7 +390,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // DELETE /retention-rules/{rule_id} — delete a retention rule
     router = OperationBuilder::delete(format!("{BASE}/retention-rules/{{rule_id}}"))
         .operation_id("file_storage.delete_retention_rule")
         .authenticated()
@@ -440,9 +405,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // ── Multipart upload (P2-M3) ─────────────────────────────────────────────────
-
-    // POST /files/{id}/multipart — initiate multipart session (server-authoritative plan)
     router = OperationBuilder::post(format!("{BASE}/files/{{id}}/multipart"))
         .operation_id("file_storage.initiate_multipart")
         .authenticated()
@@ -469,12 +431,9 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // NOTE: The control-plane PUT .../parts/{part_number} byte route is intentionally
-    // absent — bytes flow exclusively to the sidecar via the per-part signed URLs
-    // returned by the initiate response (ADR-0003 "no bytes through the control
-    // plane"; multipart-coordinator FEATURE §8 migration).
+    // No control-plane part-byte route by design: bytes go to the sidecar via the
+    // per-part signed URLs (ADR-0003).
 
-    // POST /files/{id}/multipart/{upload_id}/complete — finalize
     router = OperationBuilder::post(format!(
         "{BASE}/files/{{id}}/multipart/{{upload_id}}/complete"
     ))
@@ -499,16 +458,13 @@ pub(crate) fn register_routes(
     .error_401(openapi)
     .error_403(openapi)
     .error_404(openapi)
-    // 409 also covers `MultipartPartsMissing` (unreported parts) and the
-    // residual assembled-size mismatch guard.
+    // 409 also covers `MultipartPartsMissing` and the assembled-size mismatch guard.
     .error_409(openapi)
-    // 400: the If-Match precondition failed. `FailedPrecondition` collapses
-    // to 400 by house convention (mirrors `bind`'s route above).
+    // 400: If-Match precondition failed (see `bind`).
     .error_400(openapi)
     .error_500(openapi)
     .register(router, openapi);
 
-    // GET /files/{id}/multipart/{upload_id} — introspect/resume (item 3.4)
     router = OperationBuilder::get(format!("{BASE}/files/{{id}}/multipart/{{upload_id}}"))
         .operation_id("file_storage.introspect_multipart")
         .authenticated()
@@ -535,7 +491,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // DELETE /files/{id}/multipart/{upload_id} — abort
     router = OperationBuilder::delete(format!("{BASE}/files/{{id}}/multipart/{{upload_id}}"))
         .operation_id("file_storage.abort_multipart")
         .authenticated()
@@ -553,9 +508,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // ── Backend migration (P2-M4) ─────────────────────────────────────────────
-
-    // POST /files/{id}/migrate — backend migration
     router = OperationBuilder::post(format!("{BASE}/files/{{id}}/migrate"))
         .operation_id("file_storage.migrate_backend")
         .authenticated()
@@ -578,9 +530,6 @@ pub(crate) fn register_routes(
         .error_500(openapi)
         .register(router, openapi);
 
-    // ── Ownership transfer (P2-M5) ─────────────────────────────────────────────
-
-    // POST /files/{id}/transfer — transfer ownership
     router = OperationBuilder::post(format!("{BASE}/files/{{id}}/transfer"))
         .operation_id("file_storage.transfer_ownership")
         .authenticated()

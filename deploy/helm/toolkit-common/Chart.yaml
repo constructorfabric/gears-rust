@@ -1,0 +1,13 @@
+apiVersion: v2
+name: toolkit-common
+description: Shared Helm chart library.
+type: library
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - cf-gears
+  - toolkit
+  - oop
+  - platform
+maintainers:
+  - name: Constructor Fabric

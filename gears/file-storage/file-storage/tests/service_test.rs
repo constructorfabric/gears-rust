@@ -1,7 +1,4 @@
-//! End-to-end control-plane service tests against a real temp-file `SQLite` DB
-//! plus the in-memory storage backend and the tenant-only authorizer. These
-//! exercise the full P1 flows (create, upload, bind, download, list, versions,
-//! metadata, delete) as Rust calls, with no HTTP server.
+//! End-to-end service tests: temp-file `SQLite`, in-memory backend, tenant-only authorizer.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -37,20 +34,14 @@ async fn build_service() -> (Arc<FileService>, DataPlaneService) {
     (svc, dp)
 }
 
-/// Like [`build_service`], but with caller-chosen `default_page_size`/
-/// `max_page_size` — used by pagination tests that need a small
-/// `max_page_size` to keep version-seeding fast (P2 2.2) — and also returns
-/// the [`Store`] handle, for tests (P2 2.7) that need to drive the
-/// store/repo layer directly to simulate a race the service's own
-/// pre-transaction checks cannot reach deterministically in a single-threaded
-/// test.
+/// Like `build_service`, but with caller-chosen page sizes (a small `max_page_size` keeps version
+/// seeding fast), and also returns the `Store` for tests that drive the repo layer directly.
 async fn build_service_with_page_sizes(
     default_page_size: u64,
     max_page_size: u64,
 ) -> (Arc<FileService>, DataPlaneService, Store) {
-    // A unique temp *file* DB: the service opens a connection per call, so every
-    // connection must see the same database. A bare `sqlite::memory:` gives each
-    // pooled connection its own empty DB; a temp file is shared by construction.
+    // Temp-file DB: the service opens a connection per call, and `sqlite::memory:` gives each
+    // connection its own DB.
     let mut path = std::env::temp_dir();
     path.push(format!("cf-fs-test-{}.db", Uuid::now_v7().simple()));
     let dsn = format!("sqlite://{}?mode=rwc", path.display());
@@ -112,7 +103,6 @@ fn new_file() -> NewFile {
     }
 }
 
-/// create → upload bytes → bind → the file now has content + an ETag.
 #[tokio::test]
 async fn full_upload_bind_download_lifecycle() {
     let (svc, dp) = build_service().await;
@@ -122,12 +112,10 @@ async fn full_upload_bind_download_lifecycle() {
     assert!(ticket.upload_url.contains("fs-token="), "signed upload URL");
     assert!(ticket.upload_url.starts_with("http://sidecar.test"));
 
-    // Before bind there is no content.
     let pre = svc.get_file(&ctx, ticket.file_id).await.unwrap();
     assert!(pre.content_id.is_none());
     assert_eq!(etag::etag_for(&pre), None);
 
-    // Upload bytes (in-process equivalent of the sidecar stream-and-finalize).
     dp.put_content(
         &ctx,
         ticket.file_id,
@@ -138,7 +126,6 @@ async fn full_upload_bind_download_lifecycle() {
     .await
     .unwrap();
 
-    // Bind the uploaded version as current (first bind: no If-Match).
     let bound = svc
         .bind(&ctx, ticket.file_id, ticket.version_id, None)
         .await
@@ -147,20 +134,17 @@ async fn full_upload_bind_download_lifecycle() {
     let etag = etag::etag_for(&bound).expect("etag after bind");
     assert!(etag.starts_with('"') && etag.ends_with('"'));
 
-    // download-url pins the current content + returns its ETag.
     let dl = svc.download_url(&ctx, ticket.file_id, None).await.unwrap();
     assert_eq!(dl.version_id, ticket.version_id);
     assert_eq!(dl.etag, etag);
     assert!(dl.download_url.contains("fs-token="));
 
-    // Read the bytes back through the backend.
     let bytes = dp
         .read_content(&ctx, ticket.file_id, ticket.version_id, None)
         .await
         .unwrap();
     assert_eq!(bytes, Bytes::from_static(b"hello world"));
 
-    // Versions: exactly one, current, available.
     let versions = svc
         .list_versions(&ctx, ticket.file_id, None, 0)
         .await
@@ -169,7 +153,6 @@ async fn full_upload_bind_download_lifecycle() {
     assert!(versions[0].is_current);
     assert_eq!(versions[0].size, 11);
 
-    // Custom metadata round-trips.
     let (_f, meta) = svc
         .get_file_with_metadata(&ctx, ticket.file_id)
         .await
@@ -196,7 +179,6 @@ async fn bind_with_wrong_if_match_returns_precondition_failed() {
         .await
         .unwrap();
 
-    // New version, then bind with a bogus If-Match.
     let t2 = svc.presign_version(&ctx, t1.file_id).await.unwrap();
     dp.put_content(
         &ctx,
@@ -216,7 +198,6 @@ async fn bind_with_wrong_if_match_returns_precondition_failed() {
         "got {err:?}"
     );
 
-    // Binding with the correct current ETag succeeds.
     let current = svc.get_file(&ctx, t1.file_id).await.unwrap();
     let etag = etag::etag_for(&current).unwrap();
     let bound = svc
@@ -233,13 +214,11 @@ async fn tenant_isolation_hides_other_tenants_files() {
     let ctx_b = ctx(Uuid::now_v7());
 
     let t = svc.create_file(&ctx_a, new_file(), None).await.unwrap();
-    // Tenant B cannot see tenant A's file.
     let err = svc.get_file(&ctx_b, t.file_id).await.unwrap_err();
     assert!(
         matches!(err, DomainError::FileNotFound { .. }),
         "got {err:?}"
     );
-    // Tenant A can.
     assert!(svc.get_file(&ctx_a, t.file_id).await.is_ok());
 }
 
@@ -251,7 +230,7 @@ async fn content_type_mismatch_is_rejected() {
     nf.mime_type = "image/png".to_owned();
     let t = svc.create_file(&ctx, nf, None).await.unwrap();
 
-    // Declared png, but the bytes are a PDF signature → mismatch.
+    // Declared png, but the bytes are a PDF signature.
     let err = dp
         .put_content(
             &ctx,
@@ -292,7 +271,6 @@ async fn update_metadata_merges_and_bumps_meta_version() {
     assert_eq!(map.get("tag"), Some(&"b".to_owned()));
     assert_eq!(map.get("color"), Some(&"red".to_owned()));
 
-    // Delete a key via merge patch (null).
     let del = CustomMetadataPatch {
         entries: vec![("color".to_owned(), None)],
     };
@@ -341,7 +319,6 @@ async fn restore_prior_version_rebinds_pointer() {
     .await
     .unwrap();
 
-    // Restore v1 (a pointer swap, no re-upload).
     let restored = svc
         .restore_version(&ctx, t1.file_id, t1.version_id)
         .await
@@ -354,7 +331,6 @@ async fn delete_file_then_get_returns_not_found() {
     let (svc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
     let t = svc.create_file(&ctx, new_file(), None).await.unwrap();
-    // No bound content yet: use "*" (wildcard If-Match).
     svc.delete_file(&ctx, t.file_id, Some("*")).await.unwrap();
     let err = svc.get_file(&ctx, t.file_id).await.unwrap_err();
     assert!(
@@ -368,10 +344,8 @@ async fn download_url_pending_version_is_rejected() {
     let (svc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    // Create a file — the first version is pending (upload not yet finalized).
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
 
-    // Requesting a signed URL for a pending version must fail with Conflict.
     let err = svc
         .download_url(&ctx, ticket.file_id, Some(ticket.version_id))
         .await
@@ -387,7 +361,6 @@ async fn delete_file_if_match_required_and_enforced() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    // Create, upload, and bind a file so it has a real content ETag.
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
     dp.put_content(
         &ctx,
@@ -405,7 +378,6 @@ async fn delete_file_if_match_required_and_enforced() {
     let file = svc.get_file(&ctx, ticket.file_id).await.unwrap();
     let current_etag = etag::etag_for(&file).expect("file must have an ETag after bind");
 
-    // No If-Match: precondition required.
     let err = svc
         .delete_file(&ctx, ticket.file_id, None)
         .await
@@ -415,7 +387,6 @@ async fn delete_file_if_match_required_and_enforced() {
         "expected PreconditionFailed when If-Match absent, got {err:?}"
     );
 
-    // Wrong ETag: precondition failed.
     let err = svc
         .delete_file(&ctx, ticket.file_id, Some("\"wrong-etag\""))
         .await
@@ -425,7 +396,6 @@ async fn delete_file_if_match_required_and_enforced() {
         "expected PreconditionFailed for wrong ETag, got {err:?}"
     );
 
-    // Correct ETag → success.
     svc.delete_file(&ctx, ticket.file_id, Some(&current_etag))
         .await
         .unwrap();
@@ -474,16 +444,11 @@ async fn list_files_filters_by_owner() {
     assert!(empty.is_empty());
 }
 
-/// `GET /files/{id}/versions` must cap at `ServiceConfig::max_page_size` even
-/// when a file has more versions than that — both with no explicit `limit`
-/// (clamped to `max_page_size`) and with an explicit `limit` above
-/// `max_page_size` — and must return the newest page (P2 2.2).
+/// `list_versions` caps at `max_page_size`, with or without a larger explicit `limit`, and
+/// returns the newest page.
 #[tokio::test]
 async fn list_versions_caps_at_max_page_size() {
-    // `default_page_size == max_page_size` so the no-explicit-limit case
-    // below exercises the `max_page_size` cap directly (per the plan: "call
-    // `list_versions` with no explicit limit, assert the returned length
-    // equals `max_page_size`").
+    // `default_page_size == max_page_size`, so the no-limit case exercises the cap.
     let max_page_size = 10u64;
     let (svc, dp, _store) = build_service_with_page_sizes(max_page_size, max_page_size).await;
     let ctx = ctx(Uuid::now_v7());
@@ -522,13 +487,9 @@ async fn list_versions_caps_at_max_page_size() {
         "sanity: seeded max_page_size + 5"
     );
 
-    // No explicit limit → clamps to max_page_size (primary outcome).
     let page = svc.list_versions(&ctx, t0.file_id, None, 0).await.unwrap();
     assert_eq!(page.len() as u64, max_page_size);
 
-    // Secondary artifact: the page is exactly the newest `max_page_size`
-    // versions, newest-first — the last `max_page_size` created ids, in
-    // reverse creation order.
     let expected: Vec<Uuid> = created
         .iter()
         .rev()
@@ -538,7 +499,6 @@ async fn list_versions_caps_at_max_page_size() {
     let actual: Vec<Uuid> = page.iter().map(|v| v.version_id).collect();
     assert_eq!(actual, expected, "must be the newest-first page");
 
-    // A caller-supplied limit above max_page_size is still clamped.
     let clamped = svc
         .list_versions(&ctx, t0.file_id, Some(max_page_size + 100), 0)
         .await
@@ -546,18 +506,11 @@ async fn list_versions_caps_at_max_page_size() {
     assert_eq!(clamped.len() as u64, max_page_size);
 }
 
-// ── P2 2.7: delete_version vs bind race cannot dangle `files.content_id` ────
-
-/// Deleting the version `content_id` currently points at must be rejected
-/// (`Conflict`/`version_not_found`), and the row must survive.
-///
-/// @cpt-cf-file-storage-fr-audit-trail
 #[tokio::test]
 async fn delete_current_version_is_rejected() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    // v1 = A, bound as current.
     let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
     dp.put_content(
         &ctx,
@@ -572,7 +525,6 @@ async fn delete_current_version_is_rejected() {
         .await
         .unwrap();
 
-    // v2 = B, a second version, so the file is multi-version but A stays current.
     let t2 = svc.presign_version(&ctx, t1.file_id).await.unwrap();
     dp.put_content(
         &ctx,
@@ -584,7 +536,6 @@ async fn delete_current_version_is_rejected() {
     .await
     .unwrap();
 
-    // Deleting A (current) must be rejected, not silently succeed.
     let err = svc
         .delete_version(&ctx, t1.file_id, t1.version_id)
         .await
@@ -597,7 +548,6 @@ async fn delete_current_version_is_rejected() {
         "expected Conflict or VersionNotFound, got {err:?}"
     );
 
-    // The row must survive and content_id must still resolve.
     let versions = svc.list_versions(&ctx, t1.file_id, None, 0).await.unwrap();
     assert!(
         versions.iter().any(|v| v.version_id == t1.version_id),
@@ -607,20 +557,13 @@ async fn delete_current_version_is_rejected() {
     assert_eq!(file.content_id, Some(t1.version_id));
 }
 
-/// Deterministic reproduction of the pre-fix dangle: a version's "is this
-/// current?" check (as `delete_version` performs it, against a pre-transaction
-/// snapshot) can go stale if a concurrent `bind` promotes that exact version
-/// to current afterwards. This drives the store/repo layer directly, in the
-/// exact order such a race would leave things, to prove the DB-level guard
-/// (P2 2.7) refuses the delete instead of leaving `files.content_id` dangling
-/// — the outer service call cannot reach this window in a single-threaded
-/// test, since its own checks are always freshly re-read.
+/// Reproduces a stale "is current?" snapshot: a concurrent `bind` promotes the version after the
+/// check. Driven via the store directly; the DB-level guard must refuse the delete.
 #[tokio::test]
 async fn delete_version_then_bind_cannot_dangle() {
     let (svc, dp, store) = build_service_with_page_sizes(50, 1000).await;
     let ctx = ctx(Uuid::now_v7());
 
-    // v1 = A, bound as current.
     let t1 = svc.create_file(&ctx, new_file(), None).await.unwrap();
     dp.put_content(
         &ctx,
@@ -635,8 +578,6 @@ async fn delete_version_then_bind_cannot_dangle() {
         .await
         .unwrap();
 
-    // v2 = B, uploaded but not yet current — this is the version a would-be
-    // "T1" observed as non-current before racing ahead to delete it.
     let t2 = svc.presign_version(&ctx, t1.file_id).await.unwrap();
     dp.put_content(
         &ctx,
@@ -650,7 +591,6 @@ async fn delete_version_then_bind_cannot_dangle() {
     let pre_bind = store.get_version(t1.file_id, t2.version_id).await.unwrap();
     assert_eq!(pre_bind.map(|v| v.is_current), Some(false));
 
-    // "T2" wins the race: bind promotes B to current before T1's delete lands.
     let cur = svc.get_file(&ctx, t1.file_id).await.unwrap();
     svc.bind(
         &ctx,
@@ -661,11 +601,8 @@ async fn delete_version_then_bind_cannot_dangle() {
     .await
     .unwrap();
 
-    // "T1"'s delete of B now executes, against the store directly (bypassing
-    // FileService::delete_version's own — necessarily fresh, in this
-    // single-threaded test — pre-check) to simulate the delete landing after
-    // the interleaved bind. Pre-fix this deleted the row unconditionally;
-    // post-fix the DB-level `is_current = false` guard refuses it.
+    // Delete via the store, bypassing the service's fresh pre-check; the
+    // `is_current = false` guard must refuse it.
     let audit = AuditEntry::success(
         ctx.subject_tenant_id(),
         "user",
@@ -683,7 +620,6 @@ async fn delete_version_then_bind_cannot_dangle() {
         "guarded delete of the (now-current) version must not remove the row"
     );
 
-    // content_id must always resolve to an existing version row.
     let file = svc.get_file(&ctx, t1.file_id).await.unwrap();
     assert_eq!(file.content_id, Some(t2.version_id));
     let still_there = store.get_version(t1.file_id, t2.version_id).await.unwrap();
@@ -693,13 +629,8 @@ async fn delete_version_then_bind_cannot_dangle() {
     );
 }
 
-/// P2 1.11: `download_url`'s minted `op = get` token must carry the
-/// version's real stored MIME and content ETag as `content_type`/`etag`
-/// claims, so the sidecar (no DB access) can echo real `Content-Type`/`ETag`
-/// response headers. Decodes the token's base64url JSON payload directly —
-/// acceptable in a test asserting the minter's own internal contract, even
-/// though the token is otherwise opaque to every other party (ADR-0004's
-/// Token Opacity Contract).
+/// The `op = get` token must carry the version's stored MIME and `ETag` as `content_type`/`etag`
+/// claims; the payload is decoded directly.
 #[tokio::test]
 async fn download_url_token_carries_version_mime_and_etag() {
     let (svc, dp) = build_service().await;

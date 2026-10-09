@@ -1,10 +1,3 @@
-//! Unit tests for the data-plane sidecar binary ([`super`]).
-//!
-//! Kept in a sibling `_tests.rs` file per the `de1101_tests_in_separate_files`
-//! repo lint. Linked into `sidecar.rs` via
-//! `#[path = "sidecar_tests.rs"] mod tests;`, so the module sees `sidecar.rs`
-//! as `super`.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -41,7 +34,7 @@ fn test_state() -> SidecarState {
         verifier: std::sync::Arc::new(issuer.verifier()),
         backends,
         control_base_url: String::new(),
-        internal_token: None,
+        internal_token: "test-internal-token".to_owned(),
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
     }
@@ -61,9 +54,6 @@ async fn sidecar_healthz_returns_200() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-/// P2 1.6: `/readyz` must report `200 "ready"` when every configured
-/// backend's `is_ready` succeeds — here a `LocalFsBackend` rooted at a real,
-/// existing temp directory.
 #[tokio::test]
 async fn sidecar_readyz_returns_200_when_backends_ready() {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -78,7 +68,7 @@ async fn sidecar_readyz_returns_200_when_backends_ready() {
         verifier: Arc::new(issuer.verifier()),
         backends,
         control_base_url: String::new(),
-        internal_token: None,
+        internal_token: "test-internal-token".to_owned(),
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
     };
@@ -100,15 +90,11 @@ async fn sidecar_readyz_returns_200_when_backends_ready() {
     assert_eq!(&body[..], b"ready");
 }
 
-/// P2 1.6: `/readyz` must report `503` naming the failing backend id (and
-/// only the id — never the underlying OS error string) when a backend's root
-/// has gone missing (e.g. an unmounted volume).
 #[tokio::test]
 async fn sidecar_readyz_returns_503_when_backend_root_missing() {
     let dir = tempfile::tempdir().expect("create temp dir");
     let missing_root = dir.path().join("does-not-exist");
-    // `dir` itself is dropped here too, so `missing_root`'s parent is gone as
-    // well — belt-and-braces against the root ever accidentally existing.
+    // `dir` is dropped too, so the parent of `missing_root` is gone as well.
     drop(dir);
 
     let issuer = Issuer::generate(60).expect("issuer generation");
@@ -122,7 +108,7 @@ async fn sidecar_readyz_returns_503_when_backend_root_missing() {
         verifier: Arc::new(issuer.verifier()),
         backends,
         control_base_url: String::new(),
-        internal_token: None,
+        internal_token: "test-internal-token".to_owned(),
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
     };
@@ -153,10 +139,8 @@ async fn sidecar_readyz_returns_503_when_backend_root_missing() {
     );
 }
 
-/// Regression guard for step 1.2(a): a body over axum's blanket 2 MiB
-/// `DefaultBodyLimit` must reach the handler (and be rejected there for an
-/// unrelated reason — missing token) rather than being rejected by the
-/// transport layer with a bare `413` before any handler code runs.
+/// A body over axum's default 2 MiB limit must reach the handler (401 for a missing token),
+/// not be rejected with a bare `413` by the transport layer.
 #[tokio::test]
 async fn sidecar_body_limit_allows_bodies_over_2mib() {
     let router = build_router(test_state(), DEFAULT_MAX_BODY_BYTES);
@@ -173,22 +157,12 @@ async fn sidecar_body_limit_allows_bodies_over_2mib() {
         )
         .await
         .expect("router call succeeds");
-    // No `fs-token` supplied: the handler itself rejects with 401. If the
-    // `DefaultBodyLimit` layer were still capped at 2 MiB, this would be a
-    // `413` from axum's extractor instead, before `extract_token` ever runs.
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// P2 1.5: a control plane that accepts the TCP connection but never
-/// responds must not hang the finalize callback indefinitely — each
-/// attempt's client-configured `reqwest` timeout must trip and, since a
-/// timeout is itself retried up to `CALLBACK_MAX_ATTEMPTS` times, the
-/// call must still return `Err` well within the test's own budget (a
-/// small per-attempt timeout keeps `attempts * timeout + retry delays`
-/// comfortably under that budget). The `tokio::time::timeout` wrapping
-/// the call belongs to the *test*, not production: it exists so this
-/// test fails fast (instead of hanging the suite) if the production
-/// timeout regresses.
+/// A control plane that accepts but never responds must not hang the finalize callback:
+/// per-attempt timeouts trip, retries are exhausted and `Err` is returned. The outer
+/// `tokio::time::timeout` only makes a regression fail fast.
 #[tokio::test]
 async fn finalize_callback_times_out_within_configured_bound() {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -196,8 +170,7 @@ async fn finalize_callback_times_out_within_configured_bound() {
         .expect("bind mock listener");
     let addr = listener.local_addr().expect("local addr");
 
-    // Accept connections but never write a response, so the client's
-    // read times out rather than erroring immediately.
+    // Accept connections but never respond, so the client read times out.
     tokio::spawn(async move {
         let mut held = Vec::new();
         while let Ok((stream, _)) = listener.accept().await {
@@ -238,14 +211,9 @@ async fn finalize_callback_times_out_within_configured_bound() {
     );
 }
 
-/// P2 1.5: a transient connection-refused failure on the first attempt
-/// must be retried, and the callback must succeed once the control plane
-/// becomes reachable — without the caller ever seeing the transient
-/// failure.
 #[tokio::test]
 async fn finalize_callback_retries_on_connection_refused_then_succeeds() {
-    // Reserve a free port, then release it immediately: connecting to it
-    // while nothing is listening reliably yields ECONNREFUSED on loopback.
+    // Reserve a free port and release it: connecting then yields ECONNREFUSED.
     let probe = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind probe listener");
@@ -255,8 +223,7 @@ async fn finalize_callback_retries_on_connection_refused_then_succeeds() {
     let accepted = Arc::new(AtomicUsize::new(0));
     let accepted_clone = Arc::clone(&accepted);
 
-    // Give the first (connection-refused) attempt time to fail before a
-    // real listener claims the same address and answers 200 OK.
+    // Let the first attempt fail before a real listener claims the address.
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let listener = TcpListener::bind(addr)
@@ -309,11 +276,7 @@ async fn finalize_callback_retries_on_connection_refused_then_succeeds() {
     );
 }
 
-/// Build a `SidecarState` wired to a fresh `InMemoryBackend`, plus the
-/// `Issuer` that must be used to mint tokens the state's verifier accepts
-/// (P2 1.11's download tests need to mint real `op = get` tokens, unlike
-/// the pre-existing tests above which only exercise the missing-token
-/// path).
+/// `SidecarState` over a fresh `InMemoryBackend`, plus an `Issuer` its verifier accepts.
 fn test_download_state() -> (SidecarState, Issuer, Arc<InMemoryBackend>) {
     let issuer = Issuer::generate(60).expect("issuer generation");
     let backend = Arc::new(InMemoryBackend::new("test"));
@@ -326,23 +289,19 @@ fn test_download_state() -> (SidecarState, Issuer, Arc<InMemoryBackend>) {
         verifier: Arc::new(issuer.verifier()),
         backends,
         control_base_url: String::new(),
-        internal_token: None,
+        internal_token: "test-internal-token".to_owned(),
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
     };
     (state, issuer, backend)
 }
 
-/// Mint a signed `op = get` download token for `(file_id, version_id, backend_path)`,
-/// carrying no `content_type`/`etag` claims (P2 1.11 old-token-compat shape;
-/// most pre-existing download tests only care about range/status behavior).
+/// Signed `op = get` token with no `content_type`/`etag` claims (old-token shape).
 fn download_token(issuer: &Issuer, file_id: Uuid, version_id: Uuid, backend_path: &str) -> String {
     download_token_with_meta(issuer, file_id, version_id, backend_path, "", "")
 }
 
-/// Mint a signed `op = get` download token for `(file_id, version_id,
-/// backend_path)`, additionally carrying `content_type`/`etag` claims (P2
-/// 1.11). Passing empty strings for both reproduces a pre-1.11 token.
+/// Signed `op = get` token with `content_type`/`etag` claims; empty strings give an old token.
 fn download_token_with_meta(
     issuer: &Issuer,
     file_id: Uuid,
@@ -369,10 +328,7 @@ fn download_token_with_meta(
         .expect("issue download token")
 }
 
-/// P2 1.11: a sub-range `GET` must come back as `206` with a correct
-/// `Content-Range: bytes {start}-{end}/{total}` and the exact byte slice
-/// requested — previously the sidecar returned `206` with no
-/// `Content-Range` at all, which corrupts resumable-download reassembly.
+/// A sub-range `GET` returns `206` with a correct `Content-Range` and the exact slice.
 #[tokio::test]
 async fn download_range_response_includes_content_range() {
     let (state, issuer, backend) = test_download_state();
@@ -413,9 +369,6 @@ async fn download_range_response_includes_content_range() {
     assert_eq!(&body[..], b"hello");
 }
 
-/// P2 1.11: a range request against a blob that was never written must be
-/// `404`, not the pre-fix behavior of folding every backend error
-/// (including a missing blob) into `416`.
 #[tokio::test]
 async fn download_missing_blob_returns_404_not_416() {
     let (state, issuer, _backend) = test_download_state();
@@ -444,10 +397,7 @@ async fn download_missing_blob_returns_404_not_416() {
     );
 }
 
-/// P2 1.11: a range past the end of a blob that *does* exist is a genuine
-/// RFC 9110 §14.4 unsatisfiable-range condition — `416` with a
-/// `Content-Range: bytes */{total}` header, distinct from the
-/// missing-blob `404` case above.
+/// A range past the end of an existing blob is `416` with `Content-Range: bytes */{total}`.
 #[tokio::test]
 async fn download_unsatisfiable_range_returns_416_with_content_range() {
     let (state, issuer, backend) = test_download_state();
@@ -483,10 +433,7 @@ async fn download_unsatisfiable_range_returns_416_with_content_range() {
     assert_eq!(content_range, "bytes */11");
 }
 
-/// P2 1.11: a whole-file (`200`) download response must echo the
-/// `content_type`/`etag` claims the control plane stamped onto the token at
-/// download-URL-issuance time, as real `Content-Type`/`ETag` headers — the
-/// sidecar has no DB access, so the token is its only source for either.
+/// The `200` download echoes the token's `content_type`/`etag` claims as headers (no DB access).
 #[tokio::test]
 async fn download_sets_content_type_and_etag_from_claims() {
     let (state, issuer, backend) = test_download_state();
@@ -539,9 +486,6 @@ async fn download_sets_content_type_and_etag_from_claims() {
     );
 }
 
-/// Same assertion as above, on the `206 Partial Content` path
-/// (`download_range`) — the two response builders must not diverge on how
-/// they resolve `Content-Type`/`ETag` from the claims.
 #[tokio::test]
 async fn download_range_sets_content_type_and_etag_from_claims() {
     let (state, issuer, backend) = test_download_state();
@@ -595,10 +539,7 @@ async fn download_range_sets_content_type_and_etag_from_claims() {
     );
 }
 
-/// Old-token compatibility (P2 1.11): a token minted before `content_type`/
-/// `etag` existed (both empty, the shape `download_token` — and every
-/// pre-1.11 token — produces) must fall back to
-/// [`super::FALLBACK_CONTENT_TYPE`] and omit `ETag` entirely, not error out.
+/// Old tokens (empty claims) fall back to `FALLBACK_CONTENT_TYPE` and omit `ETag`.
 #[tokio::test]
 async fn download_without_meta_claims_falls_back_to_octet_stream_and_no_etag() {
     let (state, issuer, backend) = test_download_state();
@@ -639,12 +580,7 @@ async fn download_without_meta_claims_falls_back_to_octet_stream_and_no_etag() {
     );
 }
 
-/// P2 1.11: when the control plane's finalize endpoint returns an error
-/// response, the sidecar must not forward the raw upstream status/body or
-/// the internal control-plane address to the uploading client — only the
-/// server-side `tracing::error!` (asserted indirectly here by checking
-/// what does *not* appear in the client-facing body) may carry that
-/// detail.
+/// A control-plane finalize error must not leak the upstream status/body or address to the client.
 #[tokio::test]
 async fn finalize_failure_does_not_leak_control_plane_url() {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -706,14 +642,9 @@ async fn finalize_failure_does_not_leak_control_plane_url() {
     );
 }
 
-/// P2 0.1 remaining: when `SidecarState::internal_token` (the
-/// `FS_SIDECAR_INTERNAL_TOKEN`-derived field) is set, the callback request
-/// builder (`post_with_retry`, shared by `finalize_with_control_plane` and
-/// `report_part_with_control_plane`) must attach it as the
-/// `x-fs-internal-token` header. Captured off a raw mock TCP listener since
-/// this is a wire-level assertion, not a `reqwest`-side one.
+/// The callback builder must send the token in `x-fs-internal-token` (raw TCP listener check).
 #[tokio::test]
-async fn finalize_callback_sends_internal_token_header_when_configured() {
+async fn finalize_callback_sends_internal_token_header() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock control plane");
@@ -735,7 +666,7 @@ async fn finalize_callback_sends_internal_token_header_when_configured() {
 
     let mut state = test_state();
     state.control_base_url = format!("http://{addr}");
-    state.internal_token = Some("interim-shared-secret".to_owned());
+    state.internal_token = "interim-shared-secret".to_owned();
 
     let outcome = finalize_with_control_plane(
         &state,
@@ -761,58 +692,6 @@ async fn finalize_callback_sends_internal_token_header_when_configured() {
     );
 }
 
-/// Companion negative control: with `internal_token` unset (the default —
-/// no `FS_SIDECAR_INTERNAL_TOKEN` configured), the callback must not send the
-/// header at all, so it works unmodified against a control plane that has
-/// the internal-credential check disabled.
-#[tokio::test]
-async fn finalize_callback_omits_internal_token_header_when_not_configured() {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock control plane");
-    let addr = listener.local_addr().expect("local addr");
-
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
-            let request_text = String::from_utf8_lossy(&buf[..n]).into_owned();
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                .await
-                .ok();
-            tx.send(request_text).ok();
-        }
-    });
-
-    // `test_state()` leaves `internal_token: None`.
-    let mut state = test_state();
-    state.control_base_url = format!("http://{addr}");
-
-    let outcome = finalize_with_control_plane(
-        &state,
-        "dummy-token",
-        "test-request-id",
-        Uuid::nil(),
-        Uuid::nil(),
-        0,
-        "deadbeef",
-    )
-    .await;
-    assert!(
-        outcome.is_ok(),
-        "finalize must succeed against the mock 200 OK response"
-    );
-
-    let request_text = rx.await.expect("mock control plane must receive a request");
-    assert!(
-        !request_text.to_lowercase().contains("x-fs-internal-token"),
-        "finalize callback must not send x-fs-internal-token when unconfigured: {request_text}"
-    );
-}
-
-/// Mint a signed `op = put` upload token for `(file_id, version_id, backend_id, backend_path)`.
 fn upload_token(
     issuer: &Issuer,
     file_id: Uuid,
@@ -838,7 +717,6 @@ fn upload_token(
         .expect("issue upload token")
 }
 
-/// Mint a signed `op = multipart_part` token.
 #[allow(clippy::too_many_arguments)]
 fn multipart_part_token(
     issuer: &Issuer,
@@ -876,18 +754,8 @@ fn multipart_part_token(
         .expect("issue multipart part token")
 }
 
-/// P2 1.7 Stage 6 regression: `upload_multipart_part` must dispatch to the
-/// backend's own `upload_part` (native multipart) for a
-/// `multipart_native` backend, instead of unconditionally falling back to
-/// the local-fs-style offset-object model. That bug was silent until the
-/// S3 e2e suite (`testing/e2e/suites/file_storage/lifecycle_s3/`) surfaced
-/// it: `CompleteMultipartUpload` 500s against a real S3-compatible
-/// endpoint because no part was ever uploaded via a real `UploadPart`
-/// call. `InMemoryBackend` is `multipart_native: true` too, so this
-/// regression is caught here without needing a live S3 test double: if
-/// `upload_multipart_part` used the offset-object fallback instead, the
-/// final `complete_multipart` call below would fail (zero real parts
-/// would exist in the backend's native multipart session).
+/// `upload_multipart_part` must call the backend's native `upload_part` for `multipart_native`
+/// backends, not the offset-object fallback (else `complete_multipart` would fail).
 #[tokio::test]
 async fn sidecar_multipart_native_backend_dispatches_to_upload_part() {
     let issuer = Issuer::generate(60).expect("issuer generation");
@@ -899,7 +767,7 @@ async fn sidecar_multipart_native_backend_dispatches_to_upload_part() {
         verifier: Arc::new(issuer.verifier()),
         backends,
         control_base_url: String::new(),
-        internal_token: None,
+        internal_token: "test-internal-token".to_owned(),
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
     };
@@ -909,9 +777,7 @@ async fn sidecar_multipart_native_backend_dispatches_to_upload_part() {
     let backend_path = format!("/{file_id}/{version_id}");
     let upload_id = Uuid::now_v7();
 
-    // Mirrors `initiate_multipart_upload` (domain service): call the
-    // backend's own `initiate_multipart` up front and mint each per-part
-    // token with the resulting handle (`MultipartClaims::backend_handle`).
+    // Mirror `initiate_multipart_upload`: initiate on the backend, mint part tokens with it.
     let backend_handle = backend
         .initiate_multipart(&backend_path)
         .await
@@ -990,12 +856,7 @@ async fn sidecar_multipart_native_backend_dispatches_to_upload_part() {
         .expect("part 2 response has an etag")
         .to_owned();
 
-    // Complete the native multipart session directly against the
-    // backend (mirrors what `complete_multipart_upload` does
-    // server-side) — this only succeeds if both parts above actually
-    // landed via `upload_part`, proving the dispatch fix. ADR-0006:
-    // `complete_multipart` takes `(part_number, offset, part_hash, etag)`
-    // and returns the offset-manifest + its root.
+    // Completing the native session succeeds only if both parts landed via `upload_part`.
     let hash1 = file_storage::infra::content::hash::digest_to_array(
         file_storage::infra::content::hash::sha256(&part1),
     );
@@ -1023,8 +884,6 @@ async fn sidecar_multipart_native_backend_dispatches_to_upload_part() {
         "assembled object must be the exact concatenation of the two parts"
     );
 
-    // The returned root is the offset-manifest composite (ADR-0006 mode 2),
-    // independently reproducible from the per-part digests/offsets.
     let expected_manifest = file_storage::infra::content::hash_mode::Manifest::new(vec![
         file_storage::infra::content::hash_mode::ManifestEntry {
             offset: 0,
@@ -1047,12 +906,7 @@ async fn sidecar_multipart_native_backend_dispatches_to_upload_part() {
     );
 }
 
-/// Review nitpick fix (PR #4184): an *undersized* multipart part
-/// (client streamed fewer bytes than the token's `size` claim) is a
-/// client mismatch — `400 Bad Request` — not `413 Payload Too Large`
-/// (413 is reserved for a body that *exceeds* a limit, which the
-/// mid-stream guard above already catches). Covers the `multipart_native`
-/// write path (`write_multipart_part_native`).
+/// An undersized part (fewer bytes than the token's `size`) is `400`, not `413`.
 #[tokio::test]
 async fn write_multipart_part_native_undersized_returns_400() {
     let backend = InMemoryBackend::new("mem");
@@ -1091,8 +945,6 @@ async fn write_multipart_part_native_undersized_returns_400() {
     );
 }
 
-/// Same fix as above, for the non-native offset-object write path
-/// (`write_multipart_part_offset_object`, e.g. `LocalFsBackend`).
 #[tokio::test]
 async fn write_multipart_part_offset_object_undersized_returns_400() {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -1128,12 +980,7 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
     );
 }
 
-/// Stage 5 regression test (P2 1.7.2): the sidecar must dispatch each
-/// upload to the backend named by the verified token's `claims.backend_id`
-/// — not always the same hardcoded backend, which was the bug this stage
-/// fixes (`SidecarState` previously held a single `backend` field, ignored
-/// by every handler's `claims.backend_id`). Uses two differently-tagged
-/// in-memory backends so no S3 test double is needed.
+/// Each upload goes to the backend named by the token's `claims.backend_id`.
 #[tokio::test]
 async fn sidecar_resolves_backend_by_claims_backend_id() {
     let issuer = Issuer::generate(60).expect("issuer generation");
@@ -1151,7 +998,7 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
         verifier: Arc::new(issuer.verifier()),
         backends,
         control_base_url: String::new(),
-        internal_token: None,
+        internal_token: "test-internal-token".to_owned(),
         http: reqwest::Client::new(),
         metrics: Arc::new(NoopMetrics),
     };
@@ -1193,8 +1040,6 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
         .expect("router call succeeds");
     assert_eq!(response_b.status(), StatusCode::OK);
 
-    // Assert the bytes landed in the backend the TOKEN named, not always
-    // the same one — via each backend's own `list_paths()`/`get()`.
     let a_paths = backend_a.list_paths().await.expect("list local-fs paths");
     assert!(
         a_paths.contains(&path_a),
@@ -1226,8 +1071,6 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
     assert_eq!(&got_b[..], b"bytes-for-other");
 }
 
-/// Spawn a mock control plane that answers every request with `500` and
-/// return its base URL.
 async fn failing_control_plane() -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1247,7 +1090,6 @@ async fn failing_control_plane() -> String {
     format!("http://{addr}")
 }
 
-/// `op = multipart_part` claims for part 1, `size` bytes, at `backend_path`.
 fn part_claims(backend_id: &str, backend_path: &str, size: u64, backend_handle: String) -> Claims {
     Claims {
         op: Op::MultipartPart,
@@ -1270,8 +1112,6 @@ fn part_claims(backend_id: &str, backend_path: &str, size: u64, backend_handle: 
     }
 }
 
-/// A part that streams past its `size` claim is refused mid-stream with
-/// `413`, before anything reaches the native backend.
 #[tokio::test]
 async fn write_multipart_part_native_oversized_returns_413() {
     let backend = InMemoryBackend::new("mem");
@@ -1287,7 +1127,6 @@ async fn write_multipart_part_native_oversized_returns_413() {
     assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
-/// A body stream that errors part-way is the client's failure: `400`.
 #[tokio::test]
 async fn write_multipart_part_native_body_read_error_returns_400() {
     let backend = InMemoryBackend::new("mem");
@@ -1318,7 +1157,6 @@ async fn write_multipart_part_native_backend_failure_returns_500() {
     assert_eq!(err.body, "backend error");
 }
 
-/// The offset-object path maps the backend's `max_size` refusal to `413`.
 #[tokio::test]
 async fn write_multipart_part_offset_object_oversized_returns_413() {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -1350,8 +1188,6 @@ async fn write_multipart_part_offset_object_backend_failure_returns_500() {
     assert_eq!(err.body, "backend error");
 }
 
-/// An unreachable control plane fails the report-part callback with `502`
-/// once the retries are spent.
 #[tokio::test]
 async fn report_part_callback_unreachable_returns_502() {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -1381,7 +1217,6 @@ async fn report_part_callback_unreachable_returns_502() {
     assert_eq!(err.body, "report failed");
 }
 
-/// A failed finalize callback reaches the client as the upload's `502`.
 #[tokio::test]
 async fn upload_returns_502_when_finalize_fails() {
     let (mut state, issuer, _backend) = test_download_state();

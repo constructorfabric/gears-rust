@@ -1,7 +1,4 @@
-//! Wire-format tests for [`Manifest`] (ADR-0006 §3). Per the staged plan,
-//! this is "the single most important test in the project" — the concrete
-//! proof that the manifest grammar is byte-for-byte unambiguous across
-//! independent implementations.
+//! Wire-format tests for `Manifest` (ADR-0006): the grammar must be byte-for-byte unambiguous.
 
 use sha2::{Digest, Sha256};
 
@@ -30,10 +27,8 @@ fn sample_entries() -> Vec<ManifestEntry> {
     ]
 }
 
-/// Hand-written expected wire string for [`sample_entries`], built without
-/// going through `Manifest` at all — an independent encoding using only
-/// `hex::encode` and plain string formatting, so this test cannot pass by
-/// tautology against `to_wire_string`'s own implementation.
+/// Hand-written expected wire string for `sample_entries`, independent of `Manifest`,
+/// so the test cannot pass by tautology.
 fn expected_wire_string(entries: &[ManifestEntry]) -> String {
     let mut s = String::from("v1");
     for e in entries {
@@ -45,8 +40,6 @@ fn expected_wire_string(entries: &[ManifestEntry]) -> String {
     s
 }
 
-// ── (a) fixed (offset, digest) pairs → exact expected wire string ─────────
-
 #[test]
 fn to_wire_string_matches_hand_written_expected_string_exactly() {
     let entries = sample_entries();
@@ -54,8 +47,6 @@ fn to_wire_string_matches_hand_written_expected_string_exactly() {
     let expected = expected_wire_string(&entries);
     assert_eq!(manifest.to_wire_string(), expected);
 
-    // Spot-check the exact literal shape too, not just self-consistency
-    // against the `expected_wire_string` helper.
     let d0 = hex::encode(entries[0].digest);
     let d1 = hex::encode(entries[1].digest);
     let d2 = hex::encode(entries[2].digest);
@@ -65,7 +56,6 @@ fn to_wire_string_matches_hand_written_expected_string_exactly() {
     );
 }
 
-/// Single-part manifest (the minimum-degenerate case per §3 rule 8).
 #[test]
 fn to_wire_string_single_part_minimal_shape() {
     let digest = digest_of(b"only-part");
@@ -76,16 +66,13 @@ fn to_wire_string_single_part_minimal_shape() {
     );
 }
 
-// ── (b) sha256(to_wire_string()) matches an independently-computed root ────
-
 #[test]
 fn root_matches_independently_computed_reference_sha256() {
     let entries = sample_entries();
     let manifest = Manifest::new(entries.clone()).unwrap();
     let wire = expected_wire_string(&entries);
 
-    // Independent reference: hash the hand-written string directly with a
-    // fresh `Sha256` instance, not through `Manifest::root()`.
+    // Reference hash computed with a fresh `Sha256`, not through `Manifest::root()`.
     let reference_root: [u8; 32] = {
         let mut hasher = Sha256::new();
         hasher.update(wire.as_bytes());
@@ -94,8 +81,6 @@ fn root_matches_independently_computed_reference_sha256() {
 
     assert_eq!(manifest.root(), reference_root);
 }
-
-// ── (c) round-trip encode → decode → re-encode is byte-identical ──────────
 
 #[test]
 fn round_trip_encode_decode_reencode_is_byte_identical() {
@@ -118,8 +103,6 @@ fn from_wire_string_recovers_exact_entries() {
     assert_eq!(parsed.entries(), entries.as_slice());
     assert_eq!(parsed.len(), 3);
 }
-
-// ── (d) parser rejects malformed input ─────────────────────────────────────
 
 #[test]
 fn rejects_bad_version_prefix() {

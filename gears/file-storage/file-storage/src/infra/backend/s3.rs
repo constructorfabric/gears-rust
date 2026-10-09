@@ -1,28 +1,9 @@
-//! S3-compatible storage backend
-//! (`cpt-cf-file-storage-fr-backend-abstraction`, ADR-0005
-//! `cpt-cf-file-storage-adr-s3-client-selection`).
+//! S3-compatible storage backend (ADR-0005).
 //!
-//! Requests are **signed** by `rusty-s3` (a sign-only, Sans-IO request builder —
-//! it never performs I/O itself) and **executed** by this gear's existing
-//! `reqwest` client. S3's XML response/error bodies are parsed in-house via
-//! `quick-xml`, per the ADR.
-//!
-//! ## Dependency-feature deviation (Stage 0, recorded here per plan.md)
-//! `rusty-s3` gates its `ListObjectsV2`/`CreateMultipartUpload`/
-//! `CompleteMultipartUpload` **action builders** (not just their bundled
-//! response-parsing types) behind the `full` cargo feature — disabling it
-//! removes the ability to construct those requests at all, not just their
-//! response parsing. `full` is therefore enabled (alongside `aws-lc-rs`, reused
-//! from the workspace's existing TLS stack rather than adding `rustcrypto`).
-//! This module never uses rusty-s3's own `instant-xml`-based response types
-//! (e.g. `ListObjectsV2Response`); every S3 response body this backend reads is
-//! parsed with `quick-xml` directly, matching the ADR's intent.
-//!
-//! ## `reqwest::Client` ownership
-//! `S3Backend` constructs its own `reqwest::Client` internally (cheap: the
-//! client is a thin `Arc` handle). Stage 4/5 callers may switch to injecting a
-//! shared client if that proves more convenient once those call sites exist;
-//! nothing about this stage's trait contract depends on which is chosen.
+//! Requests are signed by `rusty-s3` (sign-only, no I/O) and executed by a `reqwest` client
+//! owned by the backend. S3 XML response/error bodies are parsed with `quick-xml`; rusty-s3's
+//! own `instant-xml` response types are deliberately unused. rusty-s3's `full` feature is
+//! enabled because it also gates the `ListObjectsV2`/multipart action builders.
 
 use std::fmt;
 use std::time::Duration;
@@ -44,44 +25,27 @@ use super::{
     BackendCapabilities, MultipartCompletionPart, StorageBackend, build_manifest_and_root,
 };
 
-/// Expiry for the presigned URLs this backend signs. Requests execute
-/// immediately after signing (there is no user-facing redirect), so this only
-/// needs to survive clock skew plus the request's own latency.
+/// Expiry of signed URLs; requests execute immediately, so it only covers clock skew and latency.
 const SIGN_DURATION: Duration = Duration::from_mins(1);
 
-/// Default `put_stream` multipart threshold: 8 MiB, comfortably above S3's
-/// own 5 MiB minimum part size, so a real S3 never rejects a part this
-/// backend produces. Also used as the part size once multipart is underway.
-/// Tests override this (via `with_multipart_threshold_bytes`) with a small
-/// value so they can exercise the multipart path without generating
-/// megabytes of data.
+/// Default `put_stream` multipart threshold and part size: 8 MiB, above S3's 5 MiB minimum
+/// part size so S3 never rejects a part. Tests shrink it via `with_multipart_threshold_bytes`.
 const DEFAULT_MULTIPART_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
-/// An S3-compatible storage backend. Talks to any S3-compatible HTTP API
-/// (real AWS S3, `MinIO`, `s3s-fs` in tests) via path-style addressing.
+/// An S3-compatible storage backend (AWS S3, `MinIO`, `s3s-fs`) using path-style addressing.
 pub struct S3Backend {
     id: String,
     bucket: rusty_s3::Bucket,
     credentials: rusty_s3::Credentials,
     http: reqwest::Client,
-    /// Page size passed as `max-keys` to `ListObjectsV2`. `None` leaves the
-    /// server's own default (S3: up to 1000 keys per page) in effect. Tests
-    /// use a small value to exercise `list_paths`'s continuation-token
-    /// pagination loop without seeding hundreds of real objects.
+    /// `max-keys` for `ListObjectsV2`; `None` keeps the server default (S3: up to 1000).
     list_page_size: Option<u16>,
-    /// `put_stream`'s threshold (in bytes) between a single buffered
-    /// `PutObject` and driving a native multipart upload; also used as the
-    /// part size once multipart is underway. See `DEFAULT_MULTIPART_THRESHOLD_BYTES`.
+    /// Bytes at which `put_stream` switches from one `PutObject` to multipart; also the part size.
     multipart_threshold_bytes: u64,
 }
 
 impl S3Backend {
-    /// Construct a new S3 backend.
-    ///
-    /// `endpoint` is the S3-compatible HTTP(S) endpoint (path-style
-    /// addressing is used throughout, i.e. `UrlStyle::Path` — matches
-    /// `s3s-fs`/MinIO-style deployments as well as real S3 when path-style is
-    /// explicitly requested).
+    /// Creates a backend for the S3-compatible `endpoint`, always with path-style addressing.
     pub fn new(
         id: impl Into<String>,
         endpoint: url::Url,
@@ -109,44 +73,30 @@ impl S3Backend {
         })
     }
 
-    /// Override `ListObjectsV2`'s `max-keys` page size. Defaults to `None`
-    /// (server default, up to 1000). Exposed for tests that need to exercise
-    /// pagination without seeding hundreds of objects.
+    /// Overrides `ListObjectsV2`'s `max-keys` page size (for pagination tests).
     #[must_use]
     pub fn with_list_page_size(mut self, n: u16) -> Self {
         self.list_page_size = Some(n);
         self
     }
 
-    /// Override `put_stream`'s multipart threshold/part size. Defaults to
-    /// `DEFAULT_MULTIPART_THRESHOLD_BYTES` (8 MiB). Exposed for tests that
-    /// need to exercise the multipart `put_stream` path without generating
-    /// megabytes of data.
+    /// Overrides `put_stream`'s multipart threshold/part size (for multipart tests).
     #[must_use]
     pub fn with_multipart_threshold_bytes(mut self, n: u64) -> Self {
         self.multipart_threshold_bytes = n;
         self
     }
 
-    /// Build an `S3Backend` from a `config::S3BackendConfig` entry (P2 1.7.3
-    /// config wiring). Shared by `gear.rs`'s `build_backend_registry` and the
-    /// sidecar's `FS_SIDECAR_S3_BACKENDS` parsing so the two don't duplicate
-    /// construction logic.
+    /// Builds a backend from a `config::S3BackendConfig` entry; performs no I/O.
     ///
-    /// - `endpoint: None` derives a real-AWS endpoint from `region`
-    ///   (`https://s3.{region}.amazonaws.com`); `Some(url)` is used verbatim
-    ///   (`MinIO`/`s3s-fs`/any other S3-compatible endpoint).
-    /// - Credentials fall back to the standard `AWS_ACCESS_KEY_ID`/
-    ///   `AWS_SECRET_ACCESS_KEY` environment variables when the config entry
-    ///   itself leaves them unset — a deliberately simple fallback, not a
-    ///   full IMDS/profile chain.
-    /// - `cfg.path_style` is currently accepted but not forwarded: this
-    ///   constructor always builds a path-style `rusty_s3::Bucket` (see
-    ///   `S3BackendConfig::path_style`'s doc comment for why that's still
-    ///   correct against real S3 too).
-    /// - Performs no I/O — invalid input (a bad endpoint URL, missing
-    ///   credentials with no environment fallback) surfaces as a returned
-    ///   `Err`, never a panic, so a caller can treat it as an init-time error.
+    /// - `endpoint: None` becomes `https://s3.{region}.amazonaws.com`; `Some(url)` is used as is.
+    /// - Missing credentials fall back to `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (no
+    ///   IMDS/profile chain).
+    /// - `cfg.path_style` is not forwarded: the bucket is always path-style.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid endpoint URL or missing credentials.
     pub fn from_config(cfg: &crate::config::S3BackendConfig) -> Result<Self, DomainError> {
         let endpoint_str = cfg
             .endpoint
@@ -189,16 +139,13 @@ impl S3Backend {
         )
     }
 
-    /// Convert an opaque backend path (e.g. `/{file_id}/{version_id}`) into
-    /// the S3 object key used for every operation (S3 keys never start with
-    /// `/`). This is the exact inverse of `key_to_path` — every path must
-    /// round-trip through `put` -> `list_paths` and compare equal.
+    /// Converts a backend path (`/{file_id}/{version_id}`) to an S3 key (no leading `/`);
+    /// exact inverse of `key_to_path`.
     fn path_to_key(path: &str) -> &str {
         path.strip_prefix('/').unwrap_or(path)
     }
 
-    /// Convert an S3 object key (as returned by `ListObjectsV2`) back into
-    /// this gear's opaque backend-path convention. Inverse of `path_to_key`.
+    /// Converts an S3 key back to a backend path; inverse of `path_to_key`.
     fn key_to_path(key: &str) -> String {
         format!("/{key}")
     }
@@ -207,9 +154,8 @@ impl S3Backend {
         DomainError::backend(&self.id, e.to_string())
     }
 
-    /// Build a `DomainError` from a non-2xx response, parsing the S3 XML error
-    /// body (`<Error><Code>...</Code><Message>...</Message></Error>`) via
-    /// `quick-xml` when a body is present (HEAD responses never carry one).
+    /// Maps a non-2xx response to a `DomainError`, using the S3 XML error body if present
+    /// (HEAD responses have none).
     fn s3_error(&self, status: StatusCode, body: &[u8]) -> DomainError {
         match parse_error_body(body) {
             Some((code, message)) => {
@@ -219,8 +165,7 @@ impl S3Backend {
         }
     }
 
-    /// Send a request that may carry an S3 XML error body on failure
-    /// (everything except HEAD). Returns the raw success body.
+    /// Sends a non-HEAD request and returns the success body; non-2xx becomes an error.
     async fn send_and_check(&self, req: reqwest::RequestBuilder) -> Result<Bytes, DomainError> {
         let resp = req.send().await.map_err(|e| self.transport_err(&e))?;
         let status = resp.status();
@@ -236,14 +181,9 @@ impl S3Backend {
         DomainError::backend(&self.id, format!("HEAD {path} failed: {status}"))
     }
 
-    /// POST a `CompleteMultipartUpload` request that assembles `parts`
-    /// (defensively sorted ascending by part number) into the final object.
-    /// This does **not** re-read the assembled object to hash it: both
-    /// callers already hold what they need without a re-download — `put_stream`
-    /// hashed the whole object incrementally as it uploaded, and
-    /// `complete_multipart` builds the ADR-0006 offset-manifest root from the
-    /// per-part digests it was handed. Either way a large multipart upload
-    /// stays a single pass over the bytes instead of upload-then-re-download.
+    /// POSTs `CompleteMultipartUpload` for `parts` (sorted by part number). Never re-reads the
+    /// assembled object: callers already hold the digest (`put_stream` hashes incrementally,
+    /// `complete_multipart` builds the ADR-0006 manifest root from per-part digests).
     async fn finalize_multipart(
         &self,
         path: &str,
@@ -269,8 +209,7 @@ impl S3Backend {
 }
 
 impl fmt::Debug for S3Backend {
-    /// Manual `Debug`, redacting `credentials` (mirrors
-    /// `FileStorageConfig`'s manual `Debug` impl's secret-redaction pattern).
+    /// Manual `Debug` that redacts `credentials`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("S3Backend")
             .field("id", &self.id)
@@ -279,8 +218,6 @@ impl fmt::Debug for S3Backend {
             .field("credentials", &"<redacted>")
             .field("list_page_size", &self.list_page_size)
             .field("multipart_threshold_bytes", &self.multipart_threshold_bytes)
-            // `reqwest::Client` has no useful `Debug` output of its own beyond
-            // internal connection-pool state; omit it explicitly.
             .finish_non_exhaustive()
     }
 }
@@ -310,19 +247,11 @@ impl StorageBackend for S3Backend {
         Ok(())
     }
 
-    /// Streams `stream` into `path` without ever buffering the whole object
-    /// in memory once it crosses `multipart_threshold_bytes`: below the
-    /// threshold, the (small) object is buffered whole and written with one
-    /// `PutObject`; above it, this drives a native multipart upload, holding
-    /// at most one part's worth of bytes beyond the current chunk at a time.
-    /// The SHA-256 digest is computed incrementally as bytes arrive
-    /// (`hash::Hasher`), and `max_size` is enforced the moment the running
-    /// total exceeds it — mid-stream, before any extra part is flushed. If a
-    /// multipart upload was already initiated when the stream fails (a
-    /// transport error or a `max_size` violation) or when finishing the
-    /// upload fails (uploading the final part / `CompleteMultipartUpload`),
-    /// the multipart session is aborted so no orphaned session or partial
-    /// object is left behind.
+    /// Streams into `path`: below `multipart_threshold_bytes` the object is buffered and
+    /// written with one `PutObject`; above it a native multipart upload runs, holding at most
+    /// one part plus the current chunk in memory. SHA-256 is computed incrementally and
+    /// `max_size` is enforced mid-stream. Any failure after the multipart upload was initiated
+    /// aborts it, leaving no orphaned session or partial object.
     async fn put_stream(
         &self,
         path: &str,
@@ -334,11 +263,8 @@ impl StorageBackend for S3Backend {
         let mut upload_handle: Option<String> = None;
         let mut parts: Vec<(u32, String)> = Vec::new();
         let mut next_part_number: u32 = 1;
-        // Byte offset of the next part within the object. `put_stream`
-        // produces a `whole-sha256` version (the digest is computed
-        // incrementally over the whole stream, not from an offset-manifest),
-        // so this is threaded purely to satisfy `upload_part`'s ADR-0006
-        // signature; it is never used to build a manifest on this path.
+        // Only satisfies `upload_part`'s ADR-0006 signature: this path hashes the whole
+        // stream and never builds an offset manifest.
         let mut next_part_offset: u64 = 0;
 
         let collect_result: Result<(), DomainError> = async {
@@ -350,9 +276,7 @@ impl StorageBackend for S3Backend {
                     return Err(DomainError::validation("size", "exceeds max_size"));
                 }
 
-                // Flush full part-sized chunks as they accumulate, so at most
-                // one part's worth of bytes (plus the current chunk) is ever
-                // held in memory beyond what's already been shipped.
+                // Flush full parts as they accumulate to bound memory.
                 while buf.len() as u64 >= self.multipart_threshold_bytes {
                     if upload_handle.is_none() {
                         upload_handle = Some(self.initiate_multipart(path).await?);
@@ -365,9 +289,7 @@ impl StorageBackend for S3Backend {
                     let part_number = next_part_number;
                     next_part_number += 1;
                     let Some(handle) = upload_handle.as_deref() else {
-                        // Unreachable: `upload_handle` was just set to `Some`
-                        // above if it was `None`. Handled defensively rather
-                        // than via `expect`/`unwrap`.
+                        // Unreachable (set just above); handled without `expect`/`unwrap`.
                         return Err(DomainError::backend(
                             &self.id,
                             "multipart handle missing right after initiation",
@@ -391,8 +313,7 @@ impl StorageBackend for S3Backend {
 
         if let Err(e) = collect_result {
             if let Some(handle) = &upload_handle {
-                // Best-effort cleanup: never leave a dangling multipart
-                // session behind after a rejected/failed stream.
+                // Best-effort cleanup of the multipart session.
                 drop(self.abort_multipart(path, handle).await);
             }
             return Err(e);
@@ -403,8 +324,7 @@ impl StorageBackend for S3Backend {
 
         match upload_handle {
             None => {
-                // Never crossed the threshold: the whole (small) object is
-                // already buffered — issue one PutObject.
+                // Never crossed the threshold: one `PutObject`.
                 self.put(path, Bytes::from(buf)).await?;
                 Ok((bytes_written, digest))
             }
@@ -423,13 +343,8 @@ impl StorageBackend for S3Backend {
                         }
                     }
                 }
-                // Use `finalize_multipart`, not `complete_multipart`, so the
-                // just-assembled object is never re-downloaded just to hash it:
-                // the digest was already computed incrementally as the bytes
-                // were uploaded, and is bit-identical to what re-reading and
-                // hashing the stored object would yield (a test asserts the two
-                // actually agree). This keeps a large streaming upload to a
-                // single pass over the bytes instead of upload-then-re-download.
+                // `finalize_multipart`, not `complete_multipart`: the digest was computed
+                // while uploading, so the object is not re-downloaded to hash it.
                 match self.finalize_multipart(path, &handle, &parts).await {
                     Ok(()) => Ok((bytes_written, digest)),
                     Err(e) => {
@@ -450,13 +365,8 @@ impl StorageBackend for S3Backend {
         self.send_and_check(self.http.get(url)).await
     }
 
-    /// Presign and execute a `GetObject` for `path`, returning the response
-    /// body as a `BoxStream` of chunks (`Response::bytes_stream()`) instead of
-    /// buffering it whole, so a read-back never holds more than one chunk in
-    /// memory at a time regardless of object size. The request itself is sent
-    /// and its status checked eagerly (before returning), so a missing object
-    /// or an S3 error surfaces from this call directly rather than from
-    /// polling the returned stream.
+    /// `GetObject` returned as a chunk stream (at most one chunk in memory). The status is
+    /// checked before returning, so a missing object or S3 error surfaces from this call.
     async fn get_stream(
         &self,
         path: &str,
@@ -485,11 +395,8 @@ impl StorageBackend for S3Backend {
         Ok(Box::pin(stream))
     }
 
-    /// Native range read: signs a plain `GetObject` request and layers an
-    /// **unsigned** `Range` header on top (valid because `Range` is not part
-    /// of `SigV4`'s signed canonical request — ADR-0005's Decision Outcome).
-    /// Builds the header directly from `range` without a prior `HEAD`, so a
-    /// range read never costs more than one round trip.
+    /// Native range read: a signed `GetObject` plus an unsigned `Range` header (allowed, as
+    /// `Range` is not in `SigV4`'s signed canonical request). One round trip, no prior `HEAD`.
     async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
         let header_value = match range {
             ByteRange::Inclusive { start, end } => {
@@ -532,8 +439,7 @@ impl StorageBackend for S3Backend {
         }
     }
 
-    /// Cheap stat via `HeadObject`: reads only the `Content-Length` response
-    /// header, never the object's content.
+    /// Size from the `HeadObject` `Content-Length` header.
     async fn size(&self, path: &str) -> Result<u64, DomainError> {
         let key = Self::path_to_key(path);
         let url = self
@@ -557,11 +463,8 @@ impl StorageBackend for S3Backend {
             .ok_or_else(|| DomainError::backend(&self.id, "HEAD response missing Content-Length"))
     }
 
-    /// `DeleteObject` is idempotent by construction: S3 returns a success
-    /// status for a missing key exactly the same as for a present one, so
-    /// there is no separate "already absent" signal to special-case here
-    /// (unlike `LocalFsBackend`, which checks the filesystem `NotFound` kind).
-    /// Only a genuine transport/auth/5xx error propagates as `Err`.
+    /// Idempotent: S3 returns success for a missing key too, so only transport/auth/5xx
+    /// errors propagate.
     async fn delete(&self, path: &str) -> Result<(), DomainError> {
         let key = Self::path_to_key(path);
         let url = self
@@ -583,10 +486,8 @@ impl StorageBackend for S3Backend {
         }
     }
 
-    /// `HeadObject`-based existence check: 200 -> present, 404 -> absent, any
-    /// other status (403, 5xx, transport failure) propagates as `Err` rather
-    /// than being folded into "missing" (mirrors `LocalFsBackend::exists`'s
-    /// present/missing/error three-way split).
+    /// `HeadObject` check: 200 present, 404 absent; any other status or transport failure is
+    /// an `Err`, not "missing".
     async fn exists(&self, path: &str) -> Result<bool, DomainError> {
         let key = Self::path_to_key(path);
         let url = self
@@ -606,11 +507,7 @@ impl StorageBackend for S3Backend {
         }
     }
 
-    /// `CreateMultipartUpload`: signs and POSTs (empty body, `uploads=1` query
-    /// param baked into the signed URL), then parses the `<UploadId>` out of
-    /// the XML response body via `quick-xml` (deliberately not rusty-s3's own
-    /// `instant-xml`-based `CreateMultipartUploadResponse` — see this module's
-    /// doc comment). The returned string is the opaque handle passed back into
+    /// `CreateMultipartUpload`; the returned `<UploadId>` is the opaque handle for
     /// `upload_part`/`complete_multipart`/`abort_multipart`.
     async fn initiate_multipart(&self, path: &str) -> Result<String, DomainError> {
         let key = Self::path_to_key(path);
@@ -627,12 +524,9 @@ impl StorageBackend for S3Backend {
         })
     }
 
-    /// `UploadPart`: PUTs `data` as the request body. Returns `(backend_etag,
-    /// part_hash_bytes)` — `backend_etag` is S3's own `ETag` response header
-    /// (its surrounding quotes stripped), fed back verbatim into
-    /// `complete_multipart`; `part_hash_bytes` is **this gear's own**
-    /// SHA-256 of `data`, computed locally rather than derived from S3's
-    /// (MD5-based) `ETag`, per the trait's hash convention.
+    /// `UploadPart`. Returns `(backend_etag, part_hash_bytes)`: S3's `ETag` header with quotes
+    /// stripped (fed back into `complete_multipart`) and the locally computed SHA-256 of
+    /// `data` (S3's `ETag` is MD5-based).
     async fn upload_part(
         &self,
         path: &str,
@@ -643,10 +537,7 @@ impl StorageBackend for S3Backend {
     ) -> Result<(String, Vec<u8>), DomainError> {
         let part_hash = hash::sha256(&data);
 
-        // S3's documented limit is 10,000 parts per upload (1..=10_000,
-        // 1-indexed) — narrower than `u16::try_from`'s 65_535 ceiling, so that
-        // conversion alone would silently accept out-of-range part numbers
-        // S3 itself would reject.
+        // S3 allows parts 1..=10_000, narrower than `u16`, so check explicitly.
         if !(1..=10_000).contains(&part_number) {
             return Err(DomainError::validation(
                 "part_number",
@@ -686,24 +577,16 @@ impl StorageBackend for S3Backend {
         Ok((etag, part_hash))
     }
 
-    /// `CompleteMultipartUpload`: builds the request XML body from `parts`'
-    /// backend `ETag`s via `finalize_multipart` (the shared POST helper that
-    /// does **not** re-read the object), then builds the ADR-0006
-    /// offset-manifest and its `root` from the `(offset, part_hash)` pairs the
-    /// caller already collected during upload — **no `GetObject` re-read of the
-    /// assembled object**. This removes the mandatory whole-object re-download
-    /// on every completed multipart upload (S3's own multipart `ETag` is an
-    /// `md5-of-part-md5s` construction and could not serve as this gear's digest
-    /// anyway; the manifest root is a plain SHA-256 construction that a client
-    /// can independently re-derive from object bytes + the returned manifest).
+    /// `CompleteMultipartUpload` via `finalize_multipart`, then the ADR-0006 offset manifest
+    /// and root from the caller's `(offset, part_hash)` pairs. The object is not re-read (S3's
+    /// multipart `ETag` is an MD5-of-MD5s and cannot serve as the digest).
     async fn complete_multipart(
         &self,
         path: &str,
         upload_handle: &str,
         parts: &[MultipartCompletionPart],
     ) -> Result<(Manifest, [u8; 32]), DomainError> {
-        // S3's native completion still needs the (part_number, backend_etag)
-        // pairs to assemble the object; it does not need the offsets/hashes.
+        // S3 needs only the `(part_number, backend_etag)` pairs.
         let etag_parts: Vec<(u32, String)> = parts
             .iter()
             .map(|(part_number, _, _, etag)| (*part_number, etag.clone()))
@@ -711,7 +594,6 @@ impl StorageBackend for S3Backend {
         self.finalize_multipart(path, upload_handle, &etag_parts)
             .await?;
 
-        // @cpt-cf-file-storage-algo-content-hash-modes-build-manifest
         build_manifest_and_root(parts)
     }
 
@@ -726,9 +608,7 @@ impl StorageBackend for S3Backend {
         Ok(())
     }
 
-    /// `ListObjectsV2`, looping on the continuation token until the response
-    /// is no longer truncated. Every returned `Key` is converted back to this
-    /// gear's `"/{file_id}/{version_id}"` path convention via `key_to_path`.
+    /// `ListObjectsV2`, following continuation tokens until the listing is complete.
     async fn list_paths(&self) -> Result<Vec<String>, DomainError> {
         let mut paths = Vec::new();
         let mut continuation_token: Option<String> = None;
@@ -762,26 +642,10 @@ impl StorageBackend for S3Backend {
         Ok(paths)
     }
 
-    /// Readiness probe: `ListObjectsV2` (`max-keys=1`) against the bucket
-    /// itself, not a `HeadObject` against a well-known probe key.
-    ///
-    /// `HeadObject` cannot distinguish "bucket exists, probe key absent"
-    /// from "bucket does not exist (or is misconfigured)": both come back as
-    /// a bare `404` with no body — HEAD responses never carry one, so there
-    /// is nothing in the response to tell `NoSuchBucket` apart from
-    /// `NoSuchKey`. `exists`'s 404-means-absent mapping (correct for its own
-    /// contract) previously leaked into readiness via this method, so a
-    /// missing/misconfigured bucket reported `Ok(false)` — "reachable,
-    /// object absent" — same as the expected steady-state, and `/readyz`
-    /// passed while every real read/write against that backend would fail.
-    ///
-    /// `ListObjectsV2` is bucket-scoped: it returns `200` (with an empty
-    /// `<Contents>` list) for *any* existing, accessible bucket regardless of
-    /// its contents, and a genuine error status (404 `NoSuchBucket`, 403
-    /// `AccessDenied`, etc.) only when the bucket itself is missing or
-    /// inaccessible. `send_and_check` already maps any non-2xx status to
-    /// `Err`, so success/failure of this call alone is the bucket-level
-    /// signal readiness needs — the returned listing body is discarded.
+    /// Readiness probe: `ListObjectsV2` (`max-keys=1`) against the bucket. A `HeadObject` on a
+    /// probe key would not do: its bodyless `404` cannot tell `NoSuchBucket` from `NoSuchKey`,
+    /// so a missing bucket would look healthy. The listing succeeds (even empty) for any
+    /// accessible bucket and errors otherwise; the body is discarded.
     async fn is_ready(&self) -> Result<(), DomainError> {
         let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
         action.with_max_keys(1);
@@ -797,22 +661,14 @@ struct ListObjectsPage {
     next_continuation_token: Option<String>,
 }
 
-/// Text of a `quick-xml` 0.42 event: already UTF-8 (`Deref<Target = str>`),
-/// then XML-unescaped. A broken entity falls back to the raw text, matching
-/// the previous `decode` + `unescape` fallback.
+/// XML-unescaped text of a `quick-xml` event; a broken entity falls back to the raw text.
 fn xml_text(t: &quick_xml::events::BytesText<'_>) -> String {
     let raw = t.as_ref();
     quick_xml::escape::unescape(raw).map_or_else(|_| raw.to_owned(), std::borrow::Cow::into_owned)
 }
 
-/// Parse a `ListObjectsV2` XML response body via `quick-xml`, extracting just
-/// the fields `list_paths` needs. Deliberately does **not** use rusty-s3's own
-/// `ListObjectsV2Response` (`instant-xml`-based) — see this module's doc
-/// comment for why.
-///
-/// Keys are percent-decoded: `rusty_s3::Bucket::list_objects_v2` always
-/// requests `encoding-type=url`, so S3 (and S3-compatible servers) percent-
-/// encode `<Key>` values in the response to keep them XML-safe.
+/// Parses a `ListObjectsV2` response, extracting the fields `list_paths` needs. Keys are
+/// percent-decoded because `rusty_s3` always requests `encoding-type=url`.
 fn parse_list_objects_response(body: &[u8]) -> Result<ListObjectsPage, quick_xml::Error> {
     use quick_xml::Reader;
     use quick_xml::events::Event;
@@ -825,8 +681,7 @@ fn parse_list_objects_response(body: &[u8]) -> Result<ListObjectsPage, quick_xml
     let mut is_truncated = false;
     let mut next_continuation_token = None;
 
-    // `<Key>` is only meaningful while inside `<Contents>` (as opposed to,
-    // e.g., a `<Prefix>` under `<CommonPrefixes>`).
+    // `<Key>` counts only inside `<Contents>`.
     let mut in_contents = false;
     let mut current_tag: Option<String> = None;
 
@@ -868,11 +723,7 @@ fn parse_list_objects_response(body: &[u8]) -> Result<ListObjectsPage, quick_xml
     })
 }
 
-/// Parse `CreateMultipartUpload`'s XML response body
-/// (`<InitiateMultipartUploadResult><UploadId>...</UploadId></InitiateMultipartUploadResult>`)
-/// via `quick-xml`, extracting just the `UploadId`. Deliberately does not use
-/// rusty-s3's own `instant-xml`-based `CreateMultipartUploadResponse` — see
-/// this module's doc comment for why.
+/// Extracts the `UploadId` from a `CreateMultipartUpload` response body.
 fn parse_upload_id(body: &[u8]) -> Option<String> {
     use quick_xml::Reader;
     use quick_xml::events::Event;
@@ -902,10 +753,7 @@ fn parse_upload_id(body: &[u8]) -> Option<String> {
     None
 }
 
-/// Parse an S3 XML error body (`<Error><Code>...</Code><Message>...</Message></Error>`)
-/// via `quick-xml`, returning `(code, message)`. Returns `None` if the body is
-/// empty or not parseable (e.g. a HEAD response's empty body, or a transport
-/// failure that never reached an S3-compatible server at all).
+/// Parses an S3 XML error body into `(code, message)`; `None` if empty or unparseable.
 fn parse_error_body(body: &[u8]) -> Option<(String, String)> {
     use quick_xml::Reader;
     use quick_xml::events::Event;
@@ -945,9 +793,7 @@ fn parse_error_body(body: &[u8]) -> Option<(String, String)> {
     code.map(|c| (c, message.unwrap_or_default()))
 }
 
-/// Minimal percent-decoder for `ListObjectsV2`'s `encoding-type=url` response
-/// keys. Self-contained rather than pulling in the `percent-encoding` crate
-/// for this single call site (rusty-s3 depends on it, but only privately).
+/// Minimal percent-decoder for `ListObjectsV2` keys (avoids a `percent-encoding` dependency).
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

@@ -64,7 +64,6 @@ fn expired_token_is_rejected() {
 
 #[test]
 fn expiry_is_exclusive_at_the_boundary() {
-    // A token must stop being usable exactly at `exp`, not one second later.
     let issuer = Issuer::generate(3600).unwrap();
     let verifier = issuer.verifier();
     let exp = now().unix_timestamp() + 60;
@@ -86,7 +85,6 @@ fn expiry_is_exclusive_at_the_boundary() {
 fn rejects_malformed_public_key() {
     assert!(Verifier::from_public_key(vec![0u8; 31]).is_err());
     assert!(Verifier::from_public_key(vec![0u8; 33]).is_err());
-    // A 32-byte key (the Ed25519 public-key length) is accepted.
     assert!(Verifier::from_public_key(vec![0u8; 32]).is_ok());
 }
 
@@ -98,7 +96,6 @@ fn tampered_payload_fails_verification() {
         .issue(sample_claims(Op::Get, now().unix_timestamp() + 60), now())
         .unwrap();
 
-    // Flip a character in the payload segment.
     let (payload, sig) = token.split_once('.').unwrap();
     let mut p = payload.to_owned();
     let last = p.pop().unwrap();
@@ -115,7 +112,6 @@ fn token_from_other_key_is_rejected() {
     let token = issuer_a
         .issue(sample_claims(Op::Get, now().unix_timestamp() + 60), now())
         .unwrap();
-    // Verifier for a different keypair must reject.
     assert!(issuer_b.verifier().verify(&token, now()).is_err());
 }
 
@@ -127,9 +123,8 @@ fn malformed_token_is_rejected() {
 
 #[test]
 fn issuer_over_explicit_provider_round_trips() {
-    // The codec calls the SignatureProvider abstraction (ADR-0004 FIPS posture),
-    // so an issuer built over an explicitly-supplied provider behaves identically
-    // — this is the seam a FIPS-validated provider plugs into.
+    // The codec goes through the `SignatureProvider` seam, so an explicitly supplied provider
+    // behaves identically.
     let provider = Arc::new(Ed25519Provider::generate().unwrap());
     let issuer = Issuer::with_provider(provider, 3600);
     let claims = sample_claims(Op::Get, now().unix_timestamp() + 60);
@@ -152,8 +147,6 @@ fn upload_constraints_round_trip() {
     assert_eq!(got.upload, claims.upload);
 }
 
-// ── P2 1.11: `content_type` / `etag` claims (GET download tokens) ───────────
-
 #[test]
 fn content_type_and_etag_round_trip() {
     let issuer = Issuer::generate(3600).unwrap();
@@ -170,10 +163,8 @@ fn content_type_and_etag_round_trip() {
 
 #[test]
 fn claims_without_content_type_and_etag_deserialize_with_empty_defaults() {
-    // Simulates verifying a token minted before these fields existed: a
-    // JSON payload with no `content_type`/`etag` keys at all must still
-    // deserialize, defaulting both to the empty string (version-skew
-    // tolerance, same pattern as `request_id`/`backend_handle`).
+    // A payload without `content_type`/`etag` keys (a pre-existing token) must deserialize
+    // with both empty.
     let json = serde_json::json!({
         "op": "get",
         "file_id": Uuid::now_v7(),

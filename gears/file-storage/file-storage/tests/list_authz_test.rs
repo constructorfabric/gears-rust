@@ -1,16 +1,5 @@
-//! Cross-user file-enumeration authorization tests (P2 remediation 0.9).
-//!
-//! `TenantOnlyAuthorizer` is not sufficient here — it ignores `action`
-//! entirely, so it can't distinguish an `ADMIN_POLICY` grant from an ordinary
-//! `READ`. This file duplicates the `ScopedTestAuthorizer` test double first
-//! introduced in `tests/policy_authz_test.rs` (0.7) rather than extracting a
-//! shared helper module: each `tests/*.rs` file compiles as its own
-//! integration-test crate, so cross-file reuse would require either a shared
-//! `tests/common/mod.rs` module (touching the already-landed 0.7 file to wire
-//! it up) or a `[lib]`-style test harness restructuring — both more invasive
-//! than the few lines duplicated below. `policy_authz_test.rs`'s doc comment
-//! on `ScopedTestAuthorizer` explicitly anticipates this: "intentionally
-//! self-contained ... so later steps (0.9/0.10/0.11) can reuse it verbatim."
+//! Cross-user file-enumeration authorization tests.
+//! Duplicates `ScopedTestAuthorizer` (each `tests/*.rs` is its own crate).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -37,10 +26,7 @@ use file_storage_sdk::{NewFile, OwnerFilter, OwnerKind};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
-// ── ScopedTestAuthorizer (duplicated from tests/policy_authz_test.rs) ───────
-
-/// Grants `READ`/`WRITE`/`DELETE` unconditionally (subject to `deny_write_for`),
-/// but only grants `ADMIN_POLICY` while `is_admin` is set.
+/// Grants `ADMIN_POLICY` only while `is_admin` is set; other actions are allowed.
 #[derive(Default)]
 struct ScopedTestAuthorizer {
     is_admin: AtomicBool,
@@ -52,7 +38,6 @@ impl ScopedTestAuthorizer {
         Self::default()
     }
 
-    /// Toggle whether `ADMIN_POLICY` is granted.
     fn set_admin(&self, admin: bool) {
         self.is_admin.store(admin, Ordering::SeqCst);
     }
@@ -85,8 +70,6 @@ impl Authorizer for ScopedTestAuthorizer {
         Ok(AccessScope::for_tenant(ctx.subject_tenant_id()))
     }
 }
-
-// ── test harness ─────────────────────────────────────────────────────────────
 
 async fn build_db() -> Arc<DBProvider<DbError>> {
     let mut path = std::env::temp_dir();
@@ -159,10 +142,7 @@ fn owner_filter(owner_id: Uuid) -> OwnerFilter {
     }
 }
 
-// ── list_files ───────────────────────────────────────────────────────────────
-
-/// `GET /files?owner_kind=user&owner_id=<victim>` from a non-owner, non-admin
-/// caller must be denied and must not leak the victim's file listing.
+/// A non-owner, non-admin listing another user's files must be denied without leaking them.
 #[tokio::test]
 async fn list_files_foreign_owner_without_admin_is_denied() {
     let h = build_harness().await;
@@ -187,7 +167,6 @@ async fn list_files_foreign_owner_without_admin_is_denied() {
     );
 }
 
-/// Positive control: listing one's own files is always allowed.
 #[tokio::test]
 async fn list_files_self_owner_is_allowed() {
     let h = build_harness().await;
@@ -209,7 +188,6 @@ async fn list_files_self_owner_is_allowed() {
     assert!(found.iter().any(|f| f.file_id == ticket.file_id));
 }
 
-/// An `ADMIN_POLICY`-authorized caller may list another user's files.
 #[tokio::test]
 async fn list_files_foreign_owner_with_admin_scope_is_allowed() {
     let h = build_harness().await;

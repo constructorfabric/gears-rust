@@ -10,17 +10,12 @@ use crate::infra::content::hash;
 use super::*;
 
 fn unique_root() -> std::path::PathBuf {
-    // No Math.random in scripts, but tests can use uuid + temp_dir.
     let mut p = std::env::temp_dir();
     p.push(format!("cf-fs-test-{}", uuid::Uuid::now_v7()));
     p
 }
 
-/// Assert that `backend.get_stream(path)`'s concatenated chunks are
-/// byte-for-byte equal to `backend.get(path)`'s result — the `get_stream`
-/// contract every `StorageBackend` implementation (default-fallback or a true
-/// chunked override) must satisfy. Factored out of `assert_backend_contract`
-/// to keep that function's own cognitive complexity down.
+/// `get_stream` chunks concatenated must equal `get` for every backend.
 async fn assert_get_stream_matches_get(backend: &dyn StorageBackend, path: &str, expected: &[u8]) {
     let mut stream = backend.get_stream(path).await.unwrap();
     let mut streamed = Vec::new();
@@ -30,18 +25,8 @@ async fn assert_get_stream_matches_get(backend: &dyn StorageBackend, path: &str,
     assert_eq!(streamed, expected);
 }
 
-/// Shared behavioral contract every `StorageBackend` implementation must
-/// satisfy, factored out of what used to be per-backend hand-written
-/// `put/get/delete/exists/get_range` assertions (`in_memory_*`/`local_fs_*`
-/// duplicated the same checks). Covers: put -> get round trip, `get_stream`
-/// (streamed chunks reassemble to the same bytes `get` returns), `get_range`
-/// correctness for both the `Inclusive` and `Suffix` variants (mirroring the
-/// former `default_get_range_slices_content`/`get_range_suffix_returns_tail`
-/// assertions), idempotent `delete`, and `exists` distinguishing
-/// present/missing. Backend-specific behavior (atomicity, tmp-file cleanup,
-/// path-traversal rejection, etc.) stays in each backend's own tests.
+/// Behavioral contract every `StorageBackend` implementation must satisfy.
 pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
-    // put -> get round trip, and exists() reports present.
     backend
         .put("contract/put-get", Bytes::from_static(b"hello, contract"))
         .await
@@ -52,12 +37,8 @@ pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
     );
     assert!(backend.exists("contract/put-get").await.unwrap());
 
-    // get_stream: concatenated chunks must equal get()'s bytes, for every
-    // backend regardless of whether it overrides the default single-chunk
-    // fallback with a true chunked read.
     assert_get_stream_matches_get(backend, "contract/put-get", b"hello, contract").await;
 
-    // get_range: Inclusive and Suffix variants.
     backend
         .put("contract/range", Bytes::from_static(b"0123456789"))
         .await
@@ -73,7 +54,6 @@ pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
         .unwrap();
     assert_eq!(tail, Bytes::from_static(b"789"));
 
-    // delete is idempotent.
     backend
         .put("contract/delete", Bytes::from_static(b"x"))
         .await
@@ -82,7 +62,6 @@ pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
     backend.delete("contract/delete").await.unwrap();
     assert!(!backend.exists("contract/delete").await.unwrap());
 
-    // exists distinguishes present from missing.
     assert!(!backend.exists("contract/never-existed").await.unwrap());
 }
 
@@ -123,8 +102,7 @@ async fn local_fs_put_is_atomic_under_concurrent_writers() {
     let root = unique_root();
     let backend = Arc::new(LocalFsBackend::new("fs", &root));
 
-    // N distinct full-size payloads, each filled with its own byte pattern so
-    // a torn/mixed result is trivially detectable.
+    // Distinct byte pattern per payload so a torn or mixed result is detectable.
     let payloads: Vec<Bytes> = (0..WRITERS).map(|i| Bytes::from(vec![i; SIZE])).collect();
 
     let handles: Vec<_> = payloads
@@ -177,10 +155,8 @@ async fn local_fs_put_cleans_up_tmp_file_on_write_failure() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
 
-    // Pre-create the target's parent directory, then strip its write bit:
-    // `create_dir_all` still succeeds (dir already exists), but the temp
-    // file's `File::create` inside it fails with a permission error before
-    // the atomic rename ever runs.
+    // Strip the write bit from the pre-created parent dir: the temp file create fails
+    // before the atomic rename runs.
     let parent = root.join("fid");
     tokio::fs::create_dir_all(&parent).await.unwrap();
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -201,21 +177,18 @@ async fn local_fs_put_cleans_up_tmp_file_on_write_failure() {
         "no orphaned tmp file should remain, found: {names:?}"
     );
 
-    // Restore permissions so the temp-dir cleanup below can actually remove it.
+    // Restore permissions so temp-dir cleanup can remove it.
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
-/// P2 1.2(b): a stream whose cumulative size crosses `max_size` partway
-/// through must be rejected *and* leave no file (partial or final) at the
-/// target path — the memory-DoS fix's "abort mid-stream, clean up" contract.
+/// A stream crossing `max_size` mid-way is rejected and leaves no file at the target.
 #[tokio::test]
 async fn local_fs_put_stream_enforces_max_size_mid_stream() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
 
-    // Three 10-byte chunks (30 bytes total) against a 15-byte max_size: the
-    // limit is crossed on the second chunk, well before the stream ends.
+    // Three 10-byte chunks against max_size 15: the limit is crossed on the second chunk.
     let chunks: Vec<std::io::Result<Bytes>> = vec![
         Ok(Bytes::from_static(b"0123456789")),
         Ok(Bytes::from_static(b"0123456789")),
@@ -247,9 +220,7 @@ async fn local_fs_put_stream_enforces_max_size_mid_stream() {
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
-/// P2 1.2(b): `put_stream`'s incremental hash (fed chunk-by-chunk as they are
-/// written) must equal `hash::sha256` computed over the fully concatenated
-/// bytes, and `bytes_written` must equal the total chunk length.
+/// `put_stream`'s incremental hash must equal `hash::sha256` of the concatenated bytes.
 #[tokio::test]
 async fn local_fs_put_stream_computes_hash_incrementally_matches_full_buffer_hash() {
     let root = unique_root();
@@ -274,21 +245,18 @@ async fn local_fs_put_stream_computes_hash_incrementally_matches_full_buffer_has
     let expected_digest = hash::digest_to_array(hash::sha256(&concatenated));
     assert_eq!(digest, expected_digest);
 
-    // Sanity: the bytes actually landed at the target path too.
     assert_eq!(b.get("fid2/vid2").await.unwrap(), Bytes::from(concatenated));
 
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
-/// `LocalFsBackend::get_stream`'s manual-chunked-read loop (64 KiB chunks)
-/// must reassemble a blob spanning multiple chunks to the exact same bytes
-/// `get` returns.
+/// A blob spanning several 64 KiB read chunks must reassemble exactly via `get_stream`.
 #[tokio::test]
 async fn local_fs_get_stream_reassembles_multi_chunk_blob() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
 
-    // 200 KB — comfortably more than one 64 KiB chunk.
+    // 200 KB: more than one 64 KiB chunk.
     let payload: Vec<u8> = (0..200_000)
         .map(|i| u8::try_from(i % 256).unwrap())
         .collect();

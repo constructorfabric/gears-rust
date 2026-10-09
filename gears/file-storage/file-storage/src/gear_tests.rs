@@ -5,21 +5,7 @@ use super::*;
 
 #[test]
 fn gear_provides_p1_and_p2_migrations() {
-    // The DatabaseCapability wiring must hand the runtime all current migrations:
-    //   1. P1 initial (control-plane metadata tables)
-    //   2. P2 initial (policy store + retention rules + multipart + idempotency
-    //      keys + audit outbox + file events outbox, in one step)
-    //   3. P2 multipart plan columns (declared_size + part_size on multipart_uploads)
-    //   4. P2 remediation 0.10: idempotency_keys.subject_id (binds a replay to
-    //      the authenticated caller, not just the request-body owner)
-    //   5. P2 remediation 2.1: idempotency_keys.request_hash (binds a replay to
-    //      the request body that created it, not just the caller)
-    //   6. P2 remediation 2.4: policies partial unique indexes (at most one row
-    //      per (tenant_id, scope, scope_owner_id), closing the upsert race)
-    //   7. ADR-0006 content-hash modes: file_versions.hash_mode/part_count +
-    //      the version_hash_manifest table
-    // (init()/register_rest() need a live GearCtx — those seams are covered by
-    // the E2E suite, not here.)
+    // The database wiring must hand the runtime every migration, in order.
     let gear = FileStorageGear::default();
     assert_eq!(
         gear.migrations().len(),
@@ -33,9 +19,7 @@ fn gear_provides_p1_and_p2_migrations() {
 
 #[test]
 fn gear_default_config_excludes_in_memory_backend() {
-    // P2 remediation 0.5: the non-durable `memory` backend must not be part
-    // of the registry unless a deployment explicitly opts in — otherwise
-    // every deployment silently exposes a volatile backend.
+    // The non-durable `memory` backend is registered only on explicit opt-in.
     let cfg = FileStorageConfig::default();
     assert!(!cfg.enable_in_memory_backend);
 
@@ -49,8 +33,6 @@ fn gear_default_config_excludes_in_memory_backend() {
 
 #[test]
 fn gear_dev_flag_enables_in_memory_backend() {
-    // Opting in via `enable_in_memory_backend: true` registers the `memory`
-    // backend alongside the always-present `local-fs` default.
     let cfg = FileStorageConfig {
         enable_in_memory_backend: true,
         ..FileStorageConfig::default()
@@ -65,11 +47,7 @@ fn gear_dev_flag_enables_in_memory_backend() {
 
 #[test]
 fn gear_registry_includes_configured_s3_backends() {
-    // P2 1.7.3 config wiring: one `s3_backends` entry must become one more
-    // backend in the registry. Construction (`S3Backend::from_config` ->
-    // `S3Backend::new`) performs no I/O — a bogus/unreachable endpoint is
-    // fine here, since this test only checks the registry's contents, never
-    // dispatching a real request against it.
+    // Construction performs no I/O, so an unreachable endpoint is fine here.
     let cfg = crate::config::FileStorageConfig {
         s3_backends: vec![crate::config::S3BackendConfig {
             id: "s3-primary".to_owned(),
@@ -98,9 +76,7 @@ fn gear_registry_includes_configured_s3_backends() {
 
 #[test]
 fn gear_default_backend_id_falls_back_to_local_fs_when_unset() {
-    // P2 1.7 Stage 6: an S3-configured deployment that does NOT set
-    // `default_backend_id` must keep routing new uploads to `local-fs`,
-    // preserving today's behavior — only an explicit override changes it.
+    // Without `default_backend_id`, new uploads keep routing to `local-fs`.
     let cfg = crate::config::FileStorageConfig {
         s3_backends: vec![crate::config::S3BackendConfig {
             id: "s3-primary".to_owned(),
@@ -120,10 +96,7 @@ fn gear_default_backend_id_falls_back_to_local_fs_when_unset() {
 
 #[test]
 fn gear_default_backend_id_override_selects_configured_backend() {
-    // P2 1.7 Stage 6 e2e wiring: setting `default_backend_id` to a configured
-    // `s3_backends` entry's id must make that backend the registry's default,
-    // so `create`/`initiate_multipart` mint upload URLs whose
-    // `claims.backend_id` names the S3 backend instead of `local-fs`.
+    // `default_backend_id` naming a configured S3 backend makes it the registry default.
     let cfg = crate::config::FileStorageConfig {
         s3_backends: vec![crate::config::S3BackendConfig {
             id: "s3-primary".to_owned(),
@@ -145,8 +118,7 @@ fn gear_default_backend_id_override_selects_configured_backend() {
 
 #[test]
 fn gear_default_backend_id_unknown_id_fails_fast() {
-    // An override naming a backend id that isn't among the configured
-    // backends must be a clean init-time `Err`, never a panic.
+    // An unknown `default_backend_id` is an init-time `Err`, not a panic.
     let cfg = crate::config::FileStorageConfig {
         default_backend_id: Some("does-not-exist".to_owned()),
         ..FileStorageConfig::default()

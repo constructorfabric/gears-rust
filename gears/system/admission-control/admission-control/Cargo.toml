@@ -1,0 +1,68 @@
+[package]
+name = "cf-gears-admission-control"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Admission-control gear: evaluates admission requests against a pluggable admission engine"
+keywords = ["constructorfabric", "cf-gears", "admission-control"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+name = "admission_control"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+admission-control-sdk = { workspace = true }
+
+# Platform SDKs
+types-registry-sdk = { workspace = true }
+event-broker-sdk = { workspace = true }
+
+# Gear crates referenced by `#[toolkit::gear(deps = [types_registry])]`
+types-registry = { workspace = true }
+
+# ToolKit dependencies
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-security = { workspace = true }
+gts = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+# `event_broker_sdk::Event::occurred_at` is a chrono timestamp.
+chrono = { workspace = true }
+
+# Error handling and serialization
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+# Required by toolkit::gear macro
+inventory = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+opentelemetry = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+parking_lot = { workspace = true }
+toolkit-gts = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# Asserts that log lines carry the `admission` span fields.
+tracing-test = { workspace = true }

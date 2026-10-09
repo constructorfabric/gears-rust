@@ -1,7 +1,6 @@
 //! Repository for the `policies` table (per-tenant / per-user policy store).
 //!
-//! Uses `SecureORM` (`toolkit_db::secure`) for tenant-scoped access, consistent
-//! with the other repositories in this gear.
+//! Tenant-scoped via `SecureORM` (`toolkit_db::secure`).
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use time::OffsetDateTime;
@@ -11,7 +10,6 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::policy::{PolicyBody, PolicyScope, StoredPolicy};
-use crate::infra::storage::db::db_err;
 use crate::infra::storage::entity::policy::{ActiveModel, Column, Entity, Model};
 
 /// Repository over the `policies` table.
@@ -48,25 +46,17 @@ impl PolicyRepo {
             .scope_with(scope)
             .one(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
 
         model.map(map_model).transpose()
     }
 
     /// Insert or replace the policy row for the given scope.
     ///
-    /// Since there is at most one policy per `(tenant_id, scope, scope_owner_id)`,
-    /// this first deletes any existing row for that combination, then inserts the
-    /// new one.
-    ///
-    /// P2 remediation 2.4: callers (`Store::upsert_policy`) run this inside an
-    /// explicit DB transaction so the delete+insert pair is atomic, and the
-    /// `policies_user_scope_unique_idx` / `policies_tenant_scope_unique_idx`
-    /// partial unique indexes (migration `m20260706_000003`) act as a
-    /// backstop against the remaining no-existing-row race between two
-    /// concurrent first-time upserts for the same scope — the losing
-    /// writer's insert fails with a constraint violation rather than
-    /// silently duplicating the row.
+    /// Deletes any existing row for the scope, then inserts. `Store::upsert_policy`
+    /// runs this in a transaction so the pair is atomic; the partial unique indexes
+    /// make the loser of two concurrent first-time upserts fail with a constraint
+    /// violation instead of duplicating the row.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert<C: DBRunner>(
         &self,
@@ -78,7 +68,6 @@ impl PolicyRepo {
         body: &PolicyBody,
         now: OffsetDateTime,
     ) -> Result<Uuid, DomainError> {
-        // Delete any existing row for this scope before inserting.
         let mut del = Entity::delete_many()
             .filter(Column::TenantId.eq(tenant_id))
             .filter(Column::Scope.eq(policy_scope.as_str()));
@@ -90,7 +79,7 @@ impl PolicyRepo {
             .scope_with(scope)
             .exec(conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
 
         let policy_id = Uuid::now_v7();
         let body_json = serde_json::to_value(body)
@@ -107,7 +96,7 @@ impl PolicyRepo {
         };
         secure_insert::<Entity>(am, scope, conn)
             .await
-            .map_err(db_err)?;
+            .map_err(DomainError::from)?;
         Ok(policy_id)
     }
 }

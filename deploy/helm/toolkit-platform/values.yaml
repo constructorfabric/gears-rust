@@ -1,0 +1,39 @@
+# Default profile: Flight Control only.
+
+global:
+  imageRegistry: ""
+  opentelemetry:
+    enabled: false
+    exporterKind: otlp_grpc
+    endpoint: "http://otel-collector:4317"
+
+flight-control:
+  enabled: true
+  fullnameOverride: flight-control
+  image:
+    registry: ghcr.io
+    repository: constructorfabric/flight-control
+    tag: "dev"
+    pullPolicy: IfNotPresent
+
+hello:
+  enabled: false
+  fullnameOverride: hello
+  image:
+    registry: ghcr.io
+    repository: constructorfabric/hello
+    tag: "dev"
+    pullPolicy: IfNotPresent
+  directoryEndpoint: "http://flight-control:50051"
+
+api-contracts:
+  enabled: false
+  image:
+    registry: ghcr.io
+    repository: constructorfabric/api-contracts
+
+api-contracts-consumer:
+  enabled: false
+  image:
+    registry: ghcr.io
+    repository: constructorfabric/api-contracts-consumer

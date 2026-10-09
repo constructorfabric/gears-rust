@@ -1,13 +1,8 @@
-//! P1 initial migration — control-plane metadata tables.
+//! Initial control-plane metadata tables: `files`, `file_versions`,
+//! `files_custom_metadata`.
 //!
-//! Mirrors the P1 section of `gears/file-storage/docs/migration.sql`:
-//!   - @cpt-cf-file-storage-dbtable-files
-//!   - @cpt-cf-file-storage-dbtable-file-versions
-//!   - @cpt-cf-file-storage-dbtable-files-custom-metadata
-//!
-//! No bytes live here — content moves over signed URLs against the sidecar
-//! (ADR-0003). Postgres uses the dedicated `file_storage` schema; `SQLite` (tests)
-//! uses flat table names and supplies `UUID`s from the application layer.
+//! No bytes live here (content moves over signed URLs against the sidecar).
+//! `SQLite` (tests) uses application-supplied `UUID`s.
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::ConnectionTrait;
@@ -23,10 +18,8 @@ impl MigrationTrait for Migration {
 
         let sql = match backend {
             sea_orm::DatabaseBackend::Postgres => {
-                // Flat (unqualified) table names on both backends: SeaORM entities use a
-                // static table_name and SQLite has no schemas, so a per-backend schema
-                // qualifier cannot be expressed in the entity. The DESIGN's `file_storage`
-                // schema is deferred; behaviour is identical with flat names.
+                // Flat (unqualified) table names: entities use a static `table_name` and
+                // `SQLite` has no schemas.
                 r"
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 

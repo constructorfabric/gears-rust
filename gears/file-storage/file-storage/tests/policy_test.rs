@@ -1,15 +1,5 @@
-//! `PolicyRepo`/`Store::upsert_policy` upsert-race tests (P2 remediation
-//! 2.4), against a real temp-file `SQLite` DB (a bare `sqlite::memory:`
-//! would give each pooled connection its own empty DB, which would defeat
-//! the point of a second, independent connection used here for the raw row
-//! count).
-//!
-//! `PolicyRepo::upsert` used to be a `delete_many()` followed by an
-//! independent `secure_insert`, with no transaction wrapper and no unique
-//! constraint on `(tenant_id, scope, scope_owner_id)`. These tests prove the
-//! fix: two sequential upserts for the same scope leave exactly one row,
-//! carrying the second call's body — never two rows, and never the first
-//! call's stale body.
+//! `Store::upsert_policy` upsert-race tests on a temp-file `SQLite` DB (`sqlite::memory:` would
+//! give each pooled connection its own DB).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -30,10 +20,7 @@ use file_storage::infra::storage::migrations::Migrator;
 const TENANT: &str = "00000000-0000-0000-0000-0000000000a1";
 const OWNER: &str = "00000000-0000-0000-0000-0000000000b1";
 
-/// Build a `Store` over a fresh temp-file SQLite DB with all migrations
-/// applied, returning both the `Store` and the raw DSN (so a second,
-/// independent connection can be opened for row-count assertions without
-/// going through `SecureORM`).
+/// `Store` over a fresh temp-file DB with migrations, plus the raw DSN for a second connection.
 async fn build_store() -> (Store, String) {
     let mut path = std::env::temp_dir();
     path.push(format!("cf-fs-policy-{}.db", Uuid::now_v7().simple()));
@@ -61,10 +48,7 @@ fn body_with_max_bytes(max_bytes: u64) -> PolicyBody {
     }
 }
 
-/// Two sequential `upsert_policy` calls for the same tenant scope must both
-/// succeed, leave exactly one row in `policies`, and that row must carry the
-/// **second** call's body — proving the rewritten upsert path (transaction +
-/// partial unique index backstop) replaces rather than duplicates.
+/// Two sequential upserts for one tenant scope leave exactly one row carrying the second body.
 #[tokio::test]
 async fn policy_upsert_on_conflict_updates_existing_row_not_duplicates() {
     let (store, dsn) = build_store().await;
@@ -98,7 +82,7 @@ async fn policy_upsert_on_conflict_updates_existing_row_not_duplicates() {
         .await
         .expect("second upsert must succeed");
 
-    // Independent raw connection, purely for the row-count assertion.
+    // Independent raw connection, purely for the row count.
     let raw = sea_orm::Database::connect(&dsn)
         .await
         .expect("second raw connection");
@@ -122,9 +106,7 @@ async fn policy_upsert_on_conflict_updates_existing_row_not_duplicates() {
     );
 }
 
-/// Same as above but for a user-scope row (`scope_owner_id = Some(..)`),
-/// exercising the other of the two new partial unique indexes
-/// (`policies_user_scope_unique_idx`).
+/// Same for a user-scope row (`scope_owner_id = Some(..)`).
 #[tokio::test]
 async fn policy_upsert_on_conflict_updates_existing_user_scope_row() {
     let (store, dsn) = build_store().await;

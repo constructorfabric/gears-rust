@@ -75,6 +75,7 @@ members = [
     "libs/toolkit-odata-macros",
     "libs/toolkit-security",
     "libs/toolkit-odata",
+    "libs/toolkit-policy-evaluation",
     "libs/toolkit-node-info",
     "libs/toolkit-stable-hash",
     "libs/toolkit-transport-grpc",
@@ -187,6 +188,8 @@ members = [
     "gears/system/license-resolver/license-resolver",
     "gears/system/license-resolver/plugins/static-license-plugin",
     "gears/system/event-broker/plugins/sqlite-event-broker-plugin",
+    "gears/system/admission-control/admission-control-sdk",
+    "gears/system/admission-control/admission-control",
 ]
 exclude = ["tools/fuzz"]
 resolver = "3"
@@ -340,6 +343,7 @@ toolkit-macros = { package = "cf-gears-toolkit-macros", version = "0.6.6", path 
 toolkit-node-info = { package = "cf-gears-toolkit-node-info", version = "0.6.6", path = "libs/toolkit-node-info" }
 toolkit-odata = { package = "cf-gears-toolkit-odata", version = "0.9.7", path = "libs/toolkit-odata" }
 toolkit-odata-macros = { package = "cf-gears-toolkit-odata-macros", version = "0.6.13", path = "libs/toolkit-odata-macros" }
+toolkit-policy-evaluation = { package = "cf-gears-toolkit-policy-evaluation", version = "0.1.0", path = "libs/toolkit-policy-evaluation" }
 toolkit-sdk = { package = "cf-gears-toolkit-sdk", version = "0.7.13", path = "libs/toolkit-sdk" }
 toolkit-security = { package = "cf-gears-toolkit-security", version = "0.11.0", path = "libs/toolkit-security" }
 toolkit-stable-hash = { package = "cf-gears-toolkit-stable-hash", version = "0.1.0", path = "libs/toolkit-stable-hash" }
@@ -878,6 +882,15 @@ gts-macros = "0.12.1"
 license-resolver-sdk = { package = "cf-gears-license-resolver-sdk", version = "0.1.4", path = "gears/system/license-resolver/license-resolver-sdk" }
 license-resolver = { package = "cf-gears-license-resolver", version = "0.1.5", path = "gears/system/license-resolver/license-resolver" }
 static-license-plugin = { package = "cf-gears-static-license-plugin", version = "0.1.5", path = "gears/system/license-resolver/plugins/static-license-plugin" }
+
+# Admission control
+admission-control-sdk = { package = "cf-gears-admission-control-sdk", version = "0.1.0", path = "gears/system/admission-control/admission-control-sdk" }
+admission-control = { package = "cf-gears-admission-control", version = "0.1.0", path = "gears/system/admission-control/admission-control" }
+# Rego interpreter backing `toolkit-policy-evaluation`. Never enable `mimalloc` /
+# `allocator-memory-limits` (they assign a global allocator), `http`, `uuid`
+# or `opa-runtime`. Pinned exactly: the denylists and structural guards are
+# written against this version, so a bump requires re-checking them.
+regorus = { version = "=0.12.0", default-features = false, features = ["arc", "std", "regex", "glob", "semver", "time", "base64", "base64url", "hex", "net"] }
 
 [workspace.metadata.cargo-shear]
 ignored-paths = ["**/tests/ui/**", "**/tests/trybuild/**"]

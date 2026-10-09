@@ -1,13 +1,8 @@
-//! Authorization Service integration (M8): a [`PolicyEnforcerAuthorizer`] that
-//! delegates per-type access decisions to the platform Authorization Service
-//! over `gts.cf.fstorage.file.type.v1~` (`cpt-cf-file-storage-fr-authorization`).
+//! `PolicyEnforcerAuthorizer`: delegates per-type access decisions to the platform
+//! Authorization Service over `gts.cf.fstorage.file.type.v1~`.
 //!
-//! This implements the domain [`Authorizer`] abstraction; the gear can swap it
-//! in for [`crate::domain::authz::TenantOnlyAuthorizer`] once the deployment's
-//! PDP is configured to return tenant-scoped constraints. Tenant-boundary
-//! enforcement (`cpt-cf-file-storage-fr-tenant-boundary`) is preserved either
-//! way — point operations prefetch within the caller's tenant before the
-//! decision, and listing applies the tenant scope.
+//! Tenant-boundary enforcement is preserved either way: point operations prefetch within the
+//! caller's tenant before the decision, and listing applies the tenant scope.
 
 use std::sync::Arc;
 
@@ -33,7 +28,7 @@ const FILE_RESOURCE: ResourceType = ResourceType::from_static(
     ],
 );
 
-/// Authorizer backed by the platform Authorization Service via [`PolicyEnforcer`].
+/// Authorizer backed by the platform Authorization Service via `PolicyEnforcer`.
 pub struct PolicyEnforcerAuthorizer {
     enforcer: PolicyEnforcer,
 }

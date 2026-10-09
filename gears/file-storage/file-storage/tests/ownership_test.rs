@@ -1,20 +1,4 @@
-//! Ownership-transfer + usage-reporting + file-events outbox integration tests
-//! (P2-M5).
-//!
-//! Verifies:
-//! 1. `transfer_ownership` updates `owner_kind`/`owner_id` on the file row.
-//! 2. A `TransferOwnership` audit row is written in the same transaction.
-//! 3. A `file.owner_transferred` event is enqueued in the `events_outbox` table
-//!    in the same transaction.
-//! 4. A `file.created` event is enqueued when a file is created.
-//! 5. A `file.deleted` event is enqueued when a file is deleted.
-//! 6. A `file.content_updated` event is enqueued when content is bound.
-//! 7. Transferring a non-existent file returns `FileNotFound`.
-//!
-//! @cpt-cf-file-storage-fr-ownership-transfer
-//! @cpt-cf-file-storage-fr-file-events
-//! @cpt-cf-file-storage-fr-usage-reporting
-//! @cpt-cf-file-storage-fr-audit-trail
+//! Ownership transfer: row update, audit row and file-events outbox, in one transaction.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -106,9 +90,6 @@ fn new_file_for(owner_id: Uuid) -> NewFile {
     }
 }
 
-// ── 1. transfer_ownership updates the file row ─────────────────────────────────
-
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[tokio::test]
 async fn transfer_ownership_updates_owner_fields() {
     let (svc, _dp, _store) = build_service().await;
@@ -123,7 +104,6 @@ async fn transfer_ownership_updates_owner_fields() {
         .unwrap();
     let file_id = ticket.file_id;
 
-    // Transfer ownership.
     let updated = svc
         .transfer_ownership(&ctx, file_id, OwnerKind::App, new_owner)
         .await
@@ -139,10 +119,6 @@ async fn transfer_ownership_updates_owner_fields() {
     assert_eq!(updated.tenant_id, tenant, "tenant_id must remain unchanged");
 }
 
-// ── 2. transfer_ownership writes a TransferOwnership audit row ─────────────────
-
-/// @cpt-cf-file-storage-fr-audit-trail
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[tokio::test]
 async fn transfer_ownership_leaves_audit_row() {
     let (svc, _dp, store) = build_service().await;
@@ -176,10 +152,6 @@ async fn transfer_ownership_leaves_audit_row() {
     assert_eq!(row.file_id, Some(file_id));
 }
 
-// ── 3. transfer_ownership enqueues a file event ────────────────────────────────
-
-/// @cpt-cf-file-storage-fr-file-events
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[tokio::test]
 async fn transfer_ownership_enqueues_file_event() {
     let (svc, _dp, store) = build_service().await;
@@ -218,9 +190,6 @@ async fn transfer_ownership_enqueues_file_event() {
     assert!(ev.published_at.is_none(), "event must not be published yet");
 }
 
-// ── 4. create_file enqueues a file.created event ──────────────────────────────
-
-/// @cpt-cf-file-storage-fr-file-events
 #[tokio::test]
 async fn create_file_enqueues_created_event() {
     let (svc, _dp, store) = build_service().await;
@@ -249,9 +218,6 @@ async fn create_file_enqueues_created_event() {
     assert!(created_events[0].published_at.is_none());
 }
 
-// ── 5. delete_file enqueues a file.deleted event ──────────────────────────────
-
-/// @cpt-cf-file-storage-fr-file-events
 #[tokio::test]
 async fn delete_file_enqueues_deleted_event() {
     let (svc, dp, store) = build_service().await;
@@ -265,7 +231,7 @@ async fn delete_file_enqueues_deleted_event() {
         .unwrap();
     let file_id = ticket.file_id;
 
-    // Finalize so ETag exists for the If-Match delete precondition.
+    // Finalize so the ETag exists for the If-Match delete.
     dp.put_content(
         &ctx,
         file_id,
@@ -279,7 +245,6 @@ async fn delete_file_enqueues_deleted_event() {
         .await
         .unwrap();
 
-    // Read current ETag.
     let file = svc.get_file(&ctx, file_id).await.unwrap();
     let etag = file_storage::domain::etag::etag_for(&file);
 
@@ -287,9 +252,7 @@ async fn delete_file_enqueues_deleted_event() {
         .await
         .unwrap();
 
-    // Events are enqueued before the row is deleted so we must query the outbox
-    // which was committed in the same transaction. The file row is gone but the
-    // outbox rows are NOT deleted by the FK cascade (separate table, no FK).
+    // Outbox rows survive file deletion (no FK cascade).
     let events = store.list_file_events(file_id).await.unwrap();
     let deleted_events: Vec<_> = events
         .iter()
@@ -303,9 +266,6 @@ async fn delete_file_enqueues_deleted_event() {
     assert_eq!(deleted_events[0].file_id, file_id);
 }
 
-// ── 6. bind enqueues a file.content_updated event ────────────────────────────
-
-/// @cpt-cf-file-storage-fr-file-events
 #[tokio::test]
 async fn bind_enqueues_content_updated_event() {
     let (svc, dp, store) = build_service().await;
@@ -329,7 +289,6 @@ async fn bind_enqueues_content_updated_event() {
     .await
     .unwrap();
 
-    // First bind (no if_match needed for first bind).
     svc.bind(&ctx, file_id, ticket.version_id, None)
         .await
         .unwrap();
@@ -348,9 +307,6 @@ async fn bind_enqueues_content_updated_event() {
     assert_eq!(content_events[0].owner_id, owner);
 }
 
-// ── 7. transfer_ownership on a non-existent file returns FileNotFound ──────────
-
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[tokio::test]
 async fn transfer_ownership_non_existent_file_returns_not_found() {
     let (svc, _dp, _store) = build_service().await;
@@ -369,13 +325,7 @@ async fn transfer_ownership_non_existent_file_returns_not_found() {
     );
 }
 
-// ── 8. audit + event in same transaction: rollback leaves no rows ──────────────
-
-/// Verify the transactional invariant: if the update returns false (no row
-/// found), neither an audit row nor an event row is written.
-///
-/// @cpt-cf-file-storage-fr-ownership-transfer
-/// @cpt-cf-file-storage-fr-file-events
+/// If the update finds no row, neither an audit row nor an event row is written.
 #[tokio::test]
 async fn transfer_ownership_no_row_means_no_audit_and_no_event() {
     let (svc, _dp, store) = build_service().await;
@@ -383,8 +333,6 @@ async fn transfer_ownership_no_row_means_no_audit_and_no_event() {
     let phantom_id = Uuid::now_v7();
     let new_owner = Uuid::now_v7();
 
-    // The service returns FileNotFound, but let us verify the store itself
-    // did not persist any rows.
     drop(
         svc.transfer_ownership(&ctx, phantom_id, OwnerKind::User, new_owner)
             .await,
@@ -403,14 +351,7 @@ async fn transfer_ownership_no_row_means_no_audit_and_no_event() {
     );
 }
 
-// ── 9. transfer_ownership rejects a malformed (nil) target owner ───────────────
-
-/// `file-storage` has no principal directory wired in (no account-management
-/// SDK), so it cannot verify `new_owner_id` names a real, same-tenant
-/// principal. The minimal guard it can enforce is rejecting the nil UUID as
-/// an obviously malformed target owner.
-///
-/// @cpt-cf-file-storage-fr-ownership-transfer
+/// No principal directory is wired in, so only the nil UUID is rejected as a malformed owner.
 #[tokio::test]
 async fn transfer_to_malformed_owner_is_rejected() {
     let (svc, _dp, _store) = build_service().await;
@@ -434,19 +375,11 @@ async fn transfer_to_malformed_owner_is_rejected() {
         "expected a new_owner_id validation error, got: {err:?}"
     );
 
-    // The file must be untouched: owner_kind/owner_id unchanged.
     let file = svc.get_file(&ctx, file_id).await.unwrap();
     assert_eq!(file.owner_id, original_owner);
     assert_eq!(file.owner_kind.as_str(), "user");
 }
 
-// ── 10. transfer_ownership succeeds for a well-formed target owner ─────────────
-
-/// Positive control: a well-formed `new_owner_id` — which, on this endpoint,
-/// is always recorded under the caller's own tenant since `tenant_id` comes
-/// from the existing file/`ctx`, never from the request — is accepted.
-///
-/// @cpt-cf-file-storage-fr-ownership-transfer
 #[tokio::test]
 async fn transfer_to_same_tenant_member_succeeds() {
     let (svc, _dp, _store) = build_service().await;

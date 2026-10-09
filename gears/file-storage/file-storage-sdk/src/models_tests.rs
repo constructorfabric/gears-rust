@@ -21,7 +21,6 @@ fn owner_kind_debug_is_stable() {
 
 #[test]
 fn file_and_version_ids_are_distinct_uuid_aliases() {
-    // FileId and VersionId are both Uuid aliases; the nil sentinel round-trips.
     let f: FileId = uuid::Uuid::nil();
     let v: VersionId = uuid::Uuid::nil();
     assert_eq!(f, v);

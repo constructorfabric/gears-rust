@@ -11,8 +11,8 @@ publish = false
 
 [features]
 default = []
-# OpenTelemetry in the resolved REST client.
-otel = ["api-contracts-sdk/otel"]
+# OpenTelemetry runtime and resolved REST client.
+otel = ["toolkit/otel", "api-contracts-sdk/otel"]
 # OoP binary (api-contracts-consumer-oop): bootstrap + embedded authn stack.
 oop_module = [
     "dep:tokio",

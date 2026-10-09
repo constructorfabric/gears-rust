@@ -1,8 +1,5 @@
-//! Trait implementations: [`CleanupStore`], [`MultipartStore`], [`PolicyStore`].
-//!
-//! Each impl is a thin delegation to the `Store` inherent methods defined in
-//! the sibling files. This file exists purely to separate the boilerplate from
-//! the intent-method implementations.
+//! Trait impls (`CleanupStore`, `MultipartStore`, `PolicyStore`): thin delegations to the
+//! `Store` inherent methods.
 
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -246,10 +243,7 @@ impl MultipartStore for Store {
         validated_mime: Option<String>,
         audit: crate::domain::audit::AuditEntry,
     ) -> Result<bool, DomainError> {
-        // `validated_mime` is the sniffed/canonical type computed by
-        // `complete_multipart_upload` from the assembled object's leading
-        // bytes (P2 remediation item 1.10) — persisted in place of the
-        // client's declared type, mirroring the single-part finalize paths.
+        // Persist the sniffed `validated_mime` in place of the declared type.
         Store::finalize_version(
             self,
             file_id,
