@@ -23,6 +23,7 @@ use crate::infra::metrics::MiniChatMetricsMeter;
 use crate::infra::outbox::{AuditEventHandler, InfraOutboxEnqueuer, UsageEventHandler};
 use crate::infra::workers::WorkerHandles;
 
+/// `AppServices` instantiated with the concrete SeaORM-backed repositories used by the gear.
 pub(crate) type AppServices = GenericAppServices<
     TurnRepository,
     MessageRepository,

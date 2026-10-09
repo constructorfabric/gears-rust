@@ -37,6 +37,7 @@ impl ProducerIdentity {
         self
     }
 
+    /// Rejects an identity whose `source` is blank.
     pub(crate) fn validate(&self) -> Result<(), crate::error::EventBrokerError> {
         if self.source.trim().is_empty() {
             return Err(crate::error::EventBrokerError::InvalidProducerOptions {
@@ -89,6 +90,7 @@ impl DirectDeduplication {
         Self::Reuse { mode, producer_id }
     }
 
+    /// Rejects option combinations the broker does not support (for example a stateless mode that registers a producer).
     pub(crate) fn validate(&self) -> Result<(), crate::error::EventBrokerError> {
         match *self {
             Self::Stateless => Ok(()),
@@ -131,6 +133,7 @@ impl DbDeduplication {
         }
     }
 
+    /// The producer mode this deduplication setting implies (`Stateless` when unmanaged).
     #[cfg(feature = "outbox")]
     pub(crate) fn mode(&self) -> ProducerMode {
         match self {
@@ -143,9 +146,13 @@ impl DbDeduplication {
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedDeduplication {
+    /// Producer mode the broker enforces for this producer.
     pub(crate) mode: ProducerMode,
+    /// Stable producer key the registration is stored under.
     pub(crate) key: String,
+    /// Behaviour when no stored registration exists for the key.
     pub(crate) on_missing: MissingProducerRegistration,
+    /// Behaviour when the broker rejects the registered producer id as unknown.
     pub(crate) on_unknown: UnknownProducerRegistration,
 }
 

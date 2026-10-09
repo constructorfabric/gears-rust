@@ -48,6 +48,7 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
+/// Builds the write actor from the security context and the request headers.
 pub(crate) fn actor(
     ctx: &SecurityContext,
     headers: &HeaderMap,

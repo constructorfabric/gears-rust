@@ -128,9 +128,13 @@ pub(crate) mod pep {
     /// Action vocabulary. `get_user` is a single-row `list_users`
     /// projection so it shares the `LIST` bucket.
     pub mod actions {
+        /// Action name for creating a user.
         pub const CREATE: &str = "create";
+        /// Action name for listing or reading users.
         pub const LIST: &str = "list";
+        /// Action name for deleting a user.
         pub const DELETE: &str = "delete";
+        /// Action name for updating a user.
         pub const UPDATE: &str = "update";
 
         /// Every action in this vocabulary, in declaration order. The

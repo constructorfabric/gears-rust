@@ -15,6 +15,7 @@ use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{Attribute, Data, DataEnum, DeriveInput, Fields, Ident, LitStr, Meta, Variant};
 
+/// Expands `#[derive(ContractError)]` on an error enum into its wire-error conversions.
 pub fn generate(input: DeriveInput) -> syn::Result<TokenStream> {
     let DeriveInput {
         attrs,

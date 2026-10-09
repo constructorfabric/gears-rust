@@ -151,12 +151,19 @@ impl<P: Send + Sync + 'static> WorkerListener<P> for StatsListener {
 /// Point-in-time snapshot of a single worker's counters.
 #[derive(Debug, Clone, Default)]
 pub struct StatsSnapshot {
+    /// Number of executions, including no-op ones.
     pub executions: u64,
+    /// Number of executions that processed no messages.
     pub noop_execs: u64,
+    /// Number of failed executions.
     pub failures: u64,
+    /// Total time spent executing, in microseconds.
     pub total_exec_us: u64,
+    /// Longest single execution, in microseconds.
     pub max_exec_us: u64,
+    /// Total time spent idle between executions, in microseconds.
     pub total_idle_us: u64,
+    /// Total number of messages processed.
     pub total_msgs: u64,
 }
 
@@ -191,7 +198,9 @@ impl StatsSnapshot {
 /// Aggregated snapshot for a category of workers.
 #[derive(Debug, Clone)]
 pub struct CategorySnapshot {
+    /// Number of workers merged into this category snapshot.
     pub workers: usize,
+    /// Summed counters of all workers in the category.
     pub snapshot: StatsSnapshot,
 }
 
@@ -208,6 +217,7 @@ pub struct StatsRegistry {
 }
 
 impl StatsRegistry {
+    /// Creates an empty registry with no listeners.
     pub fn new() -> Self {
         Self {
             listeners: Vec::new(),
@@ -265,6 +275,7 @@ pub struct StatsReporter {
 }
 
 impl StatsReporter {
+    /// Creates a reporter that drains the given registry, starting the reporting interval now.
     pub fn new(registry: Arc<StatsRegistry>) -> Self {
         Self {
             registry,

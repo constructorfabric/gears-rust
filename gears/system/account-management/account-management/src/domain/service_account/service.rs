@@ -156,9 +156,13 @@ pub(crate) mod pep {
     /// separate from `CREATE` for the same reason: an operator who may
     /// re-key an existing account need not be able to mint new ones.
     pub mod actions {
+        /// Action name for creating a service account.
         pub const CREATE: &str = "create";
+        /// Action name for listing service accounts.
         pub const LIST: &str = "list";
+        /// Action name for rotating a service account secret.
         pub const ROTATE_SECRET: &str = "rotate_secret";
+        /// Action name for revoking a service account.
         pub const REVOKE: &str = "revoke";
 
         /// Every action in this vocabulary, in declaration order. The
@@ -228,8 +232,9 @@ impl ServiceAccountService {
     ///   too many scopes, oversized scope).
     /// * [`DomainError::ServiceAccountInvalidInput`] — the provider
     ///   rejected the request with nothing retained (name already live
-    ///   in the tenant, charset violation, scope outside the allowlist,
-    ///   provider quota).
+    ///   in the tenant, charset violation, scope outside the allowlist).
+    /// * [`DomainError::ServiceAccountQuotaExceeded`] — the tenant
+    ///   reached its service-account limit; nothing retained.
     /// * [`DomainError::ServiceAccountAmbiguous`] — transport
     ///   uncertainty; the provider may hold a half-created account, so
     ///   the caller reconciles via [`Self::list`] rather than retrying.

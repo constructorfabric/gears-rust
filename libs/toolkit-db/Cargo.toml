@@ -146,6 +146,7 @@ harness = false
 required-features = ["_any-backend"]
 
 [dev-dependencies]
+toolkit-gts = { workspace = true }
 strum = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }

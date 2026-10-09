@@ -207,11 +207,25 @@ async fn repeated_bootstrap_is_idempotent_and_keeps_existing_rows() {
 }
 
 #[tokio::test]
+async fn the_schema_table_holds_one_row_whatever_major_is_recorded() {
+    let db = test_db().await;
+    let store = SqlFoundationStore::new(db.clone());
+    assert!(store.record_major(1).await.expect("first record"));
+    assert!(
+        !store.record_major(2).await.expect("second record"),
+        "a second major must conflict with the recorded one"
+    );
+    assert_eq!(count::<schema_meta::Entity>(&db).await, 1);
+    assert_eq!(store.read_installed_major().await.expect("read"), Some(1));
+}
+
+#[tokio::test]
 async fn schema_major_mismatch_fails_closed_before_seeding() {
     let db = test_db().await;
     {
         let conn = db.conn().expect("connection");
         let foreign = schema_meta::ActiveModel {
+            singleton: ActiveValue::Set(schema_meta::SINGLETON_KEY),
             contract_major: ActiveValue::Set(i32::try_from(CONTRACT_MAJOR).expect("fits") + 1),
             applied_at: ActiveValue::Set(OffsetDateTime::now_utc()),
         };

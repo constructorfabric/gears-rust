@@ -1,7 +1,10 @@
+use toolkit_macros::domain_model;
+
 use crate::domain::ports::github::{DeclaredCounts, PullDetail};
 
 pub const MAX_REPAIR: u32 = 3;
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GapOutcome {
     Complete,
@@ -9,6 +12,7 @@ pub enum GapOutcome {
     Repair,
 }
 
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CountGap {
     pub entity_type: String,

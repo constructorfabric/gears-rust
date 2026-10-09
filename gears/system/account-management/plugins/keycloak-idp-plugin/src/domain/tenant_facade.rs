@@ -280,6 +280,7 @@ fn deprovision_translate_sa_purge(e: PluginError) -> PluginError {
     }
 }
 
+/// Keycloak-backed tenant provisioning and deprovisioning (realm / group lifecycle).
 #[domain_model]
 pub struct TenantFacade {
     cfg: TenantFacadeConfig,
@@ -310,6 +311,8 @@ pub struct TenantFacade {
 }
 
 impl TenantFacade {
+    /// Construct the facade over its configuration, the Keycloak admin-client factory,
+    /// metadata codec, segregated metric ports and the service-account purge hook.
     #[must_use]
     #[allow(
         clippy::too_many_arguments,

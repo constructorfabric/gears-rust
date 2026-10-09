@@ -211,9 +211,13 @@ impl Default for CapabilitySet {
 }
 
 pub struct GearEntry {
+    /// Gear name.
     pub(crate) name: &'static str,
+    /// Names of gears this gear depends on.
     pub(crate) deps: &'static [&'static str],
+    /// Core gear implementation.
     pub(crate) core: Arc<dyn contracts::Gear>,
+    /// Capabilities declared by this gear.
     pub(crate) caps: CapabilitySet,
 }
 

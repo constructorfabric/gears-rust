@@ -12,6 +12,7 @@ use std::path::Path;
 
 const RECOGNISED_EXTS: &[&str] = &[".rs", ".toml", ".json", ".yaml", ".yml"];
 
+/// Classifies a module-relative path as `sdk`, `main`, `plugin`, `doc` or `other`.
 pub fn classify_location(rel: &Path) -> &'static str {
     let ext = rel
         .extension()

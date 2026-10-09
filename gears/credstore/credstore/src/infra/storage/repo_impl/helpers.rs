@@ -18,6 +18,7 @@ pub type CredstoreDbProvider = DBProvider<DomainError>;
 /// `SeaORM` repository adapter for
 /// [`SecretRepo`](crate::domain::secret::repo::SecretRepo).
 pub struct SecretRepoImpl {
+    /// Database provider used to open connections and transactions for secret queries.
     pub(crate) db: Arc<CredstoreDbProvider>,
 }
 

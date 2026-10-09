@@ -17,6 +17,8 @@ use crate::domain::{Readiness, ReadinessState};
 /// Check name shown in `/health`.
 pub const CHECK_NAME: &str = "quota-enforcement-bootstrap";
 
+const LOG_TARGET: &str = "qe.health";
+
 /// Reports the bootstrap state, then the cluster requirements verdict.
 pub struct ReadinessCheck {
     readiness: Arc<Readiness>,
@@ -36,17 +38,23 @@ impl ReadinessCheck {
             return HealthcheckResult::healthy();
         };
         let verdict = cluster.check().await;
-        let detail = verdict.message.unwrap_or_default();
+        if verdict.status != HealthcheckStatus::Healthy {
+            // The detail stays in the log: `/health` is unauthenticated.
+            tracing::warn!(
+                target: LOG_TARGET,
+                status = ?verdict.status,
+                code = verdict.code.as_deref().unwrap_or_default(),
+                detail = verdict.message.as_deref().unwrap_or_default(),
+                "cluster requirements not met"
+            );
+        }
         match verdict.status {
             HealthcheckStatus::Healthy => HealthcheckResult::healthy(),
             HealthcheckStatus::Degraded => {
-                HealthcheckResult::degraded(format!("cluster degraded: {detail}"))
-                    .with_code("qe_cluster_degraded")
+                HealthcheckResult::degraded("cluster degraded").with_code("qe_cluster_degraded")
             }
-            HealthcheckStatus::Unhealthy => {
-                HealthcheckResult::unhealthy(format!("cluster unavailable: {detail}"))
-                    .with_code("qe_cluster_unavailable")
-            }
+            HealthcheckStatus::Unhealthy => HealthcheckResult::unhealthy("cluster unavailable")
+                .with_code("qe_cluster_unavailable"),
         }
     }
 }

@@ -24,25 +24,41 @@ use syn::{Ident, ItemTrait, ReturnType, TraitItem, TraitItemFn, Type};
 
 use crate::model::{MethodShape, StreamOpen};
 
+/// Parsed arguments of the `#[grpc_contract(...)]` attribute.
 pub struct GrpcContractAttr {
+    /// Protobuf package name of the generated service.
     pub package: String,
+    /// Optional explicit gRPC service name; derived from the trait name when absent.
     pub service: Option<String>,
+    /// Path of the module holding the generated tonic/prost stubs.
     pub stubs_module: syn::Path,
 }
 
+/// Parsed gRPC projection of a contract trait, ready for codegen.
 pub struct GrpcContractModel {
+    /// The original projection trait item as written by the user.
     pub item: ItemTrait,
+    /// Identifier of the projection trait.
     pub trait_ident: Ident,
+    /// Path of the base contract trait this projection mirrors.
     pub base_trait: syn::Path,
+    /// Protobuf package name of the service.
     pub package: String,
+    /// Resolved gRPC service name.
     pub service: String,
+    /// Path of the module holding the generated stubs.
     pub stubs_module: syn::Path,
+    /// Projected methods in declaration order.
     pub methods: Vec<GrpcMethodModel>,
 }
 
+/// A single method of the gRPC projection.
 pub struct GrpcMethodModel {
+    /// Rust method identifier.
     pub ident: Ident,
+    /// RPC name used on the wire (upper camel case of the method).
     pub rpc_name: String,
+    /// Idempotency classification emitted into the binding IR.
     pub idempotency: GrpcIdempotency,
     /// Unary, or server-streaming with how its stream is opened
     /// (`#[streaming] fn` → `Stream(Immediate)`, `#[streaming] async fn` →
@@ -50,22 +66,32 @@ pub struct GrpcMethodModel {
     /// StreamOpen` pair, so an `open` exists exactly when the method streams
     /// (#4740).
     pub shape: MethodShape,
+    /// Whether the client may retry the call on transient failures.
     pub retryable: bool,
+    /// Whether peers may omit this method (the trait declares a default body).
     pub optional: bool,
+    /// Wire parameters of the method, excluding the receiver.
     pub params: Vec<GrpcParam>,
     /// `(ok, err)` extracted from `Result<T, E>` declared on the trait method.
     pub result_types: (Type, Type),
 }
 
+/// A wire parameter of a gRPC projection method.
 pub struct GrpcParam {
+    /// Parameter name.
     pub ident: Ident,
+    /// Parameter type.
     pub ty: Type,
 }
 
+/// Idempotency classification of a gRPC method, mirroring the runtime IR enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GrpcIdempotency {
+    /// The call has no side effects (read-only).
     NoSideEffects,
+    /// Repeating the call has the same effect as making it once.
     Idempotent,
+    /// Repeating the call may have additional effects.
     NotIdempotent,
 }
 
@@ -132,6 +158,7 @@ impl syn::parse::Parse for GrpcContractAttr {
     }
 }
 
+/// Builds a [`GrpcContractModel`] from the attribute arguments and the annotated projection trait.
 pub fn parse(attr: GrpcContractAttr, item: ItemTrait) -> syn::Result<GrpcContractModel> {
     let trait_ident = item.ident.clone();
     let trait_name = trait_ident.to_string();
@@ -437,6 +464,7 @@ fn parse_return_type(ret: &ReturnType, span: Span) -> syn::Result<(Type, Type)> 
 }
 
 impl GrpcIdempotency {
+    /// Variant name in the runtime IR's idempotency enum.
     pub fn ir_variant(self) -> &'static str {
         match self {
             GrpcIdempotency::NoSideEffects => "NoSideEffects",

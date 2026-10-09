@@ -1,8 +1,10 @@
 pub mod json;
 pub mod md;
 
+/// Location classes in the order they appear in rendered output.
 pub const LOC_ORDER: [&str; 5] = ["sdk", "main", "plugin", "doc", "other"];
 
+/// Short bracketed tag shown for a location class.
 pub fn loc_icon(loc: &str) -> &'static str {
     match loc {
         "sdk" => "[sdk]",

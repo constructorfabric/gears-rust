@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use aws_lc_rs::digest::{self, SHA256};
 use chrono::{DateTime, Duration, Utc};
+use toolkit_macros::domain_model;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -13,6 +14,7 @@ use crate::domain::repo::{EntityFingerprintRecord, EntityFingerprintRepository};
 pub const REFINEMENT_PENDING: &str = "pending";
 pub const REFINEMENT_COMPLETE: &str = "complete";
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateReason {
     New,
@@ -37,6 +39,7 @@ impl GateReason {
     }
 }
 
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct GateInputs {
     pub fingerprint: String,
@@ -97,6 +100,7 @@ pub fn family_ttl(entity: Entity, terminal: bool) -> Option<Duration> {
     }
 }
 
+#[domain_model]
 pub struct ChangeGate {
     fingerprints: Arc<dyn EntityFingerprintRepository>,
 }

@@ -20,6 +20,7 @@ use super::owner::{self, SourceGet};
 use super::query::PreparedList;
 
 /// Whether a source contributed to the answer.
+#[toolkit_macros::domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceHealth {
     /// The source answered.
@@ -31,6 +32,7 @@ pub enum SourceHealth {
 }
 
 /// One source in a list or counts answer.
+#[toolkit_macros::domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceRow {
     /// The configured name.
@@ -40,6 +42,7 @@ pub struct SourceRow {
 }
 
 /// One merged page.
+#[toolkit_macros::domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
     /// The page, in the asked order.
@@ -51,6 +54,7 @@ pub struct Listed {
 }
 
 /// The counts of the readable sources, and which sources those are.
+#[toolkit_macros::domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Counted {
     /// Summed over the readable sources only.

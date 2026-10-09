@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use bss_approvals_sdk::{InboxUnit, Order, SortKey};
 
 /// One source's answer for the page being merged. The merge takes the units it selects.
+#[toolkit_macros::domain_model]
 pub struct SourceAnswer {
     /// The configured source name.
     pub source: String,
@@ -19,6 +20,7 @@ pub struct SourceAnswer {
 }
 
 /// The merged page and the key each source carries into the next page.
+#[toolkit_macros::domain_model]
 pub struct MergedPage {
     /// The first `limit` units in the asked order.
     pub units: Vec<InboxUnit>,

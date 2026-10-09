@@ -20,6 +20,7 @@ use usage_collector_sdk::{
 pub struct NoopBackend;
 
 impl NoopBackend {
+    /// Creates the stateless no-op backend.
     #[must_use]
     pub(crate) fn new() -> Self {
         Self

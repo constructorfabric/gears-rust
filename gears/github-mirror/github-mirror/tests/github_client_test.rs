@@ -2205,10 +2205,7 @@ async fn a_rate_limit_seen_by_one_request_pauses_every_other_request() {
         "a request that had nothing to do with the limit must wait out the cooldown another \
          request armed, waited {waited:?}"
     );
-    assert!(
-        limited.calls_async().await >= 2,
-        "the limited request must have retried, which is what proves the cooldown expired"
-    );
+    wait_for_calls(&limited, 2).await;
     assert!(free.calls_async().await >= 1);
 
     limited_request.abort();

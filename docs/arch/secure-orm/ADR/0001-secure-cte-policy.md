@@ -568,6 +568,6 @@ turned out to be false; see "Recursive CTE" above.
 - System-library CTE (out of scope — `toolkit-db` internal, not user-gear code):
   [outbox/store.rs](../../../../libs/toolkit-db/src/outbox/store.rs)
 - ADR template & checklist:
-  [docs/checklists/ADR.md](../../../checklists/ADR.md)
+  [studio-kit-gears/artifacts/ADR/checklist.md](../../../../studio-kit-gears/artifacts/ADR/checklist.md)
 - sea_query `WithClause` / `CommonTableExpression`, sea_orm `find_by_statement` /
   `FromQueryResult`.

@@ -214,9 +214,11 @@ mod dialect;
 mod handler;
 mod manager;
 mod migrations;
+/// Priority ordering of work items across partitions.
 pub(crate) mod prioritizer;
 mod record;
 mod statements;
+/// Per-worker execution statistics and their periodic reporting.
 pub(crate) mod stats;
 mod store;
 mod strategy;

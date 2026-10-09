@@ -171,6 +171,7 @@ pub enum DomainError {
 /// stable wire spelling, used where the category renders the code into the
 /// `Problem` detail (`Validation`) or as a violation `type_`
 /// (`RateLimited`, the `Conflict` fallback).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     // -- NotFound (404) --

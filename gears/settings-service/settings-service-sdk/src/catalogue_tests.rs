@@ -5,13 +5,13 @@ use std::collections::HashSet;
 
 use serde_json::json;
 
-use super::{CATALOGUE, CRON, REGEX, SECRET_STRING, TEXT, VALUE_TYPE_PREFIX};
+use super::{CATALOGUE, CRON, REGEX, SECRET_STRING, TEXT, value_type_prefix};
 
 #[test]
 fn every_entry_is_a_root_type_under_the_toolkit_prefix() {
     let mut seen = HashSet::new();
     for entry in CATALOGUE {
-        assert!(entry.id.starts_with(VALUE_TYPE_PREFIX), "{}", entry.id);
+        assert!(entry.id.starts_with(&value_type_prefix()), "{}", entry.id);
         assert!(entry.id.ends_with(".v1~"), "{}", entry.id);
         assert_eq!(
             entry.id.matches('~').count(),
@@ -127,7 +127,7 @@ fn the_readme_names_every_catalogue_type() {
     for value_type in CATALOGUE {
         let name = value_type
             .id
-            .strip_prefix(VALUE_TYPE_PREFIX)
+            .strip_prefix(&value_type_prefix())
             .and_then(|rest| rest.strip_suffix(".v1~"))
             .expect("a catalogue id");
         assert!(

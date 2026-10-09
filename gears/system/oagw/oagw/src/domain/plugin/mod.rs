@@ -12,16 +12,21 @@ use toolkit_security::SecurityContext;
 #[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
+    /// The referenced secret does not exist in the credential store.
     #[error("secret not found: {0}")]
     SecretNotFound(String),
+    /// The plugin could not authenticate the outbound request.
     #[error("authentication failed: {0}")]
     #[allow(dead_code)] // Part of plugin trait API; no current plugin constructs this.
     AuthFailed(String),
+    /// A guard plugin rejected the request.
     #[error("request rejected: {0}")]
     #[allow(dead_code)] // Part of plugin trait API; no current plugin constructs this.
     Rejected(String),
+    /// The plugin's configuration is missing or malformed.
     #[error("invalid plugin configuration: {0}")]
     InvalidConfig(String),
+    /// Unexpected internal failure inside the plugin.
     #[error("plugin error: {0}")]
     Internal(String),
 }

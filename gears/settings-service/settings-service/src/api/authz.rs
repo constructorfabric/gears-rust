@@ -34,16 +34,18 @@ pub mod resource {
     use super::ResourceType;
 
     /// A setting declaration — the record of what a setting *is*.
-    pub const DECLARATION: ResourceType =
-        ResourceType::from_static("gts.cf.core.settings.declaration.v1~", &[]);
+    pub const DECLARATION: ResourceType = ResourceType::from_static(
+        toolkit_gts::gts_id!("cf.core.settings.declaration.v1~"),
+        &[],
+    );
 
     /// A stored setting value at some scope.
     pub const VALUE: ResourceType =
-        ResourceType::from_static("gts.cf.core.settings.value.v1~", &[]);
+        ResourceType::from_static(toolkit_gts::gts_id!("cf.core.settings.value.v1~"), &[]);
 
     /// A settings category.
     pub const CATEGORY: ResourceType =
-        ResourceType::from_static("gts.cf.core.settings.category.v1~", &[]);
+        ResourceType::from_static(toolkit_gts::gts_id!("cf.core.settings.category.v1~"), &[]);
 }
 
 /// Project an enforcement failure into the gear's error vocabulary.

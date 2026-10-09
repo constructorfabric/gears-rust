@@ -36,7 +36,7 @@ pub trait UsageMeterSemanticsV1: Send + Sync {
 #[derive(Debug, thiserror::Error)]
 #[error("UsageMeterSemanticsV1 is unconfigured (external dependency E1)")]
 pub struct UnconfiguredMeterSemantics;
-#[toolkit_canonical_errors::resource_error("gts.cf.bss.pricing.plan.v1~")]
+#[toolkit_canonical_errors::resource_error(gts_id!("cf.bss.pricing.plan.v1~"))]
 struct PlanResource;
 impl From<UnconfiguredMeterSemantics> for CanonicalError {
     fn from(_error: UnconfiguredMeterSemantics) -> Self {

@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use toolkit_macros::domain_model;
 
 use toolkit_db::secure::DBRunner;
 use toolkit_odata::PageInfo;
@@ -25,6 +26,7 @@ use crate::domain::value::StoredValue;
 
 /// One result: a declaration and the field that matched; for a value match,
 /// the stored row it was found in.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct Hit {
     /// The setting.
@@ -39,6 +41,7 @@ pub struct Hit {
 }
 
 /// A page of hits: the settings the page holds, expanded into their hits.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct SearchPage {
     /// In key order; a setting's own hit before its override hits, those in
@@ -49,6 +52,7 @@ pub struct SearchPage {
 }
 
 /// The service.
+#[domain_model]
 pub struct SearchService<R: SearchRepository> {
     repo: R,
 }

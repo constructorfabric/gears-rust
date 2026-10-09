@@ -44,6 +44,7 @@ struct SecureConfig {
     pep_props: Vec<(String, String, Span)>,
 }
 
+/// Expands `#[derive(Scopable)]` for a struct into its `ScopableEntity` implementation; returns a compile error for unsupported inputs.
 #[allow(clippy::needless_pass_by_value)] // DeriveInput is consumed by proc-macro pattern
 pub fn expand_derive_scopable(input: DeriveInput) -> syn::Result<TokenStream> {
     // Verify this is a struct

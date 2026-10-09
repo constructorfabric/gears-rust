@@ -95,7 +95,7 @@ mod tests {
                 name: "list".to_owned(),
             },
             resource: Resource {
-                resource_type: "gts.cf.core.users.user.v1~".to_owned(),
+                resource_type: toolkit_gts::gts_id!("cf.core.users.user.v1~").to_owned(),
                 id: None,
                 properties: HashMap::new(),
             },

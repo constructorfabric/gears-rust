@@ -481,6 +481,7 @@ impl Drop for Lifecycle {
 pub struct WithLifecycle<T: Runnable> {
     inner: Arc<T>,
     lc: Arc<Lifecycle>,
+    /// Maximum time to wait for the wrapped runnable to stop gracefully.
     pub(crate) stop_timeout: Duration,
     // lifecycle start mode configuration
     await_ready: bool,

@@ -216,6 +216,7 @@ mod tests {
         AggregationScope, Fold, MeterRef, PartialWindow, QuantitySemanticsRequest, RatingWindow,
         Reset, UsageRatingPolicyRequest,
     };
+    use toolkit_gts::gts_id;
     use uuid::Uuid;
 
     fn policy(usage_type_id: &str) -> UsageRatingPolicyRequest {
@@ -264,7 +265,9 @@ mod tests {
     /// digits (75 characters), over a code's 64, and a raw GTS id may pass 64 too.
     #[test]
     fn a_derived_accrual_version_and_a_long_gts_id_fit() {
-        let mut entry = create("gts.cf.core.uc.usage_record.v1~cf.bss.usage_type.memorygbhours.v1");
+        let mut entry = create(gts_id!(
+            "cf.core.uc.usage_record.v1~cf.bss.usage_type.memorygbhours.v1"
+        ));
         if let Some(quantity) = entry
             .usage_rating_policy
             .as_mut()

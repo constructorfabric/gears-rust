@@ -333,6 +333,7 @@ pub enum MatcherCompiled {
 }
 
 impl MatcherCompiled {
+    /// Compiles one expected-audience entry: an entry without `*` matches exactly, otherwise `*` becomes a regex wildcard. Rejects empty entries and `**`; `index` is only used in error messages.
     pub(crate) fn from_wildcard_pattern(mut pattern_raw: &str, index: usize) -> Result<Self> {
         pattern_raw = pattern_raw.trim();
 
@@ -362,12 +363,14 @@ impl MatcherCompiled {
             .map_err(|e| anyhow!("invalid expected audience pattern at index {index}: {e}"))
     }
 
+    /// Compiles `pattern` into a fully anchored (`^...$`) regex matcher.
     pub(crate) fn anchored_regex(pattern: &str) -> Result<Self> {
         let anchored = format!("^{pattern}$");
 
         Regex::new(&anchored).map_err(Into::into).map(Self::Regex)
     }
 
+    /// Returns `true` if `issuer` satisfies this matcher (exact equality or full regex match).
     #[must_use]
     pub(crate) fn is_match(&self, issuer: &str) -> bool {
         match self {

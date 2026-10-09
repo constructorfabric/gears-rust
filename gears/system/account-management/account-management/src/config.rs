@@ -266,10 +266,15 @@ impl ConversionConfig {
     /// Lower / upper bounds pinned in DESIGN §3.2 (`ConversionService`
     /// configuration bounds).
     pub(crate) const MIN_APPROVAL_TTL_SECS: u64 = 60 * 60; // 1h
+    /// Minimum accepted approval TTL, in seconds (1 hour).
     pub(crate) const MAX_APPROVAL_TTL_SECS: u64 = 30 * 24 * 60 * 60; // 30d
+    /// Maximum accepted approval TTL, in seconds (30 days).
     pub(crate) const MIN_RESOLVED_RETENTION_SECS: u64 = 24 * 60 * 60; // 1d
+    /// Minimum accepted resolved-request retention, in seconds (1 day).
     pub(crate) const MAX_RESOLVED_RETENTION_SECS: u64 = 365 * 24 * 60 * 60; // 365d
+    /// Maximum accepted resolved-request retention, in seconds (365 days).
     pub(crate) const MIN_CLEANUP_INTERVAL_SECS: u64 = 10;
+    /// Minimum accepted cleanup-sweep interval, in seconds.
     pub(crate) const MAX_CLEANUP_INTERVAL_SECS: u64 = 10 * 60; // 10m
     /// Upper bound on per-tick batch sizes (`expire_batch_size` /
     /// `retention_batch_size`). The retention sweep lowers candidate

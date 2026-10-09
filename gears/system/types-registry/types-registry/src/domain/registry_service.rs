@@ -941,7 +941,7 @@ mod tests {
         EntityRow {
             id: 7,
             gts_uuid: Uuid::nil(),
-            gts_id: "gts.cf.core.example.type.v1~".to_owned(),
+            gts_id: toolkit_gts::gts_id!("cf.core.example.type.v1~").to_owned(),
             entity_kind: kind,
             family_id: 1,
             ownership_scope: OwnershipScope::Global,
@@ -1015,7 +1015,7 @@ mod tests {
             content(),
         );
         assert!(
-            matches!(result, Err(ServiceError::CorruptDocument(ref d)) if d.contains("gts.cf.core")),
+            matches!(result, Err(ServiceError::CorruptDocument(ref d)) if d.contains(&format!("{}cf.core", toolkit_gts::GTS_ID_PREFIX))),
             "{result:?}",
         );
     }

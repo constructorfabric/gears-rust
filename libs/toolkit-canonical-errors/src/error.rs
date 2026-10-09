@@ -356,6 +356,7 @@ impl CanonicalError {
 
     // --- Builder methods ---
 
+    /// Sets the human-readable detail message on the error.
     #[must_use]
     pub(crate) fn with_detail(mut self, msg: impl Into<String>) -> Self {
         let msg = msg.into();
@@ -380,6 +381,7 @@ impl CanonicalError {
         self
     }
 
+    /// Sets the resource type the error refers to.
     #[must_use]
     pub(crate) fn with_resource_type(mut self, rt: impl Into<String>) -> Self {
         let rt = Some(rt.into());
@@ -404,6 +406,7 @@ impl CanonicalError {
         self
     }
 
+    /// Sets the resource name (identifier) the error refers to.
     #[must_use]
     pub(crate) fn with_resource(mut self, rn: impl Into<String>) -> Self {
         let rn = Some(rn.into());
@@ -513,6 +516,7 @@ impl CanonicalError {
 
     // --- Transport overrides ---
 
+    /// Returns the transport-specific overrides attached to this error.
     pub(crate) const fn transport_overrides(&self) -> &TransportOverrides {
         match self {
             Self::Cancelled { overrides, .. }
@@ -534,6 +538,7 @@ impl CanonicalError {
         }
     }
 
+    /// Returns a mutable reference to the transport-specific overrides attached to this error.
     pub(crate) fn transport_overrides_mut(&mut self) -> &mut TransportOverrides {
         match self {
             Self::Cancelled { overrides, .. }
@@ -673,6 +678,7 @@ impl CanonicalError {
         }
     }
 
+    /// Returns the canonical category name of this error (e.g. `not_found`).
     pub(crate) fn category_name(&self) -> &'static str {
         match self {
             Self::Cancelled { .. } => "cancelled",

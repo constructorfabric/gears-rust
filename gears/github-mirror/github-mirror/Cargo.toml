@@ -11,6 +11,7 @@ repository.workspace = true
 readme = "README.md"
 keywords = ["constructorfabric", "cf-gears"]
 categories = ["web-programming"]
+metadata.docs.rs.all-features = true
 
 [lib]
 name = "github_mirror"
