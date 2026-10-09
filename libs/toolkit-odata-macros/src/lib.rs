@@ -14,7 +14,9 @@
 use proc_macro::TokenStream;
 use syn::{DeriveInput, parse_macro_input};
 
+/// Implementation of the `ODataFilterable` derive macro.
 mod odata_filterable;
+/// Implementation of the `ODataSchema` derive macro.
 mod odata_schema;
 
 /// Derive macro for implementing type-safe `OData` filtering on DTOs.

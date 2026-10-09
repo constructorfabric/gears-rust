@@ -26,6 +26,7 @@ pub enum TransportOverride {
 /// [`Http::status_code`], never directly.
 #[derive(Debug, Clone)]
 pub struct HttpOverride {
+    /// HTTP status code that replaces the default one derived from the error category.
     pub(crate) status_code: u16,
 }
 
@@ -54,10 +55,12 @@ impl Http {
 /// the only public surface is [`TransportOverride`] and [`Http`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TransportOverrides {
+    /// HTTP status code override, if any.
     pub(crate) http_status: Option<u16>,
 }
 
 impl TransportOverrides {
+    /// Applies a single transport override on top of the current overrides.
     pub(crate) fn apply(&mut self, ov: &TransportOverride) {
         match ov {
             TransportOverride::Http(HttpOverride { status_code }) => {

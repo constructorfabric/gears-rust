@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use toolkit_macros::domain_model;
 
 use super::queue::TaskQueue;
 use super::task::{ExtractionTask, Lane, NewTask, RunIdentity, TaskKind, TaskPhase, TaskPriority};
@@ -64,6 +65,7 @@ fn ramp(span: u64, total: u64, remaining: u64) -> u64 {
 }
 
 /// How one run went, in tasks.
+#[domain_model]
 #[derive(Debug, Default)]
 pub struct RunReport {
     pub tasks_done: u64,
@@ -79,6 +81,7 @@ impl RunReport {
 }
 
 /// One task that did not finish, with the error it stopped on.
+#[domain_model]
 #[derive(Debug)]
 pub struct TaskFailure {
     pub kind: Option<TaskKind>,
@@ -116,6 +119,7 @@ struct TaskOutcome {
 }
 
 /// Sequential phase driver for a single repository sync.
+#[domain_model]
 pub struct RepoPhaseRunner {
     queue: Arc<TaskQueue>,
     dispatcher: Arc<WorkerDispatcher>,

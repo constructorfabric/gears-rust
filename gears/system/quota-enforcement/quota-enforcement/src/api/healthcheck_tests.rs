@@ -75,7 +75,24 @@ async fn once_ready_the_check_relays_the_cluster_requirements_verdict() {
     assert_eq!(result.code.as_deref(), Some("qe_cluster_unavailable"));
     let message = result.message.expect("message");
     assert!(message.contains("cluster unavailable"), "{message}");
-    assert!(message.contains("LeaderElectionV1"), "{message}");
+    assert!(
+        !message.contains("LeaderElectionV1"),
+        "the unauthenticated /health must not carry the cluster detail: {message}"
+    );
+
+    let degraded = ReadinessCheck::new(
+        readiness.clone(),
+        Some(Arc::new(FixedCluster(HealthcheckResult::degraded(
+            "profile backend at cache.internal:6379 is slow",
+        )))),
+    );
+    let result = degraded.check().await;
+    assert_eq!(result.code.as_deref(), Some("qe_cluster_degraded"));
+    let message = result.message.expect("message");
+    assert!(
+        !message.contains("cache.internal"),
+        "the unauthenticated /health must not carry the cluster detail: {message}"
+    );
 
     readiness.mark_failed(Dependency::Storage, "db down");
     let storage_first = broken.check().await;

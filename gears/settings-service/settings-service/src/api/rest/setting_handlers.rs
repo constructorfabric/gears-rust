@@ -44,6 +44,7 @@ pub struct TenantParam {
     pub tenant: Option<String>,
 }
 
+/// Parses the optional `tenant` query parameter; absent or empty means "not given".
 pub(crate) fn parse_tenant(raw: Option<&str>) -> Result<Option<Uuid>, DomainError> {
     match raw {
         None | Some("") => Ok(None),
@@ -65,6 +66,7 @@ fn parse_key(raw: &str) -> Result<SettingKey, DomainError> {
     })
 }
 
+/// Maps a failure to obtain a database connection to an internal domain error.
 pub(crate) fn conn_error(err: &toolkit_db::DbError) -> DomainError {
     DomainError::Internal {
         diagnostic: err.to_string(),

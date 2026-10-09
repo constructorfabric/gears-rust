@@ -12,6 +12,7 @@
 pub mod service;
 
 use std::hash::{DefaultHasher, Hash, Hasher};
+use toolkit_macros::domain_model;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -36,6 +37,7 @@ pub const MIN_QUERY_CHARS: usize = 2;
 pub const MAX_QUERY_CHARS: usize = 200;
 
 /// A validated search query: trimmed, and within the bounds.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Needle(String);
 
@@ -110,6 +112,7 @@ pub fn like_escape(s: &str) -> String {
 
 /// Which stored values the caller may match against. Decided once, before any
 /// query runs; `secret` is in neither.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Corpus {
     /// `public` values only: every caller.
@@ -146,6 +149,7 @@ impl Corpus {
 }
 
 /// Which field of a hit matched, in the order a client is told about them.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MatchedField {
     Key,
@@ -207,6 +211,7 @@ pub fn cursor_binding(
 
 /// What a search is asked with, every decision already taken by the caller:
 /// the handler decides, the service and the binding only apply.
+#[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct SearchRequest<'a> {
     /// The narrowed grant, pushed into the declarations query.

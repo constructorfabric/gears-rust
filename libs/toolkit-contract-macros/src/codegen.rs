@@ -7,6 +7,7 @@ use crate::model::{
 };
 use crate::support::contract_support_path;
 
+/// Expands a parsed `#[contract]` trait into the cleaned trait, its descriptor and IR registration tokens.
 pub fn generate(model: &ContractModel) -> TokenStream {
     let support = contract_support_path();
     let trait_def = generate_trait(model);

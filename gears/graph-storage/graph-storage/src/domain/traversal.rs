@@ -7,6 +7,7 @@
 //! union of two directed scans, never the undirected pattern).
 
 use std::collections::{BTreeMap, BTreeSet};
+use toolkit_macros::domain_model;
 
 use graph_storage_sdk::models::{
     Direction, EdgeRef, HopBudget, NodeId, TruncationReason, TypeIdSet,
@@ -17,6 +18,7 @@ use crate::domain::error::DomainError;
 
 /// Which nodes survive when a hop reaches more of them than the budget
 /// allows.
+#[domain_model]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Retention {
     /// The order the hop reached them in, by internal id. What a traversal
@@ -36,6 +38,7 @@ pub enum Retention {
     Degree,
 }
 
+#[domain_model]
 pub struct WalkPlan {
     pub depth: u8,
     /// Total node budget, seeds included. Seeds always survive truncation —
@@ -47,6 +50,7 @@ pub struct WalkPlan {
     pub retention: Retention,
 }
 
+#[domain_model]
 pub struct WalkResult {
     /// Every reached node, seeds first, in deterministic order.
     pub nodes: Vec<NodeId>,
@@ -195,8 +199,11 @@ mod tests {
     use crate::domain::ontology::BASE_SCHEMAS;
     use crate::infra::fake_store::{FakeGraphEngine, FakeGraphStore};
 
-    const OWNED: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.walk._.n.v1~";
-    const LINK: &str = "gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~acme.walk._.e.v1~";
+    const OWNED: &str =
+        toolkit_gts::gts_id!("cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.walk._.n.v1~");
+    const LINK: &str = toolkit_gts::gts_id!(
+        "cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~acme.walk._.e.v1~"
+    );
 
     fn derived(type_id: &str, family: &str) -> TypeRegistration {
         TypeRegistration {
@@ -243,11 +250,11 @@ mod tests {
             .collect();
         types.push(derived(
             OWNED,
-            "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~",
+            toolkit_gts::gts_id!("cf.core.graph.node.v1~cf.core.graph.owned_node.v1~"),
         ));
         types.push(derived(
             LINK,
-            "gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~",
+            toolkit_gts::gts_id!("cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~"),
         ));
         store
             .register_types(&ctx, types)

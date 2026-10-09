@@ -66,6 +66,7 @@ pub fn validate_meter_policy(
 }
 
 /// A deploy-3 `quantity_semantics` copy, checked against the SKU and the provider, then dropped.
+#[toolkit_macros::domain_model]
 pub struct LegacyQuantity<'a> {
     /// Meter id the client sent.
     pub meter_id: &'a str,

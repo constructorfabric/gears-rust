@@ -52,6 +52,7 @@ pub struct DbProducerBuilder<
 }
 
 impl DbProducerBuilder {
+    /// Creates an empty builder; every required part starts unset.
     pub(crate) fn new() -> Self {
         Self {
             broker: None,
@@ -291,13 +292,18 @@ impl DbProducerBuilder<Has, Has, Has, Has, Has, Has, Has> {
 
 #[derive(Clone)]
 pub struct DbProducer {
+    /// Broker the producer publishes to.
     pub(crate) broker: Arc<dyn EventBrokerApi>,
+    /// Security context publishes run under.
     pub(crate) ctx: SecurityContext,
+    /// Identity stamped on every published event.
     // Read only by `outbox_envelope`; kept on the producer so the outbox path can
     // stamp the client agent without re-deriving it from the builder.
     #[cfg_attr(not(feature = "outbox"), allow(dead_code))]
     pub(crate) identity: ProducerIdentity,
+    /// Deduplication setting the producer registers with.
     pub(crate) deduplication: DbDeduplication,
+    /// Cached producer registration, shared across clones.
     pub(crate) registration_state: Arc<Mutex<RegistrationState>>,
     registration_store: ProducerRegistrationStore,
     topics: Vec<String>,

@@ -9,6 +9,7 @@
 //! dashboard and alert templates. OAGW-specific concerns (upstream alias,
 //! pipeline phase, error variant) keep short gear-local names.
 
+/// Metric label (attribute) key names shared by all OAGW instruments.
 pub mod key {
     /// Upstream alias (stable, low-cardinality identifier of the destination service).
     pub const HOST: &str = "host";

@@ -31,9 +31,13 @@ use crate::infra::storage::{InMemoryRouteRepo, InMemoryUpstreamRepo};
 /// Shared application state injected into all handlers.
 #[derive(Clone)]
 pub struct AppState {
+    /// Control-plane service for configuration CRUD and resolution.
     pub(crate) cp: Arc<dyn ControlPlaneService>,
+    /// Data-plane service that proxies requests to upstreams.
     pub(crate) dp: Arc<dyn DataPlaneService>,
+    /// Load-balancing selector picking an endpoint per upstream.
     pub(crate) backend_selector: Arc<dyn EndpointSelector>,
+    /// Runtime configuration derived from the gear config.
     pub(crate) config: crate::config::RuntimeConfig,
 }
 

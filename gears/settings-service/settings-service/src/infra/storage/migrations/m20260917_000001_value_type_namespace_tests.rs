@@ -89,9 +89,10 @@ fn the_rewrite_renders_with_every_input_bound_on_both_backends() {
     // the fragment were dropped on the way. Rendered by each backend's own
     // builder, every input is a bound value, and the SQLite run alone could
     // never have shown the difference.
-    let statement = super::statement(super::OLD, super::NEW).expect("a prefix shorter than any id");
+    let statement = super::statement(&super::old_prefix(), &super::new_prefix())
+        .expect("a prefix shorter than any id");
     let bound = vec![
-        Value::from(super::NEW),
+        Value::from(super::new_prefix()),
         Value::from(30_i32),
         Value::from("gts.cf.toolkit.settings.type\\_%"),
     ];

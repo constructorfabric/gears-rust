@@ -265,6 +265,7 @@ impl Default for ApiGatewayConfig {
     }
 }
 
+/// Gateway-wide default limits and timeouts applied to routes that do not override them.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Defaults {

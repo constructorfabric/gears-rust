@@ -92,6 +92,7 @@ use file_storage::infra::signed_url::{Claims, Op, Verifier};
 const LOCAL_FS_ID: &str = "local-fs";
 
 #[derive(Clone)]
+/// Shared per-process state of the sidecar HTTP handlers: token verifier, backends, control-plane callback settings and metrics.
 struct SidecarState {
     verifier: Arc<Verifier>,
     /// Backends this sidecar can dispatch to, keyed by id. The backend used
@@ -118,6 +119,7 @@ struct SidecarState {
 }
 
 #[derive(Debug, Deserialize)]
+/// Query string of the data-plane routes; carries the signed token when it is not sent in a header.
 struct TokenQuery {
     #[serde(rename = "fs-token")]
     fs_token: Option<SecretString>,

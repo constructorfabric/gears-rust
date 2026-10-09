@@ -103,6 +103,7 @@ pub use lock::CasBasedDistributedLockBackend;
 /// these prefixes sat in the keyspace the cache API serves, and a caller could
 /// read, forge, or reset a lease through `Cache.Get`/`Put`/`Delete`.
 pub(crate) const ELECTION_KEY_PREFIX: &str = "election/";
+/// Key prefix under which the default lock backend stores lock entries in the reserved lease cache.
 pub(crate) const LOCK_KEY_PREFIX: &str = "lock/";
 
 /// SDK-internal seam letting the cluster wiring revoke a default backend's

@@ -14,6 +14,7 @@ use uuid::Uuid;
 const CURSOR_VERSION: u32 = 2;
 
 /// A cursor the inbox minted, after it has been checked.
+#[toolkit_macros::domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedCursor {
     /// The order the cursor was cut in.

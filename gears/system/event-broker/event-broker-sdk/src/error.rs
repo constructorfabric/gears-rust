@@ -1141,7 +1141,10 @@ mod canonical_roundtrip_tests {
                 detail: "denied".to_owned(),
             },
             EventBrokerError::TopicNotFound {
-                topic: "gts.cf.core.events.topic.v1~acme.billing.orders.stream.v1".to_owned(),
+                topic: toolkit_gts::gts_id!(
+                    "cf.core.events.topic.v1~acme.billing.orders.stream.v1"
+                )
+                .to_owned(),
                 detail: "no such topic".to_owned(),
             },
             EventBrokerError::SubscriptionNotFound {
@@ -1153,7 +1156,10 @@ mod canonical_roundtrip_tests {
                 detail: "gone".to_owned(),
             },
             EventBrokerError::EventTypeUnknown {
-                type_id: "gts.cf.core.events.event.v1~acme.orders.created.v1~".to_owned(),
+                type_id: toolkit_gts::gts_id!(
+                    "cf.core.events.event.v1~acme.orders.order.created.v1~"
+                )
+                .to_owned(),
                 detail: "unknown".to_owned(),
             },
             EventBrokerError::RateLimitExceeded {
@@ -1191,7 +1197,10 @@ mod canonical_roundtrip_tests {
                 reason: reasons::ASCII_ONLY,
             },
             EventBrokerError::EventDataInvalid {
-                type_id: "gts.cf.core.events.event.v1~acme.orders.created.v1~".to_owned(),
+                type_id: toolkit_gts::gts_id!(
+                    "cf.core.events.event.v1~acme.orders.order.created.v1~"
+                )
+                .to_owned(),
                 errors: vec!["missing field".to_owned()],
                 detail: "data invalid".to_owned(),
             },
@@ -1203,12 +1212,21 @@ mod canonical_roundtrip_tests {
                 detail: "too big".to_owned(),
             },
             EventBrokerError::TypeNotInDeclaredTopic {
-                type_id: "gts.cf.core.events.event.v1~acme.orders.created.v1~".to_owned(),
-                expected_topic: "gts.cf.core.events.topic.v1~acme.orders.stream.v1".to_owned(),
+                type_id: toolkit_gts::gts_id!(
+                    "cf.core.events.event.v1~acme.orders.order.created.v1~"
+                )
+                .to_owned(),
+                expected_topic: toolkit_gts::gts_id!(
+                    "cf.core.events.topic.v1~acme.orders.core.stream.v1"
+                )
+                .to_owned(),
                 detail: "wrong topic".to_owned(),
             },
             EventBrokerError::SchemaNotPrepared {
-                type_id: "gts.cf.core.events.event.v1~acme.orders.created.v1~".to_owned(),
+                type_id: toolkit_gts::gts_id!(
+                    "cf.core.events.event.v1~acme.orders.order.created.v1~"
+                )
+                .to_owned(),
                 detail: "prepare first".to_owned(),
             },
             EventBrokerError::PositionsNotSet {

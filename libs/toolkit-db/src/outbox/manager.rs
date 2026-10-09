@@ -122,10 +122,12 @@ pub struct OutboxBuilder {
     vacuum_tuning: Option<WorkerTuning>,
     reconciler_tuning: Option<WorkerTuning>,
     tables: OutboxTables,
+    /// Queues declared on this builder, registered when the outbox starts.
     pub(crate) queue_declarations: Vec<QueueDeclaration>,
 }
 
 impl OutboxBuilder {
+    /// Creates an outbox builder bound to the given database handle.
     pub(crate) fn new(db: Db) -> Self {
         Self {
             db,

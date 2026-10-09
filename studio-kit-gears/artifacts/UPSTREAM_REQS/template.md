@@ -1,3 +1,7 @@
+---
+description: "{One sentence: which gears need what from the future gear.}"
+---
+
 # UPSTREAM_REQS — {Gear Name}
 
 <!--

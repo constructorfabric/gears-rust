@@ -522,7 +522,11 @@ pub struct LocalDevStaticUsageTypes;
 
 /// The reserved namespace every fabricated id sits under.
 // A prefix, not an id: each fabricated id appends its leaf to it, so it ends on the dot.
-#[allow(unknown_lints, de0901_gts_string_pattern)]
+#[allow(
+    unknown_lints,
+    de0901_gts_string_pattern,
+    de0904_no_hardcoded_gts_prefix
+)]
 pub const DEV_LOCAL_USAGE_TYPE_PREFIX: &str =
     "gts.cf.core.uc.usage_record.v1~cf.dev.local.usage_type.";
 

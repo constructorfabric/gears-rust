@@ -5,11 +5,17 @@ use std::collections::HashMap;
 /// `SQLite` journal mode options.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JournalMode {
+    /// `journal_mode=DELETE`: rollback journal is deleted after each transaction.
     Delete,
+    /// `journal_mode=WAL`: write-ahead logging.
     Wal,
+    /// `journal_mode=MEMORY`: rollback journal is kept in memory.
     Memory,
+    /// `journal_mode=TRUNCATE`: rollback journal is truncated to zero length instead of deleted.
     Truncate,
+    /// `journal_mode=PERSIST`: rollback journal header is zeroed instead of deleted.
     Persist,
+    /// `journal_mode=OFF`: no rollback journal is kept.
     Off,
 }
 
@@ -31,9 +37,13 @@ impl JournalMode {
 /// `SQLite` synchronous mode options.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncMode {
+    /// `synchronous=OFF`: no syncing; fastest but risks corruption on power loss.
     Off,
+    /// `synchronous=NORMAL`: sync at the most critical moments only.
     Normal,
+    /// `synchronous=FULL`: sync after every critical write for maximum durability.
     Full,
+    /// `synchronous=EXTRA`: like `FULL`, additionally syncing the directory after journal removal.
     Extra,
 }
 
@@ -53,8 +63,11 @@ impl SyncMode {
 /// Parsed `SQLite` PRAGMA parameters.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Pragmas {
+    /// Journal mode requested via the `journal_mode` parameter.
     pub journal_mode: Option<JournalMode>,
+    /// Synchronous mode requested via the `synchronous` parameter.
     pub synchronous: Option<SyncMode>,
+    /// Busy timeout in milliseconds requested via the `busy_timeout` parameter.
     pub busy_timeout_ms: Option<i64>,
     /// Compatibility: support legacy `wal=true|false|1|0`
     pub wal_toggle: Option<bool>,

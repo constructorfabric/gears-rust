@@ -209,6 +209,7 @@ pub fn init_tracing(
     Ok(otel_layer)
 }
 
+/// Builds OTLP gRPC headers from the exporter config, overlaid with environment settings.
 #[cfg(feature = "otel")]
 pub(crate) fn build_headers_from_cfg_and_env(
     exporter: Option<&crate::telemetry::config::Exporter>,
@@ -237,6 +238,7 @@ pub(crate) fn build_headers_from_cfg_and_env(
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// Extends the metadata map with entries from a key/value source, skipping invalid names or values.
 #[cfg(feature = "otel")]
 pub(crate) fn extend_metadata_from_source<'a, I>(
     md: &mut MetadataMap,
@@ -262,6 +264,7 @@ pub(crate) fn extend_metadata_from_source<'a, I>(
     }
 }
 
+/// Builds OTLP gRPC metadata from the exporter config, overlaid with environment settings.
 #[cfg(feature = "otel")]
 pub(crate) fn build_metadata_from_cfg_and_env(
     exporter: Option<&crate::telemetry::config::Exporter>,

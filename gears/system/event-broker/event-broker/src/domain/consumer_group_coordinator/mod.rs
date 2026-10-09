@@ -23,6 +23,7 @@ use crate::domain::model::{Sequence, Subscription};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+use toolkit::domain_model;
 
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -33,37 +34,54 @@ use crate::domain::model::Assignment;
 use crate::domain::streaming::assignment::Generation;
 
 /// Topic identity and partition count, passed to `join`.
+#[domain_model]
 pub struct TopicInterest {
+    /// Topic instance id.
     pub id: GtsInstanceId,
+    /// Number of partitions the topic currently has.
     pub partitions: i32,
 }
 
+/// In-memory registry of consumer groups and their members; owns partition
+/// assignment and rebalancing.
+#[domain_model]
 pub struct ConsumerGroupCoordinator {
+    /// All group and member state, guarded by one lock so rebalances are atomic.
     pub(crate) state: Mutex<CoordinatorState>,
     /// How long a member may stay `Joined` - joined, never streamed - before
     /// it is reaped.
     join_timeout: Duration,
 }
 
+/// Mutable state behind the coordinator lock: every group plus a subscription index.
+#[domain_model]
 #[derive(Default)]
 pub(crate) struct CoordinatorState {
+    /// Per-consumer-group state, keyed by consumer group id.
     pub(crate) groups: HashMap<GtsInstanceId, GroupState>,
     /// Which group each subscription belongs to, so a lookup by subscription
     /// id - what every per-subscription request carries - is not a scan.
     pub(crate) index: HashMap<Uuid, GtsInstanceId>,
 }
 
+/// One consumer group: its members and the current topology version.
+#[domain_model]
 pub(crate) struct GroupState {
+    /// Monotonic version bumped on every rebalance of this group.
     pub(crate) topology_version: i64,
+    /// Members of the group, keyed by subscription id.
     pub(crate) members: HashMap<Uuid, MemberEntry>,
 }
 
+/// One member (subscription) of a consumer group together with its lifecycle state.
+#[domain_model]
 pub(crate) struct MemberEntry {
     /// The subscription itself. Its `assigned` and `topology_version` are
     /// rewritten by every rebalance, so reading it is reading current state.
     pub(crate) subscription: Subscription,
     /// `(topic_id, partition_count)` for each topic this member is interested in.
     pub(crate) interests: Vec<(GtsInstanceId, i32)>,
+    /// Lifecycle state of the member.
     pub(crate) state: MemberState,
     /// When `state` was entered - the age every lifetime is measured from.
     pub(crate) state_since: Instant,
@@ -86,6 +104,7 @@ pub(crate) struct MemberEntry {
 /// | `Joined`       | the coordinator's `join_timeout` |
 /// | `Streaming`    | none - an open stream is the member |
 /// | `Disconnected` | the member's own `session_timeout` |
+#[domain_model]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum MemberState {
     /// Joined, no stream opened yet. Holds its assignment.
@@ -98,6 +117,7 @@ pub(crate) enum MemberState {
 }
 
 /// A member that left the group, for the caller to clear its markers.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Removal {
     pub subscription_id: Uuid,
@@ -107,6 +127,7 @@ pub struct Removal {
 }
 
 /// What a JOIN produced.
+#[domain_model]
 pub struct JoinOutcome {
     /// The stored subscription, carrying the assignment and topology version
     /// the join computed.
@@ -472,6 +493,7 @@ fn compute_assignments(members: &HashMap<Uuid, MemberEntry>) -> HashMap<Uuid, Ve
 /// close: the signal is the same moment, and the mechanism is the one this
 /// change already uses twice - `StreamLease` releases exclusion on drop, and the
 /// module owns the loader's lifetime the same way.
+#[domain_model]
 pub struct MembershipHandle {
     coordinator: Arc<ConsumerGroupCoordinator>,
     group_id: GtsInstanceId,

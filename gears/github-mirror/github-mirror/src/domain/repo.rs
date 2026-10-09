@@ -109,6 +109,7 @@ pub struct IssueRecord {
 /// The slice of a listing a caller asked for: how many rows, and how many to
 /// skip first. The skip is pushed into SQL so a request for page 50 does not
 /// read the 49 pages before it.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageWindow {
     limit: u64,
@@ -255,6 +256,7 @@ mod page_window_tests {
 /// mirror does not yet apply (`labels`, `assignee`, `creator`, `mentioned`,
 /// `milestone`) are recorded as unsupported in PRD 4.3 rather than silently
 /// ignored here.
+#[domain_model]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ListingFilter {
     /// The state to keep, or `None` for every state.
@@ -272,6 +274,7 @@ pub struct ListingFilter {
 /// A parsed enum rather than the raw query string: an unrecognised `state`
 /// used to reach SQL and return an empty page, which reads as "no such
 /// issues" instead of "no such state".
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueState {
     Open,
@@ -306,6 +309,7 @@ impl IssueState {
 }
 
 /// The sort keys GitHub offers that the mirror stores a column for.
+#[domain_model]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ListingSort {
     #[default]
@@ -313,6 +317,7 @@ pub enum ListingSort {
     Updated,
 }
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ListingDirection {
     #[default]

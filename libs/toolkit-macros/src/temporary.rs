@@ -14,6 +14,7 @@ use syn::{Meta, Token};
 
 use crate::utils::parse_string_attribute;
 
+/// Expands `#[temporary(...)]`, validating its arguments and emitting the annotated item.
 pub fn expand_temporary(attr: TokenStream, item: &TokenStream) -> syn::Result<TokenStream> {
     let metas = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(attr)?;
 

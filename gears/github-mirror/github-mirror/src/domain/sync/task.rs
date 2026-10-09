@@ -9,6 +9,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 /// The sync phase that a task belongs to (DESIGN §4, 5-phase pipeline).
@@ -16,6 +17,7 @@ use uuid::Uuid;
 /// `priority_weight` returns a lower value for earlier phases so ordering by
 /// weight ascending always yields Discovery before Refinement; `EnumIter`
 /// walks the variants in that same declaration order.
+#[domain_model]
 #[derive(
     Debug,
     Clone,
@@ -75,6 +77,7 @@ impl std::fmt::Display for TaskPhase {
 }
 
 /// Lifecycle state of a task.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -113,6 +116,7 @@ impl std::fmt::Display for TaskStatus {
 /// open issues, global metrics, closed PRs, and closed issues last. The phase
 /// weight always dominates, so every Indexing task still precedes any
 /// Refinement task.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TaskPriority(pub i32);
 
@@ -147,6 +151,7 @@ impl Default for TaskPriority {
     }
 }
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Family {
@@ -178,6 +183,7 @@ impl std::fmt::Display for Family {
     }
 }
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Entity {
@@ -205,6 +211,7 @@ impl std::fmt::Display for Entity {
     }
 }
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -244,6 +251,7 @@ impl std::fmt::Display for TaskKind {
 /// The run a task belongs to: the sync session and the tenant it runs for,
 /// carried as one value so the two ids cannot be handed over the wrong way
 /// round.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RunIdentity {
     pub session_id: Uuid,
@@ -251,6 +259,7 @@ pub struct RunIdentity {
 }
 
 /// What [`crate::domain::sync::TaskQueue::enqueue_task`] inserts.
+#[domain_model]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewTask {
     pub run: RunIdentity,
@@ -264,6 +273,7 @@ pub struct NewTask {
 }
 
 /// An ephemeral unit of work, scoped to a single in-memory sync run.
+#[domain_model]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionTask {
     pub id: Uuid,
@@ -284,6 +294,7 @@ impl ExtractionTask {
     }
 }
 
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lane {
     PullRequest,

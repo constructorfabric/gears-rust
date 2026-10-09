@@ -5,17 +5,42 @@
 //! every table has a real primary key and `NULL` never enters a key.
 
 use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_orm::ConnectionTrait;
 
-const MYSQL_NOT_SUPPORTED: &str = "quota-enforcement-storage-plugin: MySQL is not supported; \
-    this migration set targets PostgreSQL and SQLite";
+use super::ensure_supported;
 
-const TABLES: [&str; 4] = [
-    "qe_idempotency_retention_config",
-    "qe_lease_capacity_config",
-    "qe_contention_timeout_config",
-    "qe_schema_meta",
-];
+#[derive(DeriveIden)]
+enum QeSchemaMeta {
+    Table,
+    Singleton,
+    ContractMajor,
+    AppliedAt,
+}
+
+#[derive(DeriveIden)]
+enum QeContentionTimeoutConfig {
+    Table,
+    MetricKey,
+    TimeoutMs,
+    UpdatedAt,
+}
+
+#[derive(DeriveIden)]
+enum QeLeaseCapacityConfig {
+    Table,
+    TenantKey,
+    MetricKey,
+    MaxActiveLeases,
+    UpdatedAt,
+}
+
+#[derive(DeriveIden)]
+enum QeIdempotencyRetentionConfig {
+    Table,
+    TenantKey,
+    MetricKey,
+    RetentionSeconds,
+    UpdatedAt,
+}
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -23,80 +48,158 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let statements: &[&str] = match manager.get_database_backend() {
-            sea_orm::DatabaseBackend::Postgres => &[
-                "CREATE TABLE IF NOT EXISTS qe_schema_meta ( \
-                    contract_major INTEGER PRIMARY KEY, \
-                    applied_at TIMESTAMPTZ NOT NULL \
-                );",
-                "CREATE TABLE IF NOT EXISTS qe_contention_timeout_config ( \
-                    metric_key TEXT PRIMARY KEY, \
-                    timeout_ms BIGINT NOT NULL, \
-                    updated_at TIMESTAMPTZ NOT NULL \
-                );",
-                "CREATE TABLE IF NOT EXISTS qe_lease_capacity_config ( \
-                    tenant_key TEXT NOT NULL, \
-                    metric_key TEXT NOT NULL, \
-                    max_active_leases INTEGER NOT NULL, \
-                    updated_at TIMESTAMPTZ NOT NULL, \
-                    PRIMARY KEY (tenant_key, metric_key) \
-                );",
-                "CREATE TABLE IF NOT EXISTS qe_idempotency_retention_config ( \
-                    tenant_key TEXT NOT NULL, \
-                    metric_key TEXT NOT NULL, \
-                    retention_seconds BIGINT NOT NULL, \
-                    updated_at TIMESTAMPTZ NOT NULL, \
-                    PRIMARY KEY (tenant_key, metric_key) \
-                );",
-            ],
-            sea_orm::DatabaseBackend::Sqlite => &[
-                // SQLite has no TIMESTAMPTZ type. SeaORM stores `OffsetDateTime`
-                // as ISO-8601 TEXT.
-                "CREATE TABLE IF NOT EXISTS qe_schema_meta ( \
-                    contract_major INTEGER PRIMARY KEY, \
-                    applied_at TEXT NOT NULL \
-                );",
-                "CREATE TABLE IF NOT EXISTS qe_contention_timeout_config ( \
-                    metric_key TEXT PRIMARY KEY, \
-                    timeout_ms INTEGER NOT NULL, \
-                    updated_at TEXT NOT NULL \
-                );",
-                "CREATE TABLE IF NOT EXISTS qe_lease_capacity_config ( \
-                    tenant_key TEXT NOT NULL, \
-                    metric_key TEXT NOT NULL, \
-                    max_active_leases INTEGER NOT NULL, \
-                    updated_at TEXT NOT NULL, \
-                    PRIMARY KEY (tenant_key, metric_key) \
-                );",
-                "CREATE TABLE IF NOT EXISTS qe_idempotency_retention_config ( \
-                    tenant_key TEXT NOT NULL, \
-                    metric_key TEXT NOT NULL, \
-                    retention_seconds INTEGER NOT NULL, \
-                    updated_at TEXT NOT NULL, \
-                    PRIMARY KEY (tenant_key, metric_key) \
-                );",
-            ],
-            _ => return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned())),
-        };
-        let conn = manager.get_connection();
-        for sql in statements {
-            conn.execute_unprepared(sql).await?;
-        }
-        Ok(())
+        ensure_supported(manager)?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(QeSchemaMeta::Table)
+                    .if_not_exists()
+                    // A fixed key, so the table can hold only one row.
+                    .col(
+                        ColumnDef::new(QeSchemaMeta::Singleton)
+                            .integer()
+                            .not_null()
+                            .primary_key()
+                            .check(Expr::col(QeSchemaMeta::Singleton).eq(1)),
+                    )
+                    .col(
+                        ColumnDef::new(QeSchemaMeta::ContractMajor)
+                            .integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(QeSchemaMeta::AppliedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(QeContentionTimeoutConfig::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(QeContentionTimeoutConfig::MetricKey)
+                            .text()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(QeContentionTimeoutConfig::TimeoutMs)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(QeContentionTimeoutConfig::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(QeLeaseCapacityConfig::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(QeLeaseCapacityConfig::TenantKey)
+                            .text()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(QeLeaseCapacityConfig::MetricKey)
+                            .text()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(QeLeaseCapacityConfig::MaxActiveLeases)
+                            .integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(QeLeaseCapacityConfig::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .primary_key(
+                        Index::create()
+                            .col(QeLeaseCapacityConfig::TenantKey)
+                            .col(QeLeaseCapacityConfig::MetricKey),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(QeIdempotencyRetentionConfig::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(QeIdempotencyRetentionConfig::TenantKey)
+                            .text()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(QeIdempotencyRetentionConfig::MetricKey)
+                            .text()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(QeIdempotencyRetentionConfig::RetentionSeconds)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(QeIdempotencyRetentionConfig::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .primary_key(
+                        Index::create()
+                            .col(QeIdempotencyRetentionConfig::TenantKey)
+                            .col(QeIdempotencyRetentionConfig::MetricKey),
+                    )
+                    .to_owned(),
+            )
+            .await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        if matches!(
-            manager.get_database_backend(),
-            sea_orm::DatabaseBackend::MySql
-        ) {
-            return Err(DbErr::Custom(MYSQL_NOT_SUPPORTED.to_owned()));
-        }
-        let conn = manager.get_connection();
-        for table in TABLES {
-            conn.execute_unprepared(&format!("DROP TABLE IF EXISTS {table};"))
-                .await?;
-        }
-        Ok(())
+        ensure_supported(manager)?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(QeIdempotencyRetentionConfig::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(QeLeaseCapacityConfig::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(QeContentionTimeoutConfig::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(QeSchemaMeta::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await
     }
 }

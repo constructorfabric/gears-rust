@@ -10,6 +10,7 @@ pub mod cache;
 pub mod resolver;
 
 use std::collections::HashMap;
+use toolkit_macros::domain_model;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -40,6 +41,7 @@ pub mod scope_class {
 /// Platform scope *is* the root tenant — its rows carry the root tenant's id —
 /// so the two spellings converge once the root is known; the distinction is
 /// kept only as long as the caller's wording is, for the response.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScopeTarget {
     /// `/`, the platform root.
@@ -116,6 +118,7 @@ pub fn subtree_too_large(field: &str, whose: &str) -> DomainError {
 /// The links are what a walk over the whole subtree needs: every
 /// descendant's chain below the walked tenant is read off them in memory,
 /// rather than asked of the tenant resolver once per descendant.
+#[domain_model]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Subtree {
     /// The descendants in breadth-first order, standalone subtrees left out.
@@ -216,6 +219,7 @@ mod subtree_tests;
 /// The consumer projection drops `set_by` and `last_change_at`; the
 /// administrative read keeps them.
 // Three independent facts about one scope; an enum would only re-encode them.
+#[domain_model]
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrailEntry {
@@ -236,6 +240,7 @@ pub struct TrailEntry {
 }
 
 /// The requested scope's own row, as the administrative read reports it.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnRow {
     /// Flagged for review: the resolver fell through past it.
@@ -250,6 +255,7 @@ pub struct OwnRow {
 
 /// A resolved effective value with its trace — computed, never persisted.
 // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-shape:p1
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveValue {
     /// The setting key.

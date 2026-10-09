@@ -10,7 +10,7 @@ version = "0.1.0"
 [[kits.resources]]
 id = "prd_template"
 kind = "template"
-source = "docs/spec-templates/gears-sdlc/PRD/template.md"
+source = "studio-kit-gears/artifacts/PRD/template.md"
 install_path = "artifacts/PRD/template.md"
 type = "file"
 user_modifiable = true
@@ -18,7 +18,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "prd_checklist"
 kind = "checklist"
-source = "docs/checklists/PRD.md"
+source = "studio-kit-gears/artifacts/PRD/checklist.md"
 install_path = "artifacts/PRD/checklist.md"
 type = "file"
 user_modifiable = true
@@ -26,7 +26,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "prd_example"
 kind = "directory"
-source = "docs/spec-templates/gears-sdlc/PRD/examples"
+source = "studio-kit-gears/artifacts/PRD/examples"
 install_path = "artifacts/PRD/examples"
 type = "directory"
 user_modifiable = true
@@ -34,7 +34,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "adr_template"
 kind = "template"
-source = "docs/spec-templates/gears-sdlc/ADR/template.md"
+source = "studio-kit-gears/artifacts/ADR/template.md"
 install_path = "artifacts/ADR/template.md"
 type = "file"
 user_modifiable = true
@@ -42,7 +42,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "adr_checklist"
 kind = "checklist"
-source = "docs/checklists/ADR.md"
+source = "studio-kit-gears/artifacts/ADR/checklist.md"
 install_path = "artifacts/ADR/checklist.md"
 type = "file"
 user_modifiable = true
@@ -50,7 +50,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "adr_example"
 kind = "directory"
-source = "docs/spec-templates/gears-sdlc/ADR/examples"
+source = "studio-kit-gears/artifacts/ADR/examples"
 install_path = "artifacts/ADR/examples"
 type = "directory"
 user_modifiable = true
@@ -58,7 +58,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "design_template"
 kind = "template"
-source = "docs/spec-templates/gears-sdlc/DESIGN/template.md"
+source = "studio-kit-gears/artifacts/DESIGN/template.md"
 install_path = "artifacts/DESIGN/template.md"
 type = "file"
 user_modifiable = true
@@ -66,7 +66,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "design_checklist"
 kind = "checklist"
-source = "docs/checklists/DESIGN.md"
+source = "studio-kit-gears/artifacts/DESIGN/checklist.md"
 install_path = "artifacts/DESIGN/checklist.md"
 type = "file"
 user_modifiable = true
@@ -74,7 +74,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "design_example"
 kind = "directory"
-source = "docs/spec-templates/gears-sdlc/DESIGN/examples"
+source = "studio-kit-gears/artifacts/DESIGN/examples"
 install_path = "artifacts/DESIGN/examples"
 type = "directory"
 user_modifiable = true
@@ -82,7 +82,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "decomposition_template"
 kind = "template"
-source = "docs/spec-templates/gears-sdlc/DECOMPOSITION/template.md"
+source = "studio-kit-gears/artifacts/DECOMPOSITION/template.md"
 install_path = "artifacts/DECOMPOSITION/template.md"
 type = "file"
 user_modifiable = true
@@ -90,7 +90,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "decomposition_checklist"
 kind = "checklist"
-source = "docs/checklists/DECOMPOSITION.md"
+source = "studio-kit-gears/artifacts/DECOMPOSITION/checklist.md"
 install_path = "artifacts/DECOMPOSITION/checklist.md"
 type = "file"
 user_modifiable = true
@@ -98,7 +98,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "decomposition_example"
 kind = "directory"
-source = "docs/spec-templates/gears-sdlc/DECOMPOSITION/examples"
+source = "studio-kit-gears/artifacts/DECOMPOSITION/examples"
 install_path = "artifacts/DECOMPOSITION/examples"
 type = "directory"
 user_modifiable = true
@@ -106,7 +106,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "feature_template"
 kind = "template"
-source = "docs/spec-templates/gears-sdlc/FEATURE/template.md"
+source = "studio-kit-gears/artifacts/FEATURE/template.md"
 install_path = "artifacts/FEATURE/template.md"
 type = "file"
 user_modifiable = true
@@ -114,7 +114,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "feature_checklist"
 kind = "checklist"
-source = "docs/checklists/FEATURE.md"
+source = "studio-kit-gears/artifacts/FEATURE/checklist.md"
 install_path = "artifacts/FEATURE/checklist.md"
 type = "file"
 user_modifiable = true
@@ -122,7 +122,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "feature_example"
 kind = "directory"
-source = "docs/spec-templates/gears-sdlc/FEATURE/examples"
+source = "studio-kit-gears/artifacts/FEATURE/examples"
 install_path = "artifacts/FEATURE/examples"
 type = "directory"
 user_modifiable = true
@@ -130,7 +130,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "upstream_reqs_template"
 kind = "template"
-source = "docs/spec-templates/gears-sdlc/UPSTREAM_REQS/template.md"
+source = "studio-kit-gears/artifacts/UPSTREAM_REQS/template.md"
 install_path = "artifacts/UPSTREAM_REQS/template.md"
 type = "file"
 user_modifiable = true
@@ -138,7 +138,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "upstream_reqs_checklist"
 kind = "checklist"
-source = "docs/checklists/UPSTREAM_REQS.md"
+source = "studio-kit-gears/artifacts/UPSTREAM_REQS/checklist.md"
 install_path = "artifacts/UPSTREAM_REQS/checklist.md"
 type = "file"
 user_modifiable = true
@@ -146,7 +146,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "upstream_reqs_example"
 kind = "directory"
-source = "docs/spec-templates/gears-sdlc/UPSTREAM_REQS/examples"
+source = "studio-kit-gears/artifacts/UPSTREAM_REQS/examples"
 install_path = "artifacts/UPSTREAM_REQS/examples"
 type = "directory"
 user_modifiable = true
@@ -170,7 +170,7 @@ user_modifiable = true
 [[kits.resources]]
 id = "codebase_checklist"
 kind = "checklist"
-source = "docs/checklists/CODING.md"
+source = "studio-kit-gears/codebase/checklist.md"
 install_path = "codebase/checklist.md"
 type = "file"
 user_modifiable = true
@@ -300,6 +300,102 @@ user_modifiable = true
 public = true
 
 [[kits.resources]]
+id = "prd_rules"
+kind = "rule"
+source = "studio-kit-gears/artifacts/PRD/rules.md"
+install_path = "artifacts/PRD/rules.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "adr_rules"
+kind = "rule"
+source = "studio-kit-gears/artifacts/ADR/rules.md"
+install_path = "artifacts/ADR/rules.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "design_rules"
+kind = "rule"
+source = "studio-kit-gears/artifacts/DESIGN/rules.md"
+install_path = "artifacts/DESIGN/rules.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "decomposition_rules"
+kind = "rule"
+source = "studio-kit-gears/artifacts/DECOMPOSITION/rules.md"
+install_path = "artifacts/DECOMPOSITION/rules.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "feature_rules"
+kind = "rule"
+source = "studio-kit-gears/artifacts/FEATURE/rules.md"
+install_path = "artifacts/FEATURE/rules.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "upstream_reqs_rules"
+kind = "rule"
+source = "studio-kit-gears/artifacts/UPSTREAM_REQS/rules.md"
+install_path = "artifacts/UPSTREAM_REQS/rules.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "codebase_rules"
+kind = "rule"
+source = "studio-kit-gears/codebase/rules.md"
+install_path = "codebase/rules.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "codebase_design_led_rules"
+kind = "rule"
+source = "studio-kit-gears/codebase/design-led-rules.md"
+install_path = "codebase/design-led-rules.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "gears_doc_stage_router"
+kind = "other"
+source = "studio-kit-gears/modules/doc-stage-router.md"
+install_path = "modules/doc-stage-router.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "gears_code_stage_router"
+kind = "other"
+source = "studio-kit-gears/modules/code-stage-router.md"
+install_path = "modules/code-stage-router.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "gears_doc_phase"
+kind = "other"
+source = "studio-kit-gears/plans/doc-phase.md"
+install_path = "plans/doc-phase.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "gears_code_phase"
+kind = "other"
+source = "studio-kit-gears/plans/code-phase.md"
+install_path = "plans/code-phase.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
 id = "constraints"
 kind = "constraints"
 source = "studio-kit-gears/constraints.toml"
@@ -309,30 +405,36 @@ user_modifiable = true
 
 [kits.resources.artifacts.PRD]
 template = "prd_template"
+rules = "prd_rules"
 checklist = "prd_checklist"
 examples = "prd_example"
 
 [kits.resources.artifacts.ADR]
 template = "adr_template"
+rules = "adr_rules"
 checklist = "adr_checklist"
 examples = "adr_example"
 
 [kits.resources.artifacts.DESIGN]
 template = "design_template"
+rules = "design_rules"
 checklist = "design_checklist"
 examples = "design_example"
 
 [kits.resources.artifacts.DECOMPOSITION]
 template = "decomposition_template"
+rules = "decomposition_rules"
 checklist = "decomposition_checklist"
 examples = "decomposition_example"
 
 [kits.resources.artifacts.FEATURE]
 template = "feature_template"
+rules = "feature_rules"
 checklist = "feature_checklist"
 examples = "feature_example"
 
 [kits.resources.artifacts.UPSTREAM_REQS]
 template = "upstream_reqs_template"
+rules = "upstream_reqs_rules"
 checklist = "upstream_reqs_checklist"
 examples = "upstream_reqs_example"

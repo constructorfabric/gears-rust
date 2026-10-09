@@ -14,6 +14,7 @@
 
 use async_trait::async_trait;
 use toolkit_db::secure::DBRunner;
+use toolkit_macros::domain_model;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -24,6 +25,7 @@ use super::visibility::DomainVisibility;
 use crate::domain::error::DomainError;
 
 /// A category as the domain sees it.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Category {
     /// Surrogate identity, stable across a rename.
@@ -54,6 +56,7 @@ pub struct Category {
 /// place would re-key each of them with no cascade and no tombstone
 /// (DESIGN.md "Stale keys resolve as `NotFound`"). Making the field unreachable
 /// from the update path is what keeps that from being one typo away.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct CategoryPatch {
     /// Display name; `None` leaves it.
@@ -70,6 +73,7 @@ pub struct CategoryPatch {
 
 /// What a partial update does to one nullable field: three cases, since an
 /// omitted field and an explicit `null` mean different things on the wire.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Patch<T> {
     /// Not on the wire: the field keeps its value.
@@ -104,6 +108,7 @@ impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for Patch<T> {
 /// Separate from [`Category`] because a caller cannot set `id` or `etag`: both
 /// are the service's to assign, and accepting them would let a client claim an
 /// identity or forge a precondition.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CategoryDraft {
     /// The stable slug.

@@ -9,11 +9,13 @@
 //! Pure: no clock, no channel, no frame. What a case *means* is the session's.
 
 use crate::domain::model::Assignment;
+use toolkit::domain_model;
 
 /// One published view of a member's assignment.
 ///
 /// Public fields, because this is a data carrier published on a `watch` channel
 /// rather than a value with invariants to protect.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Generation {
     pub topology_version: i64,
@@ -50,6 +52,7 @@ impl Generation {
 /// One variant per emission rule: `Unchanged` emits nothing; `VersionOnly` and
 /// `Loss` emit a non-terminal `topology` frame and the stream continues; `Gain`
 /// and `LoseAll` emit a `terminal` control frame and the stream then closes.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssignmentDelta {
     /// Same partitions, same version. Nothing to say.

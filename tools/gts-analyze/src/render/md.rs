@@ -7,6 +7,7 @@ use crate::render::{LOC_ORDER, is_type_id, loc_icon, type_prefix};
 
 const MAX_PER_LOC_VERBOSE: usize = 5;
 
+/// Renders the report as Markdown.
 pub fn render(rep: &Report) -> String {
     let mut lines: Vec<String> = Vec::new();
     let push = |lines: &mut Vec<String>, s: String| lines.push(s);

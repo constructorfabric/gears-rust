@@ -183,7 +183,8 @@ mod tests {
     use crate::infra::storage::migrations::Migrator;
     use sqlite_event_broker_plugin::{EventLogPath, SqliteEventBackend};
 
-    const TOPIC_ID: &str = "gts.cf.core.events.topic.v1~example.eb.ingestoutbox.topic.v1";
+    const TOPIC_ID: &str =
+        toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.ingestoutbox.topic.v1");
 
     async fn test_db() -> Arc<DBProvider<toolkit_db::DbError>> {
         let mut path = std::env::temp_dir();
@@ -251,14 +252,16 @@ mod tests {
     fn test_event(sequence: i64) -> Event {
         Event {
             id: Uuid::new_v4(),
-            r#type: crate::test_support::event_type_id(
-                "gts.cf.core.events.event.v1~example.eb.ingestoutbox.event.v1~",
-            ),
+            r#type: crate::test_support::event_type_id(toolkit_gts::gts_id!(
+                "cf.core.events.event.v1~example.eb.ingestoutbox.event.v1~"
+            )),
             topic: toolkit_gts::GtsInstanceId::try_new(TOPIC_ID).unwrap(),
             tenant_id: Uuid::new_v4(),
             source: "test".to_owned(),
             subject: "subject".to_owned(),
-            subject_type: gts::GtsTypeId::new("gts.example.eb.ingestoutbox.subject.v1~"),
+            subject_type: gts::GtsTypeId::new(toolkit_gts::gts_id!(
+                "example.eb.ingestoutbox.subject.v1~"
+            )),
             occurred_at: chrono::Utc::now(),
             trace_parent: None,
             data: serde_json::json!({"k": "v"}),
@@ -349,9 +352,9 @@ mod tests {
     async fn unregistered_topic_is_rejected() {
         let (handler, _backend) = test_handler().await;
         let mut event = test_event(1);
-        event.topic = toolkit_gts::GtsInstanceId::try_new(
-            "gts.cf.core.events.topic.v1~example.eb.ingestoutbox.unregistered.v1",
-        )
+        event.topic = toolkit_gts::GtsInstanceId::try_new(toolkit_gts::gts_id!(
+            "cf.core.events.topic.v1~example.eb.ingestoutbox.unregistered.v1"
+        ))
         .unwrap();
         let msg = test_message(&event);
         let result = handler.handle(&msg).await;

@@ -54,8 +54,11 @@ pub(crate) fn host_key(endpoint: &reqwest::Url) -> String {
 /// In-memory, per-process circuit breaker for IdP-facing operations.
 pub struct CircuitBreaker {
     host: String,
+    /// Lock-free state register holding one of the `STATE_*` codes.
     pub(crate) state: CircuitBreakerState,
+    /// Consecutive failures observed in the current state; reset on success and when the breaker opens.
     pub(crate) failure_count: AtomicU32,
+    /// When the breaker last opened; used to decide when `reset_timeout` has elapsed and a half-open probe is allowed.
     pub(crate) opened_at: Mutex<Option<Instant>>,
     failure_threshold: u32,
     reset_timeout: Duration,
@@ -689,48 +692,70 @@ mod tests {
         // Barrier ensures all 10 tasks call the breaker at the same instant.
         let start_barrier = Arc::new(Barrier::new(10));
 
+        // Each caller reports when its `call` returns, so the test waits on
+        // actual progress instead of a fixed scheduling delay.
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
+
         let mut handles = Vec::new();
         for _ in 0..10 {
             let b = breaker.clone();
             let pe = probe_entered.clone();
             let bar = start_barrier.clone();
             let rx = release_rx.clone();
+            let done = done_tx.clone();
             handles.push(tokio::spawn(async move {
                 bar.wait().await;
-                b.call(|| async {
-                    pe.fetch_add(1, Ordering::AcqRel);
-                    // The first probe to enter takes the receiver and waits;
-                    // later entrants (if the bug existed) would find None and
-                    // proceed immediately.
-                    if let Some(rx) = rx.lock().await.take() {
-                        drop(rx.await);
-                    }
-                    Ok::<(), AuthNError>(())
-                })
-                .await
+                let result = b
+                    .call(|| async {
+                        pe.fetch_add(1, Ordering::AcqRel);
+                        // The first probe to enter takes the receiver and waits;
+                        // later entrants (if the bug existed) would find None and
+                        // proceed immediately. The lock guard is released
+                        // before awaiting so those entrants are not blocked.
+                        let rx = rx.lock().await.take();
+                        if let Some(rx) = rx {
+                            drop(rx.await);
+                        }
+                        Ok::<(), AuthNError>(())
+                    })
+                    .await;
+                let _reported = done.send(result.is_ok());
             }));
         }
+        drop(done_tx);
 
-        // Give the runtime time to schedule all tasks and attempt the probes.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait until the nine losing callers have returned while the winning
+        // probe is still held open. The timeout only guards against a hang.
+        let loser_results = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut results = Vec::new();
+            while results.len() < 9 {
+                results.push(done_rx.recv().await.expect("caller should report"));
+            }
+            results
+        })
+        .await
+        .expect("nine callers should return while the probe is held open");
 
         assert_eq!(
             probe_entered.load(Ordering::Acquire),
             1,
             "exactly one probe closure should have entered while it is held open"
         );
+        assert!(
+            loser_results.iter().all(|ok| !ok),
+            "callers returning while the probe is held open should be rejected"
+        );
 
         // Release the probe so it completes.
         let _released = release_tx.send(());
 
-        let mut ok_count = 0usize;
+        let winner_ok = done_rx.recv().await.expect("winning caller should report");
+        assert!(winner_ok, "the winning probe should succeed");
+
         for handle in handles {
-            if handle.await.expect("task should not panic").is_ok() {
-                ok_count += 1;
-            }
+            handle.await.expect("task should not panic");
         }
 
-        assert_eq!(ok_count, 1, "exactly one caller should succeed");
         assert_eq!(breaker.state(), STATE_CLOSED);
     }
 }

@@ -129,7 +129,7 @@ Provides the fundamental task management capabilities that all other features de
 6. [ ] - `p1` - **IF** categoryId provided - `inst-val-6`
    1. [ ] - `p1` - DB: SELECT id FROM categories WHERE id = :categoryId AND user_id = :userId - `inst-val-6a`
    2. [ ] - `p1` - **IF** category not found, add error - `inst-val-6b`
-7. [ ] - `p1` - **RETURN** { valid: errors.length === 0, errors, warnings } - `inst-val-7`
+7. [ ] - `p1` - **RETURN** a result that is valid when there are no errors, together with the errors and warnings - `inst-val-7`
 
 ## 4. States (CDSL)
 
