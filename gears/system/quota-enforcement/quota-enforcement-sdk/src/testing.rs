@@ -51,15 +51,19 @@ pub fn test_tenant() -> TenantId {
 /// A registered-looking metric instance id.
 #[must_use]
 pub fn test_metric() -> MetricId {
-    MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1")
-        .expect("well-formed metric id")
+    MetricId::parse(toolkit_gts::gts_id!(
+        "cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1"
+    ))
+    .expect("well-formed metric id")
 }
 
 /// A user-scope subject under a test owner projection.
 #[must_use]
 pub fn test_subject(subject_id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: GtsTypeId::new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~"),
+        projection_type: GtsTypeId::new(toolkit_gts::gts_id!(
+            "cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~"
+        )),
         subject_id: subject_id.to_owned(),
     }
 }
@@ -81,9 +85,9 @@ pub fn quota_draft(subject: SubjectRef, cap: Option<u64>) -> QuotaDraft {
         metadata: serde_json::Map::new(),
         source: QuotaSource::Licensing,
         constraint_contract: ContractRef {
-            type_id: GtsTypeId::new(
-                "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v1~",
-            ),
+            type_id: GtsTypeId::new(toolkit_gts::gts_id!(
+                "cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v1~"
+            )),
             version: 1,
         },
     }

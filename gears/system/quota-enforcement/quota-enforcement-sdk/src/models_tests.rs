@@ -47,7 +47,7 @@ fn gts_enums_reject_short_names_and_unknown_ids() {
         }
     );
     assert!(
-        "gts.cf.core.qe.quota_type.v1~cf.core.qe.burst.v1"
+        toolkit_gts::gts_id!("cf.core.qe.quota_type.v1~cf.core.qe.burst.v1")
             .parse::<QuotaType>()
             .is_err()
     );
@@ -87,7 +87,7 @@ fn every_gts_enum_value_derives_from_its_declared_base() {
     assert_eq!(PeriodType::ALL.len(), 5, "PRD 5.4 reserves five periods");
     assert_eq!(
         PeriodType::OneTime.as_gts_id(),
-        "gts.cf.core.qe.period_type.v1~cf.core.qe.one_time.v1"
+        toolkit_gts::gts_id!("cf.core.qe.period_type.v1~cf.core.qe.one_time.v1")
     );
 }
 
@@ -182,10 +182,12 @@ fn policy_id_recognizes_the_seeded_global_policy() {
 
 #[test]
 fn metric_id_accepts_instance_ids_and_rejects_type_ids() {
-    let ok = MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1");
+    let ok = MetricId::parse(toolkit_gts::gts_id!(
+        "cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1"
+    ));
     assert!(ok.is_ok(), "{ok:?}");
     assert!(
-        MetricId::parse("gts.cf.core.qe.metric_type.v1~").is_err(),
+        MetricId::parse(toolkit_gts::gts_id!("cf.core.qe.metric_type.v1~")).is_err(),
         "type id rejected"
     );
     assert!(MetricId::parse("not-a-gts-id").is_err());
@@ -309,8 +311,10 @@ fn decision_result_is_tagged_and_denied_carries_its_reason() {
 
 #[test]
 fn policy_scope_is_tagged_by_kind() {
-    let metric = MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1")
-        .expect("metric id");
+    let metric = MetricId::parse(toolkit_gts::gts_id!(
+        "cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1"
+    ))
+    .expect("metric id");
     let scope = PolicyScope::Metric {
         metric: metric.clone(),
     };
@@ -356,7 +360,9 @@ fn foundation_bundle_carries_the_contract_major_and_prd_defaults() {
 
 #[test]
 fn subject_ref_equality_covers_both_halves_of_the_identity() {
-    let projection = GtsTypeId::new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~");
+    let projection = GtsTypeId::new(toolkit_gts::gts_id!(
+        "cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~"
+    ));
     let a = SubjectRef {
         projection_type: projection.clone(),
         subject_id: "u1".to_owned(),

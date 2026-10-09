@@ -307,7 +307,7 @@ macro_rules! gts_closed_enum {
 
         impl $name {
             /// Abstract GTS base type every value derives from.
-            pub const BASE_TYPE_ID: &'static str = $base;
+            pub const BASE_TYPE_ID: &'static str = toolkit_gts::gts_id!($base);
 
             /// Every value, in declaration order.
             pub const ALL: &'static [Self] = &[ $( Self::$variant, )+ ];
@@ -316,7 +316,7 @@ macro_rules! gts_closed_enum {
             #[must_use]
             pub const fn as_gts_id(self) -> &'static str {
                 match self {
-                    $( Self::$variant => $id, )+
+                    $( Self::$variant => toolkit_gts::gts_id!($id), )+
                 }
             }
         }
@@ -331,10 +331,12 @@ macro_rules! gts_closed_enum {
             type Err = UnknownValue;
 
             fn from_str(s: &str) -> Result<Self, Self::Err> {
-                match s {
-                    $( $id => Ok(Self::$variant), )+
-                    other => Err(UnknownValue { kind: $kind, value: other.to_owned() }),
-                }
+                $(
+                    if s == toolkit_gts::gts_id!($id) {
+                        return Ok(Self::$variant);
+                    }
+                )+
+                Err(UnknownValue { kind: $kind, value: s.to_owned() })
             }
         }
 
@@ -355,47 +357,47 @@ macro_rules! gts_closed_enum {
 
 gts_closed_enum!(
     /// Accounting model of a Quota (PRD section 5.3).
-    QuotaType, kind = "quota_type", base = "gts.cf.core.qe.quota_type.v1~", {
+    QuotaType, kind = "quota_type", base = "cf.core.qe.quota_type.v1~", {
         /// In-flight reservable capacity, no period reset.
-        Allocation => "gts.cf.core.qe.quota_type.v1~cf.core.qe.allocation.v1",
+        Allocation => "cf.core.qe.quota_type.v1~cf.core.qe.allocation.v1",
         /// Per-period cumulative consumption, reset at the period boundary.
-        Consumption => "gts.cf.core.qe.quota_type.v1~cf.core.qe.consumption.v1",
+        Consumption => "cf.core.qe.quota_type.v1~cf.core.qe.consumption.v1",
         /// Reserved for P3. Creation is rejected in P1.
-        Rate => "gts.cf.core.qe.quota_type.v1~cf.core.qe.rate.v1",
+        Rate => "cf.core.qe.quota_type.v1~cf.core.qe.rate.v1",
     }
 );
 
 gts_closed_enum!(
     /// Behaviour of a Quota at its cap boundary (PRD section 5.11).
-    EnforcementMode, kind = "enforcement_mode", base = "gts.cf.core.qe.enforcement_type.v1~", {
+    EnforcementMode, kind = "enforcement_mode", base = "cf.core.qe.enforcement_type.v1~", {
         /// Operations that would cross the cap are denied. The only P1 mode.
-        Hard => "gts.cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1",
+        Hard => "cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1",
     }
 );
 
 gts_closed_enum!(
     /// Who imposed the Quota (PRD section 5.2, "Source value semantics").
-    QuotaSource, kind = "quota_source", base = "gts.cf.core.qe.source_type.v1~", {
+    QuotaSource, kind = "quota_source", base = "cf.core.qe.source_type.v1~", {
         /// Materialized from the licensing layer. The default.
-        Licensing => "gts.cf.core.qe.source_type.v1~cf.core.qe.licensing.v1",
+        Licensing => "cf.core.qe.source_type.v1~cf.core.qe.licensing.v1",
         /// Created manually by an operator outside the licensing flow.
-        Operator => "gts.cf.core.qe.source_type.v1~cf.core.qe.operator.v1",
+        Operator => "cf.core.qe.source_type.v1~cf.core.qe.operator.v1",
     }
 );
 
 gts_closed_enum!(
     /// Calendar-aligned UTC period of a consumption Quota (PRD section 5.4).
-    PeriodType, kind = "period_type", base = "gts.cf.core.qe.period_type.v1~", {
+    PeriodType, kind = "period_type", base = "cf.core.qe.period_type.v1~", {
         /// 00:00 UTC to 24:00 UTC.
-        Day => "gts.cf.core.qe.period_type.v1~cf.core.qe.day.v1",
+        Day => "cf.core.qe.period_type.v1~cf.core.qe.day.v1",
         /// Monday 00:00 UTC to the next Monday.
-        Week => "gts.cf.core.qe.period_type.v1~cf.core.qe.week.v1",
+        Week => "cf.core.qe.period_type.v1~cf.core.qe.week.v1",
         /// First day of the month, 00:00 UTC.
-        Month => "gts.cf.core.qe.period_type.v1~cf.core.qe.month.v1",
+        Month => "cf.core.qe.period_type.v1~cf.core.qe.month.v1",
         /// First of January, 00:00 UTC.
-        Year => "gts.cf.core.qe.period_type.v1~cf.core.qe.year.v1",
+        Year => "cf.core.qe.period_type.v1~cf.core.qe.year.v1",
         /// Non-recurring. No automatic reset.
-        OneTime => "gts.cf.core.qe.period_type.v1~cf.core.qe.one_time.v1",
+        OneTime => "cf.core.qe.period_type.v1~cf.core.qe.one_time.v1",
     }
 );
 

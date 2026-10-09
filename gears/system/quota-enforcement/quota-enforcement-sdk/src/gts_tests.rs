@@ -9,7 +9,7 @@ use super::{
 fn the_storage_plugin_spec_type_id_derives_from_the_toolkit_plugin_base() {
     let storage = QuotaEnforcementStoragePluginSpecV1::TYPE_ID;
     assert!(
-        storage.starts_with("gts.cf.toolkit.plugins.plugin.v1~"),
+        storage.starts_with(toolkit_gts::gts_id!("cf.toolkit.plugins.plugin.v1~")),
         "{storage}"
     );
     assert!(storage.ends_with('~'));
@@ -24,7 +24,10 @@ fn resource_ids_are_distinct_five_segment_type_ids() {
         OPERATION_RESOURCE,
     ];
     for id in all {
-        assert!(id.starts_with("gts.cf.core.qe."), "{id}");
+        assert!(
+            id.starts_with(&format!("{}cf.core.qe.", toolkit_gts::GTS_ID_PREFIX)),
+            "{id}"
+        );
         assert!(id.ends_with(".v1~"), "{id}");
     }
     let mut sorted = all.to_vec();
