@@ -747,7 +747,7 @@ Authoritative multi-tenant catalog registry: System of Record for products, SKUs
 
 ### Plan & Price Modeling
 #### Responsibility
-Define subscription plans, price structures, add-ons, bundles, and billing descriptors so that Subscriptions can sell, Tariffs can resolve inputs, and Rating can charge deterministically from frozen snapshots.
+Define subscription plans, price structures, add-ons, bundles, and billing descriptors so that Subscriptions can sell and Rating can resolve inputs and charge deterministically from frozen snapshots.
 #### High Level Scenarios
 - [ ] p1 - plan definition with billing cycles and plan types
 - [ ] p1 - price structure and model kinds (flat, per_unit, tiered, volume, package, hybrid)
@@ -764,32 +764,18 @@ Define subscription plans, price structures, add-ons, bundles, and billing descr
 - TODO: API link
 - TODO: SDK link
 
-### Tariffs
-#### Responsibility
-Tariff definitions consumed by Rating and Product Catalog with configurable conditional clauses and tariff shapes.
-#### High Level Scenarios
-- [ ] p1 - define and manage tariff structures
-- [ ] p1 - conditional clause evaluation and tariff shape resolution
-- [ ] p2 - tariff versioning and effective dating
-- [ ] p3 - integration with Rating and Plan & Price Modeling
-#### More details
-- TODO: PRD link
-- TODO: Design link
-- TODO: API link
-- TODO: SDK link
-
 ### Rating
 #### Responsibility
-Convert metered usage and subscription state into deterministic, auditable charges via a pure evaluation core and an operational pipeline.
+Convert metered usage and subscription state into deterministic, auditable charges via a pure evaluation core and an operational pipeline. One consolidated gear (Rating ADR-0002): the former Tariffs evaluation is its pure `rating-core` crate, not a separate gear.
 #### High Level Scenarios
 - [ ] p1 - deterministic charge evaluation with byte-for-byte reproducible outputs
-- [ ] p1 - pricing model coverage: flat, per_unit, tiered, volume, package, hybrid, committed-usage
+- [ ] p1 - pricing model coverage over the bindings Pricing resolves (PriceBook): flat, per_unit, graduated, volume, package; Products derived usage meters
 - [ ] p1 - multi-tenant hierarchy evaluation (platform owner, channel partner, end customer)
 - [ ] p2 - multi-currency correctness with separated price/invoice/settlement currencies
 - [ ] p2 - rule-version audit trail with UTC effective dating
 - [ ] p2 - usage ingestion, windowed aggregation, dedup, and evaluation-unit synthesis
 - [ ] p3 - retroactivity, corrections, and period-level obligations
-- [ ] p4 - commitments, reservations, and coupons overlay
+- [ ] p4 - commitments, reservations, and coupons (no upstream source yet; Promotions deferred by Pricing)
 #### More details
 - [PRD](../gears/bss/rating/docs/PRD.md)
 - [Design](../gears/bss/rating/docs/DESIGN.md)

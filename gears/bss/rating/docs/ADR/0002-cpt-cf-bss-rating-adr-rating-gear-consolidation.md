@@ -5,7 +5,7 @@ decision-makers: "BSS Rating/Tariffs owner (single owner for both parts)"
 ---
 
 Created:  2026-08-24 by Virtuozzo International GmbH
-Updated:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-10-08 by Virtuozzo International GmbH
 
 # ADR-0002: One `rating` Gear — Consolidate Tariffs (Evaluation Core) and the Rating Pipeline
 
@@ -102,25 +102,39 @@ gears/bss/rating/
 │       ├── 01–11 …             ← evaluation-core slices (this design set, ~as-is)
 │       └── 12–16 …             ← pipeline slices (new; content = the duties today assigned
 │                                  to the "Rating" actor + T-D-10/11/15)
-├── rating-core/                ← (when code starts) pure crate: evaluate()/reresolve(),
+├── rating-core/                ← (when code starts) pure crate: evaluate()/split_points(),
 │                                  steps 1–9, guards; zero I/O dependencies
-└── …                           ← pipeline crates per ToolKit gear layout
+├── rating-sdk/                 ← RatingRunReadV1 / RatingRunControlV1 / OrderEvaluationV1 + types (ToolKit SDK pattern)
+└── rating/                     ← pipeline gear crate per ToolKit gear layout
 ```
 
-Pipeline slice set (initial): **12** usage ingestion & normalization; **13** windowed `Q` store
-(single-writer, per-slice attribution + `bandOffsetQ`) & usage/delta dedup (T-D-11);
-**14** evaluation-unit synthesis & the period tick (T-D-15) & context assembly / read-model pin;
-**15** rated-output persistence & the RatedCharge/BillableItem mapping (slice 11 §4.1 table) &
-`CommitmentBalanceEffect` publication + cascade orchestration (T-D-10);
-**16** Billing handoff & operations/scale.
+Pipeline slice set (initial, as decided 2026-07-11): **12** usage ingestion & normalization; **13**
+windowed `Q` store & usage/delta dedup (T-D-11); **14** evaluation-unit synthesis & the period tick
+(T-D-15) & context assembly / read-model pin; **15** rated-output persistence &
+`CommitmentBalanceEffect` publication (T-D-10); **16** Billing handoff & operations/scale.
+
+*Current slice content (2026-10-01, informative — this ADR's decision is unchanged)*: the "period
+tick" became Rating's child-window scheduler beneath Subscriptions' commercial facts (T-D-49);
+per-slice `bandOffsetQ` became band continuity inside one child evaluation (T-D-43); rated output
+became exact window results and absolute parent revisions delivered to Billing (T-D-50, T-D-51);
+`CommitmentBalanceEffect` publication is dormant (R-11).
+
+*Documentation layout (2026-10-06, informative — this ADR's decision is unchanged)*: the `design/`
+slice set and `SEAMS.md` shown in the target structure above were restructured. Architecture and the
+detailed contracts of the sixteen former slices are in [`../DESIGN.md`](../DESIGN.md) §6 (namespaces
+01–16 keep their section addresses); implementation scope and build order are in
+[`../DECOMPOSITION.md`](../DECOMPOSITION.md), whose §4 resolves every former slice address;
+capability behaviour is in [`../features/`](../features/); dependency evidence and asks are in
+[`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md). The `rating-core` / pipeline split decided here is
+unchanged and is the basis of that decomposition (DECISIONS T-D-72).
 
 ### What lands where (scope split)
 
 | Current content | Destination |
 |---|---|
-| PRD §6 semantics; slices 01–07 (pipeline order, selection, models, overlays, commitments, coupons, FX) | **rating-core** — unchanged in substance |
+| PRD §6 semantics; slices 01–07 (pipeline order, selection, models, overlays, commitments, coupons, FX) | **rating-core** — unchanged in substance (since 2026-10-08 selection belongs to Pricing's `resolve` and overlays no longer exist: ADR-0003, T-D-73) |
 | Slice 08 replay/diff/reversal math; slice 09 split geometry, proration math, obligation shapes | **rating-core** (pure math); their *triggers* (correction ingestion, period tick) → pipeline |
-| Slice 10 publish validators, rev-share pass-through, ASC refs | **rating-core** artifacts, registered in the pricing publish engine (unchanged) |
+| Slice 10 publish validators, rev-share pass-through, ASC refs | **rating-core** artifacts, registered in the pricing publish engine (unchanged at the time; since 2026-10-08 there is no publish-validator hook — approval is the shared `bss-approval` engine and Rating has no role there, DECISIONS R-12 closed) |
 | Slice 11: five upstream contracts (Pricing, Subscriptions, Finance, Promotions, Billing-inbound) | **gear boundary contracts** of the rating gear (unchanged in substance) |
 | Slice 11 §4.1 Rating handoff | becomes the **internal core↔pipeline crate API** (no longer a cross-gear contract) |
 | Duties assigned to the "Rating" system actor (Q aggregation, dedup, unit synthesis, period tick, persistence, balance effects, cascade routing) | **pipeline slices 12–16** (graduate from actor description to first-class design) |
@@ -222,7 +236,7 @@ Executed as ordered commits, each independently green:
 
 Naming rationale: in classical BSS taxonomy the current "Tariffs" content *is* rating (applying
 prices to usage), while the current "Rating" gear is mediation + orchestration; "tariff" denotes
-the rate definitions owned by Pricing. See the ownership matrix in [`../SEAMS.md`](../SEAMS.md)
+the rate definitions owned by Pricing. See the ownership statement ("Rating owns" / "Rating does not own") in [`../DESIGN.md`](../DESIGN.md) §1.1; the ownership matrix this sentence first cited was in an earlier `SEAMS.md` revision
 and the scope-migration record in [`../PRD.md`](../PRD.md) §2.2.
 
 ## Traceability
@@ -231,6 +245,7 @@ and the scope-migration record in [`../PRD.md`](../PRD.md) §2.2.
   §2.1 (naming), §2.2 (scope migration, VHP-810).
 - **Decisions**: T-D-16 (this consolidation), T-D-10/T-D-11/T-D-15 (obligations becoming
   intra-gear) — [`../DECISIONS.md`](../DECISIONS.md).
-- **Seams**: [`../SEAMS.md`](../SEAMS.md) (retitled Rating ⇄ Pricing in Commit B).
-- **Design**: [`../design/01-foundation.md`](../design/01-foundation.md) §3.8 (deployment),
-  [`../design/11-consumer-contracts.md`](../design/11-consumer-contracts.md) §4.1 (handoff → internal API).
+- **Seams**: [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) (formerly `SEAMS.md`, retitled Rating ⇄ Pricing in Commit B).
+- **Design**: [DESIGN 01 §3.8](../DESIGN.md#contract-01-3-8) (deployment),
+  [DESIGN 11 §4.1](../DESIGN.md#contract-11-4-1) (handoff → internal API); decomposition in
+  [`../DECOMPOSITION.md`](../DECOMPOSITION.md).
