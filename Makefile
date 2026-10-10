@@ -687,7 +687,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-durable-execution-pg coverage-durable-execution-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -817,6 +817,19 @@ test-types-registry-db: install-tools
 test-cluster-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-postgres-cluster-plugin --features integration --retries 1
+
+# Use one test binary so PostgreSQL scenarios share the testcontainers fixture.
+DURABLE_EXECUTION_PG_TEST_ARGS := -p cf-gears-durable-execution --lib --features integration \
+    -- --skip infra::storage::process_tests::worker_child --test-threads=4
+
+test-durable-execution-pg: install-tools
+	$(call print_target_banner)
+	cargo test $(DURABLE_EXECUTION_PG_TEST_ARGS)
+
+# Append profiles to the caller's LLVM session; do not clean or generate a report.
+coverage-durable-execution-pg:
+	$(call print_target_banner)
+	cargo llvm-cov test --no-rustc-wrapper --no-report $(DURABLE_EXECUTION_PG_TEST_ARGS)
 
 ## Kubernetes cluster plugin: L2 (conformance) + L3 (integration) against a real
 ## k3s API server (docs/TESTING.md 4, 7). Docker required, and k3s needs

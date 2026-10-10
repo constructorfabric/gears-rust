@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/wrong_chain.rs:6:15
+  |
+6 |         .then(Step::new("second", |_, n: u32| async move { Ok(n) }).timeout(Duration::from_secs(1)));
+  |          ---- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Step<String, _>`, found `Step<u32, u32>`
+  |          |
+  |          arguments to this method are incorrect
+  |
+  = note: expected struct `cf_gears_durable_execution_sdk::workflow::Step<String, _>`
+             found struct `cf_gears_durable_execution_sdk::workflow::Step<u32, u32>`
+note: method defined here
+ --> src/workflow.rs
+  |
+  |     pub fn then<N: Payload>(mut self, step: Step<O, N>) -> WorkflowBuilder<I, N> {
+  |            ^^^^

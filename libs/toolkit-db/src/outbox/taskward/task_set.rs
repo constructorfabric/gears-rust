@@ -7,6 +7,12 @@ struct NamedTask {
     handle: JoinHandle<()>,
 }
 
+impl Drop for NamedTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// A collection of named spawned tasks with structured shutdown.
 ///
 /// Replaces ad-hoc `Vec<JoinHandle<()>>` with named tasks and per-task
@@ -50,11 +56,15 @@ impl TaskSet {
     /// 1. Cancels the shared token
     /// 2. Joins each handle in spawn order
     /// 3. Logs per-task outcome
+    ///
+    /// Dropping this future aborts all tasks, including the one being joined.
     pub async fn shutdown(mut self) {
         self.cancel.cancel();
 
-        for task in std::mem::take(&mut self.tasks) {
-            match task.handle.await {
+        for mut task in std::mem::take(&mut self.tasks) {
+            // Each handle retains abort-on-drop ownership while shutdown awaits
+            // it. Cancelling this drain also aborts the remaining iterator.
+            match (&mut task.handle).await {
                 Ok(()) => {
                     debug!(name = task.name, "task stopped");
                 }
@@ -80,6 +90,40 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_shutdown_aborts_current_and_remaining_tasks() {
+        struct OnDrop(tokio::sync::mpsc::UnboundedSender<()>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap_or_default();
+            }
+        }
+        let (dropped, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = TaskSet::new(CancellationToken::new());
+        for name in ["current", "remaining"] {
+            let barrier = barrier.clone();
+            let dropped = dropped.clone();
+            tasks.spawn(name, async move {
+                let _guard = OnDrop(dropped);
+                barrier.wait().await;
+                std::future::pending::<()>().await;
+            });
+        }
+        barrier.wait().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), tasks.shutdown())
+                .await
+                .is_err()
+        );
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn spawn_and_shutdown() {

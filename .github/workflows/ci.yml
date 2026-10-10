@@ -432,6 +432,9 @@ jobs:
       - name: Test redis-cluster-plugin (redis integration)
         run: make test-cluster-redis
 
+      - name: Test durable-execution (PostgreSQL and subprocess recovery)
+        run: make test-durable-execution-pg
+
       - name: Test toolkit-db (sqlite integration)
         run: make test-sqlite
 
@@ -990,6 +993,10 @@ jobs:
       #   4. The k8s-cluster-plugin L2/L3 k3s suites. These live behind
       #      `required-features = ["integration"]`.
       #
+      #   5. The durable-execution PostgreSQL suites behind the integration
+      #      feature, including subprocess recovery. A single test binary
+      #      shares the workspace-pinned PostgreSQL container.
+      #
       # The per-binary k3s loop (one container per binary, cleaned between —
       # nextest's process-per-test would start ~70 of them) lives in the
       # `coverage-cluster-k8s` Makefile target so this step stays readable; it
@@ -1012,7 +1019,8 @@ jobs:
           cargo llvm-cov nextest --no-report -p cf-postgres-cluster-plugin --features integration --retries 1
           # Pass 4: k8s-cluster-plugin k3s suites
           make coverage-cluster-k8s
-          # Merge into the single report that gets uploaded.
+          # Pass 5: durable-execution PostgreSQL and subprocess recovery suites.
+          make coverage-durable-execution-pg
           cargo llvm-cov report --lcov --output-path lcov.info
 
       # Upload LCOV report as a GitHub Actions artifact so it is always

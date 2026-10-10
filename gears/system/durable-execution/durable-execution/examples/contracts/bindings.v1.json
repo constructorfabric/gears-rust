@@ -1,0 +1,33 @@
+{
+  "name": "notifications.invoice-email.v1",
+  "activities": [
+    {
+      "id": "send_invoice",
+      "timeout": {
+        "secs": 60,
+        "nanos": 0
+      },
+      "retry": {
+        "max_attempts": 10,
+        "initial_delay_secs": 15,
+        "max_delay_secs": 300
+      }
+    }
+  ],
+  "parallel_groups": [],
+  "flow": {
+    "version": 1,
+    "inputs": {
+      "send_invoice": {
+        "source": "run_input"
+      }
+    },
+    "dependencies": {
+      "send_invoice": []
+    },
+    "output": {
+      "source": "checkpoint",
+      "value": "send_invoice"
+    }
+  }
+}
