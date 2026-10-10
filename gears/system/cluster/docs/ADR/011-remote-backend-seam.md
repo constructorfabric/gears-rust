@@ -40,7 +40,7 @@ So something has to differ, and the question is *what*, and *where*. Whatever ob
 ## Decision Drivers
 
 - **Profile transparency.** One consumer source file, no `cfg`, no mode flag (Goal 2, invariant I1).
-- **The plugin contract is fixed.** The three `*Backend` traits are what every plugin implements; they cannot acquire a required method (invariant I11).
+- **The plugin contract is fixed.** The three `*Backend` traits are what every plugin implements; they cannot acquire a required method (invariant I11). *(Amended 2026-09-18, PR #4863: the store-owned-lease methods are a deliberate, scoped exception — now required, because a whole operating profile depends on them; see [ADR-012](./012-store-owned-leases.md)'s amendment and the amended I11 in DESIGN.md.)*
 - **The in-process hot path must not regress.** Cluster is on the request path of gears that call it per operation (invariant I14).
 - **Startup must not block on cluster reachability** (ADR-0005, invariant I6).
 - **The error model is frozen.** No new variant for a condition the seam introduces (invariant I3).

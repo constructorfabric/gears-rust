@@ -311,3 +311,67 @@ fn the_default_window_suppresses_every_hint() {
         );
     }
 }
+
+/// Records every `(op, result)` the lock reports, so the label a call lands under
+/// can be asserted without a database.
+#[derive(Default)]
+struct LockOps(std::sync::Mutex<Vec<String>>);
+
+impl ClusterMetrics for LockOps {
+    fn cache_op(&self, _op: &str, _result: &str) {}
+    fn cache_op_duration(&self, _op: &str, _seconds: f64) {}
+    fn lock_op(&self, op: &str, _result: &str) {
+        self.0.lock().expect("ops").push(op.to_owned());
+    }
+    fn lock_op_duration(&self, _op: &str, _seconds: f64) {}
+    fn leader_transition(&self, _transition: &str) {}
+    fn watch_reset(&self, _primitive: &str) {}
+    fn provider_error(&self, _kind: &str) {}
+}
+
+/// The token path records under its **own** `op` labels, never the guard path's:
+/// `acquire`/`acquire_waiting`/`token_renew`/`token_release` rather than
+/// `try_lock`/`lock`/`renew`/`release`. That is the same split the CAS default and
+/// the Redis and k8s locks draw, so moving a profile between backends keeps one
+/// label set. The pool points at a closed port, so every call fails fast. The label
+/// is recorded on the error path as on success, which is what makes this runnable
+/// without Postgres.
+#[tokio::test]
+async fn the_token_path_records_its_own_op_labels() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(200))
+        .connect_lazy("postgres://cluster@127.0.0.1:1/cluster")
+        .expect("a lazy pool never connects up front");
+    let ops = Arc::new(LockOps::default());
+    let lock = PostgresLock::new(LockInit {
+        pool,
+        schema: "cluster".to_owned(),
+        reaper_interval: Duration::from_secs(30),
+        fence_retention: Duration::from_hours(1),
+        metrics: Arc::clone(&ops) as Arc<dyn ClusterMetrics>,
+        provider: "postgres",
+        guard_shutdown: CancellationToken::new(),
+    });
+    let ttl = Duration::from_secs(30);
+    let token = LeaseToken::new("ledger", "owner-a", 1);
+
+    let _unreachable = lock.acquire("ledger", "owner-a", ttl).await;
+    let _unreachable = lock
+        .acquire_waiting("ledger", "owner-a", ttl, Duration::from_millis(300))
+        .await;
+    let _unreachable = lock.renew(&token, ttl).await;
+    let _unreachable = lock.release(&token).await;
+    let _unreachable = lock.try_lock("ledger", ttl).await;
+
+    assert_eq!(
+        *ops.0.lock().expect("ops"),
+        [
+            "acquire",
+            "acquire_waiting",
+            "token_renew",
+            "token_release",
+            "try_lock"
+        ],
+        "each half reports under its own op label"
+    );
+}

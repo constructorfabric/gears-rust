@@ -17,6 +17,27 @@ use cluster_sdk::lock::{
 };
 use cluster_sdk::observability::{self, ClusterMetrics, NoopMetrics, result, spans};
 
+/// Which half of the lock an acquisition serves. Both halves share one
+/// implementation, and this is what gives each its own span and `op` label.
+#[derive(Clone, Copy)]
+enum LockHalf {
+    /// `try_lock`/`lock`: the in-process [`LockGuard`] path.
+    Guard,
+    /// `acquire`/`acquire_waiting`: the store-owned token path the gRPC lock
+    /// service serves every Profile-3 lock RPC through.
+    Token,
+}
+
+impl LockHalf {
+    /// Picks this half's `op` label.
+    const fn op(self, guard: &'static str, token: &'static str) -> &'static str {
+        match self {
+            Self::Guard => guard,
+            Self::Token => token,
+        }
+    }
+}
+
 /// Records the metric side of a finished lock op (duration + bounded-`result`
 /// counter) and the shared provider-error signals. Used by both the backend
 /// (`try_lock`/`lock`) and the per-guard task (`renew`/`release`).
@@ -380,17 +401,27 @@ impl CasBasedDistributedLockBackend {
     /// [`acquire`](DistributedLockBackend::acquire) run: one insert-or-steal
     /// attempt, contention reported as [`ClusterError::LockContended`].
     ///
-    /// Instrumented here rather than at each caller so the guard-returning and
-    /// token-returning halves share one span and one metric series — they are the
-    /// same operation, and `op` is a bounded label (invariant I15).
+    /// Instrumented here rather than at each caller, so the guard-returning and
+    /// token-returning halves share one implementation. `half` still gives each its
+    /// own span and `op` label (`try_lock` vs `acquire`). A brokered Profile-3
+    /// acquire and an in-process `try_lock` are separate operations to an operator,
+    /// and every native backend draws the same split. `op` stays a bounded label
+    /// (invariant I15).
     async fn acquire_lease(
         &self,
         name: &str,
         owner: &str,
         ttl: Duration,
+        half: LockHalf,
     ) -> Result<LeaseToken, ClusterError> {
-        let span =
-            tracing::info_span!(spans::LOCK_TRY_LOCK, provider = %self.provider, lock = %name);
+        let span = match half {
+            LockHalf::Guard => {
+                tracing::info_span!(spans::LOCK_TRY_LOCK, provider = %self.provider, lock = %name)
+            }
+            LockHalf::Token => {
+                tracing::info_span!(spans::LOCK_ACQUIRE, provider = %self.provider, lock = %name)
+            }
+        };
         let op_started = std::time::Instant::now();
         let out = async {
             let key = Self::lock_key(name);
@@ -406,7 +437,7 @@ impl CasBasedDistributedLockBackend {
         record_lock(
             &*self.metrics,
             self.provider,
-            "try_lock",
+            half.op("try_lock", "acquire"),
             name,
             op_started,
             &out,
@@ -428,8 +459,18 @@ impl CasBasedDistributedLockBackend {
         owner: &str,
         ttl: Duration,
         timeout: Duration,
+        half: LockHalf,
     ) -> Result<LeaseToken, ClusterError> {
-        let span = tracing::info_span!(spans::LOCK_LOCK, provider = %self.provider, lock = %name);
+        let span = match half {
+            LockHalf::Guard => {
+                tracing::info_span!(spans::LOCK_LOCK, provider = %self.provider, lock = %name)
+            }
+            LockHalf::Token => tracing::info_span!(
+                spans::LOCK_ACQUIRE_WAITING,
+                provider = %self.provider,
+                lock = %name
+            ),
+        };
         let op_started = std::time::Instant::now();
         let out = self
             .wait_for_lease(name, owner, ttl, timeout)
@@ -438,7 +479,7 @@ impl CasBasedDistributedLockBackend {
         record_lock(
             &*self.metrics,
             self.provider,
-            "lock",
+            half.op("lock", "acquire_waiting"),
             name,
             op_started,
             &out,
@@ -595,7 +636,9 @@ impl DistributedLockBackend for CasBasedDistributedLockBackend {
         // can renew or release the other's lease. Remotely the owner is the
         // caller's `ClientId` (§5.4), supplied by the serving gear.
         let owner = identity::fresh_id();
-        let token = self.acquire_lease(name, &owner, ttl).await?;
+        let token = self
+            .acquire_lease(name, &owner, ttl, LockHalf::Guard)
+            .await?;
         Ok(self.spawn_guard(Self::lock_key(name), token))
     }
 
@@ -607,7 +650,7 @@ impl DistributedLockBackend for CasBasedDistributedLockBackend {
     ) -> Result<LockGuard, ClusterError> {
         let owner = identity::fresh_id();
         let token = self
-            .acquire_lease_waiting(name, &owner, ttl, timeout)
+            .acquire_lease_waiting(name, &owner, ttl, timeout, LockHalf::Guard)
             .await?;
         Ok(self.spawn_guard(Self::lock_key(name), token))
     }
@@ -618,7 +661,7 @@ impl DistributedLockBackend for CasBasedDistributedLockBackend {
         owner: &str,
         ttl: Duration,
     ) -> Result<LeaseToken, ClusterError> {
-        self.acquire_lease(name, owner, ttl).await
+        self.acquire_lease(name, owner, ttl, LockHalf::Token).await
     }
 
     async fn acquire_waiting(
@@ -628,13 +671,17 @@ impl DistributedLockBackend for CasBasedDistributedLockBackend {
         ttl: Duration,
         timeout: Duration,
     ) -> Result<LeaseToken, ClusterError> {
-        self.acquire_lease_waiting(name, owner, ttl, timeout).await
+        self.acquire_lease_waiting(name, owner, ttl, timeout, LockHalf::Token)
+            .await
     }
 
+    /// The token path's renew. It has its own `token_renew` span and `op` label,
+    /// distinct from the guard task's `renew`, for the reason
+    /// [`acquire_lease`](Self::acquire_lease) gives.
     async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
         let key = Self::lock_key(&token.name);
         let span = tracing::info_span!(
-            spans::LOCK_RENEW,
+            spans::LOCK_TOKEN_RENEW,
             provider = %self.provider,
             lock = %token.name
         );
@@ -643,7 +690,7 @@ impl DistributedLockBackend for CasBasedDistributedLockBackend {
         record_lock(
             &*self.metrics,
             self.provider,
-            "renew",
+            "token_renew",
             &token.name,
             op_started,
             &out,
@@ -651,10 +698,12 @@ impl DistributedLockBackend for CasBasedDistributedLockBackend {
         out
     }
 
+    /// The token path's release, with its own `token_release` span and `op` label
+    /// (see [`renew`](DistributedLockBackend::renew)).
     async fn release(&self, token: &LeaseToken) -> Result<(), ClusterError> {
         let key = Self::lock_key(&token.name);
         let span = tracing::info_span!(
-            spans::LOCK_RELEASE,
+            spans::LOCK_TOKEN_RELEASE,
             provider = %self.provider,
             lock = %token.name
         );
@@ -663,7 +712,7 @@ impl DistributedLockBackend for CasBasedDistributedLockBackend {
         record_lock(
             &*self.metrics,
             self.provider,
-            "release",
+            "token_release",
             &token.name,
             op_started,
             &out,

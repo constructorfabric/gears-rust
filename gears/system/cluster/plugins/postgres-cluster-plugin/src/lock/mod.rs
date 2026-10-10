@@ -211,12 +211,35 @@ fn validate_lock_name(name: &str) -> Result<(), ClusterError> {
     Ok(())
 }
 
+/// Which half of the lock an operation serves. Both halves share one
+/// implementation, and this is what gives each its own span and `op` label, the
+/// same split `CasBasedDistributedLockBackend` draws.
+#[derive(Clone, Copy)]
+enum LockHalf {
+    /// `try_lock`/`lock` and the per-guard task: the in-process guard path.
+    Guard,
+    /// `acquire`/`acquire_waiting`/`renew`/`release` on the trait: the store-owned
+    /// token path the gRPC lock service serves every Profile-3 lock RPC through.
+    Token,
+}
+
+impl LockHalf {
+    /// Picks this half's `op` label.
+    const fn op(self, guard: &'static str, token: &'static str) -> &'static str {
+        match self {
+            Self::Guard => guard,
+            Self::Token => token,
+        }
+    }
+}
+
 /// Records the metric side of a finished lock op (duration + bounded-`result`
 /// counter) and the shared provider-error signals, mirroring
 /// `CasBasedDistributedLockBackend::record_lock` (`cluster/src/defaults/lock.rs`)
 /// so the native Postgres lock emits the exact same ADR-004 signal set the
-/// CAS-based default does (DESIGN.md §8). Used by both the backend
-/// (`try_lock`/`lock`) and the per-guard task (`renew`/`release`).
+/// CAS-based default does (DESIGN.md §8). Used by both halves: the guard path
+/// (`try_lock`/`lock`, and the per-guard task's `renew`/`release`) and the token
+/// path (`acquire`/`acquire_waiting`/`token_renew`/`token_release`).
 fn record_lock<T>(
     metrics: &dyn ClusterMetrics,
     provider: &'static str,
@@ -402,19 +425,28 @@ impl PostgresLock {
     /// and [`acquire`](DistributedLockBackend::acquire) run, with contention turned
     /// into [`ClusterError::LockContended`].
     ///
-    /// Instrumented here rather than at each caller so the guard-returning and
-    /// token-returning halves share one span and one metric series — they are the
-    /// same operation against the same lease, and `op` is a bounded label
-    /// (invariant I15). Mirrors `CasBasedDistributedLockBackend::acquire_lease`.
+    /// Instrumented here rather than at each caller, so the guard-returning and
+    /// token-returning halves share one implementation against the same lease.
+    /// `half` still gives each its own span and `op` label (`try_lock` vs
+    /// `acquire`), so a failing Profile-3 lock RPC is separable from a healthy
+    /// in-process guard. `op` stays a bounded label (invariant I15). Mirrors
+    /// `CasBasedDistributedLockBackend::acquire_lease`.
     async fn acquire_once(
         &self,
         name: &str,
         owner: &str,
         ttl: Duration,
         ctx: &GuardContext,
+        half: LockHalf,
     ) -> Result<LeaseToken, ClusterError> {
-        let span =
-            tracing::info_span!(spans::LOCK_TRY_LOCK, provider = %self.provider, lock = %name);
+        let span = match half {
+            LockHalf::Guard => {
+                tracing::info_span!(spans::LOCK_TRY_LOCK, provider = %self.provider, lock = %name)
+            }
+            LockHalf::Token => {
+                tracing::info_span!(spans::LOCK_ACQUIRE, provider = %self.provider, lock = %name)
+            }
+        };
         let started = std::time::Instant::now();
         let out = async {
             match acquire_lease(&self.table, name, owner, ttl, ctx).await? {
@@ -429,7 +461,7 @@ impl PostgresLock {
         record_lock(
             &*self.metrics,
             self.provider,
-            "try_lock",
+            half.op("try_lock", "acquire"),
             name,
             started,
             &out,
@@ -448,8 +480,18 @@ impl PostgresLock {
         ttl: Duration,
         timeout: Duration,
         ctx: &GuardContext,
+        half: LockHalf,
     ) -> Result<LeaseToken, ClusterError> {
-        let span = tracing::info_span!(spans::LOCK_LOCK, provider = %self.provider, lock = %name);
+        let span = match half {
+            LockHalf::Guard => {
+                tracing::info_span!(spans::LOCK_LOCK, provider = %self.provider, lock = %name)
+            }
+            LockHalf::Token => tracing::info_span!(
+                spans::LOCK_ACQUIRE_WAITING,
+                provider = %self.provider,
+                lock = %name
+            ),
+        };
         let op_started = std::time::Instant::now();
         let out = self
             .wait_for_lease(name, owner, ttl, timeout, ctx)
@@ -458,7 +500,7 @@ impl PostgresLock {
         record_lock(
             &*self.metrics,
             self.provider,
-            "lock",
+            half.op("lock", "acquire_waiting"),
             name,
             op_started,
             &out,
@@ -1087,11 +1129,11 @@ async fn run_guard_task(
                 match request {
                     cluster_sdk::LockRequest::Renew { new_ttl, responder } => {
                         let result =
-                            instrumented_renew(&table, &ctx, &token, new_ttl).await;
+                            instrumented_renew(&table, &ctx, &token, new_ttl, LockHalf::Guard).await;
                         responder.respond(result);
                     }
                     cluster_sdk::LockRequest::Release { responder } => {
-                        let result = instrumented_release(&table, &ctx, &token).await;
+                        let result = instrumented_release(&table, &ctx, &token, LockHalf::Guard).await;
                         responder.respond(result);
                         return;
                     }
@@ -1104,18 +1146,25 @@ async fn run_guard_task(
 /// [`renew_lease`] with its span and its ADR-004 signals, shared by the guard task
 /// and by [`DistributedLockBackend::renew`].
 ///
-/// One wrapper rather than one per caller, so the two halves of the trait emit a
-/// single `renew` metric series over a single lease — they are the same operation,
-/// and `op` is a bounded label (invariant I15).
+/// One wrapper rather than one per caller, so both halves renew through the same
+/// code. `half` gives each its own span and `op` label (`renew` for the guard
+/// task, `token_renew` for the token path), for the reason
+/// [`PostgresLock::acquire_once`] gives. `op` stays a bounded label (invariant I15).
 async fn instrumented_renew(
     table: &str,
     ctx: &GuardContext,
     token: &LeaseToken,
     new_ttl: Duration,
+    half: LockHalf,
 ) -> Result<(), ClusterError> {
-    let span = tracing::info_span!(
-        spans::LOCK_RENEW, provider = %ctx.provider, lock = %token.name
-    );
+    let span = match half {
+        LockHalf::Guard => tracing::info_span!(
+            spans::LOCK_RENEW, provider = %ctx.provider, lock = %token.name
+        ),
+        LockHalf::Token => tracing::info_span!(
+            spans::LOCK_TOKEN_RENEW, provider = %ctx.provider, lock = %token.name
+        ),
+    };
     let started = std::time::Instant::now();
     let result = renew_lease(table, ctx, token, new_ttl)
         .instrument(span)
@@ -1123,7 +1172,7 @@ async fn instrumented_renew(
     record_lock(
         &*ctx.metrics,
         ctx.provider,
-        "renew",
+        half.op("renew", "token_renew"),
         &token.name,
         started,
         &result,
@@ -1137,16 +1186,22 @@ async fn instrumented_release(
     table: &str,
     ctx: &GuardContext,
     token: &LeaseToken,
+    half: LockHalf,
 ) -> Result<(), ClusterError> {
-    let span = tracing::info_span!(
-        spans::LOCK_RELEASE, provider = %ctx.provider, lock = %token.name
-    );
+    let span = match half {
+        LockHalf::Guard => tracing::info_span!(
+            spans::LOCK_RELEASE, provider = %ctx.provider, lock = %token.name
+        ),
+        LockHalf::Token => tracing::info_span!(
+            spans::LOCK_TOKEN_RELEASE, provider = %ctx.provider, lock = %token.name
+        ),
+    };
     let started = std::time::Instant::now();
     let result = release_lease(table, ctx, token).instrument(span).await;
     record_lock(
         &*ctx.metrics,
         ctx.provider,
-        "release",
+        half.op("release", "token_release"),
         &token.name,
         started,
         &result,
@@ -1311,7 +1366,9 @@ impl DistributedLockBackend for PostgresLock {
 
     async fn try_lock(&self, name: &str, ttl: Duration) -> Result<LockGuard, ClusterError> {
         let ctx = self.guard_context();
-        let token = self.acquire_once(name, &fresh_owner(), ttl, &ctx).await?;
+        let token = self
+            .acquire_once(name, &fresh_owner(), ttl, &ctx, LockHalf::Guard)
+            .await?;
         self.guard_from(ctx, token).await
     }
 
@@ -1324,7 +1381,7 @@ impl DistributedLockBackend for PostgresLock {
         // The same lease `try_lock` takes, minus the guard task: this caller holds
         // the token itself and renews against it from wherever it likes. No discard
         // on bail-out here — see `discard_lease`.
-        self.acquire_once(name, owner, ttl, &self.guard_context())
+        self.acquire_once(name, owner, ttl, &self.guard_context(), LockHalf::Token)
             .await
     }
 
@@ -1335,8 +1392,15 @@ impl DistributedLockBackend for PostgresLock {
         ttl: Duration,
         timeout: Duration,
     ) -> Result<LeaseToken, ClusterError> {
-        self.acquire_waiting_for(name, owner, ttl, timeout, &self.guard_context())
-            .await
+        self.acquire_waiting_for(
+            name,
+            owner,
+            ttl,
+            timeout,
+            &self.guard_context(),
+            LockHalf::Token,
+        )
+        .await
     }
 
     async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
@@ -1346,11 +1410,18 @@ impl DistributedLockBackend for PostgresLock {
         //
         // Cross-checking that the transport caller is `token.owner` is the serving
         // gear's authorization decision (§4.6), not this predicate's.
-        instrumented_renew(&self.table, &self.guard_context(), token, ttl).await
+        instrumented_renew(
+            &self.table,
+            &self.guard_context(),
+            token,
+            ttl,
+            LockHalf::Token,
+        )
+        .await
     }
 
     async fn release(&self, token: &LeaseToken) -> Result<(), ClusterError> {
-        instrumented_release(&self.table, &self.guard_context(), token).await
+        instrumented_release(&self.table, &self.guard_context(), token, LockHalf::Token).await
     }
 
     async fn lock(
@@ -1361,7 +1432,7 @@ impl DistributedLockBackend for PostgresLock {
     ) -> Result<LockGuard, ClusterError> {
         let ctx = self.guard_context();
         let token = self
-            .acquire_waiting_for(name, &fresh_owner(), ttl, timeout, &ctx)
+            .acquire_waiting_for(name, &fresh_owner(), ttl, timeout, &ctx, LockHalf::Guard)
             .await?;
         self.guard_from(ctx, token).await
     }
