@@ -1,0 +1,62 @@
+{
+  "$id": "gts://gts.cf.connectors.core.record.v1~cf.construct.chat.message.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "One raw chat message from the normalized fetch-history export (chat-engine or ai-search). Models the export contract, not either source's storage: ids are opaque strings and no source-specific concept surfaces here (filtering on session origin/type stays inside each source service). Only fields immutable once the message completes are carried - the record's version is the message's created_at at the source and is not repeated in the payload; the record's observed_at is when the connector read the message from the source's export, the forwarding sense of the base. The role set is normalized to two values, matching the OpenAI chat-completion convention; the export maps source roles as: user/human -> user; assistant/ai/llm/agent -> assistant; system/developer messages are not exported. Record provenance = source + thread id + message id. The record's subject_id is always set.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.connectors.core.record.v1~"
+    },
+    {
+      "type": "object",
+      "required": [
+        "subject_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "gts.cf.connectors.core.record.v1~cf.construct.chat.message.v1~"
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "source": {
+              "type": "string",
+              "enum": [
+                "chat_engine",
+                "ai_search"
+              ]
+            },
+            "message_id": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Opaque source message id."
+            },
+            "thread_id": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Opaque source thread/session id."
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "user",
+                "assistant"
+              ]
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "message_id",
+            "thread_id",
+            "role",
+            "text"
+          ]
+        }
+      }
+    }
+  ]
+}

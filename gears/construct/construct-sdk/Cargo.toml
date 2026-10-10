@@ -1,0 +1,32 @@
+[package]
+name = "cf-gears-construct-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SDK for the construct gear: client trait, transport-agnostic models and errors"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["web-programming"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lib]
+name = "construct_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+toolkit = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+# Link-time registration of the connector record types
+toolkit-gts = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-security = { workspace = true }
