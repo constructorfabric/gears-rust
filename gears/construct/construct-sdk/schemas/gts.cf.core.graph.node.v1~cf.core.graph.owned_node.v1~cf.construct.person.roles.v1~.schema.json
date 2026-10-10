@@ -1,0 +1,177 @@
+{
+  "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.roles.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A person's roles: current role, education, programme, affiliations and work history. One node is one fact: its payload holds one property, which names the fact, and the origin of the fact.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 2,
+          "maxProperties": 2,
+          "required": [
+            "origin"
+          ],
+          "properties": {
+            "origin": {
+              "$ref": "gts://gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~"
+            },
+            "active_course": {
+              "type": "string",
+              "minLength": 1
+            },
+            "affiliation_history": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "organization"
+              ],
+              "properties": {
+                "organization": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "country": {
+                  "type": "string",
+                  "pattern": "^[A-Z]{2}$",
+                  "description": "ISO 3166-1 alpha-2 country code."
+                },
+                "start_year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year."
+                },
+                "end_year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year."
+                }
+              }
+            },
+            "board_memberships": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "organization"
+              ],
+              "properties": {
+                "organization": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "role": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "start_year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year."
+                },
+                "end_year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year."
+                }
+              }
+            },
+            "current_affiliation": {
+              "type": "string",
+              "minLength": 1
+            },
+            "education_level": {
+              "type": "string",
+              "enum": [
+                "k12",
+                "higher_ed",
+                "professional"
+              ]
+            },
+            "group_memberships": {
+              "type": "string",
+              "minLength": 1
+            },
+            "instructor": {
+              "type": "string",
+              "minLength": 1
+            },
+            "major": {
+              "type": "string",
+              "minLength": 1
+            },
+            "program": {
+              "type": "string",
+              "minLength": 1
+            },
+            "role": {
+              "type": "string",
+              "minLength": 1
+            },
+            "roles_and_affiliations": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "role"
+              ],
+              "properties": {
+                "role": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "organization": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "school_grade": {
+              "type": "string",
+              "pattern": "^[a-z0-9_]+$",
+              "description": "Normalized lowercase token."
+            },
+            "section": {
+              "type": "string",
+              "minLength": 1
+            },
+            "work_history": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "organization"
+              ],
+              "properties": {
+                "organization": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "title": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "start_year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year."
+                },
+                "end_year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year."
+                }
+              }
+            }
+          }
+        }
+      },
+      "required": [
+        "payload"
+      ]
+    }
+  ]
+}
