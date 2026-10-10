@@ -44,20 +44,26 @@
 
 ### 1.1 Purpose
 
-Construct is an open-source component of Constructor Fabric. It keeps one living profile for each subject and serves it to the applications and AI agents of a tenant. A subject is anything with a lasting identity: a person, an organization, a partner, a competitor, a product, a project, a team or a process. Each kind of subject has its own profile types. This release supports only a person.
+Construct, an open-source component of Constructor Fabric, builds and runs autonomous digital twins — Constructs — of any entity with a persistent identity, an evolving state, an Owner and consumers of its context (e.g people, teams, projects, organizations, products, processes, AI agents). 
 
-Connectors are any systems that learn something about a subject. They send what they learn to Construct as typed records, under GTS (Global Type System) contracts that the connectors own. Construct checks each record against its type and turns it into facts. A record may add, replace or remove facts, and Construct decides which on its own. Applications and agents read the profile to personalize what they do. The profile's owner can see, correct and erase what Construct knows. A tenant administrator can also read a subject's facts and add, edit or delete them directly.
+Entity types are set as templates. The template of an entity type defines what information Constructs of that type store, in what form and from which connectors it comes. A subject is the entity a specific Construct is about. Construct keeps one living twin (profile) per subject and serves it to the applications and AI agents of a tenant.
 
-All kinds of subjects use the same intake, decisions, read path and MCP tools. They differ in three ways. First, each kind has its own categories; a person has identity, roles, skills and preferences. Second, the owner controls the profile. A person owns their own profile and has the rights of a data subject. For any other subject, the user who creates the profile owns it and controls it the same way. Where this document says the subject acts, states something or controls their data, for a subject that is not a person, the owner does. Third, the special categories of sensitive data, the data that must stay secret because of the law, security, safety, industry standards or contracts, can differ by kind of subject. This release implements them for a person; another kind of subject needs new guardrails in Construct for its own special categories.
+Each Construct has an Owner who controls it: the Owner can see, correct and erase what Construct knows, decide who may read which part of it, and direct what it collects and empower it to act on the Owner's behalf within set limits.
 
-A team that builds a SaaS product can add Construct as a component instead of building its own profile store, privacy controls and agent access. The picture shows who talks to Construct, not how it is built.
+Connectors are any systems that learn something about a subject. They send what they learn to Construct one record at a time — a record is one piece of information about one subject — each under a contract its source declared (the contract format is §7.2). 
+
+Adding one more source to an existing connector changes nothing in Construct. A source that brings a new kind of information extends the template: its stored form, the contract for how the source's records convert and map into it. Both are registered changes — never a change to Construct's code. Construct checks each record against its contract, applies the mapping and turns it into facts. A record may add, adjust, replace or remove facts, and Construct decides which on its own. 
+
+Applications and agents read Constructs to decide, adjust or personalize what they do. 
+
+A team that builds a product can add Construct as a component instead of building its own profile store, privacy controls and agent access. The picture below shows who talks to Construct (not how it is built).
 
 ```mermaid
 flowchart LR
     CN["Connector"] -->|"sends records"| C(("Construct"))
-    APP["Consumer application or agent"] -->|"reads and manages facts"| C
-    S["Subject or owner"] -->|"views, corrects, erases"| C
-    TA["Tenant administrator"] -->|"resolves review requests, reads and fixes facts"| C
+    APP["Consumer application or agent"] -->|"reads the profile"| C
+    O["Owner"] -->|"views, states facts, corrects, erases; sets permissions"| C
+    TA["Tenant administrator"] -->|"resolves review requests"| C
     TA -->|"sets tenant rules"| SS["Settings service"]
     C -->|"reads tenant settings"| SS
     DPO["Data protection officer"] -->|"audits, handles requests"| C
@@ -69,18 +75,47 @@ flowchart LR
     DPO -->|"reads audit events"| LS
 ```
 
+Applications and agents only read. A fact change is always the act of another arrow: the Owner stating, correcting or erasing — through whatever interface serves them, including an agent over MCP — or a connector's record. When the Owner tells an agent "I moved to Berlin, update my profile," the actor is the Owner; the agent is their instrument, and the fact's origin names both.
+
 ### 1.2 Background / Problem Statement
 
-A SaaS product wants to know the people, organizations, products and processes it works with, and to personalize what it does for each user. What it knows about each of them is spread across many systems: a sign-up form, a chat, a learning system, a CRM, public web pages. Each system knows a part, and the parts often disagree.
+Software applications — web, mobile or desktop — want to personalize what they do for each user, and organizations want an up-to-date information about the entities they work with. Today that knowledge is spread across many systems: 
+- islands of information with no single view; 
+- low confidence — nobody knows if a fact is true; 
+- outdated information — it goes stale the moment it is written down. 
+End users feel it too: they re-explain their context to every AI tool.
 
-Every product that personalizes builds the same parts again. It collects signals from many sources. It resolves facts that contradict each other. It keeps the profile current. It respects privacy and the right to erasure. And now it must give the profile to AI agents without letting an agent read or change data it must not touch. Each team builds these parts on its own, and each copy has its own gaps, most often in privacy. Construct gives these parts once, with the same rules for every product that uses it.
+Every development team that personalizes a feature rebuilds the same parts: collect, resolve contradictions, keep current, respect privacy, give AI agents safe access. Construct provides these parts once, with the same rules for every product.
 
 ### 1.3 Goals (Business Outcomes)
 
-- **G1 — One profile per subject that any app in the tenant can use.** Success metric: in the acceptance test suite, two consumer applications of one tenant with the same permissions get the same facts for the same subject in 100 % of reads, and a new consumer application reads profiles with platform permissions only and zero changes to Construct.
-- **G2 — The profile stays current and has no contradictions.** Success metric: on the reference evaluation set shipped with Construct, at least 95 % of records give the expected add, replace or remove decision, and the final profiles hold zero pairs of contradicting facts.
-- **G3 — The subject controls their data: they can see it, correct it and erase it.** Success metric: 100 % of view, mark-as-incorrect, delete and erase requests in the acceptance test suite give the expected result, and every erasure completes within 30 days (`cpt-cf-construct-nfr-deletion-time`).
-- **G4 — AI agents can read and manage the profile through MCP.** Success metric: a standard MCP client reads and manages facts with no Construct-specific code, and adversarial tests find zero MCP calls that reach a subject or tenant the caller is not authorized for.
+Goals G1–G6 bind the first release (p1); later goals bind the release of their priority.
+
+- **G1 — One profile per subject that any app in the tenant can use.** Success metric: in the acceptance test suite, two consumer applications of one tenant with the same permissions and the same request purpose get the same facts for the same subject in 100% of reads, and a new consumer application reads profiles with zero changes to Construct — within the permissions in force (the platform's; the Owner's once Owner-set permissions ship, p2).
+- **G2 — The profile has no contradictions and correctly reflects what sources reported.** Success metric: on the reference evaluation set shipped with Construct, at least 95% of records give the expected add, adjust, replace or remove decision, and the final profiles hold zero pairs of contradicting facts.
+- **G3 — The Owner controls the Construct: sees it, corrects it, erases it, and decides who reads what.** Success metric: 100% of view, mark-as-incorrect, delete and erase requests in the acceptance test suite give the expected result, and every erasure completes within 30 days (`cpt-cf-construct-nfr-deletion-time`).
+- **G4 — Construct serves each request the relevant slice.** What an application receives depends not only on permissions but on the request's purpose: one AI tutor asking a history question and a math question gets two different context slices for the same subject. The subject's roles and goals join the selection at p3. Success metric: on the purpose-tagged reference set, at least 95 % of requests receive the expected slice, and zero requests receive a fact outside the platform's or the Owner's permissions.
+- **G5 — A Construct updates itself.** A change at a connected source reaches the profile without anyone asking. Success metric: in the reference scenarios, 100 % of changes at sources under directed collection are reflected in the profile within the configured collection interval, with zero Owner actions.
+- **G6 — A Construct bootstraps itself.** A new Construct fills its profile from the seed and the permitted sources without the Owner typing their information in. Success metric: on the reference seed set, a new Construct reaches the template's minimum filled-category set with zero Owner-entered facts.
+
+**Second release (p2):**
+
+- **G7 — Constructs of organizations, partners and competitors.** Base templates for these entity types ship with the gear. Success metric: a Construct of each of the three types is created from its base template and serves its profile in the acceptance suite.
+- **G8 — Construct gets subject context from the organization's systems.** CRM systems (for example Salesforce, HubSpot) and meeting tools (for example Zoom, MS Teams) feed the profile through connectors. Success metric: facts from at least one CRM connector and one meeting-tool connector appear in profiles with origin and confidence.
+- **G9 — Construct understands its Subject's roles and the Owner's goals and preferences tied to them.** Success metric: on the reference set, role candidates and their related goals and preferences are identified and take effect once the Owner confirms them.
+
+**Later (p3):**
+
+- **G11 — A new Construct type is configuration, not code.** New Construct types are added as template configuration, with no change to Construct's code, and are reusable within the organization. Success metric (at p3): a new entity-type template registered as configuration yields working Constructs with zero code changes.
+- **G12 — An Owner creates Constructs of a new entity conversationally.** Name the entity and set the Construct's goals; Construct proposes the template and the collection plan; the Owner edits and approves. The first release ships the person-Construct only; the design must never assume the subject is a person (a p1 design constraint).
+- **G13 — Constructs of products, projects, teams and processes.** Base templates for these entity types ship. Success metric: a Construct of each type is created from its base template and serves its profile.
+- **G14 — Construct derives activities and preferences from communication.** History and ongoing communication both feed it; derived preferences take effect once the Owner confirms them. Success metric: on the reference communication set, the expected activities and preference candidates are derived and confirmed-effective.)
+
+**Later (p4):****
+- **G15 — The Owner can connect wearable devices.** First device: Apple Watch, through the telemetry layer. Success metric: a connected wearable's signals appear in the profile as facts with origin and confidence.)
+- **G16 — Construct detects the Owner's environment and activity and recommends suitable content immediately.** Environment (transport, classroom, gym) and activity (commute, sport, resting) are detected from wearables data; consumers receive immediate recommendations on suitable content. Success metric: on the reference wearables scenarios, the expected environment/activity classification and a matching content recommendation are produced.
+- **G17 — Construct can coach the Owner on any skill.** Success metric: for a skill chosen on the reference set, Construct serves a coaching plan grounded in the profile's skill facts, and follow-up recommendations as progress facts arrive.
+- **G18 — The Owner sees their skill-development progress.** Construct serves the progress data; the dashboard surface in the Construct sidebar is host-application UI (§4.2). Success metric: progress data per skill is servable to the sidebar with origin and, once fact history ships, its history.
 
 ### 1.4 Glossary
 
