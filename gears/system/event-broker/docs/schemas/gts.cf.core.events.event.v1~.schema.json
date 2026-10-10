@@ -13,9 +13,7 @@
     "type": {
       "description": "Full GTS event-type identifier. The event is an instance of that derived type. ASCII only.",
       "type": "string",
-      "maxLength": 512,
-      "pattern": "^[\\x20-\\x7E]+$",
-      "x-gts-type": "gts.cf.core.events.event.v1~"
+      "x-gts-ref": "gts.cf.core.events.event.v1~"
     },
     "tenant_id": {
       "description": "Tenant the event belongs to. Producer-supplied. Ingest validates the producer's principal is authorized to publish to this tenant via the platform's authz resolver; unauthorized publishes are rejected with 403 TenantIdNotAuthorized.",
@@ -38,9 +36,7 @@
     "subject_type": {
       "description": "Full GTS subject-type identifier - the type of the entity the event is about. Required and NOT derivable from `type`: event types may be generic (e.g., `rule_applied`) across multiple subject kinds, and events may have no `data` body to introspect. ASCII only.",
       "type": "string",
-      "maxLength": 512,
-      "pattern": "^[\\x20-\\x7E]+$",
-      "x-gts-type": true
+      "x-gts-ref": "gts.*"
     },
     "occurred_at": {
       "description": "When the event occurred (producer-stamped). ISO 8601 / RFC 3339 timestamp.",
@@ -154,14 +150,15 @@
       "topic": {
         "description": "Full GTS topic identifier of the stream that events of this type are published to. A topic is an instance, so this never ends in `~`.",
         "type": "string",
-        "x-gts-instance": "gts.cf.core.events.topic.v1~"
+        "x-gts-ref": "gts.cf.core.events.topic.v1~"
       },
       "allowed_subject_types": {
         "description": "GTS Type-id patterns describing which subject types an event of this type may declare in subject_type (concrete Type match, wildcard suffix <prefix>.*, or bare base Type <base>~ with implicit derived-type coverage). Enforced at publish time, independent of the subject_type:produce/:consume authorization check.",
         "type": "array",
         "items": {
           "type": "string",
-          "x-gts-type": true
+          "maxLength": 1024,
+          "pattern": "^gts\\.(([a-z_][a-z0-9_]*\\.){4}v(0|[1-9][0-9]*)(\\.(0|[1-9][0-9]*))?~)*(([a-z_][a-z0-9_]*\\.){4}v(0|[1-9][0-9]*)(\\.(0|[1-9][0-9]*))?~|([a-z_][a-z0-9_]*\\.){0,4}\\*|([a-z_][a-z0-9_]*\\.){4}v((0|[1-9][0-9]*)\\.)?\\*)$"
         },
         "default": []
       },

@@ -17,7 +17,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use gts::{CompatibilityVerdict, GTS_IMPLEMENTATION_VERSION, GTS_SPECIFICATION_VERSION, GtsId};
+use gts::{
+    CompatibilityVerdict, GTS_IMPLEMENTATION_VERSION, GTS_SPECIFICATION_VERSION, GtsId,
+    GtsRefValidation,
+};
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
@@ -681,12 +684,9 @@ fn evaluate_loaded(
 ) -> Result<EvaluatedUnit, ItemFailure> {
     check_resolution_inputs(store.store_mut(), id.id(), limits.resolution_closure)?;
     let outcome = if id.is_type() {
-        let resolved = store
-            .store_mut()
-            .validate_schema(id.id())
-            .map_err(|error| {
-                ItemFailure::new(AdmissionFailureReason::InvalidSchema, error.to_string())
-            })?;
+        let resolved = store.validate_schema(id.id()).map_err(|error| {
+            ItemFailure::new(AdmissionFailureReason::InvalidSchema, error.to_string())
+        })?;
         let artifacts = materialize_bounded(&resolved, limits)?;
         EvaluatedOutcome::TypeSchema {
             artifacts,
@@ -711,16 +711,13 @@ fn evaluate_loaded(
         };
         // A type admitted under an older, larger budget must not bypass the
         // current resolution budget when it is used to validate an Instance.
-        let resolved = store
-            .store_mut()
-            .validate_schema(&type_id)
-            .map_err(|error| {
-                ItemFailure::new(AdmissionFailureReason::InvalidSchema, error.to_string())
-            })?;
+        let resolved = store.validate_schema(&type_id).map_err(|error| {
+            ItemFailure::new(AdmissionFailureReason::InvalidSchema, error.to_string())
+        })?;
         materialize_bounded(&resolved, limits)?;
         store
             .store_mut()
-            .validate_instance(id.id())
+            .validate_instance_with(id.id(), GtsRefValidation::None)
             .map_err(|error| {
                 ItemFailure::new(AdmissionFailureReason::InvalidValue, error.to_string())
             })?;

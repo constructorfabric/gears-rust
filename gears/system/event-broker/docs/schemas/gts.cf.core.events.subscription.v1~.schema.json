@@ -15,8 +15,7 @@
     "consumer_group": {
       "description": "Full GTS consumer-group identifier. Either named (vendor-namespaced) or anonymous (~{uuid}).",
       "type": "string",
-      "pattern": "^[\\x20-\\x7E]+$",
-      "x-gts-instance": "gts.cf.core.events.consumer_group.v1~"
+      "x-gts-ref": "gts.cf.core.events.consumer_group.v1~"
     },
     "client_agent": {
       "description": "RFC 9110 User-Agent grammar; ASCII; 1-256 bytes. Informational diagnostic hint surfaced in operational logs (NEVER as a metric label). Required at create per ADR-0004.",
@@ -48,7 +47,7 @@
         "properties": {
           "topic": {
             "type": "string",
-            "x-gts-instance": "gts.cf.core.events.topic.v1~"
+            "x-gts-ref": "gts.cf.core.events.topic.v1~"
           },
           "partition": { "type": "integer", "minimum": 0 }
         }
@@ -77,8 +76,7 @@
         "topic": {
           "description": "Full GTS topic identifier. Partition / rebalance / authz unit (Kafka-style). Required.",
           "type": "string",
-          "pattern": "^[\\x20-\\x7E]+$",
-          "x-gts-instance": "gts.cf.core.events.topic.v1~"
+          "x-gts-ref": "gts.cf.core.events.topic.v1~"
         },
         "tenant_id": {
           "description": "Tenant scope. Authz-validated by the platform tenant resolver against the calling principal. Different interests MAY declare different tenant_ids (system services consuming across multiple tenants).",
@@ -104,9 +102,8 @@
           "maxItems": 32,
           "items": {
             "type": "string",
-            "pattern": "^[\\x20-\\x7E]+$",
             "maxLength": 1024,
-            "x-gts-type": "gts.cf.core.events.event.v1~"
+            "pattern": "^gts\\.cf\\.core\\.events\\.event\\.v1(\\.(0|[1-9][0-9]*))?~(([a-z_][a-z0-9_]*\\.){4}v(0|[1-9][0-9]*)(\\.(0|[1-9][0-9]*))?~)*(([a-z_][a-z0-9_]*\\.){0,4}\\*|([a-z_][a-z0-9_]*\\.){4}v((0|[1-9][0-9]*)\\.)?\\*)?$"
           }
         },
         "filter": {
@@ -118,8 +115,7 @@
             "engine": {
               "description": "Full GTS identifier of the filter engine (e.g. gts.cf.core.events.filter.v1~cf.core.expression.cel.v1).",
               "type": "string",
-              "pattern": "^[\\x20-\\x7E]+$",
-              "x-gts-instance": "gts.cf.core.events.filter.v1~"
+              "x-gts-ref": "gts.cf.core.events.filter.v1~"
             },
             "expression": {
               "description": "Engine-specific source string. 1–4096 bytes. For CEL, a CEL-syntax string.",

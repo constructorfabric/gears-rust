@@ -177,18 +177,9 @@ fn candidate_object_levels_classify_every_level_including_partial() {
     );
 }
 
-/// Guards the one failure mode `[patch.crates-io]` has: an override that stops
-/// matching the version requirement is recorded as `[[patch.unused]]` — a cargo
-/// *warning* — and the workspace silently resolves the published 0.11.0 instead.
-/// That happened once already (SPEC §7), and it was caught only because the
-/// imports above stop compiling. This says it out loud, with a diagnosis.
+/// Pin the release and specification whose behavior the registry tests cover.
 #[test]
-fn workspace_did_not_silently_fall_back_to_gts_0_11() {
-    assert_eq!(GTS_SPECIFICATION_VERSION, "0.13");
-    assert!(
-        !GTS_IMPLEMENTATION_VERSION.starts_with("0.11."),
-        "resolved gts {GTS_IMPLEMENTATION_VERSION}: the [patch.crates-io] override is not in \
-         effect. Check `Cargo.lock` for [[patch.unused]] entries and that the workspace \
-         requirements match the local checkout's version — see SPEC §7."
-    );
+fn workspace_uses_expected_gts_release() {
+    assert_eq!(GTS_SPECIFICATION_VERSION, "0.15");
+    assert_eq!(GTS_IMPLEMENTATION_VERSION, "0.14.0");
 }

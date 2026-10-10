@@ -875,9 +875,9 @@ jsonschema = { version = "0.40", default-features = false }
 walkdir = "2.5"
 
 # GTS library — published on crates.io.
-gts-id = "0.12.1"
-gts = "0.12.1"
-gts-macros = "0.12.1"
+gts-id = "0.14.0"
+gts = "0.14.0"
+gts-macros = "0.14.0"
 
 license-resolver-sdk = { package = "cf-gears-license-resolver-sdk", version = "0.1.4", path = "gears/system/license-resolver/license-resolver-sdk" }
 license-resolver = { package = "cf-gears-license-resolver", version = "0.1.5", path = "gears/system/license-resolver/license-resolver" }

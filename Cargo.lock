@@ -1719,7 +1719,7 @@ dependencies = [
  "http",
  "http-body-util",
  "inventory",
- "jsonschema",
+ "jsonschema 0.40.2",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",
@@ -2519,7 +2519,7 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
- "jsonschema",
+ "jsonschema 0.40.2",
  "opentelemetry",
  "opentelemetry_sdk",
  "rand 0.10.1",
@@ -2595,7 +2595,7 @@ dependencies = [
  "gts",
  "http",
  "http-body-util",
- "jsonschema",
+ "jsonschema 0.40.2",
  "pingora-core",
  "pingora-http",
  "reqwest",
@@ -2638,7 +2638,7 @@ dependencies = [
  "futures-util",
  "gts",
  "http-body-util",
- "jsonschema",
+ "jsonschema 0.40.2",
  "rusqlite",
  "schemars 1.2.1",
  "sea-orm",
@@ -2940,7 +2940,7 @@ dependencies = [
  "gts",
  "hex",
  "http",
- "jsonschema",
+ "jsonschema 0.40.2",
  "sea-orm",
  "sea-orm-migration",
  "serde",
@@ -3098,7 +3098,7 @@ dependencies = [
  "cf-gears-types-registry-sdk",
  "gts",
  "inventory",
- "jsonschema",
+ "jsonschema 0.40.2",
  "opentelemetry",
  "opentelemetry_sdk",
  "schemars 1.2.1",
@@ -3522,7 +3522,7 @@ dependencies = [
  "http",
  "http-body-util",
  "inventory",
- "jsonschema",
+ "jsonschema 0.40.2",
  "opentelemetry",
  "opentelemetry_sdk",
  "sea-orm",
@@ -3669,7 +3669,7 @@ dependencies = [
  "cf-gears-types-registry-sdk",
  "http",
  "inventory",
- "jsonschema",
+ "jsonschema 0.40.2",
  "opentelemetry",
  "regex",
  "sea-orm",
@@ -3700,7 +3700,7 @@ dependencies = [
  "cf-gears-toolkit-odata-macros",
  "cf-gears-toolkit-security",
  "gts-id",
- "jsonschema",
+ "jsonschema 0.40.2",
  "secrecy",
  "serde",
  "serde_json",
@@ -6126,6 +6126,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fancy-regex"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d301f5bf187b3c295fce6468d3875037a0bccc5f6b151c63cac2f85babf21912"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fast-float2"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6306,6 +6317,16 @@ checksum = "0f158e3ff0a1b334408dc9fb811cd99b446986f4d8b741bb08f9df1604085ae7"
 dependencies = [
  "lazy_static",
  "num",
+]
+
+[[package]]
+name = "fraction"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e246562084dde8ebbcc943b261c406ce4f68e5032ec28029a251a47d6a295500"
+dependencies = [
+ "num",
+ "num-bigint",
 ]
 
 [[package]]
@@ -6650,13 +6671,16 @@ dependencies = [
 
 [[package]]
 name = "gts"
-version = "0.12.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "021167e175f3810efd05ffcca9804681183a38ad89074d821dcf502bd6580b85"
+checksum = "96b8b20c2e044b45cd622dcaf2d9727e71510bed115a06bd2f924ca185ca608b"
 dependencies = [
  "gts-id",
- "jsonschema",
+ "jsonschema 0.58.6",
+ "jsonschema-regex",
  "num-cmp",
+ "referencing 0.58.6",
+ "regex",
  "schemars 1.2.1",
  "serde",
  "serde-saphyr 1.3.0",
@@ -6664,6 +6688,7 @@ dependencies = [
  "shellexpand",
  "thiserror 2.0.20",
  "tracing",
+ "uuid",
  "walkdir",
 ]
 
@@ -6685,9 +6710,9 @@ dependencies = [
 
 [[package]]
 name = "gts-id"
-version = "0.12.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29bbb4c89400d552569283dd7ea6f8da1f3b58be13f1d9213e0d348a6967221a"
+checksum = "ac5d50f5142cc2fe36d991f8298927cb448fe7e520c7dca6d2930cb0947f5d7e"
 dependencies = [
  "thiserror 2.0.20",
  "uuid",
@@ -6695,9 +6720,9 @@ dependencies = [
 
 [[package]]
 name = "gts-macros"
-version = "0.12.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "785b0213cd86538089d91ba7c491e861cce964bdb0d5a5590626bac6e9d4e073"
+checksum = "2e14a4dba5d94c7444516ca8b98fcabfd9f2a2bb5a35418e8afc45ae4b9e5ee2"
 dependencies = [
  "gts-id",
  "proc-macro2",
@@ -7712,21 +7737,74 @@ dependencies = [
  "bytecount",
  "data-encoding",
  "email_address",
- "fancy-regex",
- "fraction",
+ "fancy-regex 0.17.0",
+ "fraction 0.15.3",
  "getrandom 0.3.4",
  "idna",
  "itoa",
  "num-cmp",
  "num-traits",
  "percent-encoding",
- "referencing",
+ "referencing 0.40.2",
  "regex",
  "regex-syntax",
  "serde",
  "serde_json",
  "unicode-general-category",
  "uuid-simd",
+]
+
+[[package]]
+name = "jsonschema"
+version = "0.58.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f622c574a29fb3034a0a90645afee194dfedc75fc124228801b6e77041075bd1"
+dependencies = [
+ "ahash 0.8.12",
+ "bytecount",
+ "data-encoding",
+ "email_address",
+ "fancy-regex 0.19.2",
+ "fraction 0.17.0",
+ "getrandom 0.3.4",
+ "itoa",
+ "jsonschema-regex",
+ "jsonschema-value",
+ "num-cmp",
+ "num-traits",
+ "percent-encoding",
+ "referencing 0.58.6",
+ "regex",
+ "serde",
+ "serde_json",
+ "strum 0.28.0",
+ "unicode-general-category",
+ "uuid-simd",
+]
+
+[[package]]
+name = "jsonschema-regex"
+version = "0.58.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a968fffd387b2ab005bf00c1851f5d26e90df05b6f7ad609ed0d620033cca5e7"
+dependencies = [
+ "regex-syntax",
+]
+
+[[package]]
+name = "jsonschema-value"
+version = "0.58.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39b7670345e5ce87371339d13705dbb9276b7e3e934bbe1efa2c6734a1f65a96"
+dependencies = [
+ "ahash 0.8.12",
+ "bytecount",
+ "fraction 0.17.0",
+ "getrandom 0.3.4",
+ "num-cmp",
+ "num-traits",
+ "serde_json",
+ "zmij",
 ]
 
 [[package]]
@@ -8400,6 +8478,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "micromap"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a86d3146ed3995b5913c414f6664344b9617457320782e64f0bb44afd49d74"
+
+[[package]]
 name = "mimalloc"
 version = "0.1.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8740,9 +8824,9 @@ dependencies = [
 
 [[package]]
 name = "num-bigint"
-version = "0.4.6"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
+checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
 dependencies = [
  "num-integer",
  "num-traits",
@@ -10618,6 +10702,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "referencing"
+version = "0.58.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "558f3855529c0a7e78a48e409fa653456e55f1b167eab4109c16a255b7727e3f"
+dependencies = [
+ "ahash 0.8.12",
+ "fluent-uri",
+ "getrandom 0.3.4",
+ "hashbrown 0.17.0",
+ "itoa",
+ "micromap",
+ "parking_lot",
+ "percent-encoding",
+ "serde_json",
+]
+
+[[package]]
 name = "regex"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12388,6 +12489,9 @@ name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+dependencies = [
+ "strum_macros 0.28.0",
+]
 
 [[package]]
 name = "strum_macros"
@@ -12407,6 +12511,18 @@ name = "strum_macros"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -12787,7 +12903,7 @@ dependencies = [
  "dary_heap",
  "derive_builder",
  "esaxx-rs",
- "fancy-regex",
+ "fancy-regex 0.17.0",
  "getrandom 0.3.4",
  "itertools 0.14.0",
  "log",
@@ -14756,9 +14872,9 @@ checksum = "3be3d40e40a133f9c916ee3f9f4fa2d9d63435b5fbe1bfc6d9dae0aa0ada1513"
 
 [[package]]
 name = "zmij"
-version = "1.0.21"
+version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zopfli"

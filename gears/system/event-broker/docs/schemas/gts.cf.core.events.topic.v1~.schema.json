@@ -13,7 +13,7 @@
     "id": {
       "description": "Full GTS topic identifier (e.g., gts.cf.core.events.topic.v1~vendor.users.v1).",
       "type": "string",
-      "x-gts-instance": "gts.cf.core.events.topic.v1~"
+      "x-gts-ref": "gts.cf.core.events.topic.v1~"
     },
     "retention": {
       "default": null,

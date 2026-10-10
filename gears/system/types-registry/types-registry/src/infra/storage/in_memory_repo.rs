@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use toolkit_gts::GTS_ID_URI_PREFIX;
 
-use gts::{GtsConfig, GtsId, GtsIdPattern, GtsIdSegment, GtsOps};
+use gts::{GtsConfig, GtsId, GtsIdPattern, GtsIdSegment, GtsOps, GtsRefValidation};
 use parking_lot::Mutex;
 use uuid::Uuid;
 
@@ -173,7 +173,8 @@ impl GtsRepository for InMemoryGtsRepository {
                 return Err(DomainError::already_exists(&gts_id));
             }
 
-            let result = persistent.add_entity(entity, validate);
+            // `x-gts-ref` checks values without requiring registered targets.
+            let result = persistent.add_entity_with(entity, validate, GtsRefValidation::None);
             if !result.ok {
                 // Debug logging for registration failure
                 if gts_id.ends_with('~') {
@@ -305,7 +306,7 @@ impl GtsRepository for InMemoryGtsRepository {
         {
             let mut temporary = self.temporary.lock();
             for gts_id in &sorted_ids {
-                let result = temporary.validate_entity(gts_id);
+                let result = temporary.validate_entity_with(gts_id, GtsRefValidation::None);
                 if !result.ok {
                     // Debug logging for validation failure
                     if let Some(entity) = temporary.store.get(gts_id) {
@@ -338,7 +339,7 @@ impl GtsRepository for InMemoryGtsRepository {
             for gts_id in &sorted_ids {
                 if let Some(entity) = temporary.store.get(gts_id) {
                     let content = entity.content.clone();
-                    let result = persistent.add_entity(&content, true);
+                    let result = persistent.add_entity_with(&content, true, GtsRefValidation::None);
                     if !result.ok {
                         if gts_id.ends_with('~') {
                             log_schema_validation_failure(gts_id, &content, &result.error);

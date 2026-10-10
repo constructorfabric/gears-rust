@@ -366,7 +366,7 @@ A concrete topic is an **instance** of that base, for example `gts.cf.core.event
 **A topic carries the stream's own data, and nothing else.** What it is called, what it is for, and how long its events are kept are properties of the stream, so they live on the topic. How many partitions the broker gives it and which backend stores them are the broker's concerns, configured there - see §4.1 "Deployment Modes" - and identical for every topic a broker serves. A topic declares no traits.
 
 Members of a topic instance:
-- `id` (**required**): the topic's own full GTS identifier, carrying `x-gts-instance` narrowed to the topic base.
+- `id` (**required**): the topic's own full GTS identifier, carrying `x-gts-ref` narrowed to the topic base.
 - `description` (**required**): what the stream carries, for a reader deciding whether to subscribe to it.
 - `retention` (String, ISO 8601 Duration, optional): how long events on this topic are kept. Absent means the broker's configured default. This is event retention, distinct from the producer-state deduplication window, which has its own field and its own `P14D` cap - see §3.2 "Producer Modes".
 - `consolidation`: reserved for compaction policy. Not defined yet.
