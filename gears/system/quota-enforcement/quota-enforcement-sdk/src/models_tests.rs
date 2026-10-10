@@ -6,12 +6,14 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    BootstrapBundle, CapPatch, ConfigDefaults, Decision, DecisionResult, EnforcementMode,
-    IdempotencySubjectKey, LeaseState, MetricId, NotificationEventKind, OperationType, PageRequest,
-    PageResult, PeriodType, PolicyId, PolicyScope, QuotaDebitPlan, QuotaId, QuotaPatch,
-    QuotaSource, QuotaType, SubjectRef, UnknownValue, ValidityWindow,
+    ActiveQuotaCounts, CapPatch, ContractRef, Decision, DecisionResult, EnforcementMode,
+    EvaluationAttribution, IdempotencySubjectKey, LeaseState, MetricId, MetricKind,
+    NotificationEventKind, OperationType, PageRequest, PageResult, PeriodType, PolicyId,
+    PolicyScope, ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaId, QuotaPatch,
+    QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaView, ResourceProjection, ScopeError,
+    SubjectRef, SubjectScope, TenantId, UnknownValue, ValidityWindow,
 };
-use crate::storage_plugin::CONTRACT_MAJOR;
+use crate::gts::{SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER};
 
 fn ts(secs: i64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(secs).expect("valid unix timestamp")
@@ -373,21 +375,6 @@ fn page_types_default_to_the_platform_page_size_and_map_items() {
 }
 
 #[test]
-fn foundation_bundle_carries_the_contract_major_and_prd_defaults() {
-    let bundle = BootstrapBundle::foundation();
-    assert_eq!(bundle.contract_major, CONTRACT_MAJOR);
-    assert!(bundle.global_policy.is_none(), "seeded by a later feature");
-    assert_eq!(
-        bundle.config_defaults,
-        ConfigDefaults {
-            contention_timeout_ms: 0,
-            max_active_leases: 1000,
-            idempotency_retention_secs: 86_400,
-        }
-    );
-}
-
-#[test]
 fn subject_ref_equality_covers_both_halves_of_the_identity() {
     let projection = GtsTypeId::new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~");
     let a = SubjectRef {
@@ -400,4 +387,330 @@ fn subject_ref_equality_covers_both_halves_of_the_identity() {
     };
     assert_ne!(a, b);
     assert_eq!(a.clone(), a);
+}
+
+// --- Scopes and attribution (projection-contracts feature) -----------------
+
+#[test]
+fn subject_scope_parse_and_deserialization_accept_only_scope_instances() {
+    let user = SubjectScope::parse(SCOPE_USER).expect("user scope");
+    assert_eq!(user, SubjectScope::user());
+    assert!(!user.is_tenant());
+    let tenant = SubjectScope::parse(SCOPE_TENANT).expect("tenant scope");
+    assert_eq!(tenant, SubjectScope::tenant());
+    assert!(tenant.is_tenant());
+
+    let rejected = [
+        SCOPE_TYPE,                                             // a type, not an instance
+        "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~", // another type
+        "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1", // an instance of another type
+        "not-a-gts-id",
+        "",
+    ];
+    for raw in rejected {
+        let direct = SubjectScope::parse(raw).expect_err(raw);
+        assert!(
+            matches!(
+                direct,
+                ScopeError::Invalid { .. } | ScopeError::NotAScope { .. }
+            ),
+            "{raw}: {direct:?}"
+        );
+        let json = serde_json::to_string(raw).expect("json string");
+        assert!(
+            serde_json::from_str::<SubjectScope>(&json).is_err(),
+            "deserialization must run the same check: {raw}"
+        );
+    }
+    assert!(matches!(
+        SubjectScope::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1"),
+        Err(ScopeError::NotAScope { .. })
+    ));
+}
+
+#[test]
+fn subject_scope_serializes_as_its_instance_id_and_round_trips() {
+    let json = serde_json::to_string(&SubjectScope::user()).expect("serialize");
+    assert_eq!(json, format!("\"{SCOPE_USER}\""));
+    let back: SubjectScope = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, SubjectScope::user());
+    assert_eq!(back.as_gts().as_ref(), SCOPE_USER);
+    assert_eq!(back.to_string(), SCOPE_USER);
+}
+
+#[test]
+fn evaluation_attribution_distinguishes_omitted_metadata_from_null() {
+    let tenant = Uuid::from_u128(7);
+    let metric = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1";
+
+    let omitted: EvaluationAttribution =
+        serde_json::from_value(json!({ "tenant_id": tenant, "metric": metric }))
+            .expect("metadata may be omitted at the type level");
+    assert_eq!(
+        omitted.metadata, None,
+        "the gear rejects the omission later"
+    );
+    assert!(omitted.subjects.is_empty());
+    assert_eq!(omitted.resource, None);
+
+    let empty: EvaluationAttribution =
+        serde_json::from_value(json!({ "tenant_id": tenant, "metric": metric, "metadata": {} }))
+            .expect("an empty object is a present object");
+    assert_eq!(empty.metadata.as_ref().map(serde_json::Map::len), Some(0));
+
+    for field in ["metadata", "resource"] {
+        let explicit_null = json!({ "tenant_id": tenant, "metric": metric, field: null });
+        assert!(
+            serde_json::from_value::<EvaluationAttribution>(explicit_null).is_err(),
+            "{field}: null is not absence"
+        );
+    }
+    let unknown =
+        json!({ "tenant_id": tenant, "metric": metric, "metadata": {}, "caller_type": "x" });
+    assert!(serde_json::from_value::<EvaluationAttribution>(unknown).is_err());
+}
+
+#[test]
+fn resource_projection_keeps_an_absent_id_absent() {
+    let without_id: ResourceProjection = serde_json::from_value(json!({
+        "type": "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~",
+        "metadata": { "model_family": "gpt" }
+    }))
+    .expect("id may be omitted");
+    assert_eq!(without_id.id, None);
+    let written = serde_json::to_value(&without_id).expect("serialize");
+    let mut keys: Vec<String> = written
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["metadata", "type"],
+        "no id key is written for an absent id"
+    );
+
+    let with_id: ResourceProjection = serde_json::from_value(json!({
+        "type": "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~",
+        "id": "model-7",
+        "metadata": {}
+    }))
+    .expect("id may be present");
+    assert_eq!(with_id.id.as_deref(), Some("model-7"));
+
+    for field in ["id", "metadata"] {
+        let explicit_null = json!({
+            "type": "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~",
+            "metadata": {},
+            field: null
+        });
+        assert!(
+            serde_json::from_value::<ResourceProjection>(explicit_null).is_err(),
+            "{field}: null is rejected, the resource base requires a value when present"
+        );
+    }
+    let no_metadata = json!({ "type": "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~" });
+    let parsed: ResourceProjection = serde_json::from_value(no_metadata).expect("type only");
+    assert_eq!(
+        parsed.metadata, None,
+        "the gear rejects the omission at ingress"
+    );
+}
+
+#[test]
+fn contract_ref_for_type_takes_the_major_version_of_the_last_segment() {
+    let id = GtsTypeId::try_new(
+        "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v3~",
+    )
+    .expect("type id");
+    let reference = ContractRef::for_type(&id).expect("versioned");
+    assert_eq!(reference.type_id, id);
+    assert_eq!(reference.version, 3);
+}
+
+#[test]
+fn projection_bindings_are_distinct_by_pair() {
+    let metric =
+        MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1")
+            .expect("metric");
+    let user =
+        GtsTypeId::try_new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~").expect("type");
+    let tenant =
+        GtsTypeId::try_new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.tenant.v1~").expect("type");
+    let set: std::collections::HashSet<ProjectionBinding> = [
+        ProjectionBinding {
+            metric: metric.clone(),
+            projection_type: user.clone(),
+        },
+        ProjectionBinding {
+            metric: metric.clone(),
+            projection_type: user,
+        },
+        ProjectionBinding {
+            metric,
+            projection_type: tenant,
+        },
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(set.len(), 2);
+}
+
+// --- quota-lifecycle read and create shapes ---------------------------------
+
+fn spec() -> QuotaSpec {
+    QuotaSpec {
+        tenant_id: TenantId::new(Uuid::from_u128(7)),
+        subject: SubjectRef {
+            projection_type: GtsTypeId::new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~"),
+            subject_id: "u1".to_owned(),
+        },
+        metric: MetricId::parse(
+            "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1",
+        )
+        .expect("metric"),
+        quota_type: QuotaType::Consumption,
+        period: Some(PeriodType::Month),
+        enforcement_mode: EnforcementMode::Hard,
+        cap: Some(10),
+        notification_thresholds: vec![50, 90],
+        validity_window: None,
+        fail_open_hint: false,
+        metadata: serde_json::Map::new(),
+        source: QuotaSource::Operator,
+    }
+}
+
+fn contract() -> ContractRef {
+    ContractRef {
+        type_id: GtsTypeId::new(
+            "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v1~",
+        ),
+        version: 1,
+    }
+}
+
+fn stored(spec: QuotaSpec, window: Option<ValidityWindow>) -> Quota {
+    let draft = QuotaDraft::from_spec(spec, contract());
+    Quota {
+        id: QuotaId::new(Uuid::from_u128(1)),
+        tenant_id: draft.tenant_id,
+        subject: draft.subject,
+        metric: draft.metric,
+        quota_type: draft.quota_type,
+        period: draft.period,
+        enforcement_mode: draft.enforcement_mode,
+        cap: draft.cap,
+        notification_thresholds: draft.notification_thresholds,
+        validity_window: window,
+        fail_open_hint: draft.fail_open_hint,
+        metadata: draft.metadata,
+        source: draft.source,
+        status: QuotaStatus::Active,
+        constraint_contract: draft.constraint_contract,
+        record_version: 1,
+        created_at: ts(0),
+        updated_at: ts(0),
+    }
+}
+
+#[test]
+fn quota_view_is_computed_for_one_instant_and_flattens_the_record() {
+    let window = ValidityWindow {
+        start: Some(ts(100)),
+        end: Some(ts(200)),
+    };
+    let quota = stored(spec(), Some(window));
+    let inside = QuotaView::compute(quota.clone(), Some(MetricKind::Counter), ts(150));
+    assert!(inside.currently_within_window);
+    assert_eq!(inside.metric_kind, Some(MetricKind::Counter));
+    let after = QuotaView::compute(quota.clone(), None, ts(201));
+    assert!(
+        !after.currently_within_window,
+        "past the end, status untouched"
+    );
+    assert_eq!(after.quota.status, QuotaStatus::Active);
+    let unbounded = QuotaView::compute(stored(spec(), None), Some(MetricKind::Gauge), ts(0));
+    assert!(unbounded.currently_within_window);
+
+    let value = serde_json::to_value(&inside).expect("serialize");
+    assert_eq!(
+        value["id"],
+        json!(quota.id.to_string()),
+        "record fields are flattened"
+    );
+    assert_eq!(value["currently_within_window"], json!(true));
+    assert_eq!(value["metric_kind"], json!("counter"));
+    let back: QuotaView = serde_json::from_value(value).expect("round trip");
+    assert_eq!(back, inside);
+}
+
+#[test]
+fn metric_kind_is_closed_and_snake_case() {
+    assert_eq!(
+        serde_json::to_value(MetricKind::Gauge).expect("serialize"),
+        json!("gauge")
+    );
+    assert_eq!(
+        serde_json::from_value::<MetricKind>(json!("counter")).expect("counter"),
+        MetricKind::Counter
+    );
+    assert!(serde_json::from_value::<MetricKind>(json!("histogram")).is_err());
+}
+
+#[test]
+fn quota_spec_has_no_contract_field_and_becomes_a_draft_with_one() {
+    let spec = spec();
+    let value = serde_json::to_value(&spec).expect("serialize");
+    assert!(value.get("constraint_contract").is_none());
+    let mut with_contract = value;
+    with_contract["constraint_contract"] = json!({ "type_id": "x", "version": 1 });
+    assert!(
+        serde_json::from_value::<QuotaSpec>(with_contract).is_err(),
+        "a caller cannot smuggle the contract in"
+    );
+    let draft = QuotaDraft::from_spec(spec.clone(), contract());
+    assert_eq!(draft.constraint_contract, contract());
+    assert_eq!(draft.metric, spec.metric);
+    assert_eq!(draft.notification_thresholds, vec![50, 90]);
+}
+
+#[test]
+fn max_cap_is_the_largest_signed_64_bit_value() {
+    assert_eq!(Quota::MAX_CAP, 9_223_372_036_854_775_807);
+    assert_eq!(i64::try_from(Quota::MAX_CAP), Ok(i64::MAX));
+}
+
+#[test]
+fn active_quota_counts_default_to_zero_and_round_trip() {
+    let mut counts = ActiveQuotaCounts::default();
+    assert_eq!((counts.cap_zero, counts.cap_unbounded), (0, 0));
+    counts.cap_zero = 2;
+    counts.by_metric.insert(
+        MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1")
+            .expect("metric"),
+        3,
+    );
+    let value = serde_json::to_value(&counts).expect("serialize");
+    let back: ActiveQuotaCounts = serde_json::from_value(value).expect("round trip");
+    assert_eq!(back, counts);
+}
+
+#[test]
+fn notification_event_kind_names_equal_their_serialized_form() {
+    for kind in [
+        NotificationEventKind::ThresholdCrossed,
+        NotificationEventKind::PeriodRollover,
+        NotificationEventKind::LeaseAutoReleased,
+        NotificationEventKind::LeaseResolvedByDeactivation,
+        NotificationEventKind::QuotaChanged,
+        NotificationEventKind::QuotaCounterAdjusted,
+        NotificationEventKind::QuotaRollbackApplied,
+        NotificationEventKind::PolicyChanged,
+    ] {
+        assert_eq!(
+            serde_json::to_value(kind).expect("serialize"),
+            json!(kind.as_str())
+        );
+    }
 }

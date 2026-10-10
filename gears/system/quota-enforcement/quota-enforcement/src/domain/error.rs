@@ -11,6 +11,9 @@ use quota_enforcement_sdk::{LeaseToken, PolicyId, StorageError};
 use toolkit::plugins::ChoosePluginError;
 use toolkit_macros::domain_model;
 
+use super::ports::metrics::ValidationReason;
+use super::tokens;
+
 /// Which plugin family a binding error is about.
 ///
 /// Singleton coordination is not a plugin family: the gear consumes the
@@ -42,6 +45,8 @@ pub enum Dependency {
     Pdp,
     /// The types registry.
     TypesRegistry,
+    /// The projection contract catalogue built from the configured projections.
+    Catalog,
 }
 
 impl Dependency {
@@ -53,6 +58,7 @@ impl Dependency {
             Self::Cluster => "cluster",
             Self::Pdp => "pdp",
             Self::TypesRegistry => "types_registry",
+            Self::Catalog => "catalog",
         }
     }
 }
@@ -122,6 +128,15 @@ pub enum DomainError {
     /// The types registry could not answer.
     #[error("types registry unavailable: {0}")]
     TypesRegistryUnavailable(String),
+    /// The configured projection contract catalogue failed a bootstrap
+    /// consistency check. `subject` names the offending definition.
+    #[error("projection contract catalogue rejected {subject}: {reason}")]
+    CatalogInvalid {
+        /// Which check failed.
+        reason: ValidationReason,
+        /// The GTS id, metric, or pair the check failed on.
+        subject: String,
+    },
     /// No plugin instance matched the configured vendor.
     #[error("no {kind} plugin instance registered for vendor {vendor}")]
     PluginNotFound {
@@ -252,11 +267,48 @@ pub enum DomainError {
         /// The metric.
         metric: String,
     },
+    /// The projection is registered but outside the configured catalogue.
+    #[error("projection {projection} is not resolvable in the configured catalogue")]
+    ProjectionNotResolvable {
+        /// The projection type identifier.
+        projection: String,
+    },
     /// The projection is not registered.
     #[error("projection {projection} is not registered")]
     ProjectionNotRegistered {
         /// The projection type.
         projection: String,
+    },
+
+    // --- quota lifecycle, decided before storage ---
+    /// A reserved capability: the `rate` quota type in P1.
+    #[error("{feature} is not yet implemented")]
+    NotYetImplemented {
+        /// The reserved capability.
+        feature: &'static str,
+    },
+    /// A negative cap. Caps live in `0..=i64::MAX`; `0` and unbounded are valid.
+    #[error("cap {cap} is negative")]
+    CapMustBeNonNegative {
+        /// The requested cap.
+        cap: i64,
+    },
+    /// Notification thresholds on an unbounded cap: percentages of nothing.
+    /// Raised by the gear's pre-check and by storage on the merged row (I14).
+    #[error("notification thresholds require a bounded cap")]
+    ThresholdsRequireBoundedCap,
+    /// Quota metadata violates the metric owner's constraint contract.
+    #[error("metadata violates constraint contract {contract}")]
+    ConstraintContractMismatch {
+        /// The constraint contract type.
+        contract: String,
+    },
+    /// The metric is registered but its instance carries no usable
+    /// classification (kind and enforcement mode). Never defaulted.
+    #[error("metric {metric} carries no usable classification")]
+    MetricClassificationInvalid {
+        /// The metric.
+        metric: String,
     },
 
     /// Last-resort opaque failure. Never carries caller-facing detail.
@@ -267,6 +319,8 @@ pub enum DomainError {
 impl DomainError {
     /// Closed reason token when the PDP permit carried no usable constraints.
     pub const CONSTRAINT_COMPILE_FAILED: &'static str = "CONSTRAINT_COMPILE_FAILED";
+    /// Closed reason token when a projection is registered but not configured.
+    pub const PROJECTION_NOT_RESOLVABLE: &'static str = "PROJECTION_NOT_RESOLVABLE";
     /// Closed reason token when storage caught a subject outside the scope.
     pub const SUBJECT_OUT_OF_SCOPE: &'static str = "SUBJECT_OUT_OF_SCOPE";
 
@@ -332,6 +386,7 @@ impl From<StorageError> for DomainError {
             StorageError::CapBelowConsumed { new_cap, consumed } => {
                 Self::CapBelowConsumed { new_cap, consumed }
             }
+            StorageError::ThresholdsRequireBoundedCap => Self::ThresholdsRequireBoundedCap,
             StorageError::QuotaNotFound { id } => Self::NotFound {
                 kind: ResourceKind::Quota,
                 id: id.to_string(),
@@ -346,6 +401,10 @@ impl From<StorageError> for DomainError {
             // Storage-layer defense in depth caught what the PDP should have.
             StorageError::SubjectOutOfScope => Self::PdpDenied {
                 reason: Some(Self::SUBJECT_OUT_OF_SCOPE.to_owned()),
+            },
+            StorageError::InvalidCursor => Self::InvalidArgument {
+                field: "cursor",
+                reason: tokens::CURSOR_INVALID,
             },
             StorageError::Unavailable(detail) => Self::BackendUnavailable(detail),
             // Detected at bootstrap and fatal there. A runtime occurrence is a

@@ -6,9 +6,12 @@ use quota_enforcement_sdk::QuotaEnforcementStoragePluginV1;
 use toolkit_macros::domain_model;
 
 use super::admission::Admission;
+use super::attribution::Attribution;
 use super::bootstrap::Bound;
+use super::catalog::ProjectionContractCatalog;
 use super::error::{Dependency, DomainError};
 use super::ports::coordination::SingletonCoordinator;
+use super::quotas::{QuotaLimits, QuotaManagement};
 use super::readiness::Readiness;
 
 /// Composition root of the domain. Handlers and the in-process client reach
@@ -17,16 +20,18 @@ use super::readiness::Readiness;
 pub struct Service {
     admission: Admission,
     readiness: Arc<Readiness>,
+    limits: QuotaLimits,
     bound: OnceLock<Bound>,
 }
 
 impl Service {
     /// Assemble the service. Dependencies are bound later by bootstrap.
     #[must_use]
-    pub fn new(admission: Admission, readiness: Arc<Readiness>) -> Self {
+    pub fn new(admission: Admission, readiness: Arc<Readiness>, limits: QuotaLimits) -> Self {
         Self {
             admission,
             readiness,
+            limits,
             bound: OnceLock::new(),
         }
     }
@@ -80,6 +85,57 @@ impl Service {
             .ok_or(DomainError::NotReady {
                 dependency: Dependency::Cluster,
             })
+    }
+
+    /// The published projection contract catalogue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::NotReady`] before bootstrap completed.
+    pub fn catalog(&self) -> Result<Arc<ProjectionContractCatalog>, DomainError> {
+        self.bound
+            .get()
+            .map(|b| b.catalog.clone())
+            .ok_or(DomainError::NotReady {
+                dependency: Dependency::Catalog,
+            })
+    }
+
+    /// The ingress step of every subject-based evaluation operation: shape
+    /// check, PDP admission of the attribution tuple, catalogue mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::NotReady`] before bootstrap completed.
+    pub fn attribution(&self) -> Result<Attribution<'_>, DomainError> {
+        let bound = self.bound.get().ok_or(DomainError::NotReady {
+            dependency: Dependency::Catalog,
+        })?;
+        Ok(Attribution::new(
+            &self.admission,
+            &bound.catalog,
+            self.admission.metrics(),
+        ))
+    }
+
+    /// The Quota lifecycle: create, update, deactivate, read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::NotReady`] before bootstrap completed.
+    pub fn quotas(&self) -> Result<QuotaManagement<'_>, DomainError> {
+        let bound = self.bound.get().ok_or(DomainError::NotReady {
+            dependency: Dependency::Storage,
+        })?;
+        Ok(QuotaManagement::new(
+            &self.admission,
+            &bound.catalog,
+            bound.storage.as_ref(),
+            bound.registry.as_ref(),
+            bound.metric_registry.as_ref(),
+            self.admission.metrics(),
+            self.limits,
+        ))
     }
 }
 

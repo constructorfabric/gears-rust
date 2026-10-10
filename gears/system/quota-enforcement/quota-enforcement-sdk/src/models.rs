@@ -12,17 +12,19 @@
 //!   reject unknown fields.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::str::FromStr;
 
-use gts::{GtsIdError, GtsInstanceId, GtsTypeId};
+use gts::{GtsId, GtsIdError, GtsInstanceId, GtsTypeId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use time::serde::rfc3339;
 use toolkit_gts::gts_id;
 use uuid::Uuid;
+
+use crate::gts::{SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER};
 
 // ---------------------------------------------------------------------------
 // Identifiers
@@ -511,6 +513,35 @@ pub enum NotificationEventKind {
     PolicyChanged,
 }
 
+impl NotificationEventKind {
+    /// Stable `kebab-case` name, equal to the serialized form; the outbox
+    /// stores it as the payload type.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ThresholdCrossed => "threshold-crossed",
+            Self::PeriodRollover => "period-rollover",
+            Self::LeaseAutoReleased => "lease-auto-released",
+            Self::LeaseResolvedByDeactivation => "lease-resolved-by-deactivation",
+            Self::QuotaChanged => "quota-changed",
+            Self::QuotaCounterAdjusted => "quota-counter-adjusted",
+            Self::QuotaRollbackApplied => "quota-rollback-applied",
+            Self::PolicyChanged => "policy-changed",
+        }
+    }
+}
+
+/// Registry-reported kind of a metric (PRD section 3.2). Closed; the gear
+/// reads it from the metric instance and never defaults it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricKind {
+    /// Cumulative within a period; pairs naturally with consumption Quotas.
+    Counter,
+    /// A level; pairs naturally with allocation Quotas.
+    Gauge,
+}
+
 // ---------------------------------------------------------------------------
 // Subjects and contracts
 // ---------------------------------------------------------------------------
@@ -534,6 +565,253 @@ pub struct ContractRef {
     pub type_id: GtsTypeId,
     /// Accepted contract version.
     pub version: u32,
+}
+
+impl ContractRef {
+    /// The reference to `type_id` at the version its last segment declares.
+    ///
+    /// Returns `None` when the id does not parse or its last segment carries
+    /// no major version, which a registry-validated type id never does.
+    #[must_use]
+    pub fn for_type(type_id: &GtsTypeId) -> Option<Self> {
+        let version = GtsId::try_new(type_id.as_ref())
+            .ok()?
+            .segments()
+            .last()?
+            .ver_major_opt()?;
+        Some(Self {
+            type_id: type_id.clone(),
+            version,
+        })
+    }
+}
+
+/// A well-known instance of the scope-discriminator type
+/// `gts.cf.core.qe.scope.v1~` (ADR-0007). The value is an identity-only
+/// discriminator: it names no `SecurityContext` accessor, and the gear compares
+/// instance ids directly.
+///
+/// The invariant "an instance of the scope type" holds for every value: the
+/// constructors validate it, and deserialization goes through [`Self::parse`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct SubjectScope(GtsInstanceId);
+
+impl SubjectScope {
+    /// Parse a scope instance id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScopeError`] when `raw` is not a well-formed GTS instance id
+    /// or its declaring type is not the scope-discriminator type.
+    pub fn parse(raw: &str) -> Result<Self, ScopeError> {
+        let parsed = GtsId::try_new(raw).map_err(|e| ScopeError::Invalid {
+            id: raw.to_owned(),
+            detail: e.to_string(),
+        })?;
+        if parsed.is_type() || parsed.get_type_id().as_deref() != Some(SCOPE_TYPE) {
+            return Err(ScopeError::NotAScope { id: raw.to_owned() });
+        }
+        GtsInstanceId::try_new(raw)
+            .map(Self)
+            .map_err(|e| ScopeError::Invalid {
+                id: raw.to_owned(),
+                detail: e.to_string(),
+            })
+    }
+
+    /// The `user` scope.
+    #[must_use]
+    pub fn user() -> Self {
+        Self(GtsInstanceId::new(SCOPE_TYPE, user_segment()))
+    }
+
+    /// The `tenant` scope, materialized from every request's `tenant_id`.
+    #[must_use]
+    pub fn tenant() -> Self {
+        Self(GtsInstanceId::new(SCOPE_TYPE, tenant_segment()))
+    }
+
+    /// True for the `tenant` scope.
+    #[must_use]
+    pub fn is_tenant(&self) -> bool {
+        self.0 == SCOPE_TENANT
+    }
+
+    /// The underlying instance id.
+    #[must_use]
+    pub const fn as_gts(&self) -> &GtsInstanceId {
+        &self.0
+    }
+
+    /// The id as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+/// The instance segment of a well-known scope id: the text after the type id.
+fn user_segment() -> &'static str {
+    &SCOPE_USER[SCOPE_TYPE.len()..]
+}
+
+fn tenant_segment() -> &'static str {
+    &SCOPE_TENANT[SCOPE_TYPE.len()..]
+}
+
+impl TryFrom<String> for SubjectScope {
+    type Error = ScopeError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::parse(&raw)
+    }
+}
+
+impl Serialize for SubjectScope {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl fmt::Display for SubjectScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A value that is not a scope instance.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ScopeError {
+    /// Not a well-formed GTS instance id.
+    #[error("{id} is not a GTS instance id: {detail}")]
+    Invalid {
+        /// The rejected text.
+        id: String,
+        /// The parser's diagnostic.
+        detail: String,
+    },
+    /// A well-formed id whose declaring type is not `gts.cf.core.qe.scope.v1~`.
+    #[error("{id} is not an instance of the QE scope type")]
+    NotAScope {
+        /// The rejected id.
+        id: String,
+    },
+}
+
+/// One caller-supplied subject: a scope `kind` and an opaque `id`.
+///
+/// `kind` travels as text so a malformed value becomes a canonical
+/// `InvalidArgument` at ingress rather than a deserialization failure. The
+/// gear maps `(metric, kind)` to the owner projection; callers never name a
+/// projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectClaim {
+    /// A well-known instance of the scope-discriminator type, as text.
+    pub kind: String,
+    /// Opaque, non-empty subject identifier.
+    pub id: String,
+}
+
+/// An optional resource projection on the wire (ADR-0007): the complete
+/// `{type, id?, metadata}` document validated against the owner contract.
+///
+/// `id` and `metadata` distinguish omission from an explicit `null`: the
+/// resource base allows an omitted `id` and requires a string when present, and
+/// requires `metadata`. An omitted field is `None`; `null` fails
+/// deserialization; `None` is never written as `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceProjection {
+    /// The concrete resource projection type, as text.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// Optional resource identity.
+    #[serde(
+        default,
+        deserialize_with = "present_or_error",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub id: Option<String>,
+    /// Schematized resource properties. Required by the resource base.
+    #[serde(
+        default,
+        deserialize_with = "present_or_error",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub metadata: Option<Map<String, Value>>,
+}
+
+/// The caller-supplied attribution of one subject-based evaluation request
+/// (debit, reserve, preview, each batch item). Untrusted until the PDP
+/// authorizes the complete tuple for the authenticated service principal.
+///
+/// `metadata` is required on the wire, including `{}` when the request
+/// contract declares no properties; it is `Option` only so the gear can tell an
+/// omitted object from a present one and reject the omission instead of
+/// defaulting it. `null` fails deserialization for every optional field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationAttribution {
+    /// Target tenant. The tenant-scope subject is materialized from it.
+    pub tenant_id: TenantId,
+    /// The metric, as text: a registered instance of the platform metric base.
+    pub metric: String,
+    /// Additional subjects. The tenant scope must not be repeated here.
+    #[serde(default)]
+    pub subjects: Vec<SubjectClaim>,
+    /// The operation-level metadata object, validated against the metric's
+    /// request contract.
+    #[serde(
+        default,
+        deserialize_with = "present_or_error",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub metadata: Option<Map<String, Value>>,
+    /// Optional resource projection.
+    #[serde(
+        default,
+        deserialize_with = "present_or_error",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub resource: Option<ResourceProjection>,
+}
+
+/// Deserializes a present field as `Some`, so that `null` is an error rather
+/// than `None`. Pair with `#[serde(default)]` so an omitted field is `None`.
+fn present_or_error<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// The `(metric, projection_type)` pair an active Quota binds. Storage reports
+/// the distinct set at bootstrap so the configured catalogue can be checked
+/// against it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProjectionBinding {
+    /// The Quota's metric.
+    pub metric: MetricId,
+    /// The subject projection the Quota is bound to.
+    pub projection_type: GtsTypeId,
+}
+
+/// Active-Quota counts behind the lifecycle gauges (PRD section 5.16):
+/// `quota_cap_zero_total`, `quota_cap_unbounded_total`, and, joined with the
+/// current metric classification by the gear, `quota_for_direct_metric_total`.
+/// Platform-plane and caller-less, like [`ProjectionBinding`]; only Quotas with
+/// lifecycle status `active` count, whatever their validity window.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ActiveQuotaCounts {
+    /// Active Quotas with `cap = 0`.
+    pub cap_zero: u64,
+    /// Active Quotas with an unbounded cap.
+    pub cap_unbounded: u64,
+    /// Active Quotas per metric.
+    pub by_metric: HashMap<MetricId, u64>,
 }
 
 /// Optional validity bounds of a Quota. Both ends are inclusive.
@@ -581,7 +859,8 @@ pub struct Quota {
     pub period: Option<PeriodType>,
     /// Behaviour at the cap boundary.
     pub enforcement_mode: EnforcementMode,
-    /// Cap in metric units. `None` means unbounded.
+    /// Cap in metric units, within `0..=`[`Quota::MAX_CAP`]. `None` means
+    /// unbounded.
     pub cap: Option<u64>,
     /// Notification thresholds as percentages of cap, ascending.
     pub notification_thresholds: Vec<u8>,
@@ -595,9 +874,10 @@ pub struct Quota {
     pub source: QuotaSource,
     /// Lifecycle state.
     pub status: QuotaStatus,
-    /// Contract the metadata was validated against.
+    /// Contract the metadata was validated against: snapshotted at creation and
+    /// moved with every accepted metadata update.
     pub constraint_contract: ContractRef,
-    /// Optimistic-concurrency record version.
+    /// Record version. Increments once per accepted mutation.
     pub record_version: u32,
     /// Creation time.
     #[serde(with = "rfc3339")]
@@ -605,6 +885,90 @@ pub struct Quota {
     /// Last mutation time.
     #[serde(with = "rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+impl Quota {
+    /// Largest cap any surface accepts. Caps live in `0..=i64::MAX` so every
+    /// storage backend holds them in a signed 64-bit column: the REST surface
+    /// takes a signed integer and rejects negatives, the SDK checks `u64`
+    /// values against this bound (`CAP_OUT_OF_RANGE`), SQL carries a check
+    /// constraint.
+    pub const MAX_CAP: u64 = i64::MAX.unsigned_abs();
+}
+
+/// The public read shape of a Quota: the stored record plus what the gear
+/// computes at read time. Every Quota read and list returns it, over REST and
+/// in process alike (quota-lifecycle feature). Storage never produces it; its
+/// `read_quotas` returns the bare [`Quota`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaView {
+    /// The stored record.
+    #[serde(flatten)]
+    pub quota: Quota,
+    /// Server-computed: the response's clock reading lies within
+    /// `validity_window`, an absent bound being unbounded on its side. One
+    /// clock reading per response.
+    pub currently_within_window: bool,
+    /// Registry-reported kind of the metric at read time. `None` only when
+    /// the registry no longer knows the metric; the record stays readable and
+    /// the removal is logged.
+    #[serde(default)]
+    pub metric_kind: Option<MetricKind>,
+}
+
+impl QuotaView {
+    /// Pure computation of the view for the clock reading `now`.
+    #[must_use]
+    pub fn compute(quota: Quota, metric_kind: Option<MetricKind>, now: OffsetDateTime) -> Self {
+        let currently_within_window = quota.validity_window.is_none_or(|w| w.contains(now));
+        Self {
+            quota,
+            currently_within_window,
+            metric_kind,
+        }
+    }
+}
+
+/// Public create input of a Quota (`QuotaManagerClientV1::create_quota`): a
+/// [`QuotaDraft`] without the constraint contract, which the gear resolves from
+/// the catalogue and snapshots itself. The gear validates every field before
+/// storage sees a draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaSpec {
+    /// PDP-authorized target tenant.
+    pub tenant_id: TenantId,
+    /// Subject the Quota binds to: `(projection_type, subject_id)`.
+    pub subject: SubjectRef,
+    /// Registered metric.
+    pub metric: MetricId,
+    /// Accounting model. `rate` is reserved and rejected.
+    pub quota_type: QuotaType,
+    /// Period specification. Required for consumption Quotas, rejected for
+    /// allocation Quotas.
+    #[serde(default)]
+    pub period: Option<PeriodType>,
+    /// Behaviour at the cap boundary.
+    pub enforcement_mode: EnforcementMode,
+    /// Cap in metric units, within `0..=`[`Quota::MAX_CAP`]. `None` means
+    /// unbounded.
+    #[serde(default)]
+    pub cap: Option<u64>,
+    /// Notification thresholds as percentages of cap, ascending. Require a
+    /// bounded cap.
+    #[serde(default)]
+    pub notification_thresholds: Vec<u8>,
+    /// Optional validity bounds.
+    #[serde(default)]
+    pub validity_window: Option<ValidityWindow>,
+    /// Informational fail-open hint. Defaults to fail-closed.
+    #[serde(default)]
+    pub fail_open_hint: bool,
+    /// Metadata validated against the metric owner's constraint contract.
+    #[serde(default)]
+    pub metadata: Map<String, Value>,
+    /// Who imposes the Quota.
+    pub source: QuotaSource,
 }
 
 /// Create input for a Quota. The gear validates it before storage sees it.
@@ -624,7 +988,8 @@ pub struct QuotaDraft {
     pub period: Option<PeriodType>,
     /// Behaviour at the cap boundary.
     pub enforcement_mode: EnforcementMode,
-    /// Cap in metric units. `None` means unbounded.
+    /// Cap in metric units, within `0..=`[`Quota::MAX_CAP`]. `None` means
+    /// unbounded.
     #[serde(default)]
     pub cap: Option<u64>,
     /// Notification thresholds as percentages of cap.
@@ -641,8 +1006,32 @@ pub struct QuotaDraft {
     pub metadata: Map<String, Value>,
     /// Who imposes the Quota.
     pub source: QuotaSource,
-    /// Contract the metadata was validated against.
+    /// Contract the metadata was validated against. Set by the gear from the
+    /// catalogue, never caller-supplied: the public create shape is
+    /// [`QuotaSpec`], which has no such field.
     pub constraint_contract: ContractRef,
+}
+
+impl QuotaDraft {
+    /// The storage draft of a validated `spec` with the resolved contract.
+    #[must_use]
+    pub fn from_spec(spec: QuotaSpec, constraint_contract: ContractRef) -> Self {
+        Self {
+            tenant_id: spec.tenant_id,
+            subject: spec.subject,
+            metric: spec.metric,
+            quota_type: spec.quota_type,
+            period: spec.period,
+            enforcement_mode: spec.enforcement_mode,
+            cap: spec.cap,
+            notification_thresholds: spec.notification_thresholds,
+            validity_window: spec.validity_window,
+            fail_open_hint: spec.fail_open_hint,
+            metadata: spec.metadata,
+            source: spec.source,
+            constraint_contract,
+        }
+    }
 }
 
 /// Patch of a Quota's `cap`.
@@ -678,6 +1067,12 @@ pub struct QuotaPatch {
     pub validity_window: Option<ValidityWindowPatch>,
     /// New metadata object, replacing the previous one.
     pub metadata: Option<Map<String, Value>>,
+    /// The contract the new `metadata` was validated against, stored with it in
+    /// the same write so the reference never lags the object. Set by the gear
+    /// whenever `metadata` is present, never caller-supplied: the gear rejects a
+    /// present value from a client. Storage rejects a `metadata` patch without
+    /// it as `Internal`.
+    pub constraint_contract: Option<ContractRef>,
     /// New enforcement mode.
     pub enforcement_mode: Option<EnforcementMode>,
     /// New fail-open hint.
@@ -1192,18 +1587,6 @@ pub struct BootstrapBundle {
     /// feature registers its engine.
     #[serde(default)]
     pub global_policy: Option<PolicyDraft>,
-}
-
-impl BootstrapBundle {
-    /// Foundation bundle: schema check and default configuration rows only.
-    #[must_use]
-    pub fn foundation() -> Self {
-        Self {
-            contract_major: crate::storage_plugin::CONTRACT_MAJOR,
-            config_defaults: ConfigDefaults::default(),
-            global_policy: None,
-        }
-    }
 }
 
 #[cfg(test)]
