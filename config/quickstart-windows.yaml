@@ -80,9 +80,9 @@ logging:
     max_age_days: 28
     max_backups: 3
     max_size_mb: 100
-  calculator:
+  hello:
     console_level: debug
-    file: "logs/calculator-oop.log"
+    file: "logs/hello-oop.log"
     file_level: debug
     max_age_days: 28
     max_backups: 3
@@ -113,25 +113,25 @@ gears:
 
   grpc-hub:
     config:
-      # Use ephemeral port; OoP gears receive the actual bound address from master host
+      # Use ephemeral port; the host passes the actual bound endpoint to spawned
+      # OoP gears via TOOLKIT_DIRECTORY_ENDPOINT
       listen_addr: "127.0.0.1:0"
 
-  calculator:
+  hello:
     runtime:
       type: oop
       execution:
-        executable_path: "calculator-oop.exe"
+        executable_path: "hello-oop.exe"
         # CLI arguments passed to OoP gear. Use --config to pass gear's own config file:
-        # args: ["--config", "config/oop-example.yaml"]
+        # args: ["--config", "config/oop-hello.yaml"]
         # The local config file is used to:
-        #   - Configure system gears for OoP process (e.g., grpc_hub.listen_addr)
-        #   - Override settings from master (TOOLKIT_MODULE_CONFIG)
-        #   - Run in standalone mode (without master host)
-        args: [ "--config", "./config/oop-example.yaml" ]
+        #   - Configure the worker's own sections (e.g., oop_http.listen_addr)
+        #   - Override the rendered config the host injects via TOOLKIT_MODULE_CONFIG
+        #   - Run in standalone mode (without a spawning host)
+        args: [ "--config", "./config/oop-hello.yaml" ]
         working_directory: "."
         environment: { }
-    config:
-      some_setting: "value"
+    config: { }
 
 
   users-info:

@@ -13,7 +13,7 @@ A gear declares what it needs and what it exposes as **capabilities** in its
 
 - `db` — needs a database; implements `DatabaseCapability` (and provides migrations).
 - `rest` — exposes a REST API; implements `RestApiCapability`.
-- `grpc` — exposes a gRPC service (used by out-of-process gears).
+- `grpc` — exposes a gRPC service (opt-in transport for out-of-process gears).
 - `stateful` — runs background work with a managed lifecycle.
 
 The runtime discovers every gear at link time (via `inventory`), builds a dependency-ordered
