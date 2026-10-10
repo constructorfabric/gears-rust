@@ -43,6 +43,7 @@
 //! Every tenant-scoped call receives the caller's [`AccessScope`] unmodified
 //! and binds it through `SecureConn`. No scoped operation runs without it.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -50,16 +51,30 @@ use time::OffsetDateTime;
 use toolkit_security::{AccessScope, SecurityContext};
 
 use crate::models::{
-    ApplicableQuotas, BatchDebitItem, BootstrapBundle, DeactivateOutcome, DebitPlan, ExpiredLease,
-    IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseToken, MutationResult,
-    NotificationEvent, PageRequest, PageResult, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate,
-    PolicyVersion, PolicyVersionMeta, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch,
-    QuotaSnapshot,
+    ApplicableQuotas, BatchDebitItem, BootstrapBundle, ConfigDefaults, DeactivateOutcome,
+    DebitPlan, ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseToken,
+    MutationResult, NotificationEvent, PageRequest, PageResult, PolicyDraft, PolicyId, PolicyScope,
+    PolicyUpdate, PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota, QuotaDraft,
+    QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot,
 };
 
 /// Major version of this contract. Coupled to the gear's major version. A
 /// storage plugin that implements another major is not supported (I12).
 pub const CONTRACT_MAJOR: u32 = 1;
+
+impl BootstrapBundle {
+    /// Foundation bundle: schema check against [`CONTRACT_MAJOR`] and default
+    /// configuration rows only. Defined here, not in `models`, because it is
+    /// the one model constructor bound to this contract's version.
+    #[must_use]
+    pub fn foundation() -> Self {
+        Self {
+            contract_major: CONTRACT_MAJOR,
+            config_defaults: ConfigDefaults::default(),
+            global_policy: None,
+        }
+    }
+}
 
 /// Closed error set of [`QuotaEnforcementStoragePluginV1`].
 ///
@@ -207,6 +222,22 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ///   differs from `bundle.contract_major`. The gear fails fast.
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn bootstrap(&self, bundle: &BootstrapBundle) -> Result<(), StorageError>;
+
+    /// The distinct `(metric, projection_type)` pairs bound by active Quotas.
+    ///
+    /// Bootstrap-only and platform-plane: the gear calls it once, before it
+    /// reports ready, to check the configured projection catalogue against the
+    /// Quotas storage holds (projection-contracts feature, "Catalogue Bootstrap
+    /// and Consistency Set"). It therefore carries no caller context and no
+    /// `AccessScope`, returns identities only, and is never called on a request
+    /// path. A failure fails readiness.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
+    async fn read_active_projection_bindings(
+        &self,
+    ) -> Result<HashSet<ProjectionBinding>, StorageError>;
 
     // --- quota CRUD ---
 
