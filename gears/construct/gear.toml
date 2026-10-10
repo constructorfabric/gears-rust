@@ -1,0 +1,7 @@
+[gear]
+name = "Construct"
+description = "Living per-subject profile built from connector records and served to applications."
+category = "gen-ai"
+is_plugin = false
+has_plugins = false
+has_extension_point = false

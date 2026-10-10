@@ -246,7 +246,7 @@ Graph storage only soft-deletes in its v1. A soft delete leaves a tombstone: a m
 
 **Technology**: GTS types for records and for the profile; Rust types in the gear.
 
-**Location**: Construct's GTS profile types (`cpt-cf-construct-contract-person-types`) and the shared record base type (`cpt-cf-construct-contract-gts-record`), registered in the types registry. The record base type is `gts.cf.connectors.core.record.v1~`. The person types are `gts.cf.construct.person.identity.v1~`, `gts.cf.construct.person.roles.v1~`, `gts.cf.construct.person.skills.v1~` and `gts.cf.construct.person.preferences.v1~`, one per entity kind of a person. A person's subject ID is the UUID of the platform user, `gts.cf.core.am.user.v1~`.
+**Location**: Construct's GTS profile types (`cpt-cf-construct-contract-person-types`) and the shared record base type (`cpt-cf-construct-contract-gts-record`), registered in the types registry. The record base type is `gts.cf.connectors.core.record.v1~`. The person types are `gts.cf.construct.person.identity.v1~`, `gts.cf.construct.person.roles.v1~`, `gts.cf.construct.person.skills.v1~` and `gts.cf.construct.person.preferences.v1~`, one per entity kind of a person. Each derives from graph storage's owned node, so its registered id carries the family chain, for example `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.identity.v1~`. A person's subject ID is the UUID of the platform user, `gts.cf.core.am.user.v1~`.
 
 **Core Entities**:
 

@@ -1,0 +1,419 @@
+{
+  "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.preferences.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "How a person wants to be served: language, format, tone, accessibility, constraints and goals. One node is one fact: its payload holds one property, which names the fact, and the origin of the fact.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 2,
+          "maxProperties": 2,
+          "required": [
+            "origin"
+          ],
+          "properties": {
+            "origin": {
+              "$ref": "gts://gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~"
+            },
+            "analogy_domain": {
+              "type": "string",
+              "minLength": 1
+            },
+            "answer_language": {
+              "type": "string",
+              "pattern": "^[a-z]{2,3}(-[A-Z]{2})?$",
+              "description": "ISO 639 language code, optionally with an ISO 3166 region: en, de, en-GB."
+            },
+            "assistive_tools": {
+              "type": "string",
+              "minLength": 1
+            },
+            "average_session_length": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Duration in minutes."
+            },
+            "captions": {
+              "type": "boolean"
+            },
+            "challenge_starting_level": {
+              "type": "string",
+              "enum": [
+                "warm_up",
+                "target_level"
+              ]
+            },
+            "chunk_size": {
+              "type": "string",
+              "enum": [
+                "short_5_10m",
+                "standard_20_30m",
+                "long_45m_plus"
+              ]
+            },
+            "citation_style": {
+              "type": "string",
+              "enum": [
+                "apa",
+                "mla",
+                "ieee",
+                "acm",
+                "chicago"
+              ]
+            },
+            "cognitive_load_hint": {
+              "type": "string",
+              "minLength": 1
+            },
+            "collaboration_style": {
+              "type": "string",
+              "enum": [
+                "initiator",
+                "contributor",
+                "reviewer",
+                "coordinator"
+              ]
+            },
+            "communication_channel": {
+              "type": "string",
+              "enum": [
+                "forum",
+                "live_sessions",
+                "chat",
+                "async_comments"
+              ]
+            },
+            "content_maturity_level": {
+              "type": "string",
+              "minLength": 1
+            },
+            "current_focus_areas": {
+              "type": "string",
+              "minLength": 1
+            },
+            "dialect": {
+              "type": "string",
+              "pattern": "^[a-z]{2,3}(-[A-Z][a-z]{3})?(-[A-Z]{2})?$",
+              "description": "BCP 47 language tag: en-US, bg-BG."
+            },
+            "dyslexia_friendly": {
+              "type": "boolean"
+            },
+            "explainability": {
+              "type": "string",
+              "enum": [
+                "always_show",
+                "on_request",
+                "never"
+              ]
+            },
+            "feedback_style": {
+              "type": "string",
+              "enum": [
+                "direct_hint",
+                "scaffolded_steps",
+                "full_explanation",
+                "socratic"
+              ]
+            },
+            "focus_windows": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "days",
+                "start",
+                "end"
+              ],
+              "properties": {
+                "days": {
+                  "type": "array",
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "mon",
+                      "tue",
+                      "wed",
+                      "thu",
+                      "fri",
+                      "sat",
+                      "sun"
+                    ]
+                  }
+                },
+                "start": {
+                  "type": "string",
+                  "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+                  "description": "Local time, HH:MM."
+                },
+                "end": {
+                  "type": "string",
+                  "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+                  "description": "Local time, HH:MM."
+                }
+              }
+            },
+            "group_vs_individual": {
+              "type": "string",
+              "enum": [
+                "group",
+                "individual"
+              ]
+            },
+            "high_contrast": {
+              "type": "boolean"
+            },
+            "hint_depth": {
+              "type": "string",
+              "enum": [
+                "light",
+                "medium",
+                "full"
+              ]
+            },
+            "interface_layout": {
+              "type": "string",
+              "enum": [
+                "compact",
+                "detailed",
+                "card",
+                "pinned_widgets"
+              ]
+            },
+            "jargon_tolerance": {
+              "type": "string",
+              "enum": [
+                "avoid_jargon",
+                "ok_with_terms",
+                "acronyms_expand_first_use"
+              ]
+            },
+            "local_environment_constraint": {
+              "type": "string",
+              "enum": [
+                "chromebook_only",
+                "no_local_python",
+                "ipad_only",
+                "school_pc_limited"
+              ]
+            },
+            "long_term_goals": {
+              "type": "string",
+              "minLength": 1
+            },
+            "math_notation": {
+              "type": "string",
+              "enum": [
+                "dy_dx",
+                "f_prime",
+                "vector_bold",
+                "vector_arrows"
+              ]
+            },
+            "modality_sensitivity": {
+              "type": "string",
+              "minLength": 1
+            },
+            "motivation": {
+              "type": "string",
+              "minLength": 1
+            },
+            "notification_type": {
+              "type": "string",
+              "enum": [
+                "deadlines",
+                "weekly_recap",
+                "break_25m",
+                "quiz_alerts",
+                "milestones"
+              ]
+            },
+            "nudge_preference": {
+              "type": "string",
+              "minLength": 1
+            },
+            "preferred_format": {
+              "type": "string",
+              "enum": [
+                "tldr_first",
+                "bullets",
+                "worked_examples",
+                "videos",
+                "sims"
+              ]
+            },
+            "presentation_order": {
+              "type": "string",
+              "enum": [
+                "examples_first",
+                "theory_first"
+              ]
+            },
+            "programming_language_target": {
+              "type": "string",
+              "enum": [
+                "python",
+                "java",
+                "cpp",
+                "js",
+                "none"
+              ]
+            },
+            "readiness_hint": {
+              "type": "string",
+              "minLength": 1
+            },
+            "reading_level": {
+              "type": "string",
+              "enum": [
+                "basic",
+                "intermediate",
+                "advanced"
+              ]
+            },
+            "reduced_motion": {
+              "type": "boolean"
+            },
+            "runtime_constraint": {
+              "type": "string",
+              "minLength": 1
+            },
+            "self_efficacy": {
+              "type": "string",
+              "minLength": 1
+            },
+            "short_term_goals": {
+              "type": "string",
+              "minLength": 1
+            },
+            "study_window": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "days",
+                "start",
+                "end"
+              ],
+              "properties": {
+                "days": {
+                  "type": "array",
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "mon",
+                      "tue",
+                      "wed",
+                      "thu",
+                      "fri",
+                      "sat",
+                      "sun"
+                    ]
+                  }
+                },
+                "start": {
+                  "type": "string",
+                  "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+                  "description": "Local time, HH:MM."
+                },
+                "end": {
+                  "type": "string",
+                  "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+                  "description": "Local time, HH:MM."
+                }
+              }
+            },
+            "technology_constraint": {
+              "type": "string",
+              "enum": [
+                "low_bandwidth",
+                "mobile_only",
+                "no_audio_device",
+                "no_video_device",
+                "restricted_downloads"
+              ]
+            },
+            "time_availability_pattern": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "days",
+                "start",
+                "end"
+              ],
+              "properties": {
+                "days": {
+                  "type": "array",
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "mon",
+                      "tue",
+                      "wed",
+                      "thu",
+                      "fri",
+                      "sat",
+                      "sun"
+                    ]
+                  }
+                },
+                "start": {
+                  "type": "string",
+                  "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+                  "description": "Local time, HH:MM."
+                },
+                "end": {
+                  "type": "string",
+                  "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+                  "description": "Local time, HH:MM."
+                }
+              }
+            },
+            "time_constraint": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tone_preference": {
+              "type": "string",
+              "enum": [
+                "concise",
+                "standard",
+                "detailed"
+              ]
+            },
+            "tool_preference": {
+              "type": "string",
+              "minLength": 1
+            },
+            "ui_language": {
+              "type": "string",
+              "pattern": "^[a-z]{2,3}(-[A-Z]{2})?$",
+              "description": "ISO 639 language code, optionally with an ISO 3166 region: en, de, en-GB."
+            },
+            "units": {
+              "type": "string",
+              "enum": [
+                "si_metric",
+                "imperial"
+              ]
+            }
+          }
+        }
+      },
+      "required": [
+        "payload"
+      ]
+    }
+  ]
+}
