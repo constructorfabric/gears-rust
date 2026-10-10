@@ -83,7 +83,7 @@ behind an opt-in feature flag (see "Backend gating") and required to be re-valid
 
 - **Preserve the invariant.** A graph query must be as impossible to construct unscoped as
   an `Unscoped` select is impossible to execute
-  ([select.rs:151-188](../../../../libs/toolkit-db/src/secure/select.rs#L151-L188)).
+  ([select.rs:153-190](../../../../libs/toolkit-db/src/secure/select.rs#L153-L190)).
 - **No raw SQL in user-gear code** — the rule in
   [11_database_patterns.md:9](../../../toolkit_unified_system/11_database_patterns.md#L9)
   applies verbatim to `GRAPH_TABLE` and `CREATE PROPERTY GRAPH` strings.
@@ -92,9 +92,16 @@ behind an opt-in feature flag (see "Backend gating") and required to be re-valid
   definition of "what scope means in SQL". A second, PGQ-specific compiler would be a second
   place for tenant isolation to be wrong.
 - **Every pattern element must map to exactly one `ScopableEntity`.** Security is decided per
-  entity by `resolve_property`
-  ([entity_traits.rs:139-154](../../../../libs/toolkit-db/src/secure/entity_traits.rs#L139-L154));
+  entity by `ScopeProperties::resolve_property`
+  ([entity_traits.rs:383-402](../../../../libs/toolkit-db/src/secure/entity_traits.rs#L383-L402));
   an element whose entity is ambiguous has an ambiguous security mapping.
+
+  `ScopeProperties` is a separate trait from `ScopableEntity`, blanket-implemented for every
+  entity that implements the latter. An entity therefore declares the property-to-column table
+  and cannot supply its own `resolve_property`: a second implementation is a coherence error
+  (`E0119`). "Security is decided per entity" is consequently a property of the type system
+  rather than a convention — see issue #4726, where a hand-written lookup and a hand-written
+  column list described different sets, which is exactly the drift Policy 3 below is about.
 - **A portability regression must be visible at compile time.** The Secure ORM emits the same
   SQL for Postgres, MySQL and SQLite today, and the CTE tests assert all three. `GRAPH_TABLE`
   exists on none but Postgres 19+.
@@ -326,7 +333,7 @@ duplicate the compiler:
 AccessScope
     |
     v
-ScopableEntity::resolve_property()      <- unchanged: which column means what
+ScopeProperties::resolve_property()     <- unchanged: which column means what
     |
     v
 column addressing                        <- the only new degree of freedom
@@ -654,7 +661,7 @@ broken code.
 
 - Good, because scope is embedded in every element pattern — isolation is a compile-time
   guarantee, not a review obligation.
-- Good, because it reuses `build_scope_condition` and `ScopableEntity::resolve_property`
+- Good, because it reuses `build_scope_condition` and `ScopeProperties::resolve_property`
   unchanged in meaning; only column addressing is generalised.
 - Good, because it adds no raw-SQL surface to gear code, and no `Statement`/`ConnectionTrait`
   escape from `toolkit-db`.

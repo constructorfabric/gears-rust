@@ -1,6 +1,6 @@
 use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, sea_query::Expr};
 
-use crate::secure::{AccessScope, ScopableEntity};
+use crate::secure::{AccessScope, ScopableEntity, ScopeProperties};
 use toolkit_security::pep_properties;
 
 /// Provides tenant filtering logic for scoped queries.
