@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::batch::Batch;
 use super::handler::{HandlerResult, LeasedHandler, OutboxMessage, TransactionalHandler};
+use super::limits::Volume;
 use super::store::OutboxStore;
 use super::subscription::TraceMailbox;
 use super::taskward::stop_deadline;
@@ -62,6 +63,10 @@ pub struct ProcessResult {
     /// completed (or failed). `Some` for `PerMessageAdapter`-wrapped handlers,
     /// `None` for raw batch handlers. Used for partial-failure semantics.
     pub processed_count: Option<u32>,
+    /// What this ack took out of the outgoing channel. Reported to the
+    /// in-memory counters by the processor, after the transaction committed:
+    /// an ack that rolled back released nothing.
+    pub released: Volume,
 }
 
 // ---- SQL row types ----
@@ -313,6 +318,24 @@ fn rejected_seqs(msgs: &[OutboxMessage], rejections: &[super::batch::Rejection])
         .collect()
 }
 
+/// The volume the cursor is being advanced past: every message at or before
+/// `upto_seq`, counted the one way the outbox counts.
+///
+/// A retry releases nothing, because a retried message has not reached a
+/// terminal state and is still the queue's to deliver.
+fn released_upto(msgs: &[OutboxMessage], upto_seq: i64) -> Volume {
+    msgs.iter()
+        .filter(|m| m.seq <= upto_seq)
+        .fold(Volume::ZERO, |acc, m| acc + Volume::of_payload(&m.payload))
+}
+
+/// What an ack produced: the completions it claimed, handed over once the
+/// transaction commits, and the volume it released from the outgoing channel.
+struct Acked {
+    claimed: Vec<super::trace::TraceOutcome>,
+    released: Volume,
+}
+
 /// Append-only ack: only UPDATE `processed_seq`, no DELETEs.
 /// Vacuum handles cleanup of processed outgoing + body rows.
 async fn ack(
@@ -323,12 +346,16 @@ async fn ack(
     trace_ids: &TraceIds,
     trace_mailbox: &TraceMailbox,
     result: &HandlerResult,
-) -> Result<Vec<super::trace::TraceOutcome>, OutboxError> {
+) -> Result<Acked, OutboxError> {
     let last_seq = msgs.last().map_or(0, |m| m.seq);
     let mut claimed = Vec::new();
+    // What left the outgoing channel. Reported to the in-memory counters after
+    // the transaction commits, never written here.
+    let mut released = Volume::ZERO;
 
     match result {
         HandlerResult::Success => {
+            released = released_upto(msgs, last_seq);
             conn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 store.advance_processed_seq(),
@@ -376,6 +403,7 @@ async fn ack(
                 .await?;
             }
 
+            released = released_upto(msgs, last_seq);
             conn.execute_raw(Statement::from_sql_and_values(
                 store.backend(),
                 store.advance_processed_seq(),
@@ -400,7 +428,7 @@ async fn ack(
         }
     }
 
-    Ok(claimed)
+    Ok(Acked { claimed, released })
 }
 
 async fn try_lock_and_read_state(
@@ -500,7 +528,7 @@ impl ProcessingStrategy for TransactionalStrategy {
         // the handler's successful work is atomic with the cursor advance.
         // The `processed_count` is still recorded in ProcessResult so the
         // PartitionMode state machine can degrade batch size intelligently.
-        let claimed = ack(
+        let Acked { claimed, released } = ack(
             &DatabaseExecutor::Transaction(&txn),
             &ctx.store,
             ctx.partition_id,
@@ -520,6 +548,7 @@ impl ProcessingStrategy for TransactionalStrategy {
             count,
             handler_result: result,
             processed_count: pc,
+            released,
         }))
     }
 }
@@ -691,6 +720,8 @@ async fn lease_guarded_ack(
     let mut claimed = Vec::new();
     persist_rejections(&ack_txn, ctx, msgs, rejections, trace_ids).await?;
     let rejected = rejected_seqs(msgs, rejections);
+    // What left the outgoing channel, reported after the commit.
+    let mut released = Volume::ZERO;
 
     let lease_ok = match &result {
         HandlerResult::Success => {
@@ -700,8 +731,10 @@ async fn lease_guarded_ack(
             // little of the transaction as possible - and a lost lease skips
             // the trace statements altogether, since the rollback would undo
             // them anyway.
+            let freed = released_upto(msgs, seq);
             let ok = advance_cursor(&ack_txn, ctx, seq, lease_id).await?;
             if ok {
+                released = freed;
                 let progress = trace_progress(msgs, trace_ids, seq, &rejected);
                 claimed.extend(
                     apply_trace_progress(&ack_exec, &ctx.store, ctx.trace_mailbox, &progress)
@@ -714,8 +747,11 @@ async fn lease_guarded_ack(
             let advance_seq = processed_advance_seq(msgs, processed);
             if advance_seq > 0 {
                 // Partial progress: advance past processed prefix, retry the tail.
+                // Only the prefix is released; the tail is still the queue's.
+                let freed = released_upto(msgs, advance_seq);
                 let ok = advance_cursor(&ack_txn, ctx, advance_seq, lease_id).await?;
                 if ok {
+                    released = freed;
                     let progress = trace_progress(msgs, trace_ids, advance_seq, &rejected);
                     claimed.extend(
                         apply_trace_progress(&ack_exec, &ctx.store, ctx.trace_mailbox, &progress)
@@ -746,8 +782,10 @@ async fn lease_guarded_ack(
             }
             // Advance past the entire batch (all messages handled or dead-lettered).
             let last_seq = msgs.last().map_or(0, |m| m.seq);
+            let freed = released_upto(msgs, last_seq);
             let ok = advance_cursor(&ack_txn, ctx, last_seq, lease_id).await?;
             if ok {
+                released = freed;
                 let progress = trace_progress(msgs, trace_ids, last_seq, &failed);
                 claimed.extend(
                     apply_trace_progress(&ack_exec, &ctx.store, ctx.trace_mailbox, &progress)
@@ -777,6 +815,7 @@ async fn lease_guarded_ack(
         count,
         handler_result: result,
         processed_count: Some(processed),
+        released,
     }))
 }
 

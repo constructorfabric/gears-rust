@@ -122,10 +122,10 @@ impl Dialect {
 
     pub fn build_insert_incoming_batch(self, tables: &OutboxTables, count: usize) -> String {
         let mut sql = format!(
-            "INSERT INTO {} (partition_id, body_id) VALUES ",
+            "INSERT INTO {} (partition_id, body_id, bytes) VALUES ",
             tables.incoming()
         );
-        self.append_value_tuples(&mut sql, count, 2);
+        self.append_value_tuples(&mut sql, count, 3);
         if self.supports_returning() {
             sql.push_str(" RETURNING id");
         }
@@ -196,7 +196,7 @@ impl Dialect {
         match self {
             Self::Postgres => ClaimSql {
                 select: format!(
-                    "SELECT id, body_id \
+                    "SELECT id, body_id, bytes \
                      FROM {} \
                      WHERE partition_id = $1 \
                      ORDER BY id \
@@ -207,7 +207,7 @@ impl Dialect {
             },
             Self::Sqlite => ClaimSql {
                 select: format!(
-                    "SELECT id, body_id \
+                    "SELECT id, body_id, bytes \
                      FROM {} \
                      WHERE partition_id = $1 \
                      ORDER BY id \
@@ -219,7 +219,7 @@ impl Dialect {
             // multiple sequencers claim from adjacent partitions.
             Self::MySql => ClaimSql {
                 select: format!(
-                    "SELECT id, body_id \
+                    "SELECT id, body_id, bytes \
                      FROM {} \
                      WHERE partition_id = ? \
                      ORDER BY id \
@@ -255,10 +255,10 @@ impl Dialect {
 
     pub fn build_insert_outgoing_batch(self, tables: &OutboxTables, count: usize) -> String {
         let mut sql = format!(
-            "INSERT INTO {} (partition_id, body_id, seq) VALUES ",
+            "INSERT INTO {} (partition_id, body_id, seq, bytes) VALUES ",
             tables.outgoing()
         );
-        self.append_value_tuples(&mut sql, count, 3);
+        self.append_value_tuples(&mut sql, count, 4);
         sql
     }
 }

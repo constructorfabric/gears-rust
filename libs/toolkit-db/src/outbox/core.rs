@@ -8,6 +8,8 @@ use sea_orm::{
 };
 use tokio::sync::{Notify, RwLock};
 
+use super::admission::{Admission, Arrivals, Channels};
+use super::limits::{FullScope, Volume};
 use super::manager::OutboxBuilder;
 use super::prioritizer::SharedPrioritizer;
 use super::record::{Record, RecordItem, Records};
@@ -47,6 +49,10 @@ pub struct Outbox {
     /// the ack path so a completion this instance both finishes and owns is
     /// delivered without a query.
     trace_mailbox: Arc<TraceMailbox>,
+    /// Queues that have a configured bound, and the readings admission is
+    /// checked against. A queue with no limits has no entry here, so it pays
+    /// one map miss on enqueue and issues no additional statement.
+    bounded: DashMap<String, Arc<Admission>>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -64,8 +70,43 @@ struct TraceStatusRow {
 }
 
 #[derive(Debug, FromQueryResult)]
+struct ChannelRow {
+    partition_id: i64,
+    incoming_in_entities: i64,
+    incoming_in_bytes: i64,
+    incoming_out_entities: i64,
+    incoming_out_bytes: i64,
+    outgoing_in_entities: i64,
+    outgoing_in_bytes: i64,
+    outgoing_out_entities: i64,
+    outgoing_out_bytes: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
 struct PartitionRow {
     id: i64,
+}
+
+/// Fold a submission into one volume per partition.
+///
+/// Per partition and not per entity, because the per-partition admission guard
+/// compares a partition's reading against what this submission adds to *that*
+/// partition. Given an entry per entity it would instead test the same
+/// unchanged reading against one entity at a time, and a batch aimed at a
+/// single partition could pass the guard while overshooting the budget by
+/// nearly the whole batch. A queue has at most 64 partitions, so a linear
+/// search over the accumulator is cheaper than hashing.
+fn per_partition_volumes(items: &[RecordItem<'_>]) -> Vec<(u32, Volume)> {
+    let mut folded: Vec<(u32, Volume)> = Vec::new();
+    for item in items {
+        let volume = Volume::of_payload(&item.payload);
+        if let Some(entry) = folded.iter_mut().find(|(p, _)| *p == item.partition) {
+            entry.1 = entry.1 + volume;
+        } else {
+            folded.push((item.partition, volume));
+        }
+    }
+    folded
 }
 
 impl Outbox {
@@ -101,7 +142,273 @@ impl Outbox {
             all_partition_ids: RwLock::new(Vec::new()),
             prioritizer: OnceLock::new(),
             partition_notify: RwLock::new(None),
+            bounded: DashMap::new(),
         }
+    }
+
+    /// Give a queue a bound. Called once per bounded queue at start.
+    pub(crate) fn set_bounded(&self, queue: &str, bounded: Arc<Admission>) {
+        self.bounded.insert(queue.to_owned(), bounded);
+    }
+
+    /// Every bounded queue, for the worker that refreshes their readings.
+    pub(crate) fn bounded_queues(&self) -> Vec<(String, Arc<Admission>)> {
+        self.bounded
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect()
+    }
+
+    /// The queue a partition belongs to.
+    pub(crate) fn queue_of_partition(&self, partition_id: i64) -> Option<String> {
+        self.partition_to_queue
+            .get(&partition_id)
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Whether a queue has a configured bound, and therefore a reading worth
+    /// keeping honest.
+    /// The queue a partition belongs to, and its index within that queue.
+    pub(crate) fn locate_partition(&self, partition_id: i64) -> Option<(String, usize)> {
+        let queue = self.queue_of_partition(partition_id)?;
+        let ids = self.queue_partition_ids(&queue)?;
+        let partition = ids.iter().position(|&id| id == partition_id)?;
+        Some((queue, partition))
+    }
+
+    /// A bounded queue's admission state.
+    pub(crate) fn admission_of(&self, queue: &str) -> Option<Arc<Admission>> {
+        self.bounded
+            .get(queue)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    pub(crate) fn is_bounded(&self, queue: &str) -> bool {
+        self.bounded.contains_key(queue)
+    }
+
+    /// Install a partition's fresh channel counters, by partition id.
+    ///
+    /// Used by the audit after a correction, so this instance's view agrees
+    /// with the database rather than waiting for the next flush.
+    pub(crate) fn observe_channels(&self, partition_id: i64, channels: Channels) {
+        let Some((queue, partition)) = self.locate_partition(partition_id) else {
+            return;
+        };
+        if let Some(admission) = self.admission_of(&queue) {
+            admission.observe(partition, channels);
+        }
+    }
+
+    /// The partition ids of a registered queue, in partition order.
+    pub(crate) fn queue_partition_ids(&self, queue: &str) -> Option<Vec<i64>> {
+        self.partitions.get(queue).map(|ids| ids.value().clone())
+    }
+
+    /// Decide whether a submission fits the queue's bound.
+    ///
+    /// Compares against state this process already holds, so it issues no
+    /// statement and takes no row lock: the caller's transaction is not
+    /// lengthened by having a limit configured.
+    fn admit(&self, queue: &str, contributions: &[(u32, Volume)]) -> Result<(), OutboxError> {
+        let Some(bounded) = self.bounded.get(queue) else {
+            return Ok(());
+        };
+        let bounded = bounded.value();
+        let limits = bounded.limits();
+
+        let submission = contributions
+            .iter()
+            .fold(Volume::ZERO, |acc, &(_, volume)| acc + volume);
+        let queue_pending = bounded.pending();
+        let projected = queue_pending + submission;
+
+        if projected.entities > limits.max_entities() || projected.bytes > limits.max_bytes() {
+            return Err(OutboxError::QueueFull {
+                queue: queue.to_owned(),
+                scope: FullScope::Queue,
+                bounds: limits.bounds_against(queue_pending),
+            });
+        }
+
+        // Secondary guard: one partition may not consume the whole queue's
+        // allowance, or a skewed key would starve the others.
+        let budget = bounded.partition_budget();
+        for &(partition, volume) in contributions {
+            let pending = bounded.partition_pending(partition as usize);
+            let projected = pending + volume;
+            if projected.entities > budget.entities || projected.bytes > budget.bytes {
+                return Err(OutboxError::QueueFull {
+                    queue: queue.to_owned(),
+                    scope: FullScope::Partition { partition },
+                    // The share, not the queue's own bound, and the scope above
+                    // is what says so.
+                    bounds: limits.bounds_of(budget, pending),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Report an arrival into the incoming channel, and return it so the
+    /// enqueue's [`Wake`] can hand it back if the transaction rolls back.
+    ///
+    /// Reported at the write and not at the commit, so an instance's own
+    /// uncommitted submissions already count against its next admission.
+    /// [`Wake::discard`] takes the report back; a wake dropped unhandled keeps
+    /// it, which over-reports until the audit next proves the incoming channel
+    /// empty - erring towards refusing early rather than exceeding the bound.
+    fn record_arrivals(&self, queue: &str, contributions: &[(u32, Volume)]) -> Arrivals {
+        let mut arrivals = Arrivals::default();
+        if let Some(bounded) = self.bounded.get(queue) {
+            for &(partition, volume) in contributions {
+                bounded.value().arrived(partition as usize, volume);
+                arrivals.push(Arc::clone(bounded.value()), partition as usize, volume);
+            }
+        }
+        arrivals
+    }
+
+    /// Report that the sequencer moved work from the incoming channel to the
+    /// outgoing one, by partition id.
+    pub(crate) fn record_sequenced(&self, partition_id: i64, volume: Volume) {
+        self.report_by_partition_id(partition_id, |bounded, partition| {
+            bounded.sequenced(partition, volume);
+        });
+    }
+
+    /// Report that an ack took work out of the outgoing channel, by partition
+    /// id.
+    pub(crate) fn record_acked(&self, partition_id: i64, volume: Volume) {
+        self.report_by_partition_id(partition_id, |bounded, partition| {
+            bounded.acked(partition, volume);
+        });
+    }
+
+    fn report_by_partition_id(&self, partition_id: i64, report: impl Fn(&Admission, usize)) {
+        let Some((queue, partition)) = self.locate_partition(partition_id) else {
+            return;
+        };
+        if let Some(admission) = self.admission_of(&queue) {
+            report(&admission, partition);
+        }
+    }
+
+    /// How much unprocessed work a queue is holding.
+    ///
+    /// Both channels: rows enqueued and not yet sequenced, plus rows sequenced
+    /// and not yet acked.
+    ///
+    /// A **bounded** queue answers from its counters - one row per partition,
+    /// at most 64, an index-only read that aggregates nothing. An
+    /// **unbounded** queue has no counters, because nothing maintains them for
+    /// a queue whose reading gates nothing, so this counts the rows instead.
+    /// That is the truthful answer rather than a confident zero, and its cost
+    /// is proportional to the backlog being asked about.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue is not registered or a read fails.
+    pub async fn depth(
+        &self,
+        db: &(impl crate::secure::DBRunner + Sync + ?Sized),
+        queue: &str,
+    ) -> Result<Volume, OutboxError> {
+        // Validated before it can reach the error, which must never carry
+        // back a caller's raw input.
+        super::validation::validate_queue_name(queue)?;
+        let Some(ids) = self.queue_partition_ids(queue) else {
+            return Err(OutboxError::QueueNotRegistered(queue.to_owned()));
+        };
+
+        let runner = db.as_seaorm();
+        if self.is_bounded(queue) {
+            return Ok(self
+                .read_queue_channels(&runner, queue)
+                .await?
+                .into_iter()
+                .fold(Volume::ZERO, |acc, (_, channels)| acc + channels.pending()));
+        }
+
+        let mut total = Volume::ZERO;
+        for partition_id in ids {
+            total = total + self.count_partition_rows(&runner, partition_id).await?;
+        }
+        Ok(total)
+    }
+
+    /// Every channel counter of one queue's partitions, in partition order.
+    ///
+    /// One statement and one bound parameter, whatever the partition count.
+    /// Both admission predicates need the breakdown: the queue-wide bound is
+    /// the sum of these rows, and the per-partition guard is each row on its
+    /// own, so an aggregate would not do.
+    pub(crate) async fn read_queue_channels(
+        &self,
+        runner: &SeaOrmRunner<'_>,
+        queue: &str,
+    ) -> Result<Vec<(i64, Channels)>, OutboxError> {
+        let store = OutboxStore::new(self.statements());
+        self.read_channels(runner, store.read_queue_channels(), queue.into())
+            .await
+    }
+
+    /// One partition's channel counters.
+    pub(crate) async fn read_partition_channels(
+        &self,
+        runner: &SeaOrmRunner<'_>,
+        partition_id: i64,
+    ) -> Result<Channels, OutboxError> {
+        let store = OutboxStore::new(self.statements());
+        Ok(self
+            .read_channels(runner, store.read_partition_channels(), partition_id.into())
+            .await?
+            .into_iter()
+            .fold(Channels::ZERO, |acc, (_, channels)| acc + channels))
+    }
+
+    async fn read_channels(
+        &self,
+        runner: &SeaOrmRunner<'_>,
+        sql: &str,
+        key: sea_orm::Value,
+    ) -> Result<Vec<(i64, Channels)>, OutboxError> {
+        let conn = runner.executor();
+        let rows = ChannelRow::find_by_statement(Statement::from_sql_and_values(
+            self.statements().backend(),
+            sql,
+            [key],
+        ))
+        .all(&conn)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.partition_id,
+                    Channels {
+                        incoming_in: Volume {
+                            entities: row.incoming_in_entities,
+                            bytes: row.incoming_in_bytes,
+                        },
+                        incoming_out: Volume {
+                            entities: row.incoming_out_entities,
+                            bytes: row.incoming_out_bytes,
+                        },
+                        outgoing_in: Volume {
+                            entities: row.outgoing_in_entities,
+                            bytes: row.outgoing_in_bytes,
+                        },
+                        outgoing_out: Volume {
+                            entities: row.outgoing_out_entities,
+                            bytes: row.outgoing_out_bytes,
+                        },
+                    },
+                )
+            })
+            .collect())
     }
 
     /// Register interest in a traced batch's completion.
@@ -313,7 +620,7 @@ impl Outbox {
 
         let ids = Self::ensure_partition_rows(&txn, &store, queue, num_partitions).await?;
         Self::ensure_processor_rows(&txn, &store, &ids).await?;
-        Self::ensure_vacuum_counter_rows(&txn, &store, &ids).await?;
+        Self::ensure_counter_rows(&txn, &store, &ids).await?;
 
         txn.commit().await?;
 
@@ -391,20 +698,30 @@ impl Outbox {
         Ok(())
     }
 
-    /// Insert a vacuum counter row for each partition ID (idempotent via
-    /// insert-or-ignore).
-    async fn ensure_vacuum_counter_rows<C: ConnectionTrait>(
+    /// Create the per-partition bookkeeping rows, one per counter table
+    /// (idempotent via insert-or-ignore).
+    ///
+    /// Two tables and not one: the vacuum's work marker is bumped by the ack
+    /// on its hot path, while the channel counters are written only by the
+    /// flusher and the audit. Separate functionality, separate table, so
+    /// neither waits on a lock taken for the other.
+    async fn ensure_counter_rows<C: ConnectionTrait>(
         conn: &C,
         store: &OutboxStore<'_>,
         ids: &[i64],
     ) -> Result<(), OutboxError> {
-        for &id in ids {
-            conn.execute_raw(Statement::from_sql_and_values(
-                store.backend(),
-                store.insert_vacuum_counter_row(),
-                [id.into()],
-            ))
-            .await?;
+        for sql in [
+            store.insert_vacuum_counter_row(),
+            store.insert_partition_counter_row(),
+        ] {
+            for &id in ids {
+                conn.execute_raw(Statement::from_sql_and_values(
+                    store.backend(),
+                    sql,
+                    [id.into()],
+                ))
+                .await?;
+            }
         }
         Ok(())
     }
@@ -457,6 +774,8 @@ impl Outbox {
     ) -> Result<Wake, OutboxError> {
         let (queue, item, trace) = msg.into_parts();
         let partition_id = self.resolve_partition(queue, item.partition)?;
+        let contribution = [(item.partition, Volume::of_payload(&item.payload))];
+        self.admit(queue, &contribution)?;
 
         let runner = db.as_seaorm();
         if let Some(trace) = trace {
@@ -472,11 +791,13 @@ impl Outbox {
         )
         .await?;
 
+        let arrivals = self.record_arrivals(queue, &contribution);
         Ok(Wake::new(
             vec![OutboxMessageId(incoming_id)],
             vec![partition_id],
             self.prioritizer.get().cloned(),
-        ))
+        )
+        .with_arrivals(arrivals))
     }
 
     /// Enqueue a batch of entities for a single queue.
@@ -505,6 +826,8 @@ impl Outbox {
         for item in &items {
             resolved.push(self.resolve_partition(queue, item.partition)?);
         }
+        let contributions = per_partition_volumes(&items);
+        self.admit(queue, &contributions)?;
 
         let runner = db.as_seaorm();
         if let Some(trace) = trace {
@@ -520,13 +843,14 @@ impl Outbox {
                 .await?;
         }
         let ids = Self::insert_batch(&runner, self.statements(), &resolved, &items, trace).await?;
+        let arrivals = self.record_arrivals(queue, &contributions);
 
         // Distinct partitions touched by the batch, to be marked dirty on flush.
         let mut partitions = resolved;
         partitions.sort_unstable();
         partitions.dedup();
 
-        Ok(Wake::new(ids, partitions, self.prioritizer.get().cloned()))
+        Ok(Wake::new(ids, partitions, self.prioritizer.get().cloned()).with_arrivals(arrivals))
     }
 
     /// Insert a batch of body + incoming rows using multi-row INSERTs.
@@ -583,8 +907,11 @@ impl Outbox {
         // Insert incoming rows in chunks
         for chunk_start in (0..items.len()).step_by(BATCH_CHUNK_SIZE) {
             let chunk_end = (chunk_start + BATCH_CHUNK_SIZE).min(items.len());
-            let entries: Vec<(i64, i64)> = (chunk_start..chunk_end)
-                .map(|i| (partition_ids[i], all_body_ids[i]))
+            let entries: Vec<(i64, i64, i64)> = (chunk_start..chunk_end)
+                .map(|i| {
+                    let bytes = super::limits::Volume::of_payload(&items[i].payload).bytes;
+                    (partition_ids[i], all_body_ids[i], bytes)
+                })
                 .collect();
             let chunk_ids = store.exec_insert_incoming_batch(conn, &entries).await?;
             all_incoming_ids.extend(chunk_ids.into_iter().map(OutboxMessageId));
