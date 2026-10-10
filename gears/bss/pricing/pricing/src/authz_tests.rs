@@ -13,7 +13,7 @@ use toolkit_gts::gts_id;
 use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 use uuid::Uuid;
 
-use super::{OwnerTenant, ResourceRef, access_scope, actions, resource_types};
+use super::{OwnerTenant, ResourceRef, access_scope, actions, labels, resource_types};
 
 /// Allows under `In([tenant])` and records the tenant mode of every request it is asked.
 struct RecordingResolver {
@@ -105,4 +105,60 @@ async fn every_request_asks_for_the_callers_tenant_only() {
         vec![Some(TenantMode::RootOnly); 3],
         "every PDP request names the caller's tenant only"
     );
+}
+
+/// D-526: the catalog is exactly the (label, action) pairs the doors enforce — nineteen of them
+/// (3 + 2 + 3 + 3 + 3 + 2 + 3).
+#[test]
+fn nineteen_permissions_cover_exactly_the_enforced_pairs_and_inventory() {
+    let all = crate::gts::permissions::all();
+    assert_eq!(all.len(), 19);
+    let actual = all
+        .iter()
+        .map(|p| (p.resource_type.as_str(), p.action.as_str()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = [
+        (labels::PRICE_BOOK, actions::READ),
+        (labels::PRICE_BOOK, actions::AUTHOR),
+        (labels::PRICE_BOOK, actions::SUBMIT),
+        (labels::PRICE_BOOK_ENTRY, actions::READ),
+        (labels::PRICE_BOOK_ENTRY, actions::AUTHOR),
+        (labels::PRICE, actions::READ),
+        (labels::PRICE, actions::AUTHOR),
+        (labels::PRICE, actions::SUBMIT),
+        (labels::PLAN, actions::READ),
+        (labels::PLAN, actions::AUTHOR),
+        (labels::PLAN, actions::SUBMIT),
+        (labels::APPROVAL_UNIT, actions::READ),
+        (labels::APPROVAL_UNIT, actions::APPROVE),
+        (labels::APPROVAL_UNIT, actions::SUBMIT),
+        (labels::CONFIG, actions::READ),
+        (labels::CONFIG, actions::SETTINGS),
+        (labels::ACCEPTANCE, actions::CREATE),
+        (labels::ACCEPTANCE, actions::HOLD),
+        (labels::ACCEPTANCE, actions::READ),
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        expected.len(),
+        19,
+        "the expectation itself names nineteen pairs"
+    );
+    assert_eq!(actual, expected);
+    let prefix = gts_id!("cf.toolkit.authz.permission.v1~");
+    let inventory = toolkit_gts::inventory::iter::<toolkit_gts::InventoryInstance>
+        .into_iter()
+        .filter(|e| {
+            e.instance_id
+                .starts_with(&format!("{prefix}cf.bss.pricing."))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inventory.len(), 19);
+    for p in all {
+        let id = p.id.to_string();
+        let entry = inventory.iter().find(|e| e.instance_id == id).unwrap();
+        assert_eq!(entry.type_id, prefix);
+        assert_eq!((entry.payload_fn)(), serde_json::to_value(p).unwrap());
+    }
 }

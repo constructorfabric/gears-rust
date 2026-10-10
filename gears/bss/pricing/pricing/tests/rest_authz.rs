@@ -90,11 +90,25 @@ async fn the_census_covers_every_route_the_routers_register() {
     assert_eq!(census::readers("authz::access_scope("), registered);
     assert_eq!(registered.len(), 60);
     assert_eq!(bss_pricing::authz::labels::ALL.len(), 7);
-    let permissions: Vec<_> = toolkit_gts::inventory::iter::<toolkit_gts::InventoryInstance>
-        .into_iter()
-        .filter(|i| i.instance_id.contains("~cf.bss.pricing."))
+    // D-526: the registered pricing instances are exactly the nineteen catalog permissions.
+    let permissions: std::collections::BTreeSet<String> =
+        toolkit_gts::inventory::iter::<toolkit_gts::InventoryInstance>
+            .into_iter()
+            .filter(|i| i.instance_id.contains("~cf.bss.pricing."))
+            .map(|i| i.instance_id.to_owned())
+            .collect();
+    let catalog: std::collections::BTreeSet<String> = bss_pricing::gts::permissions::all()
+        .iter()
+        .map(|p| p.id.to_string())
         .collect();
-    assert!(permissions.is_empty());
+    assert_eq!(catalog.len(), 19);
+    assert!(
+        catalog
+            .iter()
+            .all(|id| id.starts_with("gts.cf.toolkit.authz.permission.v1~cf.bss.pricing.")),
+        "{catalog:?}"
+    );
+    assert_eq!(permissions, catalog);
 }
 
 /// Fix run W1c M1 (D-424, products P-D-222): pricing's system actor acts in-process only. A REST

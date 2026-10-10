@@ -35,10 +35,9 @@ Requirements: `cpt-cf-bss-pricing-fr-price`, `cpt-cf-bss-pricing-fr-chain-window
 Dependencies: `cpt-cf-bss-pricing-feature-books-entries`.
 Source: PriceBook spec §2.2, §5–§8, §12–§13 and [DECISIONS](../DECISIONS.md) D-384–D-443.
 
-D-503 refuses CalendarHour with any `min_fee` at price create, submit and apply
-(`UNSUPPORTED_TERMS`), and when publishing a revision selecting such approved money. D-504's
-predicate also refuses a resource-scoped floor at those gates and at sale validation (amended
-2026-10-02). A successor,
+A minimum fee is accepted on every rating window and scope since D-525; the floor is Rating's, once per window per
+scope (D-388 for `billing_cycle`). A new sale also judges the revision's book window on the acceptance day and the
+start day (D-524). A successor,
 temporary pair and return keep their entry and therefore the same policy, window, scope and reset.
 Policy changes require a different entry and an explicitly selected revision. The existing dated
 SKU chain guard uses immutable Products history captured before the transaction.
@@ -98,7 +97,7 @@ Feature algorithm: `cpt-cf-bss-pricing-algo-prices-windows-dimension-model-and-f
 1. [ ] - `p1` - Derive permitted models from charge kind for the entry's model, chosen at its create (D-427); validate each price's money against its entry's model, nonnegative prices and coherent model parameters. - `inst-prices-windows-dimension-model-and-floor-1`
 2. [ ] - `p1` - Evaluate per_unit, graduated, volume and package with decimal arithmetic and half-open tier bands; recurring/one_time allow flat or per_unit. - `inst-prices-windows-dimension-model-and-floor-2`
 3. [ ] - `p1` - Preserve usage package size and SKU (unit, usage_type_ref) read as of each price's start across successors, a start before the SKU's first version reading that first version (D-402); CHAIN_MODEL_CHANGED fails submit and is rechecked at apply. The model cannot change on a chain: it is the entry's (D-427). - `inst-prices-windows-dimension-model-and-floor-3`
-4. [ ] - `p1` - Aggregate rated amounts by price/subscription/period across every bound value and slice (no plan carries an included quantity since D-467); apply the prorated price floor, then promotions; not built in pricing, Rating applies the floor and pricing stores and validates min_fee (D-415). - `inst-prices-windows-dimension-model-and-floor-4`
+4. [ ] - `p1` - Aggregate rated amounts by price and by the entry's rating window and aggregation scope across every bound value and slice (no plan carries an included quantity since D-467); apply the floor once per window per scope, prorated by coverage for `billing_cycle` and never prorated for `calendar_hour` (D-525), then promotions; not built in pricing, Rating applies the floor and pricing stores and validates min_fee (D-415). - `inst-prices-windows-dimension-model-and-floor-4`
 
 ### reserve-write-confirm
 

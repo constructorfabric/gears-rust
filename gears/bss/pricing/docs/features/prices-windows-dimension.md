@@ -70,10 +70,9 @@ Holding multiple permissions never bypasses separation of duties.
 - [DECISIONS](../DECISIONS.md), D-384–D-443; spec means `docs/superpowers/specs/2026-09-24-pricebook-model-design.md` in the main checkout.
 - Source: spec §2 decisions 4–8, 13–17, §2.2, §5–§8, §10, §12–§13; the phase 2 plan supplies delivery boundaries and D-399/D-400.
 
-D-503 refuses CalendarHour with any `min_fee` at price create, submit and apply
-(`UNSUPPORTED_TERMS`), and when publishing a revision selecting such approved money. The same
-predicate refuses a resource-scoped floor at those gates and at sale validation (D-504, amended
-2026-10-02). A successor,
+A minimum fee is accepted on every rating window and scope since D-525; the floor is Rating's, once per window per
+scope (D-388 for `billing_cycle`). A new sale also judges the revision's book window on the acceptance day and the
+start day (D-524). A successor,
 temporary pair and return keep their entry and therefore the same policy, window, scope and reset.
 Policy changes require a different entry and an explicitly selected revision. The existing dated
 SKU chain guard uses immutable Products history captured before the transaction.
@@ -108,7 +107,7 @@ SKU chain guard uses immutable Products history captured before the transaction.
 1. [ ] - `p1` - Derive permitted models from charge kind for the entry's model, chosen at its create (D-427); validate each price's money against its entry's model, nonnegative prices and coherent model parameters. - `inst-prices-windows-dimension-model-and-floor-1`
 2. [ ] - `p1` - Evaluate per_unit, graduated, volume and package with decimal arithmetic and half-open tier bands; recurring/one_time allow flat or per_unit. - `inst-prices-windows-dimension-model-and-floor-2`
 3. [ ] - `p1` - Preserve usage package size and SKU (unit, usage_type_ref) read as of each price's start across successors, a start before the SKU's first version reading that first version (D-402); CHAIN_MODEL_CHANGED fails submit and is rechecked at apply. The model cannot change on a chain: it is the entry's (D-427). - `inst-prices-windows-dimension-model-and-floor-3`
-4. [ ] - `p1` - Aggregate rated amounts by price/subscription/period across every bound value and slice (no plan carries an included quantity since D-467); apply the prorated price floor, then promotions; not built in pricing, Rating applies the floor and pricing stores and validates min_fee (D-415). - `inst-prices-windows-dimension-model-and-floor-4`
+4. [ ] - `p1` - Aggregate rated amounts by price and by the entry's rating window and aggregation scope across every bound value and slice (no plan carries an included quantity since D-467); apply the floor once per window per scope, prorated by coverage for `billing_cycle` and never prorated for `calendar_hour` (D-525), then promotions; not built in pricing, Rating applies the floor and pricing stores and validates min_fee (D-415). - `inst-prices-windows-dimension-model-and-floor-4`
 
 ### reserve-write-confirm
 
@@ -179,7 +178,7 @@ Requirement: `cpt-cf-bss-pricing-fr-pair-guard`; PRD AC #6.
 
 Not built in pricing (D-415): Rating applies the floor; pricing stores and validates min_fee. This DoD stays unticked.
 
-Minimum fee is one floor per price/subscription/period before promotions; no plan carries an included quantity to deduct first (D-467). Shared values and slices are aggregated, and covered-period fraction prorates the floor (spec §2 decision 13).
+Minimum fee is one floor per price per rating window of the entry's policy, in the entry's aggregation scope, before promotions (D-525): for `billing_cycle` with `subscription_line` that is one floor per price/subscription/period, prorated by the covered fraction of the period (spec §2 decision 13); for `calendar_hour` it is one floor per hour, per subscription line or per resource, never prorated and applied only to an hour with at least one usage record. No plan carries an included quantity to deduct first (D-467). Shared values and slices are aggregated within the window.
 
 Requirement: `cpt-cf-bss-pricing-fr-min-fee`; PRD AC #7.
 
@@ -243,10 +242,10 @@ Verification uses domain tests, scoped repository tests on both backends and RES
 
 
 **Final seam conformance (D-510).** Prices retain dated exact money under the entry's immutable model/policy. Approval submit and final
-apply reject missing/mismatched meter evidence and hourly minimum fees (including zero). New-sale
-support is recurring/one-time Flat or PerUnit and usage PerUnit, Volume or Graduated; Package, allowances,
-FX and promotions remain outside the supported sale profile. BillingCycle floors require subscription-line
-scope; CalendarHour uses UTC, SUM and actual partial quantities with full thresholds. Stable money digest
+apply reject missing/mismatched meter evidence; a minimum fee is accepted on every window and scope
+(D-525). New-sale support is recurring/one-time Flat or PerUnit and usage PerUnit, Volume or Graduated;
+Package, allowances, FX and promotions remain outside the supported sale profile. CalendarHour uses UTC,
+SUM and actual partial quantities with full thresholds; a floor is per window per scope. Stable money digest
 projection normalizes equivalent decimal spellings. A successor never replaces a receipt's original
 price/policy; an explicit close raced with acceptance is refused. Current retirement/close checks remain
 necessary for fresh fulfilment. Tests run identical behavior on SQLite and PostgreSQL.

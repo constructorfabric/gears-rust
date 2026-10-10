@@ -9,26 +9,6 @@ use bss_pricing_sdk::{
 };
 use seam_support::{sale_query, vm_binding};
 
-#[test]
-fn hourly_window_does_not_make_the_invoice_hourly() {
-    let query = sale_query();
-    let mut binding = vm_binding();
-    let policy = binding.usage_rating_policy.as_mut().unwrap();
-    policy.content.rating_window = RatingWindow::CalendarHour {
-        timezone: Timezone::Utc,
-    };
-    policy.digest = policy_digest(&policy.content);
-    assert!(validate_commercial_terms(&query, &[binding.clone()]).is_ok());
-    binding.price.minimum_fee = Some("1".parse().unwrap());
-    binding.price.money_digest = money_digest(&binding.price);
-    assert_eq!(
-        validate_commercial_terms(&query, &[binding])
-            .unwrap_err()
-            .code,
-        "UNSUPPORTED_TERMS"
-    );
-}
-
 use bss_pricing::domain::{
     commercial_terms::{SaleObservation, validate_new_sale_observation},
     money,
@@ -149,8 +129,9 @@ fn complete_model_window_cycle_scope_matrix() {
         }
     }
 }
+/// D-525: a floor is per rating window per aggregation scope, so every window and scope takes one.
 #[test]
-fn floors_belong_to_the_subscription_period() {
+fn floors_follow_the_entry_window_and_scope() {
     for hour in [false, true] {
         for resource in [false, true] {
             for fee in [Decimal::ZERO, Decimal::ONE] {
@@ -164,11 +145,11 @@ fn floors_belong_to_the_subscription_period() {
                 }
                 b.price.minimum_fee = Some(fee);
                 certify(&mut b);
-                if hour || resource {
-                    reason(&sale_query(), &[b], R::UnsupportedTerms);
-                } else {
-                    assert!(validate_commercial_terms(&sale_query(), &[b]).is_ok());
-                }
+                assert_eq!(
+                    validate_commercial_terms(&sale_query(), &[b]),
+                    Ok(()),
+                    "hour={hour} resource={resource} fee={fee}"
+                );
             }
         }
     }
@@ -482,6 +463,7 @@ fn live_revision_coverage_and_each_sku_lifecycle_gate_fail_closed() {
         sku_active: true,
         sku_sellable: true,
         covered: true,
+        book_valid: true,
     };
     assert!(validate_new_sale_observation(&good).is_ok());
     for name in [
@@ -491,6 +473,7 @@ fn live_revision_coverage_and_each_sku_lifecycle_gate_fail_closed() {
         "deprecated",
         "off_sale",
         "uncovered",
+        "book_closed",
     ] {
         let mut o = good.clone();
         match name {
@@ -499,6 +482,7 @@ fn live_revision_coverage_and_each_sku_lifecycle_gate_fail_closed() {
             "retired" | "deprecated" => o.sku_active = false,
             "off_sale" => o.sku_sellable = false,
             "uncovered" => o.covered = false,
+            "book_closed" => o.book_valid = false,
             _ => unreachable!(),
         }
         assert_eq!(

@@ -899,5 +899,193 @@ async fn receipt_id_scoped_grant_applies_to_parent_before_child_rows_or_replay()
     assert_eq!(hold_counts(&f).await, (1, 2));
 }
 
+/// D-524: the book must sell on the acceptance day and on the start day. The fixture accepts on
+/// 2026-10-01 at 10:00 UTC. Closing the book before that day refuses a fresh check as
+/// `NotSellable`; opening it only after that day does too; the receipt already written still
+/// reads back and still holds (owner, 2026-10-06: only the new sale is refused). A fresh sale is a
+/// new order version; the accepted order line replays its original receipt.
+#[tokio::test]
+async fn book_outside_its_window_refuses_a_fresh_sale_and_keeps_the_receipt() {
+    for (column, value, key) in [
+        ("valid_until", "2026-10-01", "closed"),
+        ("valid_from", "2026-10-02", "not-yet"),
+    ] {
+        let f = fixture().await;
+        let a = accept(&f).await;
+        f.execute(&format!(
+            "UPDATE pricing_price_book SET {column}='{value}', version=version+1"
+        ))
+        .await;
+        let mut fresh = f.query.clone();
+        fresh.order_version = 2;
+        reason(
+            &f.sellability
+                .check(&f.ctx, fresh, meta(key))
+                .await
+                .unwrap_err(),
+            "NotSellable",
+        );
+        assert_eq!(
+            f.counts().await.0,
+            1,
+            "{key}: the refused check wrote no acceptance"
+        );
+        assert_eq!(
+            f.sellability
+                .check(&f.ctx, f.query.clone(), meta(&format!("replay-{key}")))
+                .await
+                .unwrap(),
+            a,
+            "{key}: the accepted order line replays its receipt"
+        );
+        assert_eq!(
+            f.acceptance
+                .acceptance(&f.ctx, receipt_query(&a))
+                .await
+                .unwrap(),
+            a,
+            "{key}"
+        );
+        let held = hold(&f, &a, &format!("hold-{key}")).await;
+        assert_eq!(held.bindings, a.bindings, "{key}");
+    }
+}
+
+/// D-524: each day is judged alone. The start-day leg accepts on 2026-10-01 at 10:00 a sale that
+/// starts on 2026-10-02 at 09:00: a book closing on 2026-10-02 refuses it, one open to 2026-10-03
+/// sells it. The acceptance-day leg accepts on 2026-09-30 at 23:00 a sale that starts on 2026-10-01
+/// at 10:00: a book opening on 2026-10-01 refuses it, one open from 2026-09-30 sells it.
+#[tokio::test]
+async fn book_window_judges_the_acceptance_day_and_the_start_day_each_alone() {
+    let at = |day: &str, hour: i64| {
+        seam_support::date(day).midnight().assume_utc() + time::Duration::hours(hour)
+    };
+    for (leg, now, start, column, refused, sells) in [
+        (
+            "start-day",
+            at("2026-10-01", 10),
+            at("2026-10-02", 9),
+            "valid_until",
+            "2026-10-02",
+            "2026-10-03",
+        ),
+        (
+            "acceptance-day",
+            at("2026-09-30", 23),
+            at("2026-10-01", 10),
+            "valid_from",
+            "2026-10-01",
+            "2026-09-30",
+        ),
+    ] {
+        let f = fixture().await;
+        *f.clock.0.lock() = now;
+        let mut q = f.query.clone();
+        q.start_at = start;
+        f.execute(&format!(
+            "UPDATE pricing_price_book SET {column}='{refused}', version=version+1"
+        ))
+        .await;
+        reason(
+            &f.sellability
+                .check(&f.ctx, q.clone(), meta(leg))
+                .await
+                .expect_err(leg),
+            "NotSellable",
+        );
+        assert_eq!(
+            f.counts().await.0,
+            0,
+            "{leg}: the refused check wrote no acceptance"
+        );
+        f.execute(&format!(
+            "UPDATE pricing_price_book SET {column}='{sells}', version=version+1"
+        ))
+        .await;
+        let accepted = f
+            .sellability
+            .check(&f.ctx, q, meta(&format!("{leg}-control")))
+            .await
+            .unwrap();
+        assert_eq!(
+            (accepted.accepted_at, accepted.query.start_at),
+            (now, start),
+            "{leg}: the window covering both days sells"
+        );
+    }
+}
+
+/// D-524: the commit judges the window again on its own clock. Observed at 2026-10-01 23:30 for a
+/// sale starting then, the book (closing on 2026-10-02) sells; the meter answer moves the clock past
+/// midnight, so the commit's day is 2026-10-02 and the receipt would be dated on a day the book does
+/// not sell: `NotSellable`, and nothing is written.
+#[tokio::test]
+async fn book_window_is_judged_again_on_the_commit_clock() {
+    let mut f = AcceptanceFixture::new().await;
+    let late = time::Duration::minutes(23 * 60 + 30);
+    f.query.start_at += late;
+    f.clock.advance(late);
+    f.execute("UPDATE pricing_price_book SET valid_until='2026-10-02', version=version+1")
+        .await;
+    f.hook(vec![], Some(time::Duration::hours(1)), false);
+    reason(
+        &f.sellability
+            .check(&f.ctx, f.query.clone(), meta("midnight"))
+            .await
+            .unwrap_err(),
+        "NotSellable",
+    );
+    assert_eq!(
+        f.counts().await.0,
+        0,
+        "the refused commit wrote no acceptance"
+    );
+}
+
+/// D-524: the observation judges the window on its own day. Observed at 2026-10-01 23:30 for a sale
+/// starting on 2026-10-02 at 00:30, a book opening on 2026-10-02 does not sell on the observation
+/// day; the meter answer moves the clock past midnight, so the commit alone would find both days
+/// inside the window. The observation refuses it: `NotSellable`, and nothing is written.
+#[tokio::test]
+async fn book_window_is_judged_on_the_observation_day() {
+    let mut f = AcceptanceFixture::new().await;
+    let late = time::Duration::minutes(23 * 60 + 30);
+    f.query.start_at += late + time::Duration::hours(1);
+    f.clock.advance(late);
+    f.execute("UPDATE pricing_price_book SET valid_from='2026-10-02', version=version+1")
+        .await;
+    f.hook(vec![], Some(time::Duration::hours(1)), false);
+    reason(
+        &f.sellability
+            .check(&f.ctx, f.query.clone(), meta("before-opening"))
+            .await
+            .unwrap_err(),
+        "NotSellable",
+    );
+    assert_eq!(
+        f.counts().await.0,
+        0,
+        "the refused observation wrote no acceptance"
+    );
+}
+
+/// D-525 end to end: a stored minimum fee on the fixture's usage price (its billing-cycle,
+/// subscription-line policy) is sold through the real check and frozen in the receipt's binding.
+#[tokio::test]
+async fn a_minimum_fee_reaches_the_receipt_through_the_real_check() {
+    let f = fixture().await;
+    f.execute("UPDATE pricing_price SET min_fee='0.10', version=version+1")
+        .await;
+    let resolved = f.resolved().await;
+    let mut q = f.query.clone();
+    q.resolved_bindings_digest =
+        bss_pricing_sdk::digest::selected_bindings_digest(&resolved, &q.selections).unwrap();
+    let a = f.sellability.check(&f.ctx, q, meta("floor")).await.unwrap();
+    assert_eq!(
+        a.bindings[0].price.minimum_fee,
+        Some("0.10".parse::<rust_decimal::Decimal>().unwrap())
+    );
+}
+
 #[path = "review_fix/mod.rs"]
 mod review_fix;

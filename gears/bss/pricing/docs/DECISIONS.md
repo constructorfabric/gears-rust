@@ -144,6 +144,9 @@ and the sold-as bundle and grants (D-411), and drops quote and the Studio wiring
 | D-521 | H | A live price is ended through the prices unit | DECIDED 2026-10-03 · Owner, 2026-10-03; ask 58a; amends D-390, D-393; amended 2026-10-03 (the event) |
 | D-522 | H | A finished book can be archived, and archiving it releases its entries' SKU references (twin of products P-D-263) | DECIDED 2026-10-03 · Owner, 2026-10-03 ("archived"; ask 58b); amends D-408, D-444; extends D-407, D-442; amended 2026-10-03 (the submit's 409, the door's drive, the unarchive's answer, the op's reason, the mark's pairing); amended 2026-10-04 (the unarchive waits for open reference work; the plan revisions' references noted as deferred) |
 | D-523 | M | The PEP gate asks the PDP for the caller's tenant only (twin of products P-D-265) | DECIDED 2026-10-04 · Owner, 2026-10-04 (the approval lists under a root tenant) |
+| D-524 | H | A price book outside its window is a new-sale fact | DECIDED 2026-10-06 · Owner, 2026-10-06; extends D-504 |
+| D-525 | H | A minimum fee is accepted on every rating window and scope; the floor is per window per scope | DECIDED 2026-10-06 · Owner, 2026-10-06; amends D-503, D-504; extends D-388 |
+| D-526 | M | The permission catalog is exactly the enforced pairs | DECIDED 2026-10-06 · Owner, 2026-10-06 |
 
 ## Entries
 
@@ -1575,7 +1578,8 @@ switch does not revalidate dependencies. New usage approvals require a policy-be
 legacy approved prices and published revisions remain readable.
 
 D-503 refuses CalendarHour with any `min_fee` at price create, submit and apply
-(`UNSUPPORTED_TERMS`), and when publishing a revision selecting such approved money. A successor,
+(`UNSUPPORTED_TERMS`), and when publishing a revision selecting such approved money.
+**Superseded by D-525 on 2026-10-06:** a minimum fee is accepted on every window and scope. A successor,
 temporary pair and return keep their entry and therefore the same policy, window, scope and reset.
 Policy changes require a different entry and an explicitly selected revision. The existing dated
 SKU chain guard uses immutable Products history captured before the transaction.
@@ -1656,14 +1660,14 @@ D-504 defines the pure new-sale profile, narrower than the readable catalog:
 | Recurring | Flat or PerUnit; month/year equal to BillingTerms | UnsupportedModel / BillingCycleMismatch |
 | One-time | Flat or PerUnit; no recurring period or usage policy | UnsupportedModel / UnsupportedTerms |
 | Usage BillingCycle | PerUnit, Volume or Graduated; period null; immutable explicit policy | MissingRatingPolicy / MeterPolicyMismatch |
-| Usage CalendarHour | Same usage models; UTC, SUM, subscription_line or resource scope; no minimum fee, including zero | UnsupportedTerms |
-| BillingCycle minimum fee | SubscriptionLine only; any Resource-scoped floor is refused | UnsupportedTerms |
-
-**Amended 2026-10-02 (phase 9 review F1b).** `refuses_minimum_fee` is that predicate at price validation, at the plan-revision check, and at sale validation. A minimum fee with CalendarHour or a resource-scoped policy is unsupported at all three.
-
-**Amended by D-514.** The usage policy in this table is the five rating rules. The binding's unit is the dated SKU's unit. It is not copied into the policy.
+| Usage CalendarHour | Same usage models; UTC, SUM, subscription_line or resource scope; a non-negative minimum fee is supported (D-525) | UnsupportedTerms for a window or zone outside this set |
+| Price book window | The revision's book sells on the acceptance day and on the start day (D-524) | NotSellable |
 | FX / cross-currency sale | Currency must equal the selected price currency | CURRENCY_MISMATCH |
 | Package, promotions, phases, allowances, quarter | Not part of new-sale terms; historical catalog reads remain intact | UnsupportedModel / UnsupportedTerms |
+
+**Amended 2026-10-02 (phase 9 review F1b); superseded by D-525 on 2026-10-06.** `refuses_minimum_fee` was the predicate at price validation, at the plan-revision check and at sale validation; D-525 removed it, and a minimum fee is supported on every window and scope.
+
+**Amended by D-514.** The usage policy in this table is the five rating rules. The binding's unit is the dated SKU's unit. It is not copied into the policy.
 
 Invoice terms must be schema version 1, month/year and UTC, with explicit order or positive,
 non-nil seller-policy provenance. Orders resolves this Subscriptions-owned snapshot before Pricing
@@ -1964,7 +1968,8 @@ semantic entry identity includes canonical policy content digest. Book remapping
 registered dimension and cannot silently replace a policy. Price/plan submit and final apply verify
 exact immutable meter evidence, with no dependency call inside the Pricing transaction. D-504's
 supported-model matrix remains binding: recurring/one-time Flat or PerUnit, usage PerUnit/Volume/
-Graduated, explicit month/year BillingTerms, no hourly minimum fee or included quantity.
+Graduated, explicit month/year BillingTerms, no included quantity; a minimum fee is accepted on every
+window and scope (D-525).
 
 The pre-seam migration proof preserves phase-9 entries, published bindings and unversioned operation
 payloads; tenant-qualified receipt/policy keys and the extended entry index are inspected. Identical
@@ -2290,3 +2295,36 @@ A finished price book stayed on the Price Books screen for ever, and its entries
 - **The tests.** `authz_tests::every_request_asks_for_the_callers_tenant_only`: a collection read, a single-row read and a write each ask for `RootOnly`.
 
 **Source:** Owner, 2026-10-04, after the approval lists measured 1.5–4 s under a root tenant. Twin of products P-D-265.
+
+#### D-524 [H] A price book outside its window is a new-sale fact
+
+**Status:** DECIDED 2026-10-06.
+
+- **The gap.** `SellabilityV1::check` judged the revision (current, available) and the SKU (published, not retiring, sellable) and never the revision's book, although the book carries `valid_from` / `valid_until` and the plan check `PLAN_BOOK_VALIDITY` judges them at approval. A book closed on 1 October still sold on 15 October.
+- **The rule.** `SaleObservation` carries a sixth verified fact, `book_valid`: the revision's book, as the resolve snapshot read it, sells (`book::valid_on`, half-open) on the acceptance day and on the sale's start day — the two days a selected price must also be in force (`PriceClosed`). A false fact is `NotSellable`, the class of a non-current revision. The door judges the window when it observes the sale and again in the commit transaction on the commit's clock, as it does a selected price's window.
+- **What it does not do (owner).** Only the new sale is refused. An accepted receipt keeps its bindings and still holds after `valid_until`; `check_fulfilment`, `hold`, `acceptance`, `GET /resolve` and `GET /prices/{id}` are unchanged; prices stay open and plans stay published.
+- **The tests.** `sellability::live_revision_coverage_and_each_sku_lifecycle_gate_fail_closed` (`book_closed`); `fulfilment_holds::book_outside_its_window_refuses_a_fresh_sale_and_keeps_the_receipt` (SQLite; the acceptance fixture's Postgres tier runs only the `postgres_*` binaries); `fulfilment_holds::book_window_judges_the_acceptance_day_and_the_start_day_each_alone` (each day refuses alone, and a window covering both days sells) and `fulfilment_holds::book_window_is_judged_again_on_the_commit_clock` (an observation before midnight, a commit after it).
+
+**Source:** Owner, 2026-10-06. Extends D-504.
+
+#### D-525 [H] A minimum fee is accepted on every rating window and scope; the floor is per window per scope
+
+**Status:** DECIDED 2026-10-06.
+
+- **The requirement (owner).** A disk priced hourly with a floor of 0.10 per hour is charged at least 0.10 for every hour it is served: `amount for the hour = max(rated amount of that hour, min_fee)`. Two hours rated 0.02 and 0.17 bill 0.27; the hours are never summed before the floor, and a monthly invoice does not turn the floor into a monthly one.
+- **Pricing.** `usage_policy::refuses_minimum_fee` and its three gates (price create/submit/apply in `prices::first_refusal`, the plan-revision check in `plan_revisions::judge`, sale validation in `commercial_terms::validate_model_and_policy`) are removed. A non-negative `min_fee` is stored, served and digested on every window and scope as before; nothing on the wire changes.
+- **The rule Rating applies.** The floor belongs to the price and applies once per rating window of the entry's policy, in the entry's aggregation scope: per subscription line per window for `subscription_line`, per resource per window for `resource`. For `calendar_hour` every hour stands alone. The floor applies to a window only when the window holds at least one usage record of that scope; it is never prorated by the fraction of the hour served; several records in one window do not multiply it; a late record re-rates the same window and the result is replaced, never added to. For `billing_cycle`, D-388 and Rating T-D-38 stand (per price, per subscription, per period, prorated by coverage).
+- **Open on the Rating side, recorded here by the owner's choice (no Rating document is edited).** The identity of a resource across hours (the usage record's resource id); the correction event of a re-rated hour; where the per-hour floor result persists. The rule is Rating's to adopt; until a Rating decision cites this entry, no consumer applies an hourly floor.
+- **Rollout (owner, 2026-10-06, after review).** No Rating runtime exists yet, so nothing applies any floor today; a minimum fee on an accepted binding is part of the frozen terms and their money digest, and a Rating that adopts this entry applies it. A rollback to a version that still refuses these fees would refuse the frozen bindings at `check_fulfilment` and at a new hold (a hold replay still answers); drain or let expire the unexpired acceptances that carry such a fee before rolling back.
+- **The tests.** `sellability::floors_follow_the_entry_window_and_scope`, `usage_rating_policy::hourly_and_resource_minimum_fees_are_accepted_at_create_submit_and_apply`; the seam corpus no longer lists `minimum_fee` among the unsupported terms.
+
+**Source:** Owner, 2026-10-06. Amends D-503 (the hourly refusal) and D-504 (the two profile rows); extends D-388.
+
+#### D-526 [M] The permission catalog is exactly the enforced pairs
+
+**Status:** DECIDED 2026-10-06.
+
+- **The gap.** `gts/permissions.rs` was a stub, so the permission catalog the types registry serves (the list a role editor offers) held Products' and Ledger's permissions and nothing of Pricing; a Pricing grant had to be typed by hand. A role that names `cf.bss.pricing.*` targets directly is unaffected.
+- **The rule.** One `AuthzPermissionV1` instance per (label, action) pair a door enforces, and no other: `price_book` read/author/submit, `price_book_entry` read/author, `price` read/author/submit, `plan` read/author/submit, `approval_unit` read/approve/submit, `config` read/settings, `acceptance` create/hold/read — nineteen. A door that gains an action adds its instance in the same change; `authz_tests::nineteen_permissions_cover_exactly_the_enforced_pairs_and_inventory` pins the set and the inventory.
+
+**Source:** Owner, 2026-10-06. Products' catalog (P-D-231) is the form.
