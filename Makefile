@@ -68,7 +68,7 @@ endef
 
 # Minimum tool versions — checked via `cargo gears tools check-version`.
 DENY_MIN_VERSION := 0.20.0
-NEXTEST_MIN_VERSION := 0.9.130
+NEXTEST_MIN_VERSION := 0.9.143
 CARGO_GEARS_VERSION := 0.0.8
 
 # check_tool_version(tool, requirement)
@@ -82,6 +82,40 @@ endef
 else
 check_tool_version = @true
 endif
+
+# CI sets NEXTEST_PROFILE=ci (see .config/nextest.toml) and JUNIT_DIR=<dir>;
+# locally both stay inert and nextest behaves as before.
+NEXTEST_PROFILE ?= default
+JUNIT_DIR ?=
+# Literal comma for $(call ...) arguments such as --features a$(comma)b.
+comma := ,
+
+# nextest_run(report-name, args[, env-prefix])
+# Run `cargo nextest run` under $(NEXTEST_PROFILE). When JUNIT_DIR is set, copy
+# this run's junit.xml to $(JUNIT_DIR)/<report-name>.xml -- also when tests
+# fail -- so sequential runs in one job don't overwrite each other's report.
+# The stale report is removed first: a run that fails to build must leave no
+# report rather than the previous run's. The saved report is then given
+# source locations (tools/scripts/junit_enrich.py; system python3, no venv --
+# best effort, never fails the run); inside GitHub Actions it also annotates
+# the failing lines and writes the job summary. The exit code is nextest's,
+# except that a passing run which leaves no report fails: the report is the
+# output CI depends on. After a failing run a missing report only warns.
+define nextest_run
+	@junit="$${CARGO_TARGET_DIR:-target}/nextest/$(NEXTEST_PROFILE)/junit.xml"; \
+	rm -f "$$junit"; \
+	(set -x; $(3) cargo nextest run --profile $(NEXTEST_PROFILE) $(2)); rc=$$?; \
+	if [ -n "$(JUNIT_DIR)" ]; then \
+		mkdir -p "$(JUNIT_DIR)"; \
+		if [ -f "$$junit" ] && cp "$$junit" "$(JUNIT_DIR)/$(1).xml"; then \
+			python3 tools/scripts/junit_enrich.py $${GITHUB_ACTIONS:+--github} "$(JUNIT_DIR)/$(1).xml" \
+				|| echo "::warning::could not add source locations to the JUnit report for '$(1)'"; \
+		elif [ $$rc -eq 0 ]; then \
+			echo "::error::nextest passed but no JUnit report was saved for '$(1)'"; rc=1; \
+		else echo "::warning::nextest produced no JUnit report for '$(1)' (build or setup failure?)"; fi; \
+	fi; \
+	exit $$rc
+endef
 
 define check_rustup_component
     @command -v rustup >/dev/null || (echo "ERROR: rustup not installed. Install rustup or run 'make setup'." && exit 1)
@@ -704,23 +738,23 @@ endif
 
 test-no-macros: install-tools
 	$(call print_target_banner)
-	cargo nextest run --workspace --exclude cf-gears-toolkit-macros-tests --exclude cf-gears-toolkit-db-macros
+	$(call nextest_run,test-no-macros,--workspace --exclude cf-gears-toolkit-macros-tests --exclude cf-gears-toolkit-db-macros)
 
 test-macros: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-toolkit-db-macros
-	cargo nextest run -p cf-gears-toolkit-macros-tests
+	$(call nextest_run,macros-db,-p cf-gears-toolkit-db-macros)
+	$(call nextest_run,macros-toolkit,-p cf-gears-toolkit-macros-tests)
 
 ## Run SQLite integration tests
 test-sqlite: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-toolkit-db --features sqlite,integration
+	$(call nextest_run,toolkit-db-sqlite,-p cf-gears-toolkit-db --features sqlite$(comma)integration)
 	cargo build -p cf-gears-toolkit-db --examples --features sqlite
 
 ## Run PostgreSQL integration tests
 test-pg: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-toolkit-db --features pg,integration
+	$(call nextest_run,toolkit-db-pg,-p cf-gears-toolkit-db --features pg$(comma)integration)
 
 ## Run the SQL/PGQ lane: toolkit-db's unit suites under the `pgq` feature (the
 ## secure graph builder and its tests compile only there), the PostgreSQL 19
@@ -732,8 +766,8 @@ test-pg: install-tools
 ## failure — do the same locally once the image is expected to be present.
 test-pgq: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-toolkit-db --features pgq,integration \
-		-E 'kind(lib) | binary(mod) | binary(ui)'
+	$(call nextest_run,toolkit-db-pgq,-p cf-gears-toolkit-db --features pgq$(comma)integration \
+		-E 'kind(lib) | binary(mod) | binary(ui)')
 
 ## Run the graph-storage gear's database-free suites: unit tests, the
 ## in-memory conformance lane, the domain-service and REST lanes. The
@@ -767,7 +801,7 @@ test-graph-storage-pg: install-tools
 ## Run MySQL integration tests
 test-mysql: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-toolkit-db --features mysql,integration
+	$(call nextest_run,toolkit-db-mysql,-p cf-gears-toolkit-db --features mysql$(comma)integration)
 
 # Run all database integration tests
 test-db: test-sqlite test-pg test-pgq test-mysql
@@ -776,13 +810,13 @@ test-db: test-sqlite test-pg test-pgq test-mysql
 ## Run users-info gear integration tests
 test-users-info-pg: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p users-info --features "integration"
+	$(call nextest_run,users-info-pg,-p users-info --features integration)
 
 ## Run TimescaleDB usage-collector plugin integration tests (Docker required;
 ## the suite spins up its own timescale/timescaledb container via testcontainers)
 test-usage-collector-pg: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres
+	$(call nextest_run,usage-collector-pg,-p cf-gears-timescaledb-usage-collector-plugin --features postgres)
 
 ## Run ClickHouse usage-collector plugin integration tests (Docker required;
 ## every test gets its own database on one shared, named clickhouse container,
@@ -794,15 +828,15 @@ test-usage-collector-pg: install-tools
 ## without it bring_up_or_skip() reports `ok` on a suite that ran nothing.
 test-usage-collector-ch: install-tools
 	$(call print_target_banner)
-	CH_REQUIRE_DOCKER=1 cargo nextest run -p cf-gears-clickhouse-usage-collector-plugin \
-		--features clickhouse --run-ignored all --no-fail-fast
+	$(call nextest_run,usage-collector-ch,-p cf-gears-clickhouse-usage-collector-plugin \
+		--features clickhouse --run-ignored all --no-fail-fast,CH_REQUIRE_DOCKER=1)
 
 ## Run types-registry PostgreSQL + MySQL integration tests (Docker required;
 ## each test spins up its own postgres or mysql container via testcontainers).
 test-types-registry-db: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-types-registry --features integration \
-	  -E 'binary(/_backends_test$$/)'
+	$(call nextest_run,types-registry-db,-p cf-gears-types-registry --features integration \
+	  -E 'binary(/_backends_test$$/)')
 
 ## Run the Postgres cluster plugin's conformance (Layer 2) and Layer 3
 ## integration suites (Docker required;
@@ -816,7 +850,7 @@ test-types-registry-db: install-tools
 ## Docker churn without masking one.
 test-cluster-pg: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-postgres-cluster-plugin --features integration --retries 1
+	$(call nextest_run,cluster-pg,-p cf-postgres-cluster-plugin --features integration --retries 1)
 
 ## Kubernetes cluster plugin: L2 (conformance) + L3 (integration) against a real
 ## k3s API server (docs/TESTING.md 4, 7). Docker required, and k3s needs
@@ -879,7 +913,7 @@ coverage-cluster-k8s:
 ## its own postgres container via testcontainers -- see
 ## gears/system/resource-group/resource-group/tests/pg_smoke_test.rs)
 test-rg-pg: install-tools
-	cargo nextest run -p cf-gears-resource-group --features integration
+	$(call nextest_run,rg-pg,-p cf-gears-resource-group --features integration)
 
 ## Run the settings-service gear's PostgreSQL migration suite (Docker required;
 ## spins up its own postgres container via testcontainers -- see
@@ -888,7 +922,7 @@ test-rg-pg: install-tools
 ## PostgreSQL refuses can still pass; this lane runs the chain a stand's startup
 ## runs, on the backend it runs it on.
 test-settings-service-pg: install-tools
-	cargo nextest run -p cf-gears-settings-service --features integration --test pg_migrations_test
+	$(call nextest_run,settings-service-pg,-p cf-gears-settings-service --features integration --test pg_migrations_test)
 
 ## Run bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).
@@ -921,7 +955,7 @@ test-settings-service-pg: install-tools
 ## whole purpose is to be the one place a Postgres-only defect surfaces must
 ## report every failure it found, not the first.
 test-pricing-pg: install-tools
-	cargo nextest run -p cf-gears-bss-pricing --run-ignored ignored-only -E 'binary(/^postgres_/)' --no-fail-fast
+	$(call nextest_run,pricing-pg,-p cf-gears-bss-pricing --run-ignored ignored-only -E 'binary(/^postgres_/)' --no-fail-fast)
 
 ## Run coord's Postgres tier (Docker required; testcontainers).
 ##
@@ -936,7 +970,7 @@ test-pricing-pg: install-tools
 ## Same `--run-ignored ignored-only` shape as `test-pricing-pg` above, and the
 ## same reason: the gate is `#[ignore]` rather than a feature.
 test-coord-pg: install-tools
-	cargo nextest run -p cf-gears-bss-coord --run-ignored ignored-only -E 'binary(/^postgres_/)'
+	$(call nextest_run,coord-pg,-p cf-gears-bss-coord --run-ignored ignored-only -E 'binary(/^postgres_/)')
 
 ## Run bss-products' Postgres tier (Docker required; testcontainers).
 ##
@@ -960,7 +994,7 @@ test-coord-pg: install-tools
 ## the one place a Postgres-only defect surfaces must report every failure it
 ## found, not the first.
 test-products-pg: install-tools
-	cargo nextest run -p cf-gears-bss-products --run-ignored ignored-only -E 'binary(/^postgres_/)' --no-fail-fast
+	$(call nextest_run,products-pg,-p cf-gears-bss-products --run-ignored ignored-only -E 'binary(/^postgres_/)' --no-fail-fast)
 
 ## Run the Redis cluster plugin's conformance (Layer 2) and Layer 3 integration
 ## suites (Docker required; each spins up its own redis container via
@@ -982,7 +1016,7 @@ test-products-pg: install-tools
 ## load-sensitive on a busy host, and a genuine logic regression fails both
 ## attempts, so this absorbs Docker churn without masking one.
 test-cluster-redis: install-tools
-	cargo nextest run -p cf-redis-cluster-plugin --features integration --retries 1
+	$(call nextest_run,cluster-redis,-p cf-redis-cluster-plugin --features integration --retries 1)
 
 ## Run FIPS-mode integration tests (requires Go for aws-lc-fips-sys).
 ## Covers:

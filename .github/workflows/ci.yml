@@ -198,8 +198,10 @@ jobs:
       - name: No unpinned database container images
         run: cargo xtask check-test-container-pins
 
+      # The wrapper turns compiler/lint errors into annotations titled by
+      # their code (E0308, DE0904, clippy::...) when the command fails.
       - name: cargo clippy
-        run: make clippy
+        run: tools/scripts/with_rust_annotations.sh make clippy
 
   test:
     name: Test Suite (${{ matrix.os }})
@@ -217,6 +219,11 @@ jobs:
         os: [ ubuntu-latest, windows-latest, macos-latest ]
     env:
       RUSTFLAGS: "-C debuginfo=0"
+      # nextest writes JUnit under the `ci` profile; the Makefile copies each
+      # run's report into JUNIT_DIR (see `nextest_run`). Relative on purpose:
+      # an absolute Windows path would reach make's sh with backslashes.
+      NEXTEST_PROFILE: ci
+      JUNIT_DIR: test-results
     steps:
       - name: Free disk space
         if: runner.os == 'Linux'
@@ -299,7 +306,21 @@ jobs:
           fi
 
       - name: cargo test (no macros)
-        run: make test-no-macros
+        shell: bash
+        run: tools/scripts/with_rust_annotations.sh make test-no-macros
+
+      # Published as GitHub Checks by test-report.yml (workflow_run), which has
+      # the `checks: write` this job lacks on fork PRs. `!cancelled()` so a
+      # failing run still ships its report; a missing report (build failure)
+      # is a warning here and the job is already red from the step above.
+      - name: Upload Rust test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rust-tests-${{ runner.os }}
+          path: test-results/*.xml
+          if-no-files-found: warn
+          retention-days: 14
 
   integration:
     name: Integration tests
@@ -313,6 +334,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-C debuginfo=0"
+      # See the `test` job: per-suite JUnit reports land in JUNIT_DIR.
+      NEXTEST_PROFILE: ci
+      JUNIT_DIR: test-results
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
@@ -361,6 +385,7 @@ jobs:
 
       # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
       - name: Probe sccache & set RUSTC_WRAPPER
+        id: setup
         shell: bash
         run: |
           if sccache --start-server >/dev/null 2>&1; then
@@ -370,54 +395,68 @@ jobs:
             echo "sccache failed, falling back to plain rustc"
           fi
 
+      # Every test step below runs even when an earlier one failed
+      # (`!cancelled()`), so one broken suite no longer hides the results of the
+      # rest; the job still fails if any of them did. Gated on `setup` so a
+      # broken toolchain does not cascade into a wall of identical failures.
       - name: UI tests for toolkit macros libraries
-        run: make test-macros
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-macros
 
       - name: Test users_info with Postgres (integration)
-        run: make test-users-info-pg
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-users-info-pg
 
       - name: Test timescaledb usage-collector plugin (pg integration)
-        run: make test-usage-collector-pg
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-usage-collector-pg
 
       - name: Test clickhouse usage-collector plugin (ch integration)
-        run: make test-usage-collector-ch
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-usage-collector-ch
 
       - name: Test postgres-cluster-plugin (pg integration)
-        run: make test-cluster-pg
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-cluster-pg
 
       - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         # k3s runs in a **privileged** container (testcontainers-modules sets it);
         # GitHub-hosted ubuntu runners permit that. The target uses `cargo test`, not
         # nextest, so one k3s container is shared per test binary -- see the Makefile.
-        run: make test-cluster-k8s
+        run: tools/scripts/with_rust_annotations.sh make test-cluster-k8s
 
       - name: Test resource-group (pg smoke, integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         # Fail if Docker is unreachable instead of letting the suite skip itself
         # into a green step that asserted nothing.
         env:
           RG_PG_REQUIRE_DOCKER: "1"
-        run: make test-rg-pg
+        run: tools/scripts/with_rust_annotations.sh make test-rg-pg
 
       - name: Test settings-service (pg migrations, integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         # Same shape as resource-group above: Docker is on this runner, so a
         # skip here would be a broken daemon passing green.
         env:
           SETTINGS_SERVICE_PG_REQUIRE_DOCKER: "1"
-        run: make test-settings-service-pg
+        run: tools/scripts/with_rust_annotations.sh make test-settings-service-pg
 
       # bss-pricing's Postgres tests are `#[ignore]`d behind Docker and ran in
       # no job until 2026-08-11 — every concurrency and trigger proof the crate
       # owns lives in them. This job already has Docker. The target passes
       # `--no-fail-fast`; see the Makefile for what the default cost on 2026-08-18.
       - name: Test bss-pricing with Postgres (integration)
-        run: make test-pricing-pg
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-pricing-pg
 
       # coord's `m0001_…` writes two independent SQL literals and only the
       # SQLite one is reachable from the in-crate tests — so the `IF NOT EXISTS`
       # that stops the `bss-pricing`-beside-`bss-ledger` boot crash, and the
       # `in_schema("bss")` form both gears actually pass, ran in no job.
       - name: Test coord with Postgres (integration)
-        run: make test-coord-pg
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-coord-pg
 
       # bss-products' Postgres tier, added 2026-08-30. It carries the gear's
       # only proofs about racing writers and the only execution of the Postgres
@@ -427,18 +466,23 @@ jobs:
       # here and runs nowhere, which is the state the pricing comment above
       # records as having cost that gear nine hidden failures.
       - name: Test bss-products with Postgres (integration)
-        run: make test-products-pg
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-products-pg
 
       - name: Test redis-cluster-plugin (redis integration)
-        run: make test-cluster-redis
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-cluster-redis
 
       - name: Test toolkit-db (sqlite integration)
-        run: make test-sqlite
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-sqlite
 
       - name: Test toolkit-db (pg integration)
-        run: make test-pg
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-pg
 
       - name: Test toolkit-db (pgq unit + PG19 integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         # Compiles and runs everything behind the `pgq` feature — the secure
         # graph builder, its unit suites and the trybuild guards — and the
         # PostgreSQL 19 integration suite. Locally that suite skips itself while
@@ -447,13 +491,28 @@ jobs:
         # libs/test-containers::graph_lane_required).
         env:
           GEARS_TEST_PG_GRAPH_REQUIRED: "1"
-        run: make test-pgq
+        run: tools/scripts/with_rust_annotations.sh make test-pgq
 
       - name: Test toolkit-db (mysql integration)
-        run: make test-mysql
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-mysql
 
       - name: Test types-registry (db integration)
-        run: make test-types-registry-db
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-types-registry-db
+
+      # Published as GitHub Checks by test-report.yml (workflow_run), which has
+      # the `checks: write` this job lacks on fork PRs. `!cancelled()` so a
+      # failing run still ships its report; a missing report (build failure)
+      # is a warning here and the job is already red from the step above.
+      - name: Upload Rust test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rust-tests-integration
+          path: test-results/*.xml
+          if-no-files-found: warn
+          retention-days: 14
 
   test-fips:
     name: FIPS verification (${{ matrix.os }})
@@ -996,24 +1055,59 @@ jobs:
       # inherits this step's CARGO_LLVM_COV_* env and accumulates into the same
       # session. Keep it in sync with `test-cluster-k8s`.
       - name: Coverage (lcov)
+        id: coverage
         env:
           RUSTFLAGS: "-C debuginfo=0 --cfg coverage_nightly"
           CARGO_LLVM_COV_TARGET_DIR: llvm-cov-target
           CARGO_LLVM_COV_BUILD_DIR: llvm-cov-build
+          # nextest reads this directly (`cargo llvm-cov --profile` is cargo's
+          # build profile, not nextest's): run every test, write JUnit.
+          NEXTEST_PROFILE: ci
         run: |
-          cargo llvm-cov clean --workspace
+          # Annotates compiler errors of whichever command fails.
+          W=tools/scripts/with_rust_annotations.sh
+          # All nextest passes write the same JUnit file. Removing it before
+          # each pass means a report found after a failure is the failing
+          # pass's own, never an earlier pass's.
+          fresh_report() { rm -f target/nextest/ci/junit.xml llvm-cov-target/nextest/ci/junit.xml; }
+          "$W" cargo llvm-cov clean --workspace
           # Pass 1: whole workspace, default features. Accumulate, don't report.
-          cargo llvm-cov nextest --workspace --no-report
+          fresh_report
+          "$W" cargo llvm-cov nextest --workspace --no-report
           # Pass 2: redis-cluster-plugin integration suites (real Redis via
           # testcontainers).
-          cargo llvm-cov nextest --no-report -p cf-redis-cluster-plugin --features integration --retries 1
+          fresh_report
+          "$W" cargo llvm-cov nextest --no-report -p cf-redis-cluster-plugin --features integration --retries 1
           # Pass 3: postgres-cluster-plugin integration suites (real Postgres
           # via testcontainers).
-          cargo llvm-cov nextest --no-report -p cf-postgres-cluster-plugin --features integration --retries 1
-          # Pass 4: k8s-cluster-plugin k3s suites
-          make coverage-cluster-k8s
+          fresh_report
+          "$W" cargo llvm-cov nextest --no-report -p cf-postgres-cluster-plugin --features integration --retries 1
+          # Pass 4: k8s-cluster-plugin k3s suites (cargo test: no JUnit).
+          fresh_report
+          "$W" make coverage-cluster-k8s
           # Merge into the single report that gets uploaded.
           cargo llvm-cov report --lcov --output-path lcov.info
+
+      # The passes stop at the first failing one and each starts without a
+      # report, so a report found here is the failing pass's. A failing test
+      # is reported by the test jobs too; this puts it on this job's page as
+      # well, where it was clicked.
+      - name: Annotate failing tests
+        if: ${{ failure() && steps.coverage.outcome == 'failure' }}
+        shell: bash
+        run: |
+          # nextest keeps its reports under the workspace's target/ even when
+          # cargo-llvm-cov points the build at CARGO_LLVM_COV_TARGET_DIR
+          # (checked with cargo-llvm-cov 0.8.7); look in both.
+          report=
+          for f in target/nextest/ci/junit.xml llvm-cov-target/nextest/ci/junit.xml; do
+            if [ -f "$f" ]; then report=$f; break; fi
+          done
+          if [ -n "$report" ]; then
+            python3 tools/scripts/junit_enrich.py --github "$report"
+          else
+            echo "The failing pass left no JUnit report (a build error, or the k8s pass, which runs cargo test); see the step above."
+          fi
 
       # Upload LCOV report as a GitHub Actions artifact so it is always
       # available, even when Codecov is unavailable or rejects the upload.
@@ -1064,4 +1158,4 @@ jobs:
         run: cargo install --locked cargo-gears@0.0.8
 
       - name: Run architecture lints
-        run: cargo gears lint --dylint
+        run: tools/scripts/with_rust_annotations.sh cargo gears lint --dylint

@@ -147,8 +147,36 @@ jobs:
           DOCKER_BUILDKIT: "1"
         run: docker build -f gears/mini-chat/deploy/docker/mini-chat.Dockerfile --build-arg BUILD_PROFILE=dev .
 
+      # pytest runs on the host here (ci.py passes its env through), so
+      # PYTEST_ADDOPTS reaches it; test-report.yml publishes the XML.
       - name: Run E2E tests in Docker
-        run: make e2e-docker-smoke
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/docker-smoke.xml -o junit_suite_name=e2e-docker-smoke"
+        run: tools/scripts/with_rust_annotations.sh make e2e-docker-smoke
+
+      # pytest records the assertion but not where it failed; take that from
+      # the traceback so the report can annotate the test's source line.
+      # --github also annotates the failures on this job and writes the job
+      # summary, so they show up here without waiting for test-report.yml.
+      - name: Add source locations to E2E reports
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          reports=(test-results/e2e/*.xml)
+          if [ ${#reports[@]} -gt 0 ]; then
+            python3 tools/scripts/junit_enrich.py --github "${reports[@]}" \
+              || echo "::warning::could not add source locations to the E2E reports"
+          fi
+
+      - name: Upload E2E test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-tests-docker
+          path: test-results/e2e/*.xml
+          if-no-files-found: warn
+          retention-days: 14
 
       # No log-dump step here: ci.py captures compose logs itself, before its own
       # teardown. A step at this point would run after the containers are gone.
@@ -210,43 +238,95 @@ jobs:
           fi
 
       - name: Install Python dependencies
+        id: setup
         run: pip install -r testing/e2e/requirements.txt
 
       # `make e2e-local` (no SUITE) runs only the shared-server suites
       # (launcher: e2e-launcher) against a single server. Self-managed suites
       # (launcher: pytest — mini-chat, usage-collector) and profile lanes
       # (tr-authz) are NOT covered by it, so they run as their own steps below.
+      # Each test step writes its own JUnit file via PYTEST_ADDOPTS (both
+      # run_e2e.py and ci.py hand their env to pytest), and runs even when an
+      # earlier one failed (`!cancelled()`) so one broken suite no longer hides
+      # the others; the job still fails if any did. Gated on `setup` so a
+      # broken environment does not cascade.
       - name: Run E2E tests
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         env:
           INPUT_MODE: ${{ inputs.mode }}
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/local.xml -o junit_suite_name=e2e-local"
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            make e2e-local            # nightly — full suite
+            tools/scripts/with_rust_annotations.sh make e2e-local            # nightly — full suite
           elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$INPUT_MODE" = "full" ]; then
-            make e2e-local            # manual — full suite
+            tools/scripts/with_rust_annotations.sh make e2e-local            # manual — full suite
           else
-            make e2e-local            # PR / manual-smoke, TODO: switch to e2e-local-smoke later
+            tools/scripts/with_rust_annotations.sh make e2e-local            # PR / manual-smoke, TODO: switch to e2e-local-smoke later
           fi
 
       # Self-managed suite (launcher: pytest): owns its own offline server.
       - name: Run mini-chat E2E tests
-        run: make e2e-mini-chat
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/mini-chat.xml -o junit_suite_name=e2e-mini-chat"
+        run: tools/scripts/with_rust_annotations.sh make e2e-mini-chat
 
       # tr-authz is a PROFILE of the resource-group suite (not a standalone
       # suite), so `make e2e-local` does not run it — keep it as its own step.
       - name: Run RG + AuthZ E2E tests (tr-authz-plugin, AuthZ -> TR -> RG chain)
-        run: make e2e-tr-authz
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/tr-authz.xml -o junit_suite_name=e2e-tr-authz"
+        run: tools/scripts/with_rust_annotations.sh make e2e-tr-authz
 
       # Self-managed suite (launcher: pytest): starts its own server plus a
       # TimescaleDB or ClickHouse container, so it needs a reachable Docker daemon.
-      - name: Run usage-collector E2E tests (TimescaleDB + ClickHouse containers)
-        run: make e2e-usage-collector
+      # Two steps, in the order `make e2e-usage-collector` runs them, because
+      # that target runs pytest twice and each run needs its own JUnit file.
+      - name: Run usage-collector E2E tests (TimescaleDB container)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/usage-collector-timescaledb.xml -o junit_suite_name=e2e-usage-collector-timescaledb"
+        run: tools/scripts/with_rust_annotations.sh make e2e-usage-collector-timescaledb
+
+      - name: Run usage-collector E2E tests (ClickHouse container)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/usage-collector-clickhouse.xml -o junit_suite_name=e2e-usage-collector-clickhouse"
+        run: tools/scripts/with_rust_annotations.sh make e2e-usage-collector-clickhouse
 
       # Self-managed OoP (loopback, no k8s) suite: builds flight-control + three
       # oop_module gear binaries and orchestrates them as processes itself, so it
       # bypasses run_e2e.py and runs via its own target.
       - name: Run OoP (loopback) E2E tests
-        run: make e2e-oop
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/oop.xml -o junit_suite_name=e2e-oop"
+        run: tools/scripts/with_rust_annotations.sh make e2e-oop
+
+      # pytest records the assertion but not where it failed; take that from
+      # the traceback so the report can annotate the test's source line.
+      # --github also annotates the failures on this job and writes the job
+      # summary, so they show up here without waiting for test-report.yml.
+      - name: Add source locations to E2E reports
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          reports=(test-results/e2e/*.xml)
+          if [ ${#reports[@]} -gt 0 ]; then
+            python3 tools/scripts/junit_enrich.py --github "${reports[@]}" \
+              || echo "::warning::could not add source locations to the E2E reports"
+          fi
+
+      - name: Upload E2E test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-tests-local
+          path: test-results/e2e/*.xml
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload E2E logs
         if: failure()
