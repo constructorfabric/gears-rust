@@ -1,3 +1,5 @@
+//! Durable managed producer registrations with UTC bindings on every SQL backend.
+
 use chrono::Utc;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, QueryFilter};
@@ -20,8 +22,8 @@ pub struct Model {
     pub mode: String,
     pub client_agent: String,
     pub generation: i64,
-    pub created_at: String,
-    pub updated_at: String,
+    pub created_at: DateTimeUtc,
+    pub updated_at: DateTimeUtc,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -96,7 +98,7 @@ impl ProducerRegistrationStore {
         producer_id: ProducerId,
         client_agent: &str,
     ) -> Result<ProducerRegistration, EventBrokerError> {
-        let now = now_string();
+        let now = Utc::now();
         let registration = ProducerRegistration {
             key: managed.key.clone(),
             producer_id,
@@ -110,7 +112,7 @@ impl ProducerRegistrationStore {
             mode: ActiveValue::Set(mode_to_str(registration.mode).to_owned()),
             client_agent: ActiveValue::Set(registration.client_agent.clone()),
             generation: ActiveValue::Set(registration.generation),
-            created_at: ActiveValue::Set(now.clone()),
+            created_at: ActiveValue::Set(now),
             updated_at: ActiveValue::Set(now),
         };
         let conn = self.db.conn().map_err(map_db_err)?;
@@ -126,7 +128,7 @@ impl ProducerRegistrationStore {
         producer_id: ProducerId,
     ) -> Result<ProducerRegistration, EventBrokerError> {
         let generation = current.generation + 1;
-        let now = now_string();
+        let now = Utc::now();
         let conn = self.db.conn().map_err(map_db_err)?;
         let result = Entity::update_many()
             .col_expr(
@@ -221,10 +223,6 @@ fn mode_from_str(mode: &str) -> Result<ProducerMode, EventBrokerError> {
     }
 }
 
-fn now_string() -> String {
-    Utc::now().to_rfc3339()
-}
-
 fn map_db_err(err: toolkit_db::DbError) -> EventBrokerError {
     EventBrokerError::Internal(format!("producer registration db access: {err}"))
 }
@@ -232,3 +230,7 @@ fn map_db_err(err: toolkit_db::DbError) -> EventBrokerError {
 fn map_scope_err(err: ScopeError) -> EventBrokerError {
     EventBrokerError::Internal(format!("producer registration store: {err}"))
 }
+
+#[cfg(test)]
+#[path = "registration_tests.rs"]
+mod tests;
