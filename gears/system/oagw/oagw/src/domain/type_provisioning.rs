@@ -1,7 +1,7 @@
 //! Trait for reading upstreams and routes from the Types Registry.
 //!
 //! During `post_init()`, OAGW reads GTS instances registered by other gears
-//! and materializes them into the in-memory upstream/route repositories.
+//! and reconciles the registry-managed upstreams and routes with them.
 
 use async_trait::async_trait;
 use toolkit_macros::domain_model;
@@ -39,8 +39,8 @@ pub struct ProvisionedRoute {
 /// Reads upstream and route GTS instances from the Types Registry.
 ///
 /// Other gears register upstream/route instances during `init()`.
-/// OAGW calls these methods during `post_init()` to discover and
-/// materialize them into the in-memory repositories.
+/// OAGW calls these methods during `post_init()` to discover them and
+/// reconcile the registry-managed rows with them.
 #[async_trait]
 pub trait TypeProvisioningService: Send + Sync {
     /// List all upstream instances registered in the types-registry.

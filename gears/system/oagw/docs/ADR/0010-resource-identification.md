@@ -208,6 +208,11 @@ The alias is immutable once set — regardless of whether it was auto-derived
 the upstream and re-create it. Providing the existing alias value on update is
 tolerated as a no-op.
 
+Exception: an upstream provisioned from the types registry takes the alias its
+registry instance gives, by the create rules, at each boot
+([ADR-0018](./0018-optional-persistence.md#startup-provisioning-from-the-types-registry)).
+The Management API still cannot change it.
+
 **Multi-endpoint with shared alias** (load balancing pool):
 
 ```text

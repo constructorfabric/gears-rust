@@ -10,23 +10,29 @@ use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use credstore_sdk::CredStoreClientV1;
 use oagw_sdk::api::ServiceGatewayClientV1;
+use sea_orm_migration::MigrationTrait;
 use tenant_resolver_sdk::TenantResolverClient;
 use toolkit::api::OpenApiRegistry;
 use toolkit::contracts::SystemCapability;
-use toolkit::{Gear, GearCtx, RestApiCapability};
+use toolkit::{DatabaseCapability, Gear, GearCtx, RestApiCapability};
+use toolkit_db::DBProvider;
 use toolkit_security::SecurityContext;
 use tracing::info;
 use types_registry_sdk::{RegisterResult, RegisterSummary, TypesRegistryClient};
 
 use crate::api::rest::routes;
 use crate::domain::ports::OagwMetricsPort;
+use crate::domain::repo::{RepositoryError, RouteRepository, UpstreamRepository};
+use crate::domain::services::registry_reconcile::reconcile_registry;
 use crate::domain::services::{
     ControlPlaneService, ControlPlaneServiceImpl, DataPlaneService, EndpointSelector,
-    ServiceGatewayClientV1Facade,
+    RegistryProvisioner, ServiceGatewayClientV1Facade,
 };
 use crate::infra::metrics::OagwMetricsMeter;
 use crate::infra::proxy::DataPlaneServiceImpl;
-use crate::infra::storage::{InMemoryRouteRepo, InMemoryUpstreamRepo};
+use crate::infra::storage::{
+    DbRouteRepo, DbUpstreamRepo, InMemoryRouteRepo, InMemoryUpstreamRepo, Migrator,
+};
 
 /// Shared application state injected into all handlers.
 #[derive(Clone)]
@@ -45,13 +51,14 @@ pub struct AppState {
 #[toolkit::gear(
     name = "oagw",
     deps = [types_registry, authz_resolver, credstore, tenant_resolver],
-    capabilities = [system, rest]
+    capabilities = [system, db, rest]
 )]
 pub struct OutboundApiGatewayGear {
     state: arc_swap::ArcSwapOption<AppState>,
     registry_client: OnceLock<Arc<dyn TypesRegistryClient>>,
     tenant_resolver: OnceLock<Arc<dyn TenantResolverClient>>,
     type_provisioning: OnceLock<Arc<dyn TypeProvisioningService>>,
+    registry_provisioner: OnceLock<Arc<dyn RegistryProvisioner>>,
 }
 
 impl Default for OutboundApiGatewayGear {
@@ -61,7 +68,50 @@ impl Default for OutboundApiGatewayGear {
             registry_client: OnceLock::new(),
             tenant_resolver: OnceLock::new(),
             type_provisioning: OnceLock::new(),
+            registry_provisioner: OnceLock::new(),
         }
+    }
+}
+
+/// The upstream and route repositories the Control Plane runs on.
+type Repositories = (Arc<dyn UpstreamRepository>, Arc<dyn RouteRepository>);
+
+impl OutboundApiGatewayGear {
+    /// Database repositories when `ctx.db()` has a handle, in-memory
+    /// otherwise (ADR-0018 *Backend Selection*). A non-null `database` value
+    /// without a handle fails startup; `database: null` counts as absent.
+    ///
+    /// Without a global `database:` section the runtime builds no database
+    /// manager, so `gears.oagw.database` alone yields no handle; this guard
+    /// keeps that from silently dropping to in-memory storage.
+    fn select_storage(ctx: &GearCtx) -> anyhow::Result<Repositories> {
+        if let Some(db) = ctx.db() {
+            let db = DBProvider::<RepositoryError>::new(db.db());
+            info!("OAGW storage: database");
+            return Ok((
+                Arc::new(DbUpstreamRepo::new(db.clone())),
+                Arc::new(DbRouteRepo::new(db)),
+            ));
+        }
+        let db_key_present = ctx
+            .config_provider()
+            .get_gear_config(Self::MODULE_NAME)
+            .and_then(|gear| gear.get("database"))
+            .is_some_and(|v| !v.is_null());
+        if db_key_present {
+            anyhow::bail!(
+                "gears.oagw.database is configured but no database is available \
+                 (is the global `database:` section missing?); refusing to start \
+                 with in-memory storage"
+            );
+        }
+        tracing::warn!(
+            "OAGW has no database configured: upstreams and routes are kept in memory and lost on restart"
+        );
+        Ok((
+            Arc::new(InMemoryUpstreamRepo::new()),
+            Arc::new(InMemoryRouteRepo::new()),
+        ))
     }
 }
 
@@ -81,8 +131,7 @@ impl Gear for OutboundApiGatewayGear {
         info!(ssrf_policy = ?ssrf_guard, "SSRF guard initialized");
 
         // -- Control Plane init --
-        let upstream_repo = Arc::new(InMemoryUpstreamRepo::new());
-        let route_repo = Arc::new(InMemoryRouteRepo::new());
+        let (upstream_repo, route_repo) = Self::select_storage(ctx)?;
         let tenant_resolver = ctx.client_hub().get::<dyn TenantResolverClient>()?;
 
         let credstore = ctx.client_hub().get::<dyn CredStoreClientV1>()?;
@@ -91,7 +140,7 @@ impl Gear for OutboundApiGatewayGear {
         let authz = ctx.client_hub().get::<dyn AuthZResolverApi>()?;
         let policy_enforcer = PolicyEnforcer::new(authz);
 
-        let cp: Arc<dyn ControlPlaneService> = Arc::new(ControlPlaneServiceImpl::new(
+        let cp_impl = Arc::new(ControlPlaneServiceImpl::new(
             upstream_repo,
             route_repo,
             tenant_resolver.clone(),
@@ -99,6 +148,12 @@ impl Gear for OutboundApiGatewayGear {
             credstore.clone(),
             ssrf_guard.clone(),
         ));
+        // Only `post_init` holds the registry write path; handlers and the SDK
+        // facade get the Control Plane trait alone.
+        let cp: Arc<dyn ControlPlaneService> = cp_impl.clone();
+        self.registry_provisioner
+            .set(cp_impl)
+            .map_err(|_| anyhow::anyhow!("RegistryProvisioner already set"))?;
 
         // -- Metrics --
         let metrics_prefix = cfg.metrics.effective_prefix("oagw");
@@ -126,9 +181,11 @@ impl Gear for OutboundApiGatewayGear {
             &server_conf,
             pingora_proxy,
         ));
-        let backend_selector: Arc<dyn EndpointSelector> = Arc::new(
+        let pingora_selector = Arc::new(
             crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(ssrf_guard.clone()),
         );
+        pingora_selector.spawn_idle_sweeper(ctx.cancellation_token().clone());
+        let backend_selector: Arc<dyn EndpointSelector> = pingora_selector;
 
         let token_http_config = if cfg.allow_http_upstream {
             tracing::warn!("allow_http_upstream is enabled — HTTP token endpoints also allowed");
@@ -141,28 +198,31 @@ impl Gear for OutboundApiGatewayGear {
 
         let token_cache_config = TokenCacheConfig::from(&cfg);
 
-        let dp: Arc<dyn DataPlaneService> = Arc::new(
-            DataPlaneServiceImpl::new(
-                cp.clone(),
-                credstore,
-                policy_enforcer,
-                token_http_config,
-                token_cache_config,
-                backend_selector.clone(),
-                proxy,
-                metrics,
-            )
-            .with_request_timeout(Duration::from_secs(cfg.proxy_timeout_secs))
-            .with_max_body_size(cfg.max_body_size_bytes)
-            .with_allow_http_upstream(cfg.allow_http_upstream)
-            .with_websocket_idle_timeout(Duration::from_secs(cfg.websocket_idle_timeout_secs))
-            .with_websocket_close_timeout(Duration::from_secs(cfg.websocket_close_timeout_secs))
-            .with_streaming_idle_timeout(Duration::from_secs(cfg.streaming_idle_timeout_secs)),
-        );
+        let dp_impl = DataPlaneServiceImpl::new(
+            cp.clone(),
+            credstore,
+            policy_enforcer,
+            token_http_config,
+            token_cache_config,
+            backend_selector.clone(),
+            proxy,
+            metrics,
+        )
+        .with_request_timeout(Duration::from_secs(cfg.proxy_timeout_secs))
+        .with_max_body_size(cfg.max_body_size_bytes)
+        .with_allow_http_upstream(cfg.allow_http_upstream)
+        .with_websocket_idle_timeout(Duration::from_secs(cfg.websocket_idle_timeout_secs))
+        .with_websocket_close_timeout(Duration::from_secs(cfg.websocket_close_timeout_secs))
+        .with_streaming_idle_timeout(Duration::from_secs(cfg.streaming_idle_timeout_secs));
+        dp_impl.spawn_rate_limit_sweeper(ctx.cancellation_token().clone());
+        let dp: Arc<dyn DataPlaneService> = Arc::new(dp_impl);
 
         // -- Facade (for external SDK consumers) --
-        let oagw: Arc<dyn ServiceGatewayClientV1> =
-            Arc::new(ServiceGatewayClientV1Facade::new(cp.clone(), dp.clone()));
+        let oagw: Arc<dyn ServiceGatewayClientV1> = Arc::new(ServiceGatewayClientV1Facade::new(
+            cp.clone(),
+            dp.clone(),
+            backend_selector.clone(),
+        ));
 
         ctx.client_hub()
             .register::<dyn ServiceGatewayClientV1>(oagw.clone());
@@ -233,13 +293,10 @@ impl SystemCapability for OutboundApiGatewayGear {
         let provisioning: Arc<dyn TypeProvisioningService> =
             Arc::new(TypeProvisioningServiceImpl::new(registry));
 
-        // -- Materialize provisioned upstreams and routes into in-memory repos --
-        let app_state = self
-            .state
-            .load()
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("AppState not set — init() must run first"))?
-            .as_ref()
+        let provisioner = self
+            .registry_provisioner
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("RegistryProvisioner not set — init() must run first"))?
             .clone();
 
         // Resolve root tenant for provisioning context.
@@ -255,56 +312,19 @@ impl SystemCapability for OutboundApiGatewayGear {
             .0;
 
         // -- Materialise upstreams and routes from types-registry --
-        // GTS instance UUIDs are passed through as `CreateUpstreamRequest.id`
-        // and `CreateRouteRequest.id`, so OAGW uses the config-provided IDs
-        // directly. Route `upstream_id` already references the upstream's GTS
-        // instance UUID, so no remapping is needed.
         let upstreams = provisioning.list_upstreams().await?;
-        for u in &upstreams {
-            let tenant_id = u.tenant_id.unwrap_or(root_tenant_id);
-            let ctx = SecurityContext::builder()
-                .subject_tenant_id(tenant_id)
-                .subject_id(toolkit_security::constants::DEFAULT_SUBJECT_ID)
-                .build()?;
-            let created = app_state
-                .cp
-                .create_upstream(&ctx, u.request.clone())
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to provision upstream (tenant={tenant_id}): {e}")
-                })?;
-            info!(
-                id = %created.id,
-                tenant_id = %tenant_id,
-                alias = %created.alias,
-                "Provisioned upstream from types-registry"
-            );
-        }
-
         let routes = provisioning.list_routes().await?;
-        for r in &routes {
-            let tenant_id = r.tenant_id.unwrap_or(root_tenant_id);
-            let ctx = SecurityContext::builder()
-                .subject_tenant_id(tenant_id)
-                .subject_id(toolkit_security::constants::DEFAULT_SUBJECT_ID)
-                .build()?;
-            let created = app_state
-                .cp
-                .create_route(&ctx, r.request.clone())
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to provision route (tenant={tenant_id}): {e}")
-                })?;
-            info!(
-                id = %created.id,
-                tenant_id = %tenant_id,
-                "Provisioned route from types-registry"
-            );
-        }
-
+        let counts = reconcile_registry(&*provisioner, &upstreams, &routes, root_tenant_id).await?;
         info!(
-            upstreams = upstreams.len(),
-            routes = routes.len(),
+            upstreams_created = counts.upstreams.created,
+            upstreams_updated = counts.upstreams.updated,
+            upstreams_unchanged = counts.upstreams.unchanged,
+            upstreams_removed = counts.upstreams.removed,
+            upstreams_kept = counts.upstreams.kept,
+            routes_created = counts.routes.created,
+            routes_updated = counts.routes.updated,
+            routes_unchanged = counts.routes.unchanged,
+            routes_removed = counts.routes.removed,
             "Type provisioning complete"
         );
 
@@ -313,6 +333,14 @@ impl SystemCapability for OutboundApiGatewayGear {
             .map_err(|_| anyhow::anyhow!("TypeProvisioningService already set"))?;
 
         Ok(())
+    }
+}
+
+/// The OAGW schema migrations.
+impl DatabaseCapability for OutboundApiGatewayGear {
+    fn migrations(&self) -> Vec<Box<dyn MigrationTrait>> {
+        use sea_orm_migration::MigratorTrait;
+        Migrator::migrations()
     }
 }
 
@@ -341,3 +369,7 @@ impl RestApiCapability for OutboundApiGatewayGear {
         Ok(router)
     }
 }
+
+#[cfg(test)]
+#[path = "gear_tests.rs"]
+mod gear_tests;

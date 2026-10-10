@@ -8,8 +8,9 @@ use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::{ControlPlaneService, DataPlaneService};
+use super::{ControlPlaneService, DataPlaneService, EndpointSelector};
 use crate::domain::model;
+use crate::domain::repo::Tags;
 
 /// Facade that implements the public `ServiceGatewayClientV1` trait by
 /// delegating to the internal CP and DP services.
@@ -17,12 +18,23 @@ use crate::domain::model;
 pub(crate) struct ServiceGatewayClientV1Facade {
     cp: Arc<dyn ControlPlaneService>,
     dp: Arc<dyn DataPlaneService>,
+    /// Shared with the Data Plane; its cached pool is dropped on update/delete.
+    backend_selector: Arc<dyn EndpointSelector>,
 }
 
 impl ServiceGatewayClientV1Facade {
-    /// Create a facade over the given control-plane and data-plane services.
-    pub(crate) fn new(cp: Arc<dyn ControlPlaneService>, dp: Arc<dyn DataPlaneService>) -> Self {
-        Self { cp, dp }
+    /// Create a facade over the given control-plane and data-plane services
+    /// and endpoint selector.
+    pub(crate) fn new(
+        cp: Arc<dyn ControlPlaneService>,
+        dp: Arc<dyn DataPlaneService>,
+        backend_selector: Arc<dyn EndpointSelector>,
+    ) -> Self {
+        Self {
+            cp,
+            dp,
+            backend_selector,
+        }
     }
 }
 
@@ -76,19 +88,22 @@ impl ServiceGatewayClientV1 for ServiceGatewayClientV1Facade {
         req: oagw_sdk::UpdateUpstreamRequest,
     ) -> Result<oagw_sdk::Upstream, CanonicalError> {
         let internal_req = sdk_update_upstream_to_domain(req);
-        self.cp
+        let upstream = self
+            .cp
             .update_upstream(&ctx, id, internal_req)
             .await
-            .map(upstream_to_sdk)
-            .map_err(CanonicalError::from)
+            .map_err(CanonicalError::from)?;
+        self.backend_selector.invalidate(id);
+        Ok(upstream_to_sdk(upstream))
     }
 
     async fn delete_upstream(&self, ctx: SecurityContext, id: Uuid) -> Result<(), CanonicalError> {
         self.cp
             .delete_upstream(&ctx, id)
             .await
-            .map(|_| ())
-            .map_err(CanonicalError::from)
+            .map_err(CanonicalError::from)?;
+        self.backend_selector.invalidate(id);
+        Ok(())
     }
 
     async fn create_route(
@@ -162,7 +177,7 @@ impl ServiceGatewayClientV1 for ServiceGatewayClientV1Facade {
         path: &str,
     ) -> Result<(oagw_sdk::Upstream, oagw_sdk::Route), CanonicalError> {
         self.cp
-            .resolve_proxy_target(&ctx, alias, method, path)
+            .resolve_proxy_target(&ctx, alias, method, path, Tags::Load)
             .await
             .map(|(u, r)| (upstream_to_sdk(u), route_to_sdk(r)))
             .map_err(CanonicalError::from)
@@ -721,6 +736,7 @@ mod tests {
             rate_limit: None,
             cors: None,
             tags: vec![],
+            managed_by: model::ManagedBy::Api,
         };
 
         let sdk = upstream_to_sdk(domain_upstream);
@@ -808,5 +824,238 @@ mod tests {
             let back = scheme_to_sdk(domain);
             assert_eq!(back, sdk_val);
         }
+    }
+
+    /// Records the upstreams whose cached pool was invalidated.
+    #[derive(Default)]
+    struct InvalidateRecorder(std::sync::Mutex<Vec<Uuid>>);
+
+    #[async_trait]
+    impl EndpointSelector for InvalidateRecorder {
+        async fn select(
+            &self,
+            _: Uuid,
+            _: &[model::Endpoint],
+        ) -> Result<super::super::SelectedEndpoint, super::super::SelectionError> {
+            Err(super::super::SelectionError::NoBackendsResolved)
+        }
+
+        fn invalidate(&self, upstream_id: Uuid) {
+            self.0.lock().unwrap().push(upstream_id);
+        }
+    }
+
+    /// The SDK's `resolve_proxy_target` returns the full effective
+    /// configuration, with the upstream's and the route's tags, which the
+    /// proxy itself skips.
+    #[tokio::test]
+    async fn sdk_resolve_proxy_target_returns_tags() {
+        use crate::domain::test_support::{TestCpBuilder, TestDpBuilder, build_test_gateway};
+
+        let hub = toolkit::client_hub::ClientHub::new();
+        let gw = build_test_gateway(&hub, TestCpBuilder::new(), TestDpBuilder::new());
+        let ctx = SecurityContext::builder()
+            .subject_tenant_id(Uuid::new_v4())
+            .subject_id(Uuid::new_v4())
+            .build()
+            .unwrap();
+        let server = oagw_sdk::Server {
+            endpoints: vec![oagw_sdk::Endpoint {
+                scheme: oagw_sdk::Scheme::Https,
+                host: "api.example.com".into(),
+                port: 443,
+            }],
+        };
+        let upstream = gw
+            .create_upstream(
+                ctx.clone(),
+                oagw_sdk::CreateUpstreamRequest::builder(server, oagw_sdk::HTTP_PROTOCOL_ID)
+                    .tags(vec!["ai".into()])
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let rules = oagw_sdk::MatchRules {
+            http: Some(oagw_sdk::HttpMatch {
+                methods: vec![oagw_sdk::HttpMethod::Get],
+                path: "/v1".into(),
+                query_allowlist: vec![],
+                path_suffix_mode: oagw_sdk::PathSuffixMode::Append,
+            }),
+            grpc: None,
+        };
+        gw.create_route(
+            ctx.clone(),
+            oagw_sdk::CreateRouteRequest::builder(upstream.id, rules)
+                .tags(vec!["chat".into()])
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let (effective, route) = gw
+            .resolve_proxy_target(ctx, "api.example.com", "GET", "/v1/models")
+            .await
+            .unwrap();
+        assert_eq!(route.tags, vec!["chat".to_owned()]);
+        assert!(
+            effective.tags.iter().any(|t| t == "ai"),
+            "{:?}",
+            effective.tags
+        );
+        assert!(
+            effective.tags.iter().any(|t| t == "chat"),
+            "{:?}",
+            effective.tags
+        );
+    }
+
+    /// SDK updates and deletes drop the cached pool, like the REST handlers.
+    #[tokio::test]
+    async fn sdk_update_and_delete_invalidate_the_cached_pool() {
+        use crate::domain::test_support::{TestCpBuilder, TestDpBuilder, build_test_gateway};
+
+        let hub = toolkit::client_hub::ClientHub::new();
+        let selector = Arc::new(InvalidateRecorder::default());
+        let gw = build_test_gateway(
+            &hub,
+            TestCpBuilder::new(),
+            TestDpBuilder::new().with_backend_selector(selector.clone()),
+        );
+        let ctx = SecurityContext::builder()
+            .subject_tenant_id(Uuid::new_v4())
+            .subject_id(Uuid::new_v4())
+            .build()
+            .unwrap();
+        let server = oagw_sdk::Server {
+            endpoints: vec![oagw_sdk::Endpoint {
+                scheme: oagw_sdk::Scheme::Https,
+                host: "api.example.com".into(),
+                port: 443,
+            }],
+        };
+        let upstream = gw
+            .create_upstream(
+                ctx.clone(),
+                oagw_sdk::CreateUpstreamRequest::builder(
+                    server.clone(),
+                    oagw_sdk::HTTP_PROTOCOL_ID,
+                )
+                .build(),
+            )
+            .await
+            .unwrap();
+
+        gw.update_upstream(
+            ctx.clone(),
+            upstream.id,
+            oagw_sdk::UpdateUpstreamRequest::builder(server, oagw_sdk::HTTP_PROTOCOL_ID).build(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*selector.0.lock().unwrap(), vec![upstream.id]);
+
+        gw.delete_upstream(ctx, upstream.id).await.unwrap();
+        assert_eq!(*selector.0.lock().unwrap(), vec![upstream.id, upstream.id]);
+    }
+
+    /// SDK writes to types-registry rows fail with `REGISTRY_MANAGED`, scoped
+    /// to the resource, and a failed write leaves the cached pool alone.
+    #[tokio::test]
+    async fn sdk_writes_to_registry_rows_fail_and_keep_the_cached_pool() {
+        use crate::domain::services::registry_reconcile::tests::{
+            in_memory_control_plane, registry_instances,
+        };
+        use crate::domain::services::registry_reconcile::{provisioning_ctx, reconcile_registry};
+        use crate::domain::test_support::{MockCredStoreClient, TestDpBuilder};
+
+        let hub = toolkit::client_hub::ClientHub::new();
+        hub.register::<dyn credstore_sdk::CredStoreClientV1>(
+            Arc::new(MockCredStoreClient::empty()),
+        );
+        let cp = Arc::new(in_memory_control_plane());
+        let root = Uuid::new_v4();
+        let (upstreams, routes) = registry_instances(root);
+        reconcile_registry(&*cp, &upstreams, &routes, root)
+            .await
+            .unwrap();
+        let cp: Arc<dyn ControlPlaneService> = cp;
+        let selector = Arc::new(InvalidateRecorder::default());
+        let dp = TestDpBuilder::new()
+            .with_backend_selector(selector.clone())
+            .build_and_register(&hub, cp.clone());
+        let gw = ServiceGatewayClientV1Facade::new(cp, dp, selector.clone());
+        let ctx = provisioning_ctx(root).unwrap();
+        let upstream_id = upstreams[0].request.id.unwrap();
+        let route_id = routes[0].request.id.unwrap();
+        let server = oagw_sdk::Server {
+            endpoints: vec![oagw_sdk::Endpoint {
+                scheme: oagw_sdk::Scheme::Https,
+                host: "api.example.com".into(),
+                port: 443,
+            }],
+        };
+        let update_upstream = || {
+            oagw_sdk::UpdateUpstreamRequest::builder(server.clone(), oagw_sdk::HTTP_PROTOCOL_ID)
+                .build()
+        };
+        let update_route = || {
+            oagw_sdk::UpdateRouteRequest::builder(oagw_sdk::MatchRules {
+                http: Some(oagw_sdk::HttpMatch {
+                    methods: vec![oagw_sdk::HttpMethod::Post],
+                    path: "/v1".into(),
+                    query_allowlist: vec![],
+                    path_suffix_mode: oagw_sdk::PathSuffixMode::Append,
+                }),
+                grpc: None,
+            })
+            .build()
+        };
+
+        #[track_caller]
+        fn assert_registry_managed(result: Result<(), CanonicalError>, resource_type: &str) {
+            let err = result.expect_err("a registry row is read-only");
+            assert_eq!(err.resource_type(), Some(resource_type));
+            match oagw_sdk::ServiceGatewayError::from(err) {
+                oagw_sdk::ServiceGatewayError::FailedPrecondition {
+                    precondition_type,
+                    subject,
+                    ..
+                } => {
+                    assert_eq!(precondition_type, oagw_sdk::precondition::REGISTRY_MANAGED);
+                    assert_eq!(subject, oagw_sdk::precondition::MANAGED_BY);
+                }
+                other => panic!("expected FailedPrecondition, got {other:?}"),
+            }
+        }
+        let upstream_schema = oagw_sdk::gts::UPSTREAM_SCHEMA;
+        let route_schema = oagw_sdk::gts::ROUTE_SCHEMA;
+        assert_registry_managed(
+            gw.update_upstream(ctx.clone(), upstream_id, update_upstream())
+                .await
+                .map(drop),
+            upstream_schema,
+        );
+        assert_registry_managed(
+            gw.delete_upstream(ctx.clone(), upstream_id).await,
+            upstream_schema,
+        );
+        assert_registry_managed(
+            gw.update_route(ctx.clone(), route_id, update_route())
+                .await
+                .map(drop),
+            route_schema,
+        );
+        assert_registry_managed(gw.delete_route(ctx.clone(), route_id).await, route_schema);
+
+        // An unknown upstream also leaves the pool alone.
+        let missing = Uuid::new_v4();
+        assert!(
+            gw.update_upstream(ctx.clone(), missing, update_upstream())
+                .await
+                .is_err()
+        );
+        assert!(gw.delete_upstream(ctx, missing).await.is_err());
+        assert!(selector.0.lock().unwrap().is_empty());
     }
 }

@@ -2,7 +2,7 @@ use crate::domain::error::DomainError;
 use crate::domain::model::Endpoint;
 
 /// Maximum length for an upstream alias.
-const MAX_ALIAS_LENGTH: usize = 253;
+pub(crate) const MAX_ALIAS_LENGTH: usize = 253;
 
 /// Validate an alias: non-empty, max length, safe charset (alphanumeric + `.:-_`),
 /// must contain at least one alphanumeric character, and must not be a dot-segment.

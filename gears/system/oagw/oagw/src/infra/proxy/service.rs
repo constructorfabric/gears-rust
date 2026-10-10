@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -14,6 +14,7 @@ use pingora_core::apps::HttpServerApp;
 use pingora_proxy::HttpProxy;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use toolkit_security::SecurityContext;
 
 use uuid::Uuid;
@@ -32,6 +33,7 @@ use crate::domain::ports::metric_labels::{self, phase};
 use crate::domain::rate_limit::{
     RateLimitKeyContext, RateLimitOutcome, RateLimitResource, RateLimiter, build_rate_limit_key,
 };
+use crate::domain::repo::Tags;
 use crate::domain::services::{
     ControlPlaneService, DataPlaneService, EndpointSelector, SelectedEndpoint,
 };
@@ -48,6 +50,8 @@ use super::{request_builder, session_bridge};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default maximum request body size: 100 MB.
 const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
+/// How often idle rate-limit buckets are evicted.
+const RATE_LIMIT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Data Plane service implementation: proxy orchestration and plugin execution.
 pub struct DataPlaneServiceImpl {
@@ -60,7 +64,7 @@ pub struct DataPlaneServiceImpl {
     auth_registry: AuthPluginRegistry,
     guard_registry: GuardPluginRegistry,
     transform_registry: TransformPluginRegistry,
-    rate_limiter: RateLimiter,
+    rate_limiter: Arc<RateLimiter>,
     request_timeout: Duration,
     /// Enforces authorization policy before proxying each request.
     policy_enforcer: PolicyEnforcer,
@@ -95,7 +99,7 @@ impl DataPlaneServiceImpl {
             AuthPluginRegistry::with_builtins(credstore, token_http_config, token_cache_config);
         let guard_registry = GuardPluginRegistry::with_builtins();
         let transform_registry = TransformPluginRegistry::with_builtins();
-        let rate_limiter = RateLimiter::new();
+        let rate_limiter = Arc::new(RateLimiter::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Self {
@@ -117,6 +121,19 @@ impl DataPlaneServiceImpl {
             streaming_idle_timeout: Duration::from_secs(300),
             metrics,
         }
+    }
+
+    /// Start evicting idle rate-limit buckets every
+    /// [`RATE_LIMIT_SWEEP_INTERVAL`]. The task ends when `cancel` fires or
+    /// this service is dropped.
+    pub fn spawn_rate_limit_sweeper(&self, cancel: CancellationToken) {
+        tokio::spawn(sweep_rate_limits(
+            Arc::downgrade(&self.rate_limiter),
+            Arc::clone(&self.metrics),
+            RATE_LIMIT_SWEEP_INTERVAL,
+            self.shutdown_rx.clone(),
+            cancel,
+        ));
     }
 
     /// Override the request timeout.
@@ -562,7 +579,7 @@ impl DataPlaneService for DataPlaneServiceImpl {
             // 1. Resolve upstream + route in one pass (single hierarchy walk).
             let (upstream, route) = self
                 .cp
-                .resolve_proxy_target(&ctx, &alias, method.as_ref(), &path_suffix)
+                .resolve_proxy_target(&ctx, &alias, method.as_ref(), &path_suffix, Tags::Skip)
                 .await?;
 
             // Capture metric labels now that upstream + route are known, and
@@ -893,6 +910,37 @@ impl DataPlaneService for DataPlaneServiceImpl {
 
     fn remove_rate_limit_keys_for_route(&self, route_id: Uuid) {
         self.rate_limiter.remove_keys_for_route(route_id);
+    }
+}
+
+/// Evict idle rate-limit buckets every `interval` until the service is
+/// dropped: its shutdown sender closes, or the limiter is gone.
+async fn sweep_rate_limits(
+    limiter: Weak<RateLimiter>,
+    metrics: Arc<dyn OagwMetricsPort>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    cancel: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    // A slow sweep should not fire a catch-up burst on the next tick.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            _ = shutdown.changed() => return,
+            _ = ticker.tick() => {
+                let Some(limiter) = limiter.upgrade() else {
+                    return;
+                };
+                let evicted = limiter.evict_idle();
+                let live = limiter.bucket_count();
+                metrics.record_rate_limit_sweep(evicted as u64, live as u64);
+                if evicted > 0 {
+                    tracing::debug!(evicted, live, "evicted idle rate-limit buckets");
+                }
+            }
+        }
     }
 }
 
@@ -1709,6 +1757,7 @@ fn domain_error_type_name(err: &DomainError) -> &'static str {
     match err {
         DomainError::Validation { .. } => "ValidationError",
         DomainError::Conflict { .. } => "Conflict",
+        DomainError::RegistryManaged { .. } => "RegistryManaged",
         DomainError::MissingTargetHost { .. } => "MissingTargetHost",
         DomainError::InvalidTargetHost { .. } => "InvalidTargetHost",
         DomainError::UnknownTargetHost { .. } => "UnknownTargetHost",
@@ -1784,7 +1833,7 @@ fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::model::{Endpoint, Scheme, Server, Upstream};
+    use crate::domain::model::{Endpoint, ManagedBy, Scheme, Server, Upstream};
     use crate::domain::services::{EndpointSelector, SelectionError};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use uuid::Uuid;
@@ -1840,6 +1889,7 @@ mod tests {
             rate_limit: None,
             cors: None,
             tags: vec![],
+            managed_by: ManagedBy::Api,
         }
     }
 
@@ -1879,6 +1929,13 @@ mod tests {
 
     /// Build a minimal `DataPlaneServiceImpl` with the given `BackendSelector`.
     fn build_svc(selector: Arc<dyn EndpointSelector>) -> DataPlaneServiceImpl {
+        build_svc_with_metrics(selector, Arc::new(crate::domain::ports::NoopMetrics))
+    }
+
+    fn build_svc_with_metrics(
+        selector: Arc<dyn EndpointSelector>,
+        metrics: Arc<dyn OagwMetricsPort>,
+    ) -> DataPlaneServiceImpl {
         use authz_resolver_sdk::{
             AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
             PolicyEnforcer,
@@ -1950,7 +2007,7 @@ mod tests {
                 &self,
                 _: &SecurityContext,
                 _: Uuid,
-            ) -> Result<Vec<Uuid>, DomainError> {
+            ) -> Result<(), DomainError> {
                 unimplemented!()
             }
             async fn create_route(
@@ -1988,6 +2045,7 @@ mod tests {
                 _: &str,
                 _: &str,
                 _: &str,
+                _: Tags,
             ) -> Result<(Upstream, Route), DomainError> {
                 unimplemented!()
             }
@@ -2014,7 +2072,7 @@ mod tests {
             TokenCacheConfig::default(),
             selector,
             proxy,
-            Arc::new(crate::domain::ports::NoopMetrics),
+            metrics,
         )
     }
 
@@ -2222,5 +2280,143 @@ mod tests {
             matches!(err, DomainError::UnknownTargetHost { .. }),
             "expected UnknownTargetHost for mismatched header on single-endpoint upstream"
         );
+    }
+
+    // -- Idle rate-limit bucket sweep --
+
+    fn fast_refill_config() -> crate::domain::model::RateLimitConfig {
+        use crate::domain::model::{
+            RateLimitAlgorithm, RateLimitConfig, RateLimitScope, RateLimitStrategy, SustainedRate,
+            Window,
+        };
+        // A spent token is back within a millisecond.
+        RateLimitConfig {
+            sharing: Default::default(),
+            algorithm: RateLimitAlgorithm::TokenBucket,
+            sustained: SustainedRate {
+                rate: 1_000,
+                window: Window::Second,
+            },
+            burst: None,
+            budget: None,
+            scope: RateLimitScope::Global,
+            strategy: RateLimitStrategy::Reject,
+            cost: 1,
+            response_headers: false,
+            pool_owner_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_evicts_idle_buckets() {
+        let limiter = Arc::new(RateLimiter::new());
+        limiter
+            .try_consume("key", &fast_refill_config(), "/test")
+            .unwrap();
+        let (_tx, rx) = watch::channel(false);
+        let sweep = tokio::spawn(sweep_rate_limits(
+            Arc::downgrade(&limiter),
+            Arc::new(crate::domain::ports::NoopMetrics),
+            Duration::from_millis(5),
+            rx,
+            CancellationToken::new(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while limiter.bucket_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the sweep evicts the refilled bucket");
+        sweep.abort();
+    }
+
+    #[tokio::test]
+    async fn sweep_ends_when_the_service_drops_its_shutdown_sender() {
+        let limiter = Arc::new(RateLimiter::new());
+        let (tx, rx) = watch::channel(false);
+        let sweep = tokio::spawn(sweep_rate_limits(
+            Arc::downgrade(&limiter),
+            Arc::new(crate::domain::ports::NoopMetrics),
+            Duration::from_secs(3600),
+            rx,
+            CancellationToken::new(),
+        ));
+
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), sweep)
+            .await
+            .expect("the sweep ends")
+            .unwrap();
+    }
+
+    /// Keeps only what the sweep reports.
+    #[derive(Default)]
+    struct SweepRecorder(std::sync::Mutex<Vec<(u64, u64)>>);
+
+    impl OagwMetricsPort for SweepRecorder {
+        fn record_request(&self, _: &str, _: &str, _: &str, _: u16) {}
+        fn record_error(&self, _: &str, _: &str, _: &str) {}
+        fn record_request_duration_seconds(&self, _: &str, _: &str, _: &str, _: f64) {}
+        fn increment_in_flight(&self, _: &str) {}
+        fn decrement_in_flight(&self, _: &str) {}
+        fn record_rate_limit_exceeded(&self, _: &str, _: &str) {}
+        fn record_rate_limit_usage_ratio(&self, _: &str, _: &str, _: f64) {}
+        fn increment_active_websocket_sessions(&self, _: &str) {}
+        fn decrement_active_websocket_sessions(&self, _: &str) {}
+        fn record_websocket_session_duration_seconds(&self, _: &str, _: f64) {}
+        fn record_rate_limit_sweep(&self, evicted: u64, live: u64) {
+            self.0.lock().unwrap().push((evicted, live));
+        }
+    }
+
+    /// The sweeper the gear spawns ticks every interval, reports evicted and
+    /// live bucket counts, and stops when the gear's token is cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn spawned_sweeper_reports_each_tick_and_stops_on_cancel() {
+        let metrics = Arc::new(SweepRecorder::default());
+        let svc = build_svc_with_metrics(Arc::new(MockSelector::new()), metrics.clone());
+        let mut slow = fast_refill_config();
+        slow.sustained.window = crate::domain::model::Window::Day;
+        svc.rate_limiter
+            .try_consume("refilled", &fast_refill_config(), "/test")
+            .unwrap();
+        svc.rate_limiter
+            .try_consume("draining", &slow, "/test")
+            .unwrap();
+        // The limiter reads the real clock: let the fast bucket refill.
+        std::thread::sleep(Duration::from_millis(5));
+        let half = RATE_LIMIT_SWEEP_INTERVAL / 2;
+        let cancel = CancellationToken::new();
+        svc.spawn_rate_limit_sweeper(cancel.clone());
+
+        // Ticks fire at 0 and at one interval; each sleep ends between ticks.
+        tokio::time::sleep(half).await;
+        tokio::time::sleep(RATE_LIMIT_SWEEP_INTERVAL).await;
+        assert_eq!(*metrics.0.lock().unwrap(), vec![(1, 1), (0, 1)]);
+
+        cancel.cancel();
+        tokio::time::sleep(RATE_LIMIT_SWEEP_INTERVAL * 3).await;
+        assert_eq!(metrics.0.lock().unwrap().len(), 2, "no tick after cancel");
+    }
+
+    #[tokio::test]
+    async fn sweep_ends_when_the_limiter_is_dropped() {
+        let limiter = Arc::new(RateLimiter::new());
+        let (_tx, rx) = watch::channel(false);
+        let sweep = tokio::spawn(sweep_rate_limits(
+            Arc::downgrade(&limiter),
+            Arc::new(crate::domain::ports::NoopMetrics),
+            Duration::from_millis(5),
+            rx,
+            CancellationToken::new(),
+        ));
+
+        drop(limiter);
+        tokio::time::timeout(Duration::from_secs(5), sweep)
+            .await
+            .expect("the sweep ends")
+            .unwrap();
     }
 }

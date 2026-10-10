@@ -340,6 +340,82 @@ async fn proxy_nonexistent_alias_returns_404() {
     }
 }
 
+// 6.5: Known alias, no matching route: 404 without calling the upstream.
+#[tokio::test]
+async fn proxy_known_alias_without_matching_route_returns_404() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "POST",
+        "/v1/chat",
+        MockResponse {
+            status: 200,
+            headers: vec![],
+            body: MockBody::Json(json!({})),
+        },
+    );
+    let h = AppHarness::builder().build().await;
+    let ctx = h.security_context().clone();
+    let upstream = h
+        .facade()
+        .create_upstream(
+            ctx.clone(),
+            CreateUpstreamRequest::builder(
+                Server {
+                    endpoints: vec![Endpoint {
+                        scheme: Scheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: h.mock_port(),
+                    }],
+                },
+                HTTP_PROTOCOL_ID,
+            )
+            .alias("no-route-test")
+            .build(),
+        )
+        .await
+        .unwrap();
+    h.facade()
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Post],
+                        path: guard.path("/v1/chat"),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Disabled,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    // Wrong method on the route's path, then the right method on another path.
+    for (method, path) in [
+        (Method::GET, guard.path("/v1/chat")),
+        (Method::POST, guard.path("/v2/other")),
+    ] {
+        let req = http::Request::builder()
+            .method(method.clone())
+            .uri(format!("/no-route-test{path}"))
+            .body(Body::Empty)
+            .unwrap();
+        match h.facade().proxy_request(ctx.clone(), req).await {
+            Err(err) => assert!(
+                matches!(err, CanonicalError::NotFound { .. })
+                    && err.resource_type() == Some(oagw_sdk::gts::ROUTE_SCHEMA),
+                "{method} {path}: expected a route 404, got {err:?}"
+            ),
+            Ok(resp) => panic!("{method} {path}: expected 404, got {}", resp.status()),
+        }
+    }
+    assert!(guard.recorded_requests().await.is_empty());
+}
+
 // 6.17: Pipeline abort — disabled upstream returns 503.
 #[tokio::test]
 async fn proxy_disabled_upstream_returns_503() {

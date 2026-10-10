@@ -56,6 +56,8 @@ pub struct OagwMetricsMeter {
     requests_in_flight: UpDownCounter<i64>,
     rate_limit_exceeded: Counter<u64>,
     rate_limit_usage_ratio: Gauge<f64>,
+    rate_limit_buckets_evicted: Counter<u64>,
+    rate_limit_buckets: Gauge<u64>,
     active_websocket_sessions: UpDownCounter<i64>,
     websocket_session_duration_seconds: Histogram<f64>,
 }
@@ -91,6 +93,14 @@ impl OagwMetricsMeter {
             rate_limit_usage_ratio: meter
                 .f64_gauge(format!("{prefix}_rate_limit_usage_ratio"))
                 .with_description("Current rate-limit bucket usage ratio (1 - remaining/limit)")
+                .build(),
+            rate_limit_buckets_evicted: meter
+                .u64_counter(format!("{prefix}_rate_limit_buckets_evicted"))
+                .with_description("Idle rate-limit buckets evicted by the periodic sweep")
+                .build(),
+            rate_limit_buckets: meter
+                .u64_gauge(format!("{prefix}_rate_limit_buckets"))
+                .with_description("Rate-limit buckets held in memory after the last sweep")
                 .build(),
             active_websocket_sessions: meter
                 .i64_up_down_counter(format!("{prefix}_active_websocket_sessions"))
@@ -185,6 +195,11 @@ impl OagwMetricsPort for OagwMetricsMeter {
     fn record_websocket_session_duration_seconds(&self, host: &str, seconds: f64) {
         self.websocket_session_duration_seconds
             .record(seconds, &[KeyValue::new(key::HOST, host.to_owned())]);
+    }
+
+    fn record_rate_limit_sweep(&self, evicted: u64, live: u64) {
+        self.rate_limit_buckets_evicted.add(evicted, &[]);
+        self.rate_limit_buckets.record(live, &[]);
     }
 }
 

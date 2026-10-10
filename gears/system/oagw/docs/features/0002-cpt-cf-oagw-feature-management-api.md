@@ -66,7 +66,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 
 - **PRD**: [PRD.md](../PRD.md)
 - **Design**: [DESIGN.md](../DESIGN.md)
-- **ADRs**: [0009 Storage Schema](../ADR/0009-storage-schema.md), [0010 Resource Identification](../ADR/0010-resource-identification.md)
+- **ADRs**: [0009 Storage Schema](../ADR/0009-storage-schema.md), [0010 Resource Identification](../ADR/0010-resource-identification.md), [0018 Optional Persistence](../ADR/0018-optional-persistence.md)
 - **Dependencies**: `cpt-cf-oagw-feature-domain-foundation`
 
 **Out of scope**:
@@ -80,6 +80,10 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 
 ## 2. Actor Flows (CDSL)
 
+> **Authorization note**: the management API authenticates every request and scopes it to the caller's tenant, but does not evaluate the GTS permissions named in the steps below (`gts.cf.core.oagw.upstream.v1~:…`, `gts.cf.core.oagw.route.v1~:…`); no Control Plane operation calls `PolicyEnforcer` for them. Only binding to an ancestor's upstream is authorized. Within a tenant, any authenticated subject can therefore create, update, read and delete upstreams and routes. The permission steps stay unchecked until this is implemented.
+
+> **Storage note**: `Repo:` steps run against the repositories selected at startup by `cpt-cf-oagw-algo-domain-storage-selection` — in-memory without a database, the `cpt-cf-oagw-adr-storage-schema` tables with one (`cpt-cf-oagw-adr-optional-persistence`). With a database, each `Repo:` create and update runs in one transaction that covers the parent row and its child rows (tags, match keys, methods, plugin bindings), and a failure rolls the whole write back; each delete is one statement. Get and list read the parent and child rows in one read-only snapshot transaction.
+
 ### Create Upstream Flow
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-flow-mgmt-create-upstream`
@@ -87,7 +91,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 **Actor**: `cpt-cf-oagw-actor-platform-operator`, `cpt-cf-oagw-actor-tenant-admin`
 
 **Success Scenarios**:
-- Upstream is created with enforced alias (auto-derived or explicit) and persisted to database
+- Upstream is created with enforced alias (auto-derived or explicit) and stored (persisted when a database is configured)
 - Response contains the created upstream with GTS anonymous identifier
 
 **Error Scenarios**:
@@ -98,20 +102,16 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 **Steps**:
 1. [x] - `p1` - Actor sends POST /api/oagw/v1/upstreams with server endpoints, protocol, auth config, headers, rate limit config, tags - `inst-create-us-1`
 2. [x] - `p1` - API: Extract SecurityContext (tenant_id, principal_id, permissions) - `inst-create-us-2`
-3. [x] - `p1` - API: Validate actor has `gts.cf.core.oagw.upstream.v1~:create` permission - `inst-create-us-3`
+3. [ ] - `p1` - API: Validate actor has `gts.cf.core.oagw.upstream.v1~:create` permission - `inst-create-us-3`
 4. [x] - `p1` - API: Deserialize and validate DTO structure - `inst-create-us-4`
 5. [x] - `p1` - Domain: Execute upstream validation algorithm (`cpt-cf-oagw-algo-mgmt-validate-upstream`) - `inst-create-us-5`
 6. [x] - `p1` - **IF** validation fails - `inst-create-us-6`
    1. [x] - `p1` - **RETURN** 400 ValidationError (RFC 9457 Problem Details) - `inst-create-us-6a`
 7. [x] - `p1` - Domain: Execute alias enforcement algorithm (`cpt-cf-oagw-algo-mgmt-enforce-alias`) - `inst-create-us-7`
-8. [x] - `p1` - DB: BEGIN transaction - `inst-create-us-8`
-9. [x] - `p1` - DB: INSERT oagw_upstream (id, tenant_id, alias, protocol, enabled, server_config, auth_config, headers_config, rate_limit_config, cors_config, plugins_config) - `inst-create-us-9`
-10. [x] - `p1` - DB: INSERT oagw_upstream_tag for each tag in request - `inst-create-us-10`
-11. [x] - `p1` - **IF** `(tenant_id, alias)` uniqueness violation - `inst-create-us-11`
-    1. [x] - `p1` - DB: ROLLBACK - `inst-create-us-11a`
-    2. [x] - `p1` - **RETURN** 409 Conflict - `inst-create-us-11b`
-12. [x] - `p1` - DB: COMMIT - `inst-create-us-12`
-13. [x] - `p1` - **RETURN** 201 Created with upstream resource (GTS ID: `gts.cf.core.oagw.upstream.v1~{uuid}`) - `inst-create-us-13`
+8. [x] - `p1` - Repo: INSERT upstream row, tag rows, and plugin binding rows (one transaction) - `inst-create-us-9`
+9. [x] - `p1` - **IF** `(tenant_id, alias)` uniqueness violation - `inst-create-us-11`
+   1. [x] - `p1` - **RETURN** 409 Conflict - `inst-create-us-11b`
+10. [x] - `p1` - **RETURN** 201 Created with upstream resource (GTS ID: `gts.cf.core.oagw.upstream.v1~{uuid}`) - `inst-create-us-13`
 
 ### Update Upstream Flow
 
@@ -130,28 +130,27 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 - Alias conflict after re-enforcement
 - Alias override rejected for hostname-based endpoints (400 Validation) — applies to both endpoint-change and alias-only updates
 - Hostname→IP endpoint transition without explicit alias (400 Validation)
+- Upstream is managed by the types registry (400 `failed_precondition`, violation type `REGISTRY_MANAGED`)
 
 **Steps**:
 1. [x] - `p1` - Actor sends PUT /api/oagw/v1/upstreams/{id} with updated configuration - `inst-update-us-1`
-2. [x] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:override` permission - `inst-update-us-2`
+2. [ ] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:override` permission - `inst-update-us-2`
 3. [x] - `p1` - API: Parse GTS anonymous identifier from path to extract UUID - `inst-update-us-3`
-4. [x] - `p1` - DB: SELECT oagw_upstream WHERE id = :uuid AND tenant_id = :tenant_id - `inst-update-us-4`
+4. [x] - `p1` - Repo: SELECT upstream WHERE id = :uuid AND tenant_id = :tenant_id - `inst-update-us-4`
 5. [x] - `p1` - **IF** upstream not found - `inst-update-us-5`
    1. [x] - `p1` - **RETURN** 404 Not Found - `inst-update-us-5a`
-6. [x] - `p1` - Domain: Execute upstream validation algorithm (`cpt-cf-oagw-algo-mgmt-validate-upstream`) - `inst-update-us-6`
-7. [x] - `p1` - **IF** server endpoints changed - `inst-update-us-7`
+6. [x] - `p1` - **IF** the upstream is registry-managed (`managed_by = registry`) - `inst-update-us-5b`
+   1. [x] - `p1` - **RETURN** 400 `failed_precondition` (`REGISTRY_MANAGED`): the upstream changes only with its types-registry instance - `inst-update-us-5c`
+7. [x] - `p1` - Domain: Execute upstream validation algorithm (`cpt-cf-oagw-algo-mgmt-validate-upstream`) - `inst-update-us-6`
+8. [x] - `p1` - **IF** server endpoints changed - `inst-update-us-7`
    1. [x] - `p1` - Domain: Re-execute alias enforcement algorithm (`cpt-cf-oagw-algo-mgmt-enforce-alias`) with old/new endpoint transition rules - `inst-update-us-7a`
    2. [x] - `p1` - **ELSE IF** alias field provided without endpoint change - `inst-update-us-7b`
       1. [x] - `p1` - **IF** endpoints are hostname-based AND normalized alias differs from derived value → **RETURN** 400 Validation: "alias cannot be overridden for hostname-based endpoints" - `inst-update-us-7b1`
       2. [x] - `p1` - **ELSE** (IP-based endpoints): normalize and validate alias; accept update - `inst-update-us-7b2`
-8. [x] - `p1` - DB: BEGIN transaction - `inst-update-us-8`
-9. [x] - `p1` - DB: UPDATE oagw_upstream SET (updated fields) WHERE id = :uuid - `inst-update-us-9`
-10. [x] - `p1` - DB: DELETE + re-INSERT oagw_upstream_tag for updated tags - `inst-update-us-10`
-11. [x] - `p1` - **IF** `(tenant_id, alias)` uniqueness violation - `inst-update-us-11`
-    1. [x] - `p1` - DB: ROLLBACK - `inst-update-us-11a`
-    2. [x] - `p1` - **RETURN** 409 Conflict - `inst-update-us-11b`
-12. [x] - `p1` - DB: COMMIT - `inst-update-us-12`
-13. [x] - `p1` - **RETURN** 200 OK with updated upstream resource - `inst-update-us-13`
+9. [x] - `p1` - Repo: UPDATE upstream row WHERE id = :uuid AND tenant_id = :tenant_id; replace tag and plugin binding rows (one transaction) - `inst-update-us-9`
+10. [x] - `p1` - **IF** `(tenant_id, alias)` uniqueness violation - `inst-update-us-11`
+    1. [x] - `p1` - **RETURN** 409 Conflict - `inst-update-us-11b`
+11. [x] - `p1` - **RETURN** 200 OK with updated upstream resource - `inst-update-us-13`
 
 ### Delete Upstream Flow
 
@@ -160,20 +159,24 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 **Actor**: `cpt-cf-oagw-actor-platform-operator`, `cpt-cf-oagw-actor-tenant-admin`
 
 **Success Scenarios**:
-- Upstream and all associated routes are deleted (cascade)
+- Upstream and all associated routes are deleted (database: one `DELETE`, whose foreign-key cascade removes the routes and every child row)
 
 **Error Scenarios**:
 - Upstream not found
+- Upstream is managed by the types registry (400 `failed_precondition`, violation type `REGISTRY_MANAGED`)
 
 **Steps**:
 1. [x] - `p1` - Actor sends DELETE /api/oagw/v1/upstreams/{id} - `inst-delete-us-1`
-2. [x] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:delete` permission - `inst-delete-us-2`
+2. [ ] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:delete` permission - `inst-delete-us-2`
 3. [x] - `p1` - API: Parse GTS anonymous identifier from path to extract UUID - `inst-delete-us-3`
-4. [x] - `p1` - DB: SELECT oagw_upstream WHERE id = :uuid AND tenant_id = :tenant_id - `inst-delete-us-4`
-5. [x] - `p1` - **IF** upstream not found - `inst-delete-us-5`
+4. [x] - `p1` - Repo: SELECT upstream WHERE id = :uuid AND tenant_id = :tenant_id, to check its owner - `inst-delete-us-4`
+5. [x] - `p1` - **IF** the upstream is registry-managed (`managed_by = registry`) - `inst-delete-us-4a`
+   1. [x] - `p1` - **RETURN** 400 `failed_precondition` (`REGISTRY_MANAGED`): the upstream changes only with its types-registry instance - `inst-delete-us-4b`
+6. [x] - `p1` - Repo: DELETE upstream WHERE id = :uuid AND tenant_id = :tenant_id (database: the cascade removes its tags, plugin bindings, routes, and the routes' child rows) - `inst-delete-us-6`
+7. [x] - `p1` - **IF** the upstream was not found or no upstream was deleted - `inst-delete-us-5`
    1. [x] - `p1` - **RETURN** 404 Not Found - `inst-delete-us-5a`
-6. [x] - `p1` - DB: DELETE oagw_upstream WHERE id = :uuid (cascades to oagw_route, oagw_upstream_tag, oagw_upstream_plugin) - `inst-delete-us-6`
-7. [x] - `p1` - **RETURN** 204 No Content - `inst-delete-us-7`
+8. [x] - `p1` - Repo: delete the tenant's routes left on the upstream (in-memory only; database: a no-op, the cascade has removed them) - `inst-delete-us-6a`
+9. [x] - `p1` - **RETURN** 204 No Content - `inst-delete-us-7`
 
 ### List and Get Upstreams Flow
 
@@ -191,16 +194,16 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 
 **Steps**:
 1. [x] - `p1` - Actor sends GET /api/oagw/v1/upstreams[?$filter=...&$select=...&$orderby=...&$top=...&$skip=...] or GET /api/oagw/v1/upstreams/{id} - `inst-list-us-1`
-2. [x] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:read` permission - `inst-list-us-2`
+2. [ ] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.upstream.v1~:read` permission - `inst-list-us-2`
 3. [x] - `p1` - **IF** list request - `inst-list-us-3`
    1. [ ] - `p1` - API: Parse OData query parameters ($filter, $select, $orderby, $top with default 50 / max 100, $skip) - `inst-list-us-3a`
    2. [ ] - `p1` - **IF** OData parse error - `inst-list-us-3b`
       1. [ ] - `p1` - **RETURN** 400 ValidationError with parse error details - `inst-list-us-3b1`
-   3. [x] - `p1` - DB: SELECT oagw_upstream WHERE tenant_id = :tenant_id with OData filters applied - `inst-list-us-3c`
+   3. [x] - `p1` - Repo: SELECT upstreams WHERE tenant_id = :tenant_id with pagination applied - `inst-list-us-3c`
    4. [x] - `p1` - **RETURN** 200 OK with paginated upstream list - `inst-list-us-3d`
 4. [x] - `p1` - **IF** get-by-ID request - `inst-list-us-4`
    1. [x] - `p1` - API: Parse GTS anonymous identifier from path - `inst-list-us-4a`
-   2. [x] - `p1` - DB: SELECT oagw_upstream WHERE id = :uuid AND tenant_id = :tenant_id - `inst-list-us-4b`
+   2. [x] - `p1` - Repo: SELECT upstream WHERE id = :uuid AND tenant_id = :tenant_id - `inst-list-us-4b`
    3. [x] - `p1` - **IF** not found - `inst-list-us-4c`
       1. [x] - `p1` - **RETURN** 404 Not Found - `inst-list-us-4c1`
    4. [x] - `p1` - **RETURN** 200 OK with upstream resource - `inst-list-us-4d`
@@ -221,18 +224,13 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 
 **Steps**:
 1. [x] - `p1` - Actor sends POST /api/oagw/v1/routes with upstream_id, match rules (type, path, methods, query allowlist), priority, enabled, rate limit, cors, plugins, tags - `inst-create-rt-1`
-2. [x] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.route.v1~:create` permission - `inst-create-rt-2`
+2. [ ] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.route.v1~:create` permission - `inst-create-rt-2`
 3. [x] - `p1` - API: Deserialize and validate DTO structure - `inst-create-rt-3`
 4. [x] - `p1` - Domain: Execute route validation algorithm (`cpt-cf-oagw-algo-mgmt-validate-route`) - `inst-create-rt-4`
 5. [x] - `p1` - **IF** validation fails - `inst-create-rt-5`
    1. [x] - `p1` - **RETURN** 400 ValidationError (RFC 9457 Problem Details) - `inst-create-rt-5a`
-6. [x] - `p1` - DB: BEGIN transaction - `inst-create-rt-6`
-7. [x] - `p1` - DB: INSERT oagw_route (id, tenant_id, upstream_id, match_type, priority, enabled, rate_limit_config, cors_config, plugins_config) - `inst-create-rt-7`
-8. [x] - `p1` - DB: INSERT oagw_route_http_match or oagw_route_grpc_match based on match_type - `inst-create-rt-8`
-9. [x] - `p1` - DB: INSERT oagw_route_method for each allowed method - `inst-create-rt-9`
-10. [x] - `p1` - DB: INSERT oagw_route_tag for each tag - `inst-create-rt-10`
-11. [x] - `p1` - DB: COMMIT - `inst-create-rt-11`
-12. [x] - `p1` - **RETURN** 201 Created with route resource (GTS ID: `gts.cf.core.oagw.route.v1~{uuid}`) - `inst-create-rt-12`
+6. [x] - `p1` - Repo: INSERT route row, HTTP or gRPC match row, method rows, tag rows, and plugin binding rows (one transaction) - `inst-create-rt-7`
+7. [x] - `p1` - **RETURN** 201 Created with route resource (GTS ID: `gts.cf.core.oagw.route.v1~{uuid}`) - `inst-create-rt-12`
 
 ### Route Update, Delete, List, and Get Flow
 
@@ -242,33 +240,35 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 
 **Success Scenarios**:
 - Update: Route configuration updated; match rules re-validated
-- Delete: Route and associated match/method/tag rows deleted (cascade)
+- Delete: Route and its match, method, tag, and plugin binding rows deleted (cascade)
 - List: Paginated routes with OData query support; filterable by upstream_id
 - Get: Single route by GTS anonymous identifier
 
 **Error Scenarios**:
 - Route not found (wrong ID or tenant)
 - Update validation fails
+- Update or delete of a route managed by the types registry (400 `failed_precondition`, violation type `REGISTRY_MANAGED`)
 - Invalid OData query syntax
 
 **Steps**:
 1. [x] - `p1` - **IF** PUT /api/oagw/v1/routes/{id} - `inst-route-crud-1`
-   1. [x] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.route.v1~:override` permission - `inst-route-crud-1a`
-   2. [x] - `p1` - DB: SELECT oagw_route WHERE id = :uuid AND tenant_id = :tenant_id - `inst-route-crud-1b`
+   1. [ ] - `p1` - API: Extract SecurityContext and validate `gts.cf.core.oagw.route.v1~:override` permission - `inst-route-crud-1a`
+   2. [x] - `p1` - Repo: SELECT route WHERE id = :uuid AND tenant_id = :tenant_id - `inst-route-crud-1b`
    3. [x] - `p1` - **IF** not found, **RETURN** 404 Not Found - `inst-route-crud-1c`
-   4. [x] - `p1` - Domain: Execute route validation algorithm (`cpt-cf-oagw-algo-mgmt-validate-route`) - `inst-route-crud-1d`
-   5. [x] - `p1` - DB: BEGIN transaction; UPDATE oagw_route; DELETE + re-INSERT match/method/tag rows; COMMIT - `inst-route-crud-1e`
-   6. [x] - `p1` - **RETURN** 200 OK with updated route - `inst-route-crud-1f`
+   4. [x] - `p1` - **IF** the route is registry-managed (`managed_by = registry`), **RETURN** 400 `failed_precondition` (`REGISTRY_MANAGED`) - `inst-route-crud-1g`
+   5. [x] - `p1` - Domain: Execute route validation algorithm (`cpt-cf-oagw-algo-mgmt-validate-route`) - `inst-route-crud-1d`
+   6. [x] - `p1` - Repo: UPDATE route row (all fields except `upstream_id` and `managed_by`) WHERE id = :uuid AND tenant_id = :tenant_id; replace match, method, tag, and plugin binding rows (one transaction) - `inst-route-crud-1e`
+   7. [x] - `p1` - **RETURN** 200 OK with updated route - `inst-route-crud-1f`
 2. [x] - `p1` - **IF** DELETE /api/oagw/v1/routes/{id} - `inst-route-crud-2`
-   1. [x] - `p1` - API: Validate `gts.cf.core.oagw.route.v1~:delete` permission - `inst-route-crud-2a`
-   2. [x] - `p1` - DB: SELECT oagw_route WHERE id = :uuid AND tenant_id = :tenant_id - `inst-route-crud-2b`
-   3. [x] - `p1` - **IF** not found, **RETURN** 404 Not Found - `inst-route-crud-2c`
-   4. [x] - `p1` - DB: DELETE oagw_route WHERE id = :uuid (cascades to match/method/tag/plugin rows) - `inst-route-crud-2d`
+   1. [ ] - `p1` - API: Validate `gts.cf.core.oagw.route.v1~:delete` permission - `inst-route-crud-2a`
+   2. [x] - `p1` - Repo: SELECT route WHERE id = :uuid AND tenant_id = :tenant_id; **IF** not found, **RETURN** 404 Not Found; **IF** registry-managed, **RETURN** 400 `failed_precondition` (`REGISTRY_MANAGED`) - `inst-route-crud-2b`
+   3. [x] - `p1` - Repo: DELETE route WHERE id = :uuid AND tenant_id = :tenant_id (database: cascades to match, method, tag, and plugin binding rows) - `inst-route-crud-2d`
+   4. [x] - `p1` - **IF** no route was deleted, **RETURN** 404 Not Found - `inst-route-crud-2c`
    5. [x] - `p1` - **RETURN** 204 No Content - `inst-route-crud-2e`
 3. [x] - `p1` - **IF** GET /api/oagw/v1/routes or GET /api/oagw/v1/routes/{id} - `inst-route-crud-3`
-   1. [x] - `p1` - API: Validate `gts.cf.core.oagw.route.v1~:read` permission - `inst-route-crud-3a`
-   2. [x] - `p1` - **IF** list: Parse OData params; DB: SELECT with filters; **RETURN** 200 paginated list - `inst-route-crud-3b`
-   3. [x] - `p1` - **IF** get-by-ID: Parse GTS identifier; DB: SELECT by id+tenant; **RETURN** 200 or 404 - `inst-route-crud-3c`
+   1. [ ] - `p1` - API: Validate `gts.cf.core.oagw.route.v1~:read` permission - `inst-route-crud-3a`
+   2. [x] - `p1` - **IF** list: Parse query params; Repo: SELECT with tenant scope, optional upstream filter, and pagination; **RETURN** 200 paginated list - `inst-route-crud-3b`
+   3. [x] - `p1` - **IF** get-by-ID: Parse GTS identifier; Repo: SELECT by id+tenant; **RETURN** 200 or 404 - `inst-route-crud-3c`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -297,9 +297,11 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 5. [x] - `p1` - **IF** auth config contains secret_ref - `inst-val-us-5`
    1. [x] - `p1` - **IF** secret_ref does not match `cred://` URI format - `inst-val-us-5a`
       1. [x] - `p1` - Add error: "Invalid secret_ref format; expected cred:// URI" - `inst-val-us-5a1`
-6. [x] - `p1` - **IF** protocol not in [http, grpc] - `inst-val-us-6`
-   1. [x] - `p1` - Add error: "Unsupported protocol: {protocol}" - `inst-val-us-6a`
-7. [x] - `p1` - **RETURN** { valid: errors.length == 0, errors } - `inst-val-us-7`
+6. [ ] - `p1` - **IF** protocol not in [http, grpc] - `inst-val-us-6`
+   1. [ ] - `p1` - Add error: "Unsupported protocol: {protocol}" - `inst-val-us-6a`
+7. [x] - `p1` - **IF** tags, the protocol, the auth type, or a plugin reference exceed the stored field limits (see [Route Validation Algorithm](#route-validation-algorithm)) - `inst-val-us-tags`
+   1. [x] - `p1` - Add error naming the limit - `inst-val-us-tags-a`
+8. [x] - `p1` - **RETURN** { valid: errors.length == 0, errors } - `inst-val-us-7`
 
 ### Alias Enforcement Algorithm
 
@@ -310,6 +312,8 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 **Output**: Resolved alias string or validation error
 
 Alias behavior is determined entirely by endpoint type. Hostname-based endpoints always auto-derive; IP-based endpoints require explicit alias.
+
+The update and alias-only paths below apply to Management API and SDK writes. A types-registry upstream, written only by the startup reconcile, takes its alias by the create path on every update, so its instance can change it ([ADR-0018](../ADR/0018-optional-persistence.md#startup-provisioning-from-the-types-registry)).
 
 **Create path** (`enforce_alias_create_with` / `enforce_alias_create_derived`):
 1. [x] - `p1` - Attempt to derive alias from endpoints (`compute_derived_alias`) - `inst-alias-1`
@@ -361,7 +365,7 @@ Alias behavior is determined entirely by endpoint type. Hostname-based endpoints
 
 **Steps**:
 1. [x] - `p1` - Parse and normalize input fields - `inst-val-rt-1`
-2. [x] - `p1` - DB: SELECT oagw_upstream WHERE id = :upstream_id AND tenant_id = :tenant_id - `inst-val-rt-2`
+2. [x] - `p1` - Repo: SELECT upstream WHERE id = :upstream_id AND tenant_id = :tenant_id - `inst-val-rt-2`
 3. [x] - `p1` - **IF** upstream not found - `inst-val-rt-3`
    1. [x] - `p1` - Add error: "Referenced upstream does not exist or is not accessible" - `inst-val-rt-3a`
 4. [x] - `p1` - **IF** match_type == "http" - `inst-val-rt-4`
@@ -369,15 +373,23 @@ Alias behavior is determined entirely by endpoint type. Hostname-based endpoints
       1. [x] - `p1` - Add error: "HTTP match path is required" - `inst-val-rt-4a1`
    2. [x] - `p1` - **IF** match.http.methods contains invalid HTTP method - `inst-val-rt-4b`
       1. [x] - `p1` - Add error: "Invalid HTTP method: {method}" - `inst-val-rt-4b1`
+   3. [x] - `p1` - **IF** match.http.path or match.http.query_allowlist exceeds the stored field limits - `inst-val-rt-4c`
+      1. [x] - `p1` - Add error naming the limit - `inst-val-rt-4c1`
 5. [x] - `p1` - **IF** match_type == "grpc" - `inst-val-rt-5`
-   1. [x] - `p1` - **IF** match.grpc.service is empty - `inst-val-rt-5a`
-      1. [x] - `p1` - Add error: "gRPC service name is required" - `inst-val-rt-5a1`
+   1. [ ] - `p1` - **IF** match.grpc.service is empty (not enforced yet) - `inst-val-rt-5a`
+      1. [ ] - `p1` - Add error: "gRPC service name is required" - `inst-val-rt-5a1`
+   2. [x] - `p1` - **IF** match.grpc.service or match.grpc.method exceeds the stored field limits - `inst-val-rt-5b`
+      1. [x] - `p1` - Add error naming the limit - `inst-val-rt-5b1`
 6. [x] - `p1` - **IF** priority is not a positive integer - `inst-val-rt-6`
    1. [x] - `p1` - Add error: "Priority must be a positive integer" - `inst-val-rt-6a`
-7. [x] - `p1` - DB: SELECT oagw_route WHERE upstream_id = :upstream_id AND priority = :priority AND enabled = true - `inst-val-rt-7`
-8. [x] - `p1` - **IF** existing enabled route shares same path_prefix and priority (HTTP) or same service and method (gRPC), excluding self on update - `inst-val-rt-8`
-   1. [x] - `p1` - Add error: "Route match conflict: another enabled route with same priority and path prefix exists" - `inst-val-rt-8a`
-9. [x] - `p1` - **RETURN** { valid: errors.length == 0, errors } - `inst-val-rt-9`
+7. [x] - `p1` - **IF** the route is an enabled HTTP route: Repo: list the tenant's routes on the upstream (`list` with an upstream filter), and keep the enabled HTTP ones in application code - `inst-val-rt-7`
+8. [x] - `p1` - **IF** one of them shares the path_prefix, the priority, and at least one method, excluding self on update - `inst-val-rt-8`
+   1. [x] - `p1` - **RETURN** 409 Conflict: "route overlap: an enabled route already exists on upstream {upstream_id} with path {path}, priority {priority}, method {method}" - `inst-val-rt-8a`
+9. [x] - `p1` - **IF** tags or a plugin reference exceed the stored field limits - `inst-val-rt-tags`
+   1. [x] - `p1` - Add error naming the limit - `inst-val-rt-tags-a`
+10. [x] - `p1` - **RETURN** { valid: errors.length == 0, errors } - `inst-val-rt-9`
+
+**Stored field limits**: an upstream or route carries at most 64 tags, each at most 128 bytes; an HTTP path prefix is at most 2048 bytes; an HTTP match allows at most 64 query parameters, each at most 128 bytes; a gRPC service and a gRPC method are at most 256 bytes each; an upstream's protocol and auth type, and every plugin reference of an upstream or route, are at most 256 bytes each; an upstream or route carries at most 32 plugin bindings. None of these may contain control characters, NUL included. Strings stored inside JSON (auth and plugin config, header rules, CORS lists) may not contain NUL, which PostgreSQL's `jsonb` cannot store; other control characters are allowed there. They apply on create and update, through the Management API, the SDK, and types-registry provisioning alike, and a violation is a 400 validation error. Each is stored in a `VARCHAR` sized to its limit (query parameters inside the route's JSON), and PostgreSQL rejects any text containing NUL, so without the limits such input would fail as a 500 on PostgreSQL and MySQL while SQLite and the in-memory repositories accepted it. The protocol is not checked against the known protocol identifiers.
 
 ### Enable/Disable Propagation Algorithm
 
@@ -396,7 +408,7 @@ Alias behavior is determined entirely by endpoint type. Hostname-based endpoints
    2. [ ] - `p1` - **IF** resource is a route - `inst-endis-1b`
       1. [ ] - `p1` - **IF** parent upstream is disabled - `inst-endis-1b1`
          1. [ ] - `p1` - **RETURN** error: "Cannot enable route: parent upstream is disabled" - `inst-endis-1b1a`
-2. [ ] - `p1` - DB: UPDATE resource SET enabled = :new_value - `inst-endis-2`
+2. [ ] - `p1` - Repo: UPDATE resource SET enabled = :new_value - `inst-endis-2`
 3. [ ] - `p1` - **RETURN** success - `inst-endis-3`
 
 ## 4. States (CDSL)
@@ -420,7 +432,7 @@ The system **MUST** provide REST handlers for POST, GET (list + by-ID), PUT (ful
 
 **Touches**:
 - API: `POST /api/oagw/v1/upstreams`, `GET /api/oagw/v1/upstreams`, `GET /api/oagw/v1/upstreams/{id}`, `PUT /api/oagw/v1/upstreams/{id}`, `DELETE /api/oagw/v1/upstreams/{id}`
-- DB: `oagw_upstream`, `oagw_upstream_tag`, `oagw_upstream_plugin`
+- DB: `oagw_upstream`, `oagw_upstream_tag`, `oagw_upstream_plugin` (when a database is configured)
 - Entities: Upstream, ServerConfig, Endpoint
 
 ### Implement Route CRUD Handlers
@@ -436,7 +448,7 @@ The system **MUST** provide REST handlers for POST, GET (list + by-ID), PUT (ful
 
 **Touches**:
 - API: `POST /api/oagw/v1/routes`, `GET /api/oagw/v1/routes`, `GET /api/oagw/v1/routes/{id}`, `PUT /api/oagw/v1/routes/{id}`, `DELETE /api/oagw/v1/routes/{id}`
-- DB: `oagw_route`, `oagw_route_http_match`, `oagw_route_grpc_match`, `oagw_route_method`, `oagw_route_tag`, `oagw_route_plugin`
+- DB: `oagw_route`, `oagw_route_http_match`, `oagw_route_grpc_match`, `oagw_route_method`, `oagw_route_tag`, `oagw_route_plugin` (when a database is configured)
 - Entities: Route
 
 ### Implement Alias Enforcement and Uniqueness
@@ -498,11 +510,17 @@ The system **MUST** return all management API errors in RFC 9457 Problem Details
 - [x] Route CRUD: create, read (single + list), update, and delete operations work with upstream reference validation and tenant scoping
 - [x] Alias enforcement: hostname-based endpoints auto-derive alias (user-provided rejected); IP-based/non-derivable require explicit alias; aliases normalized (lowercase, trailing dots stripped); update re-enforces on endpoint change per transition rules
 - [x] Hostname validation: RFC 1123 (max 253 chars, labels 1–63 chars, ASCII alphanumeric + hyphen, no leading/trailing hyphen)
-- [x] `(tenant_id, alias)` uniqueness enforced at database level; 409 Conflict returned on violation
+- [x] `(tenant_id, alias)` uniqueness enforced by the in-memory repository; 409 Conflict returned on violation
+- [x] `(tenant_id, alias)` uniqueness enforced by a database unique constraint when a database is configured; 409 Conflict returned on violation
+- [x] Deleting an upstream with a database configured writes with one `DELETE` statement, after a read of the upstream's owner; the foreign-key cascade removes the upstream's tags and plugin bindings, its routes, and the routes' child rows
+- [x] Update and delete of an upstream or route managed by the types registry return 400 `failed_precondition` with violation type `REGISTRY_MANAGED` and change nothing; a route created through the API on a registry-managed upstream is accepted
+- [x] A failed multi-table write with a database configured leaves no partial rows
+- [x] Tags, HTTP path prefixes and gRPC service and method names within the stored field limits are accepted on create and update; longer values or values with control characters are rejected with 400 on every storage backend
+- [x] Tags and HTTP methods are de-duplicated and returned in canonical order (tags ascending; methods `GET, POST, PUT, DELETE, PATCH`) on both storage backends
 - [ ] OData $filter, $select, $orderby, $top (default 50, max 100), $skip supported on list endpoints; invalid syntax returns 400
 - [ ] Enable/disable: disabled upstream causes proxy requests to be rejected (503); disabled route excluded from matching; ancestor-disabled upstream cannot be re-enabled by descendant
 - [x] All error responses use RFC 9457 Problem Details with GTS type identifiers
-- [x] All operations require appropriate GTS permissions and return 403 on unauthorized access
+- [ ] All operations require appropriate GTS permissions and return 403 on unauthorized access (not implemented: see the authorization note in [Actor Flows](#2-actor-flows-cdsl))
 - [x] Path parameters accept GTS anonymous identifiers (`gts.cf.core.oagw.{type}.v1~{uuid}`)
 - [x] DTOs annotated with serde (serialization) and utoipa (OpenAPI schema generation)
 
@@ -510,7 +528,7 @@ The system **MUST** return all management API errors in RFC 9457 Problem Details
 
 ### Performance Considerations
 
-Not applicable. Management API operations are CRUD against the database and are not on the hot path (proxy execution). No special latency requirements beyond standard ToolKit API response times.
+Not applicable. Management API operations are CRUD against the selected repositories (in-memory or database) and are not on the hot path (proxy execution). No special latency requirements beyond standard ToolKit API response times.
 
 ### Security Considerations
 

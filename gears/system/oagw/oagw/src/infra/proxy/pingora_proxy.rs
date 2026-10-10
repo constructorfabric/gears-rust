@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -16,7 +17,8 @@ use pingora_load_balancing::{Backend, Backends, LoadBalancer};
 use pingora_memory_cache::MemoryCache;
 use pingora_proxy::{HttpProxy, ProxyHttp, Session, http_proxy};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -347,13 +349,45 @@ impl ServiceDiscovery for DnsDiscovery {
 // PingoraEndpointSelector — default in-process BackendSelector (D2, D3)
 // ---------------------------------------------------------------------------
 
+/// How often a pool's background task health-checks its backends over TCP.
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// How often a pool's background task re-resolves its endpoints' DNS.
+const DNS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// A pool not selected for this long is dropped by the idle sweep. Well above
+/// the health-check and DNS intervals, so only upstreams nobody routes to any
+/// more go, e.g. ones deleted through another replica.
+const POOL_IDLE_TTL: Duration = Duration::from_secs(600);
+/// How often idle pools are swept.
+const POOL_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+const _: () = assert!(
+    POOL_IDLE_TTL.as_secs() > DNS_REFRESH_INTERVAL.as_secs()
+        && POOL_IDLE_TTL.as_secs() > HEALTH_CHECK_INTERVAL.as_secs()
+        && POOL_SWEEP_INTERVAL.as_secs() < POOL_IDLE_TTL.as_secs(),
+    "an idle pool must outlive its own background refresh, and the sweep must run within the TTL"
+);
+
 /// Cache entry: load balancer + shared reverse-lookup map + shutdown handle.
 struct LbEntry {
+    /// Endpoints the pool was built from; a different list rebuilds the pool.
+    endpoints: Vec<Endpoint>,
     lb: Arc<LoadBalancer<RoundRobin>>,
     /// Shared reverse-lookup map updated by [`DnsDiscovery::discover`].
     addr_map: AddrMap,
-    /// Dropping this sender signals the background update task to stop.
+    /// Seconds since the selector's `epoch` at the last `select()`.
+    last_used_secs: AtomicU64,
+    /// Dropping this sender stops the background update task.
     _shutdown_tx: watch::Sender<bool>,
+}
+
+impl LbEntry {
+    fn touch(&self, now_secs: u64) {
+        // Write only when the second changes, so a busy upstream does not
+        // bounce the cache line on every request.
+        if self.last_used_secs.load(Ordering::Relaxed) != now_secs {
+            self.last_used_secs.store(now_secs, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Default in-process `EndpointSelector` backed by Pingora's `LoadBalancer<RoundRobin>`
@@ -362,12 +396,16 @@ struct LbEntry {
 /// Lazily constructs a `LoadBalancer` per upstream on first `select()` call,
 /// caches it in a `DashMap`, and attaches a `TcpHealthCheck` with 10s interval.
 /// DNS re-resolution runs every 30s via the [`DnsDiscovery`] `ServiceDiscovery`
-/// implementation. Dropping the cache entry (via `invalidate()`) stops the
-/// background task.
+/// implementation. A cached pool is rebuilt whenever `select()` receives a
+/// different endpoint list, so replicas sharing a database pick up endpoint
+/// changes made elsewhere. Dropping the cache entry (via `invalidate()`, a
+/// rebuild or the idle sweep) stops the background task.
 pub struct PingoraEndpointSelector {
     cache: DashMap<Uuid, LbEntry>,
     /// Pre-compiled SSRF guard for IP filtering.
     ssrf_guard: Arc<SsrfGuard>,
+    /// Base for the entries' `last_used_secs`.
+    epoch: tokio::time::Instant,
 }
 
 impl PingoraEndpointSelector {
@@ -376,7 +414,42 @@ impl PingoraEndpointSelector {
         Self {
             cache: DashMap::new(),
             ssrf_guard,
+            epoch: tokio::time::Instant::now(),
         }
+    }
+
+    /// Start dropping pools idle for longer than [`POOL_IDLE_TTL`] every
+    /// [`POOL_SWEEP_INTERVAL`]. The task ends when `cancel` fires or this
+    /// selector is dropped.
+    pub fn spawn_idle_sweeper(self: &Arc<Self>, cancel: CancellationToken) {
+        tokio::spawn(sweep_idle_pools(
+            Arc::downgrade(self),
+            POOL_SWEEP_INTERVAL,
+            POOL_IDLE_TTL,
+            cancel,
+        ));
+    }
+
+    fn now_secs(&self) -> u64 {
+        self.epoch.elapsed().as_secs()
+    }
+
+    /// Drop the pools not selected for longer than `ttl`, which stops their
+    /// background tasks. Returns how many were dropped.
+    fn evict_idle(&self, ttl: Duration) -> usize {
+        let now = self.now_secs();
+        let mut evicted = 0;
+        // `retain` write-locks one shard at a time; `select()` never holds a
+        // map reference across an await, so this only waits out a lookup.
+        self.cache.retain(|_, entry| {
+            let idle = now.saturating_sub(entry.last_used_secs.load(Ordering::Relaxed));
+            let keep = idle <= ttl.as_secs();
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+        evicted
     }
 
     /// Select from an existing LB entry, returning a typed error when
@@ -418,8 +491,8 @@ impl PingoraEndpointSelector {
         backends.set_health_check(TcpHealthCheck::new());
 
         let mut lb = LoadBalancer::<RoundRobin>::from_backends(backends);
-        lb.health_check_frequency = Some(Duration::from_secs(10));
-        lb.update_frequency = Some(Duration::from_secs(30));
+        lb.health_check_frequency = Some(HEALTH_CHECK_INTERVAL);
+        lb.update_frequency = Some(DNS_REFRESH_INTERVAL);
 
         // update() calls discover() which resolves DNS and populates both
         // the backend selector and the addr_map in a single pass.
@@ -438,17 +511,25 @@ impl PingoraEndpointSelector {
         // Delegate periodic discovery + health checks to Pingora's
         // BackgroundService implementation, which respects
         // update_frequency and health_check_frequency.
-        // Dropping _shutdown_tx sets the watch to `true`, signaling stop.
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Pingora only reads the watch value between its sleeps, and dropping
+        // the sender does not change it, so the task also races the sender's
+        // drop: dropping _shutdown_tx ends the task at once.
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let lb_bg = lb.clone();
         tokio::spawn(async move {
             use pingora_core::services::background::BackgroundService;
-            lb_bg.start(shutdown_rx).await;
+            let pingora_rx = shutdown_rx.clone();
+            tokio::select! {
+                () = lb_bg.start(pingora_rx) => {}
+                _ = shutdown_rx.changed() => {}
+            }
         });
 
         Ok(LbEntry {
+            endpoints: endpoints.to_vec(),
             lb,
             addr_map,
+            last_used_secs: AtomicU64::new(self.now_secs()),
             _shutdown_tx: shutdown_tx,
         })
     }
@@ -461,23 +542,61 @@ impl EndpointSelector for PingoraEndpointSelector {
         upstream_id: Uuid,
         endpoints: &[Endpoint],
     ) -> Result<SelectedEndpoint, SelectionError> {
-        // Fast path: LB already cached.
-        if let Some(entry) = self.cache.get(&upstream_id) {
+        // Fast path: LB already cached for the same endpoints.
+        if let Some(entry) = self.cache.get(&upstream_id)
+            && entry.endpoints == endpoints
+        {
+            entry.touch(self.now_secs());
             return Self::select_from_entry(&entry);
         }
 
-        // Slow path: build a new LB entry then atomically insert-if-absent.
-        // Concurrent builders may race here; or_insert ensures only one wins
-        // and losers are dropped (stopping their background task via _shutdown_tx).
+        // Slow path: build a new LB entry, then insert it unless a concurrent
+        // builder already cached one for the same endpoints. A replaced or
+        // losing entry is dropped, which stops its background task.
         let entry = self.build_entry(endpoints).await?;
-        let entry_ref = self.cache.entry(upstream_id).or_insert(entry);
+        let entry_ref = match self.cache.entry(upstream_id) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                if occupied.get().endpoints != endpoints {
+                    occupied.insert(entry);
+                }
+                occupied.into_ref()
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => vacant.insert(entry),
+        };
+        entry_ref.touch(self.now_secs());
         Self::select_from_entry(&entry_ref)
     }
 
     fn invalidate(&self, upstream_id: Uuid) {
         // Removing the entry drops LbEntry, which drops _shutdown_tx,
-        // which signals the background update task to stop.
+        // which stops the background update task.
         self.cache.remove(&upstream_id);
+    }
+}
+
+/// Drop pools idle for longer than `ttl` every `interval` until `cancel`
+/// fires or the selector is gone.
+async fn sweep_idle_pools(
+    selector: Weak<PingoraEndpointSelector>,
+    interval: Duration,
+    ttl: Duration,
+    cancel: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            _ = ticker.tick() => {
+                let Some(selector) = selector.upgrade() else {
+                    return;
+                };
+                let evicted = selector.evict_idle(ttl);
+                if evicted > 0 {
+                    debug!(evicted, live = selector.cache.len(), "dropped idle upstream pools");
+                }
+            }
+        }
     }
 }
 
@@ -997,6 +1116,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changed_endpoints_rebuild_without_invalidate() {
+        let selector = PingoraEndpointSelector::new(ssrf_off());
+        let id = Uuid::new_v4();
+
+        let cached_pool = || Arc::clone(&selector.cache.get(&id).unwrap().lb);
+
+        let v1 = vec![ep("127.0.0.1", 20011, Scheme::Https)];
+        let selected = selector.select(id, &v1).await.unwrap();
+        assert_eq!(selected.endpoint.port, 20011);
+        let pool_v1 = cached_pool();
+
+        // Another replica changed the endpoints; no local invalidate() call.
+        let v2 = vec![ep("127.0.0.1", 20012, Scheme::Https)];
+        let selected = selector.select(id, &v2).await.unwrap();
+        assert_eq!(selected.endpoint.port, 20012);
+        let pool_v2 = cached_pool();
+        assert!(!Arc::ptr_eq(&pool_v1, &pool_v2), "a changed list rebuilds");
+
+        // Same endpoints again keep using the cached pool.
+        let selected = selector.select(id, &v2).await.unwrap();
+        assert_eq!(selected.endpoint.port, 20012);
+        assert!(
+            Arc::ptr_eq(&pool_v2, &cached_pool()),
+            "the same list reuses"
+        );
+    }
+
+    #[tokio::test]
     async fn select_single_endpoint() {
         let selector = PingoraEndpointSelector::new(ssrf_off());
         let id = Uuid::new_v4();
@@ -1252,6 +1399,87 @@ mod tests {
             map.contains_key("127.0.0.1:60002"),
             "new endpoint should be present"
         );
+    }
+
+    // Idle-sweep tests keep paused time under 10s: Pingora schedules its
+    // update loop on the real clock, so a later wake-up spins on the paused one.
+
+    /// Dropping a pool ends its background task, which held the last other
+    /// reference to the load balancer.
+    #[tokio::test(start_paused = true)]
+    async fn invalidate_stops_the_background_task() {
+        let selector = PingoraEndpointSelector::new(ssrf_off());
+        let id = Uuid::new_v4();
+        selector
+            .select(id, &[ep("127.0.0.1", 61001, Scheme::Https)])
+            .await
+            .unwrap();
+        let pool = Arc::downgrade(&selector.cache.get(&id).unwrap().lb);
+        // Let the task start and run its first update.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(pool.strong_count(), 2, "the task holds the pool");
+
+        selector.invalidate(id);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(pool.strong_count(), 0, "the task ended");
+    }
+
+    /// The sweep drops a pool nobody selected within the TTL and stops its
+    /// task; a pool selected since survives as the same pool.
+    #[tokio::test(start_paused = true)]
+    async fn idle_sweep_drops_only_unselected_pools() {
+        let selector = PingoraEndpointSelector::new(ssrf_off());
+        let (idle, used) = (Uuid::new_v4(), Uuid::new_v4());
+        let idle_eps = [ep("127.0.0.1", 61011, Scheme::Https)];
+        let used_eps = [ep("127.0.0.1", 61012, Scheme::Https)];
+        selector.select(idle, &idle_eps).await.unwrap();
+        selector.select(used, &used_eps).await.unwrap();
+        let idle_pool = Arc::downgrade(&selector.cache.get(&idle).unwrap().lb);
+        let used_pool = Arc::clone(&selector.cache.get(&used).unwrap().lb);
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let _ = selector.select(used, &used_eps).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        assert_eq!(selector.evict_idle(Duration::from_secs(5)), 1);
+        assert!(selector.cache.get(&idle).is_none(), "the idle pool went");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(idle_pool.strong_count(), 0, "its task ended");
+        assert!(
+            Arc::ptr_eq(&used_pool, &selector.cache.get(&used).unwrap().lb),
+            "the used pool stays"
+        );
+        selector.invalidate(used);
+    }
+
+    /// The spawned sweep drops idle pools on its ticks and ends on cancel.
+    #[tokio::test(start_paused = true)]
+    async fn idle_sweeper_drops_idle_pools_and_stops_on_cancel() {
+        let selector = Arc::new(PingoraEndpointSelector::new(ssrf_off()));
+        let id = Uuid::new_v4();
+        selector
+            .select(id, &[ep("127.0.0.1", 61021, Scheme::Https)])
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let sweep = tokio::spawn(sweep_idle_pools(
+            Arc::downgrade(&selector),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+            cancel.clone(),
+        ));
+
+        // Ticks at 0, 2 and 4 keep the pool; the one at 6 drops it.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(selector.cache.get(&id).is_some(), "not idle yet");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(selector.cache.get(&id).is_none(), "dropped once idle");
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), sweep)
+            .await
+            .expect("the sweep ends")
+            .unwrap();
     }
 
     // -- upstream_peer ALPN / TLS tests --

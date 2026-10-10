@@ -701,8 +701,11 @@ pub fn build_test_app_state(
     let dp = dp_builder
         .with_backend_selector(backend_selector.clone())
         .build_and_register(hub, cp.clone());
-    let facade: Arc<dyn ServiceGatewayClientV1> =
-        Arc::new(ServiceGatewayClientV1Facade::new(cp.clone(), dp.clone()));
+    let facade: Arc<dyn ServiceGatewayClientV1> = Arc::new(ServiceGatewayClientV1Facade::new(
+        cp.clone(),
+        dp.clone(),
+        backend_selector.clone(),
+    ));
     hub.register::<dyn ServiceGatewayClientV1>(facade.clone());
     TestAppState {
         state: crate::gear::AppState {
@@ -728,9 +731,111 @@ pub fn build_test_gateway(
     cp_builder: TestCpBuilder,
     dp_builder: TestDpBuilder,
 ) -> Arc<dyn ServiceGatewayClientV1> {
+    let backend_selector: Arc<dyn EndpointSelector> =
+        dp_builder.backend_selector.clone().unwrap_or_else(|| {
+            Arc::new(
+                crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(Arc::new(
+                    SsrfGuard::disabled(),
+                )),
+            )
+        });
     let cp = cp_builder.build_and_register(hub);
-    let dp = dp_builder.build_and_register(hub, cp.clone());
-    let oagw: Arc<dyn ServiceGatewayClientV1> = Arc::new(ServiceGatewayClientV1Facade::new(cp, dp));
+    let dp = dp_builder
+        .with_backend_selector(backend_selector.clone())
+        .build_and_register(hub, cp.clone());
+    let oagw: Arc<dyn ServiceGatewayClientV1> =
+        Arc::new(ServiceGatewayClientV1Facade::new(cp, dp, backend_selector));
     hub.register::<dyn ServiceGatewayClientV1>(oagw.clone());
     oagw
+}
+
+#[cfg(test)]
+pub use unavailable::UnavailableStorage;
+
+#[cfg(test)]
+mod unavailable {
+    use std::collections::HashSet;
+
+    use async_trait::async_trait;
+    use uuid::Uuid;
+
+    use crate::domain::model::{ListQuery, Route, Upstream};
+    use crate::domain::repo::{RepositoryError, RouteRepository, RowKey, Tags, UpstreamRepository};
+
+    /// Repositories whose every call fails, as a database outage would.
+    pub struct UnavailableStorage;
+
+    fn unavailable() -> RepositoryError {
+        RepositoryError::Internal("storage unavailable".into())
+    }
+
+    #[async_trait]
+    impl UpstreamRepository for UnavailableStorage {
+        async fn create(&self, _: Upstream) -> Result<Upstream, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn get_by_id(&self, _: Uuid, _: Uuid) -> Result<Upstream, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn list(&self, _: Uuid, _: &ListQuery) -> Result<Vec<Upstream>, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn update(&self, _: Upstream) -> Result<Upstream, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn delete(&self, _: Uuid, _: Uuid) -> Result<(), RepositoryError> {
+            Err(unavailable())
+        }
+        async fn list_by_alias_for_tenants(
+            &self,
+            _: &str,
+            _: &HashSet<Uuid>,
+            _: Tags,
+        ) -> Result<Vec<Upstream>, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn list_registry_keys(&self) -> Result<Vec<RowKey>, RepositoryError> {
+            Err(unavailable())
+        }
+    }
+
+    #[async_trait]
+    impl RouteRepository for UnavailableStorage {
+        async fn create(&self, _: Route) -> Result<Route, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn get_by_id(&self, _: Uuid, _: Uuid) -> Result<Route, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn list(
+            &self,
+            _: Uuid,
+            _: Option<Uuid>,
+            _: &ListQuery,
+        ) -> Result<Vec<Route>, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn find_matching_in_tenants(
+            &self,
+            _: &[Uuid],
+            _: &[Uuid],
+            _: &str,
+            _: &str,
+            _: Tags,
+        ) -> Result<Route, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn update(&self, _: Route) -> Result<Route, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn delete(&self, _: Uuid, _: Uuid) -> Result<(), RepositoryError> {
+            Err(unavailable())
+        }
+        async fn delete_by_upstream(&self, _: Uuid, _: Uuid) -> Result<(), RepositoryError> {
+            Err(unavailable())
+        }
+        async fn list_registry_keys(&self) -> Result<Vec<RowKey>, RepositoryError> {
+            Err(unavailable())
+        }
+    }
 }

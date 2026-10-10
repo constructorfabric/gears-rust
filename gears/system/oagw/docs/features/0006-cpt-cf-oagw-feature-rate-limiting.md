@@ -134,8 +134,9 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 1. [x] - `p2` - Actor sends PUT /api/oagw/v1/upstreams/{id} or PUT /api/oagw/v1/routes/{id} with `rate_limit`, `circuit_breaker`, or `concurrency_limit` in request body - `inst-cfg-1`
 2. [x] - `p2` - Validate rate limit config: `sustained.rate` > 0, `burst.capacity` ≥ 1, `scope` is valid enum, `strategy` is valid enum - `inst-cfg-2`
 3. [x] - `p2` - **IF** `budget.mode` = `allocated` - `inst-cfg-3`
-   1. [x] - `p2` - Validate sum of child allocations ≤ parent budget × `overcommit_ratio` - `inst-cfg-3a`
-   2. [x] - `p2` - **IF** validation fails - `inst-cfg-3b`
+   1. [x] - `p2` - Use the closest ancestor upstream already found by `cpt-cf-oagw-algo-tenant-closest-ancestor` for this request (no separate ancestor walk) - `inst-cfg-3-anc`
+   2. [x] - `p2` - Validate sum of child allocations ≤ parent budget × `overcommit_ratio`; descendant allocations are loaded with one `list_by_alias_for_tenants` call over the ancestor's descendant tree - `inst-cfg-3a`
+   3. [x] - `p2` - **IF** validation fails - `inst-cfg-3b`
       1. [x] - `p2` - **RETURN** 400 ValidationError with budget allocation details - `inst-cfg-3b1`
 4. [x] - `p2` - **IF** ancestor has `sharing: enforce` on rate limit - `inst-cfg-4`
    1. [x] - `p2` - Validate descendant's limit does not exceed ancestor's enforced limit - `inst-cfg-4a`
@@ -143,7 +144,7 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 6. [ ] - `p2` - Validate concurrency limit config: `max_concurrent` > 0, `per_tenant_max` ≤ `max_concurrent` - `inst-cfg-6`
 7. [ ] - `p2` - **IF** `strategy` = `queue` on rate_limit or concurrency_limit - `inst-cfg-7`
    1. [ ] - `p2` - Validate queue config: `max_depth` (1–10,000), `timeout` (1–60s), `memory_limit` (1B–1GB), `overflow_strategy` is valid enum (`drop_newest`, `drop_oldest`, `reject`) - `inst-cfg-7a`
-8. [x] - `p2` - Persist config to database via ControlPlaneService - `inst-cfg-8`
+8. [x] - `p2` - Store config via ControlPlaneService (persisted when a database is configured) - `inst-cfg-8`
 9. [x] - `p2` - **RETURN** updated resource - `inst-cfg-9`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -330,7 +331,7 @@ Prevents abuse, cost overruns, and protects external service agreements. Maintai
 
 - [x] `p2` - **ID**: `cpt-cf-oagw-dod-token-bucket`
 
-The system **MUST** implement token bucket rate limiting with dual-rate configuration (sustained rate + burst capacity) per `cpt-cf-oagw-adr-rate-limiting`. Tokens **MUST** be refilled at `sustained.rate` per `sustained.window`. Burst **MUST** be capped at `burst.capacity`. Each request **MUST** consume `cost` tokens (default: 1). Counter scope **MUST** support: `global`, `tenant`, `user`, `ip`, `route`. When tokens insufficient and strategy = `reject`, the system **MUST** return 429 RateLimitExceeded with `Retry-After` header.
+The system **MUST** implement token bucket rate limiting with dual-rate configuration (sustained rate + burst capacity) per `cpt-cf-oagw-adr-rate-limiting`. Tokens **MUST** be refilled at `sustained.rate` per `sustained.window`. Burst **MUST** be capped at `burst.capacity`. Each request **MUST** consume `cost` tokens (default: 1). Counter scope **MUST** support: `global`, `tenant`, `user`, `ip`, `route`. When tokens insufficient and strategy = `reject`, the system **MUST** return 429 RateLimitExceeded with `Retry-After` header. In-memory buckets at rest (full token bucket, empty sliding window) **MUST** be evicted periodically, so memory is bounded by recently active keys rather than every key ever seen.
 
 **Implements**:
 - `cpt-cf-oagw-flow-rate-limited-proxy`
@@ -411,6 +412,7 @@ The system **MUST** implement `reject` and `queue` strategies for handling overl
 - [x] Rate limit config supports dual-rate: `sustained` (rate + window) and `burst` (capacity) independently
 - [x] Counter scopes (`global`, `tenant`, `user`, `ip`, `route`) track and enforce limits independently
 - [x] Cost-based rate limiting deducts `cost` tokens per request (configurable per route)
+- [x] Buckets at rest are evicted by a sweep every 60 seconds on each replica; sliding windows keep one fixed sub-window grid, so a request on an evicted or swept key gets the same answer it would have got from an untouched bucket
 - [x] `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` headers included in all proxy responses when `response_headers: true`
 - [x] 429 RateLimitExceeded responses include `Retry-After` header with calculated wait time
 - [x] Hierarchical rate limit merge computes `effective = min(ancestor.enforced, descendant)` across tenant hierarchy

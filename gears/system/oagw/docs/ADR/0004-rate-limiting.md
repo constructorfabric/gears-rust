@@ -371,6 +371,14 @@ The `{resource_type}:{resource_id}` prefix ensures all keys for a given
 upstream or route share a common prefix, enabling efficient prefix-based
 cleanup (in-memory `retain` and Redis `SCAN`) when a resource is deleted.
 
+The in-memory limiter also evicts every bucket at rest (a full token bucket
+or an empty sliding window) on a periodic sweep. Every sliding window of a
+limiter counts on one fixed sub-window grid, which neither a sweep nor a new
+bucket shifts. A bucket at rest therefore behaves exactly like a new one, so
+eviction changes no decision; it reclaims what
+explicit cleanup misses: buckets on replicas that did not handle the delete,
+routes removed with their upstream, and client IPs or subjects seen once.
+
 > **Note:** Minute-bucket keys must use **YYYYMMDDHHMM** (12 digits) to avoid
 > confusion with hour-level granularity and prevent incorrect aggregation.
 

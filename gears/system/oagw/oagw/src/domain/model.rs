@@ -376,9 +376,10 @@ pub struct PluginsConfig {
 // Route matching
 // ---------------------------------------------------------------------------
 
-/// HTTP methods supported by route matching.
+/// HTTP methods a route can match. Declaration order is the canonical order
+/// in which stored routes return their methods.
 #[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum HttpMethod {
     /// `GET`.
     Get,
@@ -441,6 +442,17 @@ pub struct MatchRules {
 // Domain entities
 // ---------------------------------------------------------------------------
 
+/// Who owns a stored upstream or route. Set on create and never changed.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedBy {
+    /// Created through the Management API or the SDK.
+    Api,
+    /// Provisioned from a types-registry instance at startup. Read-only through
+    /// the Management API and the SDK; each boot reconciles it with the registry.
+    Registry,
+}
+
 /// A route mapping inbound requests to an upstream.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]
@@ -465,6 +477,8 @@ pub struct Route {
     pub priority: i32,
     /// Whether the route is active.
     pub enabled: bool,
+    /// Who owns the route (API or types registry).
+    pub managed_by: ManagedBy,
 }
 
 /// An external upstream service configuration.
@@ -495,6 +509,8 @@ pub struct Upstream {
     pub cors: Option<CorsConfig>,
     /// Free-form tags.
     pub tags: Vec<String>,
+    /// Who owns the upstream (API or types registry).
+    pub managed_by: ManagedBy,
 }
 
 // ---------------------------------------------------------------------------

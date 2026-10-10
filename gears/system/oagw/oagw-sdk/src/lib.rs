@@ -5,6 +5,7 @@ pub mod error;
 pub mod field;
 pub mod gts;
 pub mod multipart;
+pub mod precondition;
 pub mod quota;
 pub mod reason;
 pub mod sse;

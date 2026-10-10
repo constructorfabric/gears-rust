@@ -294,6 +294,16 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 ---
 
+### Configuration storage
+
+> **Decision reference**: [ADR-0018: Optional Persistence](../docs/ADR/0018-optional-persistence.md)
+
+#### Registry instances provisioned at startup
+- **Scenario**: [positive-19.1-registry-instances-provisioned-at-startup.md](configuration-storage/positive-19.1-registry-instances-provisioned-at-startup.md)
+- **Mechanism**: Upstream and route instances in the types registry (for example its `entities` configuration) become stored rows at startup, under their instance UUIDs, in the root tenant unless the instance names one. They are listed and proxy like API-created resources.
+
+---
+
 ### HTTP basics
 
 #### Plain HTTP request/response passthrough
@@ -552,6 +562,10 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: [negative-3.4-path-suffix-mode-disabled.md](management-api/routes/negative-3.4-path-suffix-mode-disabled.md)
 - **What happens**: Supplying any suffix returns a gateway validation error.
 
+#### Stored field limits → 400
+- **Scenario**: [negative-2.14-field-limits-rejected-400.md](management-api/upstreams/negative-2.14-field-limits-rejected-400.md)
+- **What happens**: More than 64 tags, a tag over 128 bytes or with a control character, a route path over 2048 bytes, a gRPC service or method name over 256 bytes, more than 64 query parameters or one over 128 bytes, or a protocol, auth type, or plugin reference over 256 bytes or with a control character returns `400 PD` (`invalid_argument`). Nothing is stored.
+
 #### Well-known header validation errors → 400
 - **Scenario**: [negative-7.4-well-known-header-validation-errors-400.md](proxy-api/request-transforms/negative-7.4-well-known-header-validation-errors-400.md)
 - **What happens**: Invalid `Content-Length` or mismatch with actual body returns `400 PD`.
@@ -596,9 +610,17 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: [negative-6.4-alias-not-found-returns-stable-404.md](proxy-api/alias-resolution/negative-6.4-alias-not-found-returns-stable-404.md)
 - **What happens**: Unknown alias returns `404 PD`, `ESrc=gateway`, `type` = `...upstream.not_found...`.
 
+#### Known alias without a matching route → 404
+- **Scenario**: [negative-6.5-known-alias-without-matching-route-returns-404.md](proxy-api/alias-resolution/negative-6.5-known-alias-without-matching-route-returns-404.md)
+- **What happens**: A known alias with no route for the method and path returns `404 PD`, `ESrc=gateway`, `type` = `...not_found...`. `resource_type` is the route schema, where 6.4 names the upstream schema.
+
 #### Disable route blocks proxy traffic → 404/503
 - **Scenario**: [negative-3.7-disable-route-blocks-proxy-traffic.md](management-api/routes/negative-3.7-disable-route-blocks-proxy-traffic.md)
 - **What happens**: With `route.enabled=false`, request returns `404 ROUTE_NOT_FOUND` or `503`, `ESrc=gateway`.
+
+#### Overlapping route → 409
+- **Scenario**: [negative-3.11-overlapping-route-rejected-409.md](management-api/routes/negative-3.11-overlapping-route-rejected-409.md)
+- **What happens**: An enabled route on the same upstream with the same path, the same priority and a shared method returns `409 PD` (`already_exists`, `resource_type` = route schema). Another priority does not overlap.
 
 ---
 
@@ -797,6 +819,14 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 #### IDs are anonymous GTS identifiers on API surface
 - **Scenario**: *Section 27.1 — no separate file.*
 - **What happens**: `GET /upstreams/{id}` accepts `gts.cf.core.oagw.upstream.v1~{uuid}`. Same for routes/plugins.
+
+---
+
+### Configuration storage
+
+#### Registry-managed resources are read-only → 400
+- **Scenario**: [negative-19.2-registry-managed-resources-read-only.md](configuration-storage/negative-19.2-registry-managed-resources-read-only.md)
+- **What happens**: `PUT` or `DELETE` of an upstream or route provisioned from the types registry returns `400 PD` (`failed_precondition`, violation type `REGISTRY_MANAGED`, subject `managed_by`) and changes nothing. A route created through the API on a registry upstream is allowed, and can be deleted.
 
 ---
 

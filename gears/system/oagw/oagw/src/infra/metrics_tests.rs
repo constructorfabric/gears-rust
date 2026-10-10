@@ -99,6 +99,22 @@ fn gauge_last_f64(exporter: &InMemoryMetricExporter, name: &str) -> Option<f64> 
     None
 }
 
+fn gauge_last_u64(exporter: &InMemoryMetricExporter, name: &str) -> Option<u64> {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    for rm in &metrics {
+        for sm in rm.scope_metrics() {
+            for m in sm.metrics() {
+                if m.name() == name
+                    && let AggregatedMetrics::U64(MetricData::Gauge(g)) = m.data()
+                {
+                    return g.data_points().last().map(|dp| dp.value());
+                }
+            }
+        }
+    }
+    None
+}
+
 // ── Counter tests ───────────────────────────────────────────────────────
 
 #[test]
@@ -139,6 +155,23 @@ fn rate_limit_exceeded_counter_increments() {
     provider.force_flush().unwrap();
 
     assert_eq!(counter_u64(&exporter, "oagw_rate_limit_exceeded"), 2);
+}
+
+#[test]
+fn rate_limit_sweep_counts_evictions_and_records_live_buckets() {
+    let (provider, exporter) = local_provider();
+    let m = make_meter(&provider, "oagw");
+
+    m.record_rate_limit_sweep(3, 7);
+    m.record_rate_limit_sweep(2, 5);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(counter_u64(&exporter, "oagw_rate_limit_buckets_evicted"), 5);
+    assert_eq!(
+        gauge_last_u64(&exporter, "oagw_rate_limit_buckets"),
+        Some(5)
+    );
 }
 
 // ── Histogram ───────────────────────────────────────────────────────────

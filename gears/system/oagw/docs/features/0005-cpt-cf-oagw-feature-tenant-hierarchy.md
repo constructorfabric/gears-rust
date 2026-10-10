@@ -17,6 +17,7 @@
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [Hierarchical Config Merge](#hierarchical-config-merge)
   - [Alias Shadowing Resolution](#alias-shadowing-resolution)
+  - [Closest Ancestor Lookup](#closest-ancestor-lookup)
   - [Permission Validation for Override](#permission-validation-for-override)
   - [Effective Rate Limit Computation](#effective-rate-limit-computation)
 - [4. States (CDSL)](#4-states-cdsl)
@@ -24,6 +25,7 @@
   - [Implement Sharing Mode Fields](#implement-sharing-mode-fields)
   - [Implement Hierarchical Config Merge](#implement-hierarchical-config-merge)
   - [Implement Alias Shadowing](#implement-alias-shadowing)
+  - [Implement Single-Query Ancestor Lookup](#implement-single-query-ancestor-lookup)
   - [Implement Permission-Based Override Control](#implement-permission-based-override-control)
   - [Implement Secret Access Control Integration](#implement-secret-access-control-integration)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
@@ -94,7 +96,7 @@ Enables partner/customer hierarchies where partners share upstream access with c
 4. [x] - `p2` - **IF** any sharing mode is invalid - `inst-share-4`
    1. [x] - `p2` - **RETURN** 400 ValidationError with invalid field details - `inst-share-4a`
 5. [x] - `p2` - Validate upstream fields per `cpt-cf-oagw-algo-domain-entity-validation` - `inst-share-5`
-6. [x] - `p2` - DB: INSERT oagw_upstream with sharing mode columns (auth_sharing, rate_limit_sharing, plugins_sharing, cors_sharing) - `inst-share-6`
+6. [x] - `p2` - Repo: INSERT upstream with sharing modes (`auth_sharing`, `rate_limit_sharing`, `plugins_sharing`, `cors_sharing` when a database is configured) - `inst-share-6`
 7. [x] - `p2` - **IF** `(tenant_id, alias)` uniqueness constraint fails - `inst-share-7`
    1. [x] - `p2` - **RETURN** 409 Conflict with alias collision details - `inst-share-7a`
 8. [x] - `p2` - **RETURN** created upstream with sharing configuration - `inst-share-8`
@@ -118,7 +120,7 @@ Enables partner/customer hierarchies where partners share upstream access with c
 **Steps**:
 1. [x] - `p2` - Tenant admin submits upstream creation request that resolves to an existing ancestor upstream alias - `inst-bind-1`
 2. [x] - `p2` - API: POST /api/oagw/v1/upstreams (alias matches ancestor upstream) - `inst-bind-2`
-3. [x] - `p2` - Resolve ancestor upstream by walking hierarchy via `cpt-cf-oagw-algo-tenant-alias-shadow` - `inst-bind-3`
+3. [x] - `p2` - Resolve the closest ancestor upstream via `cpt-cf-oagw-algo-tenant-closest-ancestor` (one query; the result is shared with the budget allocation check) - `inst-bind-3`
 4. [x] - `p2` - Check `oagw:upstream:bind` permission via `cpt-cf-oagw-algo-tenant-permission-check` - `inst-bind-4`
 5. [x] - `p2` - **IF** permission denied - `inst-bind-5`
    1. [x] - `p2` - **RETURN** 403 Forbidden with missing permission details - `inst-bind-5a`
@@ -141,13 +143,10 @@ Enables partner/customer hierarchies where partners share upstream access with c
    1. [x] - `p2` - **RETURN** 503 ServiceUnavailable: credential validation unavailable (fail-closed) - `inst-bind-7a`
 8. [x] - `p2` - **IF** request includes tags - `inst-bind-8`
    1. [x] - `p2` - Treat tags as tenant-local additions; do not mutate ancestor tags - `inst-bind-8a`
-9. [x] - `p2` - DB: BEGIN transaction - `inst-bind-9`
-10. [x] - `p2` - DB: INSERT oagw_upstream with descendant tenant_id, storing local overrides - `inst-bind-10`
-11. [x] - `p2` - **IF** `(tenant_id, alias)` uniqueness constraint fails - `inst-bind-11`
-    1. [x] - `p2` - DB: ROLLBACK - `inst-bind-11a`
-    2. [x] - `p2` - **RETURN** 409 Conflict with alias collision details - `inst-bind-11b`
-12. [x] - `p2` - DB: COMMIT - `inst-bind-12`
-13. [x] - `p2` - **RETURN** created upstream binding with effective configuration - `inst-bind-13`
+9. [x] - `p2` - Repo: INSERT upstream with descendant tenant_id, storing local overrides (one transaction with its child rows) - `inst-bind-10`
+10. [x] - `p2` - **IF** `(tenant_id, alias)` uniqueness constraint fails - `inst-bind-11`
+    1. [x] - `p2` - **RETURN** 409 Conflict with alias collision details - `inst-bind-11b`
+11. [x] - `p2` - **RETURN** created upstream binding with effective configuration - `inst-bind-13`
 
 ### Alias Resolution with Shadowing
 
@@ -235,17 +234,32 @@ Enables partner/customer hierarchies where partners share upstream access with c
 
 **Steps**:
 1. [x] - `p2` - Obtain ancestor chain for requesting tenant (ordered: self → parent → ... → root) - `inst-shadow-1`
-2. [x] - `p2` - **FOR EACH** tenant_id in chain (self first) - `inst-shadow-2`
-   1. [x] - `p2` - DB: SELECT from oagw_upstream WHERE tenant_id = :current AND alias = :alias - `inst-shadow-2a`
-   2. [x] - `p2` - **IF** upstream found AND (tenant_id == requesting_tenant OR any per-field sharing flag — `auth_sharing`, `rate_limit_sharing`, `plugins_sharing`, `cors_sharing` — is != `private`) - `inst-shadow-2b`
+2. [x] - `p2` - Repo: `list_by_alias_for_tenants(alias, chain, tags)` — one query `WHERE alias = :alias AND tenant_id IN (:chain)`; order the results by chain position - `inst-shadow-2a`
+3. [x] - `p2` - **FOR EACH** upstream in chain order (self first) - `inst-shadow-2`
+   1. [x] - `p2` - **IF** upstream found AND (tenant_id == requesting_tenant OR any per-field sharing mode — auth, rate_limit, plugins, cors — is != `private`) - `inst-shadow-2b`
       1. [x] - `p2` - **IF** upstream is enabled - `inst-shadow-2b1`
          1. [x] - `p2` - **RETURN** found upstream as selected match - `inst-shadow-2b1a`
       2. [x] - `p2` - **ELSE** (upstream disabled) - `inst-shadow-2b2`
          1. [x] - `p2` - Record as disabled match; continue walking for enabled ancestor - `inst-shadow-2b2a`
-3. [x] - `p2` - **IF** no match found in entire chain - `inst-shadow-3`
+4. [x] - `p2` - **IF** no match found in entire chain - `inst-shadow-3`
    1. [x] - `p2` - **RETURN** not-found error - `inst-shadow-3a`
-4. [x] - `p2` - **IF** only disabled matches found - `inst-shadow-4`
+5. [x] - `p2` - **IF** only disabled matches found - `inst-shadow-4`
    1. [x] - `p2` - **RETURN** link-unavailable error - `inst-shadow-4a`
+
+### Closest Ancestor Lookup
+
+- [x] `p2` - **ID**: `cpt-cf-oagw-algo-tenant-closest-ancestor`
+
+**Input**: Alias string, tenant chain (requesting tenant first, then ancestors to root)
+
+**Output**: Closest ancestor upstream with the alias, or none
+
+**Steps**:
+1. [x] - `p2` - **IF** the chain has no ancestors, **RETURN** none - `inst-anc-1`
+2. [x] - `p2` - Repo: `list_by_alias_for_tenants(alias, ancestors, Tags::Skip)` — one query `WHERE alias = :alias AND tenant_id IN (:ancestors)`, where ancestors is the chain without the requesting tenant - `inst-anc-2`
+3. [x] - `p2` - Order the results by chain position and **RETURN** the first (closest ancestor), regardless of its enabled flag or sharing modes, or none - `inst-anc-3`
+
+> **Reuse**: On upstream create and update, the Control Plane runs this lookup **once** and passes the result to both the bind validation (`cpt-cf-oagw-flow-tenant-bind-inherited`) and the budget allocation check (`cpt-cf-oagw-feature-rate-limiting`). Both previously walked the ancestors separately with one lookup per tenant.
 
 ### Permission Validation for Override
 
@@ -295,7 +309,7 @@ Not applicable — sharing modes (`private`, `inherit`, `enforce`) are static co
 
 - [x] `p2` - **ID**: `cpt-cf-oagw-dod-tenant-sharing-modes`
 
-The system **MUST** support `private`, `inherit`, and `enforce` sharing modes on upstream and route configuration fields (auth, rate_limit, plugins, CORS). Tags do not have a sharing mode — they always use add-only union semantics across the hierarchy. The default sharing mode **MUST** be `private`. Sharing modes **MUST** be stored as columns on `oagw_upstream` and `oagw_route` and validated during create/update operations. Route-level sharing follows the same semantics as upstream-level sharing and participates in the 3-layer merge per `cpt-cf-oagw-fr-config-layering`.
+The system **MUST** support `private`, `inherit`, and `enforce` sharing modes on upstream and route configuration fields (auth, rate_limit, plugins, CORS). Tags do not have a sharing mode — they always use add-only union semantics across the hierarchy. The default sharing mode **MUST** be `private`. Sharing modes **MUST** be stored as columns on `oagw_upstream` and `oagw_route` (except route CORS, whose sharing is stored in the route's `cors` JSON) and validated during create/update operations. Route-level sharing follows the same semantics as upstream-level sharing and participates in the 3-layer merge per `cpt-cf-oagw-fr-config-layering`.
 
 **Implements**:
 - `cpt-cf-oagw-flow-tenant-share-upstream`
@@ -330,6 +344,20 @@ The system **MUST** resolve aliases by walking the tenant hierarchy from descend
 
 **Touches**:
 - DB: `oagw_upstream` (alias lookup with tenant hierarchy walk)
+- Entities: `Upstream`
+
+### Implement Single-Query Ancestor Lookup
+
+- [x] `p2` - **ID**: `cpt-cf-oagw-dod-tenant-closest-ancestor`
+
+The system **MUST** find the closest ancestor upstream with a given alias with one `list_by_alias_for_tenants` call over the ancestor chain, instead of one lookup per ancestor. Upstream create and update **MUST** run this lookup once and share the result between bind validation and budget allocation validation.
+
+**Implements**:
+- `cpt-cf-oagw-algo-tenant-closest-ancestor`
+- `cpt-cf-oagw-flow-tenant-bind-inherited`
+
+**Touches**:
+- DB: `oagw_upstream`
 - Entities: `Upstream`
 
 ### Implement Permission-Based Override Control
@@ -378,11 +406,12 @@ The system **MUST** validate `secret_ref` accessibility via `cred_store` for the
 - [x] `secret_ref` in auth override is validated against `cred_store` for descendant tenant accessibility
 - [x] Inaccessible `secret_ref` is rejected with 400 ValidationError
 - [x] No secret material is stored or logged by OAGW
-- [x] All DB operations use secure ORM with tenant scoping per `cpt-cf-oagw-principle-tenant-scope`
+- [x] All DB operations use secure ORM with tenant scoping per `cpt-cf-oagw-principle-tenant-scope`, except the startup reconcile's `list_registry_keys`, which reads across tenants (ADR-0018)
 - [x] Route-level sharing modes (`private`, `inherit`, `enforce`) can be set per field on route create and update
 - [x] 3-layer merge applies: upstream base < route overrides < tenant hierarchy overrides
 - [x] Absent/null fields inherit from the previous level; absent rate_limit is treated as unbounded
 - [x] `cred_store` unavailability during secret_ref validation results in 503 ServiceUnavailable (fail-closed)
+- [x] With a database configured, upstream create and update issue the same number of ancestor lookup queries with 1 and with 5 ancestor tenants, and run the closest-ancestor lookup once per request
 
 ## 7. Non-Applicable Concerns
 

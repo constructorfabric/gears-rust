@@ -2,7 +2,7 @@
 //!
 //! Queries the types-registry for upstream and route GTS instances registered
 //! by other gears during `init()`, deserializes their content, and returns
-//! domain-level provisioned objects for `post_init()` to insert into repos.
+//! domain-level provisioned objects for `post_init()` to reconcile.
 
 use std::collections::HashMap;
 use std::sync::Arc;

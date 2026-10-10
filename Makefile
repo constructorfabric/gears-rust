@@ -687,7 +687,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-oagw-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -803,6 +803,14 @@ test-types-registry-db: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-types-registry --features integration \
 	  -E 'binary(/_backends_test$$/)'
+
+## Run OAGW's database tier: the repository conformance suite and the
+## migration tests on PostgreSQL and MySQL (Docker required; no skip without
+## it; images pinned in test-containers).
+## The in-memory and SQLite runs of the same suites are part of `make test`.
+test-oagw-db: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-oagw --features integration -E 'test(/postgres|mysql/)'
 
 ## Run the Postgres cluster plugin's conformance (Layer 2) and Layer 3
 ## integration suites (Docker required;
@@ -1092,7 +1100,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-usage-collector-timescaledb e2e-usage-collector-clickhouse e2e-event-broker e2e-oop
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-oagw-sqlite e2e-usage-collector e2e-usage-collector-timescaledb e2e-usage-collector-clickhouse e2e-event-broker e2e-oop
 
 E2E_TARGET ?=
 # E2E selectors for `make e2e-local`:
@@ -1136,11 +1144,11 @@ e2e-docker-smoke: py-env
 #                                  "shared-server suite" is one whose e2e.yaml
 #                                  has `launcher: e2e-launcher`.
 # Self-managed suites (`launcher: pytest` — mini-chat, usage-collector) and the
-# tr-authz profile lane start their own server, so plain `make e2e-local` and
-# GEAR= runs skip them; run them via their own targets (e2e-mini-chat,
-# e2e-usage-collector, e2e-tr-authz). All feature/config/sidecar/gear knowledge
-# lives in config/e2e-launcher.yaml and testing/e2e/suites/<suite>/e2e.yaml, so
-# this recipe stays suite-agnostic.
+# profile lanes (tr-authz, oagw-sqlite) start their own server, so plain
+# `make e2e-local` and GEAR= runs skip them; run them via their own targets
+# (e2e-mini-chat, e2e-usage-collector, e2e-tr-authz, e2e-oagw-sqlite). All
+# feature/config/sidecar/gear knowledge lives in config/e2e-launcher.yaml and
+# testing/e2e/suites/<suite>/e2e.yaml, so this recipe stays suite-agnostic.
 e2e-local: py-env
 	$(call print_target_banner)
 	$(PYTHON) tools/scripts/run_e2e.py --suite "$(SUITE)" --gear "$(GEAR)" -- $(E2E_TARGET)
@@ -1149,6 +1157,11 @@ e2e-local: py-env
 e2e-tr-authz: py-env
 	$(call print_target_banner)
 	$(PYTHON) tools/scripts/run_e2e.py --suite resource-group --profile tr-authz --
+
+## Run OAGW E2E tests with OAGW on SQLite and upstreams/routes from the types registry
+e2e-oagw-sqlite: py-env
+	$(call print_target_banner)
+	$(PYTHON) tools/scripts/run_e2e.py --suite oagw --profile sqlite -- $(E2E_TARGET)
 
 ## Run E2E smoke tests locally (only tests marked @pytest.mark.smoke)
 e2e-local-smoke: py-env
@@ -1492,7 +1505,7 @@ ci_docs: lychee gts-docs
 	$(call print_target_banner)
 
 # Run CI pipeline locally, requires docker
-ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db lychee gts-docs dylint
+ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-oagw-db lychee gts-docs dylint
 	$(call print_target_banner)
 
 ## Build the cf-gears-example-server release binary, or a single gear when GEAR=<gear> is set

@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::domain::error::DomainError;
 use crate::domain::model::{RateLimitAlgorithm, RateLimitConfig, RateLimitScope, Window};
@@ -42,6 +41,8 @@ pub struct RateLimitOutcome {
 #[domain_model]
 pub struct RateLimiter {
     buckets: DashMap<String, Bucket>,
+    /// Origin of every sliding window's sub-window grid.
+    grid_anchor: Instant,
 }
 
 #[domain_model]
@@ -83,6 +84,12 @@ impl TokenBucket {
         } else {
             false
         }
+    }
+
+    /// Full: indistinguishable from a new bucket.
+    fn is_at_rest(&mut self) -> bool {
+        self.refill();
+        self.tokens >= self.capacity
     }
 
     fn retry_after_secs(&self, cost: f64) -> u64 {
@@ -148,32 +155,38 @@ struct SlidingWindowBucket {
 }
 
 impl SlidingWindowBucket {
-    fn new(config: &RateLimitConfig) -> Self {
+    /// Sub-windows start at `grid_anchor` plus a whole number of sub-windows,
+    /// so every bucket of a limiter shares one grid.
+    fn new(config: &RateLimitConfig, grid_anchor: Instant) -> Self {
         let n = sub_windows_for(&config.sustained.window);
-        let total_nanos = window_to_nanos(&config.sustained.window);
+        let sub_window_nanos = window_to_nanos(&config.sustained.window) / n as u64;
+        let since_anchor = now().saturating_duration_since(grid_anchor).as_nanos() as u64;
+        let current_start =
+            grid_anchor + Duration::from_nanos(since_anchor - since_anchor % sub_window_nanos);
         Self {
             limit: config.sustained.rate,
             counters: vec![0; n],
             num_sub_windows: n,
-            sub_window_nanos: total_nanos / n as u64,
+            sub_window_nanos,
             current_index: 0,
-            current_start: now(),
+            current_start,
             total_count: 0,
         }
     }
 
     /// Advance the ring buffer to the current time, zeroing expired sub-windows.
+    /// `current_start` moves by whole sub-windows only, so the grid never
+    /// shifts, however often this runs.
     fn advance(&mut self) {
         let elapsed_nanos = now().duration_since(self.current_start).as_nanos() as u64;
-        let steps = (elapsed_nanos / self.sub_window_nanos) as usize;
+        let steps = elapsed_nanos / self.sub_window_nanos;
         if steps == 0 {
             return;
         }
-        if steps >= self.num_sub_windows {
+        self.current_start += Duration::from_nanos(self.sub_window_nanos * steps);
+        if steps >= self.num_sub_windows as u64 {
             self.counters.fill(0);
             self.total_count = 0;
-            self.current_index = 0;
-            self.current_start = now();
             return;
         }
         for _ in 0..steps {
@@ -181,7 +194,6 @@ impl SlidingWindowBucket {
             self.total_count -= self.counters[self.current_index];
             self.counters[self.current_index] = 0;
         }
-        self.current_start += std::time::Duration::from_nanos(self.sub_window_nanos * steps as u64);
     }
 
     fn try_consume(&mut self, cost: u32) -> bool {
@@ -197,6 +209,13 @@ impl SlidingWindowBucket {
 
     fn remaining(&self) -> u32 {
         self.limit.saturating_sub(self.total_count)
+    }
+
+    /// Every counted request has expired. An empty window on the limiter's
+    /// grid is indistinguishable from a new one.
+    fn is_at_rest(&mut self) -> bool {
+        self.advance();
+        self.total_count == 0
     }
 
     /// Seconds until enough sub-windows expire to free `cost` capacity.
@@ -233,6 +252,23 @@ enum Bucket {
 }
 
 impl Bucket {
+    fn new(config: &RateLimitConfig, grid_anchor: Instant) -> Self {
+        match config.algorithm {
+            RateLimitAlgorithm::TokenBucket => Bucket::Token(TokenBucket::new(config)),
+            RateLimitAlgorithm::SlidingWindow => {
+                Bucket::Sliding(SlidingWindowBucket::new(config, grid_anchor))
+            }
+        }
+    }
+
+    /// Removing the bucket now would change no later decision.
+    fn is_at_rest(&mut self) -> bool {
+        match self {
+            Bucket::Token(tb) => tb.is_at_rest(),
+            Bucket::Sliding(sw) => sw.is_at_rest(),
+        }
+    }
+
     /// Returns `true` if this bucket's algorithm and parameters match `config`.
     fn matches_config(&self, config: &RateLimitConfig) -> bool {
         match (self, &config.algorithm) {
@@ -365,13 +401,29 @@ impl RateLimiter {
     pub fn new() -> Self {
         Self {
             buckets: DashMap::new(),
+            grid_anchor: now(),
         }
     }
 
-    /// Remove all entries whose keys are not in `active_keys`.
-    #[allow(dead_code)]
-    pub fn purge_keys(&self, active_keys: &HashSet<String>) {
-        self.buckets.retain(|k, _| active_keys.contains(k));
+    /// Remove every bucket at rest (a full token bucket or an empty sliding
+    /// window); [`try_consume`](Self::try_consume) recreates it on the next
+    /// request, so no decision changes. Reclaims buckets no explicit cleanup
+    /// removes (other replicas' and SDK deletes, cascaded routes, one-off IPs
+    /// and subjects). Returns the number removed.
+    pub fn evict_idle(&self) -> usize {
+        let mut evicted = 0;
+        self.buckets.retain(|_, bucket| {
+            let at_rest = bucket.is_at_rest();
+            evicted += usize::from(at_rest);
+            !at_rest
+        });
+        evicted
+    }
+
+    /// Buckets currently held.
+    #[must_use]
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.len()
     }
 
     /// Remove all rate-limit buckets associated with an upstream (across all scopes).
@@ -404,20 +456,10 @@ impl RateLimiter {
             .entry(key.to_string())
             .and_modify(|bucket| {
                 if !bucket.matches_config(config) {
-                    *bucket = match config.algorithm {
-                        RateLimitAlgorithm::TokenBucket => Bucket::Token(TokenBucket::new(config)),
-                        RateLimitAlgorithm::SlidingWindow => {
-                            Bucket::Sliding(SlidingWindowBucket::new(config))
-                        }
-                    };
+                    *bucket = Bucket::new(config, self.grid_anchor);
                 }
             })
-            .or_insert_with(|| match config.algorithm {
-                RateLimitAlgorithm::TokenBucket => Bucket::Token(TokenBucket::new(config)),
-                RateLimitAlgorithm::SlidingWindow => {
-                    Bucket::Sliding(SlidingWindowBucket::new(config))
-                }
-            });
+            .or_insert_with(|| Bucket::new(config, self.grid_anchor));
 
         let now_epoch = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -640,34 +682,118 @@ mod tests {
     }
 
     #[test]
-    fn purge_removes_stale_entries() {
-        let _clock = FrozenClock::new();
+    fn evict_idle_removes_token_buckets_once_full() {
+        let mut clock = FrozenClock::new();
         let limiter = RateLimiter::new();
-        let config = make_config(10, Window::Second, None);
-        limiter.try_consume("a", &config, "/test").unwrap();
-        limiter.try_consume("b", &config, "/test").unwrap();
-        limiter.try_consume("c", &config, "/test").unwrap();
+        // One token back every 100 ms, and every 6 s.
+        let fast = make_config(10, Window::Second, None);
+        let slow = make_config(10, Window::Minute, None);
+        limiter.try_consume("fast", &fast, "/test").unwrap();
+        limiter.try_consume("slow", &slow, "/test").unwrap();
 
-        let active: HashSet<String> = ["a", "c"].iter().map(|s| (*s).into()).collect();
-        limiter.purge_keys(&active);
+        assert_eq!(limiter.evict_idle(), 0);
+        clock.advance(Duration::from_millis(100));
+        assert_eq!(limiter.evict_idle(), 1);
+        assert!(!limiter.buckets.contains_key("fast"));
+        assert!(limiter.buckets.contains_key("slow"));
 
-        // a and c survive, b is gone.
-        assert!(limiter.buckets.contains_key("a"));
-        assert!(!limiter.buckets.contains_key("b"));
-        assert!(limiter.buckets.contains_key("c"));
+        clock.advance(Duration::from_millis(5_900));
+        assert_eq!(limiter.evict_idle(), 1);
+        assert!(limiter.buckets.is_empty());
     }
 
     #[test]
-    fn purge_with_empty_set_removes_all() {
-        let _clock = FrozenClock::new();
+    fn evict_idle_removes_sliding_windows_once_empty() {
+        let mut clock = FrozenClock::new();
         let limiter = RateLimiter::new();
-        let config = make_config(10, Window::Second, None);
-        limiter.try_consume("x", &config, "/test").unwrap();
-        limiter.try_consume("y", &config, "/test").unwrap();
+        let config = make_sliding_config(10, Window::Second);
+        limiter.try_consume("key", &config, "/test").unwrap();
 
-        limiter.purge_keys(&HashSet::new());
-
+        clock.advance(Duration::from_millis(900));
+        assert_eq!(limiter.evict_idle(), 0);
+        clock.advance(Duration::from_millis(100));
+        assert_eq!(limiter.evict_idle(), 1);
         assert!(limiter.buckets.is_empty());
+    }
+
+    /// Eviction is invisible: the recreated bucket answers as the evicted one
+    /// would have.
+    #[test]
+    fn evicted_bucket_answers_like_the_one_it_replaces() {
+        let mut clock = FrozenClock::new();
+        let config = make_config(2, Window::Second, None);
+        let kept = RateLimiter::new();
+        let evicted = RateLimiter::new();
+        for limiter in [&kept, &evicted] {
+            limiter.try_consume("key", &config, "/test").unwrap();
+            limiter.try_consume("key", &config, "/test").unwrap();
+            assert!(limiter.try_consume("key", &config, "/test").is_err());
+        }
+
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(evicted.evict_idle(), 1);
+
+        for _ in 0..2 {
+            let a = kept.try_consume("key", &config, "/test").unwrap();
+            let b = evicted.try_consume("key", &config, "/test").unwrap();
+            // `reset_epoch` reads the wall clock, which the frozen clock
+            // does not cover.
+            assert_eq!((a.limit, a.remaining), (b.limit, b.remaining));
+        }
+        assert!(kept.try_consume("key", &config, "/test").is_err());
+        assert!(evicted.try_consume("key", &config, "/test").is_err());
+    }
+
+    /// Sliding windows sit on the limiter's fixed sub-window grid, so
+    /// neither evicting an empty window nor sweeping a kept one changes a
+    /// later answer. Times are ms after the limiter's creation, off the
+    /// 100 ms grid. Restarting the grid at a new bucket (A) or at the reset
+    /// in `advance` (B, C) changes the answer to each case's last request.
+    #[test]
+    fn evicted_or_swept_sliding_window_answers_like_an_untouched_one() {
+        // (limit, request times, sweep times, buckets the sweeps evict)
+        type Case = (u32, &'static [u64], &'static [u64], usize);
+        let cases: [Case; 3] = [
+            // A: the sweep evicts the bucket.
+            (1, &[10, 520, 635, 1100, 2020], &[1061], 1),
+            // B: the sweep keeps the bucket.
+            (2, &[1260, 2910, 3070, 3909], &[1991], 0),
+            // C: the untouched bucket resets at 2165 ms; the swept one was
+            // evicted just before and is recreated then.
+            (1, &[55, 2165, 2860, 3470, 4403], &[2161, 2451], 1),
+        ];
+        for (limit, requests, sweeps, expected_evictions) in cases {
+            let mut clock = FrozenClock::new();
+            let config = make_sliding_config(limit, Window::Second);
+            let untouched = RateLimiter::new();
+            let swept = RateLimiter::new();
+            let answer = |limiter: &RateLimiter| match limiter.try_consume("key", &config, "/t") {
+                Ok(outcome) => Ok(outcome.remaining),
+                Err(DomainError::RateLimitExceeded {
+                    retry_after_secs, ..
+                }) => Err(retry_after_secs),
+                Err(other) => panic!("unexpected error: {other:?}"),
+            };
+
+            let mut events: Vec<(u64, bool)> = requests.iter().map(|&t| (t, false)).collect();
+            events.extend(sweeps.iter().map(|&t| (t, true)));
+            events.sort_unstable();
+            let (mut elapsed, mut evictions) = (0, 0);
+            for (at, is_sweep) in events {
+                clock.advance(Duration::from_millis(at - elapsed));
+                elapsed = at;
+                if is_sweep {
+                    evictions += swept.evict_idle();
+                } else {
+                    assert_eq!(
+                        answer(&untouched),
+                        answer(&swept),
+                        "limit {limit}/s, request at {at} ms"
+                    );
+                }
+            }
+            assert_eq!(evictions, expected_evictions, "limit {limit}/s");
+        }
     }
 
     #[test]
@@ -1339,7 +1465,7 @@ mod tests {
     fn matches_config_sliding_window_same() {
         let mut config = make_config(100, Window::Minute, None);
         config.algorithm = RateLimitAlgorithm::SlidingWindow;
-        let bucket = Bucket::Sliding(SlidingWindowBucket::new(&config));
+        let bucket = Bucket::Sliding(SlidingWindowBucket::new(&config, now()));
         assert!(bucket.matches_config(&config));
     }
 
@@ -1347,7 +1473,7 @@ mod tests {
     fn matches_config_sliding_window_different_rate() {
         let mut config = make_config(100, Window::Minute, None);
         config.algorithm = RateLimitAlgorithm::SlidingWindow;
-        let bucket = Bucket::Sliding(SlidingWindowBucket::new(&config));
+        let bucket = Bucket::Sliding(SlidingWindowBucket::new(&config, now()));
 
         let mut changed = make_config(200, Window::Minute, None);
         changed.algorithm = RateLimitAlgorithm::SlidingWindow;

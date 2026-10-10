@@ -28,6 +28,17 @@ pub enum DomainError {
         detail: String,
     },
 
+    /// A Management API or SDK write to an upstream or route provisioned
+    /// from the types registry. Such a row changes only with its registry
+    /// instance, at the next startup.
+    #[error("{entity} {id} is managed by the types registry")]
+    RegistryManaged {
+        /// Kind of entity written (for example `upstream` or `route`).
+        entity: &'static str,
+        /// ID of the registry-managed entity.
+        id: Uuid,
+    },
+
     /// The request failed validation.
     #[error("validation [{field}/{reason}]: {detail}")]
     Validation {
@@ -296,6 +307,12 @@ impl DomainError {
     #[must_use]
     pub fn not_found(entity: &'static str, id: Uuid) -> Self {
         Self::NotFound { entity, id }
+    }
+
+    /// Construct a [`DomainError::RegistryManaged`] for the given entity kind and ID.
+    #[must_use]
+    pub fn registry_managed(entity: &'static str, id: Uuid) -> Self {
+        Self::RegistryManaged { entity, id }
     }
 
     /// Construct a [`DomainError::Conflict`] for the given entity kind, resource and detail.

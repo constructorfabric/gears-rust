@@ -184,7 +184,7 @@ async def update_upstream_raw(
     )
 
 
-async def create_route(
+async def create_route_raw(
     client: httpx.AsyncClient,
     base_url: str,
     headers: dict,
@@ -192,8 +192,11 @@ async def create_route(
     methods: list[str],
     path: str,
     **kwargs,
-) -> dict:
-    """Create a route via the Management API and return the response JSON."""
+) -> httpx.Response:
+    """Create an HTTP route and return the raw Response (no raise_for_status).
+
+    ``kwargs`` are merged into the body; pass ``match=...`` for a gRPC route.
+    """
     body: dict = {
         "upstream_id": upstream_id,
         "match": {
@@ -208,11 +211,24 @@ async def create_route(
     }
     body.update(kwargs)
 
-    resp = await client.post(
+    return await client.post(
         f"{base_url}/oagw/v1/routes",
         headers={**headers, "content-type": "application/json"},
         json=body,
     )
+
+
+async def create_route(
+    client: httpx.AsyncClient,
+    base_url: str,
+    headers: dict,
+    upstream_id: str,
+    methods: list[str],
+    path: str,
+    **kwargs,
+) -> dict:
+    """Create a route via the Management API and return the response JSON."""
+    resp = await create_route_raw(client, base_url, headers, upstream_id, methods, path, **kwargs)
     resp.raise_for_status()
     return resp.json()
 
@@ -380,28 +396,36 @@ async def list_all(
 
 
 class Cleanup:
-    """Collects upstreams to delete at teardown (see the ``cleanup`` fixture).
+    """Collects upstreams and routes to delete at teardown (see the ``cleanup`` fixture).
 
     Deletion runs in reverse creation order so children go before parents,
     and each delete must return 204 (or 404 when the test already deleted it).
+    A route needs registering only when deleting its upstream won't remove it,
+    e.g. a route on an upstream the test doesn't own.
     """
 
     def __init__(self) -> None:
-        self._upstreams: list[tuple[dict, str]] = []
+        self._resources: list[tuple[str, dict, str]] = []
 
     def upstream(self, headers: dict, upstream: dict) -> dict:
-        self._upstreams.append((headers, upstream["id"]))
+        self._resources.append(("upstreams", headers, upstream["id"]))
         return upstream
+
+    def route(self, headers: dict, route: dict) -> dict:
+        self._resources.append(("routes", headers, route["id"]))
+        return route
 
     async def run(self, base_url: str) -> None:
         failures = []
         async with httpx.AsyncClient(timeout=10.0) as client:
-            for headers, uid in reversed(self._upstreams):
+            for collection, headers, rid in reversed(self._resources):
                 try:
-                    resp = await delete_upstream(client, base_url, headers, uid)
+                    resp = await client.delete(
+                        f"{base_url}/oagw/v1/{collection}/{rid}", headers=headers,
+                    )
                 except httpx.HTTPError as exc:
-                    failures.append(f"{uid}: {exc!r}")
+                    failures.append(f"{rid}: {exc!r}")
                     continue
                 if resp.status_code not in (204, 404):
-                    failures.append(f"{uid}: {resp.status_code} {resp.text[:200]}")
+                    failures.append(f"{rid}: {resp.status_code} {resp.text[:200]}")
         assert not failures, f"cleanup failed: {failures}"

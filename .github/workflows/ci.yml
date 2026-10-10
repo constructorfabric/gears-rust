@@ -455,6 +455,9 @@ jobs:
       - name: Test types-registry (db integration)
         run: make test-types-registry-db
 
+      - name: Test oagw (pg/mysql conformance + migrations, integration)
+        run: make test-oagw-db
+
   test-fips:
     name: FIPS verification (${{ matrix.os }})
     needs: changes

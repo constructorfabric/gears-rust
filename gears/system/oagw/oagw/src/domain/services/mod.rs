@@ -2,6 +2,7 @@
 pub(crate) mod client;
 /// Control-plane (configuration management) service implementation.
 pub(crate) mod management;
+pub(crate) mod registry_reconcile;
 
 pub(crate) use client::ServiceGatewayClientV1Facade;
 pub(crate) use management::ControlPlaneServiceImpl;
@@ -19,6 +20,7 @@ use crate::domain::model::{
     CreateRouteRequest, CreateUpstreamRequest, Endpoint, ListQuery, Route, UpdateRouteRequest,
     UpdateUpstreamRequest, Upstream,
 };
+use crate::domain::repo::{RowKey, Tags};
 
 /// Internal Control Plane service trait — configuration management and resolution.
 #[async_trait]
@@ -46,14 +48,8 @@ pub(crate) trait ControlPlaneService: Send + Sync {
         req: UpdateUpstreamRequest,
     ) -> Result<Upstream, DomainError>;
 
-    /// Delete an upstream and cascade-delete its routes.
-    /// Returns the IDs of deleted routes so callers can clean up route-scoped
-    /// rate-limit keys.
-    async fn delete_upstream(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-    ) -> Result<Vec<Uuid>, DomainError>;
+    /// Delete an upstream and its routes.
+    async fn delete_upstream(&self, ctx: &SecurityContext, id: Uuid) -> Result<(), DomainError>;
 
     // -- Route CRUD --
 
@@ -87,14 +83,69 @@ pub(crate) trait ControlPlaneService: Send + Sync {
     ///
     /// Single `get_ancestors` call, correct multi-ID route matching across
     /// ancestor upstreams, and full effective config merge including route
-    /// overrides.
+    /// overrides. The proxy passes [`Tags::Skip`]: it never reads tags.
     async fn resolve_proxy_target(
         &self,
         ctx: &SecurityContext,
         alias: &str,
         method: &str,
         path: &str,
+        tags: Tags,
     ) -> Result<(Upstream, Route), DomainError>;
+}
+
+/// Writes of the startup types-registry reconcile
+/// (`cpt-cf-oagw-flow-domain-registry-provisioning`). Rows written here are
+/// registry-managed: [`ControlPlaneService`] writes reject them, and these
+/// writes reject rows the Management API created. Kept off
+/// [`ControlPlaneService`], which the Management API and the SDK hold, so
+/// they cannot reach it. Validation is the same as for API writes.
+#[async_trait]
+pub(crate) trait RegistryProvisioner: ControlPlaneService {
+    async fn create_registry_upstream(
+        &self,
+        ctx: &SecurityContext,
+        req: CreateUpstreamRequest,
+    ) -> Result<Upstream, DomainError>;
+
+    async fn update_registry_upstream(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+        req: UpdateUpstreamRequest,
+    ) -> Result<Upstream, DomainError>;
+
+    /// Delete a registry upstream and every route on it.
+    async fn delete_registry_upstream(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+    ) -> Result<(), DomainError>;
+
+    async fn create_registry_route(
+        &self,
+        ctx: &SecurityContext,
+        req: CreateRouteRequest,
+    ) -> Result<Route, DomainError>;
+
+    async fn update_registry_route(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+        req: UpdateRouteRequest,
+    ) -> Result<Route, DomainError>;
+
+    async fn delete_registry_route(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+    ) -> Result<(), DomainError>;
+
+    /// Every registry-managed upstream, across all tenants.
+    async fn registry_upstream_keys(&self) -> Result<Vec<RowKey>, DomainError>;
+
+    /// Every registry-managed route, across all tenants.
+    async fn registry_route_keys(&self) -> Result<Vec<RowKey>, DomainError>;
 }
 
 /// Internal Data Plane service trait — proxy orchestration and plugin execution.

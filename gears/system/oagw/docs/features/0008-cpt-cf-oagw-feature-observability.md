@@ -68,7 +68,7 @@ Operators need full visibility into outbound API traffic patterns, errors, and p
 - mTLS support for client certificate authentication with upstreams (future work)
 - Centralized logging system deployment and configuration (infrastructure concern)
 - Distributed tracing backend deployment (infrastructure concern; feature provides trace context propagation)
-- Custom metric definitions beyond the 12 OAGW standard metrics
+- Custom metric definitions beyond the 14 OAGW standard metrics
 
 ### 1.6 Configuration Parameters
 
@@ -318,10 +318,10 @@ Not applicable — this feature implements pipeline-integrated cross-cutting con
 
 - [ ] `p2` - **ID**: `cpt-cf-oagw-dod-obs-prometheus-metrics`
 
-The system **MUST** expose all 12 OAGW Prometheus metrics at the admin `/metrics` endpoint:
-- Counters: `oagw_requests_total`, `oagw_errors_total`, `oagw_rate_limit_exceeded_total`, `oagw_circuit_breaker_transitions_total`, `oagw_routing_target_host_used`, `oagw_routing_endpoint_selected`
+The system **MUST** expose all 14 OAGW Prometheus metrics at the admin `/metrics` endpoint:
+- Counters: `oagw_requests_total`, `oagw_errors_total`, `oagw_rate_limit_exceeded_total`, `oagw_rate_limit_buckets_evicted_total`, `oagw_circuit_breaker_transitions_total`, `oagw_routing_target_host_used`, `oagw_routing_endpoint_selected`
 - Histograms: `oagw_request_duration_seconds` with buckets `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
-- Gauges: `oagw_requests_in_flight`, `oagw_circuit_breaker_state`, `oagw_rate_limit_usage_ratio`, `oagw_upstream_available`, `oagw_upstream_connections`
+- Gauges: `oagw_requests_in_flight`, `oagw_circuit_breaker_state`, `oagw_rate_limit_usage_ratio`, `oagw_rate_limit_buckets`, `oagw_upstream_available`, `oagw_upstream_connections`
 
 Cardinality **MUST** be controlled: no tenant labels; `http.route` is the normalized route match pattern from route config; `http.request.method` is normalized to a standard verb or `_OTHER`; `http.response.status_code` is the numeric upstream status (OTel HTTP semconv) — status-class queries (e.g. `5xx` rate) are expressed at query time over the numeric code. Label-key vocabulary matches the inbound API Gateway so both gateways share dashboards.
 
@@ -427,7 +427,7 @@ When Redis (CP L2) is unavailable, the system **MUST** degrade gracefully by ski
 
 ## 6. Acceptance Criteria
 
-- [ ] All 12 Prometheus metrics are exposed at `/metrics` in Prometheus exposition format
+- [ ] All 14 Prometheus metrics are exposed at `/metrics` in Prometheus exposition format
 - [ ] `oagw_request_duration_seconds` histogram uses the specified 12-bucket configuration
 - [ ] No metric label includes tenant_id (cardinality control)
 - [ ] Metric paths are normalized from route config, not raw request paths

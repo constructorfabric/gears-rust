@@ -24,14 +24,16 @@
 //! | other field validation | [`ServiceGatewayError::Validation`] |
 //! | resource missing | [`ServiceGatewayError::NotFound`] |
 //! | resource conflict | [`ServiceGatewayError::AlreadyExists`] |
-//! | guard precondition (no resource named) | [`ServiceGatewayError::FailedPrecondition`] |
+//! | precondition failed — inspect `precondition_type` (guard rejection, unreachable secret, registry-managed resource) | [`ServiceGatewayError::FailedPrecondition`] |
 //! | guard concurrency conflict (no resource named) | [`ServiceGatewayError::Aborted`] |
 //! | internal gateway error | [`ServiceGatewayError::Internal`] |
 //! | anything else (forward-compat) | [`ServiceGatewayError::Other`] |
 //!
 //! Consumers that need to dispatch on specific field-violation codes
 //! beyond the broken-out cases can `match` against the constants in
-//! [`crate::field`] inside the [`ServiceGatewayError::Validation`] arm.
+//! [`crate::field`] inside the [`ServiceGatewayError::Validation`] arm,
+//! and on precondition types against [`crate::precondition`] inside the
+//! [`ServiceGatewayError::FailedPrecondition`] arm.
 //!
 //! [`ServiceGatewayError::Other`] holds the full [`CanonicalError`] for
 //! categories the SDK does not specifically model. Consumers that need
@@ -158,12 +160,18 @@ pub enum ServiceGatewayError {
     #[error("{resource:?} already exists: {name}")]
     AlreadyExists { resource: Resource, name: String },
 
-    // ─── Guard plugin rejection without a named resource ──────────────
-    /// Operation precondition not met. Typically emitted by guard
-    /// plugins detecting state drift / version mismatch / policy
-    /// violations when the plugin cannot name a specific resource.
-    /// Retrying without state change won't help — fix the precondition
-    /// first.
+    // ─── Precondition failures ────────────────────────────────────────
+    /// Operation precondition not met. Retrying without a state change
+    /// won't help — fix the precondition first. Dispatch on
+    /// `precondition_type` (constants in [`crate::precondition`]):
+    ///
+    /// * [`crate::precondition::STATE`] — a guard plugin rejected the
+    ///   call without naming a resource (state drift, version mismatch,
+    ///   policy), or an upstream's credential reference is not
+    ///   provisioned or shared yet.
+    /// * [`crate::precondition::REGISTRY_MANAGED`] — a Management write
+    ///   to an upstream or route that the types registry manages. The row
+    ///   changes only with its registry instance.
     ///
     /// When a guard plugin **can** name the affected resource it should
     /// supply `resource_id` in `GuardDecision::Reject` so the failure
@@ -171,12 +179,13 @@ pub enum ServiceGatewayError {
     /// `resource_name`. See `oagw::domain::plugin::GuardDecision` docs.
     #[error("precondition failed [{precondition_type}/{subject}]: {detail}")]
     FailedPrecondition {
-        /// `type_` from the canonical `PreconditionViolation`. OAGW
-        /// currently emits `"STATE"` for guard rejections; other values
-        /// may appear if the impl grows new precondition categories.
+        /// `type_` from the canonical `PreconditionViolation`: one of the
+        /// [`crate::precondition`] types. Other values may appear if the
+        /// impl grows new precondition categories.
         precondition_type: String,
-        /// `subject` from the canonical `PreconditionViolation` — the
-        /// guard plugin's `error_code`.
+        /// `subject` from the canonical `PreconditionViolation`: the guard
+        /// plugin's `error_code`, `auth.config.secret_ref`, or
+        /// [`crate::precondition::MANAGED_BY`].
         subject: String,
         detail: String,
     },
@@ -275,11 +284,11 @@ impl From<CanonicalError> for ServiceGatewayError {
                 name: resource_name,
             },
 
-            // Guard plugin rejection at status 404 without `resource_id`:
-            // the impl maps it to canonical FailedPrecondition with a
-            // single PreconditionViolation carrying the plugin's
-            // (error_code, detail, "STATE"). Take the first violation;
-            // OAGW only ever emits one.
+            // A guard rejection at status 404 without `resource_id`, an
+            // unreachable secret, or a write to a registry-managed row:
+            // the impl emits canonical FailedPrecondition with a single
+            // PreconditionViolation (see `crate::precondition`). Take the
+            // first violation; OAGW only ever emits one.
             CanonicalError::FailedPrecondition { ctx, .. } => {
                 if let Some(v) = ctx.violations.first() {
                     Self::FailedPrecondition {
@@ -850,6 +859,31 @@ mod projection_tests {
                 assert_eq!(precondition_type, "STATE");
                 assert_eq!(subject, "STATE_DRIFT");
                 assert_eq!(detail, "account state is stale");
+            }
+            other => panic!("expected FailedPrecondition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_managed_projects_to_failed_precondition() {
+        // A Management write to a types-registry row. The literals pin the
+        // wire values the constants carry.
+        let canonical = UpstreamScope::failed_precondition()
+            .with_precondition_violation(
+                crate::precondition::MANAGED_BY,
+                "upstream is managed by the types registry",
+                crate::precondition::REGISTRY_MANAGED,
+            )
+            .create();
+        assert_eq!(canonical.resource_type(), Some(crate::gts::UPSTREAM_SCHEMA));
+        match ServiceGatewayError::from(canonical) {
+            ServiceGatewayError::FailedPrecondition {
+                precondition_type,
+                subject,
+                ..
+            } => {
+                assert_eq!(precondition_type, "REGISTRY_MANAGED");
+                assert_eq!(subject, "managed_by");
             }
             other => panic!("expected FailedPrecondition, got {other:?}"),
         }

@@ -1,5 +1,6 @@
 use crate::domain::error::DomainError;
 use crate::domain::model::BudgetMode;
+use crate::domain::repo::Tags;
 
 use super::ControlPlaneServiceImpl;
 use super::merge::{rate_per_second, window_to_secs};
@@ -43,29 +44,13 @@ impl ControlPlaneServiceImpl {
     pub(super) async fn validate_budget_allocation(
         &self,
         ctx: &SecurityContext,
-        tenant_chain: &[Uuid],
+        requesting_tenant: Uuid,
+        ancestor: Option<&crate::domain::model::Upstream>,
         alias: &str,
         child_rate_limit: Option<&crate::domain::model::RateLimitConfig>,
     ) -> Result<(), DomainError> {
-        let requesting_tenant = tenant_chain[0];
-
-        // Find the closest ancestor with this alias.
-        let ancestor = {
-            let mut found = None;
-            for &ancestor_tid in &tenant_chain[1..] {
-                match self.upstreams.get_by_alias(ancestor_tid, alias).await {
-                    Ok(u) => {
-                        found = Some(u);
-                        break;
-                    }
-                    Err(crate::domain::repo::RepositoryError::NotFound { .. }) => continue,
-                    Err(e) => return Err(DomainError::from(e)),
-                }
-            }
-            match found {
-                Some(a) => a,
-                None => return Ok(()), // No ancestor with this alias — nothing to validate.
-            }
+        let Some(ancestor) = ancestor else {
+            return Ok(()); // No ancestor with this alias — nothing to validate.
         };
 
         let ancestor_budget = match ancestor
@@ -106,7 +91,7 @@ impl ControlPlaneServiceImpl {
 
         let siblings = self
             .upstreams
-            .list_by_alias_for_tenants(alias, &tree_ids)
+            .list_by_alias_for_tenants(alias, &tree_ids, Tags::Skip)
             .await?;
 
         let ancestor_rl = ancestor.rate_limit.as_ref().unwrap(); // safe: we checked above
@@ -180,7 +165,7 @@ impl ControlPlaneServiceImpl {
 
         let descendants = self
             .upstreams
-            .list_by_alias_for_tenants(alias, &tree_ids)
+            .list_by_alias_for_tenants(alias, &tree_ids, Tags::Skip)
             .await?;
 
         let mut total_rps: f64 = 0.0;

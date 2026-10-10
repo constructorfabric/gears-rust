@@ -32,6 +32,8 @@ test-utils = [
     "tokio/sync",
     "tokio/rt",
 ]
+mysql = ["toolkit-db/mysql"]
+integration = ["mysql"]
 
 [dependencies]
 oagw-sdk = { path = "../oagw-sdk", package="cf-gears-oagw-sdk", version = "0.5.15", features = ["axum"] }
@@ -73,11 +75,17 @@ parking_lot = { workspace = true }
 psl = { workspace = true }
 thiserror = { workspace = true }
 mime = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
+toolkit-db-macros = { workspace = true }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+time = { workspace = true }
 # DP deps
 form_urlencoded = "1"
 pingora-memory-cache = "0.8"
 futures-util = { workspace = true, features = ["sink"] }
 tokio = { workspace = true, features = ["time"] }
+tokio-util = { workspace = true }
 tokio-retry = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -111,3 +119,7 @@ httpmock = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 futures-util = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
+testcontainers = { workspace = true }
+test-containers = { workspace = true }
+tracing-test = { workspace = true }

@@ -200,26 +200,18 @@ pub(in crate::domain::services) async fn validate_secret_ref_accessible(
 }
 
 /// Validate bind constraints against the **closest** ancestor with a matching
-/// alias. Delegates to [`validate_bind_constraints`] for the actual checks.
+/// alias ([`super::ancestor::closest_ancestor_upstream`]).
+/// Delegates to [`validate_bind_constraints`] for the actual checks.
 ///
 /// No-op if no ancestor has the alias (fresh upstream, no bind needed).
 pub(in crate::domain::services) async fn validate_ancestor_bind(
     ctx: &SecurityContext,
-    upstreams: &dyn crate::domain::repo::UpstreamRepository,
     enforcer: &PolicyEnforcer,
-    tenant_chain: &[uuid::Uuid],
-    alias: &str,
+    ancestor: Option<&Upstream>,
     overrides: &BindOverrides<'_>,
 ) -> Result<(), DomainError> {
-    for &ancestor_tid in &tenant_chain[1..] {
-        match upstreams.get_by_alias(ancestor_tid, alias).await {
-            Ok(ancestor_upstream) => {
-                validate_bind_constraints(ctx, enforcer, &ancestor_upstream, overrides).await?;
-                break; // Only check closest ancestor with matching alias.
-            }
-            Err(crate::domain::repo::RepositoryError::NotFound { .. }) => continue,
-            Err(e) => return Err(DomainError::from(e)),
-        }
+    match ancestor {
+        Some(ancestor) => validate_bind_constraints(ctx, enforcer, ancestor, overrides).await,
+        None => Ok(()),
     }
-    Ok(())
 }

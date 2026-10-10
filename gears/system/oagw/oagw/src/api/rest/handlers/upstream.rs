@@ -109,15 +109,13 @@ pub async fn delete_upstream(
 ) -> Result<impl IntoResponse, Box<Problem>> {
     let instance = format!("/oagw/v1/upstreams/{id}");
     let uuid = parse_gts_id(&id, gts::UPSTREAM_SCHEMA, &instance)?;
-    let deleted_route_ids = state
+    state
         .cp
         .delete_upstream(&ctx, uuid)
         .await
         .map_err(|e| domain_error_to_problem(e, &instance))?;
     state.backend_selector.invalidate(uuid);
+    // The deleted routes' buckets go with the idle-bucket sweep.
     state.dp.remove_rate_limit_keys_for_upstream(uuid);
-    for route_id in deleted_route_ids {
-        state.dp.remove_rate_limit_keys_for_route(route_id);
-    }
     Ok(StatusCode::NO_CONTENT)
 }

@@ -53,7 +53,7 @@ The OAGW design is decomposed into eight features organized along functional bou
 
 - **Scope**:
   - Domain entities: Upstream, Route, Plugin, ServerConfig, Endpoint
-  - All `oagw_*` database tables and migrations
+  - Opt-in upstream and route storage: ADR-0009 tables (except `oagw_plugin`) and migrations when a database is configured, in-memory repositories otherwise (ADR-0018)
   - ToolKit gear wiring (`gear.rs`, `config.rs`, `OagwConfig`)
   - SDK crate (`oagw-sdk`): `ServiceGatewayClientV1` trait, SDK models, `ServiceGatewayError`
   - GTS type provisioning (`type_provisioning.rs`): schema and instance registration
@@ -66,6 +66,7 @@ The OAGW design is decomposed into eight features organized along functional bou
 
 - **Requirements Covered**:
   - [ ] `p1` - `cpt-cf-oagw-nfr-multi-tenancy`
+  - [ ] `p1` - `cpt-cf-oagw-fr-config-persistence`
 
 - **Design Principles Covered**:
   - `cpt-cf-oagw-principle-tenant-scope`
