@@ -398,6 +398,10 @@ Plugin chain composition: upstream plugins execute before route plugins (`[U1, U
 - Guard: `timeout`, `cors`
 - Transform: `logging`, `metrics`
 
+#### GTS Types Registry Catalog
+
+Beyond the plugin identifiers above, OAGW registers 7 JSON Schema entities at startup — `upstream`, `route`, `protocol`, `auth_plugin`, `guard_plugin`, `transform_plugin`, `proxy` — plus 2 `protocol` instances (`http.v1`, `grpc.v1`), which are not plugins. Combined with the 12 plugin identifiers listed above (6 auth + 3 guard + 3 transform), the registry holds 21 entities total.
+
 **Custom Plugins**: Starlark scripts with sandboxed execution (no network/file I/O, timeout/memory limits enforced). Immutable after creation; GC for unlinked plugins after configurable TTL.
 
 #### Hierarchical Configuration
@@ -512,7 +516,7 @@ Default validation checks (no configuration required):
 | Check | Rule | Error |
 |---|---|---|
 | Content-Length | Must be valid integer if present; must match actual size | `400 ValidationError` |
-| Max size | Hard limit 100MB; reject before buffering | `413 PayloadTooLarge` |
+| Max size | Hard limit 100MB; reject before buffering | `400 PayloadTooLarge` |
 | Transfer-Encoding | Reject unsupported encodings (only `chunked` supported) | `400 ValidationError` |
 
 Additional validation (JSON Schema, content-type checks, custom rules) implemented via guard plugins.
@@ -634,6 +638,8 @@ Authorization checks:
 
 IDs use anonymous GTS identifiers: `gts.cf.core.oagw.{type}.v1~{uuid}`. Plugins are immutable (no PUT). DELETE returns `409 PluginInUse` when referenced.
 
+**Reachability note**: the five `/api/oagw/v1/plugins*` routes above are not a routing-only gap — the whole feature stack is unbuilt. No route for any of them is registered; no request handler for plugins exists; the control-plane's repository layer has no plugin repository (only upstream and route repositories); and the control-plane service has no plugin CRUD methods. `DomainError::PluginNotFound`/`PluginInUse` and their canonical-conversion logic exist, but nothing in the current codebase constructs or reaches them — treat this as a fully unimplemented feature (storage, service layer, handlers, routing), not a missing route registration.
+
 #### CRUD Semantics
 
 **POST (Create)**:
@@ -707,36 +713,41 @@ Request classification uses `upstream.protocol` to determine match strategy:
 
 #### Error Response Format
 
-All gateway errors follow RFC 9457 Problem Details (`application/problem+json`) with GTS `type` identifiers.
+All gateway errors follow RFC 9457 Problem Details (`application/problem+json`). Every error resolves through the shared canonical-errors library — there is no OAGW-specific `type` namespace. The wire `type` always comes from the canonical category below; OAGW's own identity (`cf.core.oagw.{upstream,route,proxy,auth_plugin,guard_plugin,transform_plugin}.v1~`) appears only in the separate `resource_type` extension field, which scopes *which* resource the error is about without changing *which category* of error it is.
 
-| Error Type | HTTP | GTS Instance ID | Retriable | Description |
-|---|---|---|---|---|
-| RouteError | 400 | `gts.cf.core.errors.err.v1~cf.oagw.validation.error.v1` | No | General route validation error |
-| ValidationError | 400 | `gts.cf.core.errors.err.v1~cf.oagw.validation.error.v1` | No | Request validation failed |
-| MissingTargetHost | 400 | `gts.cf.core.errors.err.v1~cf.oagw.routing.missing_target_host.v1` | No | X-OAGW-Target-Host header required for multi-endpoint upstream with common suffix alias |
-| InvalidTargetHost | 400 | `gts.cf.core.errors.err.v1~cf.oagw.routing.invalid_target_host.v1` | No | X-OAGW-Target-Host header format is invalid (must be hostname or IP, no port/path/special chars) |
-| UnknownTargetHost | 400 | `gts.cf.core.errors.err.v1~cf.oagw.routing.unknown_target_host.v1` | No | X-OAGW-Target-Host value does not match any configured endpoint |
-| AuthenticationFailed | 401 | `gts.cf.core.errors.err.v1~cf.oagw.auth.failed.v1` | No | Authentication to upstream failed |
-| RouteNotFound | 404 | `gts.cf.core.errors.err.v1~cf.oagw.route.not_found.v1` | No | No matching route found |
-| PluginInUse | 409 | `gts.cf.core.errors.err.v1~cf.oagw.plugin.in_use.v1` | No | Plugin in use |
-| PayloadTooLarge | 413 | `gts.cf.core.errors.err.v1~cf.oagw.payload.too_large.v1` | No | Request payload exceeds limit |
-| RateLimitExceeded | 429 | `gts.cf.core.errors.err.v1~cf.oagw.rate_limit.exceeded.v1` | Yes | Rate limit exceeded |
-| SecretNotFound | 500 | `gts.cf.core.errors.err.v1~cf.oagw.secret.not_found.v1` | No | Referenced secret not found |
-| ProtocolError | 502 | `gts.cf.core.errors.err.v1~cf.oagw.protocol.error.v1` | No | Protocol-level error |
-| DownstreamError | 502 | `gts.cf.core.errors.err.v1~cf.oagw.downstream.error.v1` | Depends | Upstream service error |
-| StreamAborted | 502 | `gts.cf.core.errors.err.v1~cf.oagw.stream.aborted.v1` | No | Stream connection aborted |
-| LinkUnavailable | 503 | `gts.cf.core.errors.err.v1~cf.oagw.link.unavailable.v1` | Yes | Upstream link unavailable |
-| CircuitBreakerOpen | 503 | `gts.cf.core.errors.err.v1~cf.oagw.circuit_breaker.open.v1` | Yes | Circuit breaker open |
-| PluginNotFound | 503 | `gts.cf.core.errors.err.v1~cf.oagw.plugin.not_found.v1` | No | Plugin not found |
-| ConnectionTimeout | 504 | `gts.cf.core.errors.err.v1~cf.oagw.timeout.connection.v1` | Yes | Connection timeout |
-| RequestTimeout | 504 | `gts.cf.core.errors.err.v1~cf.oagw.timeout.request.v1` | Yes | Request timeout |
-| IdleTimeout | 504 | `gts.cf.core.errors.err.v1~cf.oagw.timeout.idle.v1` | Yes | Idle timeout |
+| Error Type | HTTP | Canonical GTS Type | `resource_type` scope | Retriable | Description |
+|---|---|---|---|---|---|
+| RouteError / ValidationError | 400 | `gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1` | `cf.core.oagw.proxy.v1~` | No | Request validation failed |
+| MissingTargetHost | 400 | `gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1` | `cf.core.oagw.proxy.v1~` | No | X-OAGW-Target-Host header required for multi-endpoint upstream with common suffix alias |
+| InvalidTargetHost | 400 | `gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1` | `cf.core.oagw.proxy.v1~` | No | X-OAGW-Target-Host header format is invalid (must be hostname or IP, no port/path/special chars) |
+| UnknownTargetHost | 400 | `gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1` | `cf.core.oagw.proxy.v1~` | No | X-OAGW-Target-Host value does not match any configured endpoint |
+| PayloadTooLarge | 400 | `gts.cf.core.errors.err.v1~cf.core.err.out_of_range.v1` | `cf.core.oagw.proxy.v1~` | No | Request payload exceeds limit (moved off `413`) |
+| AuthenticationFailed | 401 | `gts.cf.core.errors.err.v1~cf.core.err.unauthenticated.v1` | none (constructed directly, no resource scope) | No | Authentication to upstream failed |
+| PermissionDenied | 403 | `gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1` | `cf.core.oagw.proxy.v1~` (CORS/generic authorization denials) or `cf.core.oagw.guard_plugin.v1~` (guard plugin rejects with a 403) | No | AuthZ denied the resolved identity (e.g. nil-tenant token) |
+| RouteNotFound | 404 | `gts.cf.core.errors.err.v1~cf.core.err.not_found.v1` | `cf.core.oagw.route.v1~` | No | No matching route found |
+| PluginInUse | 409 | `gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1` | varies by plugin kind (`auth_plugin`/`guard_plugin`/`transform_plugin`/`proxy`) | No | Plugin in use. Same reachability caveat as `PluginNotFound` above — no `/plugins` DELETE route is registered today. |
+| RateLimitExceeded | 429 | `gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1` | `cf.core.oagw.proxy.v1~` | Yes | Rate limit exceeded |
+| SecretNotFound | 500 | `gts.cf.core.errors.err.v1~cf.core.err.internal.v1` | none (constructed directly) | No | Referenced secret not found |
+| ProtocolError | 503 | `gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1` | none | No | Protocol-level error (moved off `502`) |
+| DownstreamError | 503 | `gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1` | none | Depends | Upstream service error (moved off `502`) |
+| StreamAborted | 503 | `gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1` | none | No | Stream connection aborted (moved off `502`) |
+| LinkUnavailable | 503 | `gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1` | none | Yes | Upstream link unavailable |
+| UpstreamDisabled | 503 | `gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1` | none | Yes | Matched upstream is administratively disabled (`enabled: false`) |
+| CircuitBreakerOpen | 503 | `gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1` | none | Yes | Circuit breaker open |
+| PluginNotFound | 404 | `gts.cf.core.errors.err.v1~cf.core.err.not_found.v1` | varies by plugin kind (`auth_plugin`/`guard_plugin`/`transform_plugin`/`proxy`) | No | Plugin not found. Not currently constructed by any implemented code path — no `/plugins` REST route is registered, and runtime `plugin_ref` resolution failures use type-specific errors instead (guard → 500 `Internal`, auth → 401 `AuthenticationFailed`, transform → logged and skipped, no error). This row (and `PluginInUse` above) exist in the type system and its canonical-conversion logic, but are effectively unreachable today. |
+| ConnectionTimeout | 504 | `gts.cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1` | `cf.core.oagw.proxy.v1~` | Yes | Connection timeout |
+| RequestTimeout | 504 | `gts.cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1` | `cf.core.oagw.proxy.v1~` | Yes | Request timeout |
+| IdleTimeout | 504 | `gts.cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1` | `cf.core.oagw.proxy.v1~` | Yes | Idle timeout |
+
+Several distinct `Error Type` rows above share the same canonical `type` and HTTP status — e.g. all `service_unavailable`/503 rows (`ProtocolError`, `DownstreamError`, `StreamAborted`, `LinkUnavailable`, `CircuitBreakerOpen`, `UpstreamDisabled`) — and for this family there is **no reliable field to disambiguate them**, contrary to what a reader might assume from `resource_type`/`resource_name` existing as columns: none of these call sites populate `with_detail()`, so the wire `detail` is the fixed default `"Service temporarily unavailable"` for every one of them (the actual cause is only in the server-side `WARN`/`DEBUG` log, never on the wire), and `resource_type` is `none` for all six. The only per-type wire signal is the retry-delay value — carried in *two* places that mirror each other, not two independent signals: the `Retry-After` HTTP header, and the same number again under the body's `context.retry_after_seconds`. Even that only partially separates the six types: `ProtocolError`/`DownstreamError`/`StreamAborted` share `5`; `LinkUnavailable` shares `10` with the guard-plugin 5xx-masking path below; `CircuitBreakerOpen` shares `30` with `UpstreamDisabled`. A client can at best narrow a `service_unavailable` response to one of three retry-delay buckets — it cannot identify which specific error type produced it from the documented contract alone.
+
+**Exception**: guard-plugin-originated `5xx` rejections do not follow this rule. The gateway maps any guard-supplied `5xx` status to the generic `service_unavailable` category, discarding the guard's real status, error code, and detail — the specific cause is logged server-side at `WARN` with `trace_id`, never placed on the wire (see [positive-10.7 Scenario E](../scenarios/plugins/guards/positive-10.7-required-headers-guard-plugin-enforcement.md)). For this one path, `detail` is *not* occurrence-specific.
 
 **Standard Fields** (RFC 9457):
 - `type`: GTS identifier for the error type (used for programmatic error handling)
 - `title`: Human-readable summary
 - `status`: HTTP status code
-- `detail`: Human-readable explanation specific to this occurrence
+- `detail`: Human-readable explanation specific to this occurrence — except for the `service_unavailable` family and guard-plugin `5xx` rejections noted above, where it is a fixed generic string, not occurrence-specific
 - `instance`: URI reference identifying the specific occurrence
 
 **Extension Fields** (OAGW-specific):

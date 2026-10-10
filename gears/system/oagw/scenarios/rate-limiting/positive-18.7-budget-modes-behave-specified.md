@@ -1,8 +1,10 @@
 # Budget modes: allocated/shared/unlimited
 
+`rate_limit.budget` is an **upstream-only** field — `route.v1.schema.json`'s `rate_limit` has no `budget` property at all (a route-level `budget` would be silently inert; see that schema's own note). Every `rate_limit` below belongs to an upstream.
+
 ## Scenario A: allocated budget
 
-Parent:
+Parent upstream:
 
 ```json
 {
@@ -36,3 +38,9 @@ Expected:
 
 Expected:
 - No budget allocation validation is enforced.
+- Omitting `budget` entirely defaults to `mode: "unlimited"` — the same no-validation behavior, not a rejection.
+
+## Related
+
+- [negative-18.8](negative-18.8-budget-field-validation-errors.md): field-shape validation (`total` required for allocated/shared, `overcommit_ratio` range).
+- [positive-18.9](positive-18.9-budget-allocated-hierarchy-enforcement.md): concrete sum-based enforcement mechanics for `allocated` mode across a tenant hierarchy (multi-child sums, overcommit ceiling, update-time revalidation, cross-window rate normalization).
