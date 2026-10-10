@@ -1,0 +1,83 @@
+{
+  "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.identity.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A person's identity: names, external ids, public profiles, location, background. One node is one fact: its payload holds one property, which names the fact, and the origin of the fact.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 2,
+          "maxProperties": 2,
+          "required": [
+            "origin"
+          ],
+          "properties": {
+            "origin": {
+              "$ref": "gts://gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~"
+            },
+            "background": {
+              "type": "string",
+              "minLength": 1
+            },
+            "full_name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "google_scholar_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]+$"
+            },
+            "headline": {
+              "type": "string",
+              "minLength": 1
+            },
+            "location": {
+              "type": "string",
+              "minLength": 1
+            },
+            "name_variants": {
+              "type": "string",
+              "minLength": 1
+            },
+            "openalex_author_id": {
+              "type": "string",
+              "pattern": "^A\\d+$"
+            },
+            "orcid_id": {
+              "type": "string",
+              "pattern": "^\\d{4}-\\d{4}-\\d{4}-\\d{3}[\\dX]$"
+            },
+            "public_mentions": {
+              "type": "string",
+              "minLength": 1
+            },
+            "public_profiles": {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https?://"
+            },
+            "scopus_author_id": {
+              "type": "string",
+              "pattern": "^\\d+$"
+            },
+            "timezone": {
+              "type": "string",
+              "pattern": "^(UTC|[A-Za-z_]+(/[A-Za-z0-9_+-]+){1,2})$",
+              "description": "IANA time zone name: Europe/Berlin, UTC."
+            }
+          }
+        }
+      },
+      "required": [
+        "payload"
+      ]
+    }
+  ]
+}

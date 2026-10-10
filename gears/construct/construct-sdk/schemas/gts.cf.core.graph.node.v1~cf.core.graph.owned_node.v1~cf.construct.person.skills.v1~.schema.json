@@ -1,0 +1,199 @@
+{
+  "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.skills.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A person's skills: skills, languages, research areas, publications, awards and research metrics. One node is one fact: its payload holds one property, which names the fact, and the origin of the fact.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 2,
+          "maxProperties": 2,
+          "required": [
+            "origin"
+          ],
+          "properties": {
+            "origin": {
+              "$ref": "gts://gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~"
+            },
+            "activity_by_year": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "year"
+              ],
+              "properties": {
+                "year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year."
+                },
+                "works": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "citations": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "awards": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year."
+                },
+                "issuer": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "career_stage": {
+              "type": "string",
+              "minLength": 1
+            },
+            "first_publication_year": {
+              "type": "integer",
+              "minimum": 1800,
+              "description": "Calendar year."
+            },
+            "h_index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "i10_index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "languages": {
+              "type": "string",
+              "pattern": "^[a-z]{2,3}(-[A-Z]{2})?$",
+              "description": "ISO 639 language code, optionally with an ISO 3166 region: en, de, en-GB."
+            },
+            "latest_publication_year": {
+              "type": "integer",
+              "minimum": 1800,
+              "description": "Calendar year."
+            },
+            "mean_citedness_2y": {
+              "type": "number",
+              "minimum": 0
+            },
+            "primary_research_area": {
+              "type": "string",
+              "minLength": 1
+            },
+            "publications": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "title"
+              ],
+              "properties": {
+                "title": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "year": {
+                  "type": "integer",
+                  "minimum": 1800,
+                  "description": "Calendar year."
+                },
+                "venue": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "doi": {
+                  "type": "string",
+                  "pattern": "^10\\.\\d{4,9}/\\S+$"
+                },
+                "url": {
+                  "type": "string",
+                  "format": "uri",
+                  "pattern": "^https?://"
+                },
+                "openalex_id": {
+                  "type": "string",
+                  "pattern": "^W\\d+$"
+                }
+              }
+            },
+            "research_areas": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "weight": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              }
+            },
+            "skills": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "level": {
+                  "type": "string",
+                  "enum": [
+                    "beginner",
+                    "intermediate",
+                    "advanced",
+                    "expert"
+                  ]
+                },
+                "years": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            },
+            "total_citations": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "total_publications": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      },
+      "required": [
+        "payload"
+      ]
+    }
+  ]
+}
