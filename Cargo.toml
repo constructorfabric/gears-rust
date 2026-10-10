@@ -91,6 +91,8 @@ members = [
     "libs/system-sdks/sdks/directory",
     "gears/credstore/credstore-sdk",
     "gears/credstore/credstore",
+    "gears/credstore/v2/credstore-sdk",
+    "gears/credstore/v2/credstore",
     "gears/credstore/plugins/static-credstore-plugin",
     "gears/graph-storage/graph-storage-sdk",
     "gears/graph-storage/graph-storage",

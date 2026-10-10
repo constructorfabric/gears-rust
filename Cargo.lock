@@ -2559,6 +2559,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-credstore-v2"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-credstore-v2-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "sea-orm",
+ "sea-orm-migration",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-credstore-v2-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-tenant-resolver-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-security",
+ "gts",
+ "gts-macros",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "cf-gears-event-broker"
 version = "0.2.8"
 dependencies = [
