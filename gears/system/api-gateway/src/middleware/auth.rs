@@ -1,13 +1,18 @@
 use axum::http::Method;
 use axum::response::IntoResponse;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::middleware::common;
 
 use authn_resolver_sdk::{AuthNResolverClient, AuthNResolverError};
+use secrecy::ExposeSecret;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gateway::ProxyRegistry;
-use toolkit_security::SecurityContext;
+use toolkit_http_middleware::{admit_platform, extract_bearer_http};
+use toolkit_security::{RouteAuth, SecurityContext};
 
 /// Route matcher for a specific HTTP method (authenticated routes).
 #[derive(Clone)]
@@ -58,19 +63,33 @@ impl AnonymousRouteMatcher {
 }
 
 /// Whether a route requires authentication.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthRequirement {
     /// No authentication required (public route).
     None,
     /// Authentication required.
     Required,
+    /// Requires a validated `X-ToolKit-Internal-Token`; a presented bearer is validated but cannot
+    /// admit the caller alone.
+    Platform,
 }
+
+/// Request-scoped auth decision shared by the inner layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedRequirement(pub(crate) AuthRequirement);
+
+/// Inserted only by [`platform_gate_middleware`] after platform admission; permits tenant
+/// scope checks to be bypassed. The private field keeps construction inside this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlatformAdmitted(());
 
 /// Gateway-specific route policy implementation
 #[derive(Clone)]
 pub struct GatewayRoutePolicy {
     route_matchers: Arc<HashMap<Method, RouteMatcher>>,
     anonymous_matchers: Arc<HashMap<Method, AnonymousRouteMatcher>>,
+    /// Exact platform route templates: `/items/{id}` must not capture a declared `/items/special`.
+    platform_routes: Arc<HashMap<Method, HashSet<String>>>,
     require_auth_by_default: bool,
     /// Reverse-proxy route table (embedded edge). When set, dynamically-
     /// registered proxy routes are resolved against it so each is enforced
@@ -89,14 +108,57 @@ impl GatewayRoutePolicy {
         Self {
             route_matchers,
             anonymous_matchers,
+            platform_routes: Arc::new(HashMap::new()),
             require_auth_by_default,
             proxy_registry,
         }
     }
 
-    /// Resolve the authentication requirement for a given (method, path).
+    /// The request’s cached auth requirement, or a fresh resolution.
+    #[must_use]
+    pub fn requirement_of(&self, req: &axum::extract::Request) -> AuthRequirement {
+        req.extensions()
+            .get::<ResolvedRequirement>()
+            .map_or_else(|| self.resolve(req.method(), &policy_path(req)), |r| r.0)
+    }
+
+    /// Platform templates take precedence over other auth declarations.
+    #[must_use]
+    pub fn with_platform_routes(
+        mut self,
+        platform_routes: Arc<HashMap<Method, HashSet<String>>>,
+    ) -> Self {
+        self.platform_routes = platform_routes;
+        self
+    }
+
+    /// Resolve method/path auth; undeclared HEAD inherits GET.
     #[must_use]
     pub fn resolve(&self, method: &Method, path: &str) -> AuthRequirement {
+        self.resolve_declared(method, path)
+            .or_else(|| {
+                (*method == Method::HEAD)
+                    .then(|| self.resolve_declared(&Method::GET, path))
+                    .flatten()
+            })
+            .unwrap_or(if self.require_auth_by_default {
+                AuthRequirement::Required
+            } else {
+                AuthRequirement::None
+            })
+    }
+
+    /// The requirement declared for exactly `method` on `path`, if any.
+    fn resolve_declared(&self, method: &Method, path: &str) -> Option<AuthRequirement> {
+        // Platform-only first: no other declaration may relax it.
+        if self
+            .platform_routes
+            .get(method)
+            .is_some_and(|paths| paths.contains(path))
+        {
+            return Some(AuthRequirement::Platform);
+        }
+
         // Check if route is explicitly authenticated
         let is_authenticated = self
             .route_matchers
@@ -112,7 +174,7 @@ impl GatewayRoutePolicy {
 
         // Anonymous routes should not be forced to auth by default
         if is_anonymous {
-            return AuthRequirement::None;
+            return Some(AuthRequirement::None);
         }
 
         // Dynamically-registered proxy routes are not in the static matchers.
@@ -121,23 +183,15 @@ impl GatewayRoutePolicy {
         if let Some(registry) = &self.proxy_registry
             && let Some(authenticated) = registry.requires_auth(method, path)
         {
-            return if authenticated {
+            return Some(if authenticated {
                 AuthRequirement::Required
             } else {
                 AuthRequirement::None
-            };
+            });
         }
 
         // Statically-registered routes are the fallback when no proxy entry exists.
-        if is_authenticated {
-            return AuthRequirement::Required;
-        }
-
-        if self.require_auth_by_default {
-            AuthRequirement::Required
-        } else {
-            AuthRequirement::None
-        }
+        is_authenticated.then_some(AuthRequirement::Required)
     }
 }
 
@@ -148,40 +202,57 @@ pub struct AuthState {
     pub route_policy: GatewayRoutePolicy,
 }
 
-/// Helper to build `GatewayRoutePolicy` from operation requirements.
+/// Helper to build `GatewayRoutePolicy` from per-route auth declarations.
+///
+/// Duplicate `(method, path)` entries are deduplicated per auth kind; a platform
+/// declaration wins over any other declaration of the same route.
 ///
 /// # Errors
 ///
 /// Returns an error if a route pattern cannot be inserted into the matcher.
-#[allow(clippy::implicit_hasher)]
 pub fn build_route_policy(
     cfg: &crate::config::ApiGatewayConfig,
-    authenticated_routes: std::collections::HashSet<(Method, String)>,
-    anonymous_routes: std::collections::HashSet<(Method, String)>,
+    routes: impl IntoIterator<Item = (Method, String, RouteAuth)>,
     proxy_registry: Option<Arc<ProxyRegistry>>,
 ) -> Result<GatewayRoutePolicy, anyhow::Error> {
+    let mut authenticated_routes: HashMap<Method, HashSet<String>> = HashMap::new();
+    let mut anonymous_routes: HashMap<Method, HashSet<String>> = HashMap::new();
+    let mut platform_routes_map: HashMap<Method, HashSet<String>> = HashMap::new();
+    for (method, path, auth) in routes {
+        let by_kind = match auth {
+            RouteAuth::Authenticated => &mut authenticated_routes,
+            RouteAuth::Anonymous => &mut anonymous_routes,
+            RouteAuth::Platform => &mut platform_routes_map,
+        };
+        by_kind.entry(method).or_default().insert(path);
+    }
+
     // Build route matchers per HTTP method (authenticated routes)
     let mut route_matchers_map: HashMap<Method, RouteMatcher> = HashMap::new();
 
-    for (method, path) in authenticated_routes {
+    for (method, paths) in authenticated_routes {
         let matcher = route_matchers_map
             .entry(method)
             .or_insert_with(RouteMatcher::new);
-        matcher
-            .insert(&path)
-            .map_err(|e| anyhow::anyhow!("Failed to insert route pattern '{path}': {e}"))?;
+        for path in paths {
+            matcher
+                .insert(&path)
+                .map_err(|e| anyhow::anyhow!("Failed to insert route pattern '{path}': {e}"))?;
+        }
     }
 
     // Build anonymous matchers per HTTP method
     let mut anonymous_matchers_map: HashMap<Method, AnonymousRouteMatcher> = HashMap::new();
 
-    for (method, path) in anonymous_routes {
+    for (method, paths) in anonymous_routes {
         let matcher = anonymous_matchers_map
             .entry(method)
             .or_insert_with(AnonymousRouteMatcher::new);
-        matcher.insert(&path).map_err(|e| {
-            anyhow::anyhow!("Failed to insert anonymous route pattern '{path}': {e}")
-        })?;
+        for path in paths {
+            matcher.insert(&path).map_err(|e| {
+                anyhow::anyhow!("Failed to insert anonymous route pattern '{path}': {e}")
+            })?;
+        }
     }
 
     Ok(GatewayRoutePolicy::new(
@@ -189,7 +260,36 @@ pub fn build_route_policy(
         Arc::new(anonymous_matchers_map),
         cfg.require_auth_by_default,
         proxy_registry,
-    ))
+    )
+    .with_platform_routes(Arc::new(platform_routes_map)))
+}
+
+/// Matched route template with `prefix_path` removed; borrows the template before allocating.
+pub(crate) fn policy_path(req: &axum::extract::Request) -> String {
+    let path = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or_else(|| req.uri().path(), axum::extract::MatchedPath::as_str);
+    common::resolve_path(req, path)
+}
+
+/// Enforce [`admit_platform`] even with `auth_disabled`; mark success with [`PlatformAdmitted`].
+pub async fn platform_gate_middleware(
+    axum::extract::State(route_policy): axum::extract::State<GatewayRoutePolicy>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // Skip resolution entirely when no platform route is declared.
+    let platform = !route_policy.platform_routes.is_empty()
+        && route_policy.requirement_of(&req) == AuthRequirement::Platform;
+    if !platform {
+        return next.run(req).await;
+    }
+    if let Err(refusal) = admit_platform(&req) {
+        return refusal.into_response();
+    }
+    req.extensions_mut().insert(PlatformAdmitted(()));
+    next.run(req).await
 }
 
 /// Authentication middleware that uses the `AuthN` Resolver to validate bearer tokens.
@@ -211,14 +311,11 @@ pub async fn authn_middleware(
         return next.run(req).await;
     }
 
-    let path = req
-        .extensions()
-        .get::<axum::extract::MatchedPath>()
-        .map_or_else(|| req.uri().path().to_owned(), |p| p.as_str().to_owned());
-
-    let path = common::resolve_path(&req, path.as_str());
+    let path = policy_path(&req);
 
     let requirement = state.route_policy.resolve(req.method(), path.as_str());
+    req.extensions_mut()
+        .insert(ResolvedRequirement(requirement));
 
     match requirement {
         AuthRequirement::None => {
@@ -245,6 +342,24 @@ pub async fn authn_middleware(
             };
 
             match state.authn_client.authenticate(token).await {
+                Ok(result) => {
+                    log_auth_succeeded(req.method(), path.as_str(), &result.security_context);
+                    req.extensions_mut().insert(result.security_context);
+                    next.run(req).await
+                }
+                Err(err) => authn_error_to_response(&err),
+            }
+        }
+        // Validate presented bearers; only the internal token admits a platform caller.
+        // The validated tenant context is forwarded as-is: platform admission bypasses
+        // tenant `route_policies` scopes, so platform handlers must not authorize on it.
+        // A malformed or repeated `Authorization` header inserts no context, so
+        // `platform_gate_middleware` refuses it as an unverified bearer.
+        AuthRequirement::Platform => {
+            let Ok(token) = extract_bearer_http(req.headers()) else {
+                return next.run(req).await;
+            };
+            match state.authn_client.authenticate(token.expose_secret()).await {
                 Ok(result) => {
                     log_auth_succeeded(req.method(), path.as_str(), &result.security_context);
                     req.extensions_mut().insert(result.security_context);
@@ -415,17 +530,20 @@ mod tests {
     #[test]
     fn build_route_policy_allows_colon_in_literal_paths() {
         let cfg = crate::config::ApiGatewayConfig::default();
-        let authenticated_routes = std::collections::HashSet::from([
-            (Method::GET, "events:poll".to_owned()),
-            (Method::GET, "events:stream".to_owned()),
-        ]);
+        let routes = [
+            (
+                Method::GET,
+                "events:poll".to_owned(),
+                RouteAuth::Authenticated,
+            ),
+            (
+                Method::GET,
+                "events:stream".to_owned(),
+                RouteAuth::Authenticated,
+            ),
+        ];
 
-        if let Err(err) = build_route_policy(
-            &cfg,
-            authenticated_routes,
-            std::collections::HashSet::new(),
-            None,
-        ) {
+        if let Err(err) = build_route_policy(&cfg, routes, None) {
             panic!("literal colon route paths must not be interpreted as path parameters: {err}");
         }
     }
@@ -557,6 +675,207 @@ mod tests {
             AuthRequirement::Required,
             "wildcard authenticated still applies to non-public paths"
         );
+    }
+
+    fn platform_policy(
+        routes: &[(Method, &str)],
+        route_matchers: HashMap<Method, RouteMatcher>,
+        anonymous_matchers: HashMap<Method, AnonymousRouteMatcher>,
+    ) -> GatewayRoutePolicy {
+        let mut platform: HashMap<Method, HashSet<String>> = HashMap::new();
+        for (method, path) in routes {
+            platform
+                .entry(method.clone())
+                .or_default()
+                .insert((*path).to_owned());
+        }
+        build_test_policy(route_matchers, anonymous_matchers, false)
+            .with_platform_routes(Arc::new(platform))
+    }
+
+    #[test]
+    fn platform_route_wins_over_every_other_declaration() {
+        let mut anonymous_matchers = HashMap::new();
+        let mut anonymous = AnonymousRouteMatcher::new();
+        anonymous.insert("/p").unwrap();
+        anonymous_matchers.insert(Method::POST, anonymous);
+
+        let policy = platform_policy(&[(Method::POST, "/p")], HashMap::new(), anonymous_matchers);
+
+        assert_eq!(
+            policy.resolve(&Method::POST, "/p"),
+            AuthRequirement::Platform
+        );
+        assert_eq!(policy.resolve(&Method::GET, "/p"), AuthRequirement::None);
+    }
+
+    #[test]
+    fn platform_route_wins_over_an_authenticated_matcher_and_an_anonymous_proxy_route() {
+        let mut route_matchers = HashMap::new();
+        let mut authenticated = RouteMatcher::new();
+        authenticated.insert("/calc/v1/health").unwrap();
+        route_matchers.insert(Method::GET, authenticated);
+        let registry = Arc::new(ProxyRegistry::new());
+        registry.register(
+            toolkit_gateway::GearName::from("calculator"),
+            "calc-1",
+            toolkit_gateway::Endpoint::parse("http://calculator:8080").unwrap(),
+            vec![toolkit_gateway::RouteTemplate::new(
+                Method::GET,
+                "/calc/v1/health",
+                false,
+            )],
+        );
+        assert_eq!(
+            registry.requires_auth(&Method::GET, "/calc/v1/health"),
+            Some(false),
+            "the proxy declares the route anonymous"
+        );
+        let mut platform: HashMap<Method, HashSet<String>> = HashMap::new();
+        platform
+            .entry(Method::GET)
+            .or_default()
+            .insert("/calc/v1/health".to_owned());
+
+        let policy = GatewayRoutePolicy::new(
+            Arc::new(route_matchers),
+            Arc::new(HashMap::new()),
+            false,
+            Some(registry),
+        )
+        .with_platform_routes(Arc::new(platform));
+
+        assert_eq!(
+            policy.resolve(&Method::GET, "/calc/v1/health"),
+            AuthRequirement::Platform,
+            "neither the anonymous proxy entry nor the authenticated matcher relaxes it"
+        );
+    }
+
+    fn request(method: Method, path: &str) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .method(method)
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    fn is_platform(policy: &GatewayRoutePolicy, method: Method, path: &str) -> bool {
+        policy.requirement_of(&request(method, path)) == AuthRequirement::Platform
+    }
+
+    #[test]
+    fn platform_resolution_keeps_an_explicit_head_ahead_of_its_get() {
+        let mut anonymous_matchers = HashMap::new();
+        let mut head = AnonymousRouteMatcher::new();
+        head.insert("/b").unwrap();
+        anonymous_matchers.insert(Method::HEAD, head);
+        let policy = platform_policy(
+            &[(Method::GET, "/a"), (Method::GET, "/b")],
+            HashMap::new(),
+            anonymous_matchers,
+        );
+
+        assert!(is_platform(&policy, Method::GET, "/a"));
+        assert!(
+            is_platform(&policy, Method::HEAD, "/a"),
+            "HEAD inherits a platform GET"
+        );
+        assert!(
+            !is_platform(&policy, Method::HEAD, "/b"),
+            "an explicit anonymous HEAD is not overridden by its platform GET"
+        );
+        assert!(!is_platform(&policy, Method::GET, "/c"));
+        assert!(!is_platform(&policy, Method::POST, "/a"));
+
+        let none = platform_policy(&[], HashMap::new(), HashMap::new());
+        assert!(!is_platform(&none, Method::GET, "/a"));
+    }
+
+    #[test]
+    fn a_resolved_requirement_is_read_back_instead_of_resolved_again() {
+        let policy = platform_policy(&[(Method::GET, "/a")], HashMap::new(), HashMap::new());
+        let mut req = request(Method::GET, "/a");
+        assert_eq!(policy.requirement_of(&req), AuthRequirement::Platform);
+
+        req.extensions_mut()
+            .insert(ResolvedRequirement(AuthRequirement::None));
+        assert_eq!(
+            policy.requirement_of(&req),
+            AuthRequirement::None,
+            "the outer layer's resolution is the one that holds"
+        );
+    }
+
+    #[test]
+    fn a_platform_template_does_not_capture_another_declared_route() {
+        let mut route_matchers = HashMap::new();
+        let mut authenticated = RouteMatcher::new();
+        authenticated.insert("/items/special").unwrap();
+        route_matchers.insert(Method::GET, authenticated);
+
+        let policy = platform_policy(
+            &[(Method::GET, "/items/{id}")],
+            route_matchers,
+            HashMap::new(),
+        );
+
+        assert_eq!(
+            policy.resolve(&Method::GET, "/items/{id}"),
+            AuthRequirement::Platform
+        );
+        assert_eq!(
+            policy.resolve(&Method::GET, "/items/special"),
+            AuthRequirement::Required,
+            "the tenant route's own template must not match the platform pattern"
+        );
+    }
+
+    #[test]
+    fn head_inherits_a_platform_get_unless_declared_itself() {
+        let mut anonymous_matchers = HashMap::new();
+        let mut head = AnonymousRouteMatcher::new();
+        head.insert("/b").unwrap();
+        anonymous_matchers.insert(Method::HEAD, head);
+
+        let policy = platform_policy(
+            &[(Method::GET, "/a"), (Method::GET, "/b")],
+            HashMap::new(),
+            anonymous_matchers,
+        );
+
+        assert_eq!(
+            policy.resolve(&Method::HEAD, "/a"),
+            AuthRequirement::Platform
+        );
+        assert_eq!(policy.resolve(&Method::HEAD, "/b"), AuthRequirement::None);
+    }
+
+    #[test]
+    fn head_resolves_as_get_unless_declared_itself() {
+        let mut route_matchers = HashMap::new();
+        let mut get_matcher = RouteMatcher::new();
+        get_matcher.insert("/a").unwrap();
+        get_matcher.insert("/b").unwrap();
+        route_matchers.insert(Method::GET, get_matcher);
+        let mut anonymous_matchers = HashMap::new();
+        let mut head_matcher = AnonymousRouteMatcher::new();
+        head_matcher.insert("/b").unwrap();
+        anonymous_matchers.insert(Method::HEAD, head_matcher);
+
+        let policy = build_test_policy(route_matchers, anonymous_matchers, false);
+
+        assert_eq!(
+            policy.resolve(&Method::HEAD, "/a"),
+            AuthRequirement::Required,
+            "HEAD served by an authenticated GET route must not bypass it"
+        );
+        assert_eq!(
+            policy.resolve(&Method::HEAD, "/b"),
+            AuthRequirement::None,
+            "an explicit HEAD declaration keeps precedence"
+        );
+        assert_eq!(policy.resolve(&Method::HEAD, "/c"), AuthRequirement::None);
     }
 
     #[test]

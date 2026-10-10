@@ -95,8 +95,7 @@ bootstrap = [
     "dep:dsn",
     "dep:supports-color",
     "dep:enable-ansi-support",
-    # OoP HTTP server: two-plane auth middleware + security primitives
-    "dep:toolkit-security",
+    # OoP HTTP server: two-plane auth middleware
     "dep:toolkit-http-middleware",
     # OoP outbound platform-plane credential (InternalAuthInterceptor + SA reader)
     "dep:toolkit-transport-grpc",
@@ -116,8 +115,10 @@ cf-gears-system-sdks = { workspace = true, features = ["directory"] }
 # use `toolkit_contract::runtime::resolving`, which lives behind it.
 toolkit-contract = { workspace = true, features = ["rest-client"] }
 
-# OoP HTTP server (bootstrap feature): two-plane auth middleware + primitives
-toolkit-security = { workspace = true, optional = true }
+# Security primitives. Not optional: `toolkit-sdk` and `toolkit-contract`
+# already depend on it, and the `OpenAPI` platform scheme name is its constant.
+toolkit-security = { workspace = true }
+# OoP HTTP server (bootstrap feature): two-plane auth middleware
 toolkit-http-middleware = { workspace = true, optional = true }
 # OoP outbound platform-plane credential attachment (bootstrap feature).
 toolkit-transport-grpc = { workspace = true, optional = true }

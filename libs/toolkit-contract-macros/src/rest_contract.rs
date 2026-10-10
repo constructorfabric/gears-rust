@@ -1572,24 +1572,15 @@ fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) ->
         },
     };
 
-    // Auth axis. `.anonymous()` lands in `LicenseSet` on its own, so
-    // `.no_license_required()` must NOT follow it — that method only exists on
-    // `LicenseNotSet`. `.authenticated()` leaves the license state unset, hence
-    // the pairing.
-    //
-    // A platform-plane method (`PlatformSecurityContext` marker) is authorized
-    // by the platform-plane `internal_auth_middleware` (which validates the
-    // `X-ToolKit-Internal-Token` and inserts the `Extension<PlatformSecurityContext>`
-    // the handler reads) — NOT by the tenant-plane `security_context_middleware`.
-    // `.authenticated()` would demand a tenant JWT and 401 a legitimate
-    // internal-token caller before the handler runs, so the tenant auth axis
-    // must be left off (`.anonymous()`) until `OperationBuilder` grows a
-    // dedicated platform axis (`cpt-cf-adr-two-plane-auth`).
+    // .anonymous() already sets LicenseSet; authenticated builders still need a license decision.
+    // Platform takes precedence; the parser rejects #[anonymous] on that plane.
     let is_platform_plane = method
         .params
-        .iter()
-        .any(|p| is_platform_security_context_type(&p.ty));
-    let auth_registration = if method.anonymous || is_platform_plane {
+        .first()
+        .is_some_and(|p| is_platform_security_context_type(&p.ty));
+    let auth_registration = if is_platform_plane {
+        quote! { .platform_authenticated().no_license_required() }
+    } else if method.anonymous {
         quote! { .anonymous() }
     } else {
         quote! { .authenticated().no_license_required() }

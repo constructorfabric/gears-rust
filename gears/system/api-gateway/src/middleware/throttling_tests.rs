@@ -23,9 +23,14 @@ fn op(method: Method, path: &str, throttling: Option<ThrottlingSpec>) -> Operati
         responses: vec![],
         handler_id: "test".to_owned(),
         // Identity zones need an authenticated operation; IP zones do not care.
-        authenticated: throttling
+        auth: if throttling
             .as_ref()
-            .is_some_and(|t| t.require_security_context),
+            .is_some_and(|t| t.require_security_context)
+        {
+            toolkit::api::RouteAuth::Authenticated
+        } else {
+            toolkit::api::RouteAuth::Anonymous
+        },
         exposed: true,
         throttling,
         allowed_request_content_types: None,
@@ -281,7 +286,7 @@ fn compute_key_identity_returns_subject_id() {
 fn identity_zone_rejects_anonymous_operation_and_auth_disabled() {
     let mut cfg = cfg_with_rate("id", rate_zone_cfg(10, 10, KeyType::Identity));
     let mut anon = op(Method::GET, "/x", Some(thr("id", "", true)));
-    anon.authenticated = false;
+    anon.auth = toolkit::api::RouteAuth::Anonymous;
     let err = ThrottlingMap::from_specs(&[anon], &cfg)
         .err()
         .expect("should error")
@@ -936,4 +941,30 @@ async fn dry_run_in_flight_does_not_grow_gates_past_max_keys() {
 
     assert_eq!(inflight_zone.keys.len(), 1);
     assert_eq!(inflight_zone.tracked.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn identity_zones_reject_platform_operations() {
+    // Platform callers have no tenant identity; identity-keyed zones would collapse them.
+    let mut rate = cfg_with_rate("id", rate_zone_cfg(10, 10, KeyType::Identity));
+    let mut platform = op(Method::POST, "/p", Some(thr("id", "", true)));
+    platform.auth = toolkit::api::RouteAuth::Platform;
+    let err = ThrottlingMap::from_specs(&[platform], &rate)
+        .err()
+        .expect("rate zone should error")
+        .to_string();
+    assert!(err.contains("is platform-authenticated"), "{err}");
+
+    rate.rate_limit_zones.clear();
+    rate.in_flight_limit_zones.insert(
+        "id".to_owned(),
+        inflight_zone_cfg(1, KeyType::Identity, vec![]),
+    );
+    let mut platform = op(Method::POST, "/p", Some(thr("", "id", true)));
+    platform.auth = toolkit::api::RouteAuth::Platform;
+    let err = ThrottlingMap::from_specs(&[platform], &rate)
+        .err()
+        .expect("in-flight zone should error")
+        .to_string();
+    assert!(err.contains("is platform-authenticated"), "{err}");
 }

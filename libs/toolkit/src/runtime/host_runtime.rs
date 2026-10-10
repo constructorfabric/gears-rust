@@ -1395,6 +1395,10 @@ impl HostRuntime {
     }
 }
 
+/// Composed `OoP` router, serialized `OpenAPI`, and auth policy from the same specs.
+#[cfg(feature = "bootstrap")]
+type ComposedOopRouter = (Router, String, toolkit_http_middleware::RouteAuthPolicy);
+
 /// Out-of-process HTTP serving lifecycle (`cpt-cf-component-oop-bootstrap`).
 #[cfg(feature = "bootstrap")]
 impl HostRuntime {
@@ -1407,7 +1411,7 @@ impl HostRuntime {
         &self,
         options: &crate::runtime::OopServeOptions,
         hc_registry: &Arc<crate::healthcheck::RestHealthcheckRegistry>,
-    ) -> anyhow::Result<(Router, String)> {
+    ) -> anyhow::Result<ComposedOopRouter> {
         use crate::api::{OpenApiInfo, OpenApiRegistryImpl};
         use anyhow::Context as _;
 
@@ -1447,8 +1451,9 @@ impl HostRuntime {
             .build_openapi(&info)
             .context("OoP router: build OpenAPI document")?;
         let json = serde_json::to_string(&openapi).context("OoP router: serialize OpenAPI")?;
+        let route_auth = super::oop_serve::route_auth_policy(registry.operation_specs.iter());
 
-        Ok((router, json))
+        Ok((router, json, route_auth))
     }
 
     /// Run the full `OoP` gear lifecycle: phases (`pre_init` … `start`), then
@@ -1511,7 +1516,7 @@ impl HostRuntime {
         // gear's healthcheck into the shared registry). Grouped so a failure
         // tears the probe server down cleanly.
         let mut started = false;
-        let composed: anyhow::Result<(Router, String)> = async {
+        let composed: anyhow::Result<ComposedOopRouter> = async {
             self.run_pre_init_phase()?;
             #[cfg(feature = "db")]
             self.run_db_phase().await?;
@@ -1534,10 +1539,10 @@ impl HostRuntime {
         .await;
 
         let serve_result = match composed {
-            Ok((gear_router, openapi_json)) => {
+            Ok((gear_router, openapi_json, route_auth)) => {
                 // Publish gear routes (they go live) + start directory presence.
                 // Dependency resolution already ran in the proxy-wiring phase.
-                server.attach(gear_router, openapi_json);
+                server.attach(gear_router, openapi_json, route_auth);
                 // Serve until cancelled, drain, then deregister.
                 server.join().await
             }

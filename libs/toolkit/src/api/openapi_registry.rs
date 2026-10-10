@@ -21,7 +21,7 @@ use utoipa::openapi::{
     request_body::RequestBodyBuilder,
     response::{Response, ResponsesBuilder},
     schema::{ArrayBuilder, ComponentsBuilder, ObjectBuilder, Schema, SchemaFormat, SchemaType},
-    security::{HttpAuthScheme, HttpBuilder, SecurityScheme},
+    security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme},
     server::Server,
 };
 
@@ -125,11 +125,9 @@ fn operation_vendor_extensions(
         ext.insert("x-odata-orderby".to_owned(), value);
     }
 
-    // Visibility axis (`OperationSpec.exposed`): mark routes that are
-    // registered in the gateway for external access. The `GatewayProvider`
-    // reads this vendor extension to select which routes to reverse-proxy.
-    // The key is mirrored as a constant in `cf-gears-toolkit-gateway`.
-    if spec.exposed {
+    // GatewayProvider selects proxy routes via this extension (key shared with toolkit-gateway).
+    // The edge strips platform tokens, so platform routes stay unexposed.
+    if spec.exposed && spec.auth != operation_builder::RouteAuth::Platform {
         ext.insert(
             "x-toolkit-visibility".to_owned(),
             serde_json::Value::String("exposed".to_owned()),
@@ -315,13 +313,19 @@ impl OpenApiRegistryImpl {
             );
             op = op.responses(responses.build());
 
-            // Add security requirement if operation requires authentication
-            if spec.authenticated {
-                let sec_req = utoipa::openapi::security::SecurityRequirement::new(
-                    "bearerAuth",
+            // Platform operations require internalToken, not bearerAuth.
+            let scheme = match spec.auth {
+                operation_builder::RouteAuth::Platform => {
+                    Some(operation_builder::INTERNAL_TOKEN_SECURITY_SCHEME)
+                }
+                operation_builder::RouteAuth::Authenticated => Some("bearerAuth"),
+                operation_builder::RouteAuth::Anonymous => None,
+            };
+            if let Some(scheme) = scheme {
+                op = op.security(utoipa::openapi::security::SecurityRequirement::new(
+                    scheme,
                     Vec::<String>::new(),
-                );
-                op = op.security(sec_req);
+                ));
             }
 
             let method = match spec.method {
@@ -355,6 +359,15 @@ impl OpenApiRegistryImpl {
                     .bearer_format("JWT")
                     .build(),
             ),
+        );
+
+        // Platform-plane internal token, required by platform operations
+        components = components.security_scheme(
+            operation_builder::INTERNAL_TOKEN_SECURITY_SCHEME,
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
+                toolkit_security::constants::INTERNAL_TOKEN_HEADER,
+                "Platform-plane workload credential, validated by the receiving listener",
+            ))),
         );
 
         // 3) Info & final OpenAPI doc
@@ -406,6 +419,18 @@ impl Default for OpenApiRegistryImpl {
 impl OpenApiRegistry for OpenApiRegistryImpl {
     fn register_operation(&self, spec: &operation_builder::OperationSpec) {
         let operation_key = format!("{}:{}", spec.method.as_str(), spec.path);
+        // Normalize platform visibility at registration; warn once instead of on each document
+        // build.
+        let mut spec = std::borrow::Cow::Borrowed(spec);
+        if spec.exposed && spec.auth == operation_builder::RouteAuth::Platform {
+            tracing::warn!(
+                method = %spec.method,
+                path = %spec.path,
+                "a platform-authenticated operation is declared exposed; it is not exposed"
+            );
+            spec.to_mut().exposed = false;
+        }
+        let spec = spec.as_ref();
         // Surface duplicate (method, path) registrations — e.g. a generated
         // `register_<trait>_routes()` colliding with a hand-written route, or two
         // SDKs registering the same path (M-13). Silently overwriting the earlier
@@ -715,7 +740,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: handler.to_owned(),
-            authenticated: false,
+            auth: operation_builder::RouteAuth::Anonymous,
             exposed: false,
             throttling: None,
             allowed_request_content_types: None,
@@ -846,7 +871,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: "get_test".to_owned(),
-            authenticated: false,
+            auth: operation_builder::RouteAuth::Anonymous,
             exposed: false,
             throttling: None,
             allowed_request_content_types: None,
@@ -1012,7 +1037,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: "get_users_id".to_owned(),
-            authenticated: false,
+            auth: operation_builder::RouteAuth::Anonymous,
             exposed: false,
             throttling: None,
             allowed_request_content_types: None,
@@ -1073,7 +1098,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: "post_upload".to_owned(),
-            authenticated: false,
+            auth: operation_builder::RouteAuth::Anonymous,
             exposed: false,
             throttling: None,
             allowed_request_content_types: Some(vec!["application/octet-stream"]),
@@ -1153,7 +1178,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: "get_test".to_owned(),
-            authenticated: false,
+            auth: operation_builder::RouteAuth::Anonymous,
             exposed: false,
             throttling: None,
             allowed_request_content_types: None,
@@ -1189,6 +1214,59 @@ mod tests {
     }
 
     #[test]
+    fn platform_operations_require_the_internal_token_scheme() {
+        let registry = OpenApiRegistryImpl::new();
+        let mut spec = OperationSpec {
+            method: Method::POST,
+            path: "/tr/v1/entities".to_owned(),
+            operation_id: Some("register".to_owned()),
+            summary: None,
+            description: None,
+            tags: vec![],
+            params: vec![],
+            request_body: None,
+            responses: vec![ResponseSpec {
+                status: 202,
+                content_type: "application/json",
+                description: "Accepted".to_owned(),
+                schema: None,
+                headers: vec![],
+            }],
+            handler_id: "register".to_owned(),
+            auth: operation_builder::RouteAuth::Platform,
+            exposed: false,
+            throttling: None,
+            allowed_request_content_types: None,
+            vendor_extensions: VendorExtensions::default(),
+            license_requirement: None,
+        };
+        registry.register_operation(&spec);
+        spec.method = Method::GET;
+        spec.handler_id = "read".to_owned();
+        spec.operation_id = Some("read".to_owned());
+        spec.auth = operation_builder::RouteAuth::Authenticated;
+        registry.register_operation(&spec);
+
+        let json =
+            serde_json::to_value(registry.build_openapi(&OpenApiInfo::default()).unwrap()).unwrap();
+        let item = &json["paths"]["/tr/v1/entities"];
+        assert_eq!(
+            item["post"]["security"],
+            serde_json::json!([{ "internalToken": [] }]),
+            "platform"
+        );
+        assert_eq!(
+            item["get"]["security"],
+            serde_json::json!([{ "bearerAuth": [] }]),
+            "tenant-authenticated"
+        );
+        let scheme = &json["components"]["securitySchemes"]["internalToken"];
+        assert_eq!(scheme["type"], "apiKey");
+        assert_eq!(scheme["in"], "header");
+        assert_eq!(scheme["name"], "x-toolkit-internal-token");
+    }
+
+    #[test]
     fn test_public_operation_emits_visibility_extension() {
         let registry = OpenApiRegistryImpl::new();
         let public = OperationSpec {
@@ -1208,7 +1286,7 @@ mod tests {
                 headers: vec![],
             }],
             handler_id: "get_ping".to_owned(),
-            authenticated: false,
+            auth: operation_builder::RouteAuth::Anonymous,
             exposed: true,
             throttling: None,
             allowed_request_content_types: None,
@@ -1241,6 +1319,54 @@ mod tests {
         assert!(
             internal_op.get("x-toolkit-visibility").is_none(),
             "non-public operation must not carry the visibility extension"
+        );
+    }
+
+    #[test]
+    fn a_platform_operation_declared_exposed_is_not_exposed() {
+        let registry = OpenApiRegistryImpl::new();
+        let platform = OperationSpec {
+            method: Method::POST,
+            path: "/calc/v1/platform".to_owned(),
+            operation_id: Some("platform".to_owned()),
+            summary: None,
+            description: None,
+            tags: vec![],
+            params: vec![],
+            request_body: None,
+            responses: vec![ResponseSpec {
+                status: 200,
+                content_type: "application/json",
+                description: "OK".to_owned(),
+                schema: None,
+                headers: vec![],
+            }],
+            handler_id: "post_platform".to_owned(),
+            auth: operation_builder::RouteAuth::Platform,
+            exposed: true,
+            throttling: None,
+            allowed_request_content_types: None,
+            vendor_extensions: VendorExtensions::default(),
+            license_requirement: None,
+        };
+
+        registry.register_operation(&platform);
+        let doc = registry.build_openapi(&OpenApiInfo::default()).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+        let op = &json["paths"]["/calc/v1/platform"]["post"];
+
+        assert!(
+            op.get("x-toolkit-visibility").is_none(),
+            "no host may publish a platform operation"
+        );
+        assert_eq!(op["security"], serde_json::json!([{ "internalToken": [] }]));
+        let stored = registry
+            .operation_specs
+            .get("POST:/calc/v1/platform")
+            .expect("registered");
+        assert!(
+            !stored.exposed,
+            "stored unexposed, so every host reads it so"
         );
     }
 

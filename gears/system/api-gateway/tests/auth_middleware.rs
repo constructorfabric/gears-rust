@@ -33,7 +33,7 @@ use toolkit::{
 };
 use toolkit_canonical_errors::Problem;
 use toolkit_gts::gts_uri;
-use toolkit_security::SecurityContext;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -1267,4 +1267,568 @@ async fn test_wildcard_scope_passes_enforcement() {
     );
     // A successful response must not carry a bearer challenge.
     assert!(www_authenticate_all(&response).is_empty());
+}
+
+// Tenant/platform authentication through the embedded gateway (T25).
+
+/// `GET` tenant-authenticated (echo), `POST` platform (context-free).
+const AXIS_PATH: &str = "/tests/v1/api/axis";
+/// `GET` platform (context-free), so `HEAD` inheritance can be tested.
+const AXIS_PLATFORM_PATH: &str = "/tests/v1/api/axis-platform";
+/// `POST` platform (echo), to see which planes reach an admitted handler.
+const AXIS_ECHO_PATH: &str = "/tests/v1/api/axis-echo";
+const AXIS_INTERNAL_SECRET: &str = "axis-internal-secret";
+const AXIS_INTERNAL_HEADER: &str = "x-toolkit-internal-token";
+const AXIS_BEARER: &str = "valid-test-token";
+
+/// A tenant route's handler: reports which validated planes reached it.
+async fn tenant_handler(
+    Extension(_ctx): Extension<SecurityContext>,
+    platform: Option<Extension<PlatformSecurityContext>>,
+) -> String {
+    format!("tenant=true platform={}", platform.is_some())
+}
+
+/// A platform route's handler: reports which validated planes reached it.
+async fn platform_handler(
+    Extension(_ctx): Extension<PlatformSecurityContext>,
+    tenant: Option<Extension<SecurityContext>>,
+) -> String {
+    format!("tenant={} platform=true", tenant.is_some())
+}
+
+/// Reads no context, so only the gateway's own layers can refuse a request.
+async fn context_free_handler() -> &'static str {
+    "ok"
+}
+
+pub struct TestAxisGear;
+
+#[async_trait]
+impl Gear for TestAxisGear {
+    async fn init(&self, _ctx: &GearCtx) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl RestApiCapability for TestAxisGear {
+    fn register_rest(
+        &self,
+        _ctx: &GearCtx,
+        router: Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> Result<Router> {
+        let router = OperationBuilder::get(AXIS_PATH)
+            .operation_id("test_axis.tenant")
+            .authenticated()
+            .require_license_features::<License>([])
+            .handler(tenant_handler)
+            .text_response(http::StatusCode::OK, "OK", "text/plain")
+            .register(router, openapi);
+        let router = OperationBuilder::post(AXIS_PATH)
+            .operation_id("test_axis.platform")
+            .platform_authenticated()
+            .require_license_features::<License>([])
+            .handler(context_free_handler)
+            .text_response(http::StatusCode::OK, "OK", "text/plain")
+            .register(router, openapi);
+        let router = OperationBuilder::get(AXIS_PLATFORM_PATH)
+            .operation_id("test_axis.platform_get")
+            .platform_authenticated()
+            .require_license_features::<License>([])
+            .handler(context_free_handler)
+            .text_response(http::StatusCode::OK, "OK", "text/plain")
+            .register(router, openapi);
+        Ok(OperationBuilder::post(AXIS_ECHO_PATH)
+            .operation_id("test_axis.platform_echo")
+            .platform_authenticated()
+            .require_license_features::<License>([])
+            .handler(platform_handler)
+            .text_response(http::StatusCode::OK, "OK", "text/plain")
+            .register(router, openapi))
+    }
+}
+
+/// Disable default auth to test declared route policy, with or without an internal authenticator.
+fn axis_config(internal_auth: bool) -> serde_json::Value {
+    let mut config = json!({
+        "bind_addr": "0.0.0.0:8080",
+        "enable_docs": false,
+        "auth_disabled": false,
+        "require_auth_by_default": false,
+    });
+    if internal_auth {
+        config["internal_auth"] = json!({
+            "provider": "shared_secret",
+            "secret": AXIS_INTERNAL_SECRET,
+        });
+    }
+    config
+}
+
+/// A finalized gateway serving [`TestAxisGear`] under `config`.
+async fn create_axis_router(config: serde_json::Value) -> Router {
+    create_router_serving(config, &TestAxisGear).await
+}
+
+/// A finalized gateway serving `gear`'s routes under `config`.
+async fn create_router_serving(config: serde_json::Value, gear: &dyn RestApiCapability) -> Router {
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<dyn AuthNResolverClient>(Arc::new(mock_accepting_token(
+        AXIS_BEARER,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )));
+    let api_ctx = GearCtx::new(
+        "api-gateway",
+        Uuid::new_v4(),
+        Arc::new(TestConfigProvider {
+            config: json!({ "api-gateway": { "config": config } }),
+        }),
+        hub,
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let api_gateway = api_gateway::ApiGateway::default();
+    api_gateway.init(&api_ctx).await.expect("Failed to init");
+    let router = gear
+        .register_rest(&create_test_gear_ctx(), Router::new(), &api_gateway)
+        .expect("Failed to register routes");
+    api_gateway
+        .rest_finalize(
+            &api_ctx,
+            router,
+            Arc::new(toolkit::RestHealthcheckRegistry::new()),
+        )
+        .expect("Failed to finalize")
+}
+
+/// Returns status, body, and whether the gateway issued the RFC 6750 bearer challenge.
+/// The challenge distinguishes gateway refusal from a handler extractor’s refusal.
+async fn axis_call(
+    router: Router,
+    method: Method,
+    uri: &str,
+    bearer: Option<&str>,
+    token: Option<&str>,
+) -> (StatusCode, String, bool) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(value) = bearer {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {value}"));
+    }
+    if let Some(value) = token {
+        builder = builder.header(AXIS_INTERNAL_HEADER, value);
+    }
+    let response = router
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .expect("Request failed");
+    let status = response.status();
+    let challenged = !www_authenticate_all(&response).is_empty();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        String::from_utf8_lossy(&body).into_owned(),
+        challenged,
+    )
+}
+
+type AxisCase<'a> = (Option<&'a str>, Option<&'a str>, StatusCode, &'a str);
+
+/// Every `(bearer, token, expected status, case)` against `method uri`.
+async fn assert_axis_cases(
+    config: &serde_json::Value,
+    method: &Method,
+    uri: &str,
+    cases: &[AxisCase<'_>],
+) {
+    for (bearer, token, want, case) in cases {
+        let router = create_axis_router(config.clone()).await;
+        let (status, body, _) = axis_call(router, method.clone(), uri, *bearer, *token).await;
+        assert_eq!(status, *want, "{method} {uri}: {case}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn tenant_routes_require_a_bearer_at_the_gateway() {
+    for internal_auth in [false, true] {
+        for method in [Method::GET, Method::HEAD] {
+            let router = create_axis_router(axis_config(internal_auth)).await;
+            let (status, _, challenged) = axis_call(
+                router,
+                method.clone(),
+                AXIS_PATH,
+                None,
+                Some(AXIS_INTERNAL_SECRET),
+            )
+            .await;
+            assert_eq!(
+                (status, challenged),
+                (StatusCode::UNAUTHORIZED, true),
+                "{method} on an internal token alone, internal_auth={internal_auth}"
+            );
+            let router = create_axis_router(axis_config(internal_auth)).await;
+            let (status, _, challenged) =
+                axis_call(router, method.clone(), AXIS_PATH, None, None).await;
+            assert_eq!(
+                (status, challenged),
+                (StatusCode::UNAUTHORIZED, true),
+                "{method} without credentials, internal_auth={internal_auth}"
+            );
+            let router = create_axis_router(axis_config(internal_auth)).await;
+            let (status, _, _) =
+                axis_call(router, method.clone(), AXIS_PATH, Some(AXIS_BEARER), None).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{method} on a bearer, internal_auth={internal_auth}"
+            );
+        }
+    }
+}
+
+const PLATFORM_CASES: &[AxisCase<'static>] = &[
+    (
+        None,
+        Some(AXIS_INTERNAL_SECRET),
+        StatusCode::OK,
+        "valid token",
+    ),
+    (
+        Some(AXIS_BEARER),
+        Some(AXIS_INTERNAL_SECRET),
+        StatusCode::OK,
+        "valid bearer and token",
+    ),
+    (None, None, StatusCode::UNAUTHORIZED, "neither"),
+    (
+        Some(AXIS_BEARER),
+        None,
+        StatusCode::UNAUTHORIZED,
+        "valid bearer alone",
+    ),
+    (
+        None,
+        Some("forged"),
+        StatusCode::UNAUTHORIZED,
+        "forged token",
+    ),
+    (
+        Some("forged"),
+        Some(AXIS_INTERNAL_SECRET),
+        StatusCode::UNAUTHORIZED,
+        "forged bearer beside valid token",
+    ),
+    (
+        Some(AXIS_BEARER),
+        Some("forged"),
+        StatusCode::UNAUTHORIZED,
+        "valid bearer beside forged token",
+    ),
+];
+
+#[tokio::test]
+async fn platform_routes_require_a_validated_internal_token_at_the_gateway() {
+    let config = axis_config(true);
+    assert_axis_cases(&config, &Method::POST, AXIS_PATH, PLATFORM_CASES).await;
+    assert_axis_cases(&config, &Method::GET, AXIS_PLATFORM_PATH, PLATFORM_CASES).await;
+    assert_axis_cases(&config, &Method::HEAD, AXIS_PLATFORM_PATH, PLATFORM_CASES).await;
+}
+
+#[tokio::test]
+async fn platform_routes_are_refused_without_a_gateway_internal_authenticator() {
+    let cases: &[AxisCase<'_>] = &[
+        (
+            None,
+            Some(AXIS_INTERNAL_SECRET),
+            StatusCode::UNAUTHORIZED,
+            "token, nothing to validate it",
+        ),
+        (
+            Some(AXIS_BEARER),
+            Some(AXIS_INTERNAL_SECRET),
+            StatusCode::UNAUTHORIZED,
+            "bearer and token",
+        ),
+        (
+            Some(AXIS_BEARER),
+            None,
+            StatusCode::UNAUTHORIZED,
+            "bearer alone",
+        ),
+    ];
+    assert_axis_cases(&axis_config(false), &Method::POST, AXIS_PATH, cases).await;
+}
+
+#[tokio::test]
+async fn platform_handlers_see_the_validated_planes() {
+    let router = create_axis_router(axis_config(true)).await;
+    let (status, body, _) = axis_call(
+        router,
+        Method::POST,
+        AXIS_ECHO_PATH,
+        None,
+        Some(AXIS_INTERNAL_SECRET),
+    )
+    .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, "tenant=false platform=true")
+    );
+    let router = create_axis_router(axis_config(true)).await;
+    let (status, body, _) = axis_call(
+        router,
+        Method::POST,
+        AXIS_ECHO_PATH,
+        Some(AXIS_BEARER),
+        Some(AXIS_INTERNAL_SECRET),
+    )
+    .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, "tenant=true platform=true")
+    );
+}
+
+#[tokio::test]
+async fn platform_routes_under_a_prefix_path() {
+    // Policies must resolve unprefixed templates after gateway nesting under `prefix_path`.
+    let mut config = axis_config(true);
+    config["prefix_path"] = json!("/cf");
+    let cases: &[AxisCase<'_>] = &[
+        (
+            None,
+            Some(AXIS_INTERNAL_SECRET),
+            StatusCode::OK,
+            "valid token",
+        ),
+        (None, None, StatusCode::UNAUTHORIZED, "neither"),
+        (
+            Some(AXIS_BEARER),
+            None,
+            StatusCode::UNAUTHORIZED,
+            "valid bearer alone",
+        ),
+    ];
+    assert_axis_cases(&config, &Method::POST, &format!("/cf{AXIS_PATH}"), cases).await;
+    assert_axis_cases(
+        &config,
+        &Method::HEAD,
+        &format!("/cf{AXIS_PLATFORM_PATH}"),
+        cases,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn platform_routes_with_auth_disabled() {
+    // `auth_disabled` must not synthesize a tenant context on platform routes.
+    let mut config = axis_config(true);
+    config["auth_disabled"] = json!(true);
+    let cases: &[AxisCase<'_>] = &[
+        (
+            None,
+            Some(AXIS_INTERNAL_SECRET),
+            StatusCode::OK,
+            "valid token",
+        ),
+        (None, None, StatusCode::UNAUTHORIZED, "neither"),
+        (
+            Some(AXIS_BEARER),
+            None,
+            StatusCode::UNAUTHORIZED,
+            "bearer alone",
+        ),
+        (
+            Some("forged"),
+            Some(AXIS_INTERNAL_SECRET),
+            StatusCode::UNAUTHORIZED,
+            "unvalidated bearer beside valid token",
+        ),
+    ];
+    assert_axis_cases(&config, &Method::POST, AXIS_PATH, cases).await;
+    let router = create_axis_router(config).await;
+    let (status, body, _) = axis_call(
+        router,
+        Method::POST,
+        AXIS_ECHO_PATH,
+        None,
+        Some(AXIS_INTERNAL_SECRET),
+    )
+    .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, "tenant=false platform=true"),
+        "no synthetic tenant context on a platform route"
+    );
+}
+
+#[tokio::test]
+async fn tenant_scope_rules_do_not_apply_to_platform_routes() {
+    let mut config = axis_config(true);
+    config["route_policies"] = json!({
+        "enabled": true,
+        "rules": [{ "path": "/tests/v1/api/**", "required_scopes": ["axis.write"] }]
+    });
+    // The mock bearer carries no scopes.
+    let cases: &[AxisCase<'_>] = &[
+        (
+            None,
+            Some(AXIS_INTERNAL_SECRET),
+            StatusCode::OK,
+            "valid token",
+        ),
+        (
+            Some(AXIS_BEARER),
+            Some(AXIS_INTERNAL_SECRET),
+            StatusCode::OK,
+            "scope-less bearer beside valid token",
+        ),
+        (
+            Some(AXIS_BEARER),
+            None,
+            StatusCode::UNAUTHORIZED,
+            "bearer alone",
+        ),
+    ];
+    assert_axis_cases(&config, &Method::POST, AXIS_PATH, cases).await;
+    let router = create_axis_router(config).await;
+    let (status, _, _) = axis_call(router, Method::GET, AXIS_PATH, Some(AXIS_BEARER), None).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the rule still binds the tenant route"
+    );
+}
+
+#[tokio::test]
+async fn gateway_internal_authenticator_validates_a_presented_token_on_tenant_routes() {
+    let cases: &[AxisCase<'_>] = &[
+        (
+            Some(AXIS_BEARER),
+            Some("forged"),
+            StatusCode::UNAUTHORIZED,
+            "forged token beside valid bearer",
+        ),
+        (
+            Some("forged"),
+            Some(AXIS_INTERNAL_SECRET),
+            StatusCode::UNAUTHORIZED,
+            "forged bearer beside valid token",
+        ),
+    ];
+    assert_axis_cases(&axis_config(true), &Method::GET, AXIS_PATH, cases).await;
+    let router = create_axis_router(axis_config(true)).await;
+    let (status, body, _) = axis_call(
+        router,
+        Method::GET,
+        AXIS_PATH,
+        Some(AXIS_BEARER),
+        Some(AXIS_INTERNAL_SECRET),
+    )
+    .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, "tenant=true platform=true")
+    );
+}
+
+#[tokio::test]
+async fn gateway_ignores_the_internal_token_on_tenant_routes_when_unconfigured() {
+    let router = create_axis_router(axis_config(false)).await;
+    let (status, body, _) = axis_call(
+        router,
+        Method::GET,
+        AXIS_PATH,
+        Some(AXIS_BEARER),
+        Some("anything"),
+    )
+    .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, "tenant=true platform=false")
+    );
+}
+
+/// Profile 3 derives proxy auth from `OpenAPI` security; platform routes are excluded because the
+/// edge strips their token.
+#[tokio::test]
+async fn discovered_axis_routes() {
+    use toolkit::api::{OpenApiInfo, OpenApiRegistryImpl};
+    use toolkit_gateway::{
+        Endpoint, GatewayProvider, GearName, OpenApiSpec, ProxyRegistry, ToolKitGatewayProvider,
+    };
+
+    let openapi = OpenApiRegistryImpl::new();
+    let router = OperationBuilder::get(AXIS_PATH)
+        .operation_id("test_axis.tenant")
+        .authenticated()
+        .no_license_required()
+        .exposed()
+        .handler(tenant_handler)
+        .text_response(http::StatusCode::OK, "OK", "text/plain")
+        .register(Router::<()>::new(), &openapi);
+    let router = OperationBuilder::post(AXIS_PATH)
+        .operation_id("test_axis.platform_shared_path")
+        .platform_authenticated()
+        .no_license_required()
+        .exposed()
+        .handler(platform_handler)
+        .text_response(http::StatusCode::OK, "OK", "text/plain")
+        .register(router, &openapi);
+    let _router = OperationBuilder::post(AXIS_PLATFORM_PATH)
+        .operation_id("test_axis.platform")
+        .platform_authenticated()
+        .no_license_required()
+        .exposed()
+        .handler(platform_handler)
+        .text_response(http::StatusCode::OK, "OK", "text/plain")
+        .register(router, &openapi);
+    let document = openapi
+        .build_openapi(&OpenApiInfo {
+            title: "axis".to_owned(),
+            version: "1.0.0".to_owned(),
+            description: None,
+            servers: vec![],
+        })
+        .expect("build OpenAPI");
+    let published = serde_json::to_vec(&document).expect("serialize OpenAPI");
+
+    let registry = Arc::new(ProxyRegistry::new());
+    ToolKitGatewayProvider::new(Arc::clone(&registry))
+        .register_routes(
+            &GearName::from("axis"),
+            "axis-1",
+            OpenApiSpec::SerializedJson(published.into()),
+            &Endpoint::parse("http://axis:8080").unwrap(),
+        )
+        .await
+        .expect("register discovered routes");
+
+    assert_eq!(registry.requires_auth(&Method::GET, AXIS_PATH), Some(true));
+    // Path-only proxying can forward the excluded platform POST via a tenant GET’s path;
+    // the gear refuses it without the stripped token. Method-aware routing is outside T25.
+    assert_eq!(registry.requires_auth(&Method::POST, AXIS_PATH), Some(true));
+    // A path that is platform on every method is not routed at all.
+    assert_eq!(
+        registry.requires_auth(&Method::POST, AXIS_PLATFORM_PATH),
+        None,
+        "a platform route is not published as a proxied route"
+    );
+
+    // No default bearer requirement: discovered GET/HEAD routes must enforce their own auth.
+    let policy = api_gateway::middleware::auth::GatewayRoutePolicy::new(
+        Arc::new(std::collections::HashMap::new()),
+        Arc::new(std::collections::HashMap::new()),
+        false,
+        Some(registry),
+    );
+    for method in [Method::GET, Method::HEAD] {
+        assert_eq!(
+            policy.resolve(&method, AXIS_PATH),
+            api_gateway::middleware::auth::AuthRequirement::Required,
+            "{method}"
+        );
+    }
 }

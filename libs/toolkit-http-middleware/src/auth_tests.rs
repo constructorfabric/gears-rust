@@ -391,3 +391,376 @@ async fn public_endpoint_with_no_credentials_passes() {
     let (status, _, _) = send_headers(stacked_public_app(), &[]).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+// Platform route admission (`RouteAuth::Platform`).
+
+/// A bearer the stub resolves to a real (non-anonymous) tenant subject.
+const TENANT_TOKEN: &str = "tenant-token";
+
+/// Stub: `TENANT_TOKEN` is a tenant subject, `GOOD_TOKEN` anonymous; other tokens fail.
+struct SubjectAuthenticator;
+
+impl BearerAuthenticator for SubjectAuthenticator {
+    async fn authenticate(&self, token: &str) -> Result<SecurityContext, AuthNError> {
+        match token {
+            TENANT_TOKEN => Ok(SecurityContext::builder()
+                .subject_id(uuid::Uuid::from_u128(1))
+                .subject_tenant_id(uuid::Uuid::from_u128(2))
+                .build()
+                .unwrap()),
+            GOOD_TOKEN => Ok(SecurityContext::anonymous()),
+            _ => Err(AuthNError::InvalidToken),
+        }
+    }
+}
+
+/// Platform caller and presence of a validated tenant bearer.
+async fn platform_echo(
+    Extension(ctx): Extension<PlatformSecurityContext>,
+    tenant: Option<Extension<SecurityContext>>,
+) -> String {
+    match (ctx.identity().peer_name(), tenant.is_some()) {
+        (peer, false) => peer.to_owned(),
+        (peer, true) => format!("{peer}+tenant"),
+    }
+}
+
+/// Tenant subject on an anonymous route: `anonymous` or `subject`.
+async fn anon_echo(Extension(ctx): Extension<SecurityContext>) -> &'static str {
+    if ctx.is_anonymous() {
+        "anonymous"
+    } else {
+        "subject"
+    }
+}
+
+/// Stack built by [`layer_route_auth`]; auth planes are optional.
+/// `/p` is platform, `/anon` anonymous, `/auth` authenticated, `/unlisted` unspecified.
+fn platform_route_app(bearer: bool, internal: bool) -> Router {
+    let policy: RouteAuthPolicy = [
+        (Method::GET, "/p".to_owned(), RouteAuth::Platform),
+        (Method::POST, "/p".to_owned(), RouteAuth::Platform),
+        (Method::GET, "/anon".to_owned(), RouteAuth::Anonymous),
+        (Method::GET, "/auth".to_owned(), RouteAuth::Authenticated),
+    ]
+    .into_iter()
+    .collect();
+
+    let router = Router::new()
+        .route("/p", get(platform_echo).post(platform_echo))
+        .route("/anon", get(anon_echo))
+        .route("/auth", get(|| async { "auth" }))
+        .route("/unlisted", get(|| async { "unlisted" }));
+    layer_route_auth(
+        router,
+        policy,
+        bearer.then(|| DynBearerAuthenticator::new(SubjectAuthenticator)),
+        internal.then(|| DynInternalAuthenticator::new(StubInternalAuthenticator)),
+    )
+}
+
+const BEARER_TENANT: &str = "Bearer tenant-token";
+const BEARER_FORGED: &str = "Bearer forged-token";
+
+/// Request with optional credentials; returns status, content type, and body.
+async fn call(
+    router: Router,
+    method: Method,
+    path: &str,
+    bearer: Option<&str>,
+    token: Option<&str>,
+) -> (StatusCode, Option<String>, String) {
+    let mut builder = HttpRequest::builder().method(method).uri(path);
+    if let Some(value) = bearer {
+        builder = builder.header(header::AUTHORIZATION, value);
+    }
+    if let Some(value) = token {
+        builder = builder.header(INTERNAL_HEADER, value);
+    }
+    let response = router
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        content_type,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+fn assert_401(result: &(StatusCode, Option<String>, String), case: &str) {
+    assert_eq!(result.0, StatusCode::UNAUTHORIZED, "{case}: {}", result.2);
+    assert_eq!(result.1.as_deref(), Some(PROBLEM_JSON), "{case}");
+}
+
+fn assert_reason(result: &(StatusCode, Option<String>, String), reason: &str, case: &str) {
+    assert_401(result, case);
+    assert!(result.2.contains(reason), "{case}: {}", result.2);
+}
+
+#[tokio::test]
+async fn a_platform_route_admits_a_validated_internal_token() {
+    for method in [Method::GET, Method::POST] {
+        for (bearer, token, want) in [
+            (None, Some(SA_GOOD), "flight-control"),
+            (Some(BEARER_TENANT), Some(SA_GOOD), "flight-control+tenant"),
+        ] {
+            let (status, _, body) = call(
+                platform_route_app(true, true),
+                method.clone(),
+                "/p",
+                bearer,
+                token,
+            )
+            .await;
+            assert_eq!((status, body.as_str()), (StatusCode::OK, want), "{method}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_platform_route_refuses_a_bearer_alone_and_any_invalid_credential() {
+    for (bearer, token, reason, case) in [
+        (None, None, "MISSING_INTERNAL_TOKEN", "neither"),
+        (
+            Some(BEARER_TENANT),
+            None,
+            "MISSING_INTERNAL_TOKEN",
+            "valid bearer alone",
+        ),
+        (
+            Some(BEARER_FORGED),
+            Some(SA_GOOD),
+            "AUTHN_FAILED",
+            "forged bearer beside valid token",
+        ),
+        (
+            Some("Basic dXNlcjpwYXNz"),
+            Some(SA_GOOD),
+            "INVALID_BEARER",
+            "non-bearer scheme beside valid token",
+        ),
+        (None, Some("forged"), "INTERNAL_AUTH_FAILED", "forged token"),
+    ] {
+        let result = call(
+            platform_route_app(true, true),
+            Method::POST,
+            "/p",
+            bearer,
+            token,
+        )
+        .await;
+        assert_reason(&result, reason, case);
+    }
+}
+
+#[tokio::test]
+async fn head_inherits_the_get_policy() {
+    let (status, _, _) = call(
+        platform_route_app(true, true),
+        Method::HEAD,
+        "/p",
+        None,
+        Some(SA_GOOD),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result = call(
+        platform_route_app(true, true),
+        Method::HEAD,
+        "/p",
+        Some(BEARER_TENANT),
+        None,
+    )
+    .await;
+    assert_eq!(result.0, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn without_a_tenant_plane_a_presented_bearer_is_refused() {
+    let (status, _, body) = call(
+        platform_route_app(false, true),
+        Method::GET,
+        "/p",
+        None,
+        Some(SA_GOOD),
+    )
+    .await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "flight-control"));
+    let result = call(
+        platform_route_app(false, true),
+        Method::GET,
+        "/p",
+        Some(BEARER_TENANT),
+        Some(SA_GOOD),
+    )
+    .await;
+    assert_reason(&result, "UNVERIFIED_BEARER", "bearer beside valid token");
+}
+
+#[tokio::test]
+async fn without_a_platform_plane_every_platform_request_is_refused() {
+    for (bearer, token, reason, case) in [
+        (
+            None,
+            Some(SA_GOOD),
+            "UNVERIFIED_INTERNAL_TOKEN",
+            "token alone",
+        ),
+        (
+            Some(BEARER_TENANT),
+            Some(SA_GOOD),
+            "UNVERIFIED_INTERNAL_TOKEN",
+            "bearer beside token",
+        ),
+        (None, None, "MISSING_INTERNAL_TOKEN", "neither"),
+    ] {
+        let result = call(
+            platform_route_app(true, false),
+            Method::GET,
+            "/p",
+            bearer,
+            token,
+        )
+        .await;
+        assert_reason(&result, reason, case);
+    }
+}
+
+#[tokio::test]
+async fn an_anonymous_tenant_context_does_not_count_as_a_validated_bearer() {
+    // An anonymous bearer context cannot validate a tenant caller, even beside a valid token.
+    let result = call(
+        platform_route_app(true, true),
+        Method::GET,
+        "/p",
+        Some("Bearer valid-token"),
+        Some(SA_GOOD),
+    )
+    .await;
+    assert_reason(&result, "UNVERIFIED_BEARER", "anonymous tenant context");
+}
+
+/// Injects a sentinel context before the gate; the handler itself reads no context.
+fn sentinel_app<T: Clone + Send + Sync + 'static>(sentinel: T) -> Router {
+    let policy: RouteAuthPolicy = [(Method::GET, "/p".to_owned(), RouteAuth::Platform)]
+        .into_iter()
+        .collect();
+    Router::new()
+        .route("/p", get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn(platform_route_middleware))
+        .layer(Extension(sentinel))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(policy),
+            route_auth_middleware,
+        ))
+}
+
+#[tokio::test]
+async fn the_gate_does_not_admit_the_outbound_marker() {
+    // The locally minted outbound marker is not a validated platform caller.
+    let result = call(
+        sentinel_app(PlatformSecurityContext::outbound_marker()),
+        Method::GET,
+        "/p",
+        None,
+        None,
+    )
+    .await;
+    assert_reason(&result, "MISSING_INTERNAL_TOKEN", "outbound marker");
+}
+
+#[tokio::test]
+async fn anonymous_routes_get_a_security_context_with_or_without_a_tenant_plane() {
+    for bearer_plane in [true, false] {
+        let (status, _, body) = call(
+            platform_route_app(bearer_plane, true),
+            Method::GET,
+            "/anon",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::OK, "anonymous"),
+            "no credentials (tenant plane {bearer_plane})"
+        );
+    }
+    let (status, _, body) = call(
+        platform_route_app(true, true),
+        Method::GET,
+        "/anon",
+        Some(BEARER_TENANT),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::OK, "subject"),
+        "a validated bearer replaces the anonymous context"
+    );
+    let result = call(
+        platform_route_app(true, true),
+        Method::GET,
+        "/anon",
+        Some(BEARER_FORGED),
+        None,
+    )
+    .await;
+    assert_401(&result, "a presented bearer is still validated");
+}
+
+#[tokio::test]
+async fn the_policy_reaches_anonymous_and_authenticated_routes() {
+    let result = call(
+        platform_route_app(true, true),
+        Method::GET,
+        "/auth",
+        None,
+        Some(SA_GOOD),
+    )
+    .await;
+    assert_401(&result, "authenticated route on an internal token alone");
+    let result = call(
+        platform_route_app(true, true),
+        Method::GET,
+        "/unlisted",
+        None,
+        None,
+    )
+    .await;
+    assert_401(
+        &result,
+        "a route without a policy entry keeps requiring a bearer",
+    );
+}
+
+#[test]
+fn head_resolves_as_get_unless_it_has_its_own_entry() {
+    let mut policy = RouteAuthPolicy::default();
+    policy.insert(Method::GET, "/a", RouteAuth::Platform);
+    policy.insert(Method::GET, "/b", RouteAuth::Platform);
+    policy.insert(Method::HEAD, "/b", RouteAuth::Anonymous);
+    assert_eq!(
+        policy.resolve(&Method::HEAD, "/a"),
+        Some(RouteAuth::Platform)
+    );
+    assert_eq!(
+        policy.resolve(&Method::HEAD, "/b"),
+        Some(RouteAuth::Anonymous)
+    );
+    assert_eq!(policy.resolve(&Method::POST, "/a"), None);
+    assert_eq!(
+        policy.resolve(&Method::GET, "/a/x"),
+        None,
+        "exact templates only"
+    );
+}

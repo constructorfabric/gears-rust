@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use toolkit::api::{OpenApiRegistry, OpenApiRegistryImpl};
+use toolkit::api::{OpenApiRegistry, OpenApiRegistryImpl, RouteAuth};
 use toolkit::lifecycle::ReadySignal;
 use tower::{BoxError, ServiceBuilder};
 use tower_http::{
@@ -259,14 +259,18 @@ impl ApiGateway {
 
     /// Build route policy from operation specs.
     fn build_route_policy_from_specs(&self) -> Result<auth::GatewayRoutePolicy> {
-        let mut authenticated_routes = std::collections::HashSet::new();
-        // Anonymous (no-auth) routes. This is the *auth* axis: routes here skip
-        // bearer-token enforcement. It is NOT external visibility (`exposed`);
-        // an anonymous route may still be externally exposed or not.
-        let mut anonymous_routes = std::collections::HashSet::new();
-
-        anonymous_routes.insert((Method::GET, "/docs".to_owned()));
-        anonymous_routes.insert((Method::GET, "/openapi.json".to_owned()));
+        // Auth and gateway visibility are independent: `RouteAuth::Anonymous` is the *auth*
+        // axis (no bearer required), NOT external visibility (`exposed`). Explicit route
+        // policy overrides require_auth_by_default; platform auth takes precedence on every
+        // host.
+        let mut routes = vec![
+            (Method::GET, "/docs".to_owned(), RouteAuth::Anonymous),
+            (
+                Method::GET,
+                "/openapi.json".to_owned(),
+                RouteAuth::Anonymous,
+            ),
+        ];
 
         // In main/both mode the health probes are merged onto the main router *before* the
         // middleware stack (see `rest_finalize`), so the auth layer resolves them: mark them
@@ -278,30 +282,31 @@ impl ApiGateway {
             HealthServeMode::Main | HealthServeMode::Both
         ) {
             for path in [HEALTHZ_PATH, READYZ_PATH, HEALTH_DETAIL_PATH] {
-                anonymous_routes.insert((Method::GET, path.to_owned()));
+                routes.push((Method::GET, path.to_owned(), RouteAuth::Anonymous));
             }
         }
 
-        for spec in &self.openapi_registry.operation_specs {
+        routes.extend(self.openapi_registry.operation_specs.iter().map(|spec| {
             let spec = spec.value();
+            (spec.method.clone(), spec.path.clone(), spec.auth)
+        }));
 
-            let route_key = (spec.method.clone(), spec.path.clone());
+        let count = |auth: RouteAuth| routes.iter().filter(|route| route.2 == auth).count();
+        let requirements_count = count(RouteAuth::Authenticated);
+        let anonymous_routes_count = count(RouteAuth::Anonymous);
+        let platform_routes: Vec<String> = routes
+            .iter()
+            .filter(|route| route.2 == RouteAuth::Platform)
+            .map(|(method, path, _)| format!("{method} {path}"))
+            .collect();
 
-            // Auth axis: `authenticated` requires a JWT; `!authenticated` is
-            // anonymous (auth-skip). Visibility (`exposed`) is a *separate*
-            // axis (gateway registration) and does NOT affect the auth decision.
-            // The builder typestate forces an explicit choice, so every spec'd
-            // route lands in exactly one set; `require_auth_by_default` remains
-            // the fallback for paths with no matching spec.
-            if spec.authenticated {
-                authenticated_routes.insert(route_key);
-            } else {
-                anonymous_routes.insert(route_key);
-            }
+        if !platform_routes.is_empty() && self.internal_authenticator.lock().is_none() {
+            tracing::warn!(
+                routes = ?platform_routes,
+                "platform routes are declared but no `internal_auth` is configured; \
+                 every request to them will be refused with 401"
+            );
         }
-
-        let requirements_count = authenticated_routes.len();
-        let anonymous_routes_count = anonymous_routes.len();
 
         // When the embedded-edge reverse proxy is enabled, hand the auth policy the
         // shared proxy registry so dynamically-registered proxy routes are enforced
@@ -311,18 +316,14 @@ impl ApiGateway {
             .gateway_proxy
             .enabled
             .then(|| Arc::clone(&self.proxy_registry));
-        let route_policy = auth::build_route_policy(
-            &config,
-            authenticated_routes,
-            anonymous_routes,
-            proxy_registry,
-        )?;
+        let route_policy = auth::build_route_policy(&config, routes, proxy_registry)?;
 
         tracing::info!(
             auth_disabled = config.auth_disabled,
             require_auth_by_default = config.require_auth_by_default,
             requirements_count = requirements_count,
             anonymous_routes_count = anonymous_routes_count,
+            platform_routes_count = platform_routes.len(),
             "Route policy built from operation specs"
         );
 
@@ -382,16 +383,10 @@ impl ApiGateway {
         // Build route policy once
         let route_policy = self.build_route_policy_from_specs()?;
 
-        // IMPORTANT: `axum::Router::layer(...)` behaves like Tower layers: the **last** added layer
-        // becomes the **outermost** layer and therefore runs **first** on the request path.
-        //
-        // Desired request execution order (outermost -> innermost):
+        // Layers run in reverse registration order (outermost first):
         // SetRequestId -> PropagateRequestId -> Trace -> push_req_id_to_extensions
         // -> Timeout -> BodyLimit -> CORS -> MIME validation -> PreAuthThrottling -> ErrorMapping
-        // -> Auth -> ScopeEnforcement -> PostAuthThrottling -> License -> Router
-        //
-        // Therefore we must add layers in the reverse order (innermost -> outermost) below.
-        // Due future refactoring, this order must be maintained.
+        // -> Auth -> PlatformGate -> ScopeEnforcement -> PostAuthThrottling -> License -> Router
 
         // 14) Propagate MatchedPath to response extensions (route_layer — innermost).
         // This copies MatchedPath from the request (populated by Axum route matching)
@@ -461,6 +456,12 @@ impl ApiGateway {
             ));
         }
 
+        // 10b) Always enforce platform admission after auth and before tenant scope checks.
+        router = router.layer(from_fn_with_state(
+            route_policy.clone(),
+            auth::platform_gate_middleware,
+        ));
+
         // 10) Auth
         if config.auth_disabled {
             // Build security contexts for compatibility during migration
@@ -474,11 +475,18 @@ impl ApiGateway {
                  This mode bypasses authentication and is intended ONLY for single-user on-premises deployments without an IdP. \
                  Permission checks and secure ORM still apply. DO NOT use this mode in multi-tenant or production environments."
             );
+            // A synthetic tenant context could admit a forged bearer on a platform route.
+            let policy = route_policy;
             router = router.layer(from_fn(
                 move |mut req: axum::extract::Request, next: axum::middleware::Next| {
                     let sec_context = default_security_context.clone();
+                    let requirement = policy.requirement_of(&req);
+                    req.extensions_mut()
+                        .insert(auth::ResolvedRequirement(requirement));
                     async move {
-                        req.extensions_mut().insert(sec_context);
+                        if requirement != auth::AuthRequirement::Platform {
+                            req.extensions_mut().insert(sec_context);
+                        }
                         next.run(req).await
                     }
                 },

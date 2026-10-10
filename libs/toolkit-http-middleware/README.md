@@ -16,6 +16,11 @@ maintaining their own.
     a `PlatformSecurityContext` plus `PeerAuthenticated`
 - Header extractors for `Authorization: Bearer` and `X-ToolKit-Internal-Token`
 - `AnonymousRoute` marker so routes that carry no JWT pass through without `401`
+- Per-route policy for gear listeners: `RouteAuthPolicy` + `route_auth_middleware`
+  select auth before both planes (anonymous routes get an anonymous `SecurityContext`);
+  `platform_route_middleware` requires a validated internal token and refuses any
+  unvalidated presented credential. `layer_route_auth` installs all four layers in the
+  required order — prefer it over wiring them by hand
 - Renders rejections as canonical RFC 9457 `application/problem+json`
 
 ## What it does NOT do
@@ -28,16 +33,20 @@ maintaining their own.
 ## Usage
 
 ```rust
-use std::sync::Arc;
-use axum::{Router, middleware::from_fn_with_state, routing::get};
-use toolkit_http_middleware::{internal_auth_middleware, security_context_middleware};
+use axum::{Router, routing::get};
+use toolkit_http_middleware::{RouteAuth, RouteAuthPolicy, layer_route_auth};
 
-// `bearer` and `internal` are your concrete `BearerAuthenticator` /
-// `InternalAuthenticator` adapters, supplied at the bootstrap layer.
-let router = Router::new()
-    .route("/widgets", get(list_widgets))
-    .route_layer(from_fn_with_state(bearer, security_context_middleware::<MyBearerAuth>))
-    .route_layer(from_fn_with_state(internal, internal_auth_middleware::<MyInternalAuth>));
+// `bearer` and `internal` are `Option<DynBearerAuthenticator>` /
+// `Option<DynInternalAuthenticator>` adapters, supplied at the bootstrap layer.
+let policy: RouteAuthPolicy = [(http::Method::GET, "/widgets".to_owned(), RouteAuth::Authenticated)]
+    .into_iter()
+    .collect();
+let router = layer_route_auth(
+    Router::new().route("/widgets", get(list_widgets)),
+    policy,
+    bearer,
+    internal,
+);
 ```
 
 ## License

@@ -1,0 +1,5 @@
+error: `#[anonymous]` cannot mark a platform-plane method: a `PlatformSecurityContext` method always requires a validated `X-ToolKit-Internal-Token` (cpt-cf-adr-two-plane-auth)
+  --> tests/ui/fail/rest_anonymous_platform_method.rs:20:5
+   |
+20 |     #[anonymous]
+   |     ^

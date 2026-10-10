@@ -53,6 +53,8 @@ pub mod internal_auth_cache;
 pub mod internal_auth_config;
 /// The types most gears need, re-exported for a single glob import.
 pub mod prelude;
+/// Per-route credential requirement.
+pub mod route_auth;
 /// A pre-shared-secret [`InternalAuthenticator`], for development and simple
 /// deployments.
 pub mod shared_secret;
@@ -78,6 +80,7 @@ pub use internal_auth_cache::{
 pub use internal_auth_config::{
     BuiltAuthenticator, DEFAULT_INTERNAL_PEER_NAME, InternalAuthConfig, InvalidInternalAuth,
 };
+pub use route_auth::RouteAuth;
 pub use shared_secret::{
     InvalidSharedSecret, REDACTED_PLACEHOLDER, SharedSecretInternalAuthenticator,
 };

@@ -2,7 +2,7 @@
 
 use super::*;
 use axum::body::{Body, to_bytes};
-use axum::http::Request;
+use axum::http::{Method, Request};
 use serde_json::Value;
 use tower::ServiceExt; // for `oneshot`
 
@@ -395,7 +395,11 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
     );
 
     // 3. Attach the composed gear routes (simulates post-start()).
-    server.attach(gear_router, "{\"openapi\":\"3.1.0\"}".to_owned());
+    server.attach(
+        gear_router,
+        "{\"openapi\":\"3.1.0\"}".to_owned(),
+        RouteAuthPolicy::default(),
+    );
 
     // 4. Gear routes now serve.
     assert!(
@@ -467,6 +471,7 @@ async fn attach_forwards_configured_labels_to_directory_registration() {
     server.attach(
         Router::new().route("/ping", get(|| async { "pong" })),
         "{}".to_owned(),
+        RouteAuthPolicy::default(),
     );
 
     // Poll until the registration is captured (registration is async).
@@ -606,7 +611,11 @@ async fn gear_handler_receives_connect_info_through_fallback() {
         .await
         .expect("server should bind");
 
-    server.attach(Router::new().route("/peer", get(peer)), "{}".to_owned());
+    server.attach(
+        Router::new().route("/peer", get(peer)),
+        "{}".to_owned(),
+        RouteAuthPolicy::default(),
+    );
 
     // A `200` proves the gear handler's `ConnectInfo<SocketAddr>` extractor found
     // the connect-info in the request extensions *through* the swap fallback — a
@@ -725,6 +734,7 @@ async fn canonical_error_layer_runs_inside_the_trace_span_when_composed() {
     );
     let app = layer_gear_router(
         Router::new().route("/boom", get(boom)),
+        RouteAuthPolicy::default(),
         DrainGuard::new(readiness),
         &options,
     );
@@ -743,4 +753,269 @@ async fn canonical_error_layer_runs_inside_the_trace_span_when_composed() {
         "the canonical-error layer must run inside the trace span, so the problem \
          carries the live span's 32-hex trace_id even with no inbound traceparent; got {problem}"
     );
+}
+
+// Auth assembly: OperationBuilder → route_auth_policy → layer_gear_router.
+
+const AXIS_BEARER: &str = "Bearer tenant-token";
+const AXIS_SA: &str = "good-sa-token";
+
+/// Tenant authenticator: `tenant-token` is a real subject, the rest rejected.
+struct AxisBearer;
+
+impl BearerAuthenticator for AxisBearer {
+    async fn authenticate(&self, token: &str) -> Result<SecurityContext, AuthNError> {
+        if token == "tenant-token" {
+            Ok(SecurityContext::builder()
+                .subject_id(uuid::Uuid::from_u128(1))
+                .subject_tenant_id(uuid::Uuid::from_u128(2))
+                .build()
+                .unwrap())
+        } else {
+            Err(AuthNError::InvalidToken)
+        }
+    }
+}
+
+/// Platform authenticator: `good-sa-token` is a workload, the rest rejected.
+struct AxisInternal;
+
+impl InternalAuthenticator for AxisInternal {
+    async fn authenticate(&self, token: &str) -> Result<PlatformIdentity, InternalAuthNError> {
+        if token == AXIS_SA {
+            Ok(PlatformIdentity::KubernetesServiceAccount {
+                namespace: "toolkit".to_owned(),
+                service_account: "types-registry".to_owned(),
+                pod: None,
+            })
+        } else {
+            Err(InternalAuthNError::InvalidToken)
+        }
+    }
+}
+
+/// `OperationBuilder` routes: `/axis/v1/p` platform, `/anon` anonymous, `/auth` authenticated.
+fn axis_gear(bearer: bool, internal: bool) -> Router {
+    use crate::api::{OpenApiRegistryImpl, OperationBuilder};
+
+    async fn ok() -> &'static str {
+        "ok"
+    }
+
+    let registry = OpenApiRegistryImpl::new();
+    let mut router = Router::new();
+    router = OperationBuilder::get("/axis/v1/p")
+        .operation_id("axis.get")
+        .platform_authenticated()
+        .no_license_required()
+        .handler(ok)
+        .json_response(StatusCode::OK, "OK")
+        .register(router, &registry);
+    router = OperationBuilder::post("/axis/v1/p")
+        .operation_id("axis.post")
+        .platform_authenticated()
+        .no_license_required()
+        .handler(ok)
+        .json_response(StatusCode::OK, "OK")
+        .register(router, &registry);
+    router = OperationBuilder::get("/axis/v1/anon")
+        .operation_id("axis.anon")
+        .anonymous()
+        .handler(ok)
+        .json_response(StatusCode::OK, "OK")
+        .register(router, &registry);
+    router = OperationBuilder::get("/axis/v1/auth")
+        .operation_id("axis.auth")
+        .authenticated()
+        .no_license_required()
+        .handler(ok)
+        .json_response(StatusCode::OK, "OK")
+        .register(router, &registry);
+
+    let mut options = OopServeOptions::new(
+        "axis-gear".to_owned(),
+        "i-1".to_owned(),
+        "http://localhost".to_owned(),
+        free_addr(),
+        Arc::new(E2eDirectory::default()),
+    );
+    if bearer {
+        options = options.with_bearer_authenticator(Some(DynBearerAuthenticator::new(AxisBearer)));
+    }
+    if internal {
+        options =
+            options.with_internal_authenticator(Some(DynInternalAuthenticator::new(AxisInternal)));
+    }
+    let policy = route_auth_policy(registry.operation_specs.iter());
+    layer_gear_router(
+        router,
+        policy,
+        DrainGuard::new(readiness(Vec::<String>::new())),
+        &options,
+    )
+}
+
+async fn axis_status(
+    app: Router,
+    method: Method,
+    path: &str,
+    bearer: Option<&str>,
+    token: Option<&str>,
+) -> (StatusCode, Option<String>) {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(value) = bearer {
+        builder = builder.header(axum::http::header::AUTHORIZATION, value);
+    }
+    if let Some(value) = token {
+        builder = builder.header("x-toolkit-internal-token", value);
+    }
+    let resp = app
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    (resp.status(), content_type)
+}
+
+#[tokio::test]
+async fn platform_routes_through_the_real_assembly() {
+    use Method as M;
+    let ok = StatusCode::OK;
+    let unauthorized = StatusCode::UNAUTHORIZED;
+    let p = "/axis/v1/p";
+    let cases = [
+        (M::GET, p, None, Some(AXIS_SA), ok, "platform GET: token"),
+        (M::POST, p, None, Some(AXIS_SA), ok, "platform POST: token"),
+        (
+            M::POST,
+            p,
+            Some(AXIS_BEARER),
+            Some(AXIS_SA),
+            ok,
+            "platform: bearer + token",
+        ),
+        (
+            M::GET,
+            p,
+            Some(AXIS_BEARER),
+            None,
+            unauthorized,
+            "platform GET: bearer alone",
+        ),
+        (
+            M::POST,
+            p,
+            Some(AXIS_BEARER),
+            None,
+            unauthorized,
+            "platform POST: bearer alone",
+        ),
+        (M::POST, p, None, None, unauthorized, "platform: neither"),
+        (
+            M::POST,
+            p,
+            Some("Bearer forged"),
+            Some(AXIS_SA),
+            unauthorized,
+            "platform: forged bearer + token",
+        ),
+        (
+            M::POST,
+            p,
+            None,
+            Some("forged"),
+            unauthorized,
+            "platform: forged token",
+        ),
+        (M::HEAD, p, None, Some(AXIS_SA), ok, "HEAD inherits: token"),
+        (
+            M::HEAD,
+            p,
+            Some(AXIS_BEARER),
+            None,
+            unauthorized,
+            "HEAD inherits: bearer alone",
+        ),
+        (
+            M::GET,
+            "/axis/v1/anon",
+            None,
+            None,
+            ok,
+            "anonymous reaches the listener",
+        ),
+        (
+            M::GET,
+            "/axis/v1/auth",
+            None,
+            Some(AXIS_SA),
+            unauthorized,
+            "authenticated: token alone",
+        ),
+        (
+            M::GET,
+            "/axis/v1/auth",
+            Some(AXIS_BEARER),
+            None,
+            ok,
+            "authenticated: bearer",
+        ),
+    ];
+    for (method, path, bearer, token, want, case) in cases {
+        let (status, content_type) =
+            axis_status(axis_gear(true, true), method, path, bearer, token).await;
+        assert_eq!(status, want, "{case}");
+        if want == unauthorized {
+            assert_eq!(
+                content_type.as_deref(),
+                Some("application/problem+json"),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn platform_routes_fail_closed_without_an_authenticator() {
+    use Method as M;
+    // No tenant plane: a presented bearer cannot be validated, so it is refused.
+    for (method, bearer, token, want, case) in [
+        (M::GET, None, Some(AXIS_SA), StatusCode::OK, "token"),
+        (
+            M::POST,
+            Some(AXIS_BEARER),
+            Some(AXIS_SA),
+            StatusCode::UNAUTHORIZED,
+            "bearer + token",
+        ),
+    ] {
+        let (status, _) =
+            axis_status(axis_gear(false, true), method, "/axis/v1/p", bearer, token).await;
+        assert_eq!(status, want, "no tenant plane, {case}");
+    }
+    // No platform plane, or neither: nothing can validate the token.
+    for (bearer_plane, method, bearer) in [
+        (true, M::POST, None),
+        (true, M::GET, Some(AXIS_BEARER)),
+        (false, M::GET, None),
+        (false, M::POST, None),
+    ] {
+        let (status, _) = axis_status(
+            axis_gear(bearer_plane, false),
+            method.clone(),
+            "/axis/v1/p",
+            bearer,
+            Some(AXIS_SA),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "no platform plane (tenant plane {bearer_plane}), {method}"
+        );
+    }
 }

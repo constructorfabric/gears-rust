@@ -27,3 +27,7 @@ pub const DEFAULT_SUBJECT_ID: Uuid = uuid!("11111111-6a88-4768-9dfc-6bcd5187d9ed
 /// avoid colliding with the tenant-plane user JWT
 /// (`cpt-cf-adr-platform-plane-auth` / `cpt-cf-adr-two-plane-auth`).
 pub const INTERNAL_TOKEN_HEADER: &str = "x-toolkit-internal-token";
+
+/// `OpenAPI` apiKey scheme for [`INTERNAL_TOKEN_HEADER`] on platform operations.
+/// Discovery excludes it: the edge strips the required token, so proxy auth cannot satisfy it.
+pub const INTERNAL_TOKEN_SECURITY_SCHEME: &str = "internalToken";

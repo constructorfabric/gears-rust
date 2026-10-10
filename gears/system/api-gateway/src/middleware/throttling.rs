@@ -42,6 +42,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
+use toolkit::api::RouteAuth;
 use toolkit::api::{OperationSpec, ThrottlingSpec};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
@@ -580,10 +581,18 @@ fn check_key_type(
              (require_security_context=false) operation; identity keying requires authentication"
         );
     }
-    if !spec.authenticated {
+    if spec.auth == RouteAuth::Anonymous {
         bail!(
             "throttling: zone '{zone}' is identity-keyed but operation {} {} allows anonymous \
              access; every anonymous client would share one key",
+            spec.method,
+            spec.path
+        );
+    }
+    if spec.auth == RouteAuth::Platform {
+        bail!(
+            "throttling: zone '{zone}' is identity-keyed but operation {} {} is platform-authenticated; \
+             a platform caller carries no tenant identity to key on",
             spec.method,
             spec.path
         );

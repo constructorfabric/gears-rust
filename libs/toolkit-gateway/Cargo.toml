@@ -49,5 +49,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Captures the provider's warnings to count them.
+tracing-test = { workspace = true }
 # Build an errored request body to test the client-read-error path.
 futures-util = { workspace = true }

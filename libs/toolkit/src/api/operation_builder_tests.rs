@@ -469,8 +469,38 @@ fn authenticated() {
         .handler(test_handler)
         .json_response(http::StatusCode::OK, "Success");
 
-    assert!(builder.spec.authenticated);
+    assert_eq!(builder.spec.auth, RouteAuth::Authenticated);
     assert!(!builder.spec.exposed);
+}
+
+#[test]
+fn platform_authenticated_requires_the_platform_plane() {
+    let platform = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/a")
+        .platform_authenticated()
+        .no_license_required()
+        .handler(test_handler)
+        .json_response(http::StatusCode::OK, "OK");
+    assert_eq!(platform.spec.auth, RouteAuth::Platform);
+}
+
+#[test]
+fn every_auth_declaration_classifies_as_its_operation_auth() {
+    let authed = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/a")
+        .authenticated()
+        .handler(test_handler)
+        .json_response(http::StatusCode::OK, "OK");
+    assert_eq!(authed.spec.auth, RouteAuth::Authenticated);
+    let anon = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/a")
+        .anonymous()
+        .handler(test_handler)
+        .json_response(http::StatusCode::OK, "OK");
+    assert_eq!(anon.spec.auth, RouteAuth::Anonymous);
+    let platform = OperationBuilder::<Missing, Missing, ()>::post("/tests/v1/a")
+        .platform_authenticated()
+        .no_license_required()
+        .handler(test_handler)
+        .json_response(http::StatusCode::OK, "OK");
+    assert_eq!(platform.spec.auth, RouteAuth::Platform);
 }
 
 #[test]
@@ -480,20 +510,20 @@ fn anonymous_is_internal_by_default() {
         .handler(test_handler)
         .json_response(http::StatusCode::OK, "Success");
 
-    assert!(!builder.spec.authenticated);
+    assert_eq!(builder.spec.auth, RouteAuth::Anonymous);
     assert!(!builder.spec.exposed);
 }
 
 #[test]
 fn exposed_is_independent_of_auth() {
-    // Visibility (`exposed`) and auth (`authenticated`) are orthogonal:
+    // Visibility (`exposed`) and auth (`auth`) are orthogonal:
     // an exposed route may be authenticated or anonymous.
     let authed = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/a")
         .exposed()
         .authenticated()
         .handler(test_handler)
         .json_response(http::StatusCode::OK, "OK");
-    assert!(authed.spec.authenticated);
+    assert_eq!(authed.spec.auth, RouteAuth::Authenticated);
     assert!(authed.spec.exposed);
 
     let anon = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/b")
@@ -501,7 +531,7 @@ fn exposed_is_independent_of_auth() {
         .anonymous()
         .handler(test_handler)
         .json_response(http::StatusCode::OK, "OK");
-    assert!(!anon.spec.authenticated);
+    assert_eq!(anon.spec.auth, RouteAuth::Anonymous);
     assert!(anon.spec.exposed);
 }
 
@@ -514,7 +544,11 @@ fn deprecated_public_maps_to_anonymous_and_exposed() {
         .public()
         .handler(test_handler)
         .json_response(http::StatusCode::OK, "OK");
-    assert!(!op.spec.authenticated, "public route is anonymous");
+    assert_eq!(
+        op.spec.auth,
+        RouteAuth::Anonymous,
+        "public route is anonymous"
+    );
     assert!(op.spec.exposed, "public route is edge-exposed");
 }
 

@@ -22645,6 +22645,12 @@
         "bearerFormat": "JWT",
         "scheme": "bearer",
         "type": "http"
+      },
+      "internalToken": {
+        "description": "Platform-plane workload credential, validated by the receiving listener",
+        "in": "header",
+        "name": "x-toolkit-internal-token",
+        "type": "apiKey"
       }
     }
   },
@@ -29211,7 +29217,12 @@
             },
             "description": "Internal Server Error"
           }
-        }
+        },
+        "security": [
+          {
+            "internalToken": []
+          }
+        ]
       }
     },
     "/bss-approvals/v1/approval-units": {

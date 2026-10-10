@@ -24,6 +24,7 @@ toolkit-http = { workspace = true }
 toolkit-http-middleware = { workspace = true }
 toolkit-gateway = { workspace = true }
 toolkit-security = { workspace = true, features = ["internal-auth-cache"] }
+secrecy = { workspace = true }
 toolkit-k8s-auth = { workspace = true, optional = true }
 toolkit-transport-grpc = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
