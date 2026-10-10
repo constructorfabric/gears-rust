@@ -2,11 +2,13 @@
 
 use github_mirror::domain::error::DomainError;
 use github_mirror::domain::ports::github::{
-    CommitListing, FetchOptions, FetchedRepository, GithubPort, IssueDetailWants, IssueListing,
-    ListCursor, Listing, ListingCompleteness, PullListing, RepoRef,
+    CommitListing, FetchOptions, FetchedRepository, ForceMode, GithubPort, IssueDetailWants,
+    IssueListing, ListCursor, Listing, ListingCompleteness, PullListing, RepoRef,
 };
+use github_mirror::domain::ports::telemetry_sink::TelemetrySink;
 use github_mirror::domain::repo::ContributorRecord;
 use github_mirror::domain::scope::{CollectionMode, ScopeConfig};
+use github_mirror::domain::sync::{SessionTelemetry, TelemetryLine};
 use github_mirror::infra::github::cache::{CacheKey, CachedResponse, HttpCache};
 use github_mirror::infra::github::client::GithubClient;
 use github_mirror::infra::github::compression::MAX_BODY_BYTES;
@@ -456,9 +458,12 @@ fn opts(scope: ScopeConfig) -> FetchOptions {
         tenant_id,
         access_scope: AccessScope::for_tenant(tenant_id),
         scope,
-        force: false,
+        force: ForceMode::None,
         since: None,
         cancel: tokio_util::sync::CancellationToken::new(),
+        telemetry: std::sync::Arc::default(),
+        public_repo: std::sync::Arc::default(),
+        max_concurrent_tasks: None,
     }
 }
 
@@ -1572,6 +1577,7 @@ impl HttpCache for MemCache {
     async fn get(
         &self,
         _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
         key: &CacheKey,
     ) -> Result<Option<CachedResponse>, DomainError> {
         Ok(self.entries.lock().unwrap().get(key.as_str()).cloned())
@@ -1595,12 +1601,37 @@ impl HttpCache for MemCache {
     async fn clear(
         &self,
         _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
         _url_prefixes: &[&str],
     ) -> Result<u64, DomainError> {
         let mut entries = self.entries.lock().unwrap();
         let removed = entries.len() as u64;
         entries.clear();
         Ok(removed)
+    }
+
+    async fn expire(
+        &self,
+        _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
+        _fetched_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, DomainError> {
+        Ok(0)
+    }
+
+    async fn size(
+        &self,
+        _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
+        _url_prefixes: &[&str],
+    ) -> Result<u64, DomainError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .map(|entry| entry.body.len() as u64)
+            .sum())
     }
 }
 
@@ -1648,9 +1679,12 @@ async fn a_stored_etag_turns_the_next_sync_into_a_free_304() {
         tenant_id: tenant,
         access_scope: AccessScope::for_tenant(tenant),
         scope,
-        force: false,
+        force: ForceMode::None,
         since: None,
         cancel: tokio_util::sync::CancellationToken::new(),
+        telemetry: std::sync::Arc::default(),
+        public_repo: std::sync::Arc::default(),
+        max_concurrent_tasks: None,
     };
 
     let fresh = fetch_repository(&client, "rust-lang", "rust", &options)
@@ -1671,13 +1705,112 @@ async fn a_stored_etag_turns_the_next_sync_into_a_free_304() {
     );
 
     let forced = FetchOptions {
-        force: true,
+        force: ForceMode::All,
         ..options.clone()
     };
     fetch_repository(&client, "rust-lang", "rust", &forced)
         .await
         .expect("forced fetch");
     first.assert_calls_async(2).await;
+}
+
+/// Keeps every telemetry line the client hands it, as JSON.
+#[derive(Debug, Default)]
+struct RecordingSink {
+    lines: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+impl TelemetrySink for RecordingSink {
+    fn record(&self, _file: &std::path::Path, line: &TelemetryLine<'_>) -> Result<(), DomainError> {
+        self.lines
+            .lock()
+            .unwrap()
+            .push(serde_json::to_value(line).unwrap());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn every_call_leaves_a_telemetry_line_with_its_status_size_and_validator() {
+    let server = MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method("GET")
+                .path("/repos/rust-lang/rust")
+                .is_true(|req| {
+                    !req.headers()
+                        .iter()
+                        .any(|(k, _)| k.as_str() == "if-none-match")
+                });
+            then.status(200)
+                .header("etag", "W/\"deadbeef\"")
+                .header("x-ratelimit-remaining", "4870")
+                .json_body(gh_repo_json());
+        })
+        .await;
+    server
+        .mock_async(|when, then| {
+            when.method("GET")
+                .path("/repos/rust-lang/rust")
+                .header("if-none-match", "W/\"deadbeef\"");
+            then.status(304).header("x-ratelimit-remaining", "4870");
+        })
+        .await;
+
+    let cache = std::sync::Arc::new(MemCache::default());
+    let client =
+        GithubClient::with_cache(server.base_url(), None, cache).expect("client must build");
+    let sink = std::sync::Arc::new(RecordingSink::default());
+    let session_id = uuid::Uuid::new_v4();
+    let options = FetchOptions {
+        telemetry: std::sync::Arc::new(SessionTelemetry::logging_to(
+            std::sync::Arc::clone(&sink) as std::sync::Arc<dyn TelemetrySink>,
+            std::path::PathBuf::from("rust.jsonl"),
+            session_id,
+            "rust-lang/rust".to_owned(),
+        )),
+        ..opts(repo_only_scope())
+    };
+
+    client
+        .fetch_repository_metadata("rust-lang", "rust", &options)
+        .await
+        .expect("first fetch");
+    client
+        .fetch_repository_metadata("rust-lang", "rust", &options)
+        .await
+        .expect("second fetch");
+
+    let lines = sink.lines.lock().unwrap();
+    assert_eq!(lines.len(), 2, "one line per call: {lines:?}");
+    let (fresh, revalidated) = (&lines[0], &lines[1]);
+
+    assert_eq!(fresh["session_id"], session_id.to_string());
+    assert_eq!(fresh["repository"], "rust-lang/rust");
+    assert_eq!(fresh["api"], "rest");
+    assert_eq!(fresh["method"], "GET");
+    assert!(
+        fresh["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/repos/rust-lang/rust"),
+        "{fresh}"
+    );
+    assert_eq!(fresh["status"], 200);
+    assert_eq!(fresh["outcome"], "fresh");
+    assert_eq!(fresh["cache_hit"], false);
+    assert_eq!(fresh["etag_used"], false);
+    assert_eq!(fresh["rate_limit_remaining"], 4870);
+    assert!(
+        fresh["response_bytes"].as_u64().unwrap() > 0,
+        "a 200 line must carry the body size: {fresh}"
+    );
+
+    assert_eq!(revalidated["status"], 304);
+    assert_eq!(revalidated["outcome"], "not_modified");
+    assert_eq!(revalidated["cache_hit"], true);
+    assert_eq!(revalidated["etag_used"], true);
+    assert_eq!(revalidated["response_bytes"], 0);
 }
 
 #[tokio::test]
@@ -1774,9 +1907,7 @@ async fn a_rate_limited_response_is_retried_before_giving_up() {
     let limited = server
         .mock_async(|when, then| {
             when.method("GET").path("/repos/acme/busy");
-            then.status(403)
-                .header("retry-after", "0")
-                .header("x-ratelimit-remaining", "0");
+            then.status(403).header("retry-after", "0");
         })
         .await;
 
@@ -1855,7 +1986,7 @@ async fn a_403_with_only_an_exhausted_quota_is_retried_as_a_rate_limit() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("the clock is after 1970")
         .as_secs()
-        + 1;
+        + 2;
     let server = MockServer::start_async().await;
     let limited = server
         .mock_async(move |when, then| {
@@ -2159,9 +2290,7 @@ async fn a_rate_limit_seen_by_one_request_pauses_every_other_request() {
     let limited = server
         .mock_async(|when, then| {
             when.method("GET").path("/repos/acme/limited");
-            then.status(403)
-                .header("retry-after", "1")
-                .header("x-ratelimit-remaining", "0");
+            then.status(403).header("retry-after", "2");
         })
         .await;
     let free = server
@@ -2213,13 +2342,19 @@ async fn a_rate_limit_seen_by_one_request_pauses_every_other_request() {
 
 #[tokio::test]
 async fn a_request_waiting_for_the_only_slot_waits_out_a_cooldown_set_meanwhile() {
+    let reset = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after 1970")
+        .as_secs()
+        + 1;
     let server = MockServer::start_async().await;
     server
-        .mock_async(|when, then| {
+        .mock_async(move |when, then| {
             when.method("GET").path("/repos/acme/limited");
             then.status(403)
                 .header("retry-after", "1")
                 .header("x-ratelimit-remaining", "0")
+                .header("x-ratelimit-reset", reset.to_string())
                 .delay(std::time::Duration::from_millis(500));
         })
         .await;
@@ -2830,4 +2965,37 @@ fn a_token_may_not_travel_over_plain_http_to_another_host() {
             "{url} must be allowed: {why}"
         );
     }
+}
+
+#[tokio::test]
+async fn check_rate_limit_reads_every_pool_with_core_and_graphql_first() {
+    let server = MockServer::start_async().await;
+    let quotas = server
+        .mock_async(|when, then| {
+            when.method("GET")
+                .path("/rate_limit")
+                .header("authorization", "Bearer tok");
+            then.status(200).json_body(json!({
+                "resources": {
+                    "search": {"limit": 30, "used": 1, "remaining": 29, "reset": 1_700_000_060},
+                    "graphql": {"limit": 5000, "used": 400, "remaining": 4600, "reset": 1_700_003_600},
+                    "core": {"limit": 5000, "used": 123, "remaining": 4877, "reset": 1_700_003_600}
+                }
+            }));
+        })
+        .await;
+    let client =
+        GithubClient::new(server.base_url(), Some("tok".to_owned())).expect("client must build");
+
+    let read = client.rate_limit().await.expect("the quotas must read");
+
+    quotas.assert_calls_async(1).await;
+    let order: Vec<&str> = read.iter().map(|quota| quota.resource.as_str()).collect();
+    assert_eq!(order, ["core", "graphql", "search"]);
+    assert_eq!(read[0].remaining, 4877);
+    assert_eq!(read[0].used, 123);
+    assert_eq!(
+        read[0].reset_at.map(|at| at.timestamp()),
+        Some(1_700_003_600)
+    );
 }

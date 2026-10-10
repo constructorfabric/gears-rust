@@ -278,6 +278,7 @@ impl MirrorWorker {
             return Ok(());
         }
         let run = &self.run;
+        run.options.telemetry.add_indexed(candidates.len());
         let items: Vec<(&str, &GateInputs)> = candidates
             .iter()
             .map(|candidate| (candidate.entity_id.as_str(), &candidate.inputs))
@@ -291,11 +292,12 @@ impl MirrorWorker {
                 entity,
                 &items,
                 Utc::now(),
-                run.options.force,
+                run.options.force.refetches_all(),
             )
             .await?;
         for (candidate, reason) in candidates.into_iter().zip(reasons) {
             let Some(reason) = reason else {
+                run.options.telemetry.add_skipped();
                 continue;
             };
             tracing::debug!(
@@ -325,7 +327,9 @@ impl MirrorWorker {
                 entity_id,
                 Utc::now(),
             )
-            .await
+            .await?;
+        run.options.telemetry.add_refined();
+        Ok(())
     }
 
     fn seed(
@@ -368,6 +372,9 @@ impl MirrorWorker {
         run.repo_id.set(stored.id).map_err(|_| {
             DomainError::internal("the repository was discovered twice in one sync")
         })?;
+        run.options.public_repo.set(!stored.private).map_err(|_| {
+            DomainError::internal("the repository was discovered twice in one sync")
+        })?;
         run.tally(|s| s.repository.clone_from(&stored.full_name));
 
         let objects = run.options.scope.objects;
@@ -403,7 +410,12 @@ impl MirrorWorker {
         let repo_id = run.repo_id()?;
         let start = self
             .watermark
-            .start_sweep(&run.scope, repo_id, Family::Issues, run.options.force)
+            .start_sweep(
+                &run.scope,
+                repo_id,
+                Family::Issues,
+                run.options.force.refetches_all(),
+            )
             .await?;
         let updated_after = start.updated_after;
         let collection = run.options.scope.collection;
@@ -526,7 +538,12 @@ impl MirrorWorker {
         let repo_id = run.repo_id()?;
         let start = self
             .watermark
-            .start_sweep(&run.scope, repo_id, Family::PullRequests, run.options.force)
+            .start_sweep(
+                &run.scope,
+                repo_id,
+                Family::PullRequests,
+                run.options.force.refetches_all(),
+            )
             .await?;
         let updated_after = start.updated_after;
         let mut high = updated_after;
@@ -711,7 +728,12 @@ impl MirrorWorker {
         let repo_id = run.repo_id()?;
         let start = self
             .watermark
-            .start_sweep(&run.scope, repo_id, Family::Commits, run.options.force)
+            .start_sweep(
+                &run.scope,
+                repo_id,
+                Family::Commits,
+                run.options.force.refetches_all(),
+            )
             .await?;
         let with_ci = run.options.scope.collection.actions == CollectionMode::All;
         let mut page1_etag: Option<String> = None;

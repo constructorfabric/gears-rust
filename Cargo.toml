@@ -102,6 +102,7 @@ members = [
     "gears/file-storage/file-storage",
     "gears/github-mirror/github-mirror-sdk",
     "gears/github-mirror/github-mirror",
+    "gears/github-mirror/github-mirror-cli",
     "gears/system/account-management/account-management",
     "gears/system/account-management/account-management-sdk",
     "gears/system/account-management/plugins/static-idp-plugin",

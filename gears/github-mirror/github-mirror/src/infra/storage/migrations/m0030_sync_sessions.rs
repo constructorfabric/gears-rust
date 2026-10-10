@@ -37,8 +37,8 @@ CREATE INDEX IF NOT EXISTS idx_gm_sync_sessions_status
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_sync_sessions (
-    tenant_id VARCHAR(36) NOT NULL,
-    id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
+    id BINARY(16) NOT NULL,
     repo_full_name VARCHAR(512) NOT NULL,
     repo_id BIGINT,
     status VARCHAR(32) NOT NULL,
@@ -105,10 +105,10 @@ CREATE TABLE IF NOT EXISTS gm_active_syncs (
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_active_syncs (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     repo_full_name VARCHAR(512) NOT NULL,
-    session_id VARCHAR(36) NOT NULL,
-    owner_id VARCHAR(36) NOT NULL,
+    session_id BINARY(16) NOT NULL,
+    owner_id BINARY(16) NOT NULL,
     scope_json TEXT NOT NULL,
     since VARCHAR(64),
     updated_at VARCHAR(64) NOT NULL,

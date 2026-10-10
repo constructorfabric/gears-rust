@@ -325,6 +325,10 @@ pub struct ReviewComment {
     pub subject_type: Option<String>,
     /// The review this inline comment belongs to, when it belongs to one.
     pub pull_request_review_id: Option<i64>,
+    /// Code lines above and below the commented line, cut from `diff_hunk`
+    /// when the sync asked for them; otherwise `None`.
+    pub snippet_before: Option<String>,
+    pub snippet_after: Option<String>,
 }
 
 /// A mirrored GitHub pull-request review (the verdict object).

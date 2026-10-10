@@ -1,0 +1,46 @@
+[server]
+home_dir = "~/.github-mirror"
+
+[cli]
+database_placement = "per_repo"
+
+[database.servers.sqlite]
+engine = "sqlite"
+
+[database.servers.sqlite.params]
+WAL = "true"
+synchronous = "NORMAL"
+busy_timeout = "5000"
+
+[gears.api-gateway.config]
+bind_addr = "127.0.0.1:0"
+enable_docs = false
+cors_enabled = false
+auth_disabled = true
+
+[gears.tenant-resolver.config]
+vendor = "constructorfabric"
+
+[gears.credstore.database]
+server = "sqlite"
+file = "credstore.db"
+
+[gears.credstore.config]
+vendor = "constructorfabric"
+
+[gears.static-credstore-plugin.config]
+secrets = []
+
+[gears.github-mirror.database]
+server = "sqlite"
+file = "github_mirror.db"
+
+[gears.github-mirror.config]
+api_base_url = "https://api.github.com"
+max_concurrent_syncs = 1
+max_concurrent_tasks = 4
+max_concurrent_requests = 4
+
+[gears.github-mirror.config.github_token_secret]
+tenant_id = "00000000-df51-5b42-9538-d2b56b7ee953"
+key = "github-token"

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 
 use strum::IntoEnumIterator;
 
@@ -18,6 +19,58 @@ use crate::domain::repo::{
     WorkflowRunRecord,
 };
 use crate::domain::scope::ScopeConfig;
+use crate::domain::sync::telemetry::SessionTelemetry;
+
+pub const SHARED_CACHE_PARTITION: uuid::Uuid = uuid::Uuid::nil();
+
+/// How much of a sync ignores what earlier runs stored (PRD §5.2 force mode).
+#[domain_model]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ForceMode {
+    /// Watermarks, fingerprints and cached responses all apply.
+    #[default]
+    None,
+    /// Walk every listing and refine every entity, but still send cached
+    /// validators so unchanged pages cost no rate-limit units (`--force-full`).
+    Full,
+    /// `Full`, and fetch every page afresh with no cached validator (`--force`).
+    All,
+}
+
+impl ForceMode {
+    #[must_use]
+    pub fn from_flags(force: bool, force_full: bool) -> Self {
+        if force {
+            Self::All
+        } else if force_full {
+            Self::Full
+        } else {
+            Self::None
+        }
+    }
+
+    #[must_use]
+    pub fn refetches_all(self) -> bool {
+        self != Self::None
+    }
+
+    #[must_use]
+    pub fn skips_cache(self) -> bool {
+        self == Self::All
+    }
+}
+
+/// One GitHub rate-limit pool, as `GET /rate_limit` reports it.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RateLimitQuota {
+    /// `core`, `graphql`, `search`, and whatever else GitHub lists.
+    pub resource: String,
+    pub limit: u64,
+    pub remaining: u64,
+    pub used: u64,
+    pub reset_at: Option<DateTime<Utc>>,
+}
 
 /// Everything one fetch needs beyond the repository's name.
 #[domain_model]
@@ -28,9 +81,7 @@ pub struct FetchOptions {
     pub access_scope: AccessScope,
     /// Which object types and sub-resources to collect.
     pub scope: ScopeConfig,
-    /// Ignore any cached validator and re-fetch everything (PRD §5.2 force
-    /// mode). Fresh responses are still written back to the cache.
-    pub force: bool,
+    pub force: ForceMode,
     /// Oldest closed issue or pull request worth collecting (PRD &sect;5.4
     /// `--since`); open ones are always collected.
     pub since: Option<DateTime<Utc>>,
@@ -38,6 +89,11 @@ pub struct FetchOptions {
     /// both end as soon as it fires, so a shutdown does not wait out a
     /// rate-limit cooldown.
     pub cancel: CancellationToken,
+    pub telemetry: Arc<SessionTelemetry>,
+    pub public_repo: Arc<OnceLock<bool>>,
+    /// Tasks in flight inside this run, when the caller narrows the gear's
+    /// `max_concurrent_tasks` for it.
+    pub max_concurrent_tasks: Option<std::num::NonZeroUsize>,
 }
 
 /// A top-level listing the sync can reconcile deletions for.
@@ -426,8 +482,39 @@ pub trait GithubPort: Send + Sync {
     async fn clear_cache(
         &self,
         scope: &AccessScope,
+        tenant_id: uuid::Uuid,
         owner: &str,
         name: Option<&str>,
         repo_ids: &[i64],
     ) -> Result<u64, DomainError>;
+
+    /// # Errors
+    /// Storage failures.
+    async fn expire_cache(
+        &self,
+        scope: &AccessScope,
+        tenant_id: uuid::Uuid,
+        fetched_before: DateTime<Utc>,
+    ) -> Result<u64, DomainError>;
+
+    /// Bytes the cache holds for one `owner/name` repository, matched exactly
+    /// as `clear_cache` matches, so `status` can show what a clear would free.
+    ///
+    /// # Errors
+    /// Storage failures.
+    async fn cache_size(
+        &self,
+        scope: &AccessScope,
+        tenant_id: uuid::Uuid,
+        owner: &str,
+        name: &str,
+        repo_ids: &[i64],
+    ) -> Result<u64, DomainError>;
+
+    /// The token's quotas on every GitHub pool, `core` and `graphql` first,
+    /// read live from `GET /rate_limit`, which GitHub does not charge for.
+    ///
+    /// # Errors
+    /// `Internal` when GitHub cannot be reached or answers something else.
+    async fn rate_limit(&self) -> Result<Vec<RateLimitQuota>, DomainError>;
 }

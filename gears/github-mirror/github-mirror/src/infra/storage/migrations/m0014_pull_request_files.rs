@@ -31,10 +31,10 @@ CREATE TABLE IF NOT EXISTS gm_pull_request_files (
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_pull_request_files (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     repo_id BIGINT NOT NULL,
     pull_number BIGINT NOT NULL,
-    filename VARCHAR(768) NOT NULL,
+    filename VARCHAR(728) NOT NULL,
     status VARCHAR(32) NOT NULL,
     additions BIGINT NOT NULL,
     deletions BIGINT NOT NULL,

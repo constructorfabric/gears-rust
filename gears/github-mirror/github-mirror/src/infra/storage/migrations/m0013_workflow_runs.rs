@@ -39,7 +39,7 @@ CREATE INDEX IF NOT EXISTS idx_gm_workflow_runs_tenant_repo
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_workflow_runs (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     id BIGINT NOT NULL,
     repo_id BIGINT NOT NULL,
     workflow_id BIGINT NOT NULL,

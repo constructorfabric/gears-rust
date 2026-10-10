@@ -28,14 +28,15 @@ use github_mirror::infra::storage::sea_orm_repo::{
     SeaOrmActiveSyncRepository, SeaOrmBranchRepository, SeaOrmCheckRunRepository,
     SeaOrmCommentRepository, SeaOrmCommitCommentRepository, SeaOrmCommitFileRepository,
     SeaOrmCommitRepository, SeaOrmCommitStatusRepository, SeaOrmContributorRepository,
-    SeaOrmDeploymentRepository, SeaOrmEntityFingerprintRepository, SeaOrmIssueEventRepository,
-    SeaOrmIssueReactionRepository, SeaOrmIssueRepository, SeaOrmIssueTimelineRepository,
-    SeaOrmLabelRepository, SeaOrmMilestoneRepository, SeaOrmPullRequestCommitRepository,
-    SeaOrmPullRequestFileRepository, SeaOrmPullRequestRepository, SeaOrmReleaseRepository,
-    SeaOrmRepoRepository, SeaOrmRepoSyncStatusRepository, SeaOrmReviewCommentRepository,
-    SeaOrmReviewRepository, SeaOrmReviewThreadRepository, SeaOrmSyncSessionRepository,
-    SeaOrmSyncWatermarkRepository, SeaOrmSyncWriter, SeaOrmTagRepository,
-    SeaOrmWorkflowJobRepository, SeaOrmWorkflowRunRepository,
+    SeaOrmConversationRepository, SeaOrmDeploymentRepository, SeaOrmEntityFingerprintRepository,
+    SeaOrmIssueEventRepository, SeaOrmIssueReactionRepository, SeaOrmIssueRepository,
+    SeaOrmIssueTimelineRepository, SeaOrmLabelRepository, SeaOrmMilestoneRepository,
+    SeaOrmPullRequestCommitRepository, SeaOrmPullRequestFileRepository,
+    SeaOrmPullRequestRepository, SeaOrmReleaseRepository, SeaOrmRepoRepository,
+    SeaOrmRepoSyncStatusRepository, SeaOrmReviewCommentRepository, SeaOrmReviewRepository,
+    SeaOrmReviewThreadRepository, SeaOrmSyncSessionRepository, SeaOrmSyncWatermarkRepository,
+    SeaOrmSyncWriter, SeaOrmTagRepository, SeaOrmWorkflowJobRepository,
+    SeaOrmWorkflowRunRepository,
 };
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::{ClientHub, ConfigProvider, GearCtx};
@@ -405,11 +406,38 @@ impl GithubPort for FakeGithub {
     async fn clear_cache(
         &self,
         _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
         _owner: &str,
         _name: Option<&str>,
         _repo_ids: &[i64],
     ) -> Result<u64, DomainError> {
         Ok(0)
+    }
+
+    async fn expire_cache(
+        &self,
+        _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
+        _fetched_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, DomainError> {
+        Ok(0)
+    }
+
+    async fn cache_size(
+        &self,
+        _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
+        _owner: &str,
+        _name: &str,
+        _repo_ids: &[i64],
+    ) -> Result<u64, DomainError> {
+        Ok(0)
+    }
+
+    async fn rate_limit(
+        &self,
+    ) -> Result<Vec<github_mirror::domain::ports::github::RateLimitQuota>, DomainError> {
+        Ok(Vec::new())
     }
 }
 
@@ -421,15 +449,47 @@ pub async fn inmem_db() -> Db {
         min_conns: Some(1),
         ..Default::default()
     };
-    let db = connect_db("sqlite::memory:", opts)
+    #[cfg(feature = "integration")]
+    let url = match std::env::var("GM_TEST_DATABASE_URL") {
+        Ok(server) => fresh_database_on(&server).await,
+        Err(_) => SQLITE_MEMORY.to_owned(),
+    };
+    #[cfg(not(feature = "integration"))]
+    let url = SQLITE_MEMORY.to_owned();
+    let db = connect_db(&url, opts)
         .await
-        .unwrap_or_else(|e| panic!("in-memory database must connect: {e}"));
+        .unwrap_or_else(|e| panic!("the test database must connect: {e}"));
 
     run_migrations_for_testing(&db, Migrator::migrations())
         .await
         .unwrap_or_else(|e| panic!("migrations must apply: {e}"));
 
     db
+}
+
+const SQLITE_MEMORY: &str = "sqlite::memory:";
+
+#[cfg(feature = "integration")]
+async fn fresh_database_on(server: &str) -> String {
+    use sea_orm::ConnectionTrait;
+
+    let name = format!("gm_test_{}", uuid::Uuid::new_v4().simple());
+    let admin = sea_orm::Database::connect(server)
+        .await
+        .unwrap_or_else(|e| panic!("GM_TEST_DATABASE_URL must connect: {e}"));
+    admin
+        .execute_unprepared(&format!("CREATE DATABASE {name}"))
+        .await
+        .unwrap_or_else(|e| panic!("the test database {name} must be created: {e}"));
+    admin
+        .close()
+        .await
+        .unwrap_or_else(|e| panic!("the server connection must close: {e}"));
+
+    let mut url = url::Url::parse(server)
+        .unwrap_or_else(|e| panic!("GM_TEST_DATABASE_URL is not a URL: {e}"));
+    url.set_path(&format!("/{name}"));
+    url.to_string()
 }
 
 pub fn enforcer() -> PolicyEnforcer {
@@ -493,6 +553,7 @@ pub fn service_with_deadline(
         Arc::new(SeaOrmTagRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmCommitFileRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmReviewThreadRepository::new(Arc::clone(&db))),
+        Arc::new(SeaOrmConversationRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmCommitCommentRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmIssueEventRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmDeploymentRepository::new(Arc::clone(&db))),
@@ -516,7 +577,11 @@ pub fn service_with_deadline(
             max_concurrent_syncs: std::num::NonZeroUsize::MIN,
             max_concurrent_tasks: std::num::NonZeroUsize::MIN,
             sync_deadline,
+            telemetry_dir: None,
+            cache_max_age_days: None,
+            tenant_cache_max_age_days: std::collections::HashMap::new(),
         },
+        std::sync::Arc::new(github_mirror::infra::telemetry_sink::JsonlTelemetrySink),
     ))
 }
 
@@ -752,6 +817,8 @@ pub fn fetched_repository() -> FetchedRepository {
             side: Some("RIGHT".to_owned()),
             start_side: None,
             subject_type: Some("line".to_owned()),
+            snippet_before: None,
+            snippet_after: None,
         }],
         reviews: vec![ReviewRecord {
             id: 31,

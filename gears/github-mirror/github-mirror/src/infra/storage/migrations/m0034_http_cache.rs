@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS gm_http_cache (
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_http_cache (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     cache_key VARCHAR(64) NOT NULL,
     url TEXT NOT NULL,
     status INT NOT NULL,

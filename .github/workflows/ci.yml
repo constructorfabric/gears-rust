@@ -60,6 +60,7 @@ jobs:
       magika: ${{ steps.filter.outputs.magika }}
       onnx_embedding: ${{ steps.filter.outputs.onnx_embedding }}
       graph_storage: ${{ steps.filter.outputs.graph_storage }}
+      github_mirror: ${{ steps.filter.outputs.github_mirror }}
       dylint: ${{ steps.filter.outputs.dylint }}
       deps:   ${{ steps.filter.outputs.deps }}
       ci:     ${{ steps.filter.outputs.ci }}
@@ -103,6 +104,8 @@ jobs:
               - 'gears/graph-storage/graph-storage/**'
             graph_storage:
               - 'gears/graph-storage/**'
+            github_mirror:
+              - 'gears/github-mirror/**'
             dylint:
               - 'tools/dylint_lints/**'
             deps:
@@ -405,6 +408,12 @@ jobs:
           SETTINGS_SERVICE_PG_REQUIRE_DOCKER: "1"
         run: make test-settings-service-pg
 
+      - name: Test github-mirror (PostgreSQL and MariaDB, integration)
+        run: make test-github-mirror-db
+
+      - name: Test github-mirror (110k-entity interrupt and resume)
+        run: make test-github-mirror-scale
+
       # bss-pricing's Postgres tests are `#[ignore]`d behind Docker and ran in
       # no job until 2026-08-11 — every concurrency and trigger proof the crate
       # owns lives in them. This job already has Docker. The target passes
@@ -701,6 +710,71 @@ jobs:
           use_oidc: ${{ github.event_name != 'pull_request' }}
           files: lcov.info
           flags: graph-storage
+          disable_search: true
+          fail_ci_if_error: ${{ github.event_name != 'pull_request' }}
+
+  test-github-mirror-coverage:
+    name: github-mirror (coverage floor)
+    needs: changes
+    if: >-
+      !cancelled()
+      && (needs.changes.result != 'success'
+      || needs.changes.outputs.github_mirror == 'true'
+      || needs.changes.outputs.deps == 'true'
+      || needs.changes.outputs.ci == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain (with llvm-tools)
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
+          components: llvm-tools-preview
+
+      - name: Pin nightly for all cargo commands
+        run: echo "RUSTUP_TOOLCHAIN=${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+
+      - name: Install cargo-llvm-cov and nextest
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-llvm-cov, nextest
+
+      - name: Test and enforce the coverage floor
+        timeout-minutes: 30
+        env:
+          RUSTFLAGS: "-C debuginfo=0 --cfg coverage_nightly"
+          CARGO_LLVM_COV_TARGET_DIR: llvm-cov-target
+          CARGO_LLVM_COV_BUILD_DIR: llvm-cov-build
+        run: |
+          cargo llvm-cov nextest             -p cf-gears-github-mirror             --lcov --output-path lcov.info --fail-under-lines 85
+
+      - name: Upload to Codecov
+        if: always()
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          use_oidc: ${{ github.event_name != 'pull_request' }}
+          files: lcov.info
+          flags: github-mirror
           disable_search: true
           fail_ci_if_error: ${{ github.event_name != 'pull_request' }}
 

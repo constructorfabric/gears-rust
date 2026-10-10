@@ -19,15 +19,21 @@ name = "github_mirror"
 [lints]
 workspace = true
 
+[features]
+integration = ["toolkit-db/pg", "toolkit-db/mysql"]
+
 [dependencies]
 github-mirror-sdk = { package = "cf-gears-github-mirror-sdk", version = "0.1.0", path = "../github-mirror-sdk" }
 
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
+credstore-sdk = { workspace = true }
+credstore = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+opentelemetry = { workspace = true }
 inventory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -60,6 +66,8 @@ url = { workspace = true }
 
 [dev-dependencies]
 httpmock = { workspace = true }
+tempfile = { workspace = true }
+credstore-sdk = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
@@ -68,3 +76,4 @@ uuid = { workspace = true }
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-security = { workspace = true }
 async-trait = { workspace = true }
+tracing-subscriber = { workspace = true }

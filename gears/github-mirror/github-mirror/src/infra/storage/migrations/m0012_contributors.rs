@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS gm_contributors (
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_contributors (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     repo_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     login VARCHAR(255) NOT NULL,

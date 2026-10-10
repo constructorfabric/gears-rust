@@ -34,7 +34,7 @@ CREATE INDEX IF NOT EXISTS idx_gm_commit_comments_tenant_repo_sha
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_commit_comments (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     id BIGINT NOT NULL,
     repo_id BIGINT NOT NULL,
     commit_sha VARCHAR(64) NOT NULL,

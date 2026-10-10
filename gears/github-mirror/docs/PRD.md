@@ -99,7 +99,6 @@ A full local mirror that synchronizes incrementally with GitHub, serves a GitHub
 | Task Graph | A directed acyclic graph of synchronization tasks with priority ordering and dependency edges, enabling breadth-first list completion before deep refinement |
 | Refinement | A second-pass synchronization that fills missing details, refreshes stale objects, or repairs failed pages for entities already discovered during the initial fetch |
 | Secondary Rate Limit | An additional GitHub throttle applied when the server detects excessive concurrency or request volume beyond the primary per-token limit |
-| Hybrid Cache | A caching mode that stores raw JSON on the filesystem and normalized entities in a relational database simultaneously |
 | Derived Contributor | A person record deduced from embedded user objects already present in synchronized entities — built during normalization with no additional API calls |
 | Token Pool | A set of GitHub PATs managed by the gear to distribute API requests across multiple tokens, effectively multiplying the available rate-limit budget |
 | Write-Back Operation | A queued mutation (merge PR, post comment, etc.) that the mirror enqueues locally and executes against GitHub when API capacity is available |
@@ -202,7 +201,7 @@ A full local mirror that synchronizes incrementally with GitHub, serves a GitHub
 - Multi-tenancy and access control for both HTTP server and CLI tool
 - Token pool management for distributing API requests across multiple PATs
 - TOML-based configuration for all synchronization, caching, storage, API, and logging options
-- Persistency layer to be implemented as plugins - Filesystem only, DB, hybrid
+- Persistency layer to be implemented as plugins - Filesystem only, DB
 - In-memory task orchestration with priority queue, deduplication, and idempotent tasks
 - ETag and Last-Modified conditional request support
 - Per-endpoint stale TTLs with entity-state-aware refresh policies
@@ -475,7 +474,7 @@ The system **MUST** support PostgreSQL, MariaDB, and SQLite as database backends
 
 - [ ] `p1` - **ID**: `cpt-cf-github-mirror-fr-persistence-plugins`
 
-The persistence layer **MUST** be implemented as plugins with at least three built-in modes: filesystem-only (raw responses on disk, suitable for CLI), database-only (all data in DB, no filesystem dependency, suitable for REST API service), and hybrid (filesystem + database). The gear **MUST** be fully functional without any filesystem access when using the database-only plugin.
+The persistence layer **MUST** be implemented as plugins with at least two built-in modes: filesystem-only (raw responses on disk, suitable for CLI) and database-only (all data in DB, no filesystem dependency, suitable for REST API service). The gear **MUST** be fully functional without any filesystem access when using the database-only plugin.
 
 - **Rationale**: The CLI tool benefits from filesystem caching for manual inspection, while the REST API service deployment should avoid filesystem dependencies for containerized and ephemeral environments.
 - **Actors**: `cpt-cf-github-mirror-actor-lib-consumer`, `cpt-cf-github-mirror-actor-platform-admin`
@@ -710,6 +709,7 @@ The system **MUST** emit structured logs via `tracing`, organized into independe
 - Cache keys **MUST NOT** embed credentials; the canonical key is derived from method, URL and `Accept` (DESIGN §3.5).
 - **Production defaults MUST be `info`** with bodies and bind values off. A deployment raising verbosity beyond `debug` **MUST** be a deliberate, temporary act.
 - Log **retention MUST be bounded** by the platform's own log policy; the gear **MUST NOT** write logs to its own files outside the runtime's logging configuration, so that policy is the single place retention is enforced.
+- The one exception is the telemetry file of `cpt-cf-github-mirror-fr-telemetry`: it is written only when the operator sets its path, holds request metadata only (method, URL without query string, status, size, duration, rate-limit and cache fields, never bodies or headers), and its retention is the operator's.
 
 - **Rationale**: Layered logging lets operators dial in the right verbosity for their use case, but the mirror's `trace` layer would otherwise carry private repository content and personal data into whatever collects logs.
 - **Actors**: `cpt-cf-github-mirror-actor-lib-consumer`, `cpt-cf-github-mirror-actor-cli-operator`
@@ -744,14 +744,9 @@ The library **MUST** collect structured telemetry per synchronization session an
 - Overall progress: tasks pending/running/completed/failed, entities indexed/refined/skipped, queue depth snapshots
 - Session summary: total API calls, total 304s, bytes downloaded/saved, cache hit ratio, elapsed time, final report
 
-Telemetry **MUST** leave the gear in two ways, and the gear **MUST NOT** write telemetry files of its own (see `cpt-cf-github-mirror-fr-log-redaction`):
+The library **MUST** support writing telemetry to a caller-specified file (append-only, JSON Lines) and **MUST** expose telemetry via the public API so that the CLI tool can print it and the REST API service can attach it to synchronization job status responses.
 
-- **Process-wide metrics** through the platform's OpenTelemetry meter provider: request counts by method, status and outcome (fresh, not modified, rate limited, failed), request duration, response bytes and rate-limit headroom. Metric labels **MUST** stay low-cardinality: URLs, repository names, tenant ids and session ids **MUST NOT** be labels. Per-request detail such as the URL and the ETag used goes to `debug` logs instead.
-- **Per-session totals** stored with the synchronization session and returned by the session status API (`GET /github-mirror/v1/sessions/{id}`) and the SDK: REST calls, GraphQL calls and points, 304s, bytes downloaded and saved, cache hit ratio, rate-limit waits and failed requests. They **MUST** be updated while the run is in flight, not only when it ends.
-
-The CLI tool, when it exists, prints the per-session totals from the same API.
-
-- **Rationale**: Telemetry is essential for cost analysis, diagnostics, and optimization. Gears push telemetry over OTLP only and expose no scrape endpoint or telemetry file (`docs/TRACING_SETUP.md`), and job-level numbers live on the job, as in the other gears; a caller-specified JSON Lines file is therefore left out.
+- **Rationale**: Telemetry is essential for cost analysis, diagnostics, and optimization. Programmatic access enables both CLI rendering and REST API job status enrichment.
 - **Actors**: `cpt-cf-github-mirror-actor-lib-consumer`, `cpt-cf-github-mirror-actor-cli-operator`, `cpt-cf-github-mirror-actor-api-consumer`
 
 ### 5.17 Environment Independence
@@ -1019,7 +1014,7 @@ The mirror is a replica of personal data: every contributor row is a person, and
 
 - **Type**: Rust trait
 - **Stability**: unstable (pre-1.0)
-- **Description**: Async trait defining visibility-aware `get`, validator-only `peek`, `put`, and metadata operations for cache backends. Public repositories use shared org/repo/request cache keys; private or visibility-unknown repositories use tenant-scoped cache keys. Implemented by filesystem, database, hybrid, and plugin cache modules.
+- **Description**: Async trait defining visibility-aware `get`, validator-only `peek`, `put`, and metadata operations for cache backends. Public repositories use shared org/repo/request cache keys; private or visibility-unknown repositories use tenant-scoped cache keys. Implemented by filesystem, database, and plugin cache modules.
 - **Breaking Change Policy**: Semver; trait changes are breaking.
 
 #### MetadataStore Trait

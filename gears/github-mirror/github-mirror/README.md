@@ -31,10 +31,11 @@ follow-up work — see the PRD's "Increment scope" section.
 ## Quickstart
 
 Run the example server with the gear's dev config (set `GITHUB_TOKEN` to sync private
-repositories or to get authenticated rate limits):
+repositories or to get authenticated rate limits; the dev config hands it to the static
+credential-store plugin, and the gear reads it from there):
 
 ```bash
-cargo run --bin cf-gears-example-server -- --config config/github-mirror-dev.yaml run
+cargo run --bin cf-gears-example-server --features github-mirror,static-tenants,static-authz,static-credstore -- --config config/github-mirror-dev.yaml run
 ```
 
 That config sets no gateway `prefix_path`, so routes are served at the root
@@ -72,16 +73,20 @@ gears:
   github-mirror:
     config:
       api_base_url: https://api.github.com
-      github_token: "${GITHUB_TOKEN}"
+      github_token_secret:
+        tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+        key: "github-token"
 ```
 
-All keys are optional — `api_base_url` falls back to the public GitHub API and an unset
-token syncs unauthenticated (public repositories only, at GitHub's anonymous rate limit).
+All keys are optional — `api_base_url` falls back to the public GitHub API and without
+`github_token_secret` the gear syncs unauthenticated (public repositories only, at
+GitHub's anonymous rate limit).
 
-`github_token` is a single gear-wide credential: every tenant's sync currently
-authenticates to GitHub with it. This is an interim shortcut until credstore-backed
-per-tenant credentials land (gears-rust#4534); don't point one deployment's token at
-repositories whose visibility should differ per tenant.
+`github_token_secret` names a secret in the credential store (`credstore` gear): the
+gear reads it once at init, so a replaced token takes effect after a restart. It is a
+single gear-wide credential: every tenant's sync authenticates to GitHub with it, so
+don't point one deployment's token at repositories whose visibility should differ per
+tenant.
 
 ## Documentation
 

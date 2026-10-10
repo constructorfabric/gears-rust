@@ -224,7 +224,7 @@ async fn a_restart_closes_out_sessions_left_in_flight() {
         .await
         .expect("the session must write");
     sessions
-        .record_heartbeat(&scope, id, 0, &long_ago)
+        .record_heartbeat(&scope, id, 0, "{}", &long_ago)
         .await
         .expect("the heartbeat must write");
 
@@ -442,6 +442,7 @@ async fn sessions_and_run_statuses_page_past_the_first_page() {
                     progress_percent: 100,
                     error: None,
                     summary_json: None,
+                    telemetry_json: None,
                     created_at: format!("2026-09-0{n}T00:00:00Z"),
                     started_at: None,
                     ended_at: None,

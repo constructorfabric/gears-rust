@@ -18193,6 +18193,19 @@
               "null"
             ]
           },
+          "snippet_after": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "snippet_before": {
+            "description": "Code lines above and below the commented line, when the sync kept them.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "start_line": {
             "format": "int64",
             "type": [
@@ -18695,6 +18708,126 @@
           "interrupted"
         ],
         "type": "string"
+      },
+      "SessionTelemetryDto": {
+        "properties": {
+          "bytes_downloaded": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bytes_saved": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cache_hit_ratio": {
+            "format": "double",
+            "type": "number"
+          },
+          "entities_indexed": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "entities_refined": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "entities_skipped": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "failed": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fresh": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "graphql_calls": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "graphql_points": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "not_modified": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rate_limit_wait_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rate_limit_waits": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rate_limited": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rest_calls": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tasks_done": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tasks_failed": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tasks_pending": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tasks_running": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rest_calls",
+          "graphql_calls",
+          "fresh",
+          "not_modified",
+          "rate_limited",
+          "failed",
+          "bytes_downloaded",
+          "bytes_saved",
+          "rate_limit_waits",
+          "rate_limit_wait_ms",
+          "graphql_points",
+          "cache_hit_ratio",
+          "tasks_pending",
+          "tasks_running",
+          "tasks_done",
+          "tasks_failed",
+          "entities_indexed",
+          "entities_refined",
+          "entities_skipped"
+        ],
+        "type": "object"
       },
       "SetDualControlPolicyRequest": {
         "description": "A new dual-control threshold policy version to write (DC8). `effective_from`\ndefaults to now when omitted; out-of-range D2/A6/TTL is rejected (409, no clamp).",
@@ -20149,6 +20282,16 @@
           "summary_unreadable": {
             "description": "True when the run completed but its stored summary could not be read,\nso `summary` is empty for a reason other than \"not finished yet\".",
             "type": "boolean"
+          },
+          "telemetry": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SessionTelemetryDto"
+              }
+            ]
           },
           "updated_at": {
             "description": "Re-stamped by every write, the progress heartbeat included, so a\npoller can tell a live run from a stuck one.",
@@ -52571,6 +52714,15 @@
             }
           },
           {
+            "description": "Walk every listing and refine every entity, keeping the HTTP cache",
+            "in": "query",
+            "name": "force_full",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "description": "Comma-separated object types to collect, e.g. `issues,pull_requests`",
             "in": "query",
             "name": "include",
@@ -52999,6 +53151,15 @@
             "description": "Bypass the HTTP cache and re-fetch everything",
             "in": "query",
             "name": "force",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Walk every listing and refine every entity, keeping the HTTP cache",
+            "in": "query",
+            "name": "force_full",
             "required": false,
             "schema": {
               "type": "boolean"

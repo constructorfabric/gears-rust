@@ -81,6 +81,12 @@ pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
             "Bypass the HTTP cache and re-fetch everything",
             "boolean",
         )
+        .query_param_typed(
+            "force_full",
+            false,
+            "Walk every listing and refine every entity, keeping the HTTP cache",
+            "boolean",
+        )
         .query_param(
             "include",
             false,
@@ -156,6 +162,12 @@ pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
         .require_license_features::<License>([])
         .query_param("repo", false, "Resume only this `owner/name` repository")
         .query_param_typed("force", false, "Bypass the HTTP cache and re-fetch everything", "boolean")
+        .query_param_typed(
+            "force_full",
+            false,
+            "Walk every listing and refine every entity, keeping the HTTP cache",
+            "boolean",
+        )
         .handler(handlers::resume_syncs)
         .json_response_with_schema::<dto::ResumeAcceptedDto>(
             openapi,

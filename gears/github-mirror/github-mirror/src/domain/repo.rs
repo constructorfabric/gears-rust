@@ -114,6 +114,11 @@ pub struct IssueRecord {
 pub struct PageWindow {
     limit: u64,
     offset: u64,
+    /// Keep only rows a sync wrote at or after this instant.
+    extracted_since: Option<DateTime<Utc>>,
+    /// Keep only rows GitHub last changed at or after this instant, by the
+    /// entity's own stamp; entities without one ignore it.
+    updated_since: Option<DateTime<Utc>>,
 }
 
 impl PageWindow {
@@ -166,7 +171,12 @@ impl PageWindow {
                 ),
             });
         }
-        Ok(Self { limit, offset })
+        Ok(Self {
+            limit,
+            offset,
+            extracted_since: None,
+            updated_since: None,
+        })
     }
 
     /// The first `limit` rows, clamped to [`Self::MAX_LIMIT`].
@@ -183,6 +193,8 @@ impl PageWindow {
                 limit
             },
             offset: 0,
+            extracted_since: None,
+            updated_since: None,
         }
     }
 
@@ -196,6 +208,28 @@ impl PageWindow {
     #[must_use]
     pub const fn offset(self) -> u64 {
         self.offset
+    }
+
+    #[must_use]
+    pub const fn with_extracted_since(mut self, since: Option<DateTime<Utc>>) -> Self {
+        self.extracted_since = since;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_updated_since(mut self, since: Option<DateTime<Utc>>) -> Self {
+        self.updated_since = since;
+        self
+    }
+
+    #[must_use]
+    pub const fn extracted_since(self) -> Option<DateTime<Utc>> {
+        self.extracted_since
+    }
+
+    #[must_use]
+    pub const fn updated_since(self) -> Option<DateTime<Utc>> {
+        self.updated_since
     }
 }
 
@@ -635,6 +669,10 @@ pub struct ReviewCommentRecord {
     pub subject_type: Option<String>,
     /// The review this inline comment belongs to, when it belongs to one.
     pub pull_request_review_id: Option<i64>,
+    /// Code lines above and below the commented line, cut from `diff_hunk`
+    /// when the sync's `inline_comment_snippets` asks for them.
+    pub snippet_before: Option<String>,
+    pub snippet_after: Option<String>,
 }
 
 #[async_trait]
@@ -1168,6 +1206,7 @@ pub trait ReviewThreadRepository: Send + Sync {
         repo_id: i64,
         pull_number: i64,
         query: &ODataQuery,
+        extracted_since: Option<DateTime<Utc>>,
     ) -> Result<Page<ReviewThread>, DomainError>;
 }
 
@@ -1615,6 +1654,7 @@ pub struct SyncSessionRecord {
     pub progress_percent: i32,
     pub error: Option<String>,
     pub summary_json: Option<String>,
+    pub telemetry_json: Option<String>,
     pub created_at: String,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
@@ -1636,13 +1676,15 @@ pub trait SyncSessionRepository: Send + Sync {
         id: Uuid,
     ) -> Result<Option<SyncSessionRecord>, DomainError>;
 
-    /// The heartbeat's write: `progress_percent` and `updated_at` only, so a
-    /// tick never overwrites the rest of the row with a stale copy.
+    /// The heartbeat's write: `progress_percent`, `telemetry_json` and
+    /// `updated_at` only, so a tick never overwrites the rest of the row with
+    /// a stale copy.
     async fn record_heartbeat(
         &self,
         scope: &AccessScope,
         id: Uuid,
         progress_percent: i32,
+        telemetry_json: &str,
         updated_at: &str,
     ) -> Result<(), DomainError>;
 
@@ -1888,6 +1930,20 @@ pub trait SyncWriter: Send + Sync {
         jobs: Vec<WorkflowJobRecord>,
     ) -> Result<(), DomainError>;
 
+    /// Remove everything the mirror holds about one repository: every mirrored
+    /// entity, the change-detection state, the run status and sessions, and
+    /// the repository row itself, in one transaction. Returns how many rows
+    /// went.
+    ///
+    /// # Errors
+    /// Storage failures.
+    async fn delete_repository(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        repo_full_name: &str,
+    ) -> Result<u64, DomainError>;
+
     /// Merge the people one run met into `gm_contributors`, unioning roles
     /// with what earlier runs stored; returns how many rows were written.
     ///
@@ -1910,4 +1966,161 @@ pub trait SyncWriter: Send + Sync {
         complete: &ListingCompleteness,
         watermark: DateTime<Utc>,
     ) -> Result<u64, DomainError>;
+}
+
+/// One conversation the grouping pass derived (`domain::sync::conversations`):
+/// an inline review-comment reply chain (`conv_type` `inline`, always under a
+/// pull request) or top-level comments tied together by quoting (`toplevel`,
+/// under an issue or a pull request). `root_comment_id` is the comment that
+/// opened it and the value every member carries as `conversation_id`.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LogicalConversation {
+    pub repo_id: i64,
+    pub conv_type: String,
+    pub root_comment_id: i64,
+    pub parent_kind: String,
+    pub parent_number: i64,
+    pub comment_count: i64,
+    pub is_resolved: Option<bool>,
+    pub created_at: Option<String>,
+}
+
+/// A top-level comment as the grouping pass reads it.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentForGrouping {
+    pub id: i64,
+    pub issue_number: i64,
+    pub body: Option<String>,
+    pub created_at: String,
+    pub conversation_id: Option<i64>,
+}
+
+/// A review comment as the grouping pass reads it.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCommentForGrouping {
+    pub id: i64,
+    pub pull_number: i64,
+    pub in_reply_to_id: Option<i64>,
+    pub created_at: String,
+    pub conversation_id: Option<i64>,
+}
+
+/// A review thread as the grouping pass reads it, to pair an inline
+/// conversation with GitHub's resolution flag.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewThreadForGrouping {
+    pub id: String,
+    pub pull_number: i64,
+    pub is_resolved: bool,
+    pub comments_count: i64,
+}
+
+/// The comments of one conversation: review comments for an `inline` one,
+/// issue or pull-request comments for a `toplevel` one.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConversationComments {
+    pub comments: Vec<Comment>,
+    pub review_comments: Vec<ReviewComment>,
+}
+
+#[async_trait]
+pub trait ConversationRepository: Send + Sync {
+    async fn pull_numbers(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+    ) -> Result<Vec<i64>, DomainError>;
+
+    /// Top-level comments of the whole repository (`None`) or of the issues
+    /// and pull requests listed.
+    async fn comments_for_grouping(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        issue_numbers: Option<&[i64]>,
+    ) -> Result<Vec<CommentForGrouping>, DomainError>;
+
+    async fn review_comments_for_grouping(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        pull_numbers: Option<&[i64]>,
+    ) -> Result<Vec<ReviewCommentForGrouping>, DomainError>;
+
+    async fn review_threads_for_grouping(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        pull_numbers: Option<&[i64]>,
+    ) -> Result<Vec<ReviewThreadForGrouping>, DomainError>;
+
+    /// Issues and pull requests with a top-level comment a sync wrote at or
+    /// after `since`.
+    async fn issues_with_comments_since(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<i64>, DomainError>;
+
+    /// Pull requests with a review comment a sync wrote at or after `since`.
+    async fn pulls_with_review_comments_since(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<i64>, DomainError>;
+
+    /// Every conversation of the repository, or those under one issue or
+    /// pull-request number, ordered by parent, type and root.
+    async fn list(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        parent_number: Option<i64>,
+    ) -> Result<Vec<LogicalConversation>, DomainError>;
+
+    async fn upsert(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: LogicalConversation,
+    ) -> Result<(), DomainError>;
+
+    async fn set_comment_conversation(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        comment_id: i64,
+        conversation_id: Option<i64>,
+    ) -> Result<(), DomainError>;
+
+    async fn set_review_comment_conversation(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        comment_id: i64,
+        conversation_id: Option<i64>,
+    ) -> Result<(), DomainError>;
+
+    /// The top-level comments whose `conversation_id` is `root_comment_id`, oldest first.
+    async fn comments_in(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        root_comment_id: i64,
+    ) -> Result<Vec<Comment>, DomainError>;
+
+    /// The review comments whose `conversation_id` is `root_comment_id`, oldest first.
+    async fn review_comments_in(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        root_comment_id: i64,
+    ) -> Result<Vec<ReviewComment>, DomainError>;
 }

@@ -687,7 +687,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-pricing-pg test-coord-pg test-products-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-settings-service-pg test-github-mirror-db test-github-mirror-scale test-pricing-pg test-coord-pg test-products-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -889,6 +889,31 @@ test-rg-pg: install-tools
 ## runs, on the backend it runs it on.
 test-settings-service-pg: install-tools
 	cargo nextest run -p cf-gears-settings-service --features integration --test pg_migrations_test
+
+GM_PG_TAG := $(shell sed -n 's/^pub const POSTGRES_TAG: &str = "\(.*\)";/\1/p' libs/test-containers/src/lib.rs)
+GM_MARIADB_TAG := $(shell sed -n 's/^pub const MARIADB_TAG: &str = "\(.*\)";/\1/p' libs/test-containers/src/lib.rs)
+GM_PG_URL := postgres://postgres:pass@127.0.0.1:55432/postgres
+GM_MARIADB_URL := mysql://root:root@127.0.0.1:53306/mysql
+
+## Run the github-mirror gear's suite on PostgreSQL and MariaDB (Docker required)
+test-github-mirror-db: install-tools
+	$(call print_target_banner)
+	@docker rm -f gm-test-postgres gm-test-mariadb >/dev/null 2>&1 || true
+	docker run -d --name gm-test-postgres -e POSTGRES_PASSWORD=pass -p 55432:5432 postgres:$(GM_PG_TAG)
+	docker run -d --name gm-test-mariadb -e MARIADB_ROOT_PASSWORD=root -p 53306:3306 mariadb:$(GM_MARIADB_TAG)
+	@for i in $$(seq 1 120); do docker exec gm-test-postgres pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break; sleep 1; done; \
+		docker exec gm-test-postgres pg_isready -h 127.0.0.1 -U postgres
+	@for i in $$(seq 1 120); do docker exec gm-test-mariadb mariadb-admin ping -h 127.0.0.1 -uroot -proot >/dev/null 2>&1 && break; sleep 1; done; \
+		docker exec gm-test-mariadb mariadb-admin ping -h 127.0.0.1 -uroot -proot
+	GM_TEST_DATABASE_URL=$(GM_PG_URL) cargo nextest run -p cf-gears-github-mirror --features integration --no-fail-fast; pg=$$?; \
+	GM_TEST_DATABASE_URL=$(GM_MARIADB_URL) cargo nextest run -p cf-gears-github-mirror --features integration --no-fail-fast; maria=$$?; \
+	docker rm -f gm-test-postgres gm-test-mariadb >/dev/null; \
+	test $$pg -eq 0 && test $$maria -eq 0
+
+## Run the github-mirror gear's 110,000-entity interrupt-and-resume test (SQLite, minutes)
+test-github-mirror-scale: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-github-mirror --test scale_resume_test --run-ignored ignored-only
 
 ## Run bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).

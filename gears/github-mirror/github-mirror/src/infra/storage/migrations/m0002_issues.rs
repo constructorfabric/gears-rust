@@ -37,7 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_gm_issues_tenant_repo_state
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_issues (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     id BIGINT NOT NULL,
     repo_id BIGINT NOT NULL,
     number BIGINT NOT NULL,

@@ -47,6 +47,7 @@ fn session_record(id: Uuid, status: SessionStatus, created_at: &str) -> SyncSess
         progress_percent: 0,
         error: None,
         summary_json: None,
+        telemetry_json: None,
         created_at: created_at.to_owned(),
         started_at: None,
         ended_at: None,
@@ -109,6 +110,34 @@ async fn a_session_is_created_updated_and_listed_newest_first() {
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0].id, second, "newest created_at must come first");
     assert_eq!(recent[1].id, first);
+}
+
+#[tokio::test]
+async fn an_upsert_saves_the_new_updated_at() {
+    let db = common::inmem_db().await;
+    let provider = Arc::new(DBProvider::<DbError>::new(db));
+    let ctx = common::caller_in(Uuid::new_v4());
+    let tenant = ctx.subject_tenant_id();
+    let scope = scope_for(&ctx).await;
+    let repo = SeaOrmSyncSessionRepository::new(Arc::clone(&provider));
+    let id = Uuid::new_v4();
+
+    let mut running = session_record(id, SessionStatus::InProgress, "2026-09-25T15:23:28Z");
+    running.updated_at = Some("2026-09-25T16:39:08Z".to_owned());
+    repo.upsert(&scope, tenant, running).await.expect("insert");
+
+    let mut swept = session_record(id, SessionStatus::Interrupted, "2026-09-25T15:23:28Z");
+    swept.ended_at = Some("2026-09-30T14:07:14Z".to_owned());
+    swept.updated_at.clone_from(&swept.ended_at);
+    repo.upsert(&scope, tenant, swept).await.expect("update");
+
+    let loaded = repo
+        .find_by_id(&scope, id)
+        .await
+        .expect("find")
+        .expect("the session must exist");
+    assert_eq!(loaded.updated_at.as_deref(), Some("2026-09-30T14:07:14Z"));
+    assert_eq!(loaded.ended_at, loaded.updated_at);
 }
 
 #[tokio::test]
@@ -267,7 +296,7 @@ async fn a_heartbeat_writes_progress_and_nothing_else() {
         .await
         .expect("the running session must insert");
 
-    repo.record_heartbeat(&scope, id, 40, "2026-08-25T10:00:20Z")
+    repo.record_heartbeat(&scope, id, 40, "{}", "2026-08-25T10:00:20Z")
         .await
         .expect("the heartbeat must write");
 
@@ -322,7 +351,7 @@ async fn a_heartbeat_for_a_session_that_is_not_there_is_an_error() {
     .expect("the real session must insert");
 
     let outcome = repo
-        .record_heartbeat(&scope, Uuid::new_v4(), 40, "2026-08-25T10:00:20Z")
+        .record_heartbeat(&scope, Uuid::new_v4(), 40, "{}", "2026-08-25T10:00:20Z")
         .await;
 
     assert!(

@@ -3,6 +3,7 @@
 mod common;
 
 use github_mirror::domain::ports::github::FetchOptions;
+use github_mirror::domain::ports::github::ForceMode;
 use github_mirror::domain::repo::{
     EntityFingerprintRecord, EntityFingerprintRepository, ListingFilter, PageWindow, RepoRecord,
     SyncWatermarkRecord, SyncWatermarkRepository,
@@ -205,9 +206,12 @@ async fn every_child_listing_of_a_shared_repository_stays_with_its_tenant() {
                     tenant_id: tenant.subject_tenant_id(),
                     access_scope: AccessScope::default(),
                     scope: collect_everything(),
-                    force: false,
+                    force: ForceMode::None,
                     since: None,
                     cancel: tokio_util::sync::CancellationToken::new(),
+                    telemetry: std::sync::Arc::default(),
+                    public_repo: std::sync::Arc::default(),
+                    max_concurrent_tasks: None,
                 },
                 &SyncProgress::new(),
                 &tokio_util::sync::CancellationToken::new(),
@@ -390,7 +394,7 @@ async fn every_child_listing_of_a_shared_repository_stays_with_its_tenant() {
                 "review threads",
                 fixture.review_threads.len(),
                 service
-                    .list_review_threads(tenant, OWNER, NAME, PULL_NUMBER, &query)
+                    .list_review_threads(tenant, OWNER, NAME, PULL_NUMBER, &query, None)
                     .await
                     .expect("review threads must list")
                     .items

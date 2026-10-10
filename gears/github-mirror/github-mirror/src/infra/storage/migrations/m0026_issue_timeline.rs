@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS gm_issue_timeline (
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_issue_timeline (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     repo_id BIGINT NOT NULL,
     issue_number BIGINT NOT NULL,
     position BIGINT NOT NULL,

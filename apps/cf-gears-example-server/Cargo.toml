@@ -13,7 +13,7 @@ workspace = true
 [features]
 default = []
 file-parser = ["dep:file_parser"]
-github-mirror = ["dep:github_mirror"]
+github-mirror = ["dep:github_mirror", "credstore"]
 simple-user-settings = ["dep:simple_user_settings"]
 nodes-registry = ["dep:nodes_registry"]
 resource-group = ["dep:resource_group"]

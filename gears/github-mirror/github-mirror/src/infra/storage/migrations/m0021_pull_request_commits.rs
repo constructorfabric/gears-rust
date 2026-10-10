@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS gm_pull_request_commits (
             sea_orm::DatabaseBackend::MySql => {
                 r"
 CREATE TABLE IF NOT EXISTS gm_pull_request_commits (
-    tenant_id VARCHAR(36) NOT NULL,
+    tenant_id BINARY(16) NOT NULL,
     repo_id BIGINT NOT NULL,
     pull_number BIGINT NOT NULL,
     sha VARCHAR(64) NOT NULL,

@@ -1,0 +1,55 @@
+[package]
+name = "cf-gears-github-mirror-cli"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Command-line tool for the GitHub Mirror gear"
+
+[[bin]]
+name = "github-mirror"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = ["static-authn"]
+static-authn = ["dep:static-authn-plugin"]
+oidc-authn = ["dep:oidc-authn-plugin"]
+
+[dependencies]
+github_mirror = { package = "cf-gears-github-mirror", path = "../github-mirror" }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", path = "../../system/authn-resolver/authn-resolver-sdk" }
+
+api-gateway = { workspace = true }
+types-registry = { workspace = true }
+tenant-resolver = { workspace = true }
+authn-resolver = { workspace = true }
+authz-resolver = { workspace = true }
+credstore = { workspace = true }
+static-authz-plugin = { workspace = true }
+static-credstore-plugin = { package = "cf-gears-static-credstore-plugin", path = "../../credstore/plugins/static-credstore-plugin" }
+single-tenant-tr-plugin = { package = "cf-gears-single-tenant-tr-plugin", path = "../../system/tenant-resolver/plugins/single-tenant-tr-plugin" }
+static-authn-plugin = { workspace = true, optional = true }
+oidc-authn-plugin = { package = "cf-gears-oidc-authn-plugin", path = "../../system/authn-resolver/plugins/oidc-authn-plugin", optional = true }
+
+toolkit = { workspace = true, features = ["bootstrap"] }
+toolkit-db = { workspace = true, features = ["sqlite", "pg", "mysql"] }
+toolkit-odata = { workspace = true }
+toolkit-security = { workspace = true }
+
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+figment = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

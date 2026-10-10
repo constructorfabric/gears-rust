@@ -6,14 +6,16 @@
 //! ones. That is the whole point of the mirror, and this module is where it
 //! happens.
 //!
-//! Entries are **tenant-partitioned**. The design allows public-repository
-//! responses to be shared across tenants ([`PRD` §5.7], ADR-0002), but sharing
-//! needs the visibility and grant machinery that does not exist yet, so every
-//! entry is scoped to the tenant that fetched it. That is strictly safe — it
-//! only forgoes an optimisation.
+//! Entries of a repository Discovery has seen as public live in one shared
+//! partition, [`SHARED_CACHE_PARTITION`](crate::domain::ports::github::SHARED_CACHE_PARTITION), so every tenant revalidates the same
+//! entry ([`PRD` §5.7], ADR-0002). Entries of a private repository, and every
+//! entry fetched before Discovery has learned the visibility, stay in the
+//! partition of the tenant that fetched them. A shared body is only ever
+//! served after GitHub answers `304` to the caller's own request.
 
 use async_trait::async_trait;
 use aws_lc_rs::digest::{self, SHA256};
+use chrono::{DateTime, Utc};
 use toolkit_security::AccessScope;
 
 use crate::domain::error::DomainError;
@@ -23,7 +25,7 @@ use crate::domain::error::DomainError;
 ///
 /// The token is **never** part of the key — two callers with different tokens
 /// requesting the same URL produce the same key, and tenant partitioning
-/// rather than the key is what keeps their entries apart.
+/// rather than the key is what keeps their private-repository entries apart.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey(String);
 
@@ -79,13 +81,15 @@ impl CachedResponse {
 /// drive it in memory.
 #[async_trait]
 pub trait HttpCache: Send + Sync {
-    /// The entry for `key` within `scope`, if one exists.
+    /// The entry for `key` in the partition of `tenant_id`, which `scope` must
+    /// cover, if one exists.
     ///
     /// # Errors
     /// Storage failures. A cache miss is `Ok(None)`, not an error.
     async fn get(
         &self,
         scope: &AccessScope,
+        tenant_id: uuid::Uuid,
         key: &CacheKey,
     ) -> Result<Option<CachedResponse>, DomainError>;
 
@@ -117,7 +121,33 @@ pub trait HttpCache: Send + Sync {
     ///
     /// # Errors
     /// Storage failures.
-    async fn clear(&self, scope: &AccessScope, url_prefixes: &[&str]) -> Result<u64, DomainError>;
+    async fn clear(
+        &self,
+        scope: &AccessScope,
+        tenant_id: uuid::Uuid,
+        url_prefixes: &[&str],
+    ) -> Result<u64, DomainError>;
+
+    /// # Errors
+    /// Storage failures.
+    async fn expire(
+        &self,
+        scope: &AccessScope,
+        tenant_id: uuid::Uuid,
+        fetched_before: DateTime<Utc>,
+    ) -> Result<u64, DomainError>;
+
+    /// Bytes held for the entries `clear` would drop for `url_prefixes`: the
+    /// bodies as stored, plus the metadata files of a file cache.
+    ///
+    /// # Errors
+    /// Storage failures.
+    async fn size(
+        &self,
+        scope: &AccessScope,
+        tenant_id: uuid::Uuid,
+        url_prefixes: &[&str],
+    ) -> Result<u64, DomainError>;
 }
 
 /// A cache that stores nothing, for callers that do not want one.
@@ -131,6 +161,7 @@ impl HttpCache for NoCache {
     async fn get(
         &self,
         _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
         _key: &CacheKey,
     ) -> Result<Option<CachedResponse>, DomainError> {
         Ok(None)
@@ -150,6 +181,25 @@ impl HttpCache for NoCache {
     async fn clear(
         &self,
         _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
+        _url_prefixes: &[&str],
+    ) -> Result<u64, DomainError> {
+        Ok(0)
+    }
+
+    async fn expire(
+        &self,
+        _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
+        _fetched_before: DateTime<Utc>,
+    ) -> Result<u64, DomainError> {
+        Ok(0)
+    }
+
+    async fn size(
+        &self,
+        _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
         _url_prefixes: &[&str],
     ) -> Result<u64, DomainError> {
         Ok(0)
