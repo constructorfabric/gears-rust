@@ -29,6 +29,7 @@
   - [Preconditions: Acceptance on the two paths (normative)](#preconditions-acceptance-on-the-two-paths-normative)
   - [Preconditions: Authorization as a guard input (normative)](#preconditions-authorization-as-a-guard-input-normative)
   - [Preconditions: Traceability](#preconditions-traceability)
+  - [Commercial authority delivery (D-199)](#commercial-authority-delivery-d-199)
 
 <!-- /toc -->
 
@@ -180,7 +181,7 @@ This process is **owned by Workflow and must be implemented there**, not a new L
 |-----------|--------|
 | Successful eligible buyer submit | Record acceptance on the new submitted version within submit. |
 | Separate recording, any non-terminal state except `draft` | Preserve order state and version; append acceptance and publish its event. |
-| Amendment creates N+1 | Keep N's evidence; N+1 starts without acceptance on either sales path. |
+| Amendment creates M | Keep N's evidence; M starts without acceptance on either sales path. |
 | Administrative edit or state-only transition | Existing version-bound acceptance remains valid for that version. |
 | Begin-fulfillment with guards satisfied | `approved → in_fulfillment`, owned by Workflow Seam. |
 | Pending, non-tolerated failure or missing required acceptance | Remain `approved`; no payment state or payment outcome event. |
@@ -572,3 +573,12 @@ out of scope and stays out of scope.**
 - **ADRs**: [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md) transition through the engine; [`ADR/0002`](../ADR/0002-cpt-cf-bss-orders-lifecycle-adr-slice-decomposition.md) the foundation-plus-seven-slices decomposition
 
 <!-- /contract -->
+
+
+**D-188 reconciliation:** M denotes the next committed reserved candidate, possibly separated from N by gaps. Customer acceptance binds the exact committed version; remote Pricing receipts and reserved version numbers are not customer consent. See the [normative attempt and sparse-history contract](../DESIGN.md#contract-01-commercial-attempt).
+
+### Commercial authority delivery (D-199)
+
+The [owner contract and readiness criteria](../DESIGN.md#contract-05-commercial-owner-readiness) govern these preconditions. Pricing acceptance is not customer consent or policy approval. Referenced-contract declarations remain live at guard time; prior-version assent/verdicts cannot satisfy the current version. Workflow supplies D-175 adapter-owned authorization facts from the Payments authority and owns same-request pending recovery. Lifecycle alone evaluates tolerate-failure after conclusive failure; missing provider, outage and pending are not failed authorization. TCV never implicitly supplies the authorized amount.
+
+- [ ] Deliver owner SDK/providers/grants and real refusal/outage/restart/stale-version tests before enabling affected production paths.

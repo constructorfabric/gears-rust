@@ -79,7 +79,7 @@
 | **SUB-C1** | HIGH | **Joint (RISK — upstream unauthored)** | **Renewal / grace ladder / regional templates.** §6.5 assumes Contracts is the SoR for `Renewal` (`autoRenew`, term windows, notice), grace length/ladder, and regional templates (S:674, S:718). Upstream Contracts PRD has not authored them (S:1360). **Until authored:** the platform defaults govern — **7-day grace**, **30/14/7/1 notices**, hybrid exit trigger (S:722–725). Subscriptions stores **evaluated fields** at renewal-evaluation time for replay. Cross-PRD obligation on Contracts to author the SoR; Subscriptions consumes via events + read models. |
 | **SUB-C2** | MED | **Joint** | **Ramps (committed multi-step schedules).** Contracts authors the committed ramp; Subscriptions **executes** it as a sequence of scheduled `changePlan`/`updateQuantity` intents (**SUB-D-04**, S:630). No native `SubscriptionSchedule` aggregate at launch. **Open:** atomic multi-action submission (Zuora-Orders-style) is a Contracts/Design follow-up (S:1342). Depends on the SUB-D-01/02 intent envelopes. |
 | **SUB-C3** | MED | **SUB-adopts (owner = Contracts)** | **Commitment pools.** Committed-usage pools are **Contracts SoR**, true-up is **rating** (rating **T-D-14**, rating SEAMS **M8**; S:181). This gear keeps **subscription-side hooks only** — it neither owns the pool balance nor computes the true-up. Adopt the owner split; expose the subscription linkage. |
-| **SUB-C4** | MED | **Joint** | **Activation date-trio + acceptance.** `contractEffectiveAt` (booking) is **referenced from the Contract** — booking semantics stay Contracts/Finance SoR; `serviceActivatedAt` is stamped at the `activate` commit here; `customerAcceptedAt` is stamped by an optional **acceptance confirmation** where Contract clauses require it, else = service activation (**SUB-D-05**, S:500). **No new statuses.** All three ride lifecycle events + ASC hooks. **Open:** the confirmation-flow shape (who confirms, evidence) is design (S:1343). |
+| **SUB-C4** | MED | **Joint** | **Activation date-trio + acceptance.** `contractEffectiveAt` (booking) is **referenced from the Contract** — booking semantics stay Contracts/Finance SoR; `serviceActivatedAt` is the authoritative applied service-effective instant persisted at active-state commit (Lifecycle D-201); `customerAcceptedAt` is stamped by an optional **acceptance confirmation** where Contract clauses require it, else = service activation (**SUB-D-05**, S:500). **No new statuses.** All three ride lifecycle events + ASC hooks. **Open:** the confirmation-flow shape (who confirms, evidence) is design (S:1343). |
 | **SUB-C5** | MED | **SUB-adopts** | **`PriceOverride` windows.** Contracts supplies negotiated override windows consumed via events/read models; in rating these are the **step-5 contract overlay** (rating `04-overlays-precedence`, precedence Contract > Partner PriceOverlay > Catalog base). Subscriptions references the override binding for composition/renewal; it does not evaluate the override. |
 
 ## D. Billing & Invoicing
@@ -159,6 +159,8 @@
 | **SUB-O6** | MED | **Joint (reopens SUB-D-04 / SUB-C2)** | **Atomic multi-subscription submission is cheaper than the deferral assumed.** **SUB-C2** records "atomic multi-action submission (Zuora-Orders-style) is a Contracts/Design follow-up" and **SUB-D-04** declined a native schedule aggregate at launch — both reasoned against a saga over **committed** subscriptions. The Orders two-phase shape (SUB-O3) needs no such saga: N creates in `draft`, then N activates, with the void edge as compensation for everything before the first activation. The residual non-atomic window is activation-to-activation only, and it is bounded by SUB-O1's compensation value. → **Obligation here:** revisit the deferral against the two-phase shape rather than treating multi-line orders as Contracts-blocked; the reopen is an Orders/Subscriptions joint call. `REVIEW F-5`, `F-30`. |
 
 ---
+
+**Orders seam naming reconciliation (S1-01):** use the [source-qualified semantic alias map](../../orders-lifecycle/docs/UPSTREAM_REQS.md#subscription-seam-alias-map) when joining these obligations to Lifecycle or Workflow. Bare SUB-O numbers are not cross-document API identities; existing IDs and unresolved delivery status are preserved.
 
 ## Ownership matrix (contested / adjacent responsibilities)
 
@@ -263,3 +265,16 @@
 (§5.1/§6/§12/§15) and [`DECISIONS.md`](./DECISIONS.md). This seam map is the input to
 the design set — each slice implements the Subscriptions side of the seams listed for it in
 [`DESIGN.md`](./DESIGN.md) §1.3.
+
+
+### Lifecycle D-201 receiver amendments
+
+The receiver contract matrix preserves historical
+SUB-O aliases and names each semantic operation. All activation writers (direct, Orders,
+resume, transfer and key-changing plan change) obey the shared capacity/fence protocol.
+An Orders draft rebuild requires the [engine-issued successor](../../orders-lifecycle/docs/DESIGN.md#contract-06-replace-fulfillment-grant);
+closed generations never reopen and completed members are not recreated. Intent admission and
+applied confirmation use the [separate clock contract](../../orders-lifecycle/docs/DESIGN.md#contract-06-activation-clocks).
+Hold pauses pending confirmation; it preserves already active service. Late OSS effects remain
+reconcilable with uncertain claims retained. These are normative receiver requirements;
+provider SDK implementation and deployed conformance remain separate delivery work.

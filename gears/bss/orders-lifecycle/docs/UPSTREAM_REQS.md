@@ -24,6 +24,10 @@
 - [3. Priorities](#3-priorities)
 - [4. Traceability](#4-traceability)
 - [PriceBook readiness additions](#pricebook-readiness-additions)
+  - [R02 reconciliation: existing durable acceptance contract (D-188)](#r02-reconciliation-existing-durable-acceptance-contract-d-188)
+  - [R06 downstream adoption requirement (D-192; not delivered)](#r06-downstream-adoption-requirement-d-192-not-delivered)
+  - [R11 exact-binding evaluation delivery (D-197; missing runtime)](#r11-exact-binding-evaluation-delivery-d-197-missing-runtime)
+  - [R13 commercial owner readiness (D-199; not delivered)](#r13-commercial-owner-readiness-d-199-not-delivered)
 
 <!-- /toc -->
 
@@ -40,38 +44,50 @@ Orders Workflow PRD ([`DECISIONS.md`](./DECISIONS.md) Q-04).
 
 | Requesting gear | Why it needs the target |
 |-----------------|-------------------------|
-| `orders-lifecycle` | Owns the order document and its state machine; needs Subscriptions to accept an explicit start instant, expose an overlap-occupancy read, and carry an order reference and a compensation cancellation reason. Needs Pricing to publish its existing reads as `PricingReadV1` and to admit a `bss-orders.system` subject with `plan:read` and `price:read`, as it does for Rating and Subscriptions; the residual purchase verdict is a separate, narrower ask. Needs Rating to expose a batched exact-binding evaluation SDK, a pre-subscription evaluation and an annualised TCV figure. Needs the billing chain to propagate the external reference and to answer an indicative tax read. Needs Account Management to issue verifiable delegation proof and expose the payer's commercial profile, Contracts to answer contract status, party eligibility and the acceptance-required declaration for a referenced contract, and the platform PDP to evaluate it from request context with distinct missing/invalid deny reasons. Needs Subscriptions to answer its `SUB-G1` overlap key for a prospective PriceBook line, and Pricing's revision-reference release report to count in-flight orders; SKU protection itself is inherited from the revision's references. Needs a Payments capability that does not exist, and needs the Event Broker runtime behind the
-landed SDK before event-producing traffic can be accepted. Needs the API Gateway to key a rate-limit zone by a path parameter so the per-(caller, order) request limit can run at the gateway (D-185). |
+| `orders-lifecycle` | Owns the order document and its state machine; needs Subscriptions to accept an explicit start instant, expose an overlap-occupancy read, and carry an order reference and a compensation cancellation reason. Needs Orders to integrate the existing typed `PricingReadV1` through its own adapter (D-187), resolve required evidence gaps, and Pricing to admit an authenticated Orders service principal (D-194) with `plan:read` and `price:read`, with the remaining commercial permissions and provisioning specified by D-194; D-189 nonbinding Pricing assessment is a separate upstream implementation ask. Needs Rating to expose a batched exact-binding evaluation SDK, a pre-subscription evaluation and an annualised TCV figure. Needs the billing chain to propagate the external reference and to answer an indicative tax read. Needs Account Management to issue verifiable delegation proof and expose the payer's commercial profile, Contracts to answer contract status, party eligibility and the acceptance-required declaration for a referenced contract, and the platform PDP to evaluate it from request context with distinct missing/invalid deny reasons. Needs Subscriptions to answer its `SUB-G1` overlap key for a prospective PriceBook line, and Pricing to coordinate fenced Orders/Subscriptions usage before future revision-reference release (D-196); SKU protection itself is inherited from the revision's references. Needs a Payments capability that does not exist, and needs integration with the existing Event Broker runtime, deployed grants and verified producer recovery before event-producing traffic can be accepted (D-200). Needs the API Gateway to key a rate-limit zone by a path parameter so the per-(caller, order) request limit can run at the gateway (D-185). |
 | `orders-workflow` | Must consume `OrderAmended`, obtain the approval-requirement verdict for the new order version, and reflect the new version onward from `submitted`; without this the Lifecycle two-step re-approval seam stalls. |
 
 ## 2. Requirements
 
 ### 2.1 Subscriptions
 
-The seam-map numbering (`SUB-O1`…`SUB-O6`) is treated as canonical here, per Q-04. Of the
-identifiers the Workflow PRD adds beyond the seam map, **only `SUB-O9`** (correlation
-propagation) is an ask of this gear; it is carried below and flagged as unregistered upstream,
-since the seam map does not define it. **`SUB-O4`, `SUB-O6`, `SUB-O7` and `SUB-O8`
-are not asks of this gear** and are deliberately absent from this register — `SUB-O6` notably so,
-since Q-04 records it carrying two different meanings across the two registers. `SUB-O3` is
-registered below but is a **preservation** ask rather than a change request, which is why the
-slices that rest on it do not count it among their unagreed dependencies.
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-pre-subscription-billing-terms`
 
-The Workflow branch (`bss/orders-workflow` @ `3ccf7793c`) registers the provisioning-intent contract
-on its own side as `SUB-O11`…`SUB-O16`; the asks below that overlap them name the matching Workflow
-id so Subscriptions receives one list, not two (DECISIONS D-172–D-175).
+**D-193, proposed missing producer:** Subscriptions must expose the authorized, side-effect-free
+[pre-subscription billing-terms resolver](DESIGN.md#contract-03-billing-terms-resolution).
+It supplies complete public Pricing BillingTerms with canonical digest, exact invoice-period
+Term and retained source/version evidence without creating a subscription/receipt/hold. Agree
+and implement seller-policy source/precedence, immutable reads and grants; Settings is not a
+selected backend. Validate month/year UTC anchors, supported selected-binding combinations,
+exact capture mapping, Preview incompleteness and delayed activation geometry with Rating.
+Existing Pricing types/validation do not deliver this resolver. Orders adapts and freezes its
+result through D-188/D-192; exact retries never re-resolve it. Provider, permissions and joint
+conformance remain production acceptance prerequisites.
+
+
+Use the [semantic SUB alias map](#subscription-seam-alias-map) below to resolve cross-document
+references. Existing Subscriptions `SUB-O1`…`SUB-O6` identifiers are preserved; a bare number
+from another document is not an API identity. In particular Subscriptions `SUB-O6` and Workflow
+`SUB-O6` name different obligations. The full `cpt-…-upreq-*` IDs below identify Lifecycle asks.
+`SUB-O3` is preservation of the externally callable two-phase pair, not proof of receiver delivery.
+
+Historical references to the Workflow branch (`bss/orders-workflow` @ `3ccf7793c`) retain their
+provenance. Its `SUB-O11`…`SUB-O16` labels are not declarations in the checked-in Workflow PRD;
+do not generate APIs or merge obligations from those numbers. Both settle-create and status-read
+were cited as historical `SUB-O13`, so their distinct semantic identities remain authoritative.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-subscription-start-instant`
 
-The activation intent and `create` **MUST** accept an explicit **start instant** and **MUST NOT**
-derive the subscription start from any date carried on the order. Where the two-phase activation
-barrier defers a line past its quoted service-activation date, the spawned subscription's start is
-the **actual activation instant**; billing and entitlement **MUST NOT** be backdated to the
-earlier quoted date. Raised as **`SUB-O10`** — a new ask, not present in either existing register.
-Without it the PRD's no-backdating requirement is unenforceable from the order side, because
-Subscriptions owns the start. See [`DECISIONS.md`](./DECISIONS.md) D-56. The Workflow branch carries
-the instant on its activate intent (Workflow D-195); `start_at` wins over any internally computed
-instant.
+Create/activate **MUST** preserve distinct quoted dates, exact immutable held Pricing activation
+identity and receiver-recorded intent time. The authoritative applied OSS outcome supplies the
+actual service-effective instant; persist it with the applied transition identity, not at draft
+creation or intent admission. Billing and entitlement **MUST NOT** precede actual activation.
+A future confirmation instant cannot be a required activation request input. D-201 supersedes
+D-56/Workflow D-195's ambiguous `start_at wins` wording; use the
+[clock/held-terms compatibility contract](DESIGN.md#contract-06-activation-clocks).
+The selected BillingTerms/anchor cannot be silently rewritten; unsupported receiver/Rating
+profiles require reconciliation or newly accepted execution. Historical **SUB-O10** remains
+provenance, not an already registered callable API. Owner implementation/conformance is open.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-overlap-presence-read`
 
@@ -83,7 +99,7 @@ policy that cardinality was resolved from. Registered upstream as **`SUB-O5`**, 
 presence"): a boolean cannot evaluate `activeCount + proposed ≤ maxConcurrentActive` when the limit
 exceeds one, so this design asks for the count and the limit; the Subscriptions gear's own seam map
 is not edited here ([`DECISIONS.md`](./DECISIONS.md) D-126). The requirement ID is kept for
-stability. **Second amendment (D-179; open as Q-40):** the tuple carries the resource tenant, by making
+stability. **Second amendment (D-179; Q-40 target selected by D-198, producer adoption pending):** the tuple carries the resource tenant, by making
 `resourceTenantId` a default dimension of `overlapScopeKey` — Subscriptions' own
 `design/03-plan-changes.md` §4.4 already permits extra dimensions — and enforcing the same tuple at
 the active commit. On self-service sales payer and resource tenant are one tenant, so only the
@@ -135,7 +151,7 @@ unregistered upstream. Without it an end-to-end acquisition trace stops at the s
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-overlap-activation-atomicity`
 
-**Atomic enforcement of `overlapScopeKey` at the point a subscription commits to `active`.** The
+**Atomic enforcement of `overlapScopeKey` from activation-intent admission through active confirmation (D-198).** The [receiver protocol](DESIGN.md#contract-06-activation-admission) adds durable pending capacity, exact committed-order/Workflow-generation fencing and staged pause/revoke barriers. The scope includes resource tenant as the selected target; legacy answers cannot be locally re-bucketed. Provider delivery remains unchecked. The
 order axis of the overlap rule is closed inside this gear's transition transaction by
 [01 §3.7](DESIGN.md#contract-01-3-7)'s partial unique index, but the **subscription** axis cannot be: the committing
 transaction belongs to Subscriptions, so no re-check performed here can be atomic with it. Two
@@ -162,9 +178,8 @@ subscriptions, `resume`, `transfer`, key-altering `changePlan` — which only Su
 **Mechanism proposed to Subscriptions.** *Recommended*: mirror this gear's
 [ADR-0007](./ADR/0007-cpt-cf-bss-orders-lifecycle-adr-in-transaction-concurrency.md) — an
 in-transaction **slot claim** `(overlapScopeKey, slot)` with a partial UNIQUE over live claims and
-a row CHECK `0 ≤ slot < maxConcurrentActive` (the limit resolved for that key), taken in the same
-transaction that commits `active` and released in the transaction that leaves `active`; a
-transaction that finds no free slot commits nothing and returns `overlap-collision`. Every entry
+a row CHECK `0 ≤ slot < maxConcurrentActive` (the limit resolved for that key, under the authoritative key-policy-generation lock), taken atomically with activation-intent admission before OSS dispatch, retained through pending provisioning and the `active` commit, and released only on definitively settled abort or leaving `active` (D-198); a
+transaction that finds no free slot commits nothing and returns `overlap-collision`. Both activation-intent admission and active confirmation validate the same receiver generation; pause/revoke serializes on that receiver row. Every entry
 into `active` that §4.4 of Subscriptions' `design/03-plan-changes.md` already detects on takes a
 slot, so the rule binds all writers, not only Orders'; how the §4.4 supersedes exemption maps onto
 slots is Subscriptions' design. The slot shape D-83 rejected for Orders is the right shape here:
@@ -209,13 +224,11 @@ Atlas names the same event in C03/C09 (ticket T12).
 **PriceBook provisioning amendment (D-157, D-165).** The create/activate SDK must accept the exact
 order/version/line reference (which is the accepted version reference), the order/line external
 reference for the billable facts (§2.3), the Lifecycle acceptance instant, the referenced
-`contractId`, explicit actual start intent and tenant axes. Item composition is not passed:
-Subscriptions reads it, with the accepted `chains[]`, through the authorized Lifecycle version read,
-so there is one source of truth, and compares its pinned activation-date resolve against it before
-committing `active` (`…-upreq-initial-binding-acceptance`); arbitrary caller-provided monetary
+`contractId`, distinct quoted/held activation inputs and tenant axes (D-201). Item composition is not passed:
+Subscriptions reads the complete D-192 selected receipt/query/bindings through the authorized Lifecycle version read, then matches its hold and fresh eligibility under D-190 before fenced activation admission (`…-upreq-initial-binding-acceptance`); arbitrary caller-provided monetary
 evidence is not accepted. The mapping onto Subscriptions' three existing
 instants is fixed: Lifecycle's recorded acceptance instant becomes `customerAcceptedAt`, with the
-Lifecycle acceptance record as provenance; the actual activation instant becomes
+Lifecycle acceptance record as provenance; the authoritative applied service-effective instant becomes
 `serviceActivatedAt` (`SUB-O10`); `contractEffectiveAt` comes from the referenced Contract, never
 from an order date. A line counts as activated only when its `activate` transition reaches
 `applied`; `approved` with the OSS confirmation pending is not completion, and `oss_unconfirmed`
@@ -223,9 +236,46 @@ is a provisioning failure. Preserve Workflow's tenant/order/version/line/wave/ki
 idempotency identity inside Subscriptions' opaque `(orderingTenantId, create, client key)` scope; a
 line-ID-only key loses amendments and rebuilt drafts.
 SUB-O1 adds `order_compensation` outside fee/credit-generating early termination; SUB-O2 carries reverse
-order provenance. SUB-O5 must mirror active counts (drafts excluded), effective limit and provenance.
+order provenance. SUB-O5 must expose active and admitted-pending occupancy separately, effective limit and provenance under D-198. Draft existence alone consumes no activation slot; an admitted activation awaiting OSS confirmation does. The selected key includes resource tenant, and Orders cannot locally re-bucket an older provider answer.
 The existing Subscriptions seam numbers remain canonical; SUB-O9/O10 remain explicitly unregistered
 extensions until the counterpart records them. No change to the order's separate one-in-flight cap.
+
+
+<a id="subscription-seam-alias-map"></a>
+
+#### Canonical semantic SUB alias map (S1-01)
+
+Resolve references by **source + meaning**, not bare number. Existing requirement IDs are
+preserved. This is a documentation mapping, not a new SDK surface or evidence of provider
+implementation. The matching public SDK request/result/fence details are S1-05/S5-01 work.
+
+| Semantic contract / canonical Lifecycle requirement suffix | Subscriptions SEAMS §I | Checked-in Workflow PRD | Historical branch alias / disposition |
+|---|---|---|---|
+| Compensation cancellation reason / `compensation-cancel-reason` | SUB-O1 | Compensation contract | Preserve reason outside early-termination fee/credit class |
+| Reverse order provenance and create key / `order-reference-on-create` | SUB-O2 | §6.3 intent identity | D-198 adds exact attempt/generation/roster; do not derive a line-only key |
+| Externally callable draft/activate pair / `two-phase-pair-preserved` | SUB-O3 | §6.3 two-wave fulfillment | Preservation ask, with receiver implementation still required |
+| Nonbinding pre-purchase conjunction / `pricing-purchase-assessment` | SUB-O4 | Sellability re-check expectations | D-189 Pricing owner; not a Subscriptions acceptance command |
+| Canonical key and occupancy / `overlap-presence-read`, `catalog-subscription-product-key` | SUB-O5 plus registry SUB-G1 | SUB-O5 | D-198 resource-tenant key, active plus admitted-pending capacity |
+| Atomic multi-subscription orchestration discussion | SUB-O6 | No same-number equivalence | No new bulk API selected; Workflow two waves and per-receiver D-198 admission |
+| In-flight duplicate rejection | Not SUB-O6 | SUB-O6 | Receiver intent contract in S5-05; separate from atomic multi-subscription discussion |
+| Cancel/void an accepted transition request | Not registered as SUB-O7 | SUB-O7 | Receiver control/compensation S5-05/09; not a blind duplicate submit |
+| Intent status / `intent-status-read` | Not registered as SUB-O8 | SUB-O8 | Historical branch SUB-O13; use semantic identity |
+| Correlation propagation / `correlation-propagation` | Not registered | SUB-O9 | Process correlation remains distinct from idempotency identity |
+| Actual subscription start / `subscription-start-instant` | Not registered | Actual-start requirement | Lifecycle-raised SUB-O10; D-201 reconciled clocks, owner implementation pending |
+| Late-create settlement / `settle-create` | Not registered | No numbered equivalent | Also historically cited as SUB-O13; distinct from status-read and serialized against late create |
+| Terminal identity echo / `transition-outcome-echo` | Not registered | §6.3/FR intent identity echo | Historical branch SUB-O16; distinguish terminal applied from intent approved |
+| Remaining historical SUB-O11/12/14/15 references | No declaration verified | No declaration in checked-in PRD | Retain provenance only; no guessed alias or generated provider method |
+
+Subscriptions' older SEAMS occupancy wording is narrowed by its selected D-198 design amendment:
+unadmitted drafts consume no slot; admitted activation awaiting confirmation does. Owner adoption,
+all-writer enforcement and deployment conformance remain unchecked.
+
+**R06 downstream adoption (D-192; not delivered).** Registered here because Subscriptions is the
+first adopter; the [R06 section](#r06-downstream-adoption-requirement-d-192-not-delivered) points here.
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-frozen-commercial-materialization`
+
+Subscriptions/Rating must adopt the [D-192 first-period mapping](DESIGN.md#contract-03-frozen-commercial-snapshot): complete selected receipt query (including BillingTerms) plus identical HeldBindings, immutable receipt/hold provenance and receiver-owned activation/component facts. Hold alone is incomplete. Subscriptions contributes its segment; Rating owns broader snapshot composition and any required additional authoritative inputs. No mutable SKU/meter/invoice refresh, invented legacy provenance or assumed overlay/tax/FX policy is permitted. Implement scoped reads, versioned lossless wire mapping and joint round-trip/change/replay/negative conformance before activation delivery. Existing Pricing bindings/hold behavior satisfy the producer freeze, not downstream integration. R12 remains separately blocking.
 
 ### 2.2 Rating / price evaluation
 
@@ -238,94 +288,138 @@ counterpart acceptance is implied.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-pricing-read-sdk`
 
-Pricing must publish `PricingReadV1 { resolve, price, current_revision }` in `pricing-sdk`,
-registered in the ClientHub by the Pricing gear: the existing `GET /resolve`, `GET /prices/{id}` and
-`GET /plans/{id}` answers with their DTO field names unchanged (`PricingResolveDto` and its item,
-chain and binding members; `PricingPinnedPriceDto`; the plan's `published_rev`, revision `state` and
-`available_from`). Signatures as the reads exist: `resolve(plan_revision_id, date, item_id?, pins[])`,
-`price(price_id)`, `current_revision(plan_id)`; the plan read's `published_rev` is a revision
-number, and the revision's `state` and `available_from` are read from its `revisions[]` entry.
-The 15 golden contract files freeze `resolve` and `price`; `current_revision` needs its own.
-`pricing-sdk` exports only `product_catalog` today, and REST does not count between gears, so this
-is the same prerequisite Rating and Subscriptions have; the tenant-scoped subject context of
-D-424 (Pricing's `reference_ticker::system_actor` pattern) is only buildable in-process, which
-makes the trait a prerequisite for the access model too. Orders asks for nothing beyond those
-three reads.
-Six of the nine catalog predicates are evaluated from them ([DESIGN §4.1](DESIGN.md#contract-03-4-1),
-D-161). A missing revision is distinct from denied/unavailable/malformed answers.
+**Reconciled scope; stable ID (D-187, R01).** Main
+`a35dfc3e21b57a0ab453e01898a0e42fa6d569ec` implements and registers the typed
+`PricingReadV1`; the producer capability is present. This requirement remains unchecked for
+Orders integration and read/evidence conformance. Orders owns a catalog port and SDK adapter;
+no Pricing source/API change is selected here.
+
+Methods take `&SecurityContext` and return `Result<_, CanonicalError>`:
+`resolve(ResolveQuery) -> ResolvedBindings`, `price(PriceQuery) -> ImmutablePrice`, and
+`current_revision(PlanQuery) -> RevisionRef`. Each query carries the seller `CatalogRef`.
+These are not REST DTOs: resolve yields item/dimension cells, while current revision
+yields only plan/revision IDs and revision number. The normative
+[typed mapping and outstanding evidence](DESIGN.md#contract-03-pricing-read-mapping) retain
+required revision availability/selection-coverage gaps. D-192 explicitly retires the specified legacy pin provenance from commercial storage; required business facts may not be fabricated or made optional by the adapter.
+
+Pending conformance: published/current identity; scheduled/superseded rejection for new sales;
+selected missing/uncovered/default cells; unselected uncovered cells; incomplete required inputs;
+operation-specific missing-resource errors versus denied/unavailable/infrastructure failures;
+seller/PDP isolation; provider-clock/UTC boundary behavior and catch-up writes. Existing
+[provider tests](../../pricing/pricing/tests/pricing_read_sdk.rs) are source evidence, not Orders
+integration sign-off. Pricing's `SafeRead` current-revision method can promote revisions and emit
+audit/events; it does not create an acceptance receipt. Full Preview diagnostics, acceptance,
+holds, pin persistence and activation remain separate reconciliation decisions. The service
+permissions requirement below remains open.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-pricing-catalog-tenant-reads`
 
-**Revised scope; stable ID (D-160).** Pricing must admit a `bss-orders.system` system subject with
-`plan:read` and `price:read`, recorded beside `bss-rating.system` and `bss-subscriptions.system`
-in Pricing D-424 and its PRD actor list. Orders' adapter builds that subject's context for the
-order's **seller tenant** (Pricing's `reference_ticker::system_actor` pattern) and calls
-`PricingReadV1` in it, exactly as the two existing consumers read a seller's revision; the revision
-is looked up in the subject's tenant, and resolve reads SKU versions as Pricing's own actor. The
-`sellable`/`lifecycle` row of DESIGN §4.1 is a scoped Products read and needs its own grant
-(`…-upreq-products-sku-read-grant`, §2.10). No new API parameter for the seller, no delegation
-proof presented to Pricing, no caller-tenant or latest-price fallback. Published/superseded
-historical readability does not imply new-purchase eligibility.
+**Revised scope; stable ID (D-194 supersedes D-160 identity construction).** Provision the
+platform-authenticated Orders service principal for the seller, with explicit Pricing `plan:read`
+and `price:read` and the Products SKU reads invoked by the provider. Orders obtains the authenticated
+context through the supported S2S path; it never builds a tenant-scoped custom system actor.
+Each query's `CatalogRef { tenant_id: seller_tenant_id }` narrows the target, not the authority.
+No caller-tenant/latest-price fallback or Pricing-system impersonation is permitted. Historical
+readability does not imply eligibility. The interim Products read has its own requirement below;
+acceptance and downstream hold permissions are assigned separately by the
+[D-194 call matrix](DESIGN.md#contract-08-commercial-service-authorization).
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-commercial-service-provisioning`
+
+Platform AuthN/AuthZ, Pricing, Products and Subscriptions must agree and provision authenticated
+seller-scoped Orders/Subscriptions service principals, least-privilege policies and rotation/revocation
+handling under D-194. Orders needs acceptance create/read and related reads; Subscriptions needs
+hold/read and related reads. Orders does not inherit hold or Products reference writes. Proposed
+D-189 assessment, D-191 seller-policy discovery and D-193 terms resolver require agreed read grants
+before delivery; Preview must not depend on acceptance create/hold. Keep original buyer/resource/
+proposed-payer authorization independent, and preserve authenticated command principal identity
+through D-188 retry/recovery. Credential refresh cannot silently change principal or replay identity.
+Existing ordinary Products PDP routing is available; no privileged system branch extension is selected.
+Real-provider positive and missing/revoked-grant tests, foreign-seller/payer denial, PDP outage,
+Preview without command grants and credential/principal-change recovery are release prerequisites;
+SDK availability alone does not close this requirement.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-pricing-purchase-assessment`
 
-**Narrowed scope; stable ID (D-161).** Only the predicates no existing read can answer remain
-here: the market applicability of a selected dimension value to the payer's `(currency, region)`,
-and any purchase-eligibility rule the catalog owner holds beyond revision currentness, availability,
-membership, chain coverage and the two Products fields. Proposed as `SellabilityV1::check` over
-prospective-purchase inputs (revision, date, selected items and dimension values), owned by Pricing
-or composed by an owner Pricing names (Atlas decision 1). Until it exists those rows are
-`catalog-predicate-unevaluable`; the six read rows are not blocked by it. A small companion ask:
-resolve may echo `Sku.sellable` and `Sku.lifecycle` per item so the gate needs no second call.
+**Reconciled scope; stable ID (D-189).** Pricing must implement the proposed separate
+`PricingAssessmentV1::assess` SafeRead described in the [normative contract](DESIGN.md#contract-03-nonbinding-assessment).
+It accepts basket intent without acceptance order/version/line identities and shares Pricing's
+commercial evaluator with authoritative receipt admission. It returns all independent Pricing
+predicate results, unavailable observations, proposed bindings and observation time. The
+implemented `SellabilityV1::check` is an acceptance command and cannot satisfy this requirement.
+This supersedes D-161's residual-only/withdrawn-assess proposal; existing safe reads retain their
+D-187 adapter mapping. Required absent results remain unevaluable, never a successful full Preview.
+Pricing SDK/provider work, seller-scoped least-privilege authorization, shared evaluation and
+Orders composition/conformance are required. The D-189 no-commercial-artifact, parity, race,
+incomplete-vector, TCV-withholding and retention scenarios are the completion evidence.
+D-195 further requires the [versioned owner diagnostic contract](DESIGN.md#contract-03-diagnostic-mapping):
+immutable rule/result profiles, operation-specific applicability, independently checkable roster
+and expected coverage, stable predicate/reason/observation/selection identity and bounded typed
+evidence. Orders owns the reviewed mapping registry and lossless aggregation, not Pricing rules.
+Missing/unknown required results and invalid envelopes fail closed; genuine partial results remain
+honest and do not claim completeness. Complete result vectors, multi-failure/unavailable-line,
+TCV-only withholding, collision-free identities, redaction and profile compatibility tests are
+required in addition to D-189. First-error acceptance commands need no synthetic full-vector API.
+No upstream implementation or permission provisioning is claimed here.
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-pricing-acceptance-policy`
+
+**New requirement (D-191).** Pricing owns the issued commercial deadline and must implement
+[authorized seller-policy discovery/resolution](DESIGN.md#contract-03-commercial-deadline).
+The proposed typed SafeRead returns seller/catalog identity, immutable positive policy version,
+positive duration and observation time under PDP scope; acceptance must use the same seller
+resolver. Current Pricing has one deployment policy (default version 1 / 86,400 seconds), no
+policy-discovery SDK and no seller-specific resolver. Merely exposing deployment configuration
+solves discovery, not the retained seller-specific requirement. Configuration/storage/provider
+choice is upstream work; no Settings Service or uniform-policy downgrade is selected here.
+Orders freezes the discovered version in each immutable D-188 attempt and copies issued
+`hold_until` verbatim; no fallback version/duration. Policy races retain actual `UnsupportedTerms`
+semantics without blindly retrying every such error. Required evidence includes multi-seller
+isolation, absent/unavailable/denied/malformed policy distinctions, immutable version behavior,
+stale-version refusal, unchanged historical receipts and nonbinding Preview. All implementation,
+grants and conformance remain unchecked.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-initial-binding-acceptance`
 
-**Revised scope; stable ID (D-162).** No new Pricing resolve mode is asked for. Before committing
-`active`, Subscriptions reads the accepted matrix of the order version through Lifecycle's
-authorized `get_version`, encodes each consumed slot (the slot whose `dim_value` equals the item's
-`selected_dim_value`) as a pin under DESIGN §4.3's own-chain/default rule, runs the ordinary
-`resolve(plan_revision_id, activation date, pins)` and compares: for every consumed slot the
-answered `binding.price_id` equals the accepted one. Pricing's renewal walk keeps the accepted price
-while it is in force, stops before a `new` successor and moves only for an `all` successor or an
-ended price, so the comparison refuses exactly when the promise cannot be kept. Equal activates on
-those bindings, with `pinned_from` as provenance, and stores them as the first period's pins;
-different, or a consumed slot missing, refuses with the closed reason `accepted-price-mismatch`,
-which Workflow maps to `order-binding-expired` and compensates. A signup resolve is not used.
-Replay of a committed activation precedes the comparison. The comparison resolve runs at the
-`applied` commit; its date is the first period's start, or Rating reads the stored `price_id`s for
-that period through `price`. Subscriptions' `create` gate on a published plan (SUB-P5) must admit
-an accepted revision superseded after submit; resolve still answers it. `activation_deadline` is
-derived by Orders from the stored bindings and a seller-scoped Orders setting; it is an early check
-at submit and before each dispatch, never the admission authority, so no clock agreement between
-gears is required. Subscriptions and Rating still own which of them cuts a period at an `ends_on`
-inside it (Atlas decision 7).
+**Revised scope; stable ID (D-190).** Implement the [accepted-price activation handoff](DESIGN.md#contract-03-accepted-price-activation).
+The Pricing receipt/hold/live-eligibility capabilities already exist. Subscriptions, not Orders
+or Preview, owns `hold` after choosing a durable activation instant, using only the receipt
+selected by the authorized committed version. It checks exact identities/digests and performs
+fresh `check_fulfilment` even after an exact hold replay. `FulfilmentQuery` has no `hold_until`
+input. Initial activation honors the accepted price across successors; no pinned price-ID
+comparison or `accepted-price-mismatch` admission branch remains.
+
+Subscriptions must fence the committed order/version and current fulfillment attempt at activation
+intent and enforce occupancy. The remote check and local commit are not one atomic operation:
+R12's concrete fencing, cancellation and ambiguous-outcome recovery protocol remains a release
+gate. Grants and cross-service tests are not delivered by the existing Pricing provider.
+D-191 policy discovery/resolution and deadline conformance, plus D-192 frozen complete-receipt-to-first-period mapping implementation, remain
+separate implementation prerequisites; never refresh accepted terms/descriptors implicitly.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-rating-evaluation`
 
 Rating must publish a ClientHub SDK for one logical batched pre-purchase evaluation over the exact
-selected bindings of an assessment. The request is the accepted matrix in resolve's own vocabulary,
-`lines[{ line_id, plan_revision_id, items[{ item_id, quantity, chains[{ dim_value, binding }] }] }]`
-with `assessment_id` and `resolve_date` (D-167), so Rating rates the same object Subscriptions will
-store; carry seller/resource/payer context, contract, market and term/cycle beside it. Return
+selected bindings of an assessment. D-192 replaces D-167's legacy full `items[].chains[]` input: carry native selected bindings, explicit quantity/term/BillingTerms context and line/revision identity with `assessment_id` and `resolve_date`, plus seller/resource/payer context, contract and market. These are proposed nonbinding inputs before acceptance; issued receipt selection must match the evaluated inputs. The concrete DTO and unresolved purchase-model mappings remain required work, not an existing SDK. Unselected diagnostic cells cannot be billed, and this request is not the complete receiver period snapshot. Return
 assessment identity, per-item/per-line and whole-order figures, gross/net/discount, promotion
 status, currency/scale/rounding, three charge kinds and TCV.
 Exact-price mode must not feed order pins to renewal resolve and walk to successors. One-time
 preview does not synthesize a one-time recurring/usage rating unit. Minimum fees are Rating's.
 Absent SDK, inconsistent binding identity or incomplete required figures is `evaluation-unavailable`.
 Every submit/amendment requires totals; Preview retains only the explicitly allowed TCV withholding.
-This D-167 request is the single evaluation DTO: Seam Atlas C06 (`acceptance_ref` plus digest,
+The D-192 amendment of D-167 governs the required evaluation DTO: Seam Atlas C06 (`acceptance_ref` plus digest,
 `ExactAmount` outputs) is not consumed, figures are integer minor units stored verbatim, and
-Rating's own `fr-pre-purchase-evaluation` must be promoted from p2 and lose its catalog-version
-prefix before the seam exists (Atlas ticket T3).
+Rating's `fr-pre-purchase-evaluation` is aligned in documentation by D-197 to p1 exact-binding inputs and Rating-owned aggregation; SDK/provider delivery remains missing (Atlas ticket T3).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-pricing-bundle-sellability`
 
-**Narrowed scope; stable ID (D-161).** The immutable item composition, treatments, included
-allowances and chain coverage are what resolve already returns and are consumed through
-`…-upreq-pricing-read-sdk`; this ID keeps only what that read does not settle: resolve must return
+**Narrowed scope; stable ID (D-161, read mapping amended by D-187).** Typed resolve supplies
+item/dimension cells and covered bindings through `…-upreq-pricing-read-sdk`; it does not supply
+the former treatment/included-allowance fields or an independent complete-roster attestation.
+The [D-187 evidence mapping](DESIGN.md#contract-03-pricing-read-mapping) applies without relaxing
+this obligation: resolve must return
 the complete roster or an explicit unavailable answer, never a truncated matrix, and the
 composition-only SKU sellability rule (a SKU sold only inside a plan) belongs to the residual
-`SellabilityV1` verdict of `…-upreq-pricing-purchase-assessment`. Deferred sold-as/grants and
+D-189 Pricing assessment of `…-upreq-pricing-purchase-assessment`. Deferred sold-as/grants and
 removed bundle price-basis rules are not implicit prerequisites or functionality. A truncated or
 missing roster remains fail-closed as `catalog-predicates-unavailable`, never a passing aggregate
 substituted for missing facts.
@@ -345,7 +439,7 @@ Rating computes whole-order **net pre-tax TCV**, excluding usage, counting one-t
 annualizing rolling recurring terms by their cycle (12 for `month`, 1 for `year`, the two periods
 PriceBook supports).
 Orders stores integer minor-unit figures verbatim; it neither sums lines nor converts decimal money.
-Rating's current caller-summation wording must be amended. Define mixed recurring cycles and
+D-197 amends Rating's caller-summation target; its implementation remains required. Define mixed recurring cycles and
 per-cycle display breakdowns without adding unlike-period figures. For an unsupported cycle/term,
 refuse evaluation rather than invent a mapping. Missing Preview term/cycle may withhold only TCV
 under the existing explicit annotation; submit/amendment cannot use that exception.
@@ -486,10 +580,10 @@ Product has approved the divergence. See [06 §4.3](features/06-workflow-seam.md
 Workflow must consume the complete Lifecycle SDK (all verdict authorities, explicit completion
 line mapping and immutable-version reads), pass the accepted version reference, acceptance
 instant, contract reference and external references to Subscriptions (never the bindings
-themselves; Subscriptions reads `chains[]` through `get_version`), check `activation_deadline`
+themselves; Subscriptions reads selected receipt identities/digests through `get_version`), check `activation_deadline`
 before each activation dispatch, treat a line as activated only at Subscriptions' `applied`, map
-`oss_unconfirmed` and the receiver's `accepted-price-mismatch` refusal to its failure catalog
-(`order-binding-expired` for the latter) and handle receiver refusal through compensation. Its approved-instance
+`oss_unconfirmed` and D-190's receiver refusals to its closed failure catalog
+(`order-binding-expired` for expiry/explicit closure, `market-divergence` for market change; other receiver reasons require explicit mapping, never a blanket provider-failure conversion) and handle receiver refusal through compensation. Its approved-instance
 constructor no longer requires a dependency graph: Workflow D-196 (branch `3ccf7793c`) withdrew the
 graph and the `dependency-graph-invalid` outcome, and wave ordering is Workflow-internal; the
 former unknown-topology clause is withdrawn with it (D-172). Workflow's approval-policy
@@ -544,11 +638,11 @@ tolerance, C4 no reconstruction, C5 durably pending work on an unavailable or de
 **MUST** pass the shared `orders-events` golden corpus specified there against their real handler,
 with their declared per-event applicability rule. **Passing the corpus is the integration
 sign-off gate** for each of the three; no consumer integration is accepted on a reading of the
-contract alone. Precedent: Pricing gates publish-contract sign-off on the joint proration golden
-fixture ([`../../pricing/docs/design/06-consumer-contracts.md`](../../pricing/docs/design/06-consumer-contracts.md)
-K5), held in [`gears/bss/fixtures`](../../fixtures/README.md). The corpus is specified in this gear
-and built with the first consumer integration (Workflow); Orders states the cases, each consumer
-owns its evaluator. The platform supplies no consumer-side processed-event store: the Event Broker
+contract alone. The former `gears/bss/fixtures`/Pricing `06-consumer-contracts.md` references
+are historical and absent from the current checkout. S1-06 must deliver or select an actual
+shared harness; no existing `CorpusEvaluator` or fixture runner is presumed. Orders states the
+cases and each consumer owns its real-handler evaluator. The corpus is built with the first
+consumer integration (Workflow), and remains unchecked until then. The platform supplies no consumer-side processed-event store: the Event Broker
 consumer contract places de-duplication on the consumer
 ([`0002-consumer-subscription-lifecycle.md`](../../../system/event-broker/docs/features/0002-consumer-subscription-lifecycle.md) §2.3).
 
@@ -590,11 +684,89 @@ publish the actual topic partition count so Orders can configure and verify it b
 The integration gate **MUST** cover eager GTS schema preparation, producer registration/cursor
 recovery, accepted/duplicate outcomes, transient retry and permanent rejection.
 
-This is an explicit release blocker, not a request for Orders to implement the broker. The current
-platform inventory says “SDK landed (`cf-gears-event-broker-sdk`) — impl crate TODO”
-([`../../../../docs/GEARS.md`](../../../../docs/GEARS.md)). Orders can test against an
-`EventBrokerApi` double, but it **MUST NOT** report ready for production event traffic without the
-runtime.
+**Capability present; integration remains open (D-200).** Main contains the
+[Event Broker implementation](../../../system/event-broker/event-broker/src/lib.rs) and its
+[ClientHub registration](../../../system/event-broker/event-broker/src/module.rs), as well as the
+managed producer and toolkit outbox. The SDK-only statement in the platform inventory is stale.
+Orders does not implement a broker or a private relay. This stable requirement now tracks actual
+runtime wiring, schema/partition readiness, deployment and real-provider conformance, not delivery
+of a missing implementation crate. Doubles permit local development but cannot satisfy this gate.
+See the [selected integration contract](DESIGN.md#contract-01-event-platform-integration).
+
+**S2-08 integration status (2026-10-06).** Orders binds the real `EventBrokerApi`, managed
+Chained `DbProducer` and toolkit queue `bss-orders-events`; readiness requires every prerequisite
+(evidence). These platform findings remain open:
+
+- **Partition-count read capability (requested).** No Event Broker API reports the partition
+  count. `models::Topic` deliberately omits it because it is the broker's own configuration:
+  per topic, `TopicSettingsEntry.partitions`, falling back to the instance-less topic-type
+  entry and then `BUILT_IN_PARTITIONS` (8). `list_topic_segments` returns an empty manifest for
+  any partition index, and producer cursors list only partitions already written, so neither
+  can substitute, so startup cannot compare the counts. Event Broker maintainers are asked for
+  a broker-level partition-count capability: an authorized read of a topic's resolved partition
+  count (or the hint validation below), so that Orders startup can fail on a mismatch. **DESIGN
+  §3.7 is amended by D-205** to match the platform: Orders requires an explicit, non-defaulted
+  `events.broker_partitions` and never assumes the SDK default of 8; equality with the broker
+  deployment is a deployment gate of this requirement (S6-05), set from one source and verified
+  before release; startup **MUST** fail on a mismatch once the capability exists.
+- **Silent loss under a partition-count mismatch (defect report for Event Broker / SDK
+  maintainers; S2-08 gap review, 2026-10-06). Deferred escalation:** recorded at the user's
+  request to be raised with the Event Broker owners later; nothing has been filed externally. Reproduced by the Orders PostgreSQL probe
+  `a_wrong_declared_partition_count_silently_drops_events` against the real in-process broker:
+  the producer declares 3 partitions and the broker is configured with 4. Twelve sequential
+  committed events, each settled before the next, gave **8 stored, 2 dead-lettered and 2
+  acknowledged without being stored**, with no queue retry or error. The result is deterministic.
+  The S2-08 implementation report's figures (3 stored, 7 silently acknowledged) counted
+  before the broker's asynchronous ingest outbox had persisted accepted events and are
+  superseded. The control `a_matching_partition_count_stores_every_event` (4 declared, 4
+  configured) stores all 12 events, and every publish is a first-time `Accepted`. The mechanism
+  follows.
+  1. *Producer side.* `producer/partitioning.rs` computes
+     `partition_hint = murmur3(subject) % declared` and maps each hinted broker partition to one
+     toolkit outbox partition. The chained processor (`producer/outbox.rs`
+     `ProducerOutboxProcessor::cursor_for`/`refresh_cursor`) keys its cursor by that hint.
+     `meta.sequence` is the outbox partition's `OutboxMessage.seq`.
+  2. *Broker side.* Ingest ignores `meta.partition_hint`. It selects the partition from the
+     configured count and checks the chain per `(producer, topic, selected partition)`
+     (`event-broker/src/domain/ingest.rs`, `ProducerChainCheck`). Under a mismatch, one broker
+     chain is therefore fed by several producer chains whose sequences collide.
+  3. *Silent acknowledgement.* `ProducerChainCheck::decide`
+     (`event-broker/src/domain/idempotency.rs`) returns `DuplicateIgnore` whenever
+     `sequence == last`, without checking `previous` or event identity. A **different** event
+     whose sequence equals the head of the selected chain is answered `Duplicate` and never
+     stored. The SDK maps `Duplicate` to `MessageResult::Ok`. Observed: `seq=1, previous=-1`
+     and `seq=4, previous=2`, both answered `Duplicate`.
+  4. *Dead letters.* Other collisions get `SequenceViolation`. The SDK refreshes the cursor
+     of the *hinted* partition, republishes, and on a second violation rejects with "producer
+     outbox chained sequence divergence persisted after cursor refresh". Observed for `seq=7,
+     previous=6` and `seq=3, previous=2`.
+  5. *Latent second path.* `ProducerOutboxProcessor::handle_sequence_violation` acknowledges
+     `seq <= previous` as already sequenced without publishing. Under a mismatch, `previous`
+     is read from the wrong partition, so this path can also drop an event silently; this run
+     did not exercise it.
+
+  Without a mismatch, one broker chain is fed by exactly one outbox partition, in FIFO order.
+  A sequence equal to the head is then a genuine retry: Orders observed it in the lost-ack
+  tests, before and after a restart, with the same event ID and `meta.sequence`. The
+  defect class is therefore gated on the count mismatch, which nothing currently detects.
+  Requested fixes, owner Event Broker:
+  - a broker-level partition-count read, or broker validation of `partition_hint` against
+    the selected partition (refuse instead of re-routing);
+  - `DuplicateIgnore` only when `previous` also links as for the original append, or the
+    event ID matches;
+  - an SDK guard that never acknowledges without a positive broker answer for the same
+    event.
+
+  Any producer republication protocol (`upreq-event-broker-dead-letter-recovery`) must also
+  avoid the `seq <= previous` acknowledgement for a re-driven message.
+- **PostgreSQL producer-registration defect (fixed in the owner).** The SDK's managed
+  registration store bound `created_at`/`updated_at` as RFC 3339 text, which PostgreSQL refuses
+  for its `TIMESTAMPTZ` columns, so no managed producer could register on PostgreSQL. SDK tests
+  ran only SQLite. The workspace carries exactly the upstream fix on branch
+  `fix/eb-sdk-producer-registration-timestamptz` (commit `797f902cf`): the columns are mapped
+  as `DateTimeUtc`, `Utc::now()` is bound, and `registration_tests.rs` adds SQLite and opt-in
+  PostgreSQL round trips plus legacy-text reload. It drops out of the Orders change set once that
+  branch merges. Orders' PostgreSQL integration suite is a further regression.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-event-broker-cursor-retry`
 
@@ -606,17 +778,21 @@ cadence remains owned by toolkit-db.
 
 **Owner:** Event Broker SDK maintainers.
 
-**Current gap:** `ProducerOutboxProcessor::handle` converts every error from
-`event_for_message` into `Reject`, including transient failures fetching the initial producer
-cursor. See the SDK's
-[`producer/outbox.rs`](../../../system/event-broker/event-broker-sdk/src/producer/outbox.rs).
-An empty cursor cache after restart or worker takeover can therefore turn a temporary broker
-outage into permanent rejection of valid events.
+**Source capability present (D-200).** The SDK's
+[`producer/outbox.rs`](../../../system/event-broker/event-broker-sdk/src/producer/outbox.rs)
+now maps initial cursor-fetch transport and rate-limit errors to `Retry`; the previously recorded
+all-errors-to-`Reject` defect is fixed. Source history identifies commit `c7de7b80ae` (2026-09-23).
+Existing SDK tests cover startup cursor recovery, sequence refresh and publish rate-limit retry;
+this inspection did not establish the dedicated empty-cache transient cursor-fetch regression.
+**S2-08 (2026-10-06):** the dedicated regression now exists in the owner's suite,
+`outbox_processor_retries_transient_initial_cursor_read_with_empty_cache`
+(`event-broker-sdk/tests/producer/outbox.rs`, real in-process broker). Orders' PostgreSQL suite
+repeats it through the running toolkit workers. Deployed-revision evidence remains open.
 
-**Release gate:** Orders production deployment **MUST** use an SDK revision containing this
-fix. Closure **MUST** record the merged SDK fix PR, the deployed revision containing it and
-passing regression evidence. This is a release prerequisite, not a runtime health check.
-**Tracking status:** open; no SDK fix PR or qualifying revision has been recorded.
+**Release gate:** record the deployed revision containing this behavior and passing the complete
+regression below. No new fix PR is required merely to satisfy the superseded defect description;
+a successful health check or presence of the source branch is not regression/deployment evidence.
+**Tracking status:** open for deployment and conformance; code behavior is present.
 
 **Acceptance evidence:** regression coverage **MUST** start with an empty cursor cache and
 inject transport and rate-limit cursor-fetch failures. Each failure **MUST** retain the message
@@ -675,8 +851,10 @@ override API. `ROOT_TENANT_ID` is the conceptual identity, not an assumed export
 Event Broker **MUST** honor the explicit envelope tenant when the producer is authorized for it,
 independently of its service-context tenant, and enforce the service grants in
 [authorization contract](DESIGN.md#contract-08-4-3).
-The platform **MUST** reconcile the broker design's producer-supplied tenant contract with wording
-that describes recording the publisher-context tenant. Root-scoped events **MUST NOT** become
+The implemented LocalBroker preserves the explicit event tenant and ingest checks authorization
+against that tenant. D-200 therefore tracks root identity/grants and real-provider verification,
+not a missing tenant override API; any conflicting publisher-context documentation remains a
+shared documentation follow-up. Root-scoped events **MUST NOT** become
 readable merely because a principal has customer, partner or seller access to an Orders API.
 
 **Owners:** Event Broker, platform tenant identity and authorization maintainers, with the
@@ -685,6 +863,13 @@ Workflow, Subscriptions and Billing owners confirming their consumer grants.
 **Release gate and tracking:** open. Orders production deployment requires a documented root UUID
 source, the concrete producer/consumer identities and grants, and passing broker integration
 evidence. No verified identity source or deployed grant configuration has been recorded.
+**S2-08 (2026-10-06):** Orders resolves the root from the platform
+`TenantResolverClient::get_root_tenant` before readiness. It requires an active parentless tenant
+and stamps that UUID on every envelope. The tenant-identity owners still have to confirm that
+call as the authoritative source. Locally, the broker authorized only the root envelope tenant,
+and a missing root grant dead-lettered without changing the order. The bundled rules AuthZ
+provider cannot express the broker's property-less `event_type` produce check: any rule
+constraint fails closed. Deployed grants therefore need a PDP able to grant that decision.
 
 **Acceptance evidence:** publish from an authorized service context with an explicitly selected
 root tenant and verify that envelope tenancy survives enqueue, publication, recovery and consumer
@@ -775,6 +960,11 @@ payload minimization and authorization. Provider non-reuse/deletion/restore evid
 the shared follow-up above, not to a new Orders-built mechanism. See
 [`DESIGN.md §4.3`](./DESIGN.md#43-data-protection-residency-and-retention).
 
+**Administrative free-text minimization (D-204).** `display_label`/`internal_notes` before/after
+values are a keyed `hmac-sha256:v1:<key_id>:<hex>` under required Orders configuration, replacing
+the S2-06 unkeyed digest. Privacy/Legal still owns whether a keyed pseudonym of that content may
+be retained and for how long; the minimizer is one replaceable function if that answer changes it.
+
 ### 2.9 Platform authorization policy
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-pdp-policy-integration`
@@ -828,6 +1018,23 @@ concrete ask:
 Orders never classifies a path as delegated and never validates proof locally, so the delegated
 arm of every Orders operation stays unbuildable until items 1–3 are provided.
 
+**Orders-side carrier (D-202, decided 2026-10-06).** The Orders REST boundary accepts the proof
+reference in the optional `X-Delegation-Proof-Ref` header (opaque, 1–512 printable ASCII,
+credential-free; malformed or repeated is `request-invalid` before authorization; never logged,
+echoed or forwarded except as PolicyEnforcer request context). It fills the same
+`CallMeta.delegation_proof_ref` as the SDK ([08 §4.4](DESIGN.md#contract-08-4-4)). This fixes the
+Orders boundary only. Items 1–3 above still ask the platform for its own carrier and deny codes;
+until then the reference travels as the reserved, never-compiled resource property
+`delegation_proof_ref`, and the deny codes `delegation_proof_required`/`delegation_proof_invalid`
+are Orders constants pending platform agreement.
+
+**Integration and E2E provider (2026-10-06).** The fail-closed `rules-authz-plugin` is a real
+resolver provider for integration and live E2E, not the production provider. It also grants
+Event Broker's property-less `event_type` `produce` check to the Orders producer principal through
+an exact unconditional grant, with no wildcard or allow-all, and its tenant-scope `produce` check
+through an ordinary rule constrained to the platform root tenant. Production provisioning of
+those producer grants remains part of this requirement and of `…-upreq-event-broker-runtime`.
+
 **Acceptance evidence:** identify the deployed provider and policy/configuration revisions, then
 jointly test principals in the same tenant with different action grants; each of the three read
 axes; rejection outside all authorized paths; former-payer loss of access; and old-order permission
@@ -875,27 +1082,35 @@ inside it; the subscription-side dimension rides the `SUB-O5` amendment above.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-products-sku-read-grant`
 
-Products must admit the `bss-orders.system` subject to `ProductsClient::get_sku` in the seller
+Products must admit the authenticated Orders service principal (D-194) to `ProductsClient::get_sku` in the seller
 tenant (a SKU read grant), so the gate can read `Sku.sellable` and `Sku.lifecycle` for each consumed
 SKU (DESIGN §4.1, D-160). `get_sku` is a scoped read: the tenant argument narrows, it never grants.
-P-D-222 (fork tip `7d3544156`) refuses the Pricing system actor at every REST door, so this grant
-is the only self-service path; the resolve-echo alternative is withdrawn (D-171). The read is
-interim: it retires when Pricing publishes `SellabilityV1` (D-177), after which Seam Atlas P9
+P-D-222 refuses the Pricing system actor at every REST door; D-194 uses the ordinary service
+PDP path instead of impersonating it. The resolve-echo alternative is withdrawn (D-171). The read is
+interim: it retires when the proposed D-189 nonbinding assessment supplies authoritative SKU results
+(amending D-177; the existing acceptance command alone is insufficient), after which Seam Atlas P9
 holds. Until the grant exists the row is `catalog-predicate-unevaluable`.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-sku-protection`
 
-**Narrowed scope; stable ID (D-164).** Protection is inherited: every item of a published or
-superseded revision holds a `plan_item` reference on its SKU, Pricing keeps those references until
-Subscriptions reports that no subscription pins the revision, plan retirement is deferred (D-410)
-and Products refuses retirement with `SKU_REFERENCED` while a reference is live. Orders asks for no
-owner, kind, receipt or reserve/confirm/release. The one ask is the release trigger: when Pricing's
-release report is implemented, the holders that keep a revision's references alive must include
-orders that have accepted the revision and are not terminal, since a subscription draft not yet
-created is invisible to Subscriptions' presence read (`SUB-P8`). Either the Subscriptions report
-takes Orders' in-flight claims as an input, or Pricing reads them from this gear's authorized read
-surface. Forced administrative retirement needs a documented refusal/compensation outcome, not
-prevention from here.
+**Pricing coordinates release; stable ID (D-164, amended by D-196).** SKU protection is inherited
+from revision `plan_item` references. Pricing is the sole Products reference owner; Orders asks
+for no registry owner, kind, receipt or reserve/confirm/release grant. Current Pricing retains
+published/superseded revision references: revision retirement/release is deferred by Pricing
+D-410, and book archival releases entry references only. This is existing conservative protection,
+not an implemented usage-aware cleanup feature.
+
+Before enabling revision-reference release, deliver the [D-196 closure/drain and usage contract](DESIGN.md#contract-03-revision-reference-protection).
+Pricing coordinates authorized Orders and Subscriptions reports itself. It MUST durably close new
+admission, fence and drain older work, and prove absence of every remaining holder under the same
+release generation before releasing references. A zero count from an ordinary read is insufficient.
+Reports cover D-188 preparations that can still commit, committed nonterminal versions, and the
+handoff to durable Subscriptions ownership without a protection gap. Missing, stale, denied or
+unavailable reports retain references. Receipts from failed attempts confer no activation rights.
+The SDK/report shapes, closure acknowledgements, grants, recovery and cross-owner tests remain
+unimplemented release prerequisites; no existing API is asserted. R12 activation/cardinality
+fencing remains a separate dependency. If a SKU becomes retired, D-190 fresh eligibility refusal
+and failure/compensation handling still apply; this decision adds no force-retire capability.
 
 ### 2.11 Contracts
 
@@ -950,11 +1165,17 @@ the gateway's own open ADR-0001 and is not asked here.
 `(subject_id, orderId)`, before the engine call, writing no audit row and answering 429; Orders
 removes it when the gateway variant lands. Architecture decides between waiting and the fallback.
 
+**Status (2026-10-07, S2-12, D-211):** the fallback is implemented and verified
+(`api::rest::throttle::PerOrderLimiter`, 20/min baseline, bounded key store, consulted before
+boundary validation; real-PostgreSQL and live E2E evidence in
+MILESTONE). The request to the gateway stands: the gear-local
+limiter is per replica and Orders removes it when the composite key lands.
+
 ## 3. Priorities
 
 | Priority | Requirements |
 |----------|-------------|
-| `p1` (critical) | `…-upreq-subscription-start-instant`, `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-pre-subscription-evaluation`, `…-upreq-tcv-with-annualisation`, `…-upreq-external-reference-propagation`, `…-upreq-delegation-proof-credential`, `…-upreq-authorization-outcome`, `…-upreq-event-consumer-conformance`, `…-upreq-workflow-amendment-verdict`, `…-upreq-workflow-overdue-escalation`, `…-upreq-event-broker-runtime`, `…-upreq-event-broker-cursor-retry`, `…-upreq-event-broker-dead-letter-recovery`, `…-upreq-event-broker-root-tenancy`, `…-upreq-event-delivery-observability`, `…-upreq-catalog-subscription-product-key`, `…-upreq-pricing-read-sdk`, `…-upreq-pricing-catalog-tenant-reads`, `…-upreq-products-sku-read-grant`, `…-upreq-pricing-purchase-assessment`, `…-upreq-initial-binding-acceptance`, `…-upreq-sku-protection`, `…-upreq-rating-evaluation`, `…-upreq-payer-commercial-profile`, `…-upreq-contract-party-eligibility`, `…-upreq-contract-acceptance-declaration`, `…-upreq-settle-create`, `…-upreq-intent-status-read`, `…-upreq-transition-outcome-echo`, `…-upreq-overlap-activation-atomicity` (release gate for submit/activation, D-180) |
+| `p1` (critical) | `…-upreq-subscription-start-instant`, `…-upreq-pre-subscription-billing-terms`, `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-pre-subscription-evaluation`, `…-upreq-tcv-with-annualisation`, `…-upreq-external-reference-propagation`, `…-upreq-delegation-proof-credential`, `…-upreq-authorization-outcome`, `…-upreq-event-consumer-conformance`, `…-upreq-workflow-amendment-verdict`, `…-upreq-workflow-overdue-escalation`, `…-upreq-event-broker-runtime`, `…-upreq-event-broker-cursor-retry`, `…-upreq-event-broker-dead-letter-recovery`, `…-upreq-event-broker-root-tenancy`, `…-upreq-event-delivery-observability`, `…-upreq-catalog-subscription-product-key`, `…-upreq-pricing-read-sdk`, `…-upreq-pricing-catalog-tenant-reads`, `…-upreq-commercial-service-provisioning`, `…-upreq-products-sku-read-grant`, `…-upreq-pricing-purchase-assessment`, `…-upreq-pricing-acceptance-policy`, `…-upreq-initial-binding-acceptance`, `…-upreq-sku-protection`, `…-upreq-rating-evaluation`, `…-upreq-payer-commercial-profile`, `…-upreq-contract-party-eligibility`, `…-upreq-contract-acceptance-declaration`, `…-upreq-settle-create`, `…-upreq-intent-status-read`, `…-upreq-transition-outcome-echo`, `…-upreq-overlap-activation-atomicity` (release gate for submit/activation, D-180) |
 | `p2` (important) | `…-upreq-order-reference-on-create`, `…-upreq-two-phase-pair-preserved`, `…-upreq-correlation-propagation`, `…-upreq-indicative-tax-read`, `…-upreq-audit-identity-lifecycle`, `…-upreq-gateway-path-param-throttle-key` |
 
 `cpt-cf-bss-orders-lifecycle-upreq-pdp-policy-integration` is also `p1`: verification and
@@ -987,8 +1208,7 @@ mitigation exists.
 
 ## PriceBook readiness additions
 
-The p1 requirements `…-upreq-pricing-read-sdk`, `…-upreq-pricing-purchase-assessment` (narrowed to
-the residual verdict), `…-upreq-initial-binding-acceptance` (compare-at-activation),
+The p1 requirements `…-upreq-pricing-read-sdk`, `…-upreq-pricing-purchase-assessment` (D-189 nonbinding shared assessment), `…-upreq-pricing-acceptance-policy` (D-191 seller-policy discovery/resolution), `…-upreq-initial-binding-acceptance` (D-190 committed-receipt activation),
 `…-upreq-sku-protection` (narrowed to the release trigger) and `…-upreq-workflow-pricebook-contracts`
 are additional release prerequisites. Existing seller-read, Rating, composition and overlap-key IDs
 carry the revised contracts above. The 2026-09-30 revision (D-159–D-168) pulls each ask back onto the
@@ -998,5 +1218,34 @@ seam that already exists where one does; no ID marked unchecked is represented a
 `…-upreq-intent-status-read`, `…-upreq-transition-outcome-echo`), co-signed with the Workflow
 branch's `SUB-O13`/`SUB-O16`; §2.2, §2.4, §2.5, §2.6, §2.10 and §2.11 carry field shapes and the
 fork-tip facts (Pricing D-454/D-460/D-467/D-469, Products P-D-222, Workflow D-193–D-199).
-Decisions D-169–D-178 record the Orders-side positions; Q-32 (the hold) and Q-33 (add-ons and
-change orders) are the two open product questions.
+Decisions D-169–D-178 record the Orders-side positions; Q-32 (the hold) is now resolved by D-190; Q-33 (add-ons and change orders) remains open.
+
+
+### R02 reconciliation: existing durable acceptance contract (D-188)
+
+`SellabilityV1::check` already commits immutable receipts uniquely by seller/order/version/line. Orders adopts permanently reserved candidate version numbers through the [D-188 protocol](DESIGN.md#contract-01-commercial-attempt); no Pricing SDK or uniqueness change is requested. Orders still owns its adapter, durable attempts, authorization/grants, immutable input mapping and recovery. Cross-service conformance must prove exact-key replay after a lost response, partial multi-line failure followed by edited resubmission on a fresh candidate, and rejection of reserved/unselected receipts by downstream activation. The receipt command is not the previously assumed residual predicate verdict or a Preview read: those evidence/API gaps remain open. R03 is separately resolved by D-189; R04 follows D-190; D-191 resolves policy/deadline authority, with seller-policy discovery/resolution and deadline conformance still missing.
+
+
+### R06 downstream adoption requirement (D-192; not delivered)
+
+The requirement is registered in [§2.1](#21-subscriptions) as
+`cpt-cf-bss-orders-lifecycle-upreq-frozen-commercial-materialization`, where requirement IDs are
+defined; its full text is kept there unchanged.
+
+### R11 exact-binding evaluation delivery (D-197; missing runtime)
+
+Implement the [D-197 request/result and failure contract](DESIGN.md#contract-03-rating-purchase-evaluation), including authorized service grants, model/profile declaration, canonical input identity, complete minor-unit aggregates, single TCV carrier and finite/rolling/mixed basis. Orders freezes evaluation in D-188 and validates receipt equality. No arithmetic adapter or test double closes this prerequisite. Joint tests cover temporal/rounding/model boundaries, usage versus zero, missing scope, malformed responses, Preview-only withholding, changed catalog and replay. The Rating PRD/SEAMS amendments select the target; they are not deployed-provider evidence or owner signoff. Indicative tax remains separately open.
+
+
+**D-198 delivery prerequisite (unchecked):** Subscriptions/Workflow must implement the [receiver admission, complete inventory barriers, cancellation/hold linearization and ambiguous-outcome recovery protocol](DESIGN.md#contract-06-activation-admission). Include pending admissions in capacity, protect policy-generation updates, retain unknown claims, and reject unselected/reserved version receipts. Existing hold/eligibility reads cannot supply this authority. Engine coordination SDKs, receiver typed evidence, grants and cross-service tests remain missing; target scope selection does not establish peer sign-off.
+
+### R13 commercial owner readiness (D-199; not delivered)
+
+The [owner contract/readiness matrix](DESIGN.md#contract-05-commercial-owner-readiness) governs §2.4–2.6 and §2.11 delivery: record SDK/schema, actual provider, principal/grants, scope, evidence identity, freshness and real conformance for each affected path. Account Management's existing tenant/metadata APIs do not yet define the commercial profile; Ledger payments and admission-control are not Payments authorization; BSS Approvals does not establish order approval policy.
+
+- [ ] Deliver authoritative payer profile and PDP-verified delegation, including absent/invalid/foreign-axis tests.
+- [ ] Deliver batched Contracts status/eligibility/declaration and live guard-time reads with no unavailable fallback.
+- [ ] Deliver Payments authorize/read-by-request and Workflow restart recovery; bind request to version/payer/amount provenance separately from TCV.
+- [ ] Deliver current-version approval/consent independence, amendment reapproval and Workflow production integration with actual owner providers.
+
+Lifecycle continues consuming Workflow adapter facts under D-175; no new direct provider verification API is introduced. Runtime, permissions and owner signoff remain open, and doubles never close production requirements.

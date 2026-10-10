@@ -261,7 +261,8 @@ singleton ([`01-foundation-lifecycle.md`](./01-foundation-lifecycle.md) §3.8).
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-normative-overlap-chg`
 
-- Default: at most **one `active`** per `overlapScopeKey = (payerTenantId, catalogSubscriptionProductKey)`; `catalogSubscriptionProductKey` is **registry-owned** — Design binds the stored field to a published SKU/product key (SEAMS **SUB-G1**, PR #4177).
+- **D-198 target reconciliation (implementation/adoption pending):** default scope becomes `(payerTenantId, resourceTenantId, catalogSubscriptionProductKey)` plus declared extra dimensions. The legacy producer default below remains the compatibility interpretation until SUB-G1/SUB-O5 adopt the target; consumers cannot re-bucket it. [Orders receiver contract](../../../orders-lifecycle/docs/DESIGN.md#contract-06-activation-admission) requires pending intent slot reservations, policy-generation consistency and receiver fencing at admission/confirmation.
+- Legacy producer default: at most **one `active`** per `overlapScopeKey = (payerTenantId, catalogSubscriptionProductKey)`; `catalogSubscriptionProductKey` is **registry-owned** — Design binds the stored field to a published SKU/product key (SEAMS **SUB-G1**, PR #4177).
 - Multiple concurrent `active` are allowed when they differ on `overlapScopeKey` (extra dimensions) or when Catalog/Contract sets `maxConcurrentActive > 1`; else `maxConcurrentActive = 1` ([`../PRD.md`](../PRD.md) §6.3).
 - **Detection runs on every entry into `active`** — `activate` **and** `resume` — **and on every committed change that mutates the key**: a `changePlan` that alters `catalogSubscriptionProductKey` and an ownership `transfer` that alters `payerTenantId` (slice 07) re-evaluate before commit (2026-07-15 review fix; detection-on-activate-only left three bypasses). The rule **rejects or queues fail-closed** when it would break idempotent billing.
 - **Supersedes exemption:** a successor carrying `supersedesSubscriptionId` (§4.3 cancel+new) is exempt from the rule against exactly its predecessor until the predecessor **actually ends** — the handover window is not a violation. If the predecessor's cancel firing is retrying (§4.3 symmetric compensation), the exemption is **held open** past the originally-scheduled end for the retry window rather than lapsing into a spurious overlap violation.
@@ -306,3 +307,16 @@ machine. The executor contract, normative here with pricing D-36/D-38 as the cou
 - **Decisions**: SUB-D-02 (`updateQuantity`), SUB-D-04 (ramps), SUB-D-15 (manual change supersedes mid-ramp; §4.5), SUB-D-21 (immediate-delta producer; §4.1), SUB-D-26 (cancel+new cohort disclosure; §4.3), SUB-D-27 (anchor-altering change at next boundary; §4.1) — [`../DECISIONS.md`](../DECISIONS.md).
 - **ADR**: [`../ADR/0002`](../ADR/0002-cpt-cf-bss-subscriptions-adr-when-not-math-split.md) (WHEN/MATH split).
 - **Slices**: [`01-foundation-lifecycle.md`](./01-foundation-lifecycle.md) (envelope, scheduler), [`02-composition-versioning.md`](./02-composition-versioning.md) (intervals), [`08-events-billing.md`](./08-events-billing.md) (change events), [`09-consumer-contracts.md`](./09-consumer-contracts.md) (rating read-model).
+
+
+### Lifecycle D-201 receiver amendments
+
+The receiver contract matrix preserves historical
+SUB-O aliases and names each semantic operation. All activation writers (direct, Orders,
+resume, transfer and key-changing plan change) obey the shared capacity/fence protocol.
+An Orders draft rebuild requires the [engine-issued successor](../../../orders-lifecycle/docs/DESIGN.md#contract-06-replace-fulfillment-grant);
+closed generations never reopen and completed members are not recreated. Intent admission and
+applied confirmation use the [separate clock contract](../../../orders-lifecycle/docs/DESIGN.md#contract-06-activation-clocks).
+Hold pauses pending confirmation; it preserves already active service. Late OSS effects remain
+reconcilable with uncertain claims retained. These are normative receiver requirements;
+provider SDK implementation and deployed conformance remain separate delivery work.

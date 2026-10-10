@@ -268,3 +268,22 @@ own policy — DRY the mechanism, not the policy. Not a launch blocker.
 **Pricing D-372 amendment (2026-09-16), K6:** row selection uses `(skuId, dimensionKey)`. The SKU is the priced row's registry resource identity; `meter` is derived and frozen for measurement-model mapping, and two resource SKUs may share it. The plan-level SKU continues to name the sold offer.
 
 **Pricing D-419–D-422, D-424 and D-425 amendment (2026-09-26), C1:** the frozen consumer contract C1 asks Rating to adopt is now pricing's read contract (the legacy `design/06` contract this row cites was replaced by the PriceBook model, T-D-37): `GET /bss-pricing/v1/resolve` answers a published or superseded revision on the period start, renewing from the subscription's pins, with the whole chain matrix per item — a binding or `uncovered` per chain, the SKU version and meter as of the date, and the invoice inputs each with its source (`entry`, `sku`, `tenant` or null) — and `GET /bss-pricing/v1/prices/{id}` serves a pinned price's original money forever. Both are frozen in `gears/bss/pricing/pricing/tests/contract/` on SQLite and Postgres; the pin syntax, the full shape and the grants (pricing `plan:read` and `price:read` only: resolve reads SKU versions as pricing's system actor, pricing D-424) are in [`DECISIONS.md`](./DECISIONS.md) T-D-37/T-D-38. The minimum-fee floor and proration are Rating's (T-D-38): pricing computes neither, and the joint fixture corpus, its proration family included, was deleted with `gears/bss/fixtures/` in pricing phase 4.
+
+## Orders purchase evaluation target — D-197 (2026-10-05)
+
+The selected [Orders R11 contract](../../orders-lifecycle/docs/DESIGN.md#contract-03-rating-purchase-evaluation) and Rating `fr-pre-purchase-evaluation` supersede the historical chain-matrix/catalog-prefix and caller-summation descriptions **for pre-purchase evaluation only**. Input is exact selected Pricing native bindings plus explicit quantity, market and D-193 BillingTerms; Rating owns all money and returns minor-unit line/order aggregates and TCV basis. No renewal resolve, subscription/cohort fabrication, posting or billing input is authorized. Broader snapshot composition remains Rating-owned.
+
+- [ ] Deliver SDK/provider, supported profiles, grants and exact request/response schemas.
+- [ ] Prove finite/rolling/mixed terms, rounding/models, usage versus zero, authorization, Preview-only withholding and receipt-equality/replay scenarios against real providers.
+
+This is an adopted planning target, not runtime conformance or producer-owner signoff; the gear remains docs-only. Historical seam entries remain historical outside this narrow amendment.
+
+
+### Orders asynchronous start compatibility (Lifecycle D-201)
+
+An Orders receiver reports the actual service-effective instant from the authoritative applied
+outcome, separately from the held Pricing activation identity and quoted date. Follow the
+[clock contract](../../orders-lifecycle/docs/DESIGN.md#contract-06-activation-clocks): a supported
+Rating profile must preserve the accepted BillingTerms/period anchors when actual start differs.
+Missing support or a required term change blocks activation and requires reconciliation/new
+commercial acceptance; never silently move the billing anchor. No deployed profile is claimed.

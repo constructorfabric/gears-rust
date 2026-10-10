@@ -1,0 +1,72 @@
+[package]
+name = "cf-gears-bss-orders-lifecycle"
+edition.workspace = true
+license.workspace = true
+description = "Orders Lifecycle fail-closed runtime scaffold"
+
+[lib]
+name = "bss_orders_lifecycle"
+
+[lints]
+workspace = true
+
+[dependencies]
+bss-orders-lifecycle-sdk = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Worker observability (01 §3.5/§3.8): instruments on the process meter, as settings-service.
+opentelemetry = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+aws-lc-rs = { workspace = true }
+# Opaque continuation tokens (08 §2.2, D-139), following the Approvals cursor precedent.
+base64 = { workspace = true }
+# Read query-string decoding at the REST boundary (filters, page_size, cursor).
+serde_urlencoded = { workspace = true }
+secrecy = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+arc-swap = { workspace = true }
+axum = { workspace = true }
+# The gear-local per-(caller, order) edge limiter (Foundation §3.7, D-185), the same keyed
+# token-bucket the api-gateway throttling zones use.
+governor = { workspace = true }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+toolkit-db-macros = { workspace = true }
+event-broker-sdk = { workspace = true, features = ["db", "outbox"] }
+tenant-resolver-sdk = { workspace = true }
+# Required gear dependencies (D-200): the platform root-tenant source and the real broker.
+tenant-resolver = { workspace = true }
+event-broker = { workspace = true }
+time = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-macros = { workspace = true }
+utoipa = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+authz-resolver = { workspace = true }
+authz-resolver-sdk = { workspace = true }
+types-registry = { workspace = true }
+types-registry-sdk = { workspace = true }
+toolkit = { workspace = true, features = ["db"] }
+toolkit-db = { workspace = true, features = ["pg"] }
+
+[dev-dependencies]
+# The real gateway throttling maps and middleware, so the D-185 zone bindings are proven against
+# the platform limiter in-process (the live E2E runs the whole gateway).
+api-gateway = { workspace = true }
+# The real in-process Event Broker gear harness (LocalBroker, ingest, spec loading).
+event-broker = { workspace = true, features = ["test-utils"] }
+static-authz-plugin = { workspace = true }
+rules-authz-plugin = { workspace = true }
+parking_lot = { workspace = true }
+serde-saphyr = { workspace = true }
+trybuild = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+toolkit-db = { workspace = true, features = ["sqlite"] }
+test-containers = { workspace = true }
+testcontainers-modules = { workspace = true }

@@ -1,0 +1,7 @@
+[gear]
+name = "Orders Lifecycle"
+description = "Order capture and commercial lifecycle; draft authoring and draft reads enabled (S2 foundation milestone), later operations registered but unavailable."
+category = "bss"
+is_plugin = false
+has_plugins = false
+has_extension_point = false

@@ -1,0 +1,176 @@
+error[E0308]: mismatched types
+  --> tests/ui/runtime_capability_escape.rs:13:5
+   |
+12 | fn deref_escape(discovery: &DiscoveryScope) -> &AccessScope {
+   |                                                ------------ expected `&AccessScope` because of return type
+13 |     discovery
+   |     ^^^^^^^^^ expected `&AccessScope`, found `&DiscoveryScope`
+   |
+   = note: expected reference `&AccessScope`
+              found reference `&DiscoveryScope`
+
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/ui/runtime_capability_escape.rs:20:13
+   |
+20 |     let _ = DiscoveryScope(AccessScope::deny_all());
+   |             ^^^^^^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> tests/ui/../../src/infra/maintenance/scope.rs
+   |
+   | pub struct DiscoveryScope(AccessScope);
+   |                           ^^^^^^^^^^^ private field
+help: consider making the field publicly accessible
+  --> tests/ui/../../src/infra/maintenance/scope.rs
+   |
+   | pub struct DiscoveryScope(pub AccessScope);
+   |                           +++
+
+error[E0624]: associated function `new` is private
+  --> tests/ui/runtime_capability_escape.rs:21:29
+   |
+21 |     let _ = DiscoveryScope::new();
+   |                             ^^^ private associated function
+   |
+  ::: tests/ui/../../src/infra/maintenance/scope.rs
+   |
+   |     fn new() -> Self {
+   |     ---------------- private associated function defined here
+   |
+   = help: items from traits can only be used if the trait is in scope
+help: trait `Paint` which provides `new` is implemented but not in scope; perhaps you want to import it
+   |
+ 4 + use yansi::paint::Paint;
+   |
+
+error[E0308]: mismatched types
+  --> tests/ui/runtime_capability_escape.rs:23:48
+   |
+23 |     let _ = TargetScope::from_discovered_order(&uuid::Uuid::nil());
+   |             ---------------------------------- ^^^^^^^^^^^^^^^^^^ expected `&DiscoveredOrder`, found `&Uuid`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected reference `&DiscoveredOrder`
+              found reference `&uuid::Uuid`
+note: associated function defined here
+  --> tests/ui/../../src/infra/maintenance/scope.rs
+   |
+   |     pub fn from_discovered_order(row: &DiscoveredOrder) -> Self {
+   |            ^^^^^^^^^^^^^^^^^^^^^ ---------------------
+
+error[E0277]: the trait bound `TargetScope: From<AccessScope>` is not satisfied
+  --> tests/ui/runtime_capability_escape.rs:24:50
+   |
+24 |     let _: TargetScope = AccessScope::deny_all().into();
+   |                                                  ^^^^ unsatisfied trait bound
+   |
+help: the trait `From<AccessScope>` is not implemented for `TargetScope`
+  --> tests/ui/../../src/infra/maintenance/scope.rs
+   |
+   | pub struct TargetScope {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `AccessScope` to implement `Into<TargetScope>`
+
+error: cannot construct `DiscoveredOrder` with struct literal syntax due to private fields
+  --> tests/ui/runtime_capability_escape.rs:26:13
+   |
+26 |     let _ = DiscoveredOrder {
+   |             ^^^^^^^^^^^^^^^
+27 |         order_id: uuid::Uuid::nil(),
+   |         --------------------------- private field
+   |
+   = note: ...and other private fields that were not provided
+
+error[E0308]: mismatched types
+  --> tests/ui/runtime_capability_escape.rs:34:18
+   |
+34 |     worker_entry(&discovery);
+   |     ------------ ^^^^^^^^^^ expected `&TargetScope`, found `&DiscoveryScope`
+   |     |
+   |     arguments to this function are incorrect
+   |
+   = note: expected reference `&TargetScope`
+              found reference `&DiscoveryScope`
+note: function defined here
+  --> tests/ui/runtime_capability_escape.rs:15:4
+   |
+15 | fn worker_entry(_: &TargetScope) {}
+   |    ^^^^^^^^^^^^ ---------------
+
+error[E0308]: mismatched types
+  --> tests/ui/runtime_capability_escape.rs:35:48
+   |
+35 |     let _ = TargetScope::from_discovered_order(&discovery);
+   |             ---------------------------------- ^^^^^^^^^^ expected `&DiscoveredOrder`, found `&DiscoveryScope`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected reference `&DiscoveredOrder`
+              found reference `&DiscoveryScope`
+note: associated function defined here
+  --> tests/ui/../../src/infra/maintenance/scope.rs
+   |
+   |     pub fn from_discovered_order(row: &DiscoveredOrder) -> Self {
+   |            ^^^^^^^^^^^^^^^^^^^^^ ---------------------
+
+error[E0308]: mismatched types
+  --> tests/ui/runtime_capability_escape.rs:36:70
+   |
+36 |     let _ = entity::order::Entity::delete_many().secure().scope_with(&discovery);
+   |                                                           ---------- ^^^^^^^^^^ expected `&AccessScope`, found `&DiscoveryScope`
+   |                                                           |
+   |                                                           arguments to this method are incorrect
+   |
+   = note: expected reference `&AccessScope`
+              found reference `&DiscoveryScope`
+note: method defined here
+  --> $WORKSPACE/libs/toolkit-db/src/secure/db_ops.rs
+   |
+   |     pub fn scope_with(self, scope: &AccessScope) -> SecureDeleteMany<E, Scoped> {
+   |            ^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/runtime_capability_escape.rs:37:70
+   |
+37 |     let _ = entity::order::Entity::update_many().secure().scope_with(&discovery);
+   |                                                           ---------- ^^^^^^^^^^ expected `&AccessScope`, found `&DiscoveryScope`
+   |                                                           |
+   |                                                           arguments to this method are incorrect
+   |
+   = note: expected reference `&AccessScope`
+              found reference `&DiscoveryScope`
+note: method defined here
+  --> $WORKSPACE/libs/toolkit-db/src/secure/db_ops.rs
+   |
+   |     pub fn scope_with(self, scope: &AccessScope) -> SecureUpdateMany<E, Scoped> {
+   |            ^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/runtime_capability_escape.rs:41:27
+   |
+41 |         .scope_with_model(&discovery, &model);
+   |          ---------------- ^^^^^^^^^^ expected `&AccessScope`, found `&DiscoveryScope`
+   |          |
+   |          arguments to this method are incorrect
+   |
+   = note: expected reference `&AccessScope`
+              found reference `&DiscoveryScope`
+note: method defined here
+  --> $WORKSPACE/libs/toolkit-db/src/secure/db_ops.rs
+   |
+   |     pub fn scope_with_model(
+   |            ^^^^^^^^^^^^^^^^
+
+error[E0624]: method `select` is private
+  --> tests/ui/runtime_capability_escape.rs:43:23
+   |
+43 |       let _ = discovery.select(entity::order::Entity::find());
+   |                         ^^^^^^ private method
+   |
+  ::: tests/ui/../../src/infra/maintenance/scope.rs
+   |
+   | /     fn select<E: ScopableEntity + EntityTrait>(&self, query: Select<E>) -> SecureSelect<E, Scoped>
+   | |     where
+   | |         E::Model: Send + Sync,
+   | |______________________________- private method defined here

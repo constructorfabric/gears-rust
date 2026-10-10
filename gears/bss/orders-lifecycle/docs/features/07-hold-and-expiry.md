@@ -83,7 +83,7 @@ Product-owned TTL durations have no code default; they ship as provisional, migr
 **Input**: target, authenticated context, idempotency key and `expected_version` for each separate request; optional hold reason.
 
 1. Request `POST /bss-orders-lifecycle/v1/orders/{orderId}/hold` through the shared authorization pre-guard and engine. The caller supplies no resume target.
-2. The engine admits only `submitted`, `pending_approval`, `approved` or `in_fulfillment`, stores the outgoing state in `pre_hold_state`, and commits `on_hold`, audit and `OrderHeld` atomically. The optional reason is `caller_reason`, NULL when omitted.
+2. For a post-spawn fulfillment hold, first stage engine-owned pause coordination under [D-198](../DESIGN.md#contract-06-activation-admission), block new grants and obtain every receiver barrier outside SQL locks; return existing still-processing until ready. The engine admits only `submitted`, `pending_approval`, `approved` or `in_fulfillment`, stores the outgoing state in `pre_hold_state`, and commits `on_hold`, audit and `OrderHeld` atomically. The optional reason is `caller_reason`, NULL when omitted.
 3. Later request `/resume` with its own key and expected version. After shared authorization/idempotency checks, the engine checks admissibility and expected version, then evaluates the registered resume-cap guard before resolving or validating the stored resume target, all under the aggregate lock.
 4. On success, restore exactly `pre_hold_state`, clear it, reset the state dwell clock, increment `resume_count`, and commit audit and `OrderResumed` in the same transaction.
 
@@ -111,7 +111,7 @@ Workflow uses its separate `/workflow-cancel` endpoint and compensation evidence
 **Actors**: two distinct Fulfillment Operators holding the break-glass `order × force-fail-unreconciled` grant. **Use case**: `cpt-cf-bss-orders-lifecycle-usecase-order-fulfillment-complete`.
 
 1. The §3.8 overdue alert or Workflow's escalation names an order in `in_fulfillment`, or `on_hold` with pre-hold `in_fulfillment`, past expected fulfillment time plus the overdue window, after the spawn signal, that Workflow can neither complete nor close with complete evidence.
-2. The requester calls `POST /bss-orders-lifecycle/v1/orders/{orderId}/forced-failure` with a mandatory reason, the attested `drafts_voided` and `activated_rolled_back` lists, its own idempotency key and expected version, and no `request_audit_id`. Every guard runs; the last refuses `second-approver-required`, committed and audited, returning `requestAuditId`. That refused entry is the request.
+2. The requester calls `POST /bss-orders-lifecycle/v1/orders/{orderId}/forced-failure` with a mandatory reason, the attested `drafts_voided` and `activated_rolled_back` lists, its own idempotency key and expected version, and no `request_audit_id`. Every guard runs; the last refuses `second-approver-required`, committed and audited, returning `request_audit_id`. That refused entry is the request.
 3. A different operator calls the same endpoint with its own key, the current expected version, its reason and lists, and that `request_audit_id` within the approval window and before any state change.
 4. The engine commits row 28 or 29 to `fulfillment_failed`: `failure_reason = operator-forced-unreconciled`, the forced evidence variant with `no_active_subscription_remains = unknown` and the operator attestation naming both, the claim release of every terminal, audit and `OrderFulfillmentFailed`. A dedicated alert fires.
 
@@ -243,15 +243,15 @@ Output: on_hold then the restored state, or a registered refusal
 
 1. [ ] - `p1` - Declare no admissibility guard: hold is admissible only where [01 §4.3](01-foundation.md#contract-01-4-3) has a hold row (`submitted`, `pending_approval`, `approved`, `in_fulfillment`), and the engine refuses any other state as `not-admissible` at [01 §3.6](01-foundation.md#contract-01-3-6) *Attempt Transition* step 11 - `inst-hr-declare-admissibility-guard`
 2. [ ] - `p1` - Supply no pre-hold value; the engine records the outgoing state as `pre_hold_state` at [01 §3.6](01-foundation.md#contract-01-3-6) *Attempt Transition* step 20.2, and this slice contributes nothing to the aggregate on hold - `inst-hr-store-prehold`
-3. [ ] - `p1` - Request the hold transition with the request's `expected_version`; the engine records the actor, the instant and the reason, if one was supplied, on the audit entry — the reason in its `caller_reason`, NULL when none was supplied ([01 §3.7](../DESIGN.md#contract-01-3-7), D-143) — and publishes OrderHeld, which carries the reason only when present. No guard requires a hold reason (D-138) - `inst-hr-request-hold`
-4. [ ] - `p1` - **RETURN** on_hold - `inst-hr-return-on-hold`
+3. [ ] - `p1` - For post-spawn fulfillment, use the [D-198 staged receiver pause](../DESIGN.md#contract-06-activation-admission); only complete exact barrier evidence permits the effective hold. Pending work returns existing still-processing, retaining the prior public state. Request the hold transition with the request's `expected_version`; the engine records the actor, the instant and the reason, if one was supplied, on the audit entry — the reason in its `caller_reason`, NULL when none was supplied ([01 §3.7](../DESIGN.md#contract-01-3-7), D-143) — and publishes OrderHeld, which carries the reason only when present. No guard requires a hold reason (D-138) - `inst-hr-request-hold`
+4. [ ] - `p1` - **RETURN** on_hold only after the effective transition commits; D-198 pending receiver control is not on_hold - `inst-hr-return-on-hold`
 5. [ ] - `p1` - **WHEN** resume is later requested: - `inst-hr-when-resume`
    1. [ ] - `p1` - Declare the **resume-cap guard** on row 22, so the engine evaluates it under the aggregate row lock: it fails with `resume-cap-exhausted`, naming the cap and the count, when `orders_order.resume_count` is at or above the cap of §4.5 - `inst-hr-declare-resume-cap`
    2. [ ] - `p1` - Request the resume transition with the request's `expected_version`, resolving no state and reading no column first — **an order that is not `on_hold` is refused by the engine as `not-admissible`, and one with no stored pre-hold state by [01 §3.6](01-foundation.md#contract-01-3-6) *Attempt Transition* step 15 (`resume-target-missing`)** - `inst-hr-request-resume`
-   3. [ ] - `p1` - The engine reads the stored pre-hold state as the effective target, clears the pre-hold column, increments `resume_count` and publishes OrderResumed, all inside the transition transaction ([01 §3.6](01-foundation.md#contract-01-3-6) *Attempt Transition* steps 14, 20.3 and 20.4) — both the target and the counter are engine-owned and this slice contributes neither - `inst-hr-engine-resolves-resume`
+   3. [ ] - `p1` - The engine reads the stored pre-hold state as the effective target, clears the pre-hold column, increments `resume_count` and publishes OrderResumed; on a post-spawn fulfillment resume it also verifies the settled pause barrier/no pending control, increments the D-198 generation and inserts the immutable successor grant, visible only after commit (never invoking report-spawn-signal again), all inside the transition transaction ([01 §3.6](01-foundation.md#contract-01-3-6) *Attempt Transition* steps 14, 20.3 and 20.4) — both the target and the counter are engine-owned and this slice contributes neither - `inst-hr-engine-resolves-resume`
    4. [ ] - `p1` - **RETURN** the restored state - `inst-hr-return-restored`
 
-**Description**: Nothing about the spawned subscriptions changes at either end. A hold from
+**Description (D-198)**: Already-active subscriptions keep their state. Pending activation intents are paused/fenced at the receiver before hold becomes effective; unresolved external effects are settled/reconciled. A hold from
 `in_fulfillment` leaves activated subscriptions serving and billing, and leaves wave-1 drafts
 alone — including their own auto-void TTL, which this gear cannot pause.
 
@@ -392,7 +392,7 @@ sequenceDiagram
     participant E as Transition Engine
     participant W as Orders Workflow
     R ->> E: forced-failure (reason, attested lists, no request_audit_id)
-    E -->> R: refused second-approver-required + requestAuditId (audited)
+    E -->> R: refused second-approver-required + request_audit_id (audited)
     A ->> E: forced-failure (reason, lists, request_audit_id)
     E ->> E: guards, forced evidence (unknown), release claims, audit
     E -->> A: fulfillment_failed
@@ -405,16 +405,25 @@ sequenceDiagram
 Input: order_id, forced_reason, drafts_voided, activated_rolled_back, request_audit_id (absent on
 the requester's call), security_context, idempotency_key, expected_version
 Output: fulfillment_failed, or a registered refusal — the requester's call always ends in
-`second-approver-required` carrying `requestAuditId`
+`second-approver-required` carrying `request_audit_id`
 
 1. [ ] - `p1` - Validate at the boundary: `forced_reason` text within the caller-reason bound, both lists arrays of distinct subscription UUIDs (empty allowed), `request_audit_id` a UUID when present; anything else is `request-invalid`, unaudited ([01 §4.7](../DESIGN.md#contract-01-4-7), D-142) - `inst-ff-boundary`
 2. [ ] - `p1` - Declare the guards the engine evaluates and audits, after its authorization pre-guard (`order × force-fail-unreconciled`, actor class `user`, [08 §4.3](../DESIGN.md#contract-08-4-3)), idempotency, admissibility (rows 28 and 29 only; any other state is `not-admissible`) and version check, in this registration order: forced reason present and non-blank (`forced-failure-reason-required`); on row 29, stored pre-hold state `in_fulfillment` (06's `prehold-not-in-fulfillment`); spawn signal recorded (`spawn-signal-not-recorded`); overdue window elapsed (`overdue-window-not-elapsed`); distinct second approver (`second-approver-required`) - `inst-ff-declare-guards`
 3. [ ] - `p1` - Resolve the overdue guard's inputs from stored data under the aggregate lock: `begin_fulfillment_at`, the `created_at` of the order's single committed `begin-fulfillment` audit entry (row 11; no row returns an order to `approved` once it has left it for `in_fulfillment`), and the latest non-null `service_activation_date` among the current version's lines at 00:00 UTC; expected fulfillment time is the later of the two, PRD §6.3's `max(now, latest service-activation date)` at begin-fulfillment, derived and never stored. Admit only when database time is at or past it plus the overdue window of §4.5 - `inst-ff-overdue`
-4. [ ] - `p1` - **IF** `request_audit_id` is absent: refuse `second-approver-required`; the engine allocates the refusal entry's `audit_id` before settling and returns it as `context.data.requestAuditId`, so a replay under the same key returns the same value. That refused, audited entry, which only a caller past every earlier guard can produce, is the request - `inst-ff-request`
-5. [ ] - `p1` - **ELSE** read the referenced audit entry and admit only when it is a `refused` entry with `reason = second-approver-required` and `trigger = force-fail-unreconciled` for this `order_id`, its `from_state` equals the current state and its `created_at` is at or after `state_entered_at` (no state change since), it is within the approval window of §4.5 of database time, and its `actor` differs from the caller's; otherwise refuse `second-approver-required`, which records the caller's own attempt as a new request - `inst-ff-approve`
+4. [ ] - `p1` - **IF** `request_audit_id` is absent: refuse `second-approver-required`; the engine allocates the refusal entry's `audit_id` before settling and returns it as `context.data.request_audit_id`, so a replay under the same key returns the same value. That refused, audited entry, which only a caller past every earlier guard can produce, is the request - `inst-ff-request`
+5. [ ] - `p1` - **ELSE** read the referenced audit entry and admit only when it is a `refused` entry with `reason = second-approver-required` and `trigger = force-fail-unreconciled` for this `order_id`, its hashed `force_request_observation` exactly equals the locked current `{audit_sequence, state, version}` (D-201), its `from_state` equals the current state and its `created_at` is at or after `state_entered_at`, it is within the approval window of §4.5 of database time, and its `actor` differs from the caller's; otherwise refuse `second-approver-required`, which records the caller's own attempt as a new request - `inst-ff-approve`
 6. [ ] - `p1` - Contribute the forced evidence variant of [01 §3.7](../DESIGN.md#contract-01-3-7): the approver's attested lists, `activation_dispatched = true`, `at_sale_facts_emitted` and `no_active_subscription_remains` = `unknown`, and `operator_attestation` = `{requested_by, request_audit_id, requested_at, approved_by}` taken from the referenced entry and the caller's SecurityContext; fix `failure_reason = operator-forced-unreconciled`; the forced reason is the audit `caller_reason` - `inst-ff-contribute`
-7. [ ] - `p1` - Request the `force-fail-unreconciled` transition; the engine resolves row 28 or 29, releases every live claim at [01 §3.6](01-foundation.md#contract-01-3-6) *Attempt Transition* step 17.1 because the target is terminal, writes the committed audit token `force-fail-unreconciled` and publishes `OrderFulfillmentFailed` - `inst-ff-request-transition`
+7. [ ] - `p1` - Request the `force-fail-unreconciled` transition; the engine resolves row 28 or 29, releases Orders overlap claims but retains uncertain receiver capacity claims under D-198, at [01 §3.6](01-foundation.md#contract-01-3-6) *Attempt Transition* step 17.1 because the target is terminal, writes the committed audit token `force-fail-unreconciled` and publishes `OrderFulfillmentFailed` - `inst-ff-request-transition`
 8. [ ] - `p1` - **RETURN** fulfillment_failed - `inst-ff-return`
+
+**D-201 freshness:** when recording a resolved `second-approver-required` refusal, capture the
+committed audit sequence/state/version together under the aggregate lock and persist them in
+`force_request_observation` using audit v3. Do not allocate a committed sequence to the refusal.
+Missing observation, an intervening state-only audit or internal grant replacement invalidates
+the request even when timestamps and current state/version coincide. Revalidate the requester's
+break-glass authority as well as the approver's; identity equality remains forbidden. Preserve
+the existing state/spawn/overdue/reason/24-hour guards and their order. Do not overwrite or
+backfill an old request. Copy both actors into the terminal attestation as before.
 
 **Description**: The two-person rule needs no new table or row: the requester's committed refusal
 is the durable request, as Ledger answers a missing approval with `DUAL_CONTROL_REQUIRED`
@@ -717,3 +726,6 @@ Billing credit note.
 - **ADRs**: [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md) transition through the engine; [`ADR/0002`](../ADR/0002-cpt-cf-bss-orders-lifecycle-adr-slice-decomposition.md) the foundation-plus-seven-slices decomposition; [`ADR/0004`](../ADR/0004-cpt-cf-bss-orders-lifecycle-adr-closed-enumerations.md) the closed state and event enumerations
 
 <!-- /contract -->
+
+
+**D-198 receiver barrier:** fulfillment resume may issue a newly authorized generation only after resume commits; old paused grants remain fenced and already-active subscriptions keep serving/billing. Expiry still excludes fulfillment/holds from fulfillment. Two-person D-182 force-fail may bypass a missing receiver barrier with explicit unknown evidence; it fences superseded local controls, requests revocation and retains uncertain receiver slots/reconciliation, never asserting no late effects. The [normative protocol](../DESIGN.md#contract-06-activation-admission) defines the staged schema, exact target inventory, no-network-lock boundary and tests.

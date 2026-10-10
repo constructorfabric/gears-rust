@@ -1,0 +1,134 @@
+error[E0308]: mismatched types
+ --> tests/ui/discovery_escape.rs:9:5
+  |
+8 | fn raw_scope_escape(discovery: &DiscoveryScope) -> &AccessScope {
+  |                                                    ------------ expected `&AccessScope` because of return type
+9 |     discovery
+  |     ^^^^^^^^^ expected `&AccessScope`, found `&DiscoveryScope`
+  |
+  = note: expected reference `&AccessScope`
+             found reference `&DiscoveryScope`
+
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/ui/discovery_escape.rs:13:13
+   |
+13 |     let _ = DiscoveryScope(AccessScope::deny_all());
+   |             ^^^^^^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> tests/ui/../capability_support/capabilities.rs
+   |
+   | pub struct DiscoveryScope(AccessScope);
+   |                           ^^^^^^^^^^^ private field
+help: consider making the field publicly accessible
+  --> tests/ui/../capability_support/capabilities.rs
+   |
+   | pub struct DiscoveryScope(pub AccessScope);
+   |                           +++
+
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/ui/discovery_escape.rs:14:13
+   |
+14 |     let _ = DiscoveredOrder(entity::Model {
+   |             ^^^^^^^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> tests/ui/../capability_support/capabilities.rs
+   |
+   | pub struct DiscoveredOrder(entity::Model);
+   |                            ^^^^^^^^^^^^^ private field
+help: consider making the field publicly accessible
+  --> tests/ui/../capability_support/capabilities.rs
+   |
+   | pub struct DiscoveredOrder(pub entity::Model);
+   |                            +++
+
+error[E0308]: mismatched types
+  --> tests/ui/discovery_escape.rs:20:42
+   |
+20 |     let _ = TargetScope::from_discovered(uuid::Uuid::nil());
+   |             ---------------------------- ^^^^^^^^^^^^^^^^^ expected `DiscoveredOrder`, found `Uuid`
+   |             |
+   |             arguments to this function are incorrect
+   |
+note: associated function defined here
+  --> tests/ui/../capability_support/capabilities.rs
+   |
+   |     pub fn from_discovered(row: DiscoveredOrder) -> Self {
+   |            ^^^^^^^^^^^^^^^ --------------------
+
+error[E0308]: mismatched types
+  --> tests/ui/discovery_escape.rs:21:42
+   |
+21 |     let _ = TargetScope::from_discovered(AccessScope::deny_all());
+   |             ---------------------------- ^^^^^^^^^^^^^^^^^^^^^^^ expected `DiscoveredOrder`, found `AccessScope`
+   |             |
+   |             arguments to this function are incorrect
+   |
+note: associated function defined here
+  --> tests/ui/../capability_support/capabilities.rs
+   |
+   |     pub fn from_discovered(row: DiscoveredOrder) -> Self {
+   |            ^^^^^^^^^^^^^^^ --------------------
+
+error[E0308]: mismatched types
+  --> tests/ui/discovery_escape.rs:25:46
+   |
+25 |     let _ = capabilities::recheck_target(db, discovery);
+   |             ----------------------------     ^^^^^^^^^ expected `TargetScope`, found `DiscoveryScope`
+   |             |
+   |             arguments to this function are incorrect
+   |
+note: function defined here
+  --> tests/ui/../capability_support/capabilities.rs
+   |
+   | pub async fn recheck_target(db: &Db, target: TargetScope) -> anyhow::Result<bool> {
+   |              ^^^^^^^^^^^^^^          -------------------
+
+error[E0308]: mismatched types
+  --> tests/ui/discovery_escape.rs:30:63
+   |
+30 |     let _ = entity::Entity::delete_many().secure().scope_with(discovery);
+   |                                                    ---------- ^^^^^^^^^ expected `&AccessScope`, found `&DiscoveryScope`
+   |                                                    |
+   |                                                    arguments to this method are incorrect
+   |
+   = note: expected reference `&AccessScope`
+              found reference `&DiscoveryScope`
+note: method defined here
+  --> $WORKSPACE/libs/toolkit-db/src/secure/db_ops.rs
+   |
+   |     pub fn scope_with(self, scope: &AccessScope) -> SecureDeleteMany<E, Scoped> {
+   |            ^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/discovery_escape.rs:31:63
+   |
+31 |     let _ = entity::Entity::update_many().secure().scope_with(discovery);
+   |                                                    ---------- ^^^^^^^^^ expected `&AccessScope`, found `&DiscoveryScope`
+   |                                                    |
+   |                                                    arguments to this method are incorrect
+   |
+   = note: expected reference `&AccessScope`
+              found reference `&DiscoveryScope`
+note: method defined here
+  --> $WORKSPACE/libs/toolkit-db/src/secure/db_ops.rs
+   |
+   |     pub fn scope_with(self, scope: &AccessScope) -> SecureUpdateMany<E, Scoped> {
+   |            ^^^^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/discovery_escape.rs:33:77
+   |
+33 |     let _ = entity::Entity::insert(model.clone()).secure().scope_with_model(discovery, &model);
+   |                                                            ---------------- ^^^^^^^^^ expected `&AccessScope`, found `&DiscoveryScope`
+   |                                                            |
+   |                                                            arguments to this method are incorrect
+   |
+   = note: expected reference `&AccessScope`
+              found reference `&DiscoveryScope`
+note: method defined here
+  --> $WORKSPACE/libs/toolkit-db/src/secure/db_ops.rs
+   |
+   |     pub fn scope_with_model(
+   |            ^^^^^^^^^^^^^^^^

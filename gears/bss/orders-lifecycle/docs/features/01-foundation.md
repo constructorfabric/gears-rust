@@ -33,6 +33,7 @@
   - [Foundation: The State Machine (normative)](#foundation-the-state-machine-normative)
   - [Foundation: What this slice deliberately does not own](#foundation-what-this-slice-deliberately-does-not-own)
   - [Foundation: Traceability](#foundation-traceability)
+  - [R14 event platform integration (D-200)](#r14-event-platform-integration-d-200)
 
 <!-- /toc -->
 
@@ -131,10 +132,10 @@ The full precedence, private persistence scopes, diagnostic settlement and aggre
 **Output**: Stored response, non-owning conflict, or ownership of a new execution.
 
 1. Scope the key by `(operation, principal_scope, idempotency_key)`; derive the principal from stable authenticated identity, never token/session/delegation identity. Fingerprint exactly the [Foundation contract §4.2](01-foundation.md#contract-01-4-2) input set, excluding correlation, transport and server-assigned values.
-2. Under the registry lock apply logical retention expiry using fresh database time. Expired settled rows may be replaced; an in-flight row requires both expired retention and lease. Neither replay nor reclaim extends the 24-hour window.
+2. Under the registry lock apply logical retention expiry using fresh database time. Expired settled rows may be replaced; an in-flight row requires both expired retention and lease. Neither replay nor reclaim extends the operation-specific retention deadline (ordinary 24 hours; workflow-class at least 30 days under D-173).
 3. Compare fingerprints before settlement/lease state: mismatches audit without changing the winner; matching settled rows return the stored response; matching live leases audit `still-processing` without stealing or settling ownership.
 4. Claim absence with conflict-safe insert and locked re-read. Reclaim matching expired leases atomically using the configured positive finite lease duration and fresh database wall-clock time; distinguish one's own successful insert from a competing lease.
-5. Hold the lock through writes, audit and settlement. Claim/reclaim never commits separately. A competitor cannot bypass a live transaction because its lease time elapsed.
+5. Hold the lock through writes, audit and settlement. Claim/reclaim never commits separately for ordinary triggers; D-188 explicitly commits commercial-attempt ownership before remote writes; D-198 applies the same execution/fencing rules to staged receiver controls. A competitor cannot bypass a live transaction because its lease time elapsed.
 6. Settle success or an owned business refusal with its immutable public response and assessment, if reached. Cleanup uses the existing bounded worker (baseline every 60 seconds, 500 rows), row locks and expiry rechecks; it never deletes live markers or referenced evidence.
 
 Cross-principal create duplication and post-window re-execution remain disclosed limitations, not covered guarantees.
@@ -161,7 +162,7 @@ Cross-principal create duplication and post-window re-execution remain disclosed
 **Output**: Atomic append, or integrity finding with no historical repair.
 
 1. Append one committed audit entry per transition, except administrative changes append one per changed field at consecutive sequences. Use the closed trigger token as machine reason and the separately validated caller explanation as `caller_reason`.
-2. Allocate committed sequences under the aggregate lock. Emit hash v2 over the exact stored fields, canonical microsecond timestamp and predecessor defined in [Foundation contract §4.4](../DESIGN.md#contract-01-4-4); retain v1 verification. Identity removal never changes stored references/hashes.
+2. Allocate committed sequences under the aggregate lock. Emit D-201 hash v3 over the exact stored fields, canonical microsecond timestamp and predecessor defined in [Foundation contract §4.4](../DESIGN.md#contract-01-4-4); retain frozen v1/v2 verification. Identity removal never changes stored references/hashes.
 3. Keep refused entries outside the committed chain with NULL sequence/predecessor; unresolved targets retain the trusted subject tenant/requested reference without invented target facts or aggregate lookup for enrichment.
 4. Enforce append-only grants and triggers. Only the restricted retention role may purge expired refusal rows under [Foundation contract §3.7](../DESIGN.md#contract-01-3-7)'s canonical retention policy.
 5. Verify committed chains read-only and alert on any mismatch, unsupported hash version or incomplete sequence. The audit worker captures atomic daily namespace checkpoints from one consistent snapshot, reconciles current orders and previous members, and never blesses a discrepancy.
@@ -191,7 +192,7 @@ Cross-principal create duplication and post-window re-execution remain disclosed
 **Output**: Expired rows deleted in bounded batches; per-store metrics; committed evidence untouched.
 
 1. Run daily as `cpt-cf-bss-orders-lifecycle-component-retention-purge` under advisory key `retention-purge` ([Foundation contract §3.8](../DESIGN.md#contract-01-3-8)); a contended pass skips, lifecycle cancellation stops it. This is a phase 0/1 deliverable: Foundation does not ship refusal auditing without it (D-185).
-2. Per store, select bounded batches (baseline 5,000 rows each, repeated while the pass budget lasts) in deterministic `(time, primary key)` order through the store's own index, under `SKIP LOCKED`, rechecking eligibility against fresh database time: `orders_gate_outcome` Preview rows with `order_id IS NULL` past **7 days** via `(evaluated_at) WHERE order_id IS NULL`; `orders_transition_audit` rows with `outcome = 'refused'` past **90 days** via `(created_at) WHERE outcome = 'refused'`; `orders_read_access_log` rows past **90 days** via `(accessed_at)`.
+2. Per store, select bounded batches (baseline 5,000 rows each, repeated while the pass budget lasts) in deterministic `(time, primary key)` order through the store's own index, rechecking eligibility against fresh database time in the conditional DELETE itself (it deletes only the discovered IDs that still satisfy the store's class predicate and window, re-evaluated on the current row version under the row's lock; the retention role holds SELECT and DELETE only, so no `SELECT … FOR UPDATE SKIP LOCKED` is possible or needed — D-209 item 9): `orders_gate_outcome` Preview rows with `order_id IS NULL` past **7 days** via `(evaluated_at) WHERE order_id IS NULL`; `orders_transition_audit` rows with `outcome = 'refused'` past **90 days** via `(created_at) WHERE outcome = 'refused'`; `orders_read_access_log` rows past **90 days** via `(accessed_at)`.
 3. Delete under the store's restricted retention grant only; the audit DELETE is granted for expired refused rows and nothing else ([Foundation contract §3.7](../DESIGN.md#contract-01-3-7)). Commit per batch; on failure roll back and retry on the next pass. Never acquire an aggregate lock, delete a committed audit row, an idempotency record (idempotency cleanup's) or a platform outbox row (toolkit vacuum's).
 4. Emit per store: rows purged, batch duration, overdue backlog (eligible rows still present after the pass), oldest overdue row age and last successful pass. [Foundation contract §3.8](../DESIGN.md#contract-01-3-8) alerts on a growing backlog, an overdue refused row older than 1 day and a missed daily run.
 5. Validate batch size and cadence against the [`DESIGN.md §4.1`](../DESIGN.md#41-capacity-and-cost) refusal-audit write baseline: one daily pass must delete at least one day's refused rows at the measured mean rate, or the backlog grows without bound.
@@ -210,7 +211,7 @@ Cross-principal create duplication and post-window re-execution remain disclosed
 
 Implement the exact **29 rows and 21 trigger tokens** of [`cpt-cf-bss-orders-lifecycle-state-order-lifecycle`](01-foundation.md#contract-01-4-3), including guards, actor classes, versioning behavior and event declarations. Expand multi-state rows into unique `(from-state, trigger)` lookup keys and reject duplicate keys at startup. There are no inferred transitions or terminal exits.
 
-Create, submit and amendment append versions; draft and administrative edits do not. Submit materializes version 2. Resume uses stored pre-hold state. `in_fulfillment` has no expiry row, and expiry of a hold from fulfillment is guard-refused. Held fulfillment can fail/cancel through the Workflow rows but cannot acknowledge completion while held. An overdue post-spawn fulfillment, held or not, can also be forced to `fulfillment_failed` by the two-person operator trigger `force-fail-unreconciled` (rows 28 and 29, D-182), which records compensation as `unknown`. Amendment lands in `submitted` under the design's disclosed PRD reconciliation items.
+Create, submit and amendment append versions; draft and administrative edits do not. Submit materializes its reserved candidate version C > 1 (D-188). Resume uses stored pre-hold state. `in_fulfillment` has no expiry row, and expiry of a hold from fulfillment is guard-refused. Held fulfillment can fail/cancel through the Workflow rows but cannot acknowledge completion while held. An overdue post-spawn fulfillment, held or not, can also be forced to `fulfillment_failed` by the two-person operator trigger `force-fail-unreconciled` (rows 28 and 29, D-182), which records compensation as `unknown`. Amendment lands in `submitted` under the design's disclosed PRD reconciliation items.
 
 ### 4.2 Idempotency record lifecycle
 
@@ -337,10 +338,10 @@ record probed or touched (`§4.1` *Expected version is validated at the boundary
 `orders_order.draft_revision` starts at 0 and increases exactly once for every committed
 commercial draft edit, including header changes and line insertion, replacement or removal.
 Administrative edits do not increment it. Draft writes and submit require the client's
-`expected_draft_revision`, exposed as `draftRevision` by draft reads, in addition to
+`expected_draft_revision`, exposed as `draft_revision` by draft reads, in addition to
 `expected_version`. For `draft-mutate` it is **optional at the boundary** (D-147): its absence is
 never a boundary rejection, because a client of an order past `draft` has never been shown a
-`draftRevision`. The engine compares it only at step 12, after step 11's admissibility check, so a
+`draft_revision`. The engine compares it only at step 12, after step 11's admissibility check, so a
 commercial `PATCH` outside `draft` refuses `not-admissible` (D-145), and in `draft` an absent
 value is a mismatch that step 12 refuses `version-conflict` naming the current draft revision.
 It is part of the request fingerprint, an absent value taking the not-applicable sentinel. It does not create an immutable
@@ -361,13 +362,13 @@ later edit. Step 12 includes these comparisons. No automatic rebase or reuse of 
 results is permitted. Server snapshot tokens are not part of the client request fingerprint.
 
 **PriceBook admission guards (D-152, D-158).** For a new submit/amendment, the
-registered gate guards validate the pin's presence and supported shape, the locally derived
+registered gate guards validate the pin's presence and supported shape, the Pricing-issued
 exclusive activation deadline against the engine transaction timestamp, and the 200-consumed-item,
 1,000-bound-slots-per-line and 1 MiB version limits (`purchase-capacity-exceeded`) before
 version persistence. Begin-fulfillment also checks the current binding deadline. These checks
 run after authorized settled replay and version/admissibility checks, in the existing guard
 settlement path; they use `order-binding-expired` or `purchase-capacity-exceeded` as applicable.
-They do not replace Subscriptions' atomic compare-at-activation (D-162) and occupancy checks on each
+They do not replace Subscriptions' committed-receipt activation admission (D-190/D-198, receiver implementation and conformance pending) and occupancy checks on each
 activation. Failure during fulfillment uses the existing compensation acknowledgement path.
 
 Required tests race submit with header/quantity edits and line addition/removal, race two draft
@@ -389,9 +390,9 @@ it MUST NOT permit the operation, disclose target existence or be reported as a 
 refusal. The common infrastructure-error mapping applies, without target-specific detail.
 
 1. [ ] - `p1` - Evaluate the authorization pre-guard through the shared PolicyEnforcer adapter for the trigger's resource/action from [08 §4.3](../DESIGN.md#contract-08-4-3), using the authenticated SecurityContext and, as PDP request context, the delegation proof reference the caller supplied — PDP policy decides whether the path needs it and whether it is valid ([08 §4.4](../DESIGN.md#contract-08-4-4), D-111); the engine never verifies proof itself. Every trigger on this path names a target, so a PDP delegation-proof denial answers `order-not-found`, never `delegation-proof-required` / `delegation-proof-invalid` (D-141); the classified reason is kept only in the scoped internal log/metric ([08 §3.6](08-read-and-authz.md#contract-08-3-6) common read wrapper item 3). Use only the platform-approved minimal point-target prefetch to obtain current authorization properties, without a row lock or disclosure, then enforce the returned current-order scope. Where the prefetch finds no row, still make this call with the target ID and an empty property set, **and** the D-114 follow-up `order × read` below with the same target ID and an empty property set, discard both results and take the `order-not-found` arm, so both arms make the same PDP calls; a PDP outage on either call returns the sanitized 503 exactly as for an existing order ([08 §3.6](08-read-and-authz.md#contract-08-3-6) common read wrapper item 2, D-68). Actor class alone grants nothing. If denied, map the denial by [08 §3.6](08-read-and-authz.md#contract-08-3-6)'s common wrapper denial mapping (D-114, D-141): make the follow-up `order × read` on the target, on this deny path only and whatever the deny reason; a delegation-proof denial answers `order-not-found` (404) whatever the follow-up answers, and any other denial answers `operation-not-permitted-for-actor` (403) where the follow-up allows, otherwise `order-not-found` (404); append refusal evidence under the separately authorized service scope, commit and return without probing or settling idempotency; do not load the aggregate merely for audit enrichment. Only after authorization may the scoped registry be probed for (operation, principal_scope, idempotency_key), with principal_scope from the authenticated context. A matching settled outcome may replay before business guard work only after current access has been rechecked; a stored outcome is not an access grant - `inst-probe-idempotency`
-2. [ ] - `p1` - For a new execution, construct the complete proposed arrangement from stored values and validated contribution. Obtain the additional proposed-relationship authorization required by [08 §4.3](../DESIGN.md#contract-08-4-3) before fetching commercial facts about newly named parties; submit also requires current payer-use authority. Denial follows the authorization refusal path, not a tentative business write. Resolve the remaining declared business guard inputs outside any transaction under each port's deadline - `inst-resolve-guard-inputs`
+2. [ ] - `p1` - **Post-spawn hold/ordinary terminal operations additionally use the [D-198 staged receiver-control subflow](../DESIGN.md#contract-06-activation-admission): persist owned coordination before external work; recognize the same owner on both success and unavailable-input paths; commit public effects only after exact barrier evidence. D-182 remains its explicit unknown-outcome exception. Submit/amendment issuing Pricing commands use the [D-188 commercial-attempt subflow](../DESIGN.md#contract-01-commercial-attempt): authorize, prepare read-only inputs, then durably claim/fence idempotency ownership and reserve the candidate before the first command. Both success and unavailable-input/refusal branches (steps 3 and 6–9) validate that execution and owner instead of rejecting its own live marker or allocating anew. All other triggers retain the ordinary flow below.** For a new execution, construct the complete proposed arrangement from stored values and validated contribution. Obtain the additional proposed-relationship authorization required by [08 §4.3](../DESIGN.md#contract-08-4-3) before fetching commercial facts about newly named parties; submit also requires current payer-use authority. Denial follows the authorization refusal path, not a tentative business write. Resolve the remaining declared business guard inputs outside any transaction under each port's deadline - `inst-resolve-guard-inputs`
 3. [ ] - `p1` - **IF** any declared input is unresolvable or its deadline elapses — a **precluded** input (`§4.1`) is never unresolvable and never enters this branch: - `inst-if-input-unresolvable`
-   1. [ ] - `p1` - Open a refusal transaction and apply the same PDP-scoped locked-row and authorization-fact recheck as step 5. Run the common transactional idempotency gate below, equivalent to steps 6–9: return an unchanged matching settled outcome, refuse a fingerprint mismatch without changing the record, or refuse a matching live lease without stealing it. After claiming/reclaiming ownership, apply steps 10–12, including client and prepared draft revisions: changed draft inputs settle version-conflict, not a stale unevaluable reason. Lost access or changed authorization facts take their existing non-settling refusal paths instead. A still-current new execution then settles by `§4.1` precedence: - `inst-return-input-unresolvable`
+   1. [ ] - `p1` - Open a refusal transaction and apply the same PDP-scoped locked-row and authorization-fact recheck as step 5. For D-188 commercial attempts, validate execution_id, attempt_id, owner_token and fencing_generation and recognize this executor’s matching live marker before settlement; do not return still-processing for its own marker. For other executions run the common transactional idempotency gate below, equivalent to steps 6–9: return an unchanged matching settled outcome, refuse a fingerprint mismatch without changing the record, or refuse a matching live lease without stealing it. After claiming/reclaiming ownership, apply steps 10–12, including client and prepared draft revisions: changed draft inputs settle version-conflict, not a stale unevaluable reason. Lost access or changed authorization facts take their existing non-settling refusal paths instead. A still-current new execution then settles by `§4.1` precedence: - `inst-return-input-unresolvable`
       1. [ ] - `p1` - **FOR EACH** slice guard in the row's guard set registered **ahead of** the first guard with an unresolved input, in registration order, whose own inputs all resolved: evaluate it against the locked state as step 13 does, and **IF** it fails, settle that engine/guard-only refusal without an assessment exactly as step 13 does, append refusal audit, commit and **RETURN** it — an earlier-registered failing guard is never masked by a later unavailable input (D-113) - `inst-if-earlier-guard-fails`
       2. [ ] - `p1` - Only when none fails, persist the completed gate assessment under the diagnostic settlement contract below, settle the owned record with the complete response and selected unevaluable reason, append refusal audit and commit. Non-gate input failures carry no assessment - `inst-settle-input-unresolvable`
 4. [ ] - `p1` - Open one transaction for everything that follows - `inst-open-transaction`
@@ -428,7 +429,7 @@ refusal. The common infrastructure-error mapping applies, without target-specifi
     5. [ ] - `p1` - **IF** fewer rows return than distinct tuples were offered: release only the exact claim IDs returned by this attempt's insert, scoped to this order and `released_at IS NULL`, and require the affected count to equal the returned-ID count. Skip the UPDATE if that set is empty. On release error/count mismatch abort the whole transaction with an infrastructure outcome. Otherwise preserve all pre-existing claims, persist the reached assessment with predicate 9 replaced by the authoritative conflict under the diagnostic settlement contract, settle the complete response for `order-in-flight-for-key`, append refusal audit and commit by returning a successful transaction result carrying the refusal; §3.7 defines the released-reservation history - `inst-if-claim-conflict`
     6. [ ] - `p1` - After complete acquisition, release only this order's unreleased claims whose full `(payer_tenant_id, resource_tenant_id, overlap_scope_key)` tuple is absent from the proposed set. A payer-only change therefore releases `(old payer, resource tenant, key)` after acquiring `(new payer, resource tenant, key)`, in the same transaction as the amendment - `inst-release-superseded-claims`
 18. [ ] - `p1` - **IF** the row's versioning behaviour is versioning: - `inst-if-versioning-row`
-    1. [ ] - `p1` - Append a new version row from the contribution, with supersedes_version set to the outgoing current version - `inst-append-version`
+    1. [ ] - `p1` - Append the reserved candidate version row from the D-188 attempt, with supersedes_version set to the outgoing current version (never candidate minus one) - `inst-append-version`
     2. [ ] - `p1` - Move the aggregate's current-version pointer to the new version - `inst-move-version-pointer`
 19. [ ] - `p1` - Write every other document contribution the row declares — lines, totals, verdict, linkage, projection, acceptance, gate outcome — including the aggregate fields in the explicit contribution mapping below - `inst-write-contributions`
 20. [ ] - `p1` - **IF** the effective target differs from the outgoing state: - `inst-if-state-changes`
@@ -449,8 +450,10 @@ refusal. The common infrastructure-error mapping applies, without target-specifi
 slice guard over the prepared complete vector, not a series of early returns on individual
 predicates. Register it after all non-gate slice guards on submit/amendment; those earlier
 guards retain their engine-only refusal behavior. Evaluate the vector in declared predicate order,
-then binary line ID, binary resolve item ID and slot-key (`dim_value`, token `default`) UTF-8 bytes, NULL
-first at each level, as specified in [03 §3.7](../DESIGN.md#contract-03-3-7). Preserve both component/key identity fields in
+then binary line ID and binary resolve item ID (NULL first), followed by the tagged selection
+identity: no selection before selected; within selected, raw NULL dimension before non-NULL
+UTF-8 dimension bytes. Selected NULL is distinct from literal text `default`; no sentinel
+substitution is permitted (D-195). Preserve all item/selection identity fields in
 the stored assessment, public report and replay; the failure list retains this same order.
 §4.7 selects its primary Problem while retaining every failed/unevaluable result.
 Authorization, authoritative idempotency resolution, state/version/draft-revision checks and
@@ -517,15 +520,22 @@ user SecurityContext.
 | Admitted transition | Required aggregate write |
 |---------------------|--------------------------|
 | Row 2, commercial draft edit | Increment `draft_revision` once after the locked client/prepared-revision checks; apply all declared header and line changes atomically; row 3 administrative edits do not increment it |
-| Row 12, `report-spawn-signal` | Set `spawn_signal_at` to the server-recorded report instant; the registered already-recorded guard prevents replacement, and no later transition clears it |
+| Row 12, `report-spawn-signal` | Require no pending fulfillment control; checked-increment fulfillment_control_generation and insert immutable D-198 grant from verified Workflow contribution atomically with spawn_signal_at. Return grant identity only after commit; signal stays write-once |
+| Row 22, resume to fulfillment after post-spawn hold | Require complete paused-generation barrier and no pending control; increment generation and insert successor D-198 grant atomically with resume state/counter/audit/event. Other resumes insert no grant; never re-run row 12 |
 | Row 11, `begin-fulfillment`, with tolerated authorization failure | Set `authorization_failure_tolerated_at` to the server-recorded tolerance-decision instant only when the registered tolerance guard admits that outcome; otherwise preserve its value, never clear it |
 | Row 14 or 26, `acknowledge-failed`, or row 16 or 27, `cancel-workflow-mediated` | Persist the validated `compensation_evidence` contribution after its evidence guards pass; other transitions preserve the field |
-| Row 28 or 29, `force-fail-unreconciled` | Persist the forced `compensation_evidence` after every row-28 guard passes: the operator-attested lists, `activation_dispatched = true` (the recorded spawn signal), `at_sale_facts_emitted` and `no_active_subscription_remains` both `unknown`, and the `operator_attestation` naming requester and approver ([01 §3.7](../DESIGN.md#contract-01-3-7) *Compensation evidence schema*, D-182); the terminal target releases every live claim at step 17.1 like any terminal |
+| Row 28 or 29, `force-fail-unreconciled` | Persist the forced `compensation_evidence` after every row-28 guard passes: the operator-attested lists, `activation_dispatched = true` (the recorded spawn signal), `at_sale_facts_emitted` and `no_active_subscription_remains` both `unknown`, and the `operator_attestation` naming requester and approver ([01 §3.7](../DESIGN.md#contract-01-3-7) *Compensation evidence schema*, D-182); the terminal target releases Orders overlap claims at step 17.1; uncertain D-198 receiver capacity claims remain retained for reconciliation |
 
 These writes precede audit and commit. A rollback removes them together with the transition.
+The D-201 [internal rebuild writer](../DESIGN.md#contract-06-replace-fulfillment-grant)
+is registered separately from these 29 public transition rows: it uses the same authorization,
+owned execution, transactional audit/settlement and rollback machinery. Its only grant mutation
+is append with a checked generation; it changes no public state/timestamp/cap or commercial version.
+S5-02 must register this contribution before Workflow's S5-08 adapter can use it.
+
 One refusal also carries an engine-allocated value: for `second-approver-required` on rows 28 and
-29 the engine allocates the refusal entry's `audit_id` before step 13.2.1 settles the response and
-settles it as `context.data.requestAuditId`, so a same-key replay returns the identical request
+29 the engine captures `force_request_observation` under the aggregate lock (D-201 audit v3) and allocates the refusal entry's `audit_id` before step 13.2.1 settles the response and
+settles it as `context.data.request_audit_id`, so a same-key replay returns the identical request
 reference ([07 §3.6](07-hold-and-expiry.md#contract-07-3-6) *Force Fail Unreconciled*, D-182).
 Required implementation tests must show that a committed spawn signal blocks direct cancellation,
 a tolerated failure retains its flag, and failure/workflow-cancel stores its evidence; refused
@@ -567,7 +577,7 @@ nor the policy that a genuinely settled unevaluable refusal replays for the idem
 
 **Claim/reclaim mechanics (normative).** `idempotency_lease_duration` is an explicit, positive,
 finite deployment setting, validated before accepting mutations; there is no implicit default.
-It is distinct from the 24-hour retention window, order-state TTLs and worker advisory locks.
+It is distinct from the operation-specific retention window (24 hours ordinarily, at least 30 days for workflow-class triggers under D-173), order-state TTLs and worker advisory locks.
 After acquiring the registry row lock, read the current row and obtain fresh database wall-clock
 time `t` (PostgreSQL `clock_timestamp()`, not transaction-start `now()` captured before a lock
 wait). A matching `in_flight` row is expired exactly when `lease_expires_at <= t`. Reclaim it by
@@ -581,8 +591,10 @@ The successful inserter is the owner of its own new row; its locked re-read must
 own fresh lease for a competing request's lease. An insert loser re-enters the gate against the
 winner's locked row instead. Reclaim failure or database error aborts; it never grants ownership.
 
-Ownership is the right of the transaction holding the registry row lock to complete this attempt,
-not a separately persisted owner ID or fencing token. Keep that lock through all business writes,
+For ordinary single-transaction triggers, ownership is the right of the transaction holding the
+registry row lock to complete this attempt, without a separately persisted owner ID or fence.
+D-188 commercial attempts and D-198 staged receiver controls instead require their persisted
+execution identity, owner token and fencing generation on every continuation. Keep that lock through all business writes,
 audit append, settlement and commit. Settlement sets `status = settled`, stores the outcome and
 clears `lease_expires_at`. No lease renewal is needed during this locked transaction: passing
 the deadline does not revoke its lock or let a second recoverer proceed. A competing recoverer
@@ -590,11 +602,13 @@ waits, then re-reads and either replays the settled result or re-evaluates the r
 Bound lock waits/transaction duration through database timeouts; timeout is not permission to
 continue without the lock or evidence that the operation succeeded.
 
-Claim/reclaim is **not committed separately** from the attempt. Crash before commit rolls back
+For ordinary triggers, claim/reclaim is **not committed separately** from the attempt. Crash before commit rolls back
 the new claim or deadline update and every new business/audit effect; crash after commit leaves
 a settled result for replay. This atomic path normally leaves no durable in-flight marker after
 a crash. Handling a pre-existing durable marker is an explicit recovery case, not a reason to
-add a two-phase ownership protocol. A failed reclamation rolls back to that marker's prior
+add a two-phase ownership protocol to ordinary triggers. D-188/D-198 explicitly commit durable
+coordination before remote commands; their uncertain outcomes remain recoverable and fenced
+even when the final public transition rolls back. A failed ordinary reclamation rolls back to that marker's prior
 deadline so a later authorized request can retry the gate.
 
 **Internal worker entry.** The private maintenance capability in [08 §3.5](../DESIGN.md#contract-08-3-5) is the sole exception
@@ -723,7 +737,7 @@ expected version in the §4.2 fingerprint. Server-generated identity/number are 
 3. [ ] - `p1` - Resolve declared creation inputs before opening the write transaction. Apart from platform authorization, current Capture has no external business-input calls and does not resolve the optional contract. Preserve any input-resolution failure for the refusal branch below; never attempt to load an aggregate to record it - `inst-create-resolve-inputs`
 4. [ ] - `p1` - Open one transaction and run the common transactional idempotency gate, locking the authoritative registry row rather than a nonexistent order. Check fingerprint before settlement/lease state. If settled and matching, return its stored outcome without another mutation/audit entry, subject to replay authorization below. A different fingerprint appends an unresolved idempotency-mismatch audit row and commits without overwriting the registry; a matching live in-flight lease appends still-processing and commits without settling another owner's record. Claim absent records by conflict-safe insert and locked re-read; only a confirmed owner may continue - `inst-create-claim-key`
 5. [ ] - `p1` - Only the key owner may continue. An expired matching lease may be reclaimed atomically under the registry lock; retain that lock through the transaction. Evaluate the registered create/category guards. An input-resolution or guard refusal appends unresolved refusal evidence, settles the owned registry record as refused with NULL order_id and its audit_id, commits and returns the registered reason; insert no aggregate, version or placeholder - `inst-create-guard-refusal`
-6. [ ] - `p1` - On guard acceptance only, allocate the UUID and seller-unique immutable order number inside this branch. Insert the aggregate in draft with current_version 1, audit_sequence initially 0, immutable audit_tenant_id from the authorized resource tenant and immutable sales_path by the §3.7 `sales_path` rule — `partner_placed` iff this allowed request carried a delegation proof reference, else `self_service` (D-106, D-140); insert its empty version 1 and declared creation contributions using the deferred version FK. Do not run the existing-order state/version checks or increment version to 2 - `inst-create-insert-order`
+6. [ ] - `p1` - On guard acceptance only, allocate the UUID and seller-unique immutable order number inside this branch. Insert the aggregate in draft with current_version 1 and version_allocation_high_water 1, audit_sequence initially 0, immutable audit_tenant_id from the authorized resource tenant and immutable sales_path by the §3.7 `sales_path` rule — `partner_placed` iff this allowed request carried a delegation proof reference, else `self_service` (D-106, D-140); insert its empty version 1 and declared creation contributions using the deferred version FK. Do not run the existing-order state/version checks or increment version to 2 - `inst-create-insert-order`
 7. [ ] - `p1` - Set audit_sequence to 1 and append exactly one committed create audit row: order_id is the new ID, requested_order_ref is NULL, from_state is NULL, to_state is draft, version/sequence are 1, and genesis/tenant/actor fields follow D-99/D-104. Settle the registry success with this order_id, audit_id and immutable settled_response, commit all effects together, then return the committed identity and number. Create remains event-less per the state table; do not enqueue a new lifecycle event - `inst-create-audit-and-commit`
 
 **Creation initialization (step 6).** The engine is the sole writer of these initial values.
@@ -969,8 +983,15 @@ configuration and invalid status/deadline combinations. Run these cases through 
 gate for normal execution, input-resolution refusal and create; no extra order, version,
 committed audit entry or producer-outbox message may result.
 
-The retention window is **24 hours** and **MUST** exceed the longest caller retry horizon; past
-it, a replayed key is a new operation. It **MUST NOT** be conflated with the per-state TTLs.
+The ordinary retention window is **24 hours**. **D-173 exception:** workflow-class triggers
+listed in DESIGN §4.1 retain receipts for **at least 30 days**, covering the issuing Workflow
+process retry horizon; a shorter window is superseded for those triggers. On new claim select
+the operation's window and persist its absolute `expires_at`; replay, reclaim and settlement
+never extend it. Retention must cover the caller retry horizon; only after the applicable
+deadline can a replayed key become a new execution. It is not an order-state TTL. Keep D-188
+attempt and D-198 control evidence while unresolved, independently of response-cache expiry.
+Test a workflow replay after day one and before day 30, ordinary 24-hour expiry, and cleanup
+against both persisted deadlines; no workflow effect may execute twice within its window.
 
 **Expiry is logical, not dependent on sweep timing.** New-claim insertion writes `created_at`
 and `expires_at` as specified in §3.7. The advisory probe must not replay an expired record.
@@ -987,10 +1008,9 @@ create may be followed by a genuinely new create after the window, as the contra
 `idempotency-cleanup` in namespace `bss-orders-lifecycle`. Design-selected configurable baseline:
 run every 60 seconds, at most 500 rows per pass, using the `expires_at` index and deterministic
 ordering by expiry then primary key. Discover candidate keys under a `DiscoveryScope` in a
-read-only transaction (D-184), then in the deleting transaction lock those rows through their
-per-record `TargetScope` with `SKIP LOCKED` (a locking read is refused in a read-only
-transaction, so it belongs to the target phase), recheck against fresh database time, and delete only rows with `expires_at <= t` that are either
-settled or also have an expired in-flight lease. Commit the bounded batch and explicitly release
+read-only transaction (D-184), then in the deleting transaction address each row through its
+per-record `TargetScope`, classify the current row (replaced generation, live window or lease,
+unresolved linked execution: each preserved) and delete it with one conditional statement whose predicates (exact discovered generation, `expires_at < clock_timestamp()`, lease lapsed or absent) PostgreSQL re-evaluates under the row's lock; the maintenance role holds SELECT and DELETE only, so the row lock is the DELETE's own and no `SELECT … FOR UPDATE SKIP LOCKED` is issued (D-209 item 2). Commit the bounded batch and explicitly release
 the advisory guard; on failure roll back and retry on a later scheduled pass. Never acquire an
 aggregate lock from this worker, delete a live/reclaimed marker, or delete its referenced audit
 or order. Its restricted service role needs DELETE only on eligible registry rows. The request
@@ -1151,3 +1171,18 @@ their guard *registrations* and their reason *entries*, never their logic.
 - **Review**: the 2026-09-08 wave — resolves R-01…R-03, R-06…R-08, R-10…R-14, R-16…R-30, R-32…R-36, R-46, R-59, R-62, R-68, R-74
 
 <!-- /contract -->
+
+
+**D-188 completion gate:** implement and test the [durable commercial-attempt schema, execution subflow and failure matrix](../DESIGN.md#contract-01-commercial-attempt). Ordinary atomic settlement remains unchanged; only submit/amendment operational preparation commits separately. Sparse commercial versions do not make audit sequences sparse.
+
+
+**D-198 completion gate:** registered post-spawn hold/ordinary cancel/failure contributions require complete typed receiver-barrier evidence and expected-version/owner checks before public transition writes. The engine owns the staged control schema and prevents new grants while control is pending; the existing idempotency worker resumes bounded work. Exact protocol, schema and D-182 exception: [receiver activation admission](../DESIGN.md#contract-06-activation-admission). No new public state, endpoint, 202 convention or sixth worker is introduced.
+
+### R14 event platform integration (D-200)
+
+Use the [existing platform producer/broker integration contract](../DESIGN.md#contract-01-event-platform-integration).
+The broker implementation and initial chained-cursor transient retry already exist; Orders wiring,
+eleven schema registrations, root identity/grants, exact deployment evidence and conformance remain
+work. Preserve same-transaction enqueue, post-commit Wake and at-least-once consumer semantics.
+Supported producer dead-letter republication and shared operator recovery remain release gates;
+toolkit message claiming and consumer DLQ support alone do not satisfy them.

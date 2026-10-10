@@ -1,0 +1,9 @@
+error[E0451]: fields `scope` and `target` of struct `TargetScope` are private
+  --> tests/ui/runtime_capability_private.rs:14:9
+   |
+13 |     TargetScope {
+   |     ----------- in this type
+14 |         scope: AccessScope::deny_all(),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private field
+15 |         ..existing.clone()
+   |           ^^^^^^^^^^^^^^^^ field `target` is private

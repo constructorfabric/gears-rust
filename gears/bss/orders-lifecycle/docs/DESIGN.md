@@ -152,6 +152,46 @@
   - [Reads and authorization: The permission model (normative)](#reads-and-authorization-the-permission-model-normative)
   - [Reads and authorization: Delegation proof (normative)](#reads-and-authorization-delegation-proof-normative)
   - [Reads and authorization: Policy values](#reads-and-authorization-policy-values)
+- [D-188: Durable commercial attempts and sparse version identities](#d-188-durable-commercial-attempts-and-sparse-version-identities)
+  - [Persistence and ownership](#persistence-and-ownership)
+  - [Engine execution subflow (overrides ordinary steps 2–9 for commercial commands)](#engine-execution-subflow-overrides-ordinary-steps-29-for-commercial-commands)
+  - [Failure matrix and acceptance criteria](#failure-matrix-and-acceptance-criteria)
+- [D-189: Nonbinding Pricing assessment for Preview, submit and amendment](#d-189-nonbinding-pricing-assessment-for-preview-submit-and-amendment)
+  - [Proposed typed boundary](#proposed-typed-boundary)
+  - [Effects, authorization and commitment](#effects-authorization-and-commitment)
+  - [Required conformance before completion](#required-conformance-before-completion)
+- [R05 reconciliation: Pricing-issued commercial deadline (D-191)](#r05-reconciliation-pricing-issued-commercial-deadline-d-191)
+  - [Issued evidence and enforcement](#issued-evidence-and-enforcement)
+  - [Seller policy ownership and missing discovery](#seller-policy-ownership-and-missing-discovery)
+  - [Assessment and Preview](#assessment-and-preview)
+  - [Required conformance (not yet executed)](#required-conformance-not-yet-executed)
+- [R07 — Subscriptions-owned pre-subscription billing terms (D-193)](#r07--subscriptions-owned-pre-subscription-billing-terms-d-193)
+  - [Proposed contract and staging](#proposed-contract-and-staging)
+  - [Exact authored-term mapping and supported profile](#exact-authored-term-mapping-and-supported-profile)
+  - [Required implementation and conformance (unchecked)](#required-implementation-and-conformance-unchecked)
+- [R08 — Authenticated commercial service principals (D-194)](#r08--authenticated-commercial-service-principals-d-194)
+  - [Permission and call ownership](#permission-and-call-ownership)
+  - [Buyer authority, retries and attribution](#buyer-authority-retries-and-attribution)
+  - [Required implementation evidence (unchecked)](#required-implementation-evidence-unchecked)
+- [R09 — Versioned owner diagnostics and explicit Orders mapping (D-195)](#r09--versioned-owner-diagnostics-and-explicit-orders-mapping-d-195)
+  - [Owner profile, expected coverage and result contract](#owner-profile-expected-coverage-and-result-contract)
+  - [Composition, storage and response](#composition-storage-and-response)
+  - [Required implementation and conformance](#required-implementation-and-conformance)
+- [R10 revision-reference protection and release coordination (D-196)](#r10-revision-reference-protection-and-release-coordination-d-196)
+  - [Proposed cross-owner protocol](#proposed-cross-owner-protocol)
+  - [Required implementation and conformance](#required-implementation-and-conformance-1)
+- [D-198: Receiver activation admission and effective lifecycle barriers](#d-198-receiver-activation-admission-and-effective-lifecycle-barriers)
+  - [Canonical capacity and asynchronous activation](#canonical-capacity-and-asynchronous-activation)
+  - [Dispatch identity and receiver linearization](#dispatch-identity-and-receiver-linearization)
+  - [Internal draft-rebuild continuation (D-201)](#internal-draft-rebuild-continuation-d-201)
+  - [Staged hold/cancel/failure without new public states](#staged-holdcancelfailure-without-new-public-states)
+  - [Engine persistence and recovery](#engine-persistence-and-recovery)
+  - [Required evidence before production](#required-evidence-before-production)
+  - [Commercial prerequisites: owner contracts and delivery evidence (D-199)](#commercial-prerequisites-owner-contracts-and-delivery-evidence-d-199)
+- [R14 existing Event Broker integration and release evidence (D-200)](#r14-existing-event-broker-integration-and-release-evidence-d-200)
+  - [Existing capabilities and Orders work](#existing-capabilities-and-orders-work)
+  - [Implementation and release checklist](#implementation-and-release-checklist)
+- [Asynchronous activation clocks (D-201)](#asynchronous-activation-clocks-d-201)
 
 <!-- /toc -->
 
@@ -563,7 +603,7 @@ The constraints each slice adds are defined here and specified normatively in [�
   — Foundation — The engine is the single writer ([contract](#contract-01-the-engine-is-the-single-writer))
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-idempotency-window`
-  — Foundation — The idempotency window is 24 hours and is not a commercial bound ([contract](#contract-01-the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound))
+  — Foundation — Operation-specific idempotency retention is not a commercial bound ([contract](#contract-01-the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound))
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-outbox-at-least-once`
   — Foundation — Delivery is at-least-once; ordering is partition-scoped ([contract](#contract-01-delivery-is-at-least-once-ordering-is-partition-scoped))
@@ -1227,12 +1267,14 @@ engine's `expected_version`; create has its own no-existing-version branch. A mi
 unparseable expected version is rejected by boundary input validation, before authorization,
 with `expected-version-required` (HTTP 428), unaudited and without touching idempotency
 ([01 §4.1](DESIGN.md#contract-01-4-1), D-112). Draft commercial
-writes and submit additionally require `expected_draft_revision`, returned as `draftRevision`
+writes and submit additionally require `expected_draft_revision`, returned as `draft_revision`
 with a coherent draft read; on `draft-mutate` it is optional at the boundary and compared only after
 admissibility, so a commercial `PATCH` after `draft` refuses `not-admissible` (D-147). The commercial-version ETag alone cannot detect draft edits.
 Acceptance recording checks the current immutable version and never accepts a draft. State
 expiry and draft auto-void are scheduler-driven and deliberately absent from this surface;
 their complete internal engine inputs are specified in [07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6).
+
+**Implementation binding baseline (S1-02).** The operation/storage catalog and boundary fixtures enumerate the interfaces below and select adapter names, headers and routine input bounds where this design left them open. The catalog preserves business refusal ordering and documents the explicit HTTP 428 adapter exception. It is a design/fixture deliverable, not runtime or provider conformance.
 
 #### API evolution and stability
 
@@ -1269,7 +1311,7 @@ boundary validation and engine ordering as REST; context is never synthesized fr
 |---|---|---|---|
 | `reflect_approval` | `OrderRef`, `ApprovalReflection`, `CallMeta` | `TransitionResult` | `POST /orders/{id}/approval-reflection` |
 | `begin_fulfillment` | `OrderRef`, `AuthorizationOutcome`, `CallMeta` | `TransitionResult` | `POST /orders/{id}/begin-fulfillment` |
-| `report_spawn_signal` | `OrderRef`, `CallMeta` | `SpawnSignalResult { transition, spawn_signal_at }` | `POST /orders/{id}/spawn-signal` |
+| `report_spawn_signal` | `OrderRef`, D-198 typed attempt/receiver/line/create-key contribution, `CallMeta` | `SpawnSignalResult { transition, spawn_signal_at, grant_id, generation }` | `POST /orders/{id}/spawn-signal` |
 | `acknowledge` | `OrderRef`, `FulfillmentAcknowledgement`, `CallMeta` | `TransitionResult` | `POST /orders/{id}/fulfillment-acknowledgement` |
 | `workflow_cancel` | `OrderRef`, `cancel_reason`, `CompensationEvidence`, `CallMeta` | `TransitionResult` | `POST /orders/{id}/workflow-cancel` |
 | `hold` | `OrderRef`, optional `reason`, `CallMeta` | `TransitionResult` | `POST /orders/{id}/hold` |
@@ -1279,16 +1321,18 @@ boundary validation and engine ordering as REST; context is never synthesized fr
 
 Paths use `/bss-orders-lifecycle/v1` as their prefix. All mutation methods carry
 `OrderRef { order_id: Uuid, expected_version: positive integer }` and
-`CallMeta { idempotency_key: String, correlation_id: Uuid }`; the metadata obeys Foundation's
+`CallMeta { idempotency_key: String, correlation_id: Uuid }` plus the optional
+`delegation_proof_ref`, which REST carries in the `X-Delegation-Proof-Ref` header
+([08 §4.4](DESIGN.md#contract-08-4-4), D-202); the metadata obeys Foundation's
 existing bounds and authorized-principal idempotency namespace. State names, reason names,
 version semantics and errors come from Foundation, not a second SDK registry.
 
 **Alignment with the Workflow branch (`bss/orders-workflow` @ `3ccf7793c`, D-193…D-199).** Workflow
 calls all nine methods as specified here. `hold` and `resume` are reserved: holds are driven by
 Lifecycle events, and the branch declares both and calls neither. `get_version` is also the read
-Subscriptions performs for the pinned comparison at activation (D-158, D-162), granted to
+Subscriptions performs for committed receipt selection at activation (D-158, D-190), granted to
 `bss-subscriptions.system` over the same finite order set as Workflow's (08 §4.3). Idempotency
-receipts for these triggers are retained for at least 30 days, the window under which Workflow
+receipts for workflow-class triggers (the exact class in Foundation §4.1) are retained for at least 30 days, the window under which Workflow
 re-issues a key (D-173). The attempt-fenced `OrdersLifecycleClientV1` of Seam Atlas C02 is not this
 contract; both gears use this one (D-175, Atlas ticket T2).
 
@@ -1330,7 +1374,9 @@ spawn-already-recorded and compensation refusals retain their existing meanings.
 `OrderVersionView` exposes the immutable commercial content of exactly the requested version,
 including selections, pins, assessment identity, market and received totals/exclusions. It returns
 the requested version even after amendment, subject to current authorization and documented retention;
-absence is `order-not-found`, never substitution of the current version. Administrative projections
+An absent or undiscoverable parent returns `order-not-found`; after current-parent authorization,
+a missing committed version returns `version-not-found` (the shared version-read wrapper in §6).
+Neither case substitutes the current version. Administrative projections
 are separately marked mutable and do not enter accepted-binding verification. Workflow obtains
 current state/version separately through `get` before acting; possession of an event/version reference
 grants no authority. Implementation must reuse the existing version-read permission boundary.
@@ -1408,15 +1454,15 @@ concern rather than a core change.
 
 | Dependency Gear | Interface Used | Purpose |
 |-----------------|----------------|---------|
-| `event-broker` | `EventBrokerApi` through `event-broker-sdk` | Receives the GTS-typed Orders notifications. Event types and managed producer registration are prepared before readiness; the transaction only enqueues locally. Runtime availability is a release gate because [docs/GEARS.md](../../../../docs/GEARS.md) currently records the implementation crate as TODO |
+| `event-broker` | `EventBrokerApi` through `event-broker-sdk` | Receives the GTS-typed Orders notifications. Event types and managed producer registration are prepared before readiness; the transaction only enqueues locally. The [Event Broker runtime](../../../system/event-broker/event-broker/src/lib.rs) and SDK exist. Orders producer integration, deployed identities/grants, readiness and recovery evidence remain release gates under [D-200](#contract-01-event-platform-integration); an obsolete inventory TODO is not evidence of a missing runtime |
 
 #### Pricing and catalog
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|---------------|---------|
-| `pricing` | `PricingReadV1` (`resolve`, `price`, `current_revision`) over the existing reads, called as the `bss-orders.system` subject in the seller tenant (D-160, D-161) | Revision currentness and availability, item roster, chain bindings, SKU versions and descriptors; the residual purchase verdict and the activation deadline are the open asks of UPSTREAM_REQS §2.2. The trait does not exist on the pinned baseline. |
+| `pricing` | `PricingReadV1` (`resolve`, `price`, `current_revision`) over the existing reads, called as the authenticated Orders service principal (D-194) in the seller tenant (D-160, D-161) | Revision currentness and availability, item roster, chain bindings, SKU versions and descriptors; the D-189 nonbinding assessment and D-191 seller-policy discovery/resolution are open asks of UPSTREAM_REQS §2.2. Acceptance already issues the deadline. The typed trait and ClientHub provider exist on main; Orders adapter integration, evidence gaps and grants remain open (D-187, §4.1). |
 | `rating` | SDK client — **unexposed today** (no Rating SDK crate exists) | The price-evaluation contract producing the non-authoritative resolved total, **including the named TCV figure computed there rather than here**; composition system of record for the full pricing snapshot, which this gear never stores. Raised as `cpt-cf-bss-orders-lifecycle-upreq-rating-evaluation` in `UPSTREAM_REQS.md` §2.2; until exposed the gate refuses `evaluation-unavailable` |
-| `products` | `ProductsClient::get_sku` (`sellable`, `lifecycle`) under this gear's own grant (D-171, D-177); the resolve-echo alternative is withdrawn | SKU sellability and lifecycle at assessment, interim until `SellabilityV1` exists. SKU protection is inherited from the revision's `plan_item` references (D-164); no registry call. The overlap key is Subscriptions' SUB-G1 key, not a Product entity. |
+| `products` | `ProductsClient::get_sku` (`sellable`, `lifecycle`) under this gear's own grant (D-171, D-177); the resolve-echo alternative is withdrawn | SKU sellability and lifecycle at assessment, interim until the D-189 nonbinding assessment supplies authoritative SKU results (the existing acceptance command alone does not retire it). SKU protection is inherited from the revision's `plan_item` references (D-164); no registry call. The overlap key is Subscriptions' SUB-G1 key, not a Product entity. |
 | Billing-chain tax owner | SDK client | The **indicative** tax figure Preview returns and never stores; a Preview-only operation with its own unavailability reason |
 
 #### Identity, contracts and downstream fulfillment
@@ -1485,15 +1531,15 @@ sequenceDiagram
     participant E as Transition Engine
     participant W as Orders Workflow
     A ->> E: amend (idempotency key, version N)
-    E ->> E: append version N+1, re-run gate, re-pin, audit
-    E -->> A: version N+1 current
-    E ->> W: OrderAmended (version N+1)
+    E ->> E: append version M, re-run gate, re-pin, audit
+    E -->> A: version M current
+    E ->> W: OrderAmended (version M)
     W ->> E: reflect approval (version N)
     E -->> W: refused - stale version
 ```
 
 **Description**: The version counter is the concurrency and supersession mechanism at once. Once
-N+1 exists, any approval reflection or fulfillment acknowledgement carrying N is refused, which
+M exists, any approval reflection or fulfillment acknowledgement carrying N is refused, which
 is what makes asynchronous approval safe without distributed locking.
 
 #### Fulfillment acknowledgement and linkage
@@ -1704,6 +1750,9 @@ and their mutability. Platform producer/outbox tables are not Orders-owned table
 | `orders_transition_audit` | `bss_orders__transition_audit` | [01 §3.7](DESIGN.md#contract-01-3-7) | engine | append-only, hash-chained over committed entries; no application/operational UPDATE grant or erasure exception (D-96, §4.3), DELETE only to the retention worker for expired refused rows — [01 §3.7](DESIGN.md#contract-01-3-7) is the canonical grant and retention contract |
 | `orders_audit_checkpoint` | `bss_orders__audit_checkpoint` | [01 §3.7](DESIGN.md#contract-01-3-7) | audit worker | append-only tenant roll-up headers; D-100 |
 | `orders_audit_checkpoint_member` | `bss_orders__audit_checkpoint_member` | [01 §3.7](DESIGN.md#contract-01-3-7) | audit worker | append-only expected order-chain heads; D-100 |
+| `orders_fulfillment_grant` | `bss_orders__fulfillment_grant` | [D-198](#contract-06-activation-admission) | engine | Immutable dispatch authority; inserted atomically by spawn/resume or D-201 internal rebuild |
+| `orders_fulfillment_control` | `bss_orders__fulfillment_control` | [D-198](#contract-06-activation-admission) | engine | Immutable coordination intent/roster and conditional fence/evidence/status; not a public lifecycle state |
+| `orders_commercial_attempt` | `bss_orders__commercial_attempt` | [D-188](#contract-01-commercial-attempt) | engine | Immutable inputs, conditional operational status/lease/receipt updates; no commercial history placeholder |
 | `orders_idempotency` | `bss_orders__idempotency` | [01 §3.7](DESIGN.md#contract-01-3-7) | engine | **mutable** — marker settles |
 | `orders_line_fulfillment` | `bss_orders__line_fulfillment` | [01 §3.7](DESIGN.md#contract-01-3-7) | workflow-seam | **mutable** — projection advances |
 | `orders_inflight_overlap_claim` | `bss_orders__inflight_overlap_claim` | [01 §3.7](DESIGN.md#contract-01-3-7) | gate-and-pin | **mutable** — only to set `released_at`; claims are never deleted |
@@ -1778,6 +1827,15 @@ The tables and schema each slice contributes are defined here and specified norm
 
 **ID**: `cpt-cf-bss-orders-lifecycle-dbtable-idempotency`
 — Foundation — Table: orders_idempotency ([contract](#contract-01-table-orders_idempotency))
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-dbtable-commercial-attempt`
+— Foundation — Table: orders_commercial_attempt ([contract](#contract-01-commercial-attempt))
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-dbtable-fulfillment-control`
+— Foundation — Table: orders_fulfillment_control ([contract](#contract-06-activation-admission))
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-dbtable-fulfillment-grant`
+— Foundation — Table: orders_fulfillment_grant ([contract](#contract-06-activation-admission))
 
 **ID**: `cpt-cf-bss-orders-lifecycle-dbtable-line-fulfillment`
 — Foundation — Table: orders_line_fulfillment ([contract](#contract-01-table-orders_line_fulfillment))
@@ -1871,7 +1929,8 @@ format are static gear configuration on the same promotion path.
 instance **not ready**, so it stops receiving traffic while remaining alive, rather than being
 killed and restarted into the same unavailable store. Readiness additionally requires
 `EventBrokerApi`, eager preparation of all Orders event types, managed chained producer
-registration, declared broker-partition-count agreement and a running toolkit outbox handle. Since
+registration, a declared broker partition count (its equality with the broker is a deployment
+gate until a broker-level read exists, D-205) and a running toolkit outbox handle. Since
 [docs/GEARS.md](../../../../docs/GEARS.md) currently says the Event Broker implementation crate is TODO, event-producing
 Orders deployment is blocked until that runtime and its integration tests exist.
 
@@ -1882,8 +1941,8 @@ event is a trigger and a version reference, and only effect-free consumers may a
 ([event consumer contract](#contract-01-event-consumer-contract), D-186, closing Q-25's §9.2 half
 in line with PRD §9.2 PB-2026-09-29). Service read grants and durable unavailable-read recovery
 are required by [UPSTREAM_REQS.md §2.7](UPSTREAM_REQS.md#27-event-broker). Pricing
-readiness is split in `DECOMPOSITION.md`: PriceBook revision reads exist behind REST, but the `PricingReadV1` trait, the
-`bss-orders.system` grant, the residual purchase verdict and exact-binding Rating evaluation remain pending. Complete consumed-item coverage is mandatory;
+readiness is split in `DECOMPOSITION.md`: PriceBook revision reads and typed `PricingReadV1` exist, but the Orders adapter/evidence conformance (D-187), the
+Orders service-principal grants (D-194), the D-189 nonbinding Pricing assessment and exact-binding Rating evaluation remain pending. Complete consumed-item coverage is mandatory;
 [UPSTREAM_REQS.md §2.2](UPSTREAM_REQS.md#22-rating--price-evaluation) registers that prerequisite and fail-closed behavior. Assessment identity
 includes component and scope key so a bundle's repeated predicate results remain distinct.
 These are documented contracts and prerequisites, not runtime verification results.
@@ -2062,6 +2121,21 @@ Orders MUST NOT duplicate that mapping or resolve names into audit responses. Au
 subject to the existing tenant/delegation authorization, and identity resolution requires separate
 platform authorization. Resolution failure MUST NOT prevent reading or verifying retained evidence.
 
+**Administrative before/after minimization (D-204, amending D-96's interim).** An administrative
+edit's `prior_value`/`new_value` follow a closed allowlist: `external_reference` is stored
+verbatim (bounded, credential-free), and `display_label` and `internal_notes` are stored only as
+`hmac-sha256:v1:<key_id>:<hex>`, the lowercase-hex HMAC-SHA256 of the exact UTF-8 value under the
+active Orders minimization key. NULL stays NULL. The key is required gear configuration supplied
+as a secret reference resolved at load time; it is never committed, logged or echoed, and a
+missing, unresolved or shorter-than-32-byte key, or a malformed `key_id`, fails startup. `key_id`
+names the key in every value so a rotation is visible and values under different keys are never
+compared as equal; rotation installs a new `key_id` with a new key and leaves stored rows as
+written. Audit verification hashes the stored text and never needs the key. A whitespace- or
+case-only change yields a different tag, so the `prior_value IS DISTINCT FROM new_value` rule
+still admits it. The replaceable minimizer is one function; a later Privacy/Legal decision changes
+it without changing the row shape. A keyed tag is pseudonymization, not anonymization: approval of
+the retained content stays open under `cpt-cf-bss-orders-lifecycle-upreq-audit-identity-lifecycle`.
+
 **Erasure changes identity data, not audit history.** Subject to the approved retention and
 privacy policy, the identity owner removes or restricts identifying data and mappings, including
 their replicas, caches and backups under a documented lifecycle. It records the authorized action
@@ -2178,8 +2252,13 @@ it follows the SDK's `EventV1` envelope, uses `data` for business content and ex
 envelope fields; §4.7 defines registration and SDK publication acceptance tests, still pending.
 The root identity source and broker grants remain an open integration dependency in
 [`UPSTREAM_REQS.md §2.7`](./UPSTREAM_REQS.md#27-event-broker).
-Compensating-transaction patterns are deliberately absent: this gear holds no distributed saga,
-and every failure it can suffer is contained in one database transaction.
+Ordinary transition effects commit or roll back in one local transaction. D-188 commercial
+acceptance and D-198 post-spawn controls are explicit exceptions to a single-transaction
+execution: engine-owned attempts/coordination commit before external commands, and fenced
+continuations reconcile their outcomes before the final public transition. A local rollback
+cannot undo an issued Pricing receipt or installed receiver fence. Workflow owns the provisioning
+saga and compensation; Lifecycle owns the durable commercial-attempt and control ledgers,
+including D-182's explicit unknown-outcome forced-exit exception.
 
 ### 4.6 Testability
 
@@ -2516,16 +2595,19 @@ are not permission to repair business state or broaden any role's grants.
 
 <a id="contract-01-the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound"></a>
 
-#### The idempotency window is 24 hours and is not a commercial bound
+#### Operation-specific idempotency retention is not a commercial bound
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-constraint-idempotency-window` (`p1`), defined in [§2.2 Slice constraints](#register-constraints).
 
-The registry is request-cache infrastructure with a **24-hour** retention window, matching the
-sibling catalog gear's ratified value. Past the window a replayed key is a new operation, so the
-window must exceed the longest caller retry horizon — including the sibling gear's reconciliation
-sweep, which is explicitly read-only once the window has elapsed. The window is a working
-baseline pending the program NFR workshop and **MUST NOT** be conflated with the per-state TTLs
-that bound an order's commercial life.
+The registry is request-cache infrastructure with an ordinary **24-hour** retention window.
+D-173 overrides that baseline for the workflow retention class (§4.1: the workflow-class
+triggers plus the D-201 internal `replace-fulfillment-grant` continuation, D-203): retain
+their receipts for **at least 30 days**, covering the issuing Workflow retry horizon. Persist
+the applicable deadline at claim time; retries, reclamation and settlement do not extend it.
+After that deadline, expired keys may name a new execution under the guarded expiry rules;
+Workflow reconciliation becomes read-only after its key window. D-188 attempt/D-198 control
+evidence must survive independently while unresolved. These windows are not commercial
+state TTLs. The old explicit anchor is preserved for existing links.
 
 <a id="contract-01-delivery-is-at-least-once-ordering-is-partition-scoped"></a>
 
@@ -2752,7 +2834,7 @@ no money arithmetic, and holds no commercial vocabulary.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-guard-registry` (`p1`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-01-why-this-component-exists-6"></a>
+<a id="contract-01-why-this-component-exists-6-guard-registry"></a>
 
 ##### Why this component exists
 
@@ -2760,7 +2842,7 @@ Guards must be declarable by slices without letting slices control when or in wh
 run — and without letting a slice refuse a request outside the engine, which would leave the
 refusal unaudited and unreplayable.
 
-<a id="contract-01-responsibility-scope-6"></a>
+<a id="contract-01-responsibility-scope-6-guard-registry"></a>
 
 ##### Responsibility scope
 
@@ -2768,14 +2850,14 @@ Startup registration of named guard predicates against transition-table rows; th
 contract including each guard's declared inputs and its reason on failure; and rejection at
 startup of a guard registered against a row that does not exist.
 
-<a id="contract-01-responsibility-boundaries-6"></a>
+<a id="contract-01-responsibility-boundaries-6-guard-registry"></a>
 
 ##### Responsibility boundaries
 
 It contains no predicate logic of its own and no commercial policy. It never invokes a slice
 mid-transition.
 
-<a id="contract-01-related-components-by-id-6"></a>
+<a id="contract-01-related-components-by-id-6-guard-registry"></a>
 
 ##### Related components (by ID)
 
@@ -2788,14 +2870,14 @@ mid-transition.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-state-table` (`p1`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-01-why-this-component-exists-6"></a>
+<a id="contract-01-why-this-component-exists-6-state-table"></a>
 
 ##### Why this component exists
 
 An edge that exists only in control flow is an edge nobody can enumerate. Making the machine
 data makes coverage testable and makes the expiry exclusions structural.
 
-<a id="contract-01-responsibility-scope-6"></a>
+<a id="contract-01-responsibility-scope-6-state-table"></a>
 
 ##### Responsibility scope
 
@@ -2803,13 +2885,13 @@ The declarative rows of `(from, to, trigger, guard set, actor class, versioning 
 type)`; the terminal set; the hold and resume mapping; expiry eligibility; and the admissibility
 check.
 
-<a id="contract-01-responsibility-boundaries-6"></a>
+<a id="contract-01-responsibility-boundaries-6-state-table"></a>
 
 ##### Responsibility boundaries
 
 It holds no guard implementations and no scheduling. It does not know why an edge exists.
 
-<a id="contract-01-related-components-by-id-6"></a>
+<a id="contract-01-related-components-by-id-6-state-table"></a>
 
 ##### Related components (by ID)
 
@@ -2821,7 +2903,7 @@ It holds no guard implementations and no scheduling. It does not know why an edg
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-idempotency-registry` (`p1`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-01-why-this-component-exists-6"></a>
+<a id="contract-01-why-this-component-exists-6-idempotency-registry"></a>
 
 ##### Why this component exists
 
@@ -2829,23 +2911,23 @@ Orders drive subscription creation, so a duplicate transition can double-provisi
 double-charge. Storing outcomes rather than de-duplicating requests is what makes replay
 answerable.
 
-<a id="contract-01-responsibility-scope-6"></a>
+<a id="contract-01-responsibility-scope-6-idempotency-registry"></a>
 
 ##### Responsibility scope
 
 Key resolution ahead of every other check; the binding of a key to the principal authorized to
 present it and to the target order (§4.2); the insert-if-absent-then-re-read protocol; the
 request fingerprint and mismatch detection; the in-flight marker with its lease; outcome
-settlement including refusals; and the 24-hour retention window with its sweep.
+settlement including refusals; and operation-specific retention (24 hours ordinarily, at least 30 days for workflow-class triggers) with its sweep.
 
-<a id="contract-01-responsibility-boundaries-6"></a>
+<a id="contract-01-responsibility-boundaries-6-idempotency-registry"></a>
 
 ##### Responsibility boundaries
 
 It does not decide whether an operation is admissible and never suppresses a guard. It retains the fingerprint and bounded authorized response snapshot for replay, including
 assessment diagnostics when present; it is not the source of current commercial state.
 
-<a id="contract-01-related-components-by-id-6"></a>
+<a id="contract-01-related-components-by-id-6-idempotency-registry"></a>
 
 ##### Related components (by ID)
 
@@ -2857,14 +2939,14 @@ assessment diagnostics when present; it is not the source of current commercial 
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-audit-store` (`p1`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-01-why-this-component-exists-6"></a>
+<a id="contract-01-why-this-component-exists-6-audit-store"></a>
 
 ##### Why this component exists
 
 Financial-grade auditability requires that the record cannot lag the fact it records, and that
 tampering is detectable rather than merely forbidden.
 
-<a id="contract-01-responsibility-scope-6"></a>
+<a id="contract-01-responsibility-scope-6-audit-store"></a>
 
 ##### Responsibility scope
 
@@ -2873,14 +2955,14 @@ delegation-proof reference and administrative change payload; the per-order pred
 chain and its verification job; retrieval by order; and the grant-and-retention contract of §3.7
 `orders_transition_audit`, which this component implements and does not restate.
 
-<a id="contract-01-responsibility-boundaries-6"></a>
+<a id="contract-01-responsibility-boundaries-6-audit-store"></a>
 
 ##### Responsibility boundaries
 
 It stores no commercial content — that is the version chain's job — and it never becomes the
 source a read derives state from.
 
-<a id="contract-01-related-components-by-id-6"></a>
+<a id="contract-01-related-components-by-id-6-audit-store"></a>
 
 ##### Related components (by ID)
 
@@ -2892,7 +2974,7 @@ source a read derives state from.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-outbox-publisher` (`p1`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-01-why-this-component-exists-6"></a>
+<a id="contract-01-why-this-component-exists-6-platform-event-producer-adapter"></a>
 
 ##### Why this component exists
 
@@ -2900,7 +2982,7 @@ Publishing inside the transaction would put an external dependency in the commit
 custom Orders outbox would duplicate platform sequencing, leasing, retry and dead-letter
 capabilities. The adapter binds Orders events to the supported platform path.
 
-<a id="contract-01-responsibility-scope-6"></a>
+<a id="contract-01-responsibility-scope-6-platform-event-producer-adapter"></a>
 
 ##### Responsibility scope
 
@@ -2910,7 +2992,7 @@ gateway-issued service `SecurityContext`; binding one `ProducerOutboxQueue` to `
 transition's transaction runner. The queue uses 16 toolkit partitions and the high-throughput
 profile; `orderId` remains the event type's broker partition key.
 
-<a id="contract-01-responsibility-boundaries-6"></a>
+<a id="contract-01-responsibility-boundaries-6-platform-event-producer-adapter"></a>
 
 ##### Responsibility boundaries
 
@@ -2919,7 +3001,7 @@ acquisition, sequence assignment, retry classification, dead-letter lifecycle, v
 re-drive API. Those are platform library responsibilities. Publication failure never alters order
 state.
 
-<a id="contract-01-related-components-by-id-6"></a>
+<a id="contract-01-related-components-by-id-6-platform-event-producer-adapter"></a>
 
 ##### Related components (by ID)
 
@@ -2931,7 +3013,7 @@ state.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-reason-registry` (`p2`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-01-why-this-component-exists-6"></a>
+<a id="contract-01-why-this-component-exists-6-reason-registry"></a>
 
 ##### Why this component exists
 
@@ -2939,7 +3021,7 @@ A refusal a caller cannot key on is not a contract, and two names for one condit
 defect rather than a cosmetic one. Centralising the catalogue is what keeps reasons stable across
 slices and mappable to one wire envelope.
 
-<a id="contract-01-responsibility-scope-6"></a>
+<a id="contract-01-responsibility-scope-6-reason-registry"></a>
 
 ##### Responsibility scope
 
@@ -2949,13 +3031,13 @@ domain/code at the wire edge, and the
 mapping from each PRD reason **descriptor** to the registered identifier that satisfies it
 (§4.2).
 
-<a id="contract-01-responsibility-boundaries-6"></a>
+<a id="contract-01-responsibility-boundaries-6-reason-registry"></a>
 
 ##### Responsibility boundaries
 
 It does not author slice reasons and never carries internal diagnostics into a response.
 
-<a id="contract-01-related-components-by-id-6"></a>
+<a id="contract-01-related-components-by-id-6-reason-registry"></a>
 
 ##### Related components (by ID)
 
@@ -2967,7 +3049,7 @@ It does not author slice reasons and never carries internal diagnostics into a r
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-retention-purge` (`p1`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-01-why-this-component-exists-6"></a>
+<a id="contract-01-why-this-component-exists-6-retention-purge-worker"></a>
 
 ##### Why this component exists
 
@@ -2975,7 +3057,7 @@ ADR-0005 makes every refused transition a durable write and refusals are most tr
 90-day refusal retention, the 7-day Preview retention and the 90-day read-log retention bound
 nothing unless a worker deletes the expired rows (D-185).
 
-<a id="contract-01-responsibility-scope-6"></a>
+<a id="contract-01-responsibility-scope-6-retention-purge-worker"></a>
 
 ##### Responsibility scope
 
@@ -2986,7 +3068,7 @@ restricted DELETE grant (§3.7); and its metrics (rows purged, batch duration, o
 oldest overdue row age, last success). Algorithm:
 [`features/01-foundation.md` §3.5](features/01-foundation.md#35-purge-bounded-retention-rows).
 
-<a id="contract-01-responsibility-boundaries-6"></a>
+<a id="contract-01-responsibility-boundaries-6-retention-purge-worker"></a>
 
 ##### Responsibility boundaries
 
@@ -2994,7 +3076,7 @@ It never deletes a committed audit row, a row inside its retention, idempotency 
 `idempotency-cleanup` worker's) or platform outbox rows (toolkit vacuum's). It repairs nothing and
 acquires no aggregate lock.
 
-<a id="contract-01-related-components-by-id-6"></a>
+<a id="contract-01-related-components-by-id-6-retention-purge-worker"></a>
 
 ##### Related components (by ID)
 
@@ -3136,7 +3218,7 @@ because the aggregate row and its first version are inserted in one transaction.
 **A draft carries version 1.** Creation appends version 1 — an empty commercial document — so
 `current_version` is never null and PRD §12 AC-1's "the order version **MUST** be set to 1" holds.
 Draft content lives in the mutable `orders_draft_content` working tables and is materialised into
-**version 2** by submit. Draft mutation (row 2) and the administrative edit (row 3) are state-only
+**the reserved candidate version** by submit (D-188). Draft mutation (row 2) and the administrative edit (row 3) are state-only
 rows that append no version, and they present the **current version** as their expected version
 like any other transition, so the optimistic check applies uniformly and no path bypasses it
 ([DECISIONS.md](DECISIONS.md) D-64).
@@ -3160,15 +3242,17 @@ table is sized by order count rather than by traffic and needs no partitioning a
 
 **Immutability** is per table rather than global. Append-only with **no UPDATE or DELETE grant**:
 `orders_order_version`, `orders_order_line_identity`, `orders_order_line`,
-`orders_resolved_total`, `orders_acceptance`, `orders_audit_checkpoint` and
+`orders_resolved_total`, `orders_acceptance`, `orders_fulfillment_grant`, `orders_audit_checkpoint` and
 `orders_audit_checkpoint_member`.
 `orders_transition_audit` has no UPDATE grant; its sole bounded DELETE exception is defined
 on that table below. Deliberately **mutable**: `orders_order` (denormalized state),
-`orders_idempotency` (marker settlement),
+`orders_idempotency` (marker settlement and D-188 fenced preparation),
+`orders_commercial_attempt` (D-188 operational state/lease/results only; inputs immutable),
+`orders_fulfillment_control` (D-198 staged receiver coordination; intent/roster immutable),
 `orders_order_admin` and `orders_order_line_admin` (administrative content),
 `orders_draft_content` (pre-submit working set), `orders_line_fulfillment` (projection advance),
 and `orders_inflight_overlap_claim` (UPDATE only to set `released_at`, no DELETE).
-This register covers every Foundation table; the gear-wide inventory including slice-owned
+This register covers every Foundation table, including D-188 operational attempts; the gear-wide inventory including slice-owned
 tables is [DESIGN.md §3.7](DESIGN.md#37-database-schemas--tables). Mutability does not confer unrestricted write or delete authority:
 each table's constraints and writer/retention rules still apply.
 
@@ -3209,9 +3293,15 @@ The producer queue name is `bss-orders-events`, with `Partitions::of(16)` and
 `UnknownProducerRegistration::RegisterNew`; the producer source is `bss-orders-lifecycle`.
 Registration rotation affects future enqueues and permanently rejects a message carrying the
 unknown old producer identity, which is why consumers cannot treat the stream as a ledger. The SDK
-producer declares the actual Event Broker topic partition count
-(default 8 only when deployment uses that default); startup **MUST** fail rather than silently use
-a count that differs from the broker. Serialized producer envelopes **MUST** remain within the
+producer declares the Event Broker topic partition count as the required, non-defaulted gear
+setting `events.broker_partitions` (1–4096); Orders never assumes the SDK default of 8, and a
+missing or out-of-range declaration fails startup (D-205). Equality with the broker's configured
+count for the Orders topic is a **deployment gate** under
+[`upreq-event-broker-runtime`](UPSTREAM_REQS.md#27-event-broker): no Event Broker API reports the
+count, so startup cannot compare it, and a mismatch is known to lose events silently (deferred
+escalation, UPSTREAM_REQS §2.7). The deployment **MUST** set both values from one source and
+verify them before release. Once Event Broker provides the requested broker-level partition-count
+capability, startup **MUST** fail on a mismatch. Serialized producer envelopes **MUST** remain within the
 toolkit outbox's 64 KiB payload limit. Capacity tests cover the largest `OrderSubmitted` and
 `OrderCompleted` envelopes at the 200-line order cap.
 
@@ -3237,11 +3327,14 @@ toolkit outbox's 64 KiB payload limit. Capacity tests cover the largest `OrderSu
 | contract_id | uuid, nullable | Governing contract where one is referenced |
 | state | enum | Current state; denormalized for read latency |
 | state_entered_at | timestamptz | When the current state was entered; the dwell input for every sweep and the "in this state since" list filter |
-| current_version | integer, **NOT NULL, `1` from creation** | Pointer into the version chain (deferred FK). Creation appends version 1 carrying the empty draft; submit appends version 2 carrying the gated content |
+| current_version | integer, **NOT NULL, `1` from creation** | Pointer into the version chain (deferred FK). Creation appends version 1 carrying the empty draft; submit appends its reserved candidate version carrying the gated content (D-188) |
+| version_allocation_high_water | integer, NOT NULL, initially 1 | Greatest permanently reserved candidate; monotonic, never decremented; checked allocation under aggregate lock; independent of current_version (D-188) |
 | draft_revision | bigint, NOT NULL, CHECK >= 0 | Mutable-draft concurrency token; initialized to 0, incremented by every commercial draft edit under the aggregate lock, retained after submit; §3.6 defines snapshot and locked comparisons |
 | pre_hold_state | enum, nullable | Set by a hold, consumed and cleared by a resume |
 | resume_count | integer, **NOT NULL, `0` from creation** | Resumes taken on this order. Incremented by row 22 and by nothing else; **no transition decrements or resets it**, which is what makes the resume cap of [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2) a bound rather than a quota. Read by row 22's guard on the already-locked aggregate row, so the cap costs no scan and no index |
 | amendment_count | integer, **NOT NULL, `0` from creation** | Amendments appended to this order. Incremented by rows 18, 19 and 20 and by nothing else; **no transition decrements or resets it**. Read by those rows' guard on the already-locked aggregate row. It is a **separate counter from `resume_count` on purpose** — a resume is a seller-side operational act and an amendment a buyer-side commercial one, so a seller's compliance holds **MUST NOT** consume a buyer's ability to revise the order ([04 §4.1](features/04-versioning.md#contract-04-4-1), [07 §4.2](features/07-hold-and-expiry.md#contract-07-4-2)) |
+| fulfillment_control_generation | bigint, NOT NULL, initially 0 | Checked monotonic generation for D-198 dispatch/control grants; never inferred from sparse commercial version or worker lease |
+| fulfillment_control_pending | uuid, nullable | Engine-owned D-198 staged control intent; blocks new activation grants until settled; independent of public state |
 | spawn_signal_at | timestamptz, nullable | Written by the spawn-signal transition; never cleared |
 | authorization_failure_tolerated_at | timestamptz, nullable | The tolerated-authorization risk flag; records a decision taken at an instant and is never cleared |
 | compensation_evidence | jsonb, nullable | Workflow-supplied evidence under the closed schema below — drafts voided, activated subscriptions rolled back, whether activation was dispatched, whether at-sale facts were emitted, and the no-active-subscription assertion; recorded only by failure acknowledgement or workflow-mediated cancellation, or — in its forced variant with `unknown` assertions and an operator attestation — by the operator-forced unreconciled failure (rows 28 and 29, D-182) |
@@ -3324,8 +3417,8 @@ indexes are a design baseline, not proof that every combination avoids sorting o
 | Column | Type | Description |
 |--------|------|-------------|
 | order_id | uuid | Owning aggregate |
-| version | integer | Monotonic per order, starting at 1 |
-| supersedes_version | integer, nullable | The version this one replaces; NULL on the first |
+| version | integer | Strictly increasing committed identities, starting at 1; gaps allowed after abandoned reservations (D-188) |
+| supersedes_version | integer, nullable | Explicit previous committed version, never candidate minus one; NULL on the first |
 | market_currency | char(3), nullable | The derived order market, per version, so an amendment does not overwrite the market a prior version was gated against |
 | market_region | text, nullable | As above |
 | payer_tenant_id | uuid | The payer **at this version** — the one tenant axis PRD §6.1 permits an amendment to change, so the aggregate's current value cannot answer who a prior version was gated and approved against |
@@ -3392,22 +3485,25 @@ which is the key the projection and the totals depend on.
 |--------|------|-------------|
 | order_id, version | uuid, integer | Owning version |
 | line_id | uuid | References the order-scoped identity |
+| commercial_attempt_id | uuid | D-188 engine attempt selecting this line; required for receipt-bearing submit/amendment versions, immutable FK to orders_commercial_attempt |
+| pricing_acceptance_id | uuid | Exact receipt selected by the successful commercial transaction; not a cross-database FK |
+| pricing_request_digest, pricing_terms_digest | text | Immutable producer digests verified against the stored per-line request and returned receipt; no local recomputation substitute |
 | plan_id, plan_revision_id | uuid | Opaque authored plan/revision references; verified together at admission |
 | selected_items | jsonb | Item IDs, optional choices, positive exact-decimal quantities and selected dimension values under §4.3 |
 | currency | char(3) | The line's currency; the single-currency predicate reads it |
-| order_pin | jsonb | Versioned `OrderPin` under [03 §4.3](#contract-03-4-3), including exact selected prices, descriptors, assessment and activation deadline; NULL only on the draft version |
+| order_pin | jsonb | Versioned `OrderPin` under [03 §4.3](#contract-03-4-3), schema 2 complete immutable Pricing receipt/query/bindings plus assessment and exact issued deadline (D-192); NULL only on the draft version |
 | overlap_scope_key | text | Subscriptions' registry-owned `catalogSubscriptionProductKey` (SUB-G1) for this accepted line, stored as received from its owner and never computed here; the PriceBook derivation proposed to that owner is the SKU of the line's paid recurring item(s). Persisted and reused by claims and activation; D-153, D-163. |
 | contract_effective_date | date | Mandatory |
-| service_activation_date | date, nullable | Requested activation; retained even when deferred |
-| acceptance_due_date | date, nullable | A calendar field; never recorded assent |
+| service_activation_date | date | Requested activation; retained even when deferred. Never NULL on an admitted line: the authored value or, where the snapshot does not require it, the contract-effective default (D-60, D-208) |
+| acceptance_due_date | date | A calendar field; never recorded assent. Never NULL on an admitted line: the authored value or, where the snapshot does not require it, the contract-effective default (D-60, D-208) |
 | date_policy_switch_state | jsonb | Snapshot of the effective `orders_date_policy` row resolved before the transaction ([Capture contract §3.7](DESIGN.md#contract-02-3-7), [Capture contract §4.2](features/02-capture.md#contract-02-4-2); D-121): its two switches, the source row's scope (tenant row or platform default) and its `revision`; never read from the not-yet-created version; retained after policy changes |
-| term_duration | interval | The term the price was quoted against |
+| term_duration | interval | Authored term intent; exact invoice-period conversion required by [D-193](#contract-03-billing-terms-resolution), never a day-based approximation |
 | billing_cycle | enum (`month`, `year`) | The cycle the price was quoted against; PriceBook's two periods (D-167), an unsupported cycle refuses evaluation |
 
 **PK**: (order_id, version, line_id)
 
 **Constraints**: append-only, no UPDATE or DELETE grant; FK to `orders_order_version` and to
-`orders_order_line_identity`. The engine validates the supported pin shape and finite deadline before admission; at its single transition timestamp an elapsed deadline refuses `order-binding-expired`. Capacity excess refuses `purchase-capacity-exceeded` through the same audited engine guard. The pin's presence from `submitted` onward is an engine-enforced
+`orders_order_line_identity`. For receipt-bearing lines the engine verifies attempt.order_id/version and receipt seller/order/version/line match this committed row, with all receipt link/digest fields present together; reserved-only attempts cannot have version-line rows. The engine validates the D-192 complete receipt/query encoding and row-link equality, then exact equality of its finite deadline to the selected receipt’s `hold_until` (D-191) before admission; at its single transition timestamp an elapsed deadline refuses `order-binding-expired`. Capacity excess refuses `purchase-capacity-exceeded` through the same audited engine guard. The pin's presence from `submitted` onward is an engine-enforced
 invariant (see preamble), verified by a test asserting no `submitted`-or-beyond line exists
 without one.
 
@@ -3525,12 +3621,14 @@ the concurrency enforcement behind the gate's friendly pre-check.
 **Contract**: `cpt-cf-bss-orders-lifecycle-dbtable-draft-content`, defined in [§3.7 Slice tables](#register-tables).
 
 **Schema**: mirrors `orders_order_line`'s authored columns, keyed `(order_id, line_id)` with no
-`version`.
+`version`. `billing_cycle` is nullable here (and only here): the cycle may be unauthored in
+`draft`, and a whole-period term keeps its intent with no interval until the cycle is authored
+(D-206 item 4); committed lines keep the non-null cycle.
 
 **PK**: (order_id, line_id)
 
 **Constraints**: **mutable**; rows are freely inserted, updated and deleted while the order is in
-`draft`, and are materialised into version 2 by the submit transition, after which the draft rows
+`draft`, and are materialised into the reserved candidate version by the submit transition, after which the draft rows
 are removed. FK to `orders_order`.
 
 **Additional info**: this table exists so that "a draft is freely modifiable" and "the version
@@ -3573,11 +3671,14 @@ transition, and the audit entry carries the changed field with its prior and new
 | currency_minor_digits, rounding_policy | integer, text | Evaluation owner supplies scale and rounding; Orders performs no conversion |
 | exclusions | jsonb | Explicit usage/tax/unsupported-overlay exclusions and discount availability |
 | item_breakdown, recurring_by_cycle | jsonb | Producer-supplied item amounts and labeled recurring cycles; no Orders summation or conversion |
-| gross_minor, net_minor | bigint | Integer minor units at the currency's scale |
-| discount_minor | bigint | Explicit discount component |
+| amount_status | enum | `committed` for recurring/one_time, `uncommitted_usage` for usage; committed describes the component, never a binding quote or billing authority (D-197) |
+| amount_basis, period_evidence | text, jsonb | Producer-declared monetary horizon and line/term/cycle evidence; aggregate recurring money uses the declared TCV horizon, not a sum of unlike per-cycle amounts (D-197) |
+| gross_minor, net_minor | bigint, nullable | Producer minor units; NULL iff uncommitted_usage, never a zero stand-in |
+| discount_minor | bigint, nullable | Explicit producer discount; NULL iff uncommitted_usage; unavailable required discount refuses |
 | promotion_ref | text, nullable | Where a promotion applied |
 | charge_kind | enum | `recurring`, `usage`, `one_time` |
-| tcv_minor | bigint, nullable | The named net pre-tax figure, order scope only, **received computed** from the evaluation contract |
+| tcv_minor | bigint, nullable | Producer-computed net pre-tax figure, only on the order/recurring carrier row (D-197); NULL elsewhere |
+| tcv_basis, tcv_evidence | text, jsonb, nullable | Only on that carrier: finite_term, rolling_annualized or mixed, per-line basis and producer policy version |
 
 **PK**: (order_id, version, scope, line_id, charge_kind)
 
@@ -3597,7 +3698,7 @@ storable: a nullable column cannot participate in a primary key.
 | Column | Type | Description |
 |--------|------|-------------|
 | audit_id | uuid | Entry identity |
-| hash_version | smallint | Audit encoding version, not the order version: every writer emits 2, which covers `caller_reason` (D-143); 1 is D-99's frozen encoding, retained so the verifier can select it per entry (§4.4) |
+| hash_version | smallint | Audit encoding version, not the order version: every new writer emits 3, covering `force_request_observation` (D-201); frozen versions 1 and 2 remain readable (§4.4) |
 | audit_tenant_id | uuid, nullable | Immutable chain namespace from the resolved aggregate; NULL for unresolved refusals (D-104) |
 | subject_tenant_id | uuid | Actor home tenant from trusted SecurityContext, including on unresolved refusals; never copied from requested order tenancy (D-104) |
 | resource_tenant_id | uuid, nullable | Resource-tenant snapshot from the resolved aggregate; required for committed entries, NULL for unresolved refusals; not broker-root tenancy or caller-asserted identity |
@@ -3614,14 +3715,15 @@ storable: a nullable column cannot participate in a primary key.
 | delegation_proof_ref | text, nullable | The proof reference PDP reported accepting for a cross-tenant action, else the reference the caller supplied — Orders does not verify it ([08 §4.4](DESIGN.md#contract-08-4-4), D-111) |
 | reason | text | Registered machine reason, never caller text and never composed: on a committed entry exactly one closed token per trigger, listed under *Committed audit reason tokens* below (D-148); on a refused entry the registered refusal reason (§4.7) |
 | caller_reason | text, nullable | What the caller supplied as its explanation, stored as received and never interpreted (D-143): the cancel reason (mandatory, [07 §4.6](features/07-hold-and-expiry.md#contract-07-4-6) *Cancel Order*), the optional hold reason ([07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6) *Hold Then Resume*, D-138), the amendment explanation (the value a committed amendment also stores on `orders_order_version.amendment_reason`, [04 §3.6](features/04-versioning.md#contract-04-3-6)), or, on a failed acknowledgement, the closed `failure_reason` value ([06 §4.4](features/06-workflow-seam.md#contract-06-4-4), D-136), or, on an operator-forced unreconciled failure, the approver's mandatory forced-failure reason ([07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6), D-182), whose `failure_reason` is the fixed `operator-forced-unreconciled` and not caller text. NULL where the trigger carries no such input or an optional one was not supplied, and on every refused entry, whose `reason` records why the attempt failed; a caller value that failed its own validation is therefore never stored |
-| changed_field, prior_value, new_value | text, nullable | Populated for an administrative edit, one entry per changed field; a line-level field is named with its line, as `lines/<line_id>/<field>` (D-117) |
+| force_request_observation | jsonb, nullable | D-201 closed object `{audit_sequence, state, version}` observed under the aggregate lock for a resolved `second-approver-required` / `force-fail-unreconciled` refusal; NULL otherwise. Separate from this refusal's NULL chain sequence; covered by audit hash v3. |
+| changed_field, prior_value, new_value | text, nullable | Populated for an administrative edit, one entry per changed field; a line-level field is named with its line, as `lines/<line_id>/<field>` (D-117). Values are minimized before hashing: `external_reference` verbatim, `display_label`/`internal_notes` as `hmac-sha256:v1:<key_id>:<hex>` ([§4.3](DESIGN.md#43-data-protection-residency-and-retention), D-204) |
 | idempotency_key | text | The key in force |
 | correlation_id | uuid, nullable | The sibling gear's process correlation identifier |
 | version | integer, nullable | Observed version in force; NULL when the aggregate was not resolved, never copied from an unverified expected_version |
 | created_at | timestamptz | Append instant |
 
 **Committed audit reason tokens (D-148).** The committed-entry vocabulary of `reason` is
-**closed**: one token per §4.3 trigger, equal to the trigger name, and nothing else — `create`,
+**closed**: one token per §4.3 trigger, equal to the trigger name, plus the D-201 internal writer token `replace-fulfillment-grant` — `create`,
 `draft-mutate`, `administrative-edit`, `submit`, `cancel`, `auto-void`, `reflect-approval-required`,
 `reflect-approval-not-required`, `reflect-approval-granted`, `reflect-approval-denied`,
 `begin-fulfillment`, `report-spawn-signal`, `acknowledge-completed`, `acknowledge-failed`,
@@ -3669,8 +3771,14 @@ When both references are present they MUST agree. The writer MUST retain `reques
 on every validated order-targeted attempt. A committed create links the newly inserted aggregate;
 a refused create with no target identifier may leave both references NULL. A resolved business
 refusal keeps the known order and observed state/version. No placeholder aggregate or later
-backfill of an immutable refusal row is permitted. `hash_version` MUST be 1 or 2, and a
-`hash_version = 1` row MUST have NULL `caller_reason`, because v1 does not cover it (D-143).
+backfill of an immutable refusal row is permitted. `hash_version` MUST be 1, 2 or 3; v1 MUST
+have NULL `caller_reason`, and v1/v2 MUST have NULL `force_request_observation` because their
+frozen encodings do not cover it. New writers use v3. Non-null observations require a resolved
+refused `force-fail-unreconciled` entry with `reason = second-approver-required`; their state and
+version equal the row's observed state/version. Require exactly three non-null members,
+positive signed-bigint `audit_sequence`, a registered state and positive signed-int `version`.
+For a newly recorded force request all three members are mandatory. Old requests without the
+observation are readable but cannot be approved; obtain a fresh request.
 
 **Refusal security ownership (D-104).** `subject_tenant_id` is mandatory on every audit record and
 comes only from the authenticated actor's SecurityContext. It is the security-ownership axis for
@@ -3852,12 +3960,17 @@ intact rather than delete it. Tenant and sequence must match the owning header.
 | order_id | uuid, nullable | Target order; NULL for in-flight/refused create, populated atomically on successful create for replay. Non-create requests bind their target in the fingerprint; create fingerprints use the stable create sentinel, never the generated ID (D-105) |
 | request_fingerprint | text | Hash over the inputs `§4.2` enumerates; detects a same-key different-request replay |
 | status | enum | `in_flight` or `settled` |
+| execution_id | uuid, NOT NULL, immutable | Fresh registry-generation identity; never derived from reusable raw client key (D-188) |
+| attempt_id | uuid, nullable | D-188 commercial attempt link; required after candidate reservation, immutable once set |
+| fulfillment_control_id | uuid, nullable | D-198 staged hold/terminal coordination link; mutually exclusive with commercial attempt_id; generation/fence ownership rules apply |
+| owner_token | uuid, nullable | D-188 live commercial executor; fresh token on reclaim |
+| fencing_generation | bigint, NOT NULL, initially 0 | Checked monotonic increment on commercial ownership/reclaim; overflow refuses; local writes compare exact generation (D-188) |
 | lease_expires_at | timestamptz, nullable | Required while `in_flight`; initialized/replaced from fresh database time plus configured lease duration under §3.6's registry lock; NULL when settled |
 | outcome | enum, nullable | `success` or `refused` once settled |
 | outcome_reason | text, nullable | The registered reason on a refusal |
 | audit_id | uuid, nullable | The transition a settled record produced |
 | settled_response | jsonb, nullable | Immutable versioned response snapshot written at settlement: HTTP status, public body and semantic headers (including returned version/revision); no transport credentials. Includes the assessment result below when gate evaluation was reached; NULL while in flight |
-| created_at, expires_at | timestamptz | On new claim, write fresh database time `t` and `t + 24 hours`; replay, reclamation and settlement do not extend the window (§4.2) |
+| created_at, expires_at | timestamptz | On new claim, write fresh database time `t` and `t + retention_window(operation)`: ordinary 24 hours; the workflow retention class (workflow-class triggers and `replace-fulfillment-grant`) at least 30 days (D-173, D-203). Replay, reclamation and settlement do not extend this stored deadline (§4.2) |
 
 **Persisted response and assessment binding.** Every settled record requires a non-null
 `settled_response` with `formatVersion = 1`; readers retain decoders for supported versions.
@@ -3974,7 +4087,7 @@ authoritative roster and coordination contract for the **five Orders-owned worke
 |--------|--------------------------------------------------------|-----------------------------------------------------|
 | Per-state TTL expiry | `expiry` | Locked-row eligibility/state/version recheck and deterministic transition idempotency key |
 | Draft auto-void | `draft-auto-void` | Locked-row draft/TTL recheck and deterministic transition idempotency key |
-| Idempotency-window cleanup | `idempotency-cleanup` | Recheck expiry and settlement under row lock; never delete a live/reclaimed in-flight record |
+| Idempotency-window cleanup | `idempotency-cleanup` | Recheck expiry and settlement on the current row version under the row's lock, which is the conditional DELETE's own (the maintenance role holds SELECT and DELETE only, so no `SELECT … FOR UPDATE`; D-209 item 2); never delete a live/reclaimed in-flight record |
 | Retention purge (`cpt-cf-bss-orders-lifecycle-component-retention-purge`, phase 0/1, D-185) | `retention-purge` | Conditional bounded deletion of still-eligible rows only; audit deletion restricted to expired refused rows |
 | Audit verification/checkpointing | `audit/<canonical audit-tenant UUID>` | Read-only verification; consistent checkpoint snapshot and unique next checkpoint sequence (§4.4) |
 
@@ -4052,19 +4165,21 @@ producer-registration and toolkit outbox migrations explicitly before constructi
 `SecurityContext` for producer calls (distinct from and never substituted for the transition
 caller's context), calls eager
 `prepare_all()` for the topic and all eleven event types, resolves or registers the durable managed
-chained producer identity, verifies the declared broker partition count, registers the
+chained producer identity, validates the declared broker partition count (equality with the broker
+is a deployment gate, D-205), registers the
 `bss-orders-events` queue and starts its toolkit workers. Any failure leaves the instance not ready.
-The repository currently records Event Broker as “SDK landed — impl crate TODO”
-([platform inventory](../../../../docs/GEARS.md)); Orders event-producing deployment is
-therefore blocked until a runtime implementation is available and passes the integration gate.
+The Event Broker implementation and its ClientHub provider already exist on main (D-200);
+the platform inventory's SDK-only wording is stale. Orders still must integrate and verify actual
+runtime wiring, registrations, partition configuration, permissions and recovery before production.
+The [D-200 capability/evidence boundary](#contract-01-event-platform-integration) applies.
 
 **SDK release prerequisite.** The deployed Event Broker SDK revision **MUST** satisfy
 `cpt-cf-bss-orders-lifecycle-upreq-event-broker-cursor-retry` in
 [`UPSTREAM_REQS.md §2.7`](UPSTREAM_REQS.md#27-event-broker): initial chained-cursor recovery
 must retry transient failures without dead-lettering the event or advancing the queue cursor.
-The retry guarantee in §4.4 depends on this SDK fix. Release verification requires the fix
-PR/revision and passing SDK regression evidence; a successful startup health check does not
-establish this behavior.
+That source behavior is already present (commit `c7de7b80ae`, 2026-09-23); the remaining gate is
+verification of the deployed revision and complete empty-cache regression evidence, not a request
+for a still-missing fix. A successful startup health check does not establish this behavior.
 
 **Platform recovery release prerequisite.** Production deployment **MUST** also satisfy
 `cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery` in
@@ -4182,7 +4297,11 @@ the caller never saw ([DECISIONS.md](DECISIONS.md) D-110; `§3.6` *Attempt Trans
 `acknowledge-completed` (row 13), `acknowledge-failed` (rows 14, 26) and `cancel-workflow-mediated`
 (rows 16, 27). No draft trigger is in the class, so draft-revision handling is unchanged.
 `force-fail-unreconciled` (rows 28, 29) is **not** in the class: it is a human operator's trigger
-with the ordinary admissibility-then-version order (D-182). A
+with the ordinary admissibility-then-version order (D-182). The **workflow retention class**
+(§2.2, D-173) is this class plus the D-201 internal `replace-fulfillment-grant` continuation
+([06](DESIGN.md#contract-06-replace-fulfillment-grant)), which Workflow issues and retries under
+one key: its receipts are retained for at least 30 days (D-203). That adds no trigger to the class
+and does not change the continuation's own closed guard order. A
 slice **MUST NOT** refuse a request before calling the engine, and **MUST NOT** depend on running
 before another slice's guard for the same row.
 
@@ -4333,8 +4452,11 @@ normative statement of both, which this section defers to rather than repeats. N
 from it.
 
 **Canonical audit hash v1 (D-99).** This is the authoritative byte contract for
-`orders_transition_audit`, following Pricing's [domain/audit.rs](../../pricing/pricing/src/domain/audit.rs) framing pattern but not its
-field set or domain tag. It does not introduce hashing for `orders_read_access_log`.
+`orders_transition_audit`. The existing [Pricing audit repository](../../pricing/pricing/src/infra/storage/repo/audit_repo.rs)
+is a precedent for scoped, same-transaction insertion only: it explicitly writes unsealed rows
+with NULL chain/hash fields and performs no sealing or verification. The byte framing, domain
+tags, chain verification and checkpoints below are Orders-owned requirements, not an existing
+Pricing codec to reuse. This contract does not introduce hashing for `orders_read_access_log`.
 
 * Algorithm: SHA-256 through the platform-approved cryptographic provider. Store digest bytes
   in `bytea`, exactly 32 bytes; hex is presentation only. `hash_version = 1` is required for v1
@@ -4380,12 +4502,25 @@ delegation_proof_ref, reason, changed_field, prior_value, new_value,
 idempotency_key, correlation_id, version, created_at, prev_hash, caller_reason
 ```
 
-Every writer emits v2, and every v2 column except `entry_hash` is covered. The verifier selects
+Every v2 column except `entry_hash` is covered. D-201 supersedes the v2 writer election with v3 below. The verifier selects
 the encoding per entry from its stored `hash_version`, so one chain may hold both versions: a
 predecessor link is the stored `entry_hash` whatever version produced it, and genesis is
 unchanged. No Orders writer has shipped, so no v1 entry exists; v1 stays defined, with its
 vectors, so a verifier never has to guess, as D-99's *Failure/evolution* rule requires, and it
-rejects any other version as unsupported.
+rejects versions other than the explicitly defined v1, v2 and v3 as unsupported.
+
+**Canonical audit hash v3 (D-201).** New writers emit v3. Keep v1/v2 preimages and tags frozen.
+Use `VHP-BSS-ORDERS-AUDIT-ROW-v3` followed by `0x1f`, then the complete v2 field order,
+then `F(force_request_observation)`. A NULL observation contributes `0x00`. A non-null
+observation contributes one framed byte string containing, in fixed order,
+`F(audit_sequence as u64 big-endian) || F(state as UTF-8) || F(version as u64 big-endian)`.
+The positive signed database bounds above apply. This is typed binary framing, never arbitrary
+JSON serialization; unknown/missing members refuse. The row's `hash_version` is 3. Committed
+and ordinary refused rows append the explicit NULL frame. A resolved forced-request refusal
+still has NULL `sequence`/`prev_hash` and remains outside the business chain. Its hash covers the
+observation but does not authenticate it independently of the restricted writer/database role.
+Approval reauthorizes both users and compares this observation under the aggregate lock.
+Genesis/checkpoint encodings remain unchanged; a v3 row may link to a stored v1/v2 hash.
 
 No runtime identity lookup, current order
 state, query result ordering, broker sequence or implicit database default contributes bytes.
@@ -4591,17 +4726,15 @@ and PRD §9.2's PB-2026-09-29 amendment, which supersedes the earlier "without a
 wording; no event-payload widening reopens it.
 
 **Golden conformance corpus `orders-events` (specified here, not built).** The consumer obligations
-are verified by one shared corpus rather than by each consumer's own reading of this table, following
-the joint golden fixture precedent: [`gears/bss/fixtures`](../../fixtures/README.md) holds hand-authored
-TOML under `corpus/<family>/` with a `_family.toml` manifest and a dev-only
-`bss-fixtures-conformance` runner, and Pricing gates publish-contract sign-off on its joint proration
-fixture ([`pricing/docs/design/06-consumer-contracts.md`](../../pricing/docs/design/06-consumer-contracts.md)
-K5 and its conformance criterion). `orders-events` is a new family there: one TOML case per row below,
-each a script of deliveries (envelopes) and stubbed Orders read responses, with the expected effect
-log. Because an event handler is not an arithmetic subject, the runner gains a sibling evaluator
-trait beside `CorpusEvaluator`; each consumer implements it over its real handler and supplies its
-declared C2 applicability rule as case parameters, so expected outcomes are per consumer where the
-rule decides them. The corpus is **built with the first consumer integration** (Workflow, per
+are verified by one shared corpus rather than by each consumer's reading of this table.
+The previously cited `gears/bss/fixtures` directory, `bss-fixtures-conformance` runner and
+Pricing `06-consumer-contracts.md` K5 are absent from the current checkout (S1-01 verification).
+They are historical references, not reusable infrastructure proven present. S1-06 must select
+an existing supported repository harness or implement the missing shared harness explicitly.
+The required corpus remains one case per row below: a script of deliveries and controlled
+Orders read responses, expected effect log, and each consumer's declared C2 applicability rule.
+Run these cases against real consumer handlers; fixture-only success is not integration evidence.
+The corpus is **built with the first consumer integration** (Workflow, per
 [06 §5.2](features/06-workflow-seam.md#52-cross-gear-safety-and-recovery-evidence)); until then
 no consumer may report it passed.
 
@@ -4731,8 +4864,9 @@ gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.acceptance_reco
 
 `cf.bss.orders.event.v1~` is **`x-gts-abstract`**: it is never instantiated, and it carries the
 common `data` fields invariant across all eleven — `orderId`, `orderVersion`, `occurredAt`, the correlation
-identifier, and the common order-summary block `§4.4` requires so a consumer can act without
-fetching the order back. Each of the eleven concrete types is **`x-gts-final`**: they are the
+identifier, and the common order-summary block `§4.4` requires for bounded projections.
+Effect-free consumers may use that summary alone; D-186 requires fresh authorized reads before
+business effects. Each of the eleven concrete types is **`x-gts-final`**: they are the
 published contract and nothing derives further from them, so a consumer matching on one is matching
 on a closed shape.
 
@@ -4903,6 +5037,9 @@ pairs distinguish Orders reasons from similarly named failures in other gears.
 | `direct-cancel-window-closed` | `DIRECT_CANCEL_WINDOW_CLOSED` | FailedPrecondition | 400 |
 | `forced-failure-reason-required` | `FORCED_FAILURE_REASON_REQUIRED` | InvalidArgument | 400 |
 | `spawn-signal-not-recorded` | `SPAWN_SIGNAL_NOT_RECORDED` | FailedPrecondition | 400 |
+| `grant-source-mismatch` | `GRANT_SOURCE_MISMATCH` | FailedPrecondition | 400 |
+| `grant-predecessor-unsettled` | `GRANT_PREDECESSOR_UNSETTLED` | FailedPrecondition | 400 |
+| `grant-generation-exhausted` | `GRANT_GENERATION_EXHAUSTED` | FailedPrecondition | 400 |
 | `overdue-window-not-elapsed` | `OVERDUE_WINDOW_NOT_ELAPSED` | FailedPrecondition | 400 |
 | `second-approver-required` | `SECOND_APPROVER_REQUIRED` | FailedPrecondition | 400 |
 | `order-not-found` | `ORDER_NOT_FOUND` | NotFound | 404 |
@@ -4914,7 +5051,7 @@ pairs distinguish Orders reasons from similarly named failures in other gears.
 | `cursor-invalid` | `CURSOR_INVALID` | InvalidArgument | 400 |
 | `read-store-unavailable` | `READ_STORE_UNAVAILABLE` | ServiceUnavailable | 503 |
 
-`second-approver-required` is the one refusal whose `context.data` carries `requestAuditId`, the
+`second-approver-required` is the one refusal whose `context.data` carries `request_audit_id`, the
 refusal entry's own `audit_id`, which the engine allocates before settling so a replay returns the
 same value; a second operator names it to approve ([07 §3.6](features/07-hold-and-expiry.md#contract-07-3-6), D-182, after Ledger's
 `DUAL_CONTROL_REQUIRED`). `operator-forced-unreconciled` is a `failure_reason` value, not a refusal.
@@ -4925,8 +5062,12 @@ Adopted catalog reasons retain their upstream identifiers and meaning in the gat
 adapter must supply the upstream canonical category and domain/code mapping, not invent Orders
 aliases or put an upstream reason URI in `type`. Validate that contract during integration.
 For an all-failures response, retain the complete authorized report in `context.data`; select
-the first unavailable result in declared predicate order as the primary error if any input was
-unevaluable, otherwise the first failed result in that order. Its category and domain/code form
+the first unavailable result in declared predicate order from the **blocking** result set,
+otherwise the first failed blocking result in that order. D-195's versioned applicability mapping
+excludes approved D-189/D-193 optional-context TCV unevaluability and D-191 optional forecast
+absence from that set: it preserves successful
+Preview with `tcvWithheld` and remains in the diagnostic vector. Required sellability checks remain
+blocking. The selected blocking result's category and domain/code form
 the outer Problem. Neither selection nor a 503 status changes refusal audit/idempotency
 settlement or authorizes automatic replay with a fresh key.
 
@@ -4945,8 +5086,11 @@ rules take precedence over reason specificity: an invisible order and an absent 
 the same `ORDER_NOT_FOUND` envelope without target data.
 
 **Compatibility and verification.** The canonical SDK fixes `FailedPrecondition` to HTTP 400,
-not 409 or 422; the only exception is `expected-version-required`, whose variant declares the
-SDK's same-class transport override to 428 (D-112). Concurrency conflicts retain 409; dependency unavailability uses 503. The
+not 409 or 422; the only exception is `expected-version-required`, whose REST mapping explicitly applies the
+SDK's same-class transport override to 428 (D-112). The current `ContractError` derive builds
+`Problem::contract_error` with the category default (400); it has no per-variant HTTP override
+attribute. The Orders adapter must preserve the registered domain/code/type and apply the 428
+transport mapping explicitly, with a fixture proving it; deriving the error alone is insufficient. Concurrency conflicts retain 409; dependency unavailability uses 503. The
 authorization-context conflict keeps 409 but now has canonical title "Aborted" and the fixed
 detail in §3.3. No Orders runtime has shipped this contract; update response/OpenAPI declarations
 when implementing it. Required tests (not yet implemented) cover every listed variant's
@@ -5380,7 +5524,7 @@ it to the admitted version.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-capture-field-classifier` (`p1`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-02-why-this-component-exists-1"></a>
+<a id="contract-02-why-this-component-exists-1-field-classifier"></a>
 
 ##### Why this component exists
 
@@ -5388,7 +5532,7 @@ The commercial-versus-administrative split is the mechanism behind the whole ver
 contract, and it is only trustworthy if it lives in one declaration that both the capture path
 and the amendment path read.
 
-<a id="contract-02-responsibility-scope-1"></a>
+<a id="contract-02-responsibility-scope-1-field-classifier"></a>
 
 ##### Responsibility scope
 
@@ -5398,14 +5542,14 @@ maps any commercial field to `draft-mutate`, whose state-table admissibility ref
 classes (§4.3, D-118); and the startup check that fails
 if any authored field is unclassified.
 
-<a id="contract-02-responsibility-boundaries-1"></a>
+<a id="contract-02-responsibility-boundaries-1-field-classifier"></a>
 
 ##### Responsibility boundaries
 
 It holds no field values and performs no edit. It does not decide what an amendment does with a
 commercial change — that is [`04-versioning`](DESIGN.md#contract-04-1-1).
 
-<a id="contract-02-related-components-by-id-1"></a>
+<a id="contract-02-related-components-by-id-1-field-classifier"></a>
 
 ##### Related components (by ID)
 
@@ -5450,6 +5594,14 @@ operation outside `draft` other than an administrative edit is the engine's `not
 **Order number**: assigned at creation, unique per `sellerTenantId`, and treated as a display
 and reconciliation handle only — no logic keys on its structure, so its format may change under
 the additive-change policy without a major version.
+
+**Wire bindings (D-206).** Every request, settled success body and `context.data` member of these
+operations is `snake_case` (`draft_revision`, `request_audit_id`, `expected_draft_revision`);
+create answers 201 with the committed empty draft's `OrderView`, `ETag: "1"` and `Location`; a
+line insert returns the server-reserved `line_id` in its settled body; `DELETE …/lines/{lineId}`
+accepts an optional body carrying only `expected_draft_revision`; an SDK caller receives a settled
+refusal with its stored Problem diagnostics; and a request proposing a resource or payer change is
+fingerprinted over the arrangement it establishes.
 
 
 <!-- /contract -->
@@ -5803,7 +5955,7 @@ reset a deadline. D-150/D-158 define the assessment dependency graph.
 | Port | Deadline | Output / dependency |
 |---|---|---|
 | `PricingReadV1::current_revision` | 250 ms | Currentness and availability of each line's revision under §4.1; no implicit latest revision |
-| `PricingReadV1::resolve` | 250 ms | The item roster, chain matrix, SKU versions and descriptors under §4.1; the stored matrix and the local deadline under §4.3 |
+| `PricingReadV1::resolve` | 250 ms | The item roster, chain matrix, SKU versions and descriptors under §4.1; separate diagnostic matrix; the D-192 commercial pin contains selected receipt bindings only; issued deadlines come from acceptance, not this read (D-191) |
 | `ProductsClient::get_sku` | 250 ms | `sellable` and `lifecycle` per consumed SKU under §4.1, until resolve echoes them |
 | Subscriptions SUB-G1 key | 250 ms | The registry overlap key per prospective line (D-163); owner adoption pending |
 | Identity/payer profile | 250 ms | Tenant axes and authoritative payer market |
@@ -5834,33 +5986,22 @@ measurement/ratification; no one-second end-to-end latency claim is made.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-constraint-partial-predicate-evaluability` (`p1`), defined in [§2.2 Slice constraints](#register-constraints).
 
-On PriceBook `16705a243`, `pricing-sdk/src/lib.rs` exports only `product_catalog`. REST resolve
-returns binding matrices for published or superseded revisions, no total and no purchase verdict.
-The reads exist and are golden-tested; the trait over them, `PricingReadV1`, does not (D-161), and
-the residual purchase verdict has no owner (§4.1). Missing SDKs produce their registered unavailable
-outcomes; Orders must not import producer internals or use per-line REST calls as an alternative
-to an owning contract.
+**D-187 (R01 reconciliation).** The historical `16705a243` baseline lacked the read SDK;
+reviewed main `a35dfc3e21b57a0ab453e01898a0e42fa6d569ec` implements and registers it.
+Orders owns a catalog port and a typed SDK adapter; it does not import Pricing internals or REST
+DTOs. The [mapping and evidence gaps](#contract-03-pricing-read-mapping) below govern what the
+adapter can establish. Capability presence does not close Orders integration or the unresolved
+purchase/Preview protocols; missing required evidence remains fail-closed.
 
-Access follows the pattern Pricing already grants its two consumers (Pricing D-424; D-160): Rating
-and Subscriptions call resolve as the system subjects `bss-rating.system` and
-`bss-subscriptions.system` with `plan:read` and `price:read`, the revision is looked up in the
-subject's tenant, and resolve reads SKU versions as Pricing's own actor. The tenant-scoped subject
-context is Pricing's own `reference_ticker::system_actor` pattern
-(`SecurityContext::builder().subject_id(..).subject_tenant_id(tenant).subject_type(..)`), which only
-works in-process through a ClientHub SDK, one more reason `PricingReadV1` is a prerequisite. Orders
-asks for the same: a `bss-orders.system` subject with those two Pricing grants, plus a Products SKU
-read grant for the `get_sku` row of §4.1, which is a scoped read. The adapter builds that subject's
-context for the order's **seller tenant** and calls the traits; the seller scope is an adapter
-input, never a Pricing API parameter, and the buyer, payer and resource axes stay in Orders' own
-context. The subject is configured as the scheduler's `system` actor is (01 §3.7, D-115) and fails
-closed when missing. A seller-read PEP denial maps to the port-unavailable reason with operator-only
-diagnostics, never a buyer-facing 403 disclosing seller details. Successful unknown revision is
-`pricing-revision-absent`, while unreachable/denied/malformed revision read is
-`pricing-revision-unavailable`.
-
-The hardcoded Pricing actor restriction belongs to Products' reference registry, a door for the
-`pricing` owner only; Orders never calls it (§4.3, D-164). No missing or unevaluable purchase fact
-is treated as permission to sell.
+**D-194 replaces the former D-160 system-actor construction.** Orders obtains an authenticated
+platform service principal provisioned for the seller and uses explicit PDP grants as specified in
+[the service-authorization contract](#contract-08-commercial-service-authorization). It does not
+construct a seller context, borrow Pricing's identity, or treat CatalogRef as authority. Pricing
+passes this ordinary service caller through Products' PDP path for related reads. Catalog access
+and buyer/resource/payer authority are independent. Missing credentials/grants fail closed;
+seller-read denial remains a port-unavailable result with operator-only diagnostics, never a
+buyer-facing disclosure. Successful unknown revision is `pricing-revision-absent`; denied,
+unreachable or malformed reads are `pricing-revision-unavailable`.
 
 <a id="contract-03-the-overlap-check-depends-on-an-unagreed-upstream-read"></a>
 
@@ -6103,14 +6244,14 @@ verdict.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-gate-pin-capture` (`p1`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-03-why-this-component-exists-2"></a>
+<a id="contract-03-why-this-component-exists-2-pin-and-total-capture"></a>
 
 ##### Why this component exists
 
 Price integrity between capture and activation is the revenue-integrity risk the gear exists to
 close, and it can only be closed atomically with the state change.
 
-<a id="contract-03-responsibility-scope-2"></a>
+<a id="contract-03-responsibility-scope-2-pin-and-total-capture"></a>
 
 ##### Responsibility scope
 
@@ -6119,14 +6260,14 @@ the resolved total as received — gross, net, the discount component, the promo
 three charge-kind rows and the TCV figure. The summation and annualisation behind that figure are
 performed by the evaluation contract, not here (D-40).
 
-<a id="contract-03-responsibility-boundaries-2"></a>
+<a id="contract-03-responsibility-boundaries-2-pin-and-total-capture"></a>
 
 ##### Responsibility boundaries
 
 It computes no price and applies no overlay. Usage carries no committed amount and is excluded
 from TCV. Nothing it stores may be read as a billing input.
 
-<a id="contract-03-related-components-by-id-2"></a>
+<a id="contract-03-related-components-by-id-2-pin-and-total-capture"></a>
 
 ##### Related components (by ID)
 
@@ -6138,14 +6279,14 @@ from TCV. Nothing it stores may be read as a billing input.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-gate-preview` (`p2`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-03-why-this-component-exists-2"></a>
+<a id="contract-03-why-this-component-exists-2-preview"></a>
 
 ##### Why this component exists
 
 A buyer needs to know whether a basket is purchasable and what it costs before committing to it,
 and the answer must be the same answer submit would give.
 
-<a id="contract-03-responsibility-scope-2"></a>
+<a id="contract-03-responsibility-scope-2-preview"></a>
 
 ##### Responsibility scope
 
@@ -6153,7 +6294,7 @@ The read-only run over a supplied basket; per-line gate results; the resolved to
 TCV; the indicative tax figure obtained from the tax owner and never stored; expected
 fulfillment time and per-line deferral where line dates differ.
 
-<a id="contract-03-responsibility-boundaries-2"></a>
+<a id="contract-03-responsibility-boundaries-2-preview"></a>
 
 ##### Responsibility boundaries
 
@@ -6161,7 +6302,7 @@ It creates and mutates nothing, stores no tax, and returns no approval-requireme
 basket line omits term duration or billing cycle it still answers successfully with every other
 field, omits `tcv` and states why in `tcvWithheld` (§4.6, D-125); it does not refuse the request.
 
-<a id="contract-03-related-components-by-id-2"></a>
+<a id="contract-03-related-components-by-id-2-preview"></a>
 
 ##### Related components (by ID)
 
@@ -6261,9 +6402,9 @@ An expired acceptance or exceeded aggregate capacity contributes `order-binding-
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|---------------|---------|
-| `pricing` | `PricingReadV1` (`resolve`, `price`, `current_revision`) over the existing reads, called as the `bss-orders.system` subject in the seller tenant (D-160, D-161) | Revision currentness and availability, item roster, chain bindings, SKU versions and descriptors; the residual purchase verdict and the activation deadline are the open asks of UPSTREAM_REQS §2.2. The trait does not exist on the pinned baseline. |
+| `pricing` | `PricingReadV1` (`resolve`, `price`, `current_revision`) over the existing reads, called as the authenticated Orders service principal (D-194) in the seller tenant (D-160, D-161) | Revision currentness and availability, item roster, chain bindings, SKU versions and descriptors; the D-189 nonbinding assessment and D-191 seller-policy discovery/resolution are open asks of UPSTREAM_REQS §2.2. Acceptance already issues the deadline. The typed trait and ClientHub provider exist on main; Orders adapter integration, evidence gaps and grants remain open (D-187, §4.1). |
 | `rating` | SDK client — **unexposed today** (no Rating SDK crate exists) | The price-evaluation contract producing the resolved total and the TCV figure; composition owner of the full snapshot, which this slice never stores. Raised as `cpt-cf-bss-orders-lifecycle-upreq-rating-evaluation` (TCV semantics under `cpt-cf-bss-orders-lifecycle-upreq-tcv-with-annualisation`); until exposed the evaluation outcome is `evaluation-unavailable` |
-| `products` | `ProductsClient::get_sku` (`sellable`, `lifecycle`) under this gear's own grant (D-171, D-177); the resolve-echo alternative is withdrawn | SKU sellability and lifecycle at assessment, interim until `SellabilityV1` exists. SKU protection is inherited from the revision's `plan_item` references (D-164); no registry call. The overlap key is Subscriptions' SUB-G1 key, not a Product entity. |
+| `products` | `ProductsClient::get_sku` (`sellable`, `lifecycle`) under this gear's own grant (D-171, D-177); the resolve-echo alternative is withdrawn | SKU sellability and lifecycle at assessment, interim until the D-189 nonbinding assessment supplies authoritative SKU results (the existing acceptance command alone does not retire it). SKU protection is inherited from the revision's `plan_item` references (D-164); no registry call. The overlap key is Subscriptions' SUB-G1 key, not a Product entity. |
 
 <a id="contract-03-identity-contracts-and-fulfillment"></a>
 
@@ -6315,10 +6456,14 @@ of `orders_resolved_total`.
 | line_id | uuid, nullable | NULL for order-level predicates |
 | predicate | text | Predicate identity, adopted or delta |
 | item_id | uuid, nullable | Pricing revision-item identity; NULL for a line/order-level result |
-| catalog_scope_key | text, nullable | The slot's `dim_value` as resolve answered it, with the literal token `default` for the null default slot (D-159), for a per-item/chain result; NULL for a plan/order-level result |
+| has_catalog_selection | boolean | D-195 distinguishes a selected null/default dimension (`true`) from a result without selection identity (`false`) |
+| catalog_scope_key | text, nullable | Raw `dim_value`, including NULL for the selected default; literal text `default` remains text. Must be NULL when `has_catalog_selection=false` |
 | verdict | enum | `passed`, `failed` or `unevaluable` |
 | reason | text, nullable | Registered reason on failure or unevaluability |
-| upstream_detail | jsonb, nullable | Adopted predicate identity and original `detail` or `owed_to`; never inferred from a transport error |
+| mapping_version | text | Immutable D-195 Orders mapping/coverage registry version used for this run, including local applicability rules |
+| applicability | enum | `required`, `tcv-only` or `preview-forecast`; D-195 registry validates operation-specific dependencies and the narrow missing-context nonblocking conditions, never a caller-controlled admission bypass |
+| producer_results | jsonb | Ordered D-195 typed subresults with owner/predicate/reason/profile, tri-state verdict and allowlisted observation/selection context; empty for a wholly local result; restricted diagnostic metadata |
+| upstream_detail | jsonb, nullable | D-195 allowlisted local dependency/evidence identifiers only; never raw provider payload, secret or detail inferred from a transport error |
 | evaluated_at | timestamptz | Run instant |
 
 **PK**: outcome_id
@@ -6332,11 +6477,12 @@ outcomes and trusted metadata are written atomically. A storage failure is an in
 failure, not a successful diagnostic recording. Submit/amendment reuse the engine transaction;
 [Foundation contract §3.6](features/01-foundation.md#contract-01-3-6) defines the explicit diagnostic write on early-input, gate and overlap
 refusals, before settlement and commit, without commercial contributions. [Foundation contract §3.7](DESIGN.md#contract-01-3-7)'s
-`orders_idempotency.settled_response` stores the immutable assessment ID, complete ordered
-vector, failure list and original public response; its assessment ID equals this run_id.
+`orders_idempotency.settled_response` stores the immutable assessment ID, complete authorized public ordered
+vector, failure list, immutable D-195 mapping version and original public response; restricted
+producer evidence stays in this scoped diagnostic store. Its assessment ID equals this run_id.
 Idempotent replay returns that snapshot without another run. Order outcomes by declared
-predicate order, then binary line ID, binary item ID and canonical item/chain-key UTF-8
-bytes, with NULL first at each level. Foundation uses this same order for replay and primary
+predicate order, then binary line ID, binary item ID, selection presence (`false` first) and raw dimension
+UTF-8 bytes, with NULL first at each nullable level (D-195). Foundation uses this same order for replay and primary
 failure selection. Include pin composition in every completed assessment: it runs in the
 dependency-ordered assessment whatever independent checks answer (D-150), so a refused run persists each
 line's pin outcome too; unavailable or invalid pins must have a persisted outcome,
@@ -6351,12 +6497,14 @@ denial does not persist caller-asserted commercial assessment metadata.
 
 **Evaluation identity.** A bundle remains one order line; do not invent component order lines
 or collapse distinct item/slot results into one predicate answer. Preserve resolve's `item_id` and
-the slot's `dim_value` (token `default` for the null slot) on every result, including passed
-results; that pair is the slot identity of D-159, and no other key encoding is asked of Pricing.
-Plan-level answers carry NULL key;
+the slot's raw `dim_value` and `has_catalog_selection` on every result, including passed
+results (D-195 narrowly replaces D-159's ambiguous `default` sentinel). Pricing supplies native
+selection identity; Orders preserves selected NULL separately from literal text `default`.
+Plan-level answers carry NULL key and `has_catalog_selection=false`;
 component plan-level answers still carry item_id. Order-level predicates have NULL
 line/component/key; a non-NULL component or key requires a non-NULL line. Ordinary line
-predicates have NULL component; per-key predicates require the returned key. Repeated references
+predicates have NULL component; per-key predicates require item identity and
+`has_catalog_selection=true` with the returned nullable dimension. Repeated references
 to the same component/key may share its one evaluation, but results for distinct components or
 keys must remain distinct. The ordered vector in settled_response retains both identity fields.
 
@@ -6372,7 +6520,7 @@ Tests isolate concurrent runs of identical baskets and two tenants, cover passed
 inputs, and verify atomic persistence, retention and denial of cross-scope diagnostic lookup.
 
 **Constraints**: append-only;
-`(run_id, line_id, predicate, item_id, catalog_scope_key)` UNIQUE NULLS NOT DISTINCT
+`(run_id, line_id, predicate, item_id, has_catalog_selection, catalog_scope_key)` UNIQUE NULLS NOT DISTINCT
 (one result per complete evaluation identity, including order-level predicates);
 `reason` NOT NULL when `verdict` is not `passed`; indexed on
 `(evaluated_at) WHERE order_id IS NULL` for the 7-day Preview purge, and on `(order_id)` for the
@@ -6398,9 +6546,9 @@ does not overwrite the one a prior version was gated against.
 
 Inherited from [01-foundation — Deployment Topology](DESIGN.md#contract-01-3-8). This slice adds no background worker;
 its nine outbound operations are called synchronously under the budgets of §2.2. Every
-catalog-facing operation runs against the **seller's** catalog tenant: the adapter builds the
-`bss-orders.system` subject's context for the order's seller tenant and calls the trait in it, never
-the buyer's context and never a tenant argument on the Pricing API (D-160, superseding D-122).
+catalog-facing operation runs against the **seller's** catalog tenant: the adapter obtains the
+authenticated Orders service context provisioned for that seller (D-194) and calls the trait in it; each query also carries the seller's `CatalogRef`, checked against PDP
+constraints rather than trusted as authority (D-187 amends D-160's no-tenant-argument wording).
 
 **Observability owned here**: per-port latency, timeout and breaker-state series, so a slow
 upstream is attributable rather than surfacing as an unexplained submit latency; gate-refusal
@@ -6422,39 +6570,94 @@ guarantee is refusing real purchases.
 <!-- contract:03-gate-and-pin:4.1 -->
 ### Gate and pin: The adopted predicate set (normative)
 
-**D-159 / D-161.** The catalog predicates are evaluated from the reads Pricing already serves, consumed
-through one SDK trait over those reads, and only the rows no existing read can answer remain an
-upstream ask. The trait is `PricingReadV1 { resolve, price, current_revision }` in `pricing-sdk`,
-carrying the existing `GET /resolve`, `GET /prices/{id}` and `GET /plans/{id}` answers with their
-DTO field names unchanged; it is the same trait Rating and Subscriptions need, and it is a release
-prerequisite because `pricing-sdk` exports only the product catalog today. The adapter calls it as
-the configured `bss-orders.system` subject in the order's seller tenant (§3.5, D-160). The three
-signatures, as the reads exist: `resolve(plan_revision_id, date, item_id?, pins[]) → PricingResolveDto`;
-`price(price_id) → PricingPinnedPriceDto`; `current_revision(plan_id) → PricingPlanDto` with
-`published_rev: Option<i32>` (a revision number) and `revisions[] { id, rev_no, book_id, state,
-available_from, published_at }`; at the fork tip (`7d3544156`, Pricing D-460) the plan read also
-names `in_effect`, and `state` admits `scheduled` (D-446–D-454). Resolve's 404 is
-`pricing-revision-absent`; its 409 `REVISION_NOT_PUBLISHED` is a `catalog-predicate-failed` result
-on the first row, as is its 409 `REVISION_NOT_YET_AVAILABLE` with detail `revision-not-yet-available`
-(Pricing D-454, D-169); its 503 `REGISTRY_UNAVAILABLE` (Pricing D-469) and any other unreachable,
-denied or malformed answer from the trait is `pricing-revision-unavailable`. The 15
-golden contract files freeze `resolve` and `price`; `current_revision` has no golden today.
+**D-187 amends D-159/D-161's read contract only.** Orders owns a small catalog port and an
+infrastructure adapter over the existing typed `PricingReadV1`, obtained from ClientHub. Pricing
+owns commercial read semantics and, under D-189, shared commercial rule evaluation; Orders owns
+assessment composition, its own predicate evaluation, diagnostic mapping and its
+versioned evidence encoding. No Pricing API/source change is selected by R01.
 
-| Predicate | Source | Status |
+The actual methods take `&SecurityContext` and return `Result<_, CanonicalError>`:
+
+| Method | Typed input | Typed output |
 |---|---|---|
-| The line's revision is the plan's revision **in effect** on the assessment date (D-169, Pricing D-460): the `revisions[]` entry with `id == plan_revision_id` is the one `current_revision` names as `in_effect`; `current` may name a `scheduled` revision waiting for its sale date and does not make a sale current; a `superseded` or `scheduled` entry fails, the latter with detail `revision-not-yet-available` | `current_revision(plan_id)`; resolve `state` | Existing read (served contract at `7d3544156`) |
-| The revision is available on the assessment date | that entry's `available_from`; null means available since publication | Existing read |
-| Every selected item is a member of the revision; since Pricing D-467 an item is a SKU and its entry, with no optional or included items and no `treatment`, `qty_min` or `included_qty` to hold (D-170) | resolve `items[]` | Existing read |
-| The selected slot of every consumed charged item exists and is covered | resolve `items[].chains[]`: the slot whose `dim_value` equals `selected_dim_value` (null selects the default chain) has `uncovered == false`; no such slot is `catalog-predicate-failed` with detail `dim-value-unknown` | Existing read |
-| SKU version and descriptors as of the assessment date | resolve `items[].sku_version`, invoice inputs, `meter` | Existing read |
-| The SKU is sellable and its lifecycle admits a sale | `Sku.sellable` and `Sku.lifecycle` through `ProductsClient::get_sku`, a scoped read that needs a Products SKU read grant for `bss-orders.system` (UPSTREAM_REQS §2.10); P-D-222 makes that grant the only self-service path, since the Pricing system actor is in-process only (D-171); the read is interim until `SellabilityV1` exists (D-177) | Existing read; grant is an ask |
-| The selected dimension value applies to the payer's market | none | Residual ask, Atlas decision 1 |
-| Any further purchase-eligibility rule the catalog owner holds | none | Residual ask, `SellabilityV1` |
+| `resolve` | `ResolveQuery { catalog, revision_id, date, item_id: Option<Uuid>, pins: Vec<PricePin> }` | `ResolvedBindings { plan_id, revision_id, cells }` |
+| `price` | `PriceQuery { catalog, price_id }` | `ImmutablePrice` |
+| `current_revision` | `PlanQuery { catalog, plan_id }` | `RevisionRef { plan_id, revision_id, revision_no }` |
 
-An item is dimensioned iff resolve answers at least one non-null `dim_value` slot for it; a null
+Every `catalog` is `CatalogRef { tenant_id: seller_tenant_id }`, alongside the configured
+authenticated Orders service context for that seller (D-194). The provider checks that resource hint against PDP constraints;
+passing a tenant UUID does not grant access. Orders must not use Pricing's owner-only Products
+registry identity or fall back to the buyer's tenant.
+
+The adopted obligations remain separate; the adapter choice does not remove a predicate:
+
+| Predicate | Typed source / outstanding evidence |
+|---|---|
+| The requested revision is the plan's revision in effect on the assessment date (D-169) | Compare requested plan/revision IDs with `current_revision` and `resolve` identities. The current-only provider clock and observation limits below apply; a superseded or scheduled revision is not admitted merely because resolve can read it. |
+| The revision is available on the assessment date | Resolve's admission/refusal is observable, but explicit `available_from` and publication evidence are absent. Independent availability evidence/diagnostic conformance remains open; absent fields cannot produce a passed result. |
+| Every selected item belongs to the revision (D-170) | Full resolve cells expose item IDs; selected-item membership must be checked. Independent complete-roster evidence remains a gap. |
+| Every selected charged slot exists and is covered | Match `(item_id, dimension_value)` to the selection; an absent cell or `binding: None` fails. Other unselected uncovered cells do not fail this predicate. |
+| SKU version and descriptors are those used for the assessment date | `AcceptedBinding` supplies a version number and dated descriptor projection; D-192 retires the absent SKU effective-date/source provenance from the mandatory pin; required dated-version/descriptor semantics still need producer conformance, never a guessed timestamp. |
+| SKU sellability and lifecycle admit the sale | Separate authorized Products `get_sku` flags under the existing grant requirement; D-189 retires this interim read only when the proposed assessment supplies authoritative SKU results. |
+| The selected dimension value applies to the payer's market | No answer from `PricingReadV1`; market-applicability evidence is required from the proposed D-189 assessment and remains unevaluable until implemented. |
+| Any further purchase-eligibility rule owned by the catalog | No answer from `PricingReadV1`; the implemented `SellabilityV1` command does not automatically satisfy this read-only assessment role. D-188 governs receipt commands; D-189 supplies the proposed nonbinding assessment contract. |
+
+<a id="contract-03-pricing-read-mapping"></a>
+
+#### Typed read mapping and evidence gaps (D-187)
+
+| Evidence | Mapping / status |
+|---|---|
+| Plan/revision identity | Exact: `ResolvedBindings.plan_id/revision_id`; compare both with the requested line and `RevisionRef`. New-sale currentness uses the returned current identity, never the highest revision number. |
+| Matrix and selections | Exact: each `ResolvedCell.selection` is `(item_id, dimension_value)`; `binding: None` is uncovered, never free. Group cells by item to obtain Orders' matrix. `PricePin` uses the same selection plus `price_id`; do not reuse REST pin syntax. |
+| Consumed-slot coverage | Derived: select the cell matching `selected_dim_value` (including null); absent selection fails with `dim-value-unknown`, uncovered selected cell fails coverage. Unselected uncovered cells alone do not fail admission. Preserve returned slots as assessment evidence where needed; D-192 stores only selected receipt bindings in the commercial envelope. Full-resolution calls use `item_id: None`; the answer has no independent roster/count proving completeness, so do not claim truncated-roster detection from the SDK alone. |
+| Binding identity and financial inputs | Exact: `AcceptedBinding` supplies item/entry/SKU IDs, SKU version number, descriptors, unit, meter, kind, recurring period, usage policy, invoice inputs and `ImmutablePrice` (including money digest, currency, model, minimum fee, effective start, observed end and state). Preserve exact decimals and producer fields; do not recalculate price. `price()` can return cancelled historical money: read success is not eligibility or authority to pin it; preserve `PriceState` and use the provider's binding admission semantics. |
+| Default-chain fallback | `via_default` records fallback. Orders retains requested `dimension_value` and this flag; it must not claim a verbatim legacy `dim_used`/`pinned_from` payload. |
+| Revision state, availability and roster | Missing as explicit evidence: `RevisionRef` has no `state`, `available_from`, publication date or revision roster. Provider currentness and resolve admission are observations, not independently supplied evidence for every former predicate. Keep the separate availability diagnostic/evidence requirement open; do not manufacture timestamps or mark it passed from absent fields. |
+| Legacy pin provenance | Missing from this read contract: `book_id`, SKU-version `effective_from`, GL/tax/timing input sources (`template_source` is supplied), and several legacy binding fields (`pinned_from`, `eligibility`, `effective_to`, `temporary_until`, `keep_for_bound`). D-192 explicitly retires these legacy provenance fields from the commercial pin in §4.3; required commercial values and sale-coverage evidence remain mandatory, never nullable defaults. |
+| Live SKU sellability and additional owner rules | Separate Products/sellability integration and grants remain required. R01 does not decide receipt issuance, read-only Preview, acceptance/holds or their authority. |
+
+`current_revision` uses Pricing's current clock, not a caller-supplied assessment date. It promotes
+due scheduled revisions using `transaction_with_events`, then returns the published revision.
+The SDK classifies this as `SafeRead`: it issues no acceptance receipt, but it can write revision
+state, audit and events. Orders must not promise zero Pricing writes during reads or execute the
+call inside an Orders read-only transaction. Existing UTC date-change invalidation before submit
+commit remains required (§4.3); same-date revision changes and observation consistency need
+integration evidence. These calls do not establish an atomic catalog snapshot across methods.
+Scheduled and superseded revisions cannot qualify as a new sale merely because resolve accepts
+them; current identity must also match. Backdated/future-dated currentness cannot be inferred from
+the current-only method.
+
+The adapter maps canonical error category/reason and operation context, not REST DTOs or raw
+HTTP response text. A resolve not-found identifying the revision maps to
+`pricing-revision-absent`; a missing item is not automatically a missing revision. Recognized
+`REVISION_NOT_PUBLISHED` and `REVISION_NOT_YET_AVAILABLE` refusals fail the relevant catalog
+predicate (the latter keeps `revision-not-yet-available`). Do not classify every aborted/conflict
+error as a business refusal: storage contention also uses that category. Denial, dependency
+failure, malformed answers and unknown/unmapped failures remain unavailable, with seller details
+restricted to operator diagnostics. `INCOMPLETE_COMMERCIAL_INPUTS` is missing required evidence,
+never a passed predicate or a free binding. Exact error fixtures, including `PLAN_UNPUBLISHED`,
+remain part of adapter conformance; no arbitrary status-only mapping is authorized.
+
+**Pending acceptance evidence (no runtime verification claimed):** real-provider fixtures must
+cover a published matching revision; scheduled/superseded mismatch; absent, uncovered and default
+selected cells; unselected uncovered cells; incomplete inputs; denial and foreign catalog hints;
+known business versus infrastructure errors; due-revision catch-up and UTC rollover. Mapping
+fixtures must list unsupported legacy fields and demonstrate fail-closed behavior for required
+missing evidence. Required unavailable facts still prevent a successful gate.
+
+Source evidence at reviewed main: [typed contract](../../pricing/pricing-sdk/src/read.rs),
+[provider and scope checks](../../pricing/pricing/src/api/pricing_read.rs),
+[canonical errors and resolve checks](../../pricing/pricing/src/infra/pricing_reads.rs),
+[ClientHub registration](../../pricing/pricing/src/module.rs), and
+[existing provider tests](../../pricing/pricing/tests/pricing_read_sdk.rs). This follows the
+[SDK/adapter boundary](../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md),
+not the historical REST answer shapes.
+
+An item is dimensioned iff resolve answers at least one non-null `selection.dimension_value` cell for it; a null
 selection on a dimensioned item is admitted only when its default slot is bound. The activation
-deadline is not a predicate: it is derived locally under §4.3 from the stored bindings and an
-Orders-owned setting.
+deadline is issued only with Pricing acceptance: D-191 copies the selected receipt’s `hold_until`
+verbatim under [the deadline contract](#contract-03-commercial-deadline). Assessment alone has no issued deadline.
 
 Resolve's acceptance of a superseded revision is for history and renewal; the first row is what
 makes a new sale current. All selected charged items must bind; unselected optional chains need not
@@ -6463,15 +6666,14 @@ matrix would reject valid sales. Under Pricing D-467 every revision item is a ch
 entry; the optional and included distinctions remain in the stored shape only as history for
 assessments made before the tip and are never evaluated (D-170). Composition-only SKU sellability and deprecated/retiring treatment
 follow the two Products fields as they are read; a stricter owner rule, if one is added, arrives
-through the residual `SellabilityV1` row and never as a local reimplementation.
+through the proposed D-189 Pricing assessment and never as a local reimplementation.
 
-Each row is recorded as an independent result: `passed`, `failed` with `catalog-predicate-failed`, or
-`unevaluable` with `catalog-predicate-unevaluable`, preserving item/chain scope, `detail` and
-`owed_to`. Only the two residual rows are `unevaluable` while their owner is missing; the six read
-rows are evaluable as soon as `PricingReadV1` and the Products grant exist. A missing trait, a
-truncated roster or a port failure is `catalog-predicates-unavailable`. Unevaluable never becomes
-passed. The same six reads govern Subscriptions' own new-purchase path; accepted initial activation
-instead follows §4.3.
+Each adopted predicate is still recorded independently as passed, failed or unevaluable,
+preserving item/slot scope, detail and owed-to authority. D-187 removes only the missing-SDK
+blocker: it does not establish that all six historical read predicates or the full pin evidence
+are satisfied by today's projections. D-192 replaces the legacy persisted shape; missing required sale facts still remain unevaluable/unavailable under
+the existing gate contract; a missing client, malformed answer or port failure is not permission
+to sell. Initial activation semantics remain a separate §4.3 reconciliation decision.
 
 
 <!-- /contract -->
@@ -6483,9 +6685,9 @@ instead follows §4.3.
 
 **D-150/D-152/D-156; ADR-0008.** The legacy entity ID
 `cpt-cf-bss-orders-lifecycle-entity-catalog-price-pin` is retained for traceability; its value is
-now `OrderPin`, not a catalog snapshot. This is the Orders-side target contract. No new Pricing
-capability is required for it: acceptance is Subscriptions' pinned comparison at activation
-(D-162) over the resolve that exists.
+now `OrderPin`, not a catalog snapshot. This Orders-side target integrates durable acceptance
+under D-188 and the existing Pricing hold protocol under D-190; upstream assessment (D-189),
+missing evidence and downstream integration remain implementation prerequisites.
 
 #### Purchase and assessment identity
 
@@ -6495,8 +6697,7 @@ One order line is one subscription acquisition. It names `plan_id`, `plan_revisi
 are purchased; included allowances remain part of the immutable revision. An included item with
 no price entry has no chain and no pin. No line-level quantity multiplies item quantities implicitly.
 Drafts may carry unresolved opaque IDs; admission verifies membership and required selections.
-`selected_dim_value` is the customer's choice at item scope; the chains an item is answered are
-stored beneath the item (D-159), and the choice never becomes a chain field.
+`selected_dim_value` is the customer's choice at item scope; D-192 stores its accepted selection and native binding rather than D-159's complete matrix.
 
 An assessment fixes `assessment_id`, `assessed_at` (UTC instant), `resolve_date` (UTC calendar
 date of that instant), `seller_tenant_id`, proposed dates and draft/date-policy revisions. Different
@@ -6508,166 +6709,248 @@ A UTC date change before submit commit invalidates the prepared assessment with 
 
 #### Stored shape
 
-`orders_order_line.order_pin` is a versioned JSON object with the following required contract:
+<a id="contract-03-frozen-commercial-snapshot"></a>
 
-| Member | Meaning |
+**D-192 (R06 Option A): adopt the complete frozen Pricing receipt.** This explicitly
+replaces the legacy required matrix/provenance pin shape under D-152/D-159/D-162/D-187.
+The commercial authority is the receipt selected by the successful D-188 commit, not a
+fresh catalog projection. `orders_order_line.order_pin` uses Orders encoding **schema 2**;
+schema 1 names the former design and is not silently reinterpreted. No existing runtime
+rows or migration are claimed. Any future supported historical decoder must be explicit;
+unknown/unsupported schemas and missing required commercial inputs fail closed.
+
+| Required schema-2 member | Exact source and meaning |
 |---|---|
-| `schema_version` | `1`, a closed supported encoding |
-| `assessment_id`, `assessed_at`, `resolve_date` | Common assessment identity and UTC basis |
-| `seller_tenant_id`, `plan_id`, `plan_revision_id`, `book_id` | Authorized origin and immutable composition |
-| `currency`, `currency_minor_digits`, `rounding_policy` | Producer-supplied monetary interpretation, frozen with the evidence |
-| `items[]` | Complete revision-item roster with `treatment`, `selected`, `item_id`, `sku_id`, `quantity`, `included_qty`, `qty_min`, `charge_kind`, `period`, `model` and `selected_dim_value`, as resolve names them; unselected optionals are identified, not billed. `treatment`, `included_qty` and `qty_min` are absent from resolve since Pricing D-467 and stored as null; no reader may depend on them (D-170) |
-| `items[].sku_version` | `{ published_version, effective_from }` used in assessment; required for consumed items; no fallback to today's mutable SKU head |
-| `items[].descriptor_snapshot` | `meter` and the four invoice inputs with their `source`, as resolve returned them, or an immutable producer reference guaranteeing identical replay |
-| `items[].chains[]` | The item's matrix as resolve answered it (D-159): one slot per `dim_value` (null is the default slot), each `{ dim_value, uncovered, binding? }`. A consumed charged item stores every slot it was answered; an unpriced included item and an unselected optional have none |
-| `items[].chains[].binding` | Resolve's binding verbatim: `price_id`, `dim_used`, `pinned_from`, `price`, `min_fee`, `eligibility`, `effective_from`, `effective_to`, `temporary_until`, `ends_on`, `keep_for_bound`; no Orders price calculation |
-| `activation_deadline` | Exclusive UTC instant before which initial activation must commit, derived **locally**: `min(earliest exclusive end over the consumed slots, assessed_at + max_acceptance_interval)`, where a slot's end is `min(ends_on, temporary_until)` converted to exclusive UTC midnight (pinned-holder semantics, Pricing D-425) and `max_acceptance_interval` is an Orders-owned, seller-scoped setting configured like the date policy. Date arithmetic over stored producer fields, not pricing arithmetic. Unset interval is `order-binding-policy-missing`. An early check only (D-162) |
-| `accepted_version_ref` | `(order_id, order_version)`; what the receiver reads through the authorized version read to build its pins and compare (D-162). No client-supplied snapshot is authority |
+| `schema_version` | Orders envelope encoding `2`; independent of Pricing's private storage encoding and `BillingTerms.schema_version` |
+| `assessment_id`, `assessed_at`, `resolve_date` | Orders assessment correlation and UTC basis; not issuer acceptance time or deadline |
+| `accepted_version_ref` | Exact `(order_id, order_version, line_id)` of the committed selection; equality with receipt query and row links is mandatory |
+| `receipt` | Complete `AcceptanceReceipt`: `acceptance_id`, original `request_digest`, original `terms_digest`, complete `query`, `accepted_at`, `hold_until`, and exact `bindings[]` |
+| `receipt.query` | Complete `NewSaleQuery`: tenant axes, order/version/line, plan/revision, selections, exact plan quantity (not an implicit per-item multiplier), market, `start_at`, term, complete `BillingTerms`, resolved-bindings digest and hold-policy version; never reconstruct from current defaults |
+| `receipt.bindings[]` | Exact selected `AcceptedBinding` values, including item/entry/dimension identity, SKU id/version/code/name/unit/meter, complete immutable price, charge kind/recurring period, default-chain flag, usage policy and invoice inputs |
+| `activation_deadline` | Exact finite `receipt.hold_until` under D-191; checked equality, never another deadline calculation |
 
-Uniqueness is one slot per `(line_id, item_id, dim_value)`, with null `dim_value` the default slot.
-Quantity and `included_qty` are item-scoped and are never multiplied by the number of slots; two
-slots sharing one `price_id` share Rating's per-price minimum fee, not two. The **consumed slot** of a
-consumed charged item is the one slot whose `dim_value` equals the item's `selected_dim_value`
-(null selects the default chain); it must be `uncovered = false`. The other answered slots are
-stored as answered, uncovered ones included, for information and for the first period fact; they
-take no part in the deadline or in the comparison at activation. Renewal membership after
-activation follows Pricing's D-420 rules at the receiver: a value registered later is bound as a
-signup would, a removed value retained by a pin keeps resolving.
+`receipt` is an Orders-owned lossless wire projection of the public Pricing SDK values,
+not access to Pricing's private database wire types. Implement an explicit versioned
+encoder/decoder: preserve exact decimals, UTC instants, enum meanings, identities and all
+issuer digest bytes. Do not assume SDK structs implement serde; do not serialize Rust
+Debug output, coerce decimals through binary floats, silently default absent fields, or
+recompute/replace issued digests using an invented JSON hash. Pricing's supported digest
+helpers may validate their specified inputs; an Orders encoding version is not a new Pricing
+digest algorithm. Request digest identifies the full requested command; terms digest identifies accepted commercial terms; money digest covers the provider-defined monetary subset, and template digest covers template content. They are not interchangeable and template/money equality alone cannot establish receipt equality. Unknown encodings/scalars and mismatching required links refuse admission
+or historical decoding with the appropriate corruption/unsupported category, not expiry.
 
-Assessment has `purpose = preview | submit | amendment`, local diagnostic metadata that reaches no
-producer. Preview evaluates the same reads and rules, computes and reports the deadline, but stores
-no pin and never refuses on the deadline. Submit and amendment store the matrix as answered; the
-reads write nothing on the producer side (Pricing D-419: resolve is a read with no binding, audit
-row or idempotency key), so there is no producer receipt to issue, recover or reclaim. The authority
-that the accepted prices are the ones activated is the receiver's comparison at activation (D-162),
-not a token. No network work enters the Orders transaction; a failed amendment preserves its old
-version's pin.
+The complete receipt query must equal the frozen D-188 request and its returned bindings
+must agree with the accepted selections and expected digest evidence. The row's
+`pricing_acceptance_id`, request/terms digests, seller, order/version/line, plan/revision and
+currency must match the envelope. Preserve all accepted inputs even if an Orders convenience
+column represents only a subset. This does not resolve the separate quantity/term mapping
+questions: an unrepresentable requested purchase must fail closed, never be silently reduced
+to the SDK's shape. The engine alone selects/persists the envelope in the final commercial
+transaction; failed/reserved attempts and their receipts remain operational evidence only.
+
+#### Field reconciliation and required business facts
+
+| Legacy requirement | D-192 disposition |
+|---|---|
+| Seller, plan and revision | Retained exactly in `receipt.query.tenant_axes` and plan/revision fields; authorized origin remains mandatory |
+| Currency, minor digits, rounding | Retained as accepted market/price currency and each binding's `invoice.currency_scale` / `invoice.rounding`; require agreement where the consumer requires a common currency, never guess from currency code |
+| SKU version and descriptors | Retain `sku_id`, `sku_version`, code/name/unit/meter and complete invoice/policy values exactly. No activation-time SKU-head lookup replaces them |
+| Invoice template, GL, tax category and timing | **Values remain required** as supplied by `InvoiceInputs`, with template digest and `template_source`. Missing required GL/tax/timing/template facts are an incomplete input, not optional provenance |
+| Source of GL/tax/timing | Retired as a mandatory commercial field: current SDK supplies values but not those source labels. May be separate producer-backed diagnostics; never invent `source = sku_version` or null placeholders |
+| `book_id`, SKU-version `effective_from` | Retired from the commercial pin requirement. Exact entry/price and SKU-version identities remain. Optional diagnostic provenance needs its own authoritative source and observation identity; entry ID is not book ID, price start is not SKU-version start |
+| Full unselected chain matrix, included/optional treatment and allowance metadata | Retired from the commercial envelope. Store the exact receipt's selected bindings only. A separately authorized diagnostic projection may retain observations, including uncovered cells; it cannot bill, prove an unobserved roster complete or add purchases |
+| `dim_used` / chain association | Preserve native `dimension_key`, `dimension_value`, `via_default` and query selections; renewal encoding is an adapter responsibility below, not an invented receipt field |
+| `pinned_from`, `eligibility`, `effective_to`, `temporary_until`, `keep_for_bound` | Retired as required local receipt fields; no synthetic defaults. Preserve actual `ImmutablePrice` fields, including `effective_from`, observed `ends_on`, state and money digest. Fresh admission still obtains authoritative D-190 eligibility; these observations cannot manufacture it |
+| Selected coverage, membership, quantity, meter/policy compatibility and billing terms | Remain real admission obligations. Missing required authoritative evidence blocks admission; removing legacy storage fields does not waive these checks or close D-187/D-189 upstream gaps |
+
+A full catalog read remains useful assessment evidence; it is **not** an extra set of
+accepted billable bindings. No unselected/uncovered diagnostic cell becomes a first-period
+charge. Missing selection coverage cannot be cured by fabricating a free binding.
+
+#### Downstream first-period materialization
+
+Subscriptions reads the exact committed version under its finite authorized scope, validates
+its complete receipt and selects the same acceptance ID/terms digest for D-190. It persists
+its chosen activation instant and performs the hold/fresh-eligibility/fencing protocol.
+`HeldBindings` must match the selected receipt's ID, terms digest and exact bindings; it is
+**not a complete first-period snapshot** because it lacks the full query and `BillingTerms`.
+Materialization therefore takes the committed receipt query **plus** matching held bindings,
+retaining receipt/hold provenance and actual activation time. Receipt `query.start_at` is the accepted earliest start; held `activation_at` is the chosen business activation identity within its allowed window, distinct from the later applied service instant (D-201). A different actual instant does not silently rewrite accepted BillingTerms or its anchor. It never joins a newer SKU,
+meter, policy, invoice template or price into those accepted commercial inputs.
+
+The first-period handoff preserves accepted market, selections/quantity/term, complete
+`BillingTerms`, price models/minimum fees, SKU/unit/meter versions, usage policy and invoice
+inputs. Subscriptions contributes its own interval/component identity and activation facts;
+Rating owns composition of its broader `pricingSnapshotRef` in the current downstream design.
+The receipt and `HeldBindings` are neither that complete composite nor a ready-to-post bill.
+Orders does not choose missing overlay, coupon, tax-calculation, FX or commitment policies.
+Any additionally required downstream input needs an authoritative contract; inability to
+construct a supported reproducible first-period input blocks activation, not a guessed default.
+Subscriptions/Rating contract adoption, wire mapping and conformance remain unchecked
+implementation prerequisites; no sibling design or runtime delivery is asserted here.
+
+Example: accept SKU v3, template A and meter M1; publish SKU v4, template B and meter M2.
+Initial commercial materialization still uses v3/A/M1. A separately labelled current-product
+UI projection may show the new label, but cannot overwrite the accepted invoice name/template,
+meter, tax category or accounting inputs. D-190 fresh eligibility still observes current safety
+conditions without refreshing commercial descriptors. D-191 preserves issued expiry; R12
+still owns unresolved activation races/fencing. Renewal and future period policies are not
+changed by freezing initial materialization.
+
+Required completion evidence (all pending):
+
+- [ ] Schema-2 round trips preserve the full query, every selected binding, exact decimals,
+  instants and original digests; unknown schema, lost fields and mismatching links fail closed.
+- [ ] After SKU/template/GL/tax/timing/meter/policy changes, Orders and first-period inputs
+  retain the accepted values; separately labelled live UI data cannot alter billing inputs.
+- [ ] Hold-only input, missing BillingTerms, absent required invoice values, altered bindings,
+  foreign receipt and reserved/unselected D-188 receipt cannot create first-period authority.
+- [ ] Unselected/uncovered diagnostic cells are never billed; removing unavailable legacy
+  provenance neither blocks an otherwise complete receipt nor weakens required sale coverage.
+- [ ] Lost-response replay reproduces the same materialized commercial input; Rating composes
+  its own snapshot without catalog refresh, with required extra inputs explicitly supplied.
+
+Assessment has `purpose = preview | submit | amendment` as Orders-local diagnostic metadata.
+D-189 shares nonbinding assessment composition; Preview stores no commercial pin and calls neither
+acceptance nor hold. Submit/amendment issue durable acceptance through D-188's reserved attempt,
+and only their final successful transaction selects receipts in the committed version. A failed
+amendment preserves the preceding committed pin; remote evidence may survive without selection.
+D-190 governs activation of the selected receipts. No network work enters the Orders transaction.
 
 Totals remain in `orders_resolved_total`, linked by the same assessment identity; they are not a
 billing authorization or part of Pricing's `Pin` input. Unknown schema, foreign references, missing
-consumed-item descriptors, omitted roster members, a selected slot that is uncovered, or a total
+required selected-binding descriptors, missing required selections, an uncovered selected cell, or a total
 evaluated against different prices cannot be committed as a valid pin.
 
-#### Own-chain versus default-chain pins
+#### Selected dimensions and later renewal
 
-The selected dimension and Pricing's input pin are different fields. For a selected value `eu`:
-
-| Binding | Pricing renewal encoding, when renewal is due |
-|---|---|
-| Own `eu` chain (`dim_used = eu`) | `{price_id: P, dim_value: null}` |
-| Default-chain fallback (`dim_used = null`) | `{price_id: P, dim_value: "eu"}` |
-| Undimensioned/default selection | `{price_id: P, dim_value: null}` |
-
-The encoding is applied per stored slot: a slot whose `binding.dim_used` equals its `dim_value`
-goes back as the bare `price_id`; a slot bound through the default price (`dim_used` null,
-`dim_value` set) goes back as `price_id:dim_value`. Deduplicate identical provider pins within a
-request; reject incompatible assignments rather than lose per-slot association. The current resolver
-infers ownership from entry/price and may associate one pin with several items. An adapter must
-prove the projected slots round-trip exactly. Never encode an own-chain price as `price_id:eu`:
-current Pricing refuses that as `PIN_FOREIGN`.
+D-192 preserves native query `BindingSelection { item_id, dimension_value }` and binding
+`via_default`/dimension identity. The actual read SDK accepts
+`PricePin { item_id, dimension_value, price_id }`: a later consumer must use that public
+typed contract, preserving the requested item/dimension association. D-159's historical
+bare-price / `price_id:dim_value` encoding is not the current SDK wire shape and is not
+an initial-activation protocol. Provider conformance must prove own-chain, default fallback
+and undimensioned round trips before a renewal adapter is delivered; this choice neither
+implements renewal nor introduces catalog resolution at initial activation.
 
 #### Initial activation, renewal and expiry
 
-**D-162: the accepted prices are verified by a pinned comparison at activation, not held by a new
-resolve mode.** The stored matrix is held unchanged through the order's states. Pricing offers no
-initial-acceptance mode and this design asks for none. Instead Subscriptions, before committing
-`active`, reads the accepted matrix of the order version through the authorized `get_version`,
-encodes the consumed slots as pins under the own-chain/default rule above, and runs the ordinary
-`resolve(plan_revision_id, activation date, pins)`. The resolver routes each pin through its renewal
-walk (Pricing D-420 rules 2–4): it stays on the accepted price while that price is in force, stops
-before a `new` successor and keeps the price bound (`keep_for_bound`), and moves only when an `all`
-successor has started or the accepted price has ended. The comparison is therefore exact: for every
-consumed slot the answered `binding.price_id` must equal the accepted one. Equal: the subscription
-activates on those bindings, `pinned_from` naming the accepted price as provenance, and stores them
-as its first period's pins. Different, or a consumed slot missing from the answer: the activation is
-refused with a closed receiver reason (`accepted-price-mismatch`), Workflow maps it to
-`order-binding-expired` and compensates. A signup resolve is **not** used for the comparison: it
-binds whichever price is in force regardless of eligibility and would refuse an order after any
-`new` list-price change that Pricing itself would honour for a pinned holder. Two accepted
-refusals: a temporary promotion pair that starts and ends between submit and activation lands the
-walk on the return price, a different row with the same money; and an `all` successor that started
-before activation moves the binding, which is the case the promise cannot survive. Subsequent
-renewal follows Pricing's `all`/`new` rules, with period slicing at `ends_on`.
+<a id="contract-03-accepted-price-activation"></a>
 
-The comparison is exact on `price_id`. SKU versions and descriptors are read as of the activation
-date by that same resolve (Pricing D-424) and may differ from the assessment's; Subscriptions
-stores the activation-date descriptors under SUB-D-29 and the order keeps its own as history. Rating
-evaluated totals and TCV on the assessment's descriptors, which is what approval saw; a descriptor
-change is not a refusal. Because approvals with `effective_from` equal to the current day are
-allowed and registry values and tenant settings are read at request time, no resolve is
-deterministic within a day; the design does not claim it. The Subscriptions amendment therefore
-states that the comparison resolve runs at the `applied` commit, that the bindings it accepted are
-the first period's pins, and that the first period's start is that date or Rating reads the stored
-`price_id`s for that period through `price` (Pricing D-422, served forever). Who cuts a period at an
-`ends_on` inside it remains Atlas decision 7, a Subscriptions/Rating contract. Subscriptions'
-`create` gate on a **published** plan (SUB-P5) must admit an accepted revision that was superseded
-after submit: resolve still answers it, and the comparison is the authority.
+**D-190 (R04 Option A): initial activation honors the committed accepted price.**
+This supersedes D-162's pinned price-ID comparison and closes Q-32. A successor price,
+including an `all` successor, does not by itself invalidate the initial accepted price.
+Fixture F-B2 now expects acceptance at 10 followed by initial activation at 10 even if the
+catalog successor is 12, provided live eligibility and activation admission still pass.
+Ordinary resolve/renewal remains a catalog operation, not initial activation authority.
 
-`activation_deadline` is an early check, not the authority. It is computed locally at assessment as
-the stored-shape table says: the earliest exclusive end over the consumed slots, `min(ends_on,
-temporary_until)` at exclusive UTC midnight, or `assessed_at` plus the seller's configured
-`max_acceptance_interval`, whichever is earlier; an unset interval is `order-binding-policy-missing`.
-A known `all` successor is not in that derivation (its start sets `effective_to`, which a `new`
-successor also sets) and is caught by the comparison instead. The engine checks its single
-transition timestamp against the deadline at submit/amendment commit; an order whose earliest
-possible activation, the line's proposed service-activation date from the Capture date cascade, is
-at/after it fails the gate as `order-binding-expired`. Workflow checks it again before each
-activation dispatch. Neither check is an admission guarantee, and no clock agreement between gears
-is required: the receiver's comparison decides. Replay lookup precedes the comparison: an activation
-committed before a price change replays its success after it.
+The existing SDK is the integration boundary: `PricingAcceptanceV1::acceptance(ctx,
+AcceptanceQuery)` reads the immutable receipt; `hold(ctx, FulfilmentQuery, CommandMeta)`
+returns `HeldBindings`; `SellabilityV1::check_fulfilment(ctx, FulfilmentQuery)` returns a
+fresh `FulfilmentEligibility`. `FulfilmentQuery` contains tenant axes,
+`AcceptanceRef { acceptance_id, terms_digest }`, `current_market` and `activation_at`.
+It has no caller-supplied `hold_until`. The receipt already supplies `hold_until`, and
+eligibility supplies `checked_at`/`valid_before`. These implemented types do not complete
+the missing Subscriptions/Workflow integration or its grants.
 
-**The hold is Pricing's decision (Q-32, Atlas ticket T1).** Three documents answer differently
-what happens to an order accepted at price 10 when an `all` successor at 12 starts before
-activation: Pricing's resolve walks (12), this design refuses (D-162), and Seam Atlas P5/D02
-honour 10 through a hold no Pricing document defines. This design holds D-162 and prepares the
-other branch: if Pricing adds a hold, the activation read passes `hold_until = activation_deadline`,
-the `accepted-price-mismatch` path becomes unreachable and fixture F-B2 expects 10; if Pricing
-declines, D-162 stands and F-B2 expects `order-binding-expired`.
+The required handoff is:
 
-A hold or resume changes no deadline. State TTLs are restartable dwell budgets (provisional
-values, D-181) and fulfillment is expiry-exempt; they do not bound commercial validity. Before fulfillment, a fresh assessment uses the existing
-admissible amendment path and re-obtains approval/acceptance for the new version. During fulfillment,
-a refused comparison or a passed deadline stops further dispatch and requires void of drafts and
-compensation of already activated subscriptions before `acknowledge-failed` with
-`order-binding-expired`. No new expiry transition or amendment from fulfillment is introduced. Later
-price boundaries after successful activation are handled by Subscriptions/Rating's period contract,
-not by rewriting the order.
+1. Workflow dispatches the exact committed `(order_id, order_version)` and fulfillment
+   attempt reference. Subscriptions reads that version under its finite authorized order
+   scope and verifies each selected line's receipt identity/digests, seller/payer/resource
+   axes and terms. D-188 reserved-only, failed or unselected receipts cannot authorize activation.
+2. **Subscriptions owns the commercial hold call**, after selecting and durably recording
+   the activation instant and immutable attempt input. Submit, amendment and Preview do not
+   call `hold`. The first successful hold freezes `activation_at` and accepted bindings;
+   retries use the same input and command key. A different key cannot extend validity or
+   change an existing hold's activation instant. Recovery cannot silently shift that instant.
+   A changed instant requires refusal/replanning and fresh accepted-version input where the
+   state machine permits it; after fulfillment begins, compensation/recovery applies rather
+   than inventing an amendment from fulfillment.
+3. Subscriptions verifies the held acceptance ID/digest and bindings against the selected
+   committed receipt. It performs a fresh `check_fulfilment` for the same input immediately
+   before the activation-intent admission protocol. Exact hold replay is historical evidence:
+   it can succeed after expiry and never substitutes for a fresh eligibility check.
+4. Subscriptions fences the committed order/version and current fulfillment attempt and
+   enforces occupancy/cardinality at its local activation-intent boundary. A late worker,
+   obsolete version, cancelled attempt or unrelated receipt cannot activate. Replay of an
+   already committed activation returns its authorized recorded outcome without a second
+   activation. The concrete receiver fence, ambiguous-outcome recovery, cancellation races
+   and cross-service conformance remain the **R12 release prerequisite**; a version read or
+   remote eligibility check is not atomic with the local activation transaction.
+
+Fresh checks still reject expired acceptance, explicit price closure/temporary end, retired
+SKU, market drift and mismatched terms; provider failures and denied authorization remain
+fail-closed failures, not fabricated commercial expiry. Normal successor selection and SKU
+deprecation alone do not replace the accepted bindings. The precise receiver-to-Workflow
+closed failure mapping must be delivered with the adapter: confirmed expiry or explicit
+closure/temporary end maps to `order-binding-expired`; market changes retain `market-divergence`.
+Retirement, term/identity mismatch and other distinct receiver reasons require an explicit agreed
+mapping, not a blanket expiry conversion. Transport, authorization and corruption keep their own categories.
+Workflow stops further dispatch on refusal and compensates/voids created subscriptions through
+the existing failure acknowledgement protocol. There is no automatic renewal-price fallback or
+silent repricing of the accepted order; any new offer follows the admissible amendment path
+before fulfillment. No amendment from fulfillment is introduced.
+
+**Deadline authority (D-191).** Orders copies each selected receipt’s `hold_until` verbatim;
+[the deadline contract](#contract-03-commercial-deadline) defines seller-policy discovery,
+exclusive bounds and unchanged replay. Its missing policy provider/integration and conformance
+remain production prerequisites. D-192 defines the [complete-receipt mapping](#contract-03-frozen-commercial-snapshot) into the receiver's first-period inputs; implementation and downstream adoption remain pending. Accepted SKU versions, billing terms and descriptors remain frozen; the old activation-time refresh rule is superseded. Subsequent renewal and period slicing
+remain Subscriptions/Rating contracts, not an order rewrite.
+
+Lifecycle `on_hold` is a paused workflow state; Pricing `hold` is the durable commercial binding
+command. Neither pause/resume nor commercial command replay renews receipt validity. State TTLs
+are dwell budgets, not commercial guarantees.
+
+Required integration evidence (all pending implementation):
+
+- [ ] Accept 10, publish successor 12, then activate at 10 within eligibility; retain receipt identity.
+- [ ] Deprecation remains eligible where Pricing permits it; retirement, explicit closure,
+  temporary end and equality at expiry refuse fresh admission.
+- [ ] Expired exact hold replay cannot activate; a new key cannot refresh its deadline or instant.
+- [ ] Lost hold response retries exactly; held input or terms mismatch refuses without replacement.
+- [ ] Unselected D-188 receipt, stale version, cancelled/obsolete attempt and duplicate worker
+  cannot create activation; already committed activation replays once.
+- [ ] Provider outage/denial stays distinct from commercial expiry; partial activation uses
+  compensation and repeatable acknowledgement, including unknown-outcome recovery.
 
 #### Reference protection and activation handoff
 
-**D-164: protection is inherited from the accepted revision's references; Orders reserves
-nothing.** Every item of a published or superseded revision holds a `plan_item` reference on its
-SKU in Products' registry, Pricing keeps those references until Subscriptions reports that no
-subscription pins the revision (Pricing D-414), plan retirement is deferred
-(D-410), and Products refuses retirement with `SKU_REFERENCED` while a reference is live. An order
-can only name items of a revision that is current and published at assessment (§4.1), so every SKU
-an accepted order names is protected by Pricing's own reference for as long as the revision is
-referenced, which on the pinned baseline is indefinitely. The registry admits only the `pricing`
-owner with its system actor, and this design asks for no Orders owner, kind or receipt.
+**D-164, refined by D-196: protection is inherited from the accepted revision's references;
+Orders reserves nothing.** Every item of a published or superseded revision holds a `plan_item`
+reference on its SKU in Products. Pricing currently retains those references indefinitely:
+revision retirement/release is deferred (Pricing D-410), including after book-entry archival.
+Products refuses ordinary retirement with `SKU_REFERENCED` while a reference is live. The
+owner-bound registry remains Pricing's responsibility; this design adds no Orders owner,
+kind, receipt or reference-write grant. D-194 ordinary service principals use authorized SKU reads.
 
-The residual ask is the release trigger: when Pricing's release report is implemented, the set of
-holders that keeps a revision's references alive must include orders that have accepted the revision
-and are not terminal, because a draft subscription that has not been created yet is invisible to
-Subscriptions' presence read (SUB-P8). That is one input to the Subscriptions report, or one read of
-this gear's in-flight claims; it is registered in `UPSTREAM_REQS.md` §2.10. Forced retirement by an
-administrator remains an override to document with its refusal/compensation outcome, not one to
-prevent from here. A live SKU read at activation is not a race closer and is not relied on.
+Before future cleanup can release revision references, Pricing must coordinate the
+[D-196 closure/drain and fenced usage proof](#contract-03-revision-reference-protection) from both
+Orders and Subscriptions. This includes potentially committable D-188 attempts, accepted nonterminal
+versions and a gap-free handoff to durable Subscriptions ownership. Pricing's zero usage observation
+alone never authorizes release; all relevant admission must be durably closed/fenced first, and
+unknown usage retains protection. Concrete cross-owner interfaces and conformance remain the
+`UPSTREAM_REQS.md` §2.10 prerequisite. If a SKU becomes retired, D-190 fresh eligibility refusal
+and its failure/compensation handling still apply; this decision adds no force-retire capability.
+A live SKU read at activation is not a race closer; the R12 activation protocol remains separate
+and required.
 
 #### Capacity and publication
 
-Authoring admits at most 200 acquisition lines. Admission additionally caps the total selected or
-included consumed items at 200 per order (working design limit, D-158) and the **bound** chain
-slots at **1,000 per line**, counted before pin deduplication (D-159): Pricing's resolve accepts at
-most 1,000 pins per request, a request covers one revision, which is one line, and one item's
-matrix cannot be split because `item_id` filtering selects an item, not a chain. Uncovered slots
-produce no pins and are not counted, but every stored slot counts toward the **1 MiB** serialized
-immutable-version envelope, as does unselected optional roster metadata. Any bound exceeded is
-`purchase-capacity-exceeded`, evaluated on the answered matrix even when a signup sends zero pins;
-a matrix is never truncated. Producers must return bounded, complete answers;
-absence/truncation is an unavailable response, never a partial sale. One logical batched request
-per port may be split by revision/item inside the owning adapter, at most 200 subrequests, maximum
-8 concurrent, under one shared per-port deadline. These limits are design baselines, not measured
-throughput claims.
+Authoring admits at most 200 acquisition lines. The existing 200 consumed-item per-order
+limit remains an admission obligation (D-158), subject to the separately resolved purchase
+model. D-192 replaces the former full-matrix bound-slot accounting for the commercial pin:
+cap **selected receipt bindings at 1,000 per line**, before any deduplication. The **1 MiB**
+serialized immutable-version limit counts the entire schema-2 receipt/query/bindings and all
+other persisted version content, not merely price IDs; exceeding it refuses
+`purchase-capacity-exceeded` before commercial commit. A selected receipt is never truncated.
+Optional diagnostic matrices remain bounded assessment data, separate from billing authority;
+if retained inside a version they also consume its byte budget. Large unselected matrices
+cannot be silently dropped when needed to prove a required sale predicate: unavailable or
+truncated required evidence fails closed. Provider result/request limits remain separately
+enforced by the adapter. One logical batched request per port may be split by revision/item,
+at most 200 subrequests, maximum 8 concurrent, under one shared per-port deadline. These
+are design limits, not measured throughput or proof of full-roster availability.
 
 Events carry `orderId` and `orderVersion` as the immutable read reference, plus the existing bounded
 summary/provenance and explicit line mappings where required; they do **not** embed expanded pins,
@@ -6719,11 +7002,76 @@ figure must reference the exact accepted price selection. Recurring amounts with
 must not be summed into an unlabeled per-period number; `orders_resolved_total` stores the owner's
 breakdown alongside the aggregate figures. Missing/inconsistent required evaluation is
 `evaluation-unavailable`; an absent total is never zero or approval-not-required. Preview alone
-retains its explicit term/cycle withholding rule. The request to Rating is the accepted matrix in
-resolve's own vocabulary, `lines[{ line_id, plan_revision_id, items[{ item_id, quantity, chains[] }] }]`
-with `assessment_id` and `resolve_date`, so Rating rates the same object Subscriptions will store
-(D-167). Periods are `month` or `year`, the two PriceBook supports; an unsupported cycle refuses
+retains its explicit term/cycle withholding rule. Under D-192 the proposed Rating request carries exact selected native bindings and explicit quantity/term/BillingTerms context per line, with `assessment_id` and `resolve_date`; it does not carry the full unselected matrix as billable content. Before receipt issuance these are nonbinding assessment inputs; final receipt selection must match the evaluated commercial inputs. The concrete evaluation DTO and unresolved purchase-model mappings remain upstream implementation prerequisites; an assessment is not a complete Subscriptions period snapshot. This narrows D-167's legacy `items[].chains[]` request shape. Periods are `month` or `year`, the two PriceBook supports; an unsupported cycle refuses
 evaluation rather than inventing a mapping.
+
+<a id="contract-03-rating-purchase-evaluation"></a>
+
+**D-197 (R11 Option A): Rating owns exact-binding purchase evaluation.** The proposed
+`RatingPurchaseEvaluationV1::evaluate(ctx, request)` is an authorized ClientHub `SafeRead`
+contract, not an existing SDK. Rating has no runtime crate in the inspected main tree.
+It creates no subscription, receipt, billing evaluation state, invoice or posting. Its output
+is nonbinding display/approval evidence, never the receiver's billing snapshot.
+
+| Contract member | Required meaning |
+|---|---|
+| Request identity | Schema/profile version, assessment ID/instant/UTC resolve date, exact line/plan/revision identities and canonical input digest |
+| Authority/context | Independently authorized seller/resource/payer axes, payer-backed market, contract reference and required authoritative policy versions; D-194 service grant plus resource authorization, never caller market as authority |
+| Commercial inputs | Exact selected native Pricing bindings and original producer digests, explicit quantity mapping to the accepted query, start, D-193 term and complete BillingTerms/digest; no implicit per-item/plan multiplication |
+| Optional Preview context | Explicitly tagged missing term/cycle only under D-189/D-193; no fabricated subscription, cohort, receipt or default term; submit/amendment requires complete inputs |
+| Result identity | Echo request identity/digest, supported profile and evaluation-policy version; exact item/line coverage, no extras, duplicates or omissions |
+| Monetary result | Producer-calculated item/line/order gross/net/discount and promotion availability/reference, three charge kinds, cycle-labelled recurring components, currency/minor digits/rounding, exclusions and one order TCV with basis/status |
+
+Rating owns model evaluation, minimum fees, quantity application, temporal rules, discounts,
+rounding, decimal-to-minor-unit conversion and all aggregation. Orders checks identity,
+completeness and representability and stores the response verbatim; it does not sum rows or
+recalculate monetary equations. Different recurring cycles have labelled breakdowns and no
+unlabelled per-period sum. Producer `amount_basis` and `period_evidence` declare the common
+valuation horizon for aggregate recurring gross/net/discount: finite accepted terms, annualized
+rolling terms or their explicitly labelled mixed approval basis, as applicable. Per-cycle
+figures remain in the breakdown. Orders neither derives a horizon nor converts cycles; missing
+or inconsistent basis makes the answer unusable. `committed` amount status describes a
+non-usage component, not a binding quote or billing authority. Supported no-promotion may be explicit zero; unavailable discount
+is not zero. Usage has no committed amount, distinct from a supported zero-priced charge.
+One-time assessment does not synthesize a recurring/usage billing unit.
+
+Rating evaluates these exact bindings without successor lookup or mutable SKU/default refresh.
+D-188 freezes the request and returned evaluation before acceptance dispatch; the final issued
+receipt's selection, quantity, market, terms and bindings must equal those evaluated. Mismatch
+cannot be repaired by silently replacing totals; the attempt cannot commit. Exact retry uses
+frozen evidence; changed input requires a new attempt. Subscriptions/Rating still own actual
+activation geometry and downstream billing; equality of input does not promise that an
+indicative total includes later tax, usage or every activation-time proration.
+
+TCV includes finite recurring duration and one-time once, excluding uncommitted usage and tax.
+For rolling lines the existing policy annualizes month/year by 12/1. Rating returns
+`tcv_basis = finite_term | rolling_annualized | mixed`, with per-line term/basis evidence and
+policy version; the mixed figure is the declared approval measure, not an unlabeled recurring
+sum. Only the order-scope `recurring` row carries `tcv_minor` and TCV metadata, even for a
+one-time-only or usage-only basket; other rows have null TCV. A usage-only order may have zero
+TCV without asserting zero usage charges. Finite-term TCV and rolling annualization must be
+labelled distinctly on responses; annualization is this product policy, not a universal TCV definition.
+
+Unsupported required scope/model/cycle, unknown schema, unavailable required context, currency
+or rounding inconsistency, overflow, mismatched identity/digest or incomplete results makes
+required evaluation unavailable. No production partial-success or guessed-zero substitute is
+allowed. The explicitly disclosed subscription-context overlay exclusions remain governed by
+§4.5; an unsupported required scope cannot be silently added to those exclusions. Only Preview's
+existing missing-term/cycle exception may return successful `tcvWithheld` and affected line IDs
+when every otherwise required figure/check is available, following D-195. Indicative tax remains
+a separate missing owner dependency and is not supplied or inferred by Rating.
+
+Pending conformance (none claimed delivered):
+
+- [ ] Real provider covers finite/rolling month/year and mixed terms/cycles, one-time-only and usage-only baskets, fractional quantities, minimum fees, supported models and monetary boundaries.
+- [ ] Unknown/unsupported model, malformed/truncated response, foreign tenant, changed digest/currency, overflow and missing required policy fail closed; no automatic FX or defaults.
+- [ ] Catalog/SKU/invoice changes do not replace evaluated bindings; receipt mismatch refuses, and retries preserve frozen inputs/results.
+- [ ] Preview withholding preserves complete remaining fields/diagnostics and persists no money or business effects; supported zero differs from unavailable/uncommitted amounts.
+- [ ] Billing fixtures share the accepted inputs with explicit activation/proration geometry; evaluation results never become billing authority.
+
+This selected target narrowly supersedes Rating's historical caller-summation and catalog-prefix
+pre-purchase wording. SDK/provider, grant provisioning, supported-profile declaration and joint
+real-provider evidence remain implementation prerequisites, not implied owner signoff.
 
 **TCV is not deal value.** A predominantly usage-based order presents a low or zero TCV, because
 committed usage is not representable on the line this phase. The figure **MUST NOT** be read as
@@ -6782,7 +7130,7 @@ old one, re-runs the whole gate, re-pins every line, and leaves the amended vers
 ([PRD.md](PRD.md) §6.2).
 
 The design rests on one observation: **the version counter is both the audit chain and the
-concurrency mechanism**. Appending version N+1 simultaneously records what changed and
+concurrency mechanism**. Appending version M simultaneously records what changed and
 invalidates every asynchronous result still in flight against version N. That is why approval
 can be a long-running, human-paced process without distributed locking: a decision that arrives
 late is refused as stale, and the sibling gear's process instance for the prior version is
@@ -6828,7 +7176,7 @@ returns the amended version to `submitted` and never preserves or infers a prior
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-bss-orders-lifecycle-nfr-order-audit-completeness` | 100 % of amendments audited | Version appender | The version append and the audit entry share the engine transaction; an administrative edit audits without a version | Test asserting every amendment yields both a version row and an audit row, and every administrative edit yields an audit row only |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-retention` | All versions retained | Version store | Append-only with no update or delete path; retention is the program policy and archival never removes a version | Test asserting no code path deletes a version row |
-| `cpt-cf-bss-orders-lifecycle-nfr-order-snapshot-integrity` | Every submitted line pinned | Re-pin on amendment | The gate re-run and re-pin are part of the amendment commit, so version N+1 is pinned contemporaneously with itself | Test asserting a version's pin assessment/revision identities match the amendment inputs, not the original submit |
+| `cpt-cf-bss-orders-lifecycle-nfr-order-snapshot-integrity` | Every submitted line pinned | Re-pin on amendment | The gate re-run and re-pin are part of the amendment commit, so version M is pinned contemporaneously with itself | Test asserting a version's pin assessment/revision identities match the amendment inputs, not the original submit |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-read-latency` | Version read p95 < 200 ms | Version reader | A version is addressed by `(order_id, version)` and read directly; no chain walk and no event replay | Benchmark on historical version reads at realistic chain depths |
 
 <a id="contract-04-key-adrs"></a>
@@ -6866,8 +7214,10 @@ directly.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-principle-version-is-concurrency` (`p1`), defined in [§2.1 Slice principles](#register-principles).
 
-Appending a version invalidates every in-flight asynchronous result against the prior one. There
-is no separate lock, lease or generation token. A consequence to hold onto: a caller that omits
+Appending a committed version invalidates asynchronous business results against the prior one.
+The expected commercial version remains the public optimistic-concurrency token. D-188 adds
+separate operational attempt ownership/leases/fences and D-198 adds dispatch/control generations;
+these do not substitute for the expected-version check or become public commercial versions. A caller that omits
 the expected version is refused rather than served, because an amendment that races an approval
 reflection must have a defined loser. The refusal is `expected-version-required`, raised by
 boundary input validation before authorization, unaudited and without touching idempotency
@@ -6881,7 +7231,7 @@ engine's `version-conflict`.
 **Contract**: `cpt-cf-bss-orders-lifecycle-principle-amend-by-append` (`p1`), defined in [§2.1 Slice principles](#register-principles).
 
 A prior version is never rewritten, re-pinned, corrected or deleted — not by a repair path, not
-by a migration. A mistake in version N is fixed by version N+1. This is what makes a reviewer
+by a migration. A mistake in version N is fixed by version M. This is what makes a reviewer
 able to say what they approved, and it is the reason the aggregate row holds a pointer rather
 than the content.
 
@@ -7068,21 +7418,21 @@ platform producer outbox from the transition.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-versioning-reader` (`p2`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-04-why-this-component-exists-1"></a>
+<a id="contract-04-why-this-component-exists-1-version-reader"></a>
 
 ##### Why this component exists
 
 "What exactly did they agree to, and who changed it" is the question the gear exists to answer,
 and answering it must not require reconstructing anything.
 
-<a id="contract-04-responsibility-scope-1"></a>
+<a id="contract-04-responsibility-scope-1-version-reader"></a>
 
 ##### Responsibility scope
 
 Retrieval of any version by order and version number; the version list with actor, timestamp,
 reason and supersession; and the administrative-edit trail alongside it.
 
-<a id="contract-04-responsibility-boundaries-1"></a>
+<a id="contract-04-responsibility-boundaries-1-version-reader"></a>
 
 ##### Responsibility boundaries
 
@@ -7090,7 +7440,7 @@ It serves no current-state projection — that is
 [`08-read-and-authz`](DESIGN.md#contract-08-1-1) — and it applies no access decision of its own
 beyond the engine's pre-guard.
 
-<a id="contract-04-related-components-by-id-1"></a>
+<a id="contract-04-related-components-by-id-1-version-reader"></a>
 
 ##### Related components (by ID)
 
@@ -7502,7 +7852,7 @@ it supplies one of two guard inputs.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-preconditions-money-gate` (`p1`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-05-why-this-component-exists-1"></a>
+<a id="contract-05-why-this-component-exists-1-money-gate"></a>
 
 ##### Why this component exists
 
@@ -7510,7 +7860,7 @@ Without a money check before provisioning, a non-paying tenant receives resource
 failure surfaces later as dunning over consumed capacity — the most expensive compensation path
 the platform has.
 
-<a id="contract-05-responsibility-scope-1"></a>
+<a id="contract-05-responsibility-scope-1-money-gate"></a>
 
 ##### Responsibility scope
 
@@ -7518,14 +7868,14 @@ The begin-fulfillment guard: the authorization outcome as input, the three-way d
 between authorized, pending and failed, the seller tolerate-failure election read at guard time,
 and the risk flag recorded when a failed authorization is tolerated.
 
-<a id="contract-05-responsibility-boundaries-1"></a>
+<a id="contract-05-responsibility-boundaries-1-money-gate"></a>
 
 ##### Responsibility boundaries
 
 It holds no payment mechanism, no instrument and no token, performs no credit scoring, and
 stores no authorization outcome as an order fact.
 
-<a id="contract-05-related-components-by-id-1"></a>
+<a id="contract-05-related-components-by-id-1-money-gate"></a>
 
 ##### Related components (by ID)
 
@@ -7625,13 +7975,13 @@ cleared, since it records a decision taken at a moment rather than a current con
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-dbtable-policy-election`, defined in [§3.7 Slice tables](#register-tables).
 
-**Schema**: `election` enum (`tolerate_authorization_failure`, `acceptance_required`), `scope`
+**Schema**: `policy_id` (UUID, NOT NULL), `election` enum (`tolerate_authorization_failure`, `acceptance_required`), `scope`
 enum (`platform`, `seller`), `scope_id` (null for platform scope), `elected`, `elected_by`,
 `elected_at`.
 
-**PK**: (election, scope, scope_id)
+**PK**: policy_id. The semantic business key remains `(election, scope, scope_id)`.
 
-**Constraints**: `NULLS NOT DISTINCT` on the key so a second platform row for one election is
+**Constraints**: a unique business-key constraint with `NULLS NOT DISTINCT` (or equivalent platform/seller partial unique indexes on a supported backend) so a second platform row for one election is
 impossible; `scope_id` NOT NULL where `scope = 'seller'` and NULL where `scope = 'platform'`.
 Mutable only by deployment promotion; a seller's election is requested through platform
 operations. `elected_by`/`elected_at` record the promotion's change identity and instant (D-133).
@@ -7996,14 +8346,14 @@ verdict for an amended version from the version it superseded.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-seam-fulfillment-coordinator` (`p1`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-06-why-this-component-exists-2"></a>
+<a id="contract-06-why-this-component-exists-2-fulfillment-coordinator"></a>
 
 ##### Why this component exists
 
 Begin-fulfillment and acknowledgement bracket the only window in which this gear's document can
 be overtaken by physical reality, and both ends need to be exact.
 
-<a id="contract-06-responsibility-scope-2"></a>
+<a id="contract-06-responsibility-scope-2-fulfillment-coordinator"></a>
 
 ##### Responsibility scope
 
@@ -8012,7 +8362,7 @@ activation re-check integration contract in [`03-gate-and-pin`](DESIGN.md#contra
 acknowledgement with the per-line subscription mapping; the compensation-evidence check on a
 failure acknowledgement and on every workflow-mediated cancel; and the workflow-mediated cancel.
 
-<a id="contract-06-responsibility-boundaries-2"></a>
+<a id="contract-06-responsibility-boundaries-2-fulfillment-coordinator"></a>
 
 ##### Responsibility boundaries
 
@@ -8020,7 +8370,7 @@ It performs no retry, no compensation and no provisioning, and it holds no adapt
 Subscriptions or OSS. It does not decide that compensation completed — it verifies that Workflow
 asserted it and records the evidence.
 
-<a id="contract-06-related-components-by-id-2"></a>
+<a id="contract-06-related-components-by-id-2-fulfillment-coordinator"></a>
 
 ##### Related components (by ID)
 
@@ -8033,7 +8383,7 @@ asserted it and records the evidence.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-seam-line-projection` (`p2`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-06-why-this-component-exists-2"></a>
+<a id="contract-06-why-this-component-exists-2-line-projection-maintainer"></a>
 
 ##### Why this component exists
 
@@ -8042,21 +8392,21 @@ belongs to Workflow's existing PRD §9.1 progress-read operation (per-line track
 this acknowledgement-only projection. No intermediate Lifecycle update endpoint is introduced.
 Until acknowledgement, absent projection data means "not acknowledged", never "not started".
 
-<a id="contract-06-responsibility-scope-2"></a>
+<a id="contract-06-responsibility-scope-2-line-projection-maintainer"></a>
 
 ##### Responsibility scope
 
 Maintenance of the per-line projection from acknowledgements; the subscription identifier; and
 the transition-request identifier as a join key.
 
-<a id="contract-06-responsibility-boundaries-2"></a>
+<a id="contract-06-responsibility-boundaries-2-line-projection-maintainer"></a>
 
 ##### Responsibility boundaries
 
 It exposes no transition, defines no per-line terminal, and is read by no guard. Order terminals
 remain atomic and order-level.
 
-<a id="contract-06-related-components-by-id-2"></a>
+<a id="contract-06-related-components-by-id-2-line-projection-maintainer"></a>
 
 ##### Related components (by ID)
 
@@ -8726,14 +9076,14 @@ sibling gear's timers — it publishes the event that lets that gear decide.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-expiry-scheduler` (`p1`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-07-why-this-component-exists-2"></a>
+<a id="contract-07-why-this-component-exists-2-expiry-scheduler"></a>
 
 ##### Why this component exists
 
 Bounded lifetime is only real if something enforces it without a caller, and enforcing it twice
 concurrently would double-expire orders.
 
-<a id="contract-07-responsibility-scope-2"></a>
+<a id="contract-07-responsibility-scope-2-expiry-scheduler"></a>
 
 ##### Responsibility scope
 
@@ -8742,7 +9092,7 @@ deterministic idempotency keys per expiry; the batch and cadence controls; and, 
 independently of any TTL value, the read-only overdue-fulfillment observation of §3.8
 (D-182). It has **one** selection pass — the restart bound lives on the resume transition, not here (§4.2).
 
-<a id="contract-07-responsibility-boundaries-2"></a>
+<a id="contract-07-responsibility-boundaries-2-expiry-scheduler"></a>
 
 ##### Responsibility boundaries
 
@@ -8751,7 +9101,7 @@ admissibility check and pre-hold guard independently refuse exempt targets regar
 the sweep selects. It raises no escalation and drives no transition on an overdue order; it
 publishes the gauge, and the escalation is the sibling gear's.
 
-<a id="contract-07-related-components-by-id-2"></a>
+<a id="contract-07-related-components-by-id-2-expiry-scheduler"></a>
 
 ##### Related components (by ID)
 
@@ -8764,14 +9114,14 @@ publishes the gauge, and the escalation is the sibling gear's.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-draft-sweep` (`p2`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-07-why-this-component-exists-2"></a>
+<a id="contract-07-why-this-component-exists-2-draft-abandonment-sweep"></a>
 
 ##### Why this component exists
 
 Abandoned baskets accumulate without bound, and deleting them would destroy the audit trail of
 what a buyer nearly bought.
 
-<a id="contract-07-responsibility-scope-2"></a>
+<a id="contract-07-responsibility-scope-2-draft-abandonment-sweep"></a>
 
 ##### Responsibility scope
 
@@ -8780,13 +9130,13 @@ transition to `expired` that keeps them readable. The TTL ships provisionally at
 cannot be promoted unset to production (D-181); only in a non-production environment that leaves
 it unset does the sweep do no work and `draft` accumulate without bound (§4.4).
 
-<a id="contract-07-responsibility-boundaries-2"></a>
+<a id="contract-07-responsibility-boundaries-2-draft-abandonment-sweep"></a>
 
 ##### Responsibility boundaries
 
 It deletes nothing and touches no order past `draft`.
 
-<a id="contract-07-related-components-by-id-2"></a>
+<a id="contract-07-related-components-by-id-2-draft-abandonment-sweep"></a>
 
 ##### Related components (by ID)
 
@@ -8810,7 +9160,7 @@ It deletes nothing and touches no order past `draft`.
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/cancel` | Cancel from any non-terminal state, per guards | unstable |
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/hold` | Pause from an eligible state, storing the outgoing state | unstable |
 | `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/resume` | Return to the stored pre-hold state | unstable |
-| `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/forced-failure` | Two-person operator-forced `fulfillment_failed` from an overdue post-spawn `in_fulfillment` (or a hold over it), compensation recorded as `unknown`; the requester's call refuses `second-approver-required` and returns `requestAuditId`, the approver's call names it (D-182) | unstable |
+| `POST` | `/bss-orders-lifecycle/v1/orders/{orderId}/forced-failure` | Two-person operator-forced `fulfillment_failed` from an overdue post-spawn `in_fulfillment` (or a hold over it), compensation recorded as `unknown`; the requester's call refuses `second-approver-required` and returns `request_audit_id`, the approver's call names it (D-182) | unstable |
 
 **State expiry is deliberately not a public operation.** It is scheduler-driven with the system
 as actor class, which is what makes "who expired this order" answerable as `system` rather than
@@ -9354,7 +9704,8 @@ ordering from the table above.
   appends no access-log row, because input validation precedes the access decision. Reauthorize
   every request against current permissions and delegation validity. Never reconstruct an access
   scope from cursor-supplied claims or use a token to preserve revoked access. No new filters are
-  introduced by this contract.
+  introduced by this contract. The delivered token encoding (opaque base64url JSON, version 1,
+  microsecond/UUID position, principal/parent/filter binding) is recorded in D-210 item 2.
 
 **Audit concurrency contract (D-101).** This refines only the audit collection, not the version,
 order or line endpoints. One page is one consistent database read of the currently authorized
@@ -9468,14 +9819,14 @@ row.
 
 **Contract**: `cpt-cf-bss-orders-lifecycle-component-authz-declaration` (`p1`), defined in [§3.2 Slice components](#register-components).
 
-<a id="contract-08-why-this-component-exists-1"></a>
+<a id="contract-08-why-this-component-exists-1-permission-declaration"></a>
 
 ##### Why this component exists
 
 Per-actor authorization stated once and enforced centrally is the only version of it that cannot
 drift between capabilities.
 
-<a id="contract-08-responsibility-scope-1"></a>
+<a id="contract-08-responsibility-scope-1-permission-declaration"></a>
 
 ##### Responsibility scope
 
@@ -9484,7 +9835,7 @@ axis each scope is evaluated against, the delegation-proof requirement, and the 
 rule for acceptance; plus the **shared platform PDP adapter** the engine pre-guard and the read paths both
 invoke, and the startup check that fails if an operation exists with no declaration.
 
-<a id="contract-08-responsibility-boundaries-1"></a>
+<a id="contract-08-responsibility-boundaries-1-permission-declaration"></a>
 
 ##### Responsibility boundaries
 
@@ -9492,7 +9843,7 @@ It defines no authentication. Authentication is platform-owned at the gateway, a
 service-principal check for the workflow-only operations is specified in
 [06-workflow-seam — API Contracts](DESIGN.md#contract-06-3-3).
 
-<a id="contract-08-related-components-by-id-1"></a>
+<a id="contract-08-related-components-by-id-1-permission-declaration"></a>
 
 ##### Related components (by ID)
 
@@ -9509,7 +9860,7 @@ service-principal check for the workflow-only operations is specified in
 **Contract**: `cpt-cf-bss-orders-lifecycle-interface-read-ops` (`p1`), defined in [§3.3 Slice interfaces](#register-interfaces).
 
 - **Requirement**: `cpt-cf-bss-orders-lifecycle-interface-order-ops`
-- **Technology**: REST/OpenAPI via `OperationBuilder`; RFC 9457 problems; ETag carries the current commercial version. Draft reads also expose `draftRevision`; draft commercial writes and submit must supply it as `expected_draft_revision`, separately from expected_version; on `draft-mutate` its absence is not a boundary rejection, and the engine compares it only after admissibility, so a post-draft commercial `PATCH` refuses `not-admissible` (D-147). ETag alone cannot detect mutable draft edits.
+- **Technology**: REST/OpenAPI via `OperationBuilder`; RFC 9457 problems; ETag carries the current commercial version. Draft reads also expose `draft_revision`; draft commercial writes and submit must supply it as `expected_draft_revision`, separately from expected_version; on `draft-mutate` its absence is not a boundary rejection, and the engine compares it only after admissibility, so a post-draft commercial `PATCH` refuses `not-admissible` (D-147). ETag alone cannot detect mutable draft edits.
 
 | Method | Path | Description | Stability |
 |--------|------|-------------|-----------|
@@ -9519,6 +9870,12 @@ service-principal check for the workflow-only operations is specified in
 | `GET` | `/bss-orders-lifecycle/v1/orders/{orderId}/versions/{version}` | One historical version, served with the version reader owned by [`04-versioning`](DESIGN.md#contract-04-1-1) | unstable |
 | `GET` | `/bss-orders-lifecycle/v1/orders/{orderId}/lines` | Per-line fulfillment status and subscription linkage, **paged** | unstable |
 | `GET` | `/bss-orders-lifecycle/v1/orders/{orderId}/audit` | The transition audit trail, including refused attempts; **paged**, because ADR-0005 makes it grow with request traffic | unstable |
+
+**Delivered draft reads (D-210).** `GET /orders/{orderId}`, `GET /orders` and `GET /orders/{orderId}/lines`
+are delivered for `draft` orders with the S1-02 query names, the `OrderPage`/`OrderSummary`/`LinePage`
+shapes (a line page of a draft also carries `draft_revision`), the boundary order proof header →
+`page_size` → filters → `cursor`, and a fail-closed `unavailable` answer for the undelivered
+committed-version composition; D-210 records those bindings.
 
 **Reasons contributed to the registry**: order-not-found (returned in preference to a
 forbidden response where the caller has no relationship to the order, so existence is not
@@ -9561,13 +9918,14 @@ PDP-produced database scopes. Orders supplies its own resource/action constants,
 properties and business guards. Do not copy Pricing's caller-tenant-only repository predicate
 or treat its permission catalog as proof that the deployed PDP enforces role assignments.
 This selects an integration pattern, not a new Orders policy engine or a new toolkit API.
-Caller-driven operations use PDP; the explicitly bounded internal-worker exception below adopts
-Pricing's trusted system-context pattern.
+Caller-driven operations use PDP; the explicitly bounded internal-worker exception below is
+an Orders design contract requiring the capability and role proof specified here.
 
-**Trusted internal maintenance (Pricing pattern).** The five Orders-owned workers—per-state
+**Trusted internal maintenance (Orders bounded capability).** The five Orders-owned workers—per-state
 expiry, draft auto-void, idempotency cleanup, retention purge and audit verification/checkpointing—
 operate under configured system authority without a per-pass or per-row PDP decision. This is
-an explicit exception to blanket PDP-derived scopes, modeled on Pricing's [infra/jobs.rs](../../pricing/pricing/src/infra/jobs.rs):
+an explicit exception to blanket PDP-derived scopes. The historical Pricing `infra/jobs.rs`
+reference is absent from this checkout and is not evidence of a current implementation:
 bounded cross-tenant candidate scans may use `AccessScope::allow_all()`, but each subsequent
 operation must narrow to its actual target and applicable scope. It is not an exception for
 REST, public SDK calls, administrative requests, Orders Workflow calls or failed user requests.
@@ -9593,11 +9951,10 @@ only inside this worker exception. Never carry a broad discovery scope into a wr
 remain mandatory; a lease is coordination, not authorization.
 
 **Structural scope separation (D-184).** The narrowing rule above is enforced by type and lint,
-not by review alone. Pricing's discover-broad-then-narrow convention ([infra/jobs.rs:42-47](../../pricing/pricing/src/infra/jobs.rs);
-`list_due` under `allow_all` at [jobs/window_activation.rs:413](../../pricing/pricing/src/infra/jobs/window_activation.rs) vs `for_tenant` before the write at `:453`)
-is the pattern being hardened; Ledger's `expire_due_all` ([approval_repo.rs:310-331](../../ledger/ledger/src/infra/storage/repo/approval_repo.rs)), a
-cross-tenant `UPDATE` executed directly under `allow_all`, is evidence that the convention alone
-drifts. The toolkit has no read-only scope type: one `&AccessScope` is accepted by
+not by review alone. Historical Pricing `infra/jobs.rs` and `jobs/window_activation.rs` are
+absent from this checkout; they cannot be cited as a verified current narrowing implementation.
+The requirement remains structural and must be proved through S1-03/S2-03's capability tests.
+The toolkit has no read-only scope type: one `&AccessScope` is accepted by
 `SecureSelect::scope_with` (`libs/toolkit-db/src/secure/select.rs:167`), `SecureUpdateMany::scope_with`
 and `SecureDeleteMany::scope_with` (`db_ops.rs:1164`, `:1262`) and `SecureInsertOne::scope_with_model`
 (`db_ops.rs:661`), and `AccessScope::allow_all()` (`libs/toolkit-security/src/access_scope.rs:844`) is
@@ -9613,8 +9970,10 @@ fields; no toolkit change is required or proposed:
   `tx_config.rs:134`), so the database also rejects a write issued from discovery. Discovery
   returns owned discovered-row values (`DiscoveredOrder` and one type per cleanup/purge/audit
   table) and ends its transaction before any write. PostgreSQL refuses a locking read
-  (`FOR UPDATE … SKIP LOCKED`) in a read-only transaction, so candidate locking and the
-  eligibility recheck belong to the target phase, under `TargetScope`.
+  (`FOR UPDATE … SKIP LOCKED`) in a read-only transaction, so the eligibility recheck belongs
+  to the target phase, under `TargetScope`; for the deleting classes it is the conditional
+  DELETE's own predicates, re-evaluated under the row's lock, because their roles hold no
+  UPDATE grant and so cannot issue any row-locking read (D-209 items 2 and 9).
 - `TargetScope` — constructible only from a discovered row's persisted identifiers.
   `TargetScope::from_discovered(&DiscoveredOrder)` yields the standard resource-ID restriction
   on `order_id` (`AccessScope::for_resource`, `access_scope.rs:888`) conjoined with that row's
@@ -9775,11 +10134,11 @@ is not a substitute for the missing policy. Proposed-value enforcement remains t
 with the existing provider/toolkit APIs before deciding whether any upstream extension is
 necessary. No mandatory new proposed-value validation API is selected by this decision.
 
-**Implementation and verification plan (Pricing pattern).** Pricing records shared PEP/catalog
-enforcement in [pricing/docs/design/05-governance.md](../../pricing/docs/design/05-governance.md)'s RBAC & Isolation definition of done and
-§9 acceptance criteria. Its [pricing/tests/rest_authz.rs](../../pricing/pricing/tests/rest_authz.rs) provides route-set coverage and
-explicitly separates gear enforcement tests from the PDP-owned role matrix. Orders adopts
-that separation, not a new authorization framework:
+**Implementation and verification plan (verified Pricing route census).** The existing
+[Pricing REST authorization tests](../../pricing/pricing/tests/rest_authz.rs) compare declared,
+runtime and source route sets. Reuse this census technique; it does not itself prove Orders'
+three-axis PDP policy or proposed-value enforcement. The previously cited `05-governance.md`
+file is absent in the current Pricing design. Orders' required evidence is the table below:
 
 | Layer / owner | Required evidence |
 |---------------|-------------------|
@@ -9823,7 +10182,7 @@ section. The rest of its contract is expressed as index requirements on tables o
 - **The cost of that is stated rather than hidden.** The index count on the gear's hottest write target is real write amplification on every transition, and it is accepted because the alternatives are worse: sorting on `state_entered_at` is forbidden by §2.2 for correctness, not for performance, and sorting the scoped set per page fails the budget. The benchmark of §1.2 **MUST** cover each filter shape at production row counts, since it is what establishes that these indexes are the ones the planner actually chooses.
 - The "in this state since" filter reads `orders_order.state_entered_at`, maintained by the engine inside the transition that changes state. It is the same column the expiry sweep reads, so the two slices no longer specify opposite sources for one fact — and it is a *filter* input only, never a sort key (§2.2).
 - **`orders_transition_audit` needs an index its unique constraint does not supply.** The audit read is ordered and paged by `(created_at, audit_id)` per §2.2, because a refused entry carries a **NULL `sequence`** and so joins no `sequence` ordering at all ([01-foundation — Database Schemas and Tables](DESIGN.md#contract-01-3-7)). `(order_id, sequence)` UNIQUE therefore serves the chain and the per-order committed lookup, and **cannot** serve this page: a cursor in one order over rows returned in another repeats and skips rows at page boundaries, silently, with a 200 and a valid-looking cursor. The read needs **`(order_id, created_at, audit_id)`**, declared in [01 §3.7](DESIGN.md#contract-01-3-7) with the rest of the audit table's index set.
-- The **version list**'s cursor of §2.2 is served by `orders_order_version`'s `(order_id, version)` primary key with no further index, in either direction, and the **acceptance history**'s by `orders_acceptance`'s `(order_id, accepted_version)` primary key likewise. The **per-line read**'s cursor is `(created_at, line_id)` over `orders_order_line_identity`, whose primary key orders by `line_id` instead, so that table **MUST** carry `(order_id, created_at, line_id)`; no line count is bounded anywhere in this design, so the page cannot rely on the set being small enough to sort.
+- The **version list**'s cursor of §2.2 is served by `orders_order_version`'s `(order_id, version)` primary key with no further index, in either direction, and the **acceptance history**'s by `orders_acceptance`'s `(order_id, accepted_version)` primary key likewise. The **per-line read**'s cursor is `(created_at, line_id)` over `orders_order_line_identity`, whose primary key orders by `line_id` instead, so that table **MUST** carry `(order_id, created_at, line_id)`; the 200-line order cap does not replace the declared deterministic keyset ordering or its index.
 
 <a id="contract-08-table-orders_read_access_log"></a>
 
@@ -9968,13 +10327,13 @@ and the gear **MUST** report unhealthy in that condition rather than degrading.
 ### Reads and authorization: What a read exposes (normative)
 
 The composed read **MUST** carry the order document at its current version, each line's full
-`OrderPin` (`items[].chains[]`, D-159), the stored resolved total, and the per-line fulfillment
+`OrderPin` (complete schema-2 receipt/query/selected bindings, D-192), the stored resolved total, and the per-line fulfillment
 status with the subscription linkage.
 
 It **MUST** also carry the **fulfillment inputs** of the current version: each line's stored
 `overlap_scope_key`, the version's market (`market_currency`, `market_region`), the version's
 `payer_tenant_id`, each line's `activation_deadline` (Workflow's check before each activation
-dispatch) and the `accepted_version_ref` it hands to Subscriptions (D-162). Workflow executes the activation re-check that
+dispatch) and the `accepted_version_ref` it hands to Subscriptions (D-190). Workflow executes the activation re-check that
 [03-gate-and-pin — Interactions and Sequences](features/03-gate-and-pin.md#contract-03-3-6) *Re-check Activation Preconditions* specifies —
 step 5 compares against the market frozen at submit, step 6 reads occupancy for each line's
 stored key with the version's payer — and reaches Lifecycle data only through this read
@@ -10054,7 +10413,7 @@ ordinary seller-scope grants under *Combining permissions* below.
 **Event-consumer read path.** Event Consumers means the explicitly configured Workflow,
 Subscriptions and Billing service principals validating lifecycle notifications under Foundation
 §4.4, and, for the Subscriptions principal, verifying the accepted content of an order version at
-activation through `get_version` (D-162). The per-order grant for that read is the same finite
+activation through `get_version` (D-190). The per-order grant for that read is the same finite
 order-ID set Workflow is granted for the order it is fulfilling, provisioned before the first
 provisioning intent; Subscriptions thereby depends on `orders-lifecycle-sdk` while Orders depends
 on Subscriptions' occupancy read, an SDK-level pair with no runtime loop, recorded as accepted.
@@ -10384,6 +10743,9 @@ treated as delegated when the caller supplied a delegation proof reference on th
 That comparison classifies logging only; it never grants or denies access. A direct seller or
 current-payer grant needs no delegation proof solely because those tenants differ, but the
 served read still logs. All point/child reads use the same authorized current-parent snapshot.
+The delivered reads take that snapshot in one `REPEATABLE READ`, `READ ONLY` transaction after
+the decision and commit the required served row in its own short transaction before the payload;
+a collection scope counts as "provably confined" only under the conservative rule of D-210 items 4–6.
 
 | Request / effective authority | Served log | Delegation evidence |
 |-------------------------------|------------|---------------------|
@@ -10444,6 +10806,19 @@ the engine writes the audit store.
 Where a caller has **no relationship** to an order, the response **MUST** be not-found rather
 than forbidden, because distinguishing the two leaks the existence of another tenant's order.
 
+**REST carrier of the proof reference (D-202).** A REST caller presents the delegation proof
+reference in the optional request header `X-Delegation-Proof-Ref`, on every operation, reads
+included. Its value is opaque: 1–512 printable non-space ASCII characters (`0x21`–`0x7E`), and
+it **MUST NOT** embed credential material (a compact JWS/JWE, PEM armour, URL user-info or a
+secret-named parameter). A header that is empty, longer than 512 characters, outside that range,
+credential-bearing or present more than once is refused `request-invalid` at the boundary,
+**before** authorization, idempotency resolution or any read. A valid header maps to the same
+`CallMeta.delegation_proof_ref` an in-process SDK caller supplies, so both enter one application
+service and one PEP. The value is never validated as proof by Orders, never written to
+operational logs or metrics, never echoed in a response, Problem or event, and never forwarded on
+any outbound call except as the PolicyEnforcer request context above; its only persistence is
+the audit/access-log evidence column defined in this section.
+
 
 <!-- /contract -->
 
@@ -10467,3 +10842,1199 @@ governs how far back this surface can read at all. That is **PRD §15 row 5**, t
 
 
 <!-- /contract -->
+
+
+<a id="contract-01-commercial-attempt"></a>
+
+## D-188: Durable commercial attempts and sparse version identities
+
+**Selected R02 Option A (2026-10-05).** This contract supersedes fixed submit-version-2,
+consecutive-commercial-version and exclusively single-transaction idempotency-claim wording
+for submit/amendment that can issue Pricing commands. It does not change contiguous committed
+**audit sequences**, create's version 1, state-only operations, or Pricing's SDK. In active
+examples N is the previous committed version and M/C is the new reserved candidate, strictly
+larger than N but not necessarily N + 1. Earlier D-19/D-64 version-2 rationale is historical.
+
+`SellabilityV1::check` durably writes one Pricing receipt per seller/order/version/line.
+A rollback in Orders cannot undo it; a new command key with changed inputs still conflicts
+with Pricing's business identity. Orders therefore permanently reserves candidate numbers
+before that first command. A failed submission may consume 2 and 3 while current_version stays
+1; the first successful submit can commit 4 with supersedes_version=1. An amendment may later
+commit 7 with supersedes_version=4. No placeholder versions 2, 3, 5 or 6 are inserted. Committed
+version history exposes only 1, 4, 7; exact-version reads of reserved-only numbers return the
+normal authorized not-found outcome. Failed attempts do not increment amendment_count.
+
+### Persistence and ownership
+
+**Table contract:** `cpt-cf-bss-orders-lifecycle-dbtable-commercial-attempt`; engine-owned `orders_commercial_attempt` (`bss_orders__commercial_attempt`).
+
+`orders_order.version_allocation_high_water` is initialized to 1 alongside current_version=1.
+Allocation locks the authorized aggregate first, then the idempotency record, and performs a
+checked increment within the same transaction as inserting `orders_commercial_attempt` and
+claiming its owning idempotency execution. The invariant is
+`1 <= current_version <= version_allocation_high_water <= 2147483647`, matching the existing
+signed SQL integer version columns. At exhaustion reject before any Pricing command with the
+existing canonical resource-exhaustion Problem; never wrap, reuse, renumber history or silently
+widen the wire/storage contract. Rolled-back allocations not exposed to a command are not
+reservations; once committed, an allocation is never reclaimed, including after retention.
+
+The new engine-owned table has PK `attempt_id` (UUID), FK `order_id`, unique
+`(order_id, candidate_version)`, and unique `idempotency_execution_id` (UUID generation, matching registry execution_id; durable value retained after registry expiry, not a cascading FK).
+Persist immutable operation/principal scope/request fingerprint, candidate_version,
+previous_committed_version, prepared_draft_revision (submit), complete proposed arrangement,
+authorization-fact fingerprint, original principal/proof references, canonical per-line
+Pricing requests and their hashes/stable command keys, and captured date/policy basis.
+Also persist immutable `commercial_subject_id` (UUID), `commercial_subject_type` (text) and
+`commercial_subject_tenant_id` (UUID) from the authenticated seller service context
+([D-194](#contract-08-commercial-service-authorization)); these are distinct from the original
+business principal and must match on command retry/recovery. Never store bearer tokens here.
+Persist conditional operational fields `status` (prepared/running/committed/refused/abandoned),
+owner token, monotonically increasing fencing generation, lease_until, created_at,
+terminal_at, and per-line receipt IDs/digests/results. Index `(status, lease_until, attempt_id)` supports bounded unresolved-work discovery; `(order_id, candidate_version)` supports fenced point recovery. Per-line inputs/results may be child rows
+uniquely keyed by `(attempt_id,line_id)`; immutable inputs and first receipt results cannot be
+overwritten. Attempts introducing amendment lines reserve server-generated line IDs here;
+commercial line-identity/membership rows are inserted only at successful final commit.
+
+`orders_idempotency` gains an immutable execution-generation UUID and optional attempt_id;
+its unique client scope remains unchanged. Owner token/fencing generation are explicit new schema fields, mirrored consistently with the attempt on reclaim. Persisting this marker before remote commands is
+an explicit exception to Foundation's ordinary claim-and-settle-in-one-transaction rule.
+The engine is the only writer, through SecureConn/PDP scopes: runtime INSERT and conditional
+UPDATE of operational columns, no DELETE or UPDATE of immutable inputs; high-water UPDATE
+only in allocation. Read APIs and slices receive no operational writer grant. Ordinary
+retention workers MUST NOT delete an unresolved linked marker or attempt. A settled marker
+may expire under the existing 24-hour rule, but reuse of its raw client key creates a new
+execution generation and new candidate; it cannot attach to an old attempt. Attempt evidence
+is retained with the order in this phase (no purge grant); a later bounded-retention design
+must preserve non-reuse through the aggregate high-water and preserve committed receipt links.
+
+### Engine execution subflow (overrides ordinary steps 2–9 for commercial commands)
+
+1. Recheck current access and proposed relationships/payer-use authority before resolving
+foreign commercial facts. Authorized settled replay returns before external work. An authorized matching existing
+execution loads its frozen attempt and recovers that identity before any fresh assessment:
+new resolution results or outages cannot replace/block exact historical receipt recovery. Fresh
+authorization and final eligibility/deadline/state checks still apply before any new commercial
+commit. Only genuinely new executions prepare
+non-receipt assessment evidence and the exact immutable proposed basket/line requests; missing prerequisites
+can refuse without reserving a candidate. This does not decide R03 Preview or manufacture
+missing BillingTerms/policy/descriptor inputs.
+2. In a short engine transaction lock aggregate then idempotency record. Recheck PDP facts,
+state, expected current version and prepared draft revision. Apply fingerprint and settled
+replay rules. A matching live owner returns still-processing; a matching expired owner is
+reclaimed with a new fencing generation **on the same immutable attempt/candidate**. For a
+new execution claim ownership and allocate the candidate atomically; stamp it into the exact
+per-line request snapshots before committing the attempt and marker. No commercial version,
+claim, pin, total, lifecycle event or committed business audit entry is created here.
+3. Release all SQL locks before Pricing/network calls. Use stable command keys derived from
+attempt_id/line_id/operation, never transient worker IDs or the bare client key. Exact retry
+uses the stored query byte-equivalent canonical content, including reserved version and date
+basis; do not re-resolve changed terms under the same candidate. Persist returned receipt IDs
+and digests conditionally under the current fence. A lost response is resolved by repeating
+the same authorized Pricing command; a stale worker can at most produce/replay the same
+remote receipt and cannot record results or commit Orders. No receipt grants Order access.
+4. At final commit reacquire aggregate then registry/attempt locks. Verify owner/fence, current
+and proposed authorization facts (fresh PDP evaluation before the transaction, checked against
+locked facts), state, expected previous committed version, prepared revision, immutable input
+hashes, exact per-line receipt identity/digests and all required evidence/deadlines. Both successful and unavailable-input/refusal branches recognize their own matching owner token,
+fence and execution generation: they do not reject their own live marker as still-processing or
+reclaim it unnecessarily. Foreign owners retain the ordinary live-lease refusal. Original
+caller authority is required for a new commercial commit; the recovery service's maintenance
+grant is not a substitute. Missing/revoked authority cannot advance the order. Recheck overlap
+claims transactionally using existing precedence. No automatic rebase to a later draft/version.
+5. On success append precisely candidate_version with supersedes_version equal to the locked
+previous committed version; atomically select each receipt ID/digest on its version line,
+write pins/totals/claims/audit/outbox, move current_version, settle response, and mark the attempt
+committed. On a business refusal atomically record authorized diagnostics/refusal audit and
+settled response and mark refused; candidate stays burned. No Orders commercial version/pin/
+total/event is committed on refusal. The durable operational attempt/high-water and external
+Pricing evidence are expressly outside that no-commercial-effects promise.
+6. Infrastructure rollback preserves the separately committed attempt and remote receipts.
+Retry the same attempt while its exact inputs remain admissible; never allocate because a
+response was lost. Resolve uncertain final commit by reading attempt status and the committed
+version/receipt links before retry or abandonment. Final abandonment is conditional under the
+same locks and fence and disallows any later commit by old workers; records an operational
+reason, leaves the candidate burned, and settles an authorized refusal only through the engine's
+existing refusal path. A settled same-key retry returns its original outcome. New intent after
+terminal refusal/abandonment requires a fresh execution and candidate, even with identical terms.
+
+Recovery is an engine service invoked by request retries and a bounded continuation in the
+existing idempotency maintenance worker (no sixth worker). Use its existing batch/cadence,
+positive finite lease and per-port deadline limits; each pass makes bounded progress and yields.
+On unrecoverable/stale inputs mark abandoned conditionally rather than spin or refresh inputs.
+Expired unresolved attempts are recovered/terminated before marker cleanup, never silently
+purged. Original principal authorization unavailable means no business commit; preserve work
+for bounded subsequent recovery or terminal abandonment, with backlog/oldest-age alerts.
+
+Downstream dispatch/activation must verify the receipt belongs to the selected **committed
+current** version and eligible fulfillment attempt. Reserved or abandoned candidates, including
+valid remote receipts, are not submitted orders and cannot authorize activation. Exact IDs and
+explicit supersedes_version drive history, approvals, customer acceptance and callbacks; arithmetic
+predecessors are forbidden. R03 is governed by D-189, R04 by D-190 and deadline authority by D-191;
+their missing upstream implementations, evidence/grants and R12 admission remain prerequisites.
+
+### Failure matrix and acceptance criteria
+
+| Injected condition | Required result |
+|---|---|
+| Crash before allocation commit | No command issued; no reserved candidate visible |
+| Crash after reservation, before first command | Same execution resumes the same candidate/inputs |
+| Receipt committed, response lost | Same per-line command replays original receipt; no fresh candidate |
+| Line A accepted, B refused | No committed Orders version/event; candidate burned; edited new submission uses fresh candidate |
+| Two workers, expired lease or late remote response | Single fenced local winner; no candidate/input substitution or duplicate final effects |
+| Different-key submits from the same prior version | Unique candidate allocation; at most one commits from that prior version |
+| Draft edit, payer/authorization change or competing amendment | Final locked checks refuse stale work; prior committed version preserved |
+| Overlap conflict after receipt issuance | Refusal diagnostics committed, no new commercial version or selected receipts |
+| Audit/outbox/commit failure | Final transaction rolls back; operational attempt and Pricing evidence remain recoverable |
+| Lost final commit response | Read committed linkage; replay success rather than abandon or emit another event |
+| Key expiry/reuse and late worker | New execution/candidate; old generation cannot settle or mutate the new marker |
+| Expired receipt or changed terms | No deadline refresh under old identity; refuse/abandon and require fresh execution |
+| Version integer exhaustion | Bounded canonical refusal, no network write, wrap or high-water reset |
+| Candidate 2 refused, candidate 4 committed | History has 1,4; predecessor is 1; candidate-only reads/activation refuse |
+| Amendment 4 to 7, stale callback for 4 or reserved 6 | Equality check rejects stale/uncommitted version; acceptance remains version-bound |
+
+These are required real-database concurrency and fault-injection tests, plus cross-service
+receipt selection conformance; none is claimed implemented by this documentation decision.
+
+
+<a id="contract-03-nonbinding-assessment"></a>
+
+## D-189: Nonbinding Pricing assessment for Preview, submit and amendment
+
+**R03, selected Option A (2026-10-05); proposed upstream capability, not implemented.**
+Pricing MUST expose a separate typed `SafeRead` assessment operation, provisionally
+`PricingAssessmentV1::assess(ctx, BasketAssessmentQuery) -> BasketAssessment`.
+This name and shape describe the requested SDK contract, not a trait available on main.
+It shares Pricing-owned fact resolution and commercial rules with receipt admission;
+Orders MUST NOT copy those rules into its adapter. This narrowly supersedes D-161's
+withdrawn-assess/residual-only assumption and D-177's use of the existence of
+`SellabilityV1` as the trigger to retire interim SKU reads. The implemented
+`SellabilityV1::check` is a command, not this missing assessment capability.
+
+### Proposed typed boundary
+
+The query contains independently authorized tenant axes, seller catalog scope, a
+request correlation/assessment identifier and basket-local line keys; each line supplies
+fixed plan/revision/selection identity, quantity, currency/region, proposed start and
+available term/billing inputs. Optional Preview term, billing-cycle/`BillingTerms` and
+hold-policy context may be explicitly absent; their absence is not filled with fabricated values. Basket-local keys only correlate results. The query MUST NOT
+require or manufacture an order ID, commercial version, receipt line identity, command
+idempotency key or D-188 attempt. Missing Preview term/cycle remains explicitly absent;
+no default is invented to satisfy `NewSaleQuery`. Pricing resolves live eligibility facts
+itself; caller-supplied intent or an earlier observation is never authoritative eligibility.
+
+The answer identifies each evaluated revision/selection and observation time, returns
+proposed resolved bindings with sufficient exact selection/revision identity and binding digest
+for Rating input correlation and subsequent acceptance comparison, and every applicable independent Pricing predicate result
+(`passed`, `failed`, `unevaluable`) with predicate/item/slot identity, reason and authorized
+detail. Missing observations, dependency failure and incomplete coverage are explicit;
+unobserved facts cannot become passed results. Dependent checks may be unevaluable when
+their prerequisites are absent; independent checks still run. A first-error command response
+is not a complete assessment. Orders validates result identity and completeness against the independently established expected
+coverage and versioned registry in [D-195](#contract-03-diagnostic-mapping), maps
+producer reasons through its port, and combines these results with Orders-owned predicates
+and the other owner ports. Exact descriptor/legacy pin metadata gaps from D-187 remain
+open until the producer supplies them or a separate decision changes their requirement.
+
+Preview, submit and amendment MUST share this Orders assessment composition. Safe reads
+remain useful inputs where their evidence is sufficient, but their availability alone does
+not deliver this complete diagnostic contract. Until assessment and required dependencies
+are delivered, missing required results remain unevaluable/unavailable and full Preview
+parity is not complete. Missing term/cycle withholds TCV successfully as already specified;
+it does not suppress unrelated diagnostics or permit invented totals. The result identifies
+operation-specific applicability and missing-input dependencies: a TCV-only check requiring an
+absent optional term/cycle is unevaluable with explicit `tcv-only` scope and does not become a
+failed required sellability gate. Unaffected predicates still evaluate. A genuinely required
+sellability input being unavailable continues to fail closed; no dependent check is marked passed
+merely to preserve TCV withholding. Submit/amendment retain their complete-input requirements.
+
+### Effects, authorization and commitment
+
+Preview MUST NOT invoke `SellabilityV1::check` or `PricingAcceptanceV1::hold`, reserve a
+commercial version or create a D-188 attempt. Assessment creates no acceptance receipt,
+hold, commercial command record or acceptance/hold audit. Preview creates no Orders
+commercial version, pin or total; only its existing bounded diagnostic run is persisted,
+with distinct run IDs on repeated calls, seven-day retention and no stored total/TCV/tax.
+Existing authorized catalog catch-up (including `current_revision` promotion/audit/events)
+is allowed: `SafeRead` does not promise that all provider tables remain unchanged.
+
+Orders performs the same buyer-axis/delegation checks as purchase before foreign-party
+resolution. The provider independently enforces seller-scoped PDP access using an agreed
+least-privilege assessment/read grant. Provider permission does not prove payer/resource
+authority. The precise service-principal and Products access path remain an explicit
+upstream authorization prerequisite; no Pricing system identity may be impersonated and
+acceptance-create permission is not a substitute for a read capability.
+
+Assessment is an observation, never a reservation, offer-validity promise or admission
+permission. Submit/amendment alone use the D-188 durable-attempt protocol to invoke receipt
+commands. Pricing authoritatively re-resolves/revalidates at acceptance, including changes
+since assessment; Orders cannot treat a previous pass as sufficient for commitment.
+D-190 governs holds/activation and D-191 deadline authority; their required implementations and other unresolved commercial policies remain prerequisites.
+
+### Required conformance before completion
+
+- Repeated Preview calls add only their specified Orders diagnostics: no Pricing receipt,
+  hold, command or commercial audit and no Orders attempt/version/pin/total. Verify table
+  deltas and command-call absence, while separately allowing catalog catch-up.
+- A read-authorized provider caller can assess without acceptance-create permission;
+  unauthorized seller scopes and buyer axes fail without foreign-party disclosure.
+- Frozen identical complete inputs yield matching overlapping predicate results for
+  assessment and acceptance; changing catalog eligibility after Preview can refuse submit.
+- Multiple independent failures plus an unavailable observation produce all reached
+  tri-state diagnostics, within existing port budgets, without fabricated passes.
+- Missing term/cycle preserves other response fields and successful `tcvWithheld`; no
+  money/TCV/tax is retained, repeats receive distinct IDs and diagnostics expire after seven days.
+- An absent/malformed/incomplete assessment provider fails closed; no fake order identity,
+  acceptance-then-delete or cross-service rollback simulation is used.
+
+These are implementation acceptance criteria, not executed test results.
+
+<a id="contract-03-commercial-deadline"></a>
+
+## R05 reconciliation: Pricing-issued commercial deadline (D-191)
+
+**Selected Option A (2026-10-05): Pricing is the sole authority for an issued commercial
+acceptance deadline.** This narrowly supersedes D-162's Orders-owned interval and local
+catalog-end/assessment-time formula. It does not add a second Orders business-expiry policy.
+D-192 frozen-descriptor mapping implementation and R12 activation admission/recovery remain separate release gates.
+
+### Issued evidence and enforcement
+
+For every submitted/amended line, `order_pin.activation_deadline` MUST equal the selected
+`AcceptanceReceipt.hold_until` verbatim, associated with its acceptance ID, terms/request
+digests and exact seller/order/version/line. The engine verifies this equality and complete
+finite UTC evidence before committing the version. Missing or inconsistent evidence fails
+closed; it cannot become an infinite deadline, a null committed deadline, a local duration,
+a catalog `effective_to`/`ends_on` calculation, or a fabricated default. A malformed/mismatched
+receipt is an integration/evidence failure, not proof of commercial expiry.
+
+Current Pricing computes `hold_until = accepted_at + policy.duration_seconds` using its server
+clock inside the acceptance transaction. Its exclusive comparisons reject `now >= hold_until`
+and require `receipt.query.start_at <= activation_at < hold_until`. Callers cannot provide
+`hold_until` in `FulfilmentQuery`. Orders stores the instant, not a duration to restart. Exact
+receipt/hold replay, policy updates, workflow hold/resume and recovery preserve the original
+issued deadline; historical replay after expiry cannot admit a new activation.
+
+Orders checks each receipt deadline at its final commercial transition timestamp; Workflow
+checks it before dispatch. Compare the actual planned mixed-date activation wave against
+**each** affected line's deadline. An aggregate minimum may be derived for display/early
+rejection, but MUST NOT replace per-line receipt evidence or extend any window. A locally
+observed elapsed deadline or activation at/after it refuses `order-binding-expired`; a pass
+is only an early check. Consumers do not assert clock equality with Pricing or adjust an
+issued instant using observed clock skew. Subscriptions obtains fresh Pricing eligibility
+under D-190: Pricing's clock determines its expiry check, and `valid_before` may be earlier
+because of current explicit closure/temporary boundaries. `valid_before` is an observation,
+not a replacement receipt deadline or reusable activation token. R12 must deliver the concrete
+protocol for the gap between that remote observation and local activation admission.
+
+Order state TTLs, idempotency retention, provider-call timeouts and workflow SLA budgets are
+separate policies. None renews or substitutes for commercial validity. Re-offering expired
+terms requires a fresh permitted amendment/acceptance execution under D-188, with a new
+candidate; no amendment from fulfillment or silent renewal-price fallback is introduced.
+
+### Seller policy ownership and missing discovery
+
+**Implemented baseline:** Pricing's `BssPricingConfig.seller_hold_policy` is one deployment-wide
+`SellerHoldPolicy { version, duration_seconds }`, defaulting to version 1 and 86,400 seconds.
+It is not a seller-indexed store. `NewSaleQuery.hold_policy_version` is required, but the existing
+SDK exposes no policy-discovery operation. Orders MUST NOT assume version 1, mirror the
+24-hour default, read Pricing internals or select a policy from another tenant.
+
+**Proposed, not delivered:** Pricing must expose an authorized typed SafeRead, provisionally
+`PricingAcceptancePolicyV1::current(ctx, CatalogRef) -> AcceptancePolicyObservation`, containing
+seller/catalog identity, positive policy version, positive duration and observation time.
+Names are proposed SDK work, not existing APIs. Pricing resolves the seller's effective policy
+and enforces it again at acceptance. The same version for a seller must identify immutable
+policy content. Both the read and acceptance use the same resolver; seller/catalog identity
+is checked against PDP scope, not trusted because supplied in the query. Orders' port validates
+answer identity/completeness, obtains only the required seller-scoped grant, and freezes the
+observed policy version in the D-188 immutable `NewSaleQuery` before issuing a command.
+
+The existing seller-specific policy requirement is retained. Exposing the current deployment
+policy would solve version discovery only for deployments explicitly accepting uniform policy;
+it does **not** deliver seller-specific policy resolution. A Pricing-owned resolver and its
+configuration/storage mechanism remain missing upstream work. This decision chooses no
+Settings Service provider, policy values, silent uniform-policy downgrade or Orders fallback.
+An absent required seller policy is `order-binding-policy-missing`; missing provider/outage,
+denied scope and malformed answers retain unavailable, authorization and contract-error
+categories respectively. For submit/amendment, required missing policy facts remain unevaluable during assessment and
+block successful admission rather than yielding a guessed window. Preview may omit policy used
+only for an optional forecast: its absence withholds that forecast, not independent evaluable
+sellability results. Genuinely required commercial evidence still fails closed under D-189.
+
+A policy can change after discovery. Current Pricing rejects a fresh command whose version
+no longer matches with `UnsupportedTerms`; that reason also covers other unsupported terms,
+so it is not a dedicated policy-race discriminator. Orders MUST NOT classify every such error
+as policy drift or blindly retry it. Refusal preserves the frozen attempt and burns its
+candidate when terminal. A genuinely new execution may refetch policy and use a new candidate;
+an exact retry/recovery cannot edit `hold_policy_version` or any other frozen input. Previously
+issued receipts retain their original policy/version/deadline after configuration changes.
+
+### Assessment and Preview
+
+Read-only assessment composes proposed pin evidence and policy diagnostics before acceptance;
+it cannot require an already-issued deadline or create a receipt to obtain one. After assessment
+passes, D-188 issues acceptance and attaches the verified receipt deadline before final Orders
+commit. Amendment follows the same staging for its new candidate, leaving the old committed
+receipt/deadline unchanged on failure.
+
+Preview has **no issued `activation_deadline`**. If its response retains a compatible deadline
+field, it is absent/null with explicit `not-issued` meaning, never a required committed pin.
+Any optional policy-based window forecast is explicitly nonbinding, identified by observed
+policy/version/time and kept separate from issued evidence. Missing policy yields unavailable
+forecast/diagnostics, not a default. Acceptance time, policy or live eligibility may differ
+from Preview; acceptance always revalidates. Existing D-189 diagnostic-only retention applies.
+
+### Required conformance (not yet executed)
+
+- [ ] Verify exact per-line receipt/deadline equality and reject missing, malformed, foreign
+  or mismatched evidence before commercial commit; preserve original receipts on failed amendments.
+- [ ] Verify `now == hold_until` and `activation_at == hold_until` refuse, while valid preceding
+  instants pass Pricing's window checks; clock-offset tests cannot turn local passes into authority.
+- [ ] Exercise multiple receipt deadlines and mixed-date activation; an aggregate minimum never
+  replaces the line evidence or permits a line outside its window.
+- [ ] Change policy after discovery: stale-version refusal leaves immutable attempt inputs intact;
+  a fresh execution refetches with a new candidate, and unrelated `UnsupportedTerms` is not retried
+  as policy drift. Existing receipts and exact replay preserve their original deadline.
+- [ ] Exercise authorized seller-specific policy discovery, foreign scopes, absent policies,
+  provider outages and malformed answers with distinct failures and no default-version fallback.
+- [ ] Verify repeated Preview issues no receipt/hold/attempt and displays no issued deadline;
+  any forecast is explicitly nonbinding, with unavailable policy remaining unavailable.
+- [ ] Verify hold/resume, state TTL changes and hold-command replay cannot refresh validity;
+  fresh `valid_before` can tighten eligibility without rewriting historical receipt evidence.
+
+Implementation sources: [policy configuration](../../pricing/pricing/src/config.rs),
+[acceptance issuance](../../pricing/pricing/src/infra/commercial_terms/check.rs),
+[exclusive checks](../../pricing/pricing/src/domain/commercial_terms.rs),
+[fresh fulfillment](../../pricing/pricing/src/infra/commercial_terms/fulfilment.rs), and
+[policy-change conformance source](../../pricing/pricing/tests/acceptance_transaction/mod.rs).
+These are existing Pricing behaviors, not evidence that Orders integration is implemented.
+
+
+<a id="contract-03-billing-terms-resolution"></a>
+
+## R07 — Subscriptions-owned pre-subscription billing terms (D-193)
+
+**Selected Option A (2026-10-05), proposed integration, not runtime delivery.**
+Subscriptions owns a pre-subscription `SafeRead` resolver; Orders adapts its result and
+Pricing validates it without choosing defaults. This resolves who supplies D-192's required
+`BillingTerms`, not the separate Rating evaluator or activation-admission prerequisites.
+The Subscriptions SDK/provider and its authorized seller-policy source are missing work.
+No Settings Service backend or existing resolver implementation is assumed.
+
+### Proposed contract and staging
+
+The proposed SDK capability `PreSubscriptionBillingTermsV1::resolve(ctx, request)` is a
+name for this requirement, not a callable API in main. It must work without an order or
+subscription identity. The request contains independently authorized seller/payer/resource
+axes, plan/revision identity and selected item contexts, authored billing cycle and term
+intent, requested earliest start instant, and explicit anchor intent when supplied. Selected
+contexts identify recurring cycles and usage-window constraints; caller-supplied facts cannot
+establish live eligibility or authorize policy access. The resolver obtains owner-authorized
+policy/contract inputs through declared upstream ports and verifies their applicability to
+that scope. Its policy precedence, seller-policy provider, immutable version lookup and grants
+must be agreed and implemented upstream; absence is never filled by an Orders default.
+
+A complete result carries exactly the public Pricing `BillingTerms` shape: schema version 1,
+`cycle`, `anchor`, `anchor_at`, `timezone`, `source`, and canonical `digest`, plus resolved
+`Term`, the unchanged earliest `start_at`, and observation/provenance context. `source` is
+`ExplicitOrder` only when complete authorized explicit intent supplies the terms, or
+`SellerPolicy { id, version }` naming the immutable positive policy version used. Mixed policy
+resolution must retain its constituent provenance outside the exact BillingTerms object and
+identify an authoritative effective seller-policy version whose declared resolution rules cover
+the result; if existing provenance cannot truthfully represent it, resolution refuses pending
+upstream agreement. It cannot label policy-derived fields explicit. Other
+source kinds require upstream contract agreement, not a locally invented enum value.
+Use the public [billing_terms_digest](../../pricing/pricing-sdk/src/digest.rs) helper;
+Orders verifies the digest and field mapping but does not rewrite the snapshot. Policy version,
+terms schema version and Pricing hold-policy version are separate coordinates.
+
+Resolution creates no subscription, order, commercial attempt, acceptance receipt or hold.
+Preview invokes it without commercial identities; complete output feeds the D-189 assessment
+and Rating inputs. Missing optional Preview term/cycle leaves dependent checks unevaluable and
+withholds TCV; independent observable predicates remain reportable. Missing required terms
+never count as a passed predicate or a successful acceptance. Distinguish missing/unresolvable
+policy, unsupported input/combination, invalid digest or malformed result, authorization denial,
+and provider unavailability through typed outcomes/canonical error metadata. These are proposed
+semantic categories, not claims that new public reason codes already exist.
+
+Submit/amendment resolve complete terms before the first Pricing acceptance command. D-188
+freezes the complete result into the per-line `NewSaleQuery` under its execution owner and
+candidate reservation; the committed D-192 receipt retains those exact query terms. A resumed
+or exact-retry attempt never re-resolves policy, recalculates anchors from a new clock instant,
+or changes the term mapping. A terminal failed attempt requires a new execution/candidate for
+changed terms. Pricing still independently checks supported-sale compatibility and live facts.
+
+### Exact authored-term mapping and supported profile
+
+The capture `term_duration` interval is authored intent, not already a Pricing `Term`.
+Preserve explicitly authored rolling intent as `Term::Rolling`; missing duration is not rolling. A finite duration is admitted only when represented
+as a positive exact integer count of the chosen invoice periods: one calendar year with a
+monthly cycle is 12 periods; one calendar year with a yearly cycle is 1. Normalize calendar
+years to months for this conversion only; require divisibility by 12 for yearly cycles, a
+positive count fitting the SDK `u32`, and no day/time remainder. Never convert days/seconds to
+months using 30/365-day approximations. Calendar-plus-day/time, ambiguous or non-integral intervals refuse
+as unsupported; capture/wire adapters must retain enough calendar-unit intent to prove the
+conversion, otherwise require explicit period-count intent. Preserve authored duration alongside
+the resolved term for display. Contract renewal election and term windows remain their owner's
+facts; resolving acquisition terms does not create an Orders renewal authority.
+
+Implemented Pricing supports `Month`/`Year`, UTC, and `Calendar` or `SubscriptionStart` anchors.
+Calendar anchors are the first day at midnight UTC (January for yearly); a subscription-start
+anchor is an explicit instant, not an instruction to fill it later. Recurring bindings must
+match the invoice cycle. Usage rating windows/policies remain frozen selected-binding inputs,
+not the invoice cycle: hourly usage with a subscription-start anchor requires exact hour
+alignment. Respect the implemented model/policy combinations; do not broaden them in an adapter.
+The resolver refuses incompatible intent rather than silently rounding the anchor.
+
+Earliest requested `start_at`, frozen invoice `anchor_at`, and Subscriptions' later chosen actual
+activation instant are distinct. D-190 freezes the chosen business activation identity; D-201 distinguishes the later applied service instant; neither delay nor
+hold replay rewrites accepted billing terms. An invoice anchor is period geometry, not permission
+to backdate service, billing coverage or entitlement before actual activation. Subscriptions and
+Rating must prove the corresponding partial-period geometry together; an unrepresentable
+activation/terms combination refuses or takes an explicitly authorized new commercial execution.
+
+### Required implementation and conformance (unchecked)
+
+- [ ] Implement scoped Subscriptions SDK/provider, policy provenance/version reads and grants;
+  prove policy absence differs from outage, denial and unsupported terms, without fallback.
+- [ ] Test monthly/yearly and rolling/fixed mapping, P1Y6M to 18 monthly periods, day-only and calendar-plus-day/time rejection, zero,
+  overflow and non-integral periods; preserve authored intent and canonical digest byte equality.
+- [ ] Test calendar/anniversary anchors, month-end/leap-year period fixtures with Subscriptions
+  and Rating, UTC/calendar boundaries, hourly alignment and recurring-cycle/model incompatibility.
+- [ ] Test Preview missing terms with honest diagnostics/withheld TCV and no commercial writes;
+  required acceptance terms remain fail-closed.
+- [ ] Change policy/clock between retries: frozen D-188 query and D-192 receipt remain identical;
+  a new execution can resolve new terms, with no historic receipt mutation.
+- [ ] Test delayed actual activation, no service/billing backdating, foreign-seller policy denial,
+  bad provenance/digests and no subscription creation during resolution.
+
+Existing source contracts: [NewSaleQuery/Term](../../pricing/pricing-sdk/src/acceptance.rs),
+[BillingTerms](../../pricing/pricing-sdk/src/terms.rs), and
+[Pricing validation](../../pricing/pricing/src/domain/commercial_terms.rs).
+
+
+<a id="contract-08-commercial-service-authorization"></a>
+
+## R08 — Authenticated commercial service principals (D-194)
+
+**Selected Option A; documentation contract, not deployed grants.** Orders and Subscriptions use
+separate platform service principals of type `gts.cf.core.security.subject_service.v1~`, authenticated
+through the supported AuthN Resolver S2S path and explicitly provisioned for each seller. The
+trusted authentication result supplies subject ID, type and tenant; an order's seller UUID selects
+a configured authorized identity, never a tenant value to insert into a handcrafted SecurityContext.
+Missing provisioning, authentication or permission prevents the call. No buyer-context fallback,
+manual production AccessScope, privileged system-actor borrowing or acceptance under a replacement
+identity is permitted. D-194 supersedes D-160's context construction and the custom Orders system
+subject assumptions in D-171/D-177; the historical ban on impersonating Pricing remains.
+
+### Permission and call ownership
+
+Every row needs explicit least-privilege PDP policy and provider enforcement; possession of the
+service type, a ClientHub handle or CatalogRef grants nothing. Scope calls to the intended seller
+and applicable resource IDs. Exact action/resource names for proposed APIs require producer agreement.
+
+| Caller / operation | Required authority | Delivery status / restriction |
+|---|---|---|
+| Orders: `PricingReadV1` reads | Pricing `plan:read`, `price:read`, plus related Products SKU reads as invoked | Existing providers; seller provisioning/grants and real-provider conformance pending |
+| Orders: D-189 assessment and D-191 policy discovery | Separate authorized nonbinding assessment/policy reads and required related reads | Proposed APIs and grant contracts missing; Preview never requires acceptance create or hold merely to obtain diagnostics |
+| Orders: D-193 billing-terms resolver | Authorized Subscriptions resolver/policy read, limited to supplied seller and authorized buyer axes | Proposed API/grants missing; does not permit subscription creation |
+| Orders: `SellabilityV1::check` | Pricing `acceptance:create` plus required plan/price and Products SKU reads | D-188 submit/amendment only, never Preview |
+| Orders: receipt recovery/read | Pricing `acceptance:read`, bounded to the applicable seller/receipt | Does not authorize a new commercial commit or a hold |
+| Subscriptions: `hold`, `check_fulfilment`, receipt read | Pricing `acceptance:hold` and `acceptance:read`, plus related price/Products SKU reads actually used | D-190 committed selected receipts and fenced fulfillment only; no automatic Orders hold grant |
+| Orders: interim `ProductsClient::get_sku` | Products SKU `read` in seller scope | Retires only when D-189 assessment supplies authoritative SKU results; related internal Pricing→Products reads still need authorization |
+
+The Products reference registry already routes ordinary authenticated service subjects through its
+PDP path and requires the call tenant to equal the subject tenant. Its privileged `*.system` branch
+remains restricted to Pricing's exact owner identity; this choice does not widen it or grant Orders
+reference reserve/confirm/release. The ordinary path is code capability, not evidence of deployed
+Orders/Subscriptions grants. Public read and inter-gear provider behavior require joint conformance.
+
+### Buyer authority, retries and attribution
+
+Before foreign-party reads or acceptance, Orders independently authorizes the original caller for
+the operation, resource tenant, seller relationship and proposed payer use under the existing
+buyer-axis/delegation contract. Before final commit it rechecks required current authority and
+D-188 expected snapshot/version/claim and worker fences. A service's catalog permission cannot
+satisfy those checks. Recovery keeps original caller attribution and authority requirements;
+maintenance permission alone cannot create business effects. Record service identity and original
+business actor separately for correlation/audit without exposing credentials or tokens.
+
+D-188 freezes the authenticated commercial caller's subject ID/type/tenant with the attempt and
+stable per-line command keys. Pricing's command identity includes caller ID and tenant: token
+refresh or credential rotation may continue only when they authenticate the same principal and
+scope. A genuinely changed principal is an explicit reconciliation prerequisite, not an exact retry
+under new credentials; uncertain old commands must be reconciled without duplicate acceptance or
+rebinding old keys to a new caller. Revocation is not bypassed to finish an attempt, and expired
+response-registry keys do not relax execution-generation fencing. Never persist bearer tokens as
+attempt identity.
+
+### Required implementation evidence (unchecked)
+
+- [ ] Provision seller-scoped Orders and Subscriptions principals through the supported platform
+  authentication path, maintain/revoke least-privilege policies, and agree permissions for all
+  proposed D-189/D-191/D-193 reads before enabling the relevant flows.
+- [ ] Real-provider Pricing→Products tests pass for the intended ordinary principals with exact
+  grants; remove each required grant and prove denial before protected effects. Test cross-seller
+  requests, forged system identities and PDP outage without leakage or privilege fallback.
+- [ ] Test unauthorized resource/proposed payer use before foreign reads and final commit,
+  revocation during recovery, and original actor attribution independent of service permission.
+- [ ] Test same-principal token refresh/rotation exact replay, changed-principal refusal/reconciliation,
+  stale worker fences, and no duplicate receipts from recovery.
+- [ ] Preview succeeds with its read grants and no acceptance-create/hold grant; Subscriptions can
+  hold only through its own authorized flow and Orders cannot hold with its normal grant set.
+
+Local evidence: [platform S2S contract](../../../../docs/arch/authorization/DESIGN.md),
+[Products ordinary/Pricing-system branches](../../products/products/src/infra/reference_registry.rs),
+[Pricing authorization test](../../pricing/pricing/tests/pricing_seam_contract.rs), and
+[Settings service identity precedent](../../../settings-service/settings-service/src/infra/secret_manager.rs).
+
+<a id="contract-03-diagnostic-mapping"></a>
+
+## R09 — Versioned owner diagnostics and explicit Orders mapping (D-195)
+
+**Selected Option A (2026-10-05); proposed contract and implementation prerequisites.**
+D-189 already selects the separate nonbinding assessment API. Pricing owns its commercial
+predicate vocabulary and evaluator; Orders owns a versioned adapter registry that maps supported
+owner results into its existing gate predicates, registered reasons and public response contract.
+This decision refines that boundary, not a second choice of API. The implemented first-error
+`SellabilityV1::check` and `CommercialReason` do not establish complete diagnostic coverage.
+
+### Owner profile, expected coverage and result contract
+
+Before admitting a profile, agree and pin its immutable schema/rule profile version, supported
+operation/input shapes, predicate identifiers, result cardinalities, applicability/dependency
+rules and allowed evidence. Orders selects a supported profile before assessment; the provider
+must echo it. The mapping registry is immutable and versioned, reviewed with the provider, and
+contains `(producer, operation, profile, predicate, reason)` mappings to Orders predicate,
+canonical category/domain/code, applicability, public detail allowlist and composition rules.
+No message parsing, status-only interpretation or locally copied commercial evaluator is allowed.
+This registry verifies the evidence contract; it does not supply missing D-187 catalog roster
+or business evidence. Those producer gaps remain prerequisites until implemented.
+These are proposed SDK contracts; this decision claims no new enum or error exists on main.
+
+Expected coverage comes from that agreed profile plus the authorized requested line/selection
+universe and authoritative revision-item roster evidence. Validate the roster against the fixed
+revision and selection contract before deriving expected result identities. The response's own
+length, a `complete=true` flag or its self-declared list of evaluated predicates does not prove
+completeness. Current read cells alone do not prove the full revision roster (D-187); supplying
+that independently checkable evidence remains part of the D-189 upstream ask. Operation-specific
+inapplicability is explicit profile metadata, not a fabricated passed result or unexplained omission.
+
+Each proposed producer result carries:
+
+| Field | Required meaning |
+|---|---|
+| Producer, immutable schema/rule profile, predicate and reason identifiers | Reason is required for failure/unevaluability; no interpretation from display text |
+| Assessment/observation identity and time | Correlate to this request and fixed revision; unavailable observation has no invented observation timestamp |
+| Basket-local line, item and native selection identity | Preserve the distinction between no selection, selected NULL dimension and text `default`; no fake receipt/order identities |
+| Verdict | `passed`, `failed`, `unevaluable`, each supported by actual observation or an explicit missing dependency |
+| Applicability/dependencies | Validated against the agreed operation/profile: required admission, `tcv-only` or `preview-forecast`, with the exact approved optional-context withholding condition |
+| Evidence/detail | Typed, size-bounded, allowlisted fields only, sufficient to justify the mapped result without exposing raw errors, credentials, money or arbitrary provider payloads |
+
+A missing, duplicate, out-of-context, unknown required predicate or unsupported profile cannot
+produce an admitted assessment. Map invalid/incomplete coverage to the existing
+`catalog-predicates-unavailable` operation outcome, not a new claim that every missing business
+predicate failed. Keep independently validated authorized results from other lines/ports. Within
+a malformed envelope retain only entries whose identity, profile, observation and evidence remain
+independently verifiable; otherwise discard that envelope's entries. Never treat this preserved
+partial evidence as a complete owner vector. An actual business failure with a well-formed complete
+vector is different: preserve all its passes, failures and unevaluable dependencies. Transport
+failure supplies an operation outcome and dependency unevaluability, not owner observations.
+Unknown optional extension data may be ignored only when the agreed profile explicitly permits it
+and required coverage still validates; it cannot affect admission or leak raw detail.
+
+### Composition, storage and response
+
+One existing `orders_gate_outcome` row remains one Orders predicate/line/item/selection identity.
+When multiple owner predicates map to that row, retain every typed owner subresult in the ordered
+`producer_results` array; never overwrite one with another. Subresult identity is
+`(producer, profile, predicate, line, item, selection-presence, raw nullable dimension)`; duplicates
+are invalid. The registry declares the complete required subresult set and deterministic order.
+For a required conjunction, any required unevaluable subresult makes the aggregate unevaluable;
+otherwise any failed required subresult makes it failed; it passes only when all required
+subresults passed. Select the aggregate reason from the first subresult of its winning verdict
+in the registry's declared order. Full subresults preserve simultaneous failures even when
+unevaluability wins.
+Do not merge results with different applicability into one aggregate: use distinct declared Orders
+predicate identities, with registration/compatibility review before implementation.
+
+Persist mapping version and applicability with the row and exact producer/profile/reason,
+observation and native identity with each subresult. Rows without owner observations use an empty
+array, not fictitious Pricing results. Local dependency outcomes remain identifiable as local.
+The schema's selection-presence flag and raw nullable dimension replace the ambiguous `default`
+sentinel; the unique key and deterministic ordering use both. After declared predicate order,
+compare binary line ID and binary item ID (NULL first), then selection-presence (absent before
+selected), then raw nullable dimension (NULL before UTF-8 text bytes). Never normalize a selected
+NULL to the literal string `default`. Constraint tests must distinguish
+plan-level/no-selection, selected NULL and literal `default`. This narrowly supersedes the old
+D-159 diagnostic encoding, not Pricing's native selection types or commercial receipt schema.
+
+Only blocking outcomes enter primary Problem selection: first unavailable, otherwise first failed,
+in the existing declared predicate/line/item/selection order. D-189/D-193 missing optional Preview
+term/cycle produces TCV-only unevaluability and successful `tcvWithheld`, while genuinely required
+sellability uncertainty still blocks. Applicability is never inferred solely from the caller or
+provider flag. Business failures and other TCV/forecast failures retain their registered behavior; this exception
+is specifically the agreed optional-context withholding path. The registry determines blocking
+status using operation, applicability, verdict and registered reason together; neither a provider
+flag nor the label `tcv-only`/`preview-forecast` alone can bypass a failed sale check. The complete authorized report retains nonblocking
+results. Unmapped upstream detail never becomes a public reason or response field.
+
+Producer identifiers and evidence persist only under existing diagnostic grants and retention,
+with bounded per-profile field allowlists and no raw payload logging fallback. Public reports
+contain only explicitly authorized registered fields; restricted subresults are not copied wholesale
+into `context.data` or `settled_response`. Store the original public vector, mapping version and
+primary Problem in the settled response, with restricted diagnostic evidence in its scoped store.
+Exact replay uses that settled representation and never remaps old reasons with today's registry;
+diagnostic expiry does not invalidate the independently retained public response.
+
+Acceptance remains authoritative and may still return one refusal after assessment. Its adapter
+uses operation-specific typed commercial reason/resource/category metadata to report only what
+that refusal establishes. For example, `NotSellable` alone proves no particular revision/SKU
+subpredicate, so it cannot generate four failed results or passes for other checks. Preserve the
+assessment as its earlier observation; record the later command refusal through D-188's settlement
+path without rewriting it as a fresh complete assessment. Provider denial stays operator-only
+behind the existing unavailable mapping; buyer authorization is separate (D-194).
+
+### Required implementation and conformance
+
+- [ ] Publish Pricing's immutable assessment profile, authoritative roster/coverage evidence,
+  typed results and shared evaluator; implement and review the Orders mapping registry.
+- [ ] Update gate storage, unique constraints, response serialization and immutable replay with
+  mapping/profile metadata, lossless bounded subresults and collision-free selection identities.
+- [ ] Test one line with two independent failures, a second with unavailable observation and a
+  third with passes; retain every genuine result and choose the deterministic blocking Problem.
+- [ ] Test missing/duplicate/unknown required results, unsupported profiles, malformed envelopes,
+  mismatched observations, false completeness flags and independent partial-line preservation.
+- [ ] Test many owner predicates mapping to one Orders result, null versus literal `default`,
+  randomized response order, optional-context TCV/forecast withholding and required-input fail-closed behavior.
+- [ ] Test public redaction, scoped diagnostic reads, size bounds, retention and exact replay after
+  a mapping upgrade; no raw upstream error or private subresult leaks into persisted public output.
+- [ ] Keep bounded fan-out, queueing and at-most-two-attempt retries inside the original logical
+  deadline; splitting batches never resets it. Exhaustion leaves unavailable evidence, not passes.
+- [ ] Test post-assessment command refusal without synthetic diagnostic expansion or commercial
+  commit; no Preview receipt/hold effects. No runtime implementation is claimed by this decision.
+
+
+<a id="contract-03-revision-reference-protection"></a>
+
+## R10 revision-reference protection and release coordination (D-196)
+
+**Selected Option A (2026-10-05).** Pricing coordinates release of its revision `plan_item`
+references using authorized Orders and Subscriptions usage evidence. Pricing remains the sole
+Products registry owner. Orders neither reserves SKU references nor impersonates that owner;
+D-194 service grants do not confer reference writes. This refines D-164's residual report ask.
+
+**Present implementation versus proposed work.** Products SKU reads and Pricing-owned reference
+reservation/recovery exist. Pricing's new-sale check owns live SKU admission, and its fulfillment
+check rejects retired SKUs while preserving accepted inputs (D-190/D-192). Interim authorized
+Orders SKU reads remain until D-189/D-195 assessment supplies the required results. Deprecation
+and retirement retain distinct rules; an assessment read cannot authorize a commercial write.
+Published/superseded revision references currently remain in place: Pricing D-410 defers their
+retirement/release. Book archival releases entry references only, not those of superseded revisions.
+Thus this decision defines prerequisites for future cleanup, not a claim that unsafe cleanup runs
+on main. Existing conservative retention continues until the prerequisites below are delivered.
+
+### Proposed cross-owner protocol
+
+The following are required semantics, **not existing SDK operations**. Pricing, Orders and
+Subscriptions must agree concrete typed report/closure interfaces, storage, grants and conformance
+before release work can be enabled. No cross-gear database reads or distributed transaction is assumed.
+
+1. **Close admission durably.** Pricing creates a seller/revision-scoped release generation and
+   stops new commercial admission for that revision. Every owner that can introduce a holder must
+   acknowledge that generation through a durable fence. New and resumed Orders final commits,
+   acceptance retries and direct Subscriptions writers cannot introduce unaccounted usage after
+   closure. Merely observing a superseded revision or checking a count does not establish closure.
+2. **Drain earlier work.** Orders accounts for every D-188 preparation that could still commit,
+   including reserved/live attempts and unresolved remote command outcomes, until it is durably
+   rejected/fenced or becomes a recorded committed holder. Reservation alone does not activate
+   anything. A failed/orphan receipt is historical evidence, never activation permission; unresolved
+   execution is conservatively retained until its inability to commit is proven. Lease expiry,
+   idempotency retention expiry or a missing response alone is not that proof. Any permitted
+   pre-closure completion stays represented throughout the drain.
+3. **Report authoritative holders.** Under the acknowledged generation, Orders reports committed
+   nonterminal versions that still require the revision and outstanding preparations/recovery;
+   Subscriptions reports its pending/active or otherwise pinning usage under its own lifetime rules.
+   Evidence is seller/revision scoped, authorized and correlated to the release generation. Exact
+   fields and aggregation are an upstream contract to implement, not inferred from generic list
+   pagination or in-flight cardinality claims. Those claims do not enumerate all commercial usage.
+4. **Transfer without a gap.** Orders retains protection through fulfillment until durable
+   Subscriptions ownership is established and reconciled. Temporary duplicate counting is safe;
+   releasing Orders usage before receiver ownership is durable is not. Cancellation, amendment,
+   failed activation and compensation must settle the actual owner obligations before removal.
+   Historical committed snapshots need retention but are not automatically live holders forever.
+   R12 defines activation/attempt/cardinality fencing; this release protocol depends on its outcome
+   and does not substitute a usage report for activation authority.
+5. **Release only under a valid fence.** Pricing releases its Products references only after all
+   relevant owners acknowledge closure, earlier work is drained and authoritative holder evidence
+   proves zero under that same generation. Missing, partial, stale, denied or unavailable evidence
+   keeps references. Pricing durably records the release decision/work before executing recoverable,
+   idempotent reference release; retries revalidate the decision's fence and cannot attach evidence
+   from another generation. A reopened revision requires a separately agreed safe generation and
+   renewed protection before admission; a released registry receipt cannot simply be revived.
+
+Keeping references prevents ordinary Products retirement (`SKU_REFERENCED`). If a SKU becomes
+retired, D-190 fresh eligibility refusal and failure/compensation handling still apply; no
+force-retire capability is introduced or asserted here. Frozen accepted descriptors,
+price protection and ordinary workflow deadlines are unchanged. No receipt or successful report
+alone authorizes activation. R12 and the Pricing retirement feature remain separate dependencies.
+
+### Required implementation and conformance
+
+- [ ] Agree Pricing/Orders/Subscriptions admission closure, usage evidence, writer inventory and
+  release generation semantics; implement authorized SDKs, durable records and deployed grants.
+- [ ] Integrate D-188 allocation/commit/recovery with revision closure without adding Products writes
+  or rewriting historical orders. Unknown attempts retain protection until reconciled/fenced.
+- [ ] Prove submit/amendment racing closure, a receipt issued before a lost Orders response, late
+  workers after closure, multiple owners and restart during drain/release cannot lose protection.
+- [ ] Prove Orders-to-Subscriptions transfer, cancellation and compensation have no zero-holder gap;
+  stale generations and denied/unavailable/partial reports never authorize release.
+- [ ] Prove book-entry archive does not release revision protection, deprecation does not become
+  retirement, ordinary retirement remains blocked while referenced and duplicate release is safe.
+- [ ] Keep revision-reference release disabled until real-provider conformance passes. These tasks
+  are documentation and implementation dependencies, not delivered runtime capability.
+
+
+<a id="contract-06-activation-admission"></a>
+
+## D-198: Receiver activation admission and effective lifecycle barriers
+
+**R12, selected Option A (2026-10-05).** Extend D-180's in-transaction slot claims into a
+Subscriptions-owned durable admission protocol. Pricing acceptance/hold/live eligibility is
+commercial evidence, never permission to activate a stale order or a revoked Workflow attempt.
+The target protocol below is selected; Subscriptions/Workflow SDKs, migrations, deployed grants,
+peer integration and conformance remain unchecked release prerequisites, not delivered behavior.
+No historical receipt/version is rewritten and no Pricing SDK change is selected here.
+
+### Canonical capacity and asynchronous activation
+
+The selected default scope is `(payer_tenant_id, resource_tenant_id,
+catalog_subscription_product_key, declared_extra_dimensions)`. SUB-G1 owns the canonical key,
+key-schema identity and provenance. SUB-O5 and all receiver writers MUST enforce that same tuple.
+This resolves Q-40's design preference in favor of the resource tenant; producer adoption is
+still pending. Until adoption, Orders interprets legacy per-payer answers exactly as supplied,
+including D-180's interim pending-order accounting; it MUST NOT re-bucket a count by resource.
+Missing or incompatible provenance fails closed. Seller/catalog namespaces must be represented
+by the producer's canonical identity where required, never guessed by Orders from labels.
+
+Subscriptions owns capacity, with one durable slot claim per logical admission on the canonical
+key and a unique live `(key,slot)` constraint. A per-key policy-generation row is locked while
+validating the limit and taking/releasing slots: a CHECK against a caller-stored limit alone
+cannot establish consistent policy across claims. Claims consume capacity from **activation
+intent admission**, before OSS dispatch, through active service or definitively settled abort.
+The same claim changes from pending to active on confirmation; it is not counted twice. An
+unconfirmed timeout never releases capacity. A reduction below occupied capacity blocks new
+admissions, without silently deleting existing claims. Policy-generation updates use the same
+serialization boundary. Lock multiple keys in canonical order for transfers/key changes.
+
+Every path into active or changing its key participates: direct activate, Orders activate,
+resume, transfer and key-altering changePlan. A predecessor/successor exemption is one explicitly
+linked handover, protected against multiple successors consuming the same exemption; its exact
+representation and Catalog/Contract policy conformance remain peer implementation obligations.
+The exemption must preserve the existing predecessor-actually-ended rule, not invent a TTL.
+SUB-O5 exposes active_count and admitted_pending_count (or an equivalent explicit occupied
+capacity field), effective limit, policy/key generation and provenance; the pending count must
+identify/exclude this request's already-reserved admissions to avoid counting them again.
+Drafts without an admission do not consume slots. Orders claims and receiver reservations are
+one logical prospective subscription when provenance proves the same committed order/version/
+line/fulfillment-attempt identity, for this request and every other Orders claim included in the
+same occupancy calculation; deduplicate that exact linkage rather than granting an arbitrary
+exemption. Unmatched or ambiguous provenance must fail closed/conservatively retain occupancy,
+not subtract an assumed duplicate. Orders' diagnostic proposed count counts only
+not-yet-admitted contributions and does not count an already-active line a second time.
+
+Subscriptions activation has two commits (slice 01 §3.6): synchronous intent and later OSS
+confirmation. Each receiver transaction locks the same fulfillment-attempt fence. Intent
+admission validates authority, exact selected committed order/version/line/receipt linkage and
+commercial evidence, takes capacity, and persists idempotent intent/outbox work atomically.
+The confirmation transaction rechecks that fence and intent identity before committing active;
+a revoked/paused generation cannot commit active even when an old OSS success arrives. External
+provisioning already performed under a now-revoked intent is reconciled/compensated, not reported
+as nonexistent. Fresh Pricing eligibility is still an observation at its owner's clock: this
+protocol does not claim global serialization with later catalog changes or silently extend
+D-190/D-191 validity. Their owner rules/deadlines remain independently mandatory.
+
+### Dispatch identity and receiver linearization
+
+**Grant table/writers:** engine-owned `orders_fulfillment_grant`
+(`bss_orders__fulfillment_grant`, contract `cpt-cf-bss-orders-lifecycle-dbtable-fulfillment-grant`)
+has PK grant_id, FK order_id and (order_id,order_version) to the committed version, unique
+(order_id,generation), and immutable fulfillment_attempt_id, generation, roster/receipt digest,
+exact receiver/line/create-key roster, authenticated authority/fact digest, predecessor_grant_id
+(nullable for first spawn), created_at, originating execution_id and originating audit_id (FK to its committed audit entry). Runtime grants allow
+engine INSERT only, no UPDATE/DELETE. Closed receiver ledgers/control evidence supersede authority
+without rewriting this record. The existing spawn request's typed Workflow contribution carries
+attempt identity and exact roster/receiver/create-key facts; the engine verifies them against the
+committed line/receipt inventory and its authenticated caller, never trusting a supplied digest.
+Its committed response/SDK result returns grant_id and generation; same-key replay returns the
+same values. Extending this existing request/result schema is an implementation prerequisite,
+not a new endpoint.
+
+At row 12, under the aggregate lock and before audit/settlement, require no pending control,
+checked-increment fulfillment_control_generation, insert the grant and set spawn_signal_at in
+the same transaction. Rollback removes all three effects; no authority is exposed before commit.
+On row 22 resume to in_fulfillment after a post-spawn hold, the **resume transaction itself**
+checks the settled pause barrier, no pending control and normal resume guards, increments the
+generation and inserts a successor grant tied to the paused attempt/verified immutable roster,
+alongside state/counter/audit/event/idempotency writes. Its authority is visible only after that
+commit. Do not call the write-once report-spawn-signal again or clear spawn_signal_at. A pre-spawn
+resume issues no grant; later first spawn follows row 12. Existing active members remain active,
+not newly provisioned; receiver admission remains idempotent per logical subscription. Fresh
+commercial eligibility is still required before new activation effects. Generation exhaustion
+refuses without a grant. The D-201 internal `replace_fulfillment_grant` continuation below is
+the only additional dispatch-grant writer. No other ordinary transition can insert a grant;
+the D-182 forced exit may fence local control ownership but cannot issue dispatch authority.
+
+<a id="contract-06-replace-fulfillment-grant"></a>
+
+### Internal draft-rebuild continuation (D-201)
+
+Register `replace_fulfillment_grant` as an engine-owned, internal SDK IdempotentWrite, using
+configured Workflow identity plus the existing `order:spawn-signal` PDP action on all tenant
+axes. Its registry operation token is `replace-fulfillment-grant`, in the workflow retention
+class: receipts are retained for at least 30 days ([01 §4.1](DESIGN.md#contract-01-4-1), D-203). It is not a REST endpoint or a new row in the public state machine. Only the engine may
+write its contribution. Request includes expected committed version, predecessor grant ID,
+full old closure/settlement proof, proposed roster, correlation and idempotency identity;
+response returns committed grant ID/generation/predecessor. Schema/SDK delivery is S5-02.
+
+Authorize and resolve owned idempotency before the version/state guards, under the aggregate,
+registry and execution-owner locks. Require current committed version (sparse 4→7 is legal),
+`in_fulfillment`, non-null original spawn signal, no pending control, current predecessor grant,
+closed predecessor generation and authoritative settlement for **every** old create key and
+activation intent. Mere absence, expired leases and a caller's higher generation are not proof.
+Uncertain external effects block replacement. Gather peer evidence outside the SQL lock and
+revalidate its immutable identities/fences at commit; no network call while holding that lock.
+
+Require identical commercial line/receipt membership. Keep completed active members' exact
+subscription/receiver/create/activation identities fixed; they are not dispatched again. Change
+only rebuilt, settled draft members to fresh attempt-specific keys and verified receiver targets.
+Retain full source/wave/kind/rebuild-attempt identity, original roster and predecessor link.
+Checked-increment the aggregate generation exactly once, append immutable grant, advance committed
+audit sequence with internal trigger/reason `replace-fulfillment-grant` (`from_state = to_state =
+in_fulfillment`), link its audit_id, and settle the owned response in one transaction. The grant's
+FK may be deferred within that transaction; rollback removes all effects. Expose authority only
+after commit. Same key/fingerprint replays the same result; changed fingerprint conflicts.
+Use existing canonical authorization/version/idempotency errors, `not-admissible` for a wrong
+state and `spawn-signal-not-recorded` before first spawn. Syntactically invalid input is
+`request-invalid` before engine entry. After authorization/version/state checks, the closed
+internal writer guard order is: pending control → `still-processing`; current predecessor,
+committed source/commercial roster or active-member mismatch → `grant-source-mismatch`;
+missing/incomplete/uncertain predecessor closure → `grant-predecessor-unsettled`; checked
+counter overflow → `grant-generation-exhausted`. These last three are registered business
+refusals and receive ordinary audit/idempotency settlement; none authorizes an alternate grant.
+They are not Workflow acknowledgement failure reasons.
+
+Preserve commercial version, public state, state-entry/hold/fulfillment timestamps, caps and
+spawn_signal_at; emit no new public event. Do not run report-spawn-signal again, replace an old
+row or reopen its generation. Post-spawn resume may append a rebuilt successor in its existing
+transaction with these same closure/roster guards and ordinary resume guards; its audit token
+remains `resume`. A pre-spawn draft rebuild has no grant to replace and cannot invoke this
+continuation; first spawn later binds the current verified roster.
+
+
+The engine's admitted spawn control binds exact committed `order_id`, sparse `order_version`,
+Workflow `fulfillment_attempt_id`, dispatch generation, selected acceptance IDs/digests, canonical
+line roster, and the authenticated authority/tenant axes. The grant is durable before dispatch;
+a current-order read alone cannot produce it. Per-line create/activate keys and target receiver
+identities belong to the immutable roster, including create keys whose subscription IDs are not
+yet known. Ordinary guards/authorization apply. No grant issues for a reserved-only D-188 version.
+A worker restart does not invent a new fulfillment attempt or generation.
+
+Each Subscriptions receiver persists an attempt ledger with immutable grant digest/authority,
+monotonic generation, exact roster and state (open/paused/revoked/settled). Admission, confirmation,
+and pause/revoke commands serialize under its row lock, in a fixed lock order with capacity and
+subscription rows. Exact same-key commands replay; changed payload refuses. A close received
+before open records a tombstone: delayed opening of that generation cannot revive it. Higher
+generations require newly authorized engine grants, never only a larger caller number. Retain
+fence/tombstone evidence beyond possible command redelivery and unresolved outcomes; retention
+must not permit old work to become new. Pricing hold replay never changes this ledger.
+
+The receiver pause/revoke commit is the linearization point for **new receiver effects**. If
+admission/confirmation won first, its outcome belongs to the drain/compensation roster; if pause/
+revoke won, later admission/active confirmation refuses. Neither an Orders read, a lease, nor a
+Workflow checkpoint can substitute for this local transactional fence.
+
+### Staged hold/cancel/failure without new public states
+
+Pre-spawn direct cancel retains the existing Orders aggregate-lock race: cancel first prevents
+spawn; spawn first closes direct cancel. For a post-spawn hold, ordinary compensated cancel or
+ordinary fulfillment-failure terminal, use this engine-owned staged continuation:
+
+1. Authorize the original operation/current and proposed facts and resolve idempotent replay.
+Under aggregate then registry/control locks validate expected version, state and preparation
+guards (original authorization, mandatory reason, admissibility/pre-hold facts and cancel window).
+For staged post-spawn operations only, compensation-complete and receiver-barrier guards are
+**finalization guards**, evaluated after coordination, not prerequisites to beginning it. Public
+request shape/enum validation remains unchanged; typed operational evidence is populated by the
+trusted continuation, never by mutating the original request/fingerprint. Pre-spawn operations
+retain their existing guard sequence. Claim
+execution ownership with the D-188 execution-ID/owner/fencing mechanism and persist immutable
+control intent/receiver inventory; set fulfillment_control_pending and block further grants.
+This is a narrow additional exception to claim-and-settle-in-one-transaction. Public state,
+state_entered_at, pre_hold_state and lifecycle event remain unchanged. A staging record is not a
+committed business audit entry and does not consume a commercial version.
+2. Release SQL locks. Workflow owns receiver fan-out and OSS/provisioning compensation. The
+engine's internal coordination port hands off the durable control intent and receives typed
+receiver evidence; this is no direct Lifecycle provisioning adapter. This narrowly amends
+D-175's no Lifecycle-to-Workflow call rule solely for durable pause/revoke control coordination;
+approval/payment decisions remain adapter-owned inputs, not new synchronous verdict queries. Its authenticated SDK
+plumbing is an implementation prerequisite, not a new public REST endpoint. All callers/recovery
+use the same control identity, immutable roster and command keys.
+3. For hold, pause every receiver generation so no pending intent can newly commit active;
+settle/cancel unresolved provisioning legs as needed to prove that condition. Already-active
+subscriptions continue service/billing and retain their capacity: order hold is not subscription
+suspend. Existing unactivated drafts remain drafts subject to their own TTL. For ordinary
+cancel/failure, revoke all receiver generations, tombstone outstanding create keys, settle every
+ambiguous intent and compensate all applied active effects. Closure must cover **all** roster
+receivers/create keys, including late/unknown create results; a partial acknowledgement is not
+complete evidence. A receiver cannot open additional targets outside the frozen roster.
+4. Barrier evidence identifies control_id, exact order/version/fulfillment attempt/generation,
+roster digest, per-receiver durable fence identity and every target outcome. Receivers attest
+their own closed inventory/late-command fencing; Workflow assembles the evidence. For hold it
+proves no later active confirmation from the paused generation, allowing existing active members;
+for ordinary terminal it also proves no active or unresolved late-applicable member remains.
+Keep the existing five-field compensation evidence public contract; the stronger barrier is a
+separate typed operational contribution, not invented caller text or a new boolean assertion.
+5. Final engine transaction rechecks original authority/facts, expected version/state, operation
+idempotency ownership/fence and exact complete barrier linkage. Run final compensation and
+barrier guards in their declared relative order against the trusted contribution; absence or
+incompleteness keeps coordination pending, not a premature successful terminal. Only then atomically perform the
+original transition, write normal business audit/event/response, clear the pending pointer and
+mark control settled. Concurrent state/control changes cannot reuse stale evidence. Competing
+ordinary control requests return existing still-processing until the owning operation settles;
+no worker bypasses it. Replayed same-key settled responses remain immutable.
+
+**User-visible change:** a post-spawn hold/cancel/failure request is not effective until this
+barrier and final commit complete. While pending, the existing state is returned by reads and
+the operation uses the existing `still-processing` contract without settling its owning key as a
+terminal refusal; do not add a 202 convention, public
+state or endpoint. No premature OrderHeld/OrderCancelled is emitted. The original immutable
+request is retried/recovered until settled. Resume of a fulfillment hold, after normal authority,
+version and cap guards, commits the existing resume transition and may issue a **new** authorized
+dispatch generation only after that commit. Old paused grants remain fenced; existing active
+subscriptions are unchanged. New work still requires fresh commercial eligibility.
+
+Failed final authorization/version checks cannot discard an installed receiver fence or silently
+reopen it. The control is terminally refused/abandoned with operational evidence; receiver work
+stays paused/revoked. In that same terminal-control transaction conditionally clear
+fulfillment_control_pending **only if it still equals this control_id**, under aggregate and
+registry/control locks. Force-fail supersession atomically abandons/fences the old control and
+clears its matching pointer likewise. A stale worker cannot clear a newer control pointer.
+Clearing this local bookkeeping never reopens a receiver generation or erases grant/fence
+evidence; new grants still require the separately authorized spawn/resume or D-201 rebuild writer above. Recovery may issue fresh grants only through a newly authorized current
+operation. Availability failures keep it pending. Lost final commit responses are resolved from
+idempotency/control settlement before retry; no success or capacity release is inferred from a
+timeout. A late command/confirmation is replayed or reconciled by its existing identity.
+
+**D-182 explicit exception:** two-person `force-fail-unreconciled` may commit fulfillment_failed
+with unknown compensation without successful receiver barrier, including when a staged ordinary
+control cannot finish. It fences/abandons any superseded local control and records a durable
+revocation request, prevents new engine grants, preserves unresolved receiver claims/identities
+and continues reconciliation. It does **not** assert no-late-activation/no-active-subscription,
+release uncertain capacity, erase receiver inventory, or reinterpret unknown as compensated.
+Late external outcomes can still need reconciliation under that exceptional terminal. This is
+not the ordinary cancel/failure success contract, and its existing operator alert remains required.
+Expiry remains barred for fulfillment and holds from fulfillment; no hidden TTL revokes a live
+receiver claim. Pre-fulfillment expiry has no opened activation grant to drain.
+
+### Engine persistence and recovery
+
+**Table contract:** `cpt-cf-bss-orders-lifecycle-dbtable-fulfillment-control`. Add engine-owned `orders_fulfillment_control` (`bss_orders__fulfillment_control`), PK control_id,
+FK order_id; unique idempotency execution_id; immutable operation/fingerprint, expected version,
+fulfillment_attempt_id/generation, original actor/proof/fact fingerprint, exact receiver/line/
+create-key roster and digest, and created_at. Operational columns are status (prepared, awaiting,
+barrier_ready, settled, refused, abandoned), owner token/fencing generation/lease, per-receiver
+command IDs and immutable first outcomes/evidence, error classification and terminal_at. Index
+(status, lease_until, control_id) supports bounded recovery. A partial unique constraint allows
+only one nonterminal control per order; force-fail supersession is atomic under the aggregate
+lock. Engine runtime alone may INSERT and conditionally UPDATE operational columns; no input
+rewrite or DELETE grant, no slice/provisioner writer. Readers cannot treat it as commercial
+history. Retain linked evidence/claims while outcomes are unresolved; standard 24-hour response
+retention cannot erase a pending control or permit a reused client key to adopt its generation.
+
+The existing idempotency maintenance worker continues bounded control recovery, using its
+existing batch/cadence and cancellation support; Workflow's own coordinator performs remote
+work. There is no sixth Orders worker, SQL lock across a network call, or direct topology write.
+Owner lease reclaim preserves immutable operation/generation and increments fencing identity;
+own live markers are recognized on both successful and unavailable-input branches. Stale worker
+results cannot settle. Canonical limit/exhaustion failures precede any new grant; generations
+never wrap. Persist backlog/oldest-age, unresolved capacity, incomplete barriers and compensation
+failures for existing monitoring/escalation. SDK adapters, migrations and tests remain work items.
+
+### Required evidence before production
+
+- Concurrent activate/direct/resume/transfer/changePlan with limit 1 and N cannot over-admit.
+- Pending OSS intents consume capacity; delayed/lost confirmation never frees their claim.
+- Exact resource-dimensional scope, legacy per-payer refusal and policy-generation change are tested.
+- Pause/revoke before open leaves a tombstone; delayed open and higher unauthorized generation refuse.
+- Admission/confirmation versus pause/revoke has one receiver winner; losing late OSS effects reconcile.
+- Post-spawn hold emits no effective state/event until every receiver barrier is verified; existing
+  active subscriptions remain unchanged. Resume cannot replay an old dispatch grant.
+- Partial receiver acknowledgements and unknown create IDs cannot settle an ordinary terminal.
+- Duplicate commands, changed same-key payload, lost responses and restarts preserve one result.
+- Final authorization/version change refuses stale control completion and cannot reopen receiver work.
+- D-182 unknown forced exit retains uncertainty and claims; no false successful compensation.
+- Selected committed receipt/version/attempt mismatch, cross-tenant grant and reserved-only candidate refuse.
+- Supersedes exemption cannot admit multiple unbounded successors.
+
+Primary engineering basis: [PostgreSQL row locking](https://www.postgresql.org/docs/current/explicit-locking.html)
+and [serializable isolation](https://www.postgresql.org/docs/current/transaction-iso.html) provide local
+transaction boundaries; [sagas](https://microservices.io/patterns/data/saga.html) require explicit
+compensation/isolation controls. Local precedents are [ADR-0007](ADR/0007-cpt-cf-bss-orders-lifecycle-adr-in-transaction-concurrency.md),
+[Subscriptions async foundation](../../subscriptions/docs/design/01-foundation-lifecycle.md),
+and [coord's external-effect limitations](../../libs/coord/README.md). These support the design,
+not a claim that missing peer runtime has been implemented.
+
+<a id="contract-05-commercial-owner-readiness"></a>
+
+### Commercial prerequisites: owner contracts and delivery evidence (D-199)
+
+**R13 Option A:** implement the owning APIs and enable each affected production path only when
+its required providers, grants and real-provider conformance are delivered. Orders does not
+replace missing owner facts with caller assertions, local policy or successful test doubles.
+This selects the implementation target; it does not claim these providers exist or that their
+owners have signed off. The [upstream register](UPSTREAM_REQS.md) remains the delivery ledger.
+
+| Owner | Existing capability | Missing requirement / authority |
+|---|---|---|
+| Account Management | Authorized tenant and metadata reads | Payer profile with currency, region, named-seller relationship and version/provenance; generic metadata is not that schema |
+| Account Management / PDP | Platform authentication and authorization machinery | Verifiable delegated actor/resource/payer authority, credential issuer/audience/scope/validity/revocation contract and PDP missing/invalid reasons; D-194 service authentication alone is not delegation |
+| Contracts | Specification, no runtime SDK/provider | Batched contract status, party eligibility/reason, effective instant/version and acceptance-required declaration for the referenced contract |
+| Payments | Ledger records/allocates payments; platform admission policy exists | Neither supplies payment authorization: idempotent authorize/read-by-request with authorized, pending and failed outcomes, amount/postpaid policy provenance |
+| Orders Workflow | Specification; BSS Approvals forwards source-owned inbox/vote operations | Order approval requirement/routing, version-bound verdicts, amendment supersession and durable authorization/fulfillment orchestration |
+
+Each required provider entry must record its versioned SDK/schema, configured implementation,
+authenticated principal and scoped grants, supported commercial scope, authoritative evidence
+identity, freshness/expiry rule, conformance run and affected operation. These are unchecked
+release criteria until actual evidence exists. A legitimately absent optional contract is not
+applicable; an unavailable referenced contract is not. Scope reduction requires an explicit
+product contract, not runtime fallback. Required unavailable or unauthorized answers retain the
+existing unavailable/denial reason taxonomy; business refusals remain distinguishable.
+
+Pricing acceptance freezes the commercial offer; Lifecycle customer acceptance records party
+consent for the current version; Workflow approval records an authorized policy decision for
+that version. None satisfies either of the others. D-175 remains in force: Lifecycle consumes
+Workflow's adapter-owned verdict/authorization inputs, with the authorized Workflow principal
+and current-version guards; it does not add a direct approval/payment provider query or treat
+those inputs as provider-verified receipts. Workflow must obtain them from the real authorities.
+
+Payer market comes from the authoritative profile, never the buyer's request. Delegation is
+verified by PDP, not Orders. Contracts' acceptance-required declaration remains live at
+acceptance-recording and begin-fulfillment (D-107/D-132); an earlier snapshot cannot suppress a
+changed requirement. Prior-version consent/approval cannot satisfy the current version.
+
+Payments request identity binds Workflow intent, order/version, payer, currency and authorized
+amount or explicit postpaid policy. Amount/provenance is specified separately from TCV; TCV is
+not the payment authorization amount. Workflow retains request identity and reads/retries the
+same request after ambiguous replies or restart; changed context needs the owner's replacement
+protocol. Pending recovery is durable and bounded under Workflow's selected execution platform.
+`pending` is neither authorized nor failed. Provider outage is not conclusive failure and cannot
+trigger tolerate-payment-failure. Only Lifecycle evaluates that policy after Workflow supplies
+a conclusive failed outcome; the policy cannot substitute for a missing Payments provider.
+
+Pending evidence for the configured production scopes:
+
+- [ ] Real payer-profile and relationship results, foreign-axis denial, stale evidence rules, and missing/invalid delegation are tested with provisioned principals/grants.
+- [ ] Inactive/ineligible contracts, outage, and live acceptance-required changes produce distinct outcomes; no default-election fallback for unavailable referenced contracts.
+- [ ] Pricing receipt, customer consent and policy approval are independently required where applicable; amendment invalidates old-version consent/verdicts.
+- [ ] Lost/pending payment replies recover the same request across restart; failure, outage and pending never collapse, and amounts are independently sourced.
+- [ ] Workflow amendment reapproval, committed spawn-signal recovery, exact current-version line roster, overdue handling and superseded-work cancellation pass actual-provider integration.
+
+BSS Approvals may serve a UI source adapter after the order owner contracts exist; its present
+Pricing/Products inbox does not supply order policy. Reciprocal Workflow amendments remain
+tracked delivery work, not implied by this decision.
+
+
+<a id="contract-01-event-platform-integration"></a>
+
+## R14 existing Event Broker integration and release evidence (D-200)
+
+**Selected Option A (2026-10-05).** Use the existing Event Broker `EventBrokerApi`, managed
+`DbProducer` and toolkit transactional outbox. Do not create an Orders relay, bypass the producer
+with a direct publish after commit, or treat source availability as production readiness. This
+corrects stale SDK-only and cursor-retry defect descriptions while preserving D-186 consumer
+conformance and the existing recovery, authorization and observability release requirements.
+
+### Existing capabilities and Orders work
+
+| Boundary | Present code | Required integration/evidence |
+|---|---|---|
+| Broker provider | Event Broker implementation; `LocalBroker` registered as `EventBrokerApi` by its module | Enable the intended deployment, resolve the actual ClientHub provider, and validate configured topic partitions before readiness |
+| Transactional producer | `ProducerOutbox::enqueue` / `enqueue_batch` accepts a scoped DB runner and returns `Wake`; managed Chained sequencing and toolkit leased workers exist | Enqueue through the same transaction as order/audit/idempotency changes; fire Wake only after commit, discard it on rollback/retry. No network publish inside the commercial transaction |
+| Schemas and routing | SDK typed events and eager preparation exist | Register order subject, abstract order-event base, eleven final event types and topic. Prepare before transactions/readiness; source is `bss-orders-lifecycle`, subject/routing derives from order UUID, not root tenant |
+| Initial cursor recovery | Transient transport/rate-limit failures already return Retry (`c7de7b80ae`) | Verify deployed revision and explicit empty-cache transient regression; retain message/event ID and cursor on retry. Permanent rejection remains distinct |
+| Event tenancy | Typed envelope tenant is retained; broker ingest authorizes that explicit tenant | Resolve canonical platform-root UUID from an authoritative source and provision least-privilege producer/consumer grants; prove denial/isolation. Root event access never grants business Orders access |
+| Producer dead letters | Toolkit persists, lists and claims rejected messages; consumer DLQ helpers also exist | Supported producer republication after chain advancement plus authenticated shared operator recovery remain open; claiming is not republication, and consumer DLQ support does not close the producer gap |
+| Consumption and monitoring | Platform transport and toolkit operational facilities exist | Consumer-owned deduplication/fresh-read effects and golden-corpus signoff; prove required queue age/retry/dead-letter monitoring and acceptance latency, not just worker statistics |
+
+All eleven schemas preserve bounded payloads and immutable version references under D-192;
+commercial envelopes stay behind authorized reads. The existing 64 KiB envelope and maximum-order
+capacity checks apply. Schema registration, partition configuration and grants are runtime
+prerequisites, not substitutes for business authorization. Failed readiness does not discard
+already committed queue work. Graceful shutdown and takeover use library-managed workers.
+
+There is one local producer message per committed event-producing transition; delivery remains
+at least once. Stable event identity, broker duplicate handling and D-186 consumer deduplication
+are required. Broker acceptance, backend persistence and downstream consumer completion are
+separate outcomes: LocalBroker does not claim synchronous persistence from its publish path.
+Do not mark a consumer effect complete merely because the broker accepted the event.
+
+Producer recovery preserves original event ID and business payload, works after the producer
+chain has advanced, and resolves the dead letter only after broker acknowledgement. A failed
+resolution after successful publication must permit safe repeat/concurrent recovery. It must not
+rerun an Orders transition or change a completed order. Retain the existing platform SDK/operator
+recovery prerequisite until implementation, scoped authorization, audit and runbook evidence exist.
+No private manipulation of toolkit tables or undocumented envelope sequencing is authorized.
+
+### Implementation and release checklist
+
+- [ ] Wire the real provider, platform migrations, managed producer registration, all eleven
+  schemas, root identity/grants and declared partition count; verify readiness/shutdown/restart.
+- [ ] Implement same-transaction enqueue and post-commit Wake; prove rollback/retried transaction
+  behavior and maximum envelope sizes without creating duplicate business effects.
+- [ ] Test broker acceptance with lost response, accepted/duplicate replay, restart/takeover,
+  empty-cache cursor transport/rate-limit retry and permanent rejection against the actual path.
+- [ ] Deliver supported producer republication and shared authorized recovery tooling; test stable
+  IDs/payloads, advanced chains, interrupted resolution, concurrent recovery, audit and denial.
+- [ ] Verify explicit root tenancy survives enqueue/recovery/delivery, order-based routing is stable,
+  and root-event grants cannot bypass target-order authorization.
+- [ ] Pass D-186 real consumer conformance and prove outage/backlog/retry/dead-letter alerts and
+  commit-to-broker-acceptance measurement. Record deployed revisions, grants, runbook and evidence.
+
+Reference source: [broker implementation](../../../system/event-broker/event-broker/src/lib.rs),
+[producer outbox](../../../system/event-broker/event-broker-sdk/src/producer/outbox.rs),
+[SDK producer tests](../../../system/event-broker/event-broker-sdk/tests/producer/outbox.rs),
+[toolkit dead-letter contract](../../../../libs/toolkit-db/src/outbox/mod.rs).
+The local [Pricing transaction integration](../../pricing/pricing/src/infra/events.rs) already
+defers its wake until commit. These source references are capability evidence; no tests or
+production deployment are claimed by this documentation decision.
+
+
+<a id="contract-06-activation-clocks"></a>
+
+## Asynchronous activation clocks (D-201)
+
+Keep the quoted order date, Pricing `FulfilmentQuery.activation_at` / `HeldBindings.activation_at`,
+receiver `activation_intent_at`, actual `service_effective_at`, and customer acceptance instant
+separate. Pricing's activation_at is business time, not a server clock. Its first hold freezes
+that exact value and bindings; retries/new keys cannot change it. The receiver records the
+intent commit instant; the request must not predict a future OSS confirmation instant.
+
+An authenticated applied OSS outcome supplies the actual service-effective instant, persisted
+with its transition-request identity when the receiver commits active. This is neither the
+intent admission clock nor necessarily the time a delayed confirmation is processed. A pending,
+failed or OSS-unconfirmed intent cannot set serviceActivatedAt or report an activated line.
+Contract-effective and customer-acceptance clocks retain their existing owner semantics.
+
+Before admission, verify the exact held activation identity and receipt BillingTerms digest,
+including selected period/anchor geometry. A receiver/Rating profile must explicitly support
+the distinction between frozen commercial anchors and an asynchronously applied service instant.
+The observed actual instant may differ only when that profile preserves **all** accepted terms
+and anchor geometry and never backdates service, billing coverage or entitlement before actual
+activation. Partial-period geometry must be supported by both Subscriptions and Rating. Confirm that compatibility before committing the applied transition; an
+unknown profile or required anchor/term change is incompatible. Retain uncertain capacity and
+external effects for reconciliation/compensation, rather than reporting activation or rewriting
+accepted anchors. A required commercial change needs a newly accepted order execution; no
+hold retry, latest-price fallback or retrospective quote rewrite can supply it. This contract
+adds no capability to the existing Pricing SDK. Owner SDK types and integration tests remain
+S5-02/05/07 and Rating work; unsupported profiles remain disabled.

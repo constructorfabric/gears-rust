@@ -1,0 +1,66 @@
+# Orders Lifecycle crate-local Clippy configuration (D-184).
+# Clippy reads the nearest clippy.toml and does not merge, so this file carries the whole
+# workspace configuration verbatim and adds the AccessScope::allow_all entry. Keep it in sync
+# with the workspace file; the source-scan test in the runtime crate fails on drift.
+# Clippy configuration for CF/Gears
+avoid-breaking-exported-api = false
+
+check-inconsistent-struct-field-initializers = true
+
+lint-commented-code = true
+
+#
+# Workspace-level lints are configured in Cargo.toml [workspace.lints.clippy]:
+#
+# The rules below enforce secure ORM usage and help prevent accidental
+# bypasses of the secure ORM layer by disallowing direct execution of
+# SeaORM queries without scoping.
+
+# Disallow direct execution methods that bypass secure wrappers
+disallowed-methods = [
+    # Select operations - must use SecureSelect
+    { path = "sea_orm::Select::all", reason = "Use SecureSelect::all() after .secure().scope_with()" },
+    { path = "sea_orm::Select::one", reason = "Use SecureSelect::one() after .secure().scope_with()" },
+    { path = "sea_orm::Select::count", reason = "Use SecureSelect::count() after .secure().scope_with()", allow-invalid = true },
+
+    # Update operations - must use SecureUpdateMany
+    { path = "sea_orm::UpdateMany::exec", reason = "Use SecureUpdateMany::exec() after .secure().scope_with()" },
+
+    # Delete operations - must use SecureDeleteMany
+    { path = "sea_orm::DeleteMany::exec", reason = "Use SecureDeleteMany::exec() after .secure().scope_with()" },
+
+    # D-184: allow_all only inside the read-only maintenance DiscoveryScope constructor.
+    { path = "toolkit_security::access_scope::AccessScope::allow_all", reason = "D-184: use a PDP-derived scope or the maintenance DiscoveryScope/TargetScope" },
+]
+
+# Note: To enable these checks in a crate, add to the crate root:
+# #![deny(clippy::disallowed_methods)]
+#
+# Or enable warnings instead:
+# #![warn(clippy::disallowed_methods)]
+
+# Type complexity threshold (default is 250)
+type-complexity-threshold = 190
+# Cognitive complexity threshold (default is 25)
+cognitive-complexity-threshold = 20
+
+# Function length threshold (default is 100)
+too-many-lines-threshold = 200
+
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+
+# Stricter thresholds for LLM-generated code
+single-char-binding-names-threshold = 4
+large-error-threshold = 128
+
+# Stack size limits
+stack-size-threshold = 512000
+
+# Struct field limits
+max-struct-bools = 2
+
+# Disallowed types (prevent common LLM mistakes)
+disallowed-types = [
+    { path = "std::collections::LinkedList", reason = "Use Vec instead - LinkedList has poor cache locality" },
+]

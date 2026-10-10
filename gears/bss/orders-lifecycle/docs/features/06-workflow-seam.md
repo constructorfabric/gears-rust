@@ -63,7 +63,7 @@ Receive approval verdicts and fulfillment outcomes through five ordinary guarded
 - **Dependencies**: [Foundation](01-foundation.md), [Gate and Pin](03-gate-and-pin.md), [Preconditions](05-preconditions.md).
 - **Related features**: [Versioning](04-versioning.md), [Hold and Expiry](07-hold-and-expiry.md), [Read and Authorization](08-read-and-authz.md).
 
-The detailed design remains authoritative for schemas and API contracts. [UPSTREAM_REQS.md](../UPSTREAM_REQS.md) retains missing approval ownership, amendment-verdict behavior, activation re-check SDKs, atomic overlap admission, actual subscription start instant, progress integration, compensation reason, reverse provenance and correlation asks. The forked `SUB-O*` numbering and Workflow PRD's post-acceptance cancellation wording still require reconciliation; this feature does not declare them resolved.
+The detailed design remains authoritative for schemas and API contracts. [UPSTREAM_REQS.md](../UPSTREAM_REQS.md) retains missing approval ownership, amendment-verdict behavior, activation re-check SDKs, atomic overlap admission, actual subscription start instant, progress integration, compensation reason, reverse provenance and correlation asks. D-201 reconciles historical aliases and pause/revoke wording locally; owner SDK delivery remains open.
 
 **Workflow as an event consumer (D-186).** Workflow is triggered by nine Orders events (W/design/10:274-276) and is bound, as every consumer is, by the [event consumer contract](../DESIGN.md#contract-01-event-consumer-contract): de-duplicate by event ID in its own processed-event store (C1), read `get_version` and the current-order `get` before reflecting a verdict, beginning fulfillment, acknowledging or cancelling (C2), treat unknown `state` and event-type values as not acted on (C3), never rebuild order state from the stream (C4), and keep a trigger durably pending with bounded retry and escalation when that read is unavailable or denied (C5). Its seam calls already carry `expected_version`, so a stale trigger that slips past C2 still refuses `version-conflict` (§6); the read is not a lock. Workflow declares its per-event applicability rule (for example, a current read of `on_hold` defers dispatch rather than retiring it) as the corpus case parameters.
 
@@ -99,7 +99,7 @@ All five operations use `/bss-orders-lifecycle/v1/orders/{orderId}` and require 
 3. [ ] Workflow executes Gate and Pin's activation re-check through owning SDKs using stored overlap keys, market and payer exposed by the composed read. Apply §3.2's four outcomes.
 4. [ ] Only on `proceed`, call `POST /spawn-signal` and wait for confirmed durable admission before dispatching the first activation intent.
 5. [ ] On timeout, resolve/replay the same key until admission is known. A crash after signal admission leaves the fence durable; Workflow reconciles its own dispatch checkpoint.
-6. [ ] Dispatch activation with actual activation instant as subscription start; quoted requested dates travel separately and never backdate billing or entitlement. Downstream enforcement remains the open `SUB-O10` dependency.
+6. [ ] Bind dispatch to the durable exact committed version/roster and Workflow attempt/generation; Subscriptions reserves capacity at intent admission and rechecks the same receiver fence at OSS confirmation under [D-198](../DESIGN.md#contract-06-activation-admission). Dispatch with distinct quoted date, immutable held activation identity and receiver-recorded intent instant; the authoritative applied outcome supplies actual service start (D-201). Never predict a future confirmation or backdate coverage. Downstream implementation remains the `SUB-O10` dependency.
 
 **Success**: Activation follows both committed begin-fulfillment and spawn fence. **Errors**: Refused begin, held/cancelled spawn, unresolved timeout or a non-proceed re-check never authorizes dispatch.
 
@@ -122,7 +122,7 @@ All five operations use `/bss-orders-lifecycle/v1/orders/{orderId}` and require 
 **Actor**: Orders Workflow.
 
 1. [ ] Complete operational compensation, including voiding wave-1 drafts where no activation was dispatched.
-2. [ ] Call `POST /workflow-cancel` with mandatory cancel reason, evidence, version, key and correlation. Evidence is required before the spawn signal as well as after it.
+2. [ ] First revoke the receiver attempt and settle its entire frozen inventory under [D-198](../DESIGN.md#contract-06-activation-admission); no delayed create/activation may remain applicable. Carry exact typed barrier evidence separately from public compensation evidence. Call `POST /workflow-cancel` with mandatory cancel reason, evidence, version, key and correlation. Evidence is required before the spawn signal as well as after it.
 3. [ ] After engine authorization, expected-version and admissibility checks, evaluate registered guards in source order: mandatory cancel reason, pre-hold state, compensation evidence, then the shared cancel-window guard (§3.5). Preserve that refusal precedence.
 4. [ ] Commit `cancelled`, evidence, caller reason, audit and `OrderCancelled` atomically. Keep the spawn signal permanently recorded.
 
@@ -158,7 +158,7 @@ Map `required`, `not_required`, `granted`, `denied` to `reflect-approval-require
 
 3. [ ] For `report-spawn-signal`, register a null-signal guard (`spawn-signal-already-recorded`) and request engine row 12. Write server report instant once; enqueue no event for this state-only row.
 4. [ ] Serialize signal and direct cancel through the same aggregate transaction. If cancel commits first, signal refuses and no activation dispatches. If signal commits first, direct cancel refuses and Workflow uses compensation and mediated cancel.
-5. [ ] Preserve same-key signal replay as the original outcome; only a different-key second report reaches the already-recorded guard. Handle downstream `overlap-collision` even after a successful early re-check through the failure/compensation path.
+5. [ ] Signal admission grants the exact roster/attempt/generation, not reusable authority to activate after a pause/revoke. Every receiver admission/confirmation validates its local transactional fence and selected committed receipt. Preserve same-key signal replay as the original outcome; only a different-key second report reaches the already-recorded guard. Handle downstream `overlap-collision` even after a successful early re-check through the failure/compensation path.
 
 ### 3.3 Validate completed acknowledgement
 
@@ -181,9 +181,9 @@ Map `required`, `not_required`, `granted`, `denied` to `reflect-approval-require
 
 **Output**: Validated terminal contribution, plus acknowledgement projection only for acknowledgement requests, or ordered refusal; invalid boundary values are rejected before engine entry.
 
-1. [ ] At boundary validation, reject unknown failure-reason values or any failure reason on a completed outcome as `request-invalid`, unaudited and before authorization. Permit exactly `market-divergence`, `overlap-collision`, `identity-party-unavailable`, `overlap-presence-unevaluable`, `line-execution-failed`, `dependency-graph-invalid`; the last two are received outcomes, not Lifecycle refusal reasons, and `dependency-graph-invalid` is accepted for replay only (D-172). `operator-forced-unreconciled` is in the closed set but is written only by `force-fail-unreconciled`; on this boundary it is `request-invalid` (D-182).
+1. [ ] At boundary validation, reject unknown failure-reason values or any failure reason on a completed outcome as `request-invalid`, unaudited and before authorization. Permit exactly `market-divergence`, `order-binding-expired`, `overlap-collision`, `identity-party-unavailable`, `overlap-presence-unevaluable`, `line-execution-failed`, `dependency-graph-invalid`; the last two are received outcomes, not Lifecycle refusal reasons, and `dependency-graph-invalid` is accepted for replay only (D-172). `operator-forced-unreconciled` is in the closed set but is written only by `force-fail-unreconciled`; on this boundary it is `request-invalid` (D-182).
 2. [ ] After engine authorization, expected-version and admissibility checks, evaluate failed-acknowledgement guards in this order: failure reason present (`failure-reason-missing`), compensation evidence present, evidence valid, then—if held—stored pre-hold state is `in_fulfillment` (`prehold-not-in-fulfillment`). The workflow-cancel guard order is separately defined in §2.4.
-3. [ ] For failed acknowledgement and every workflow cancel, refuse absent evidence with `compensation-evidence-missing`. Validate the closed five-member schema: `drafts_voided`, `activated_rolled_back`, `activation_dispatched`, `at_sale_facts_emitted`, `no_active_subscription_remains`.
+3. [ ] For ordinary post-spawn failed acknowledgement and workflow cancel, require the complete D-198 receiver revoke/drain barrier before final public transition; D-182 forced unknown failure is separate. For failed acknowledgement and every workflow cancel, refuse absent evidence with `compensation-evidence-missing`. Validate the closed five-member schema: `drafts_voided`, `activated_rolled_back`, `activation_dispatched`, `at_sale_facts_emitted`, `no_active_subscription_remains`.
 4. [ ] Require the final assertion true; schema-invalid, false or `unknown` evidence, and any `operator_attestation` member, refuse `compensation-evidence-incomplete`, so the forced variant of D-182 can never enter through this seam. Empty lists are valid. Lifecycle validates structure and asserted fact only, never reconciles the lists through Subscriptions calls.
 5. [ ] Store evidence on the aggregate and audit; failure/cancel caller reasons remain `caller_reason`, separate from registered machine `reason`. Wait for no Billing credit note.
 6. [ ] Build `created`, `activated`, `failed` line projection data only from acknowledgements. No guard reads it, no order state derives from it, and transition-request references are opaque joins. Before acknowledgement, absence means “not acknowledged”; live progress remains Workflow's read surface.
@@ -355,13 +355,13 @@ contributes the risk flag only when those guards admitted a tolerated failure.
 
 **Algorithm: Report Spawn Signal**
 
-Input: order_id, expected_version, idempotency_key, correlation_id
-Output: the recorded spawn-signal instant, or a registered refusal
+Input: order_id, expected_version, idempotency_key, correlation_id, typed fulfillment-attempt and receiver/line/create-key contribution (D-198)
+Output: the recorded spawn-signal instant, grant_id and generation, or a registered refusal
 
 1. [ ] - `p1` - Declare the guards the engine evaluates and audits: the caller is the configured Workflow `service` principal, settled by the engine's authorization pre-guard ([08 §4.3](../DESIGN.md#contract-08-4-3), D-115); expected_version current — `version-conflict`, checked ahead of the row lookup for this workflow-class trigger ([01 §4.1](../DESIGN.md#contract-01-4-1), D-110); and **`orders_order.spawn_signal_at` IS NULL** (`spawn-signal-already-recorded`) - `inst-ss-declare-guards`
 2. [ ] - `p1` - Set the **trigger** to `report-spawn-signal` ([01 §4.3](01-foundation.md#contract-01-4-3) row 12, `in_fulfillment → in_fulfillment`). A held, cancelled or otherwise non-`in_fulfillment` order has no row for this trigger and receives the engine's state-table refusal `not-admissible` (or `version-conflict` first where its version is also stale); this slice adds no state check of its own - `inst-ss-set-trigger`
-3. [ ] - `p1` - Request the spawn-signal transition with correlation_id; the engine sets `spawn_signal_at` to the server-recorded report instant, audits and commits before it returns - `inst-ss-request-transition`
-4. [ ] - `p1` - **RETURN** the recorded instant - `inst-ss-return`
+3. [ ] - `p1` - Request the spawn-signal transition with correlation_id and the D-198 typed attempt/receiver/line/create-key contribution; the engine verifies the committed receipt roster and no pending control, increments the dispatch generation, inserts immutable orders_fulfillment_grant and sets spawn_signal_at atomically with audit/idempotency. Return grant_id/generation only after commit; exact replay returns the same grant - `inst-ss-request-transition`
+4. [ ] - `p1` - **RETURN** the recorded instant, grant_id and generation from the committed response - `inst-ss-return`
 
 **Description**: A replay with the same idempotency key returns the stored outcome under the
 engine's idempotency contract and never reaches the already-recorded guard, so a Workflow retry
@@ -581,16 +581,14 @@ bypass Orders (direct subscriptions, `resume`, `transfer`, key-altering `changeP
 the wave and only Subscriptions' active commit can refuse them. The submit/activation path is not
 production-ready until `…-upreq-overlap-activation-atomicity` is agreed and delivered (D-180).
 
-**The activation intent carries the start instant.** Each activation intent **MUST** carry the
-**actual activation instant** as the spawned subscription's start, and **MUST NOT** derive that
-start from any date carried on the order. Where the two-phase barrier defers a line past its
-quoted service-activation date, the quoted date travels separately as the *requested* date and
-the subscription's start is the instant activation actually occurred — billing and entitlement
-**MUST NOT** be backdated to the earlier quoted date ([`../PRD.md`](../PRD.md) §6.1, §12 AC 8g).
-This gear cannot enforce it alone, because Subscriptions owns the start: the obligation is raised
-as [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) `…-upreq-subscription-start-instant` (**`SUB-O10`**),
-and until it lands the requirement is stated here and unenforceable from this side
-([`../DECISIONS.md`](../DECISIONS.md) D-56).
+**The activation clocks are distinct (D-201).** The intent carries quoted date and exact held
+Pricing activation identity; the receiver records its intent commit instant. Only an authoritative
+applied OSS outcome supplies actual service start, persisted at active-state commit. Follow the
+[clock/accepted-terms compatibility contract](../DESIGN.md#contract-06-activation-clocks).
+Billing and entitlement cannot precede actual service activation, and a differing actual instant
+cannot silently move the frozen BillingTerms anchor. Unsupported geometry stays unresolved for
+reconciliation/new acceptance. `SUB-O10` is preserved as historical provenance for the receiver
+obligation; no deployed implementation is claimed.
 
 The signal is **written once and never cleared**. The previous rule cleared it on a
 workflow-mediated cancel "so a subsequent attempt re-closes the window" — but that cancel lands in
@@ -640,13 +638,25 @@ signal as after it (D-134).
 | Value | Raised when |
 |-------|-------------|
 | `market-divergence` | the activation re-check returned `reject` for a line's market ([03 §3.6](03-gate-and-pin.md#contract-03-3-6)) |
-| `order-binding-expired` | An accepted binding expired before initial activation (the local deadline elapsed), or Subscriptions refused the activation-time pinned comparison (`accepted-price-mismatch`: a consumed slot's price moved); Workflow stops dispatch and compensates all created subscriptions before reporting. No renewal/reprice fallback; 03 §4.3, D-162. |
+| `order-binding-expired` | Confirmed expiry or explicit closure/temporary end before initial activation under Pricing's fresh check. Market changes retain `market-divergence`; retirement alone is not expiry; use the explicit mapping below for retirement and term/identity mismatch. A normal successor price change is not this refusal. D-191 copies the selected receipt deadline verbatim; provider outages, authorization failures and corrupt/mismatched evidence must not be blanket-mapped here. Workflow stops dispatch and compensates created subscriptions before reporting. No renewal/reprice fallback; 03 §4.3, D-190. |
 | `overlap-collision` | the re-check returned `reject` for an overlap collision, or Subscriptions raised one after the re-check (§4.3) |
 | `identity-party-unavailable` | a re-check `defer` on the identity port (whose unavailable reason is `identity-party-unavailable`) exhausted `activation-recheck-retry-budget` (D-127) |
 | `overlap-presence-unevaluable` | a re-check `defer` on the overlap-occupancy port exhausted the same budget (D-127) |
 | `line-execution-failed` | a line's provisioning failed and Workflow's remediation was exhausted or its fail-fast policy applied |
 | `dependency-graph-invalid` | **Withdrawn as an emitted value (D-172):** Workflow D-196 removed the plan dependency graph; retained in the closed set so replayed historical payloads still validate, never emitted by the current Workflow design |
 | `operator-forced-unreconciled` | **Not a Workflow value (D-182):** fixed by `force-fail-unreconciled` (Foundation rows 28/29) when two fulfillment operators close an overdue post-spawn order whose compensation is unknown; never accepted on `/fulfillment-acknowledgement`. A consumer **MUST NOT** read it as compensated |
+
+**D-201 receiver error mapping:** a verified Pricing expiry, explicit closure or temporary end
+maps to `order-binding-expired`; verified market divergence maps to `market-divergence`.
+Retirement alone, digest/identity mismatch or corrupt evidence stops dispatch and cannot supply
+expiry proof. Preserve the provider's typed error for diagnosis. Repair/reconcile the selected
+source without repricing; if remediation conclusively fails, use `line-execution-failed` only
+after ordinary compensation is established. Unknown codes, denial and outage stay unresolved;
+only the existing identity/occupancy defer-budget rules map to their dedicated failure reasons.
+A successor price is not expiry, and `not-dispatchable` triggers a fresh order read, not an ack.
+Pre-spawn abort retains the existing compensation schema/guards; post-spawn terminal outcome
+additionally requires the D-198 staged revoke/drain barrier. No generic upstream-error→expiry
+adapter is permitted. Owner SDKs must test their typed codes against this semantic mapping.
 
 A failed acknowledgement without a failure reason **MUST** be refused `failure-reason-missing`. A
 value outside the enumeration, `operator-forced-unreconciled`, and a failure reason supplied with a completed acknowledgement,
@@ -684,3 +694,17 @@ would leave orders non-terminal for reasons the order has no visibility into.
 - **ADRs**: [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md) transition through the engine; [`ADR/0002`](../ADR/0002-cpt-cf-bss-orders-lifecycle-adr-slice-decomposition.md) the foundation-plus-seven-slices decomposition
 
 <!-- /contract -->
+
+
+**D-188 reconciliation:** Workflow uses the exact committed version and selected receipt IDs. It must not derive the next/predecessor version arithmetically or dispatch a reserved-only candidate. Recovery/replayed Pricing receipts never authorize fulfillment without current committed-order and fulfillment-attempt fencing. See the [normative attempt and sparse-history contract](../DESIGN.md#contract-01-commercial-attempt).
+
+**D-190 activation handoff.** Workflow passes the exact committed version and fulfillment attempt; Subscriptions reads the selected receipt under its authorized scope and owns the commercial hold and fresh eligibility check. Workflow never treats a hold replay as activation permission. Lifecycle `on_hold` pauses workflow and does not renew Pricing acceptance. The [D-190 contract](../DESIGN.md#contract-03-accepted-price-activation) and its unchecked tests govern successor protection, changed activation instants, failure classification and compensation; D-191/R06/R12 remain production prerequisites.
+
+
+**D-192 committed commercial evidence:** authorized exact-version reads return the complete schema-2 receipt/query and selected binding evidence under the existing finite parent scope. Unsupported encoding or mismatching receipt/query/row links fails closed; do not reconstruct history from current catalog data. Subscriptions materializes complete accepted query (including BillingTerms) plus identical held bindings under the [frozen snapshot contract](../DESIGN.md#contract-03-frozen-commercial-snapshot). Workflow carries exact committed version/attempt, not a client-supplied snapshot. Current display metadata is separate; D-198 selects the admission/fencing/control protocol; D-201/S5-01 reconciles the executable seam contracts locally; receiver implementation and real-provider recovery conformance remain pending.
+
+
+**D-198 effective control semantics:** Workflow owns receiver pause/revoke, full target/create-key inventory settlement and compensation. Orders stages and recovers an internal owned control intent without changing public state, SQL locks across network calls or direct provisioning. Post-spawn hold and ordinary terminal requests remain still-processing until the exact receiver barrier and final engine commit. See [protocol, user-visible effects and tests](../DESIGN.md#contract-06-activation-admission); selected design does not claim receiver SDK/runtime delivery.
+
+
+**D-198 staging guard order:** for post-spawn controls, preparation checks authority/version/state/reason/window first; complete compensation and receiver-barrier evidence are finalization guards over the trusted operational contribution. Missing final evidence keeps the staged operation pending. Pre-spawn request validation/guard order is unchanged. [Grant storage and control finalization](../DESIGN.md#contract-06-activation-admission).
