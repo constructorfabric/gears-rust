@@ -13,14 +13,14 @@ use super::handler::{
 use super::manager::{OutboxBuilder, QueueDeclaration};
 use super::stats::StatsRegistry;
 use super::strategy::{LeasedStrategy, TransactionalStrategy, generate_worker_id};
-use super::taskward::{
-    BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit, PanicPolicy, TracingListener,
-    WorkerBuilder,
-};
 use super::types::LeaseConfig;
 use super::types::{Partitions, WorkerTuning};
 use super::workers::processor::{PartitionProcessor, ProcessorReport};
 use crate::Db;
+use toolkit_taskward::{
+    BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit, PanicPolicy, TracingListener,
+    WorkerBuilder,
+};
 
 /// All runtime context needed to spawn a processor worker.
 /// Constructed once per partition in [`OutboxBuilder::start()`].
@@ -61,7 +61,7 @@ fn build_processor_worker<S: super::strategy::ProcessingStrategy + 'static>(
     );
     let name = format!("processor-{}", ctx.pid);
     let (poker_notify, _poker_handle) =
-        super::taskward::poker(ctx.tuning.idle_interval, ctx.cancel.clone());
+        toolkit_taskward::poker(ctx.tuning.idle_interval, ctx.cancel.clone());
     let mut builder = WorkerBuilder::<ProcessorReport>::new(&name, ctx.cancel.clone())
         .stop_grace(ctx.tuning.stop_grace.saturating_add(wind_down))
         .pacing(&ctx.tuning)

@@ -1,3 +1,9 @@
+//! The worker loop and the builder that assembles it.
+//!
+//! [`WorkerBuilder`] combines an action with its wakeup sources, pacing,
+//! bulkhead, panic policy, stop grace and listeners into a [`WorkerTask`],
+//! whose `run()` loops until cancellation.
+
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -545,9 +551,7 @@ mod tests {
 
     #[test]
     fn builder_with_bulkhead() {
-        use crate::outbox::taskward::bulkhead::{
-            BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit,
-        };
+        use crate::bulkhead::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
         let cancel = CancellationToken::new();
         let bulkhead = Bulkhead::new(
             "test",
@@ -1076,9 +1080,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn error_applies_backoff_floor() {
-        use crate::outbox::taskward::bulkhead::{
-            BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit,
-        };
+        use crate::bulkhead::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
         let cancel = CancellationToken::new();
         let notify = Arc::new(Notify::new());
         notify.notify_one(); // break initial Idle
@@ -1126,9 +1128,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn consecutive_errors_escalate() {
-        use crate::outbox::taskward::bulkhead::{
-            BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit,
-        };
+        use crate::bulkhead::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
         let cancel = CancellationToken::new();
         let notify = Arc::new(Notify::new());
         notify.notify_one(); // break initial Idle
@@ -1181,9 +1181,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn success_resets_bulkhead() {
-        use crate::outbox::taskward::bulkhead::{
-            BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit,
-        };
+        use crate::bulkhead::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
         let cancel = CancellationToken::new();
         let notify = Arc::new(Notify::new());
         notify.notify_one(); // break initial Idle
@@ -1234,9 +1232,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn error_sets_directive_to_idle() {
-        use crate::outbox::taskward::bulkhead::{
-            BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit,
-        };
+        use crate::bulkhead::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
         let cancel = CancellationToken::new();
         let notify = Arc::new(Notify::new());
         // Store permit for initial Idle
@@ -1287,9 +1283,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn error_backoff_delays_idle() {
-        use crate::outbox::taskward::bulkhead::{
-            BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit,
-        };
+        use crate::bulkhead::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
         let cancel = CancellationToken::new();
         let notify = Arc::new(Notify::new());
         let mut bulkhead = Bulkhead::new(
@@ -1408,9 +1402,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn semaphore_acquired_before_execute() {
-        use crate::outbox::taskward::bulkhead::{
-            BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit,
-        };
+        use crate::bulkhead::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
         let cancel = CancellationToken::new();
         let notify = Arc::new(Notify::new());
         notify.notify_one(); // break initial Idle
@@ -1447,9 +1439,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn semaphore_blocks_until_released() {
-        use crate::outbox::taskward::bulkhead::{
-            BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit,
-        };
+        use crate::bulkhead::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
         let cancel = CancellationToken::new();
         let notify = Arc::new(Notify::new());
         notify.notify_one(); // break initial Idle
@@ -1494,9 +1484,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancel_during_semaphore_wait() {
-        use crate::outbox::taskward::bulkhead::{
-            BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit,
-        };
+        use crate::bulkhead::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
         let cancel = CancellationToken::new();
         let notify = Arc::new(Notify::new());
         notify.notify_one(); // break initial Idle

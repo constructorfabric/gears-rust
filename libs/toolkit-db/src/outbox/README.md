@@ -579,11 +579,11 @@ else is infrastructure noise that will resolve itself.
 ### Worker Overhead
 
 Infrastructure overhead (scheduling, notifiers, semaphores) with no-op actions.
-A backend feature is still required: the bench declares
-`required-features = ["_any-backend"]`, which `sqlite`/`pg`/`mysql` activate.
+The worker runtime lives in `toolkit-taskward`, and so does its bench; it needs
+no database:
 
 ```bash
-cargo bench -p cf-gears-toolkit-db --features sqlite --bench worker_overhead
+cargo bench -p cf-gears-toolkit-taskward --bench worker_overhead
 ```
 
 ### Outbox Throughput
@@ -617,6 +617,6 @@ make bench-db-longhaul     # All engines, long-haul
 
 ```bash
 systemd-run --user --scope -p MemoryMax=4G -p CPUQuota=200% \
-  cargo bench -p cf-gears-toolkit-db --features sqlite --bench worker_overhead \
+  cargo bench -p cf-gears-toolkit-taskward --bench worker_overhead \
   -- --warm-up-time 1 --measurement-time 3 --sample-size 10
 ```

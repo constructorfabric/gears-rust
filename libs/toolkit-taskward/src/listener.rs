@@ -1,3 +1,5 @@
+//! Lifecycle hooks a worker reports to, for metrics and logs.
+
 use std::time::Duration;
 
 use super::action::Directive;

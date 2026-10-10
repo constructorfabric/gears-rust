@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
-use super::taskward::{Directive, WorkerAction, WorkerListener};
+use toolkit_taskward::{Directive, WorkerAction, WorkerListener};
 
 // ---------------------------------------------------------------------------
 // StatsListener — per-worker atomic counters
