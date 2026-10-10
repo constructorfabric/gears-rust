@@ -20,18 +20,18 @@
 //!
 //! [`TenantFacade`]: crate::domain::tenant_facade::TenantFacade
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
 use account_management_sdk::idp_user::{
     IdpDeprovisionUserRequest, IdpListUsersRequest, IdpProvisionUserRequest, IdpUpdateUserRequest,
-    IdpUser, IdpUserAttribute, IdpUserFilterField, IdpUserPatch,
+    IdpUser, IdpUserAttribute, IdpUserFilterField, IdpUserPagination, IdpUserPatch,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use credstore_sdk::SecretRef;
 use serde::Deserialize;
-use toolkit_odata::filter::{FilterNode, FilterOp, ODataValue};
-use toolkit_odata::{CursorV1, Page, PageInfo, SortDir};
+use toolkit_odata::filter::{FilterField, FilterNode, FilterOp, ODataValue};
+use toolkit_odata::{CursorV1, ODataOrderBy, OrderKey, Page, PageInfo, SortDir};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -311,20 +311,12 @@ fn classify_kc_read_only_reject(
 /// `firstName` / `lastName` are concatenated into [`IdpUser::display_name`]
 /// per DESIGN "Interactions & Sequences" (KC `firstName + lastName` is the canonical KC profile
 /// shape; OIDC `name` claim is not surfaced by the admin REST endpoint).
-///
-/// `createdTimestamp` is used by the `list_users` cursor sort key
-/// `(createdTimestamp ASC, id ASC)` per DESIGN "Interactions & Sequences".
 // Field subset of Keycloak's `UserRepresentation`; the derive is the decoder.
 #[allow(unknown_lints, de0101_no_serde_in_contract)]
 #[domain_model]
 #[derive(Deserialize)]
 struct UserRep {
     id: Uuid,
-    // `default` resolves to 0 (epoch). Real KC always emits `createdTimestamp`;
-    // the default exists only for minimal test fixtures. Such users sort
-    // before all real users — acceptable for v1 but document if writing new fixtures.
-    #[serde(default, rename = "createdTimestamp")]
-    created_timestamp: i64,
     #[serde(default)]
     username: Option<String>,
     #[serde(default)]
@@ -349,20 +341,25 @@ struct UserRep {
 ///
 /// Field mapping into [`CursorV1`]:
 ///
-///   * `k = [last_created_at_ms.to_string(), last_user_id.to_string()]`
-///     — composite tiebreaker per DESIGN "Interactions & Sequences" sort
-///     `(createdTimestamp ASC, id ASC)`.
-///   * `o = SortDir::Asc`, `s = [CURSOR_ORDER_TOKENS]` — pin the
-///     hard-coded plugin sort order in the cursor so AM's handler
-///     can recover `req.order` on continuation requests via
-///     `ODataOrderBy::from_signed_tokens`.
+///   * `k` — the last emitted user's key tuple, one projected string
+///     per key of the effective order (see [`ListUsersOrder`]). When
+///     the full tuple would push the cursor past
+///     [`IdpUserPagination::MAX_CURSOR_LEN`] (long profile values
+///     across several keys), the profile values are cut to a common
+///     byte cap and `k` carries one extra trailing element: a mask of
+///     `'0'` / `'1'`, one per key, marking the values that are now
+///     strict prefixes. The `id` value is never cut, so the cursor
+///     still names its row exactly (see
+///     [`UserFacade::list_users_impl`]'s cursor skip).
+///   * `o` / `s` — the effective order's leading direction and signed
+///     tokens (e.g. `"+username,+id"`). AM's handler recovers
+///     `req.order` from `s` on continuation requests and checks it
+///     against the `IdpUserFilterField` allow-list, so `s` only ever
+///     names fields from that set (DESIGN "Interactions & Sequences").
 ///   * `f = Some(filter_hash)` — short FNV-1a fingerprint of
-///     `(tenant_id, realm_name, id_filter, string_filters)`. The
-///     `realm_name` fold replaces the pre-CursorV1 explicit
-///     `decoded.realm_name != metadata.realm_name` reject — same
-///     effective check, now bundled in the hash so a re-binding
-///     across pages surfaces as `invalid cursor` through the same
-///     path as a filter / tenant change.
+///     `(tenant_id, realm_name, id_filter, string_filters)`. A realm
+///     re-binding or filter change across pages surfaces as
+///     `invalid cursor`.
 ///   * `d = "fwd"` — the plugin does not implement backward
 ///     pagination (it would require fetching from an offset > 0,
 ///     which v1 forbids).
@@ -370,59 +367,147 @@ struct UserRep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ListUsersCursor {
     filter_hash: String,
-    last_created_at: i64,
-    last_user_id: Uuid,
+    last_key: Vec<String>,
+    /// Indices into `last_key` whose value is a strict prefix of the
+    /// row's sort value; empty when the tuple is carried in full.
+    truncated: Vec<usize>,
 }
 
-/// Pre-CursorV1 cursor shape kept ALIVE on the decode side for the
-/// rolling-deploy grace window. Mirrors the JSON shape the previous
-/// encoder produced: opaque base64url-no-pad of a serde-tagged struct
-/// with `realm_name` carried alongside `filter_hash`. Used ONLY by
-/// [`UserFacade::decode_cursor_with_legacy_fallback`]; the encoder
-/// always emits the current [`CursorV1`] shape.
-///
-/// Why keep this around: the rolling rollout window means clients
-/// that fetched page 1 BEFORE the deploy and page 2 AFTER the deploy
-/// would otherwise see `invalid cursor` mid-walk on a server-issued
-/// token. The grace decode accepts both shapes; once all in-flight
-/// pagination drains (matter of minutes), the legacy struct can be
-/// retired.
-// The derive IS the grace-window decoder described above.
-#[allow(unknown_lints, de0101_no_serde_in_contract)]
+/// Effective `list_users` order, resolved from
+/// `IdpListUsersRequest.order` against the [`IdpUserFilterField`]
+/// allow-list. Always ends in an `id` key, so it is a total order.
 #[domain_model]
-#[derive(Debug, Deserialize)]
-struct LegacyListUsersCursor {
-    realm_name: String,
-    filter_hash: String,
-    #[serde(default)]
-    last_created_at: Option<i64>,
-    #[serde(default)]
-    last_user_id: Option<Uuid>,
+#[derive(Debug, Clone)]
+struct ListUsersOrder {
+    /// Wire form, pinned in [`CursorV1::s`] / [`CursorV1::o`].
+    odata: ODataOrderBy,
+    /// Typed keys, parallel to `odata.0`.
+    keys: Vec<(IdpUserFilterField, SortDir)>,
 }
 
-/// Pre-CursorV1 `filter_hash` computation. Kept ALIVE for the same
-/// rolling-deploy grace window as [`LegacyListUsersCursor`]: a legacy
-/// cursor is accepted only if its `filter_hash` re-derives from this
-/// function given the current request's `(tenant_id, id_filter)` —
-/// i.e. the legacy filter context matches today's request.
-///
-/// Scope of revalidation: tenant + UUID-typed `id` filter only.
-/// Legacy cursors were minted before the string-filter predicate
-/// ([`StringMatcher`]) was folded into the hash; the encoded hash
-/// never folded `realm_name` or
-/// `username/email/first_name/last_name/display_name` into its
-/// state, so this routine intentionally does not either. Feeding
-/// today's [`StringMatcher`] in would change every legacy hash
-/// byte-for-byte and reject every legacy cursor minted by the prior
-/// release — defeating the rolling-deploy grace window.
-///
-/// Safety vs. drift: realm rebinding is caught upstream by the
-/// explicit `legacy.realm_name != expected_realm` check in
-/// [`UserFacade::decode_cursor_with_legacy_fallback`]. A request
-/// that adds string filters mid-walk reuses a legacy cursor for at
-/// most one more page — the response always emits a fresh `CursorV1`
-/// `next_cursor` with the full modern hash, after which the modern
-/// equality check guards every subsequent page.
+impl ListUsersOrder {
+    /// Resolve the effective order: the request's order, or
+    /// `username ASC` when a direct SPI caller omits it, with an
+    /// `id ASC` tiebreaker appended — the same default and tiebreaker
+    /// AM injects before SPI dispatch and `static-idp-plugin` applies.
+    ///
+    /// # Errors
+    ///
+    /// [`PluginError::UserOpUnsupported`] when a key names a field
+    /// outside [`IdpUserFilterField`] (e.g. `created_at`).
+    fn resolve(order: Option<&ODataOrderBy>) -> Result<Self, PluginError> {
+        let odata = order
+            .cloned()
+            .unwrap_or_else(|| {
+                ODataOrderBy(vec![OrderKey {
+                    field: IdpUserFilterField::Username.name().to_owned(),
+                    dir: SortDir::Asc,
+                }])
+            })
+            .ensure_tiebreaker(IdpUserFilterField::Id.name(), SortDir::Asc);
+        let keys = odata
+            .0
+            .iter()
+            .map(|key| {
+                IdpUserFilterField::FIELDS
+                    .iter()
+                    .find(|f| f.name() == key.field)
+                    .map(|f| (*f, key.dir))
+                    .ok_or_else(|| PluginError::UserOpUnsupported {
+                        detail: format!("list_users: unsupported order field `{}`", key.field),
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { odata, keys })
+    }
+
+    /// Project `rep` to its key tuple under this order. Each key maps to
+    /// a comparable string: `id` via its canonical text form, absent or
+    /// empty profile fields as `""` (KC stores a cleared field as `""`,
+    /// and [`UserFacade::user_rep_to_idp_user`] reads it back as absent)
+    /// — the same projection `static-idp-plugin` sorts on.
+    fn project(&self, rep: &UserRep) -> Vec<String> {
+        self.keys
+            .iter()
+            .map(|(field, _)| match field {
+                IdpUserFilterField::Id => rep.id.to_string(),
+                IdpUserFilterField::Username => rep.username.clone().unwrap_or_default(),
+                IdpUserFilterField::Email => rep.email.clone().unwrap_or_default(),
+                IdpUserFilterField::DisplayName => {
+                    UserFacade::user_rep_display_name(rep).unwrap_or_default()
+                }
+                IdpUserFilterField::FirstName => rep.first_name.clone().unwrap_or_default(),
+                IdpUserFilterField::LastName => rep.last_name.clone().unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    /// Compare two key tuples key by key, applying each key's direction.
+    fn compare(&self, a: &[String], b: &[String]) -> std::cmp::Ordering {
+        for (idx, (_, dir)) in self.keys.iter().enumerate() {
+            let lhs = a.get(idx).map_or("", String::as_str);
+            let rhs = b.get(idx).map_or("", String::as_str);
+            let ord = match dir {
+                SortDir::Asc => lhs.cmp(rhs),
+                SortDir::Desc => rhs.cmp(lhs),
+            };
+            if !ord.is_eq() {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    /// Whether `key` is the row `cursor` was issued for: every full
+    /// value equal, every truncated value a prefix. The `id` value is
+    /// never truncated, so at most one row matches.
+    fn matches_cursor(&self, key: &[String], cursor: &ListUsersCursor) -> bool {
+        (0..self.keys.len()).all(|idx| {
+            let value = key.get(idx).map_or("", String::as_str);
+            let stored = cursor.last_key.get(idx).map_or("", String::as_str);
+            if cursor.truncated.contains(&idx) {
+                value.starts_with(stored)
+            } else {
+                value == stored
+            }
+        })
+    }
+
+    /// Whether `key` sorts strictly after the cursor's position, judged
+    /// from the stored values alone. A truncated value only bounds the
+    /// row's real value by a prefix, so a `key` value that extends the
+    /// same prefix cannot be placed: it counts as after (re-emitted
+    /// rather than skipped).
+    fn is_after_cursor(&self, key: &[String], cursor: &ListUsersCursor) -> bool {
+        for (idx, (_, dir)) in self.keys.iter().enumerate() {
+            let value = key.get(idx).map_or("", String::as_str);
+            let stored = cursor.last_key.get(idx).map_or("", String::as_str);
+            let ord = if cursor.truncated.contains(&idx) {
+                if value.len() > stored.len() && value.starts_with(stored) {
+                    return true;
+                }
+                // Equal to the prefix means shorter than the real value.
+                value.cmp(stored).then(std::cmp::Ordering::Less)
+            } else {
+                value.cmp(stored)
+            };
+            let ord = match dir {
+                SortDir::Asc => ord,
+                SortDir::Desc => ord.reverse(),
+            };
+            if !ord.is_eq() {
+                return ord.is_gt();
+            }
+        }
+        false
+    }
+
+    /// Leading key's direction, pinned in [`CursorV1::o`].
+    fn primary_dir(&self) -> SortDir {
+        self.keys.first().map_or(SortDir::Asc, |(_, dir)| *dir)
+    }
+}
+
 /// FNV-1a 64-bit offset basis / prime — deterministic, non-cryptographic
 /// fingerprint (DE0708: no non-FIPS hashers). Public Fowler–Noll–Vo spec with
 /// fixed constants → identical output across Rust versions and platforms.
@@ -437,31 +522,7 @@ fn fnv1a_update(state: &mut u64, bytes: impl AsRef<[u8]>) {
     }
 }
 
-fn legacy_filter_hash(tenant_id: Uuid, user_id_filter: Option<Uuid>) -> String {
-    let mut h = FNV1A_BASIS;
-    fnv1a_update(&mut h, tenant_id.as_bytes());
-    match user_id_filter {
-        Some(u) => {
-            fnv1a_update(&mut h, [1u8]);
-            fnv1a_update(&mut h, u.as_bytes());
-        }
-        None => {
-            fnv1a_update(&mut h, [0u8]);
-        }
-    }
-    format!("{h:016x}")
-}
-
-/// Plugin's sort order, hard-coded to `(createdTimestamp ASC, id
-/// ASC)` per DESIGN "Interactions & Sequences". The literal token strings here are opaque
-/// to KC — they live only in the cursor envelope so [`CursorV1`]'s
-/// `o`/`s` fields round-trip correctly through the AM handler's
-/// order-recovery step. If the plugin ever forwards `req.order` to
-/// the KC sort (the open TODO inside `list_users_impl`), the literals
-/// here become inputs to a runtime computation instead of a fixed
-/// constant.
-const CURSOR_ORDER_TOKENS: &str = "+created_at,+id";
-const CURSOR_ORDER_DIR: SortDir = SortDir::Asc;
+/// Pagination direction pinned in [`CursorV1::d`]; forward-only.
 const CURSOR_DIRECTION: &str = "fwd";
 
 /// Hard cap on the total tenant-group members drained in one
@@ -1947,26 +2008,30 @@ impl UserFacade {
     ///
     /// 1. Decode tenant metadata.
     /// 2. Resolve realm-admin secret source.
-    /// 3. Decode the opaque cursor (if any) and validate that its
-    ///    `realm_name` + `filter_hash` still match this request —
-    ///    mismatch → [`PluginError::UserOpRejected`] ("invalid cursor").
+    /// 3. Resolve the effective order (`req.order`, default
+    ///    `username ASC`, plus an `id ASC` tiebreaker) — a key outside
+    ///    [`IdpUserFilterField`] → [`PluginError::UserOpUnsupported`].
+    ///    Decode the opaque cursor (if any) and validate that its order
+    ///    pin + `filter_hash` still match this request — mismatch →
+    ///    [`PluginError::UserOpRejected`] ("invalid cursor").
     /// 4. Resolve effective page limit:
     ///    `limit = min(req.pagination.top(), max)`. (`top()` is already
     ///    `>= 1` and `<= MAX_TOP` per SDK constructor invariants; the
     ///    facade's own `list_users_page_limit_max` is the stricter
     ///    cap.)
     /// 5. `GET /admin/realms/{realm}/groups/{tenant_group_id}/members?first=0&max={limit+1}`.
-    /// 6. Sort response `(createdTimestamp ASC, id ASC)` client-side.
-    /// 7. Skip entries already returned on prior pages (cursor tiebreaker).
+    /// 6. Sort the drained members by the effective order client-side.
+    /// 7. Skip entries already returned on prior pages (cursor key tuple).
     /// 8. Apply optional `user_id_filter` post-skip.
-    /// 9. Emit first `limit` items; encode `(last_created_at, last_user_id)`
-    ///    of the last-emitted user as `next_cursor` when `limit+1` results
-    ///    were present after the skip step.
+    /// 9. Emit first `limit` items; encode the last-emitted user's key
+    ///    tuple as `next_cursor` when more rows remain after the skip.
     ///
     /// # Errors
     ///
     /// * [`PluginError::UserOpRejected`] — malformed metadata or
     ///   mismatched cursor.
+    /// * [`PluginError::UserOpUnsupported`] — unsupported `$filter`
+    ///   shape or order key.
     /// * [`PluginError::UserOpUnavailable`] — KC 4xx (non-404 group
     ///   gone) / 5xx / transport / timeout on the members fetch.
     pub async fn list_users_inner(
@@ -1985,17 +2050,14 @@ impl UserFacade {
         result
     }
 
-    // TODO(admin-bind follow-up): the `order` clause is still dropped in
-    // favour of the hard-coded `(createdTimestamp ASC, id ASC)` cursor
-    // sort, and the v1 client-side filter strategy drains bounded
+    // TODO(admin-bind follow-up): the v1 client-side filter strategy drains bounded
     // pages from KC's `/groups/{tenant_group_id}/members` endpoint
     // (which has no search params) and post-filters. That is correct
     // for small/medium tenants but doesn't scale to "find one user in
     // a tenant with 100k members". Larger follow-up: (a) switch to
     // KC's realm-wide `/users?username=…&q=tenant_id:<uuid>&exact=true`
     // when string filters are present so KC narrows server-side; (b)
-    // forward `req.order` to the chosen sort key (timestamp /
-    // username / email); (c) widen the test matrix across
+    // widen the test matrix across
     // field×op×order×pagination shapes. The wire-contract bug
     // (string-field filters returning the full user set) is closed by
     // [`Self::build_string_matcher`] + the post-id-filter retain
@@ -2024,29 +2086,26 @@ impl UserFacade {
         let string_matcher = Self::build_string_matcher(req.filter.as_ref())?;
         let filter_hash =
             Self::filter_hash(tenant_id, &metadata.realm_name, id_filter, &string_matcher);
-        // Decode the optional inbound cursor + verify its filter_hash
-        // matches the current request's filter shape. The hash folds in
+        // Sort on the caller's effective order (DESIGN "Interactions &
+        // Sequences": ordering is honored, not fixed). An order key
+        // outside `IdpUserFilterField` is `UnsupportedOperation` before
+        // any KC call.
+        let order = ListUsersOrder::resolve(req.order.as_ref())?;
+        // Decode the optional inbound cursor + verify it was issued
+        // under this order and this filter shape. The hash folds in
         // `realm_name`, so a realm-rebinding mid-pagination surfaces
-        // here as `invalid cursor` (replaces the pre-CursorV1 explicit
-        // `decoded.realm_name != metadata.realm_name` reject).
-        let (last_created_at_param, last_user_id_param) = match req.pagination.cursor() {
+        // here as `invalid cursor` too.
+        let after: Option<ListUsersCursor> = match req.pagination.cursor() {
             Some(c) => {
-                // `decode_cursor_with_legacy_fallback` validates the
-                // cursor against the current request's filter context
-                // internally — both for the modern CursorV1 shape AND
-                // the legacy pre-CursorV1 shape accepted during the
-                // rolling-deploy grace window. Caller no longer
-                // compares hashes here.
-                let (created_at, user_id) = Self::decode_cursor_with_legacy_fallback(
-                    c,
-                    &metadata.realm_name,
-                    tenant_id,
-                    id_filter,
-                    &filter_hash,
-                )?;
-                (Some(created_at), Some(user_id))
+                let cursor = Self::decode_cursor(c, &order)?;
+                if cursor.filter_hash != filter_hash {
+                    return Err(PluginError::UserOpRejected {
+                        detail: "invalid cursor".into(),
+                    });
+                }
+                Some(cursor)
             }
-            None => (None, None),
+            None => None,
         };
 
         // ---- Step 4: resolve effective page limit. ----
@@ -2060,8 +2119,8 @@ impl UserFacade {
         //
         // `/admin/realms/{realm}/groups/{tenant_group_id}/members` has no
         // server-side sort or `q=`-filter knobs, so the facade pages the
-        // ENTIRE membership into memory and applies the DESIGN "Interactions & Sequences" sort
-        // key `(createdTimestamp ASC, id ASC)` + cursor-skip + filters
+        // ENTIRE membership into memory and applies the effective order
+        // + cursor-skip + filters
         // itself. The loop drains every KC page (`first += page_size`)
         // until a short page signals the end.
         //
@@ -2134,30 +2193,42 @@ impl UserFacade {
             .await
             .map_err(user_translate_kc)?;
 
-        // Defensive sort: KC does not guarantee stable order across pages.
-        members.sort_by(|a, b| {
-            a.created_timestamp
-                .cmp(&b.created_timestamp)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        // Offset paging over that unstable order can re-observe a row that
-        // shifted across a page boundary during the drain. Equal-id rows
-        // are adjacent after the sort above (same user ⇒ same timestamp),
-        // so drop adjacent duplicates by id to keep a user from being
+        // KC does not guarantee a stable order across offset pages, so
+        // the drain can re-observe a row that shifted across a page
+        // boundary. Keep the first sighting of each id so a user is never
         // double-counted in the page or the cursor math.
-        members.dedup_by(|a, b| a.id == b.id);
+        let mut seen = HashSet::with_capacity(members.len());
+        members.retain(|u| seen.insert(u.id));
 
-        // Skip entries already returned on prior pages (cursor tiebreaker).
-        if let (Some(t_cur), Some(id_cur)) = (last_created_at_param, last_user_id_param) {
-            members.retain(|u| (u.created_timestamp, u.id) > (t_cur, id_cur));
+        // Project each member to its key tuple once, then sort on it.
+        let mut keyed: Vec<(Vec<String>, UserRep)> = members
+            .into_iter()
+            .map(|u| (order.project(&u), u))
+            .collect();
+        keyed.sort_by(|(a, _), (b, _)| order.compare(a, b));
+
+        // Skip entries already returned on prior pages. Resume from the
+        // cursor's row by its full current key when the row is still a
+        // member — exact even when the cursor carries truncated values.
+        // If it left the group (or was renamed) between pages, place the
+        // remaining rows against the stored values instead.
+        if let Some(after) = after.as_ref() {
+            let anchor = keyed
+                .iter()
+                .find(|(key, _)| order.matches_cursor(key, after))
+                .map(|(key, _)| key.clone());
+            match anchor {
+                Some(anchor) => keyed.retain(|(key, _)| order.compare(key, &anchor).is_gt()),
+                None => keyed.retain(|(key, _)| order.is_after_cursor(key, after)),
+            }
         }
 
         // Apply optional id-eq filter post-skip.
-        members.retain(|u| id_filter.is_none_or(|wanted| u.id == wanted));
+        keyed.retain(|(_, u)| id_filter.is_none_or(|wanted| u.id == wanted));
         // Apply the string-field predicate (`eq` / `contains` / `and` /
         // `or`) lowered from `$filter`. `StringMatcher::Always` (the
         // no-`$filter` case) matches every row, so this is a no-op then.
-        members.retain(|u| string_matcher.matches(u));
+        keyed.retain(|(_, u)| string_matcher.matches(u));
 
         // `has_more` is computed AFTER cursor-skip + filter-retain so
         // it reflects how many rows the CALLER still has past this
@@ -2166,27 +2237,23 @@ impl UserFacade {
         // by stamping `has_more = true` even when client-side skip
         // left no real follow-on row. Now `has_more` is the
         // authoritative "should I emit a cursor" signal.
-        let has_more = members.len() > limit as usize;
-        members.truncate(limit as usize);
+        let has_more = keyed.len() > limit as usize;
+        keyed.truncate(limit as usize);
 
-        // Encode (last_created_at, last_user_id) of the last emitted
-        // user as the next page's cursor. CursorV1 envelope; the
-        // realm_name pinning lives inside `filter_hash` now.
+        // Encode the last emitted user's key tuple as the next page's
+        // cursor, pinned to the effective order. CursorV1 envelope; the
+        // realm_name pinning lives inside `filter_hash`.
         let next_cursor = if has_more {
-            members.last().map(|last| {
-                Self::encode_cursor(&ListUsersCursor {
-                    filter_hash: filter_hash.clone(),
-                    last_created_at: last.created_timestamp,
-                    last_user_id: last.id,
-                })
-            })
+            keyed
+                .last()
+                .map(|(last_key, _)| Self::bounded_cursor(&filter_hash, last_key, &order))
         } else {
             None
         };
 
-        let items: Vec<IdpUser> = members
+        let items: Vec<IdpUser> = keyed
             .into_iter()
-            .map(Self::user_rep_to_idp_user)
+            .map(|(_, u)| Self::user_rep_to_idp_user(u))
             .collect();
 
         Ok(Page::new(
@@ -2687,10 +2754,10 @@ impl UserFacade {
     /// parses our cursor through the exact same `CursorV1::decode`
     /// path, with no plugin-specific extractor hook.
     ///
-    /// The `k`/`o`/`s` triple pins the plugin's hard-coded sort
-    /// order; AM's handler recovers `req.order` from `cursor.s` via
+    /// The `k`/`o`/`s` triple pins the effective order; AM's handler
+    /// recovers `req.order` from `cursor.s` via
     /// `ODataOrderBy::from_signed_tokens`, so a continuation request
-    /// without `$orderby` still reaches the plugin with the right
+    /// without `$orderby` still reaches the plugin with the same
     /// effective order.
     //
     // `CursorV1::encode` returns `serde_json::Result<String>`;
@@ -2702,14 +2769,25 @@ impl UserFacade {
         clippy::expect_used,
         reason = "CursorV1 has no serialiser-defeating shape; the expect anchors that invariant"
     )]
-    fn encode_cursor(cursor: &ListUsersCursor) -> String {
+    fn encode_cursor(cursor: &ListUsersCursor, order: &ListUsersOrder) -> String {
+        let mut k = cursor.last_key.clone();
+        if !cursor.truncated.is_empty() {
+            k.push(
+                (0..order.keys.len())
+                    .map(|idx| {
+                        if cursor.truncated.contains(&idx) {
+                            '1'
+                        } else {
+                            '0'
+                        }
+                    })
+                    .collect(),
+            );
+        }
         CursorV1 {
-            k: vec![
-                cursor.last_created_at.to_string(),
-                cursor.last_user_id.to_string(),
-            ],
-            o: CURSOR_ORDER_DIR,
-            s: CURSOR_ORDER_TOKENS.to_owned(),
+            k,
+            o: order.primary_dir(),
+            s: order.odata.to_signed_tokens(),
             f: Some(cursor.filter_hash.clone()),
             d: CURSOR_DIRECTION.to_owned(),
         }
@@ -2717,95 +2795,113 @@ impl UserFacade {
         .expect("CursorV1 with primitive fields is always serialisable")
     }
 
-    /// Decode the opaque pagination cursor. Failure modes that all
-    /// surface as [`PluginError::UserOpRejected`] ("invalid cursor"):
+    /// Encode the `next_cursor` for the row keyed `last_key`, keeping
+    /// it within [`IdpUserPagination::MAX_CURSOR_LEN`] — AM rejects a
+    /// longer continuation cursor before it reaches the plugin.
+    ///
+    /// The full key tuple is used when it fits. Otherwise every profile
+    /// value longer than a byte cap is cut to that cap (on a char
+    /// boundary) and marked truncated; the cap is the largest one that
+    /// fits. Encoded length only grows with the cap, and a cap of zero
+    /// leaves the `id` value, the order pin, and the filter hash —
+    /// far below the limit — so the search always lands on a cursor
+    /// that fits.
+    fn bounded_cursor(filter_hash: &str, last_key: &[String], order: &ListUsersOrder) -> String {
+        let encode_capped = |cap: Option<usize>| {
+            let mut key = Vec::with_capacity(last_key.len());
+            let mut truncated = Vec::new();
+            for (idx, (value, (field, _))) in last_key.iter().zip(&order.keys).enumerate() {
+                match cap {
+                    Some(cap) if *field != IdpUserFilterField::Id && value.len() > cap => {
+                        key.push(value[..value.floor_char_boundary(cap)].to_owned());
+                        truncated.push(idx);
+                    }
+                    _ => key.push(value.clone()),
+                }
+            }
+            Self::encode_cursor(
+                &ListUsersCursor {
+                    filter_hash: filter_hash.to_owned(),
+                    last_key: key,
+                    truncated,
+                },
+                order,
+            )
+        };
+        let full = encode_capped(None);
+        if full.len() <= IdpUserPagination::MAX_CURSOR_LEN {
+            return full;
+        }
+        // Binary search for the largest fitting cap: `fits` always
+        // fits, `overflows` never does (it truncates nothing).
+        let (mut fits, mut overflows) = (0, last_key.iter().map(String::len).max().unwrap_or(0));
+        while overflows - fits > 1 {
+            let mid = fits.midpoint(overflows);
+            if encode_capped(Some(mid)).len() <= IdpUserPagination::MAX_CURSOR_LEN {
+                fits = mid;
+            } else {
+                overflows = mid;
+            }
+        }
+        encode_capped(Some(fits))
+    }
+
+    /// Decode the opaque pagination cursor issued under `order`.
+    /// Failure modes that all surface as [`PluginError::UserOpRejected`]
+    /// ("invalid cursor"):
     ///
     ///   * Malformed base64 / unsupported `v` / shape mismatch from
     ///     [`CursorV1::decode`].
-    ///   * `o` or `s` deviates from the plugin's hard-coded
-    ///     `(createdTimestamp ASC, id ASC)` sort. A request that
-    ///     somehow surfaces a different order-pin almost certainly
-    ///     came from a different list endpoint's cursor — reject so
-    ///     the caller cannot accidentally walk our pages with
-    ///     someone else's tiebreakers.
-    ///   * `k` doesn't carry exactly the two tiebreaker strings the
-    ///     `(created_at, id)` shape expects, or those strings don't
-    ///     parse back to `i64` / `Uuid`.
-    ///   * `f` (`filter_hash`) is absent — the cursor was emitted
-    ///     under "no filter context", which the plugin always sets,
+    ///   * `o` / `s` deviate from the effective order — the cursor was
+    ///     issued under a different `$orderby` (or by another list
+    ///     endpoint, or by a build that pinned `+created_at,+id`), so
+    ///     its key tuple is not a position in this walk.
+    ///   * `d` is not the forward direction.
+    ///   * `k` doesn't carry exactly one string per order key, plus at
+    ///     most a truncation mask that marks only profile values (never
+    ///     `id`) and marks at least one.
+    ///   * `f` (`filter_hash`) is absent — the plugin always sets one,
     ///     so this is structurally invalid.
-    fn decode_cursor(raw: &str) -> Result<ListUsersCursor, PluginError> {
+    fn decode_cursor(raw: &str, order: &ListUsersOrder) -> Result<ListUsersCursor, PluginError> {
         let invalid = || PluginError::UserOpRejected {
             detail: "invalid cursor".into(),
         };
         let cursor = CursorV1::decode(raw).map_err(|_| invalid())?;
-        if cursor.o != CURSOR_ORDER_DIR || cursor.s != CURSOR_ORDER_TOKENS {
+        if cursor.o != order.primary_dir()
+            || !order.odata.equals_signed_tokens(&cursor.s)
+            || cursor.d != CURSOR_DIRECTION
+        {
             return Err(invalid());
         }
-        let [created, id] = cursor.k.as_slice() else {
+        let mut last_key = cursor.k;
+        let truncated = if last_key.len() == order.keys.len() + 1 {
+            let mask = last_key.pop().unwrap_or_default();
+            if mask.len() != order.keys.len() {
+                return Err(invalid());
+            }
+            let mut truncated = Vec::new();
+            for (idx, (flag, (field, _))) in mask.chars().zip(&order.keys).enumerate() {
+                match flag {
+                    '0' => {}
+                    '1' if *field != IdpUserFilterField::Id => truncated.push(idx),
+                    _ => return Err(invalid()),
+                }
+            }
+            if truncated.is_empty() {
+                return Err(invalid());
+            }
+            truncated
+        } else if last_key.len() == order.keys.len() {
+            Vec::new()
+        } else {
             return Err(invalid());
         };
-        let last_created_at: i64 = created.parse().map_err(|_| invalid())?;
-        let last_user_id: Uuid = id.parse().map_err(|_| invalid())?;
         let filter_hash = cursor.f.ok_or_else(invalid)?;
         Ok(ListUsersCursor {
             filter_hash,
-            last_created_at,
-            last_user_id,
+            last_key,
+            truncated,
         })
-    }
-
-    /// Production decode used by [`UserFacade::list_users_impl`]. Tries
-    /// the modern [`Self::decode_cursor`] shape first and validates its
-    /// `filter_hash` against the current request's modern hash. On
-    /// failure, falls back to the pre-CursorV1
-    /// [`LegacyListUsersCursor`] shape for the rolling-deploy grace
-    /// window: a pre-deploy client whose page 1 lands on the new
-    /// build still gets page 2 served correctly (realm + legacy
-    /// `filter_hash` are revalidated against the current request).
-    ///
-    /// Returns the `(last_created_at, last_user_id)` tiebreaker pair
-    /// once validation passes. Any failure path (parse, shape, realm
-    /// mismatch, filter mismatch) collapses to
-    /// `PluginError::UserOpRejected { detail: "invalid cursor" }` so
-    /// the caller cannot distinguish between modern-invalid and
-    /// legacy-invalid (both are equally "client must re-paginate").
-    fn decode_cursor_with_legacy_fallback(
-        raw: &str,
-        expected_realm: &str,
-        expected_tenant_id: Uuid,
-        expected_id_filter: Option<Uuid>,
-        expected_modern_filter_hash: &str,
-    ) -> Result<(i64, Uuid), PluginError> {
-        let invalid = || PluginError::UserOpRejected {
-            detail: "invalid cursor".into(),
-        };
-
-        // --- Modern shape: validated by `decode_cursor`, then compare
-        //     filter_hash against the current request's context.
-        if let Ok(modern) = Self::decode_cursor(raw) {
-            if modern.filter_hash != expected_modern_filter_hash {
-                return Err(invalid());
-            }
-            return Ok((modern.last_created_at, modern.last_user_id));
-        }
-
-        // --- Legacy shape: pre-CursorV1 base64url(serde_json).
-        //     Revalidate realm + legacy filter context so a query
-        //     change mid-walk still rejects, matching the modern
-        //     path's safety guarantee.
-        let bytes = URL_SAFE_NO_PAD.decode(raw).map_err(|_| invalid())?;
-        let legacy: LegacyListUsersCursor =
-            serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        if legacy.realm_name != expected_realm {
-            return Err(invalid());
-        }
-        if legacy.filter_hash != legacy_filter_hash(expected_tenant_id, expected_id_filter) {
-            return Err(invalid());
-        }
-        let last_created_at = legacy.last_created_at.ok_or_else(invalid)?;
-        let last_user_id = legacy.last_user_id.ok_or_else(invalid)?;
-        Ok((last_created_at, last_user_id))
     }
 }
 
