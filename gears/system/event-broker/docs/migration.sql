@@ -10,43 +10,6 @@ CREATE DOMAIN gts_type_path AS TEXT
         AND VALUE ~ '^gts\.[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\.v(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?(?:~[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\.v(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?)*~$'
     );
 
--- ── Event Log (built-in DB storage backend) ──────────────────────────────────
--- This is the schema for the built-in DB storage backend specifically. Other backends
--- (Kafka, S3, file) have their own native storage layouts; this DDL is internal to
--- the DB backend's `persist` / `query` implementation.
---
--- No `UNIQUE (topic, partition, offset)` constraint — backend offset assignment
--- combined with single-writer-via-outbox order preservation guarantees uniqueness
--- without a global cross-segment unique index. The PRIMARY KEY on `id` (UUID,
--- client-provided) catches accidental duplicate event submissions.
---
--- Note: `tenant_id` is present for authorization filtering (queries are tenant-scoped
--- via SecureConn) but is NOT part of any uniqueness or sequencing key — topic GTS
--- identifiers are globally unique by namespace.
-CREATE TABLE evbk_event (
-    id              UUID        NOT NULL,
-    tenant_id       UUID        NOT NULL,    -- publisher's tenant; authz scope, not sequencing scope
-    topic           TEXT        NOT NULL,
-    partition       INTEGER     NOT NULL,
-    type            TEXT        NOT NULL,
-    producer_id     UUID,                    -- chained / monotonic modes only; null in stateless
-    previous        BIGINT,                  -- chained mode only; null otherwise
-    sequence        BIGINT,                  -- producer-set chain (chained / monotonic); null in stateless
-    "offset"        BIGINT      NOT NULL,    -- backend-assigned, monotonic per (topic, partition); consumer-visible
-    offset_time     TIMESTAMP   NOT NULL,
-    source          TEXT        NOT NULL,
-    subject         TEXT        NOT NULL,
-    subject_type    TEXT        NOT NULL,
-    occurred_at     TIMESTAMP   NOT NULL,
-    created_at      TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    trace_parent    TEXT,
-    data            JSONB       NOT NULL,
-
-    PRIMARY KEY (id)
-);
-
-CREATE INDEX idx_evbk_event_topic_partition_offset ON evbk_event (topic, partition, "offset");
-
 
 -- ── Consumer Group Registry ──────────────────────────────────────────────────
 -- Persistent registry row — outlives every subscription, every delivery shard
@@ -101,7 +64,7 @@ CREATE TABLE evbk_producer (
 -- narrowed by tenant. `last_sequence` tracks the highest producer-set
 -- `meta.sequence` accepted from this producer for this (topic, partition). The
 -- Reaper worker cleans up records where `last_seen_at` is older than the
--- broker's `producer.state_retention` (capped at P14D). Cascade-deleted when the parent
+-- producer registration (`producer.registration_ttl`). Cascade-deleted when the parent
 -- evbk_producer registration row is aged out.
 --
 -- Chain check at ingest (chained mode): on incoming event with
@@ -139,7 +102,6 @@ CREATE INDEX idx_evbk_producer_state_last_seen ON evbk_producer_state (last_seen
 --
 --   * evbk_topic         — Topic definitions. PK: id (GTS string).
 --   * evbk_event_type    — Event type definitions. PK: id (GTS string); FK to evbk_topic.
---   * evbk_segment       — Topic storage segments. PK: (topic, partition, segment_id).
 --
 -- Subscription, cursor, and group-state are intentionally NOT in this file — they
 -- live in the ClusterCapabilities-backed cache (see DESIGN.md §3.2 Subscription

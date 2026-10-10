@@ -53,7 +53,6 @@ Consumer subscription lifecycle defines the end-to-end contract a consumer SDK m
 - DESIGN.md §3.2 Subscription Lifecycle + Long-Poll Mechanism
 - DESIGN.md §3.5 Long-Poll Consumption Flow
 - DESIGN.md §3.6 (delivery shard ownership and SD double-check)
-- USE_CASES.md §1 Consumer State Machine, §4 Walked Scenarios, §5 Rebalance Algorithm
 - `openapi.yaml` — wire shapes for all endpoints referenced below
 - `ADR/0002-consumption-transport.md` — the transport (long-poll vs SSE vs multipart) is open; flows below assume the current long-poll transport.
 
@@ -101,12 +100,12 @@ created_at          = resp.json["created_at"]          # set at JOIN; list sort 
 
 # Broker-side join logic
 def join(req):
-    shard = dispatch_route(req.consumer_group)         # via cluster lookup or claim
+    # runs on the delivery instance the dispatcher picked (feature 0005 §3.3)
     with cluster.distributed_lock(f"evbk.group.{req.consumer_group}"):
         gs = GroupState.get_or_create(req.consumer_group)
         gs.active_members[sub_id] = Member(req.topics, req.filters)
         gs.topology_version += 1
-        rebalance(gs)                                  # round-robin v1, USE_CASES.md §5
+        rebalance(gs)                                  # range assignment, §3
     return Subscription(id=sub_id, assigned=gs.active_members[sub_id].assigned,
                         topology_version=gs.topology_version)
 
@@ -162,6 +161,9 @@ resp = http.post(f"/v1/subscriptions/{sub_id}:seek", json={
     }
 })
 assert resp.status == 200       # body echoes each position resolved to an integer
+
+# Bulk replay: run it in a dedicated group (e.g. replay-{job-id}) so it never takes
+# partitions from live consumers, then SEEK "earliest", an offset, or "at:<time>".
 
 # Broker side
 def seek(sub_id, topology_version, partition_positions, stream_is_open):
@@ -310,6 +312,9 @@ def deliver_to_member(member, raw_events):
 # When all v1 members leave, the group settles into the F2/T2 worldview.
 ```
 
+- **Scanned-past events stay behind.** Events F1 rejected but F2 would accept, and that F1 already scanned past, are never seen by F2: the cursor has moved beyond them. Gradual rollouts trade strict filter consistency for zero downtime; an operator wanting strict semantics drains v1 before starting v2.
+- **No group-level filter.** Enforcing filter parity across a group would force either rejecting v2's JOIN or evicting v1 members on a filter change. Per-member filters keep both rolling deploys and hard-stop deploys possible.
+
 ### 2.7 Session timeout (heartbeat-via-poll)
 
 ```python
@@ -356,6 +361,29 @@ async def release_ownership(G):
 The lock around `cluster.distributed_lock("evbk.group.<G>")` is the serialization point for every GroupState mutation (JOIN, LEAVE, rebalance, ownership transfer). Stream reads and pre-stream SEEK are NOT lock-protected by the GroupState mutation lock — they touch runtime cursor cache keys directly and rely on the cache's own consistency guarantees.
 
 `topology_version` is monotonically increasing per group; every mutation increments it. Consumers compare across poll responses to detect rebalance.
+
+**Rebalance (v1): range assignment per topic.** Runs under the group lock on every JOIN, LEAVE and lapsed `session_timeout`, and recomputes the whole assignment:
+
+```python
+def rebalance(gs):
+    members = sorted(gs.active_members.values(), key=lambda m: m.subscription_id)   # deterministic
+    for topic in union(m.topics for m in members):
+        eligible = [m for m in members if topic in m.topics]     # only members subscribed to it
+        n, k = topic.partitions, len(eligible)
+        if k == 0:
+            continue                                             # no eligible member: unassigned
+        if k >= n:
+            for p in range(n): assign(topic, p, eligible[p])     # surplus members get nothing here
+            continue
+        base, extra, cursor = n // k, n % k, 0
+        for i, m in enumerate(eligible):                         # member i gets a contiguous range
+            count = base + (1 if i < extra else 0)
+            for p in range(cursor, cursor + count): assign(topic, p, m)
+            cursor += count
+    gs.topology_version += 1
+```
+
+- **Thrash is accepted in v1.** A full recompute can move nearly every partition on every membership change. At-least-once delivery with idempotent consumers absorbs it: work in flight on a moved partition is delivered again by the new owner. Sticky assignment, which minimizes movement, is deferred (DESIGN §4.8); `topology_version` already carries the contract, so it is an internal change.
 
 A subscription carries a `created_at` timestamp set at JOIN. `GET /v1/subscriptions` returns subscriptions newest-first, ordered by `created_at` descending with `id` as a stable tiebreaker, so a freshly created subscription lands on the first page rather than wherever its random id would fall.
 
