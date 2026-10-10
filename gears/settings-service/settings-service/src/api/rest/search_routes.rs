@@ -68,10 +68,11 @@ pub fn register_routes(
         .query_param_typed("limit", false, "Page size, in settings", "integer")
         .query_param("cursor", false, "Cursor for pagination")
         .handler(handlers::search_settings)
-        .json_response_with_schema::<toolkit_odata::Page<SearchHitDto>>(
+        .json_response_with_schema::<crate::api::rest::page_dto::PageDto<SearchHitDto>>(
             openapi,
             StatusCode::OK,
-            "A page of hits, ordered by key, with its pagination cursors",
+            "A page of hits, ordered by key, with its pagination cursors and the total \
+             of matching settings",
         )
         .with_odata_filter::<SettingFilterField>()
         .error_400(openapi)

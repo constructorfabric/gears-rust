@@ -777,6 +777,7 @@ impl RestApiCapability for SettingsService {
             router,
             openapi,
             service,
+            self.resolver()?,
             self.db()?,
             self.enforcer()?,
         );

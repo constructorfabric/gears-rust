@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-23 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-08 by Virtuozzo International GmbH -->
 
 # Feature: Effective Value Resolution, Defaults and Cache
 
@@ -192,7 +192,7 @@ Three properties matter more than the walk itself.
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
 **Success Scenarios**:
-- A page of effective values at one scope, by category or by a named key set, each item carrying its own outcome
+- A page of effective values at one scope, by category or by a named key set, each item carrying its own outcome, with the total of settings the listing holds
 - The overrides in the caller's subtree that need review, when the filter asks for them
 
 **Error Scenarios**:
@@ -210,7 +210,7 @@ Three properties matter more than the walk itself.
 7. [x] - `p1` - **IF** the filter asks for `needs_review` → DB: SELECT the flagged override rows for declarations in the page whose tenant lies in the caller's subtree, excluding standalone descendants, through `idx_values_needs_review`, at most one thousand of them — a page with more is refused `400 review_too_many_rows` naming the bound, never cut — and return them with their detail, the setter identity masked for a caller not authorized for unmasked PII; this lists rows, not resolved values; the subtree is obtained under the shared subtree budget, and **IF** the budget cuts it → **RETURN** `400` naming the bound rather than a silently partial listing - `inst-vr-browse-7`
 8. [x] - `p1` - **ELSE** obtain the ancestor chain once and resolve every item in the page against it, masking each value and its fallback by classification, so one page answers the whole table — the value a scope holds and what it would hold without it - `inst-vr-browse-8`
 9. [x] - `p1` - **IF** the filter named a key set → report a key the caller may not see or that does not exist in its own entry with its own outcome, never as a failure of the request - `inst-vr-browse-9`
-10. [x] - `p1` - **RETURN** `200` with the page and its cursors - `inst-vr-browse-10`
+10. [x] - `p1` - **RETURN** `200` with the page, its cursors and `page_info.total_count` — the settings the walk holds for the caller, counted after the hidden exclusion under the same filter and without the cursor, so every page of one walk reports the same number; none under `needs_review`, whose items are flagged rows and not the settings paged - `inst-vr-browse-10`
 
 ## 3. Processes / Business Logic (CDSL)
 

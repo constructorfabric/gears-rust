@@ -6,21 +6,26 @@
 //! the scope is the argument every read needs, and there is no way to get one
 //! except by asking the policy decision point.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::Path;
 use axum::{Extension, Json};
 use toolkit::api::canonical_prelude::*;
+use toolkit_db::secure::DBRunner;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
 use crate::api::rest::dto::CategoryDto;
 use crate::api::rest::if_match;
+use crate::api::rest::page_dto::PageDto;
 use crate::audit::AuditSink;
 use crate::domain::category::service::Actor;
 use crate::domain::category::{CategoryRepository, CategoryService};
+use crate::domain::declaration::CategoryTally;
 use crate::domain::error::DomainError;
+use crate::gear::ConcreteResolver;
 
 /// The concrete service the routes carry.
 pub type ConcreteCategoryService = CategoryService<
@@ -34,6 +39,58 @@ const CREATE: &str = "create";
 const UPDATE: &str = "update";
 const DELETE: &str = "delete";
 
+// @cpt-dod:cpt-cf-settings-service-dod-category-management-counts:p1
+/// How many settings each of `category_ids` holds for the caller, or nothing
+/// when the caller may not read values.
+///
+/// The counts are an aggregate over settings, so they are gated as the
+/// settings are — one `read` decision on the value resource, whose
+/// constraints become the scope of the count — and counted under exactly
+/// what the caller's browse of a category pages: its administrative-domain
+/// visibility and the settings `hidden` for it on its own root-to-self
+/// chain. A category's number therefore agrees with the table under it, and
+/// a setting the caller may not see is in neither. A caller without the
+/// value read gets the categories and no counts, rather than counts of what
+/// it could not open.
+///
+/// # Errors
+/// [`DomainError`] when the caller's chain or the tallies cannot be read; a
+/// denied or unobtainable decision is not an error here but an absent count.
+async fn category_tallies<C: DBRunner>(
+    enforcer: &authz_resolver_sdk::PolicyEnforcer,
+    ctx: &SecurityContext,
+    resolver: &ConcreteResolver,
+    conn: &C,
+    category_ids: &[Uuid],
+) -> Result<Option<HashMap<Uuid, CategoryTally>>, DomainError> {
+    // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-10
+    // @cpt-begin:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-9
+    let Ok(scope) = authz::access_scope(enforcer, ctx, &resource::VALUE, READ, None).await else {
+        return Ok(None);
+    };
+    let caller_chain = resolver.chain_of(ctx.subject_tenant_id()).await?;
+    let tallies = resolver
+        .tally_declarations(conn, &scope, &caller_chain, category_ids)
+        .await?;
+    Ok(Some(tallies))
+    // @cpt-end:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-9
+    // @cpt-end:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-10
+}
+
+/// A category rendered with its counts, when the caller may see them; a
+/// category with nothing counted holds zeros, not nothing.
+fn render(
+    category: crate::domain::category::Category,
+    tallies: Option<&HashMap<Uuid, CategoryTally>>,
+) -> CategoryDto {
+    let id = category.id;
+    let dto = CategoryDto::from(category);
+    match tallies {
+        Some(tallies) => dto.with_tally(tallies.get(&id).copied().unwrap_or_default()),
+        None => dto,
+    }
+}
+
 /// `GET /settings-service/v1/categories/{id}`
 ///
 /// # Errors
@@ -42,6 +99,7 @@ const DELETE: &str = "delete";
 pub async fn get_category<R: CategoryRepository + 'static, S: AuditSink + 'static>(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<CategoryService<R, S>>>,
+    Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
     Path(id): Path<Uuid>,
@@ -66,13 +124,17 @@ pub async fn get_category<R: CategoryRepository + 'static, S: AuditSink + 'stati
     // @cpt-end:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-5
     // @cpt-end:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-4
 
+    // The same counts the listing carries, so a client that reads one
+    // category back after the rail sees the number it saw there.
+    let tallies = category_tallies(&enforcer, &ctx, &resolver, &conn, &[id]).await?;
+
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-8
     // The tag travels as a header, never in the body: one source, so a client
     // cannot echo back a stale copy it read from the wrong place.
     let etag = category.etag.as_str().to_owned();
     Ok((
         [(axum::http::header::ETAG, super::etag_header(&etag))],
-        Json(CategoryDto::from(category)),
+        Json(render(category, tallies.as_ref())),
     ))
     // @cpt-end:cpt-cf-settings-service-flow-category-management-get:p1:inst-cat-get-8
 }
@@ -86,6 +148,7 @@ pub async fn get_category<R: CategoryRepository + 'static, S: AuditSink + 'stati
 pub async fn list_categories<R: CategoryRepository + 'static, S: AuditSink + 'static>(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<CategoryService<R, S>>>,
+    Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
     OData(query): OData,
@@ -106,13 +169,17 @@ pub async fn list_categories<R: CategoryRepository + 'static, S: AuditSink + 'st
         diagnostic: err.to_string(),
     })?;
 
-    // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-9
     let page = svc.list(&conn, &scope, &query).await?;
-    let items: Vec<CategoryDto> = page.items.into_iter().map(CategoryDto::from).collect();
-    Ok(Json(toolkit_odata::Page {
-        items,
-        page_info: page.page_info,
-    }))
+    // One decision and one statement for the whole page: the counts of the
+    // categories on it, under the caller's own view of the settings.
+    let ids: Vec<Uuid> = page.items.iter().map(|c| c.id).collect();
+    let tallies = category_tallies(&enforcer, &ctx, &resolver, &conn, &ids).await?;
+    // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-9
+    // @cpt-begin:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-11
+    Ok(Json(PageDto::counted(page, |category| {
+        render(category, tallies.as_ref())
+    })))
+    // @cpt-end:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-11
     // @cpt-end:cpt-cf-settings-service-flow-category-management-list:p1:inst-cat-list-9
 }
 

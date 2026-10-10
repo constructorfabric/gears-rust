@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-24 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-08 by Virtuozzo International GmbH -->
 
 # Feature: Setting Declarations and Scope Class
 
@@ -290,7 +290,7 @@ The hardest constraint here is not any single field but the rule connecting them
 6. [x] - `p1` - DB: SELECT declarations with the combined predicate applied inside the query - `inst-decl-read-6`
 7. [x] - `p1` - **IF** a single-declaration read is filtered out → **RETURN** `404` rather than `403`, so a gated declaration's existence is not disclosed - `inst-decl-read-7`
 8. [x] - `p1` - Resolve each returned declaration's trait set for client rendering - `inst-decl-read-8`
-9. [x] - `p1` - **RETURN** `200` with the declaration or page, each carrying `key`, `value_type_id`, and resolved traits - `inst-decl-read-9`
+9. [x] - `p1` - **RETURN** `200` with the declaration or page, each carrying `key`, `value_type_id`, and resolved traits; a page carries `page_info.total_count`, the declarations the whole listing holds under its filter and visibility, counted without the cursor - `inst-decl-read-9`
 
 ## 3. Processes / Business Logic (CDSL)
 

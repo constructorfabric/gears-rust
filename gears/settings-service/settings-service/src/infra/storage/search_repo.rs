@@ -18,9 +18,9 @@ use sea_orm::{
     ColumnTrait, Condition, DbBackend, EntityTrait, ExprTrait, QueryFilter, QueryOrder,
     QuerySelect, QueryTrait,
 };
-use toolkit_db::odata::{LimitCfg, paginate_odata};
+use toolkit_db::odata::LimitCfg;
 use toolkit_db::secure::{DBRunner, SecureEntityExt};
-use toolkit_odata::{Page, SortDir};
+use toolkit_odata::SortDir;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -28,12 +28,14 @@ use crate::domain::category::Category;
 use crate::domain::category::visibility::DomainVisibility;
 use crate::domain::declaration::Declaration;
 use crate::domain::error::DomainError;
+use crate::domain::odata::Listing;
 use crate::domain::search::{Corpus, Needle, SearchRepository, SearchRequest};
 use crate::domain::value::StoredValue;
 use crate::infra::storage::declaration_odata_mapper::DeclarationODataMapper;
 use crate::infra::storage::entity::category::{self, Entity as CategoryEntity};
 use crate::infra::storage::entity::declaration::{self, Entity as DeclarationEntity};
 use crate::infra::storage::entity::setting_value::{self, Entity as ValueEntity};
+use crate::infra::storage::listing::list_counted;
 use crate::infra::storage::{category_repo, declaration_repo, value_repo};
 use settings_service_sdk::odata::DeclarationFilterField;
 
@@ -175,7 +177,7 @@ impl SearchRepository for SearchRepo {
         &self,
         conn: &C,
         request: &SearchRequest<'_>,
-    ) -> Result<Page<Declaration>, DomainError> {
+    ) -> Result<Listing<Declaration>, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-7
         let pattern = request.needle.like_pattern();
 
@@ -250,14 +252,17 @@ impl SearchRepository for SearchRepo {
                 .filter(value_repo::subjectless());
             base = base.filter(declaration::Column::Id.in_subquery(flagged.into_query()));
         }
-        let base = base.secure().scope_with(request.scope);
 
         // Tiebreaker `key`, unique, so a page boundary neither repeats nor
         // skips a row. The query carries the page, the `$filter` remainder on
         // `key` and `category_id` — browse's grammar, on the declaration
-        // columns — and the binding the cursor must match.
-        let page = paginate_odata::<DeclarationFilterField, DeclarationODataMapper, _, _, _, _>(
+        // columns — and the binding the cursor must match. The total beside
+        // the page counts the settings that match in all, under the same
+        // corpus and the same exclusions, so it discloses nothing a page of
+        // hits does not.
+        let page = list_counted::<DeclarationFilterField, DeclarationODataMapper, _, _, _, _>(
             base,
+            request.scope,
             conn,
             request.query,
             ("key", SortDir::Asc),
@@ -271,13 +276,14 @@ impl SearchRepository for SearchRepo {
             message: err.to_string(),
         })?;
 
-        Ok(Page {
+        Ok(Listing {
             items: page
                 .items
                 .into_iter()
                 .map(declaration_repo::to_domain)
                 .collect(),
             page_info: page.page_info,
+            total_count: page.total_count,
         })
         // @cpt-end:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-7
     }

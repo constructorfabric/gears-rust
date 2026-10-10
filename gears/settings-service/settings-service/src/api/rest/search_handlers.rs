@@ -13,6 +13,7 @@ use toolkit_odata::ODataQuery;
 use toolkit_security::{AccessScope, SecurityContext};
 
 use crate::api::authz::{self, resource};
+use crate::api::rest::page_dto::{PageDto, PageInfoDto};
 use crate::api::rest::search_dto::{SearchHitDto, render_hit};
 use crate::api::rest::setting_filter::interpret;
 use crate::api::rest::setting_handlers::{
@@ -154,9 +155,11 @@ pub async fn search_settings(
 
     // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-11
     let items: Vec<SearchHitDto> = page.hits.iter().map(|h| render_hit(h, root, pii)).collect();
-    Ok(Json(toolkit_odata::Page {
+    // The total is of settings, as the cursor is: a setting's hits travel
+    // with it, so a page of hits is cut at a setting, never inside one.
+    Ok(Json(PageDto {
         items,
-        page_info: page.page_info,
+        page_info: PageInfoDto::of(page.page_info, Some(page.total_count)),
     }))
     // @cpt-end:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-11
 }
