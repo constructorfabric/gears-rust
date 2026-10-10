@@ -1,5 +1,8 @@
 # DB behavior audit — resource-group
 
+The general rules and audit method are in
+[`docs/toolkit_unified_system/14_db_behavior_testing.md`](../../../../docs/toolkit_unified_system/14_db_behavior_testing.md);
+this document is the report of the audit run against resource-group.
 
 <!-- toc -->
 
