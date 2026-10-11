@@ -129,6 +129,15 @@ pub enum OutboxError {
 
     #[error("a traced batch of {entities} entities exceeds the addressable maximum")]
     TracedBatchTooLarge { entities: usize },
+    #[error("queue '{queue}' is full: {scope} {bounds}")]
+    QueueFull {
+        queue: String,
+        /// Which predicate refused it. The queue-wide figure and a partition's
+        /// share are different numbers, and this is what tells them apart.
+        scope: super::limits::FullScope,
+        /// Only the bounds that are actually configured.
+        bounds: super::limits::Bounds,
+    },
 
     #[error("invalid queue name: {reason}")]
     InvalidQueueName { reason: &'static str },
@@ -421,6 +430,29 @@ impl WorkerTuning {
         }
     }
 
+    /// Counter-audit defaults.
+    ///
+    /// Signal-driven, with a slow timer behind it: the vacuum tells it which
+    /// partition looked unaudited, and `idle_interval` paces a sweep for the
+    /// drift the vacuum cannot see, such as rows deleted from the incoming
+    /// channel. Because it always reports `Idle` - a correction creates no
+    /// further work - the other pacing intervals are never consulted.
+    #[must_use]
+    pub fn counter_audit() -> Self {
+        Self {
+            batch_size: 1,
+            min_interval: Duration::from_millis(100),
+            active_interval: Duration::from_millis(100),
+            idle_interval: Duration::from_secs(30),
+            ramp_step: Duration::ZERO,
+            retry_base: Duration::from_millis(100),
+            retry_max: Duration::from_secs(30),
+            degradation_threshold: 1,
+            lease_duration: Duration::from_secs(30),
+            stop_grace: Duration::from_secs(5),
+        }
+    }
+
     /// Reconciler defaults.
     #[must_use]
     pub fn reconciler() -> Self {
@@ -660,6 +692,7 @@ pub struct OutboxProfile {
     pub reconciler: WorkerTuning,
     pub notifier: WorkerTuning,
     pub trace_sweeper: WorkerTuning,
+    pub counter_audit: WorkerTuning,
 }
 
 impl OutboxProfile {
@@ -673,6 +706,7 @@ impl OutboxProfile {
             reconciler: WorkerTuning::reconciler(),
             notifier: WorkerTuning::notifier(),
             trace_sweeper: WorkerTuning::trace_sweeper(),
+            counter_audit: WorkerTuning::counter_audit(),
         }
     }
 
@@ -688,6 +722,7 @@ impl OutboxProfile {
             // waiting on a chat message, not a nightly job.
             notifier: WorkerTuning::notifier().idle_interval(Duration::from_millis(50)),
             trace_sweeper: WorkerTuning::trace_sweeper(),
+            counter_audit: WorkerTuning::counter_audit(),
         }
     }
 
@@ -701,6 +736,7 @@ impl OutboxProfile {
             reconciler: WorkerTuning::reconciler(),
             notifier: WorkerTuning::notifier().batch_size(500),
             trace_sweeper: WorkerTuning::trace_sweeper(),
+            counter_audit: WorkerTuning::counter_audit(),
         }
     }
 
@@ -714,6 +750,7 @@ impl OutboxProfile {
             reconciler: WorkerTuning::reconciler().idle_interval(Duration::from_mins(2)),
             notifier: WorkerTuning::notifier().idle_interval(Duration::from_secs(1)),
             trace_sweeper: WorkerTuning::trace_sweeper(),
+            counter_audit: WorkerTuning::counter_audit(),
         }
     }
 }

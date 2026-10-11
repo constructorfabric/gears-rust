@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::admission::Arrivals;
 use super::prioritizer::SharedPrioritizer;
 use super::types::OutboxMessageId;
 
@@ -32,6 +33,9 @@ pub struct Wake {
     /// `None` before the pipeline has started (no prioritizer installed) or for
     /// an empty wake; `fire` is then a no-op.
     prioritizer: Option<Arc<SharedPrioritizer>>,
+    /// What the enqueue reported to a bounded queue's admission journal,
+    /// handed back by [`discard`](Self::discard).
+    arrivals: Arrivals,
 }
 
 impl std::fmt::Debug for Wake {
@@ -40,7 +44,7 @@ impl std::fmt::Debug for Wake {
             .field("ids", &self.ids)
             .field("partitions", &self.partitions)
             .field("started", &self.prioritizer.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -57,6 +61,7 @@ impl Wake {
             ids: Vec::new(),
             partitions: Vec::new(),
             prioritizer: None,
+            arrivals: Arrivals::default(),
         }
     }
 
@@ -70,7 +75,21 @@ impl Wake {
             ids,
             partitions,
             prioritizer,
+            arrivals: Arrivals::default(),
         }
+    }
+
+    /// Carry what the enqueue reported to admission, so a rollback can take
+    /// it back.
+    pub(crate) fn with_arrivals(mut self, arrivals: Arrivals) -> Self {
+        self.arrivals = arrivals;
+        self
+    }
+
+    /// Take what the enqueue counted against admission, leaving the wake to
+    /// fire without it.
+    pub(crate) fn take_arrivals(&mut self) -> Arrivals {
+        std::mem::take(&mut self.arrivals)
     }
 
     /// The ids of the enqueued messages, in enqueue order.
@@ -105,9 +124,16 @@ impl Wake {
     /// Deliberately drop without firing - the rollback path, where the rows
     /// were never committed and must not wake a sequencer. Marks the wake
     /// handled so [`Drop`] stays silent.
+    ///
+    /// Also takes back what the enqueue counted against a bounded queue, so a
+    /// rolled-back submission stops occupying the queue's allowance at once. A
+    /// wake dropped unhandled keeps that count, since whether its rows
+    /// committed is unknown, and the counter audit clears it once the partition
+    /// is proved empty.
     pub fn discard(mut self) {
         self.prioritizer = None;
         self.partitions.clear();
+        std::mem::take(&mut self.arrivals).roll_back();
     }
 }
 
@@ -135,6 +161,7 @@ impl std::ops::AddAssign for Wake {
         // as a no-op.
         self.ids.append(&mut rhs.ids);
         self.partitions.append(&mut rhs.partitions);
+        self.arrivals.append(&mut rhs.arrivals);
         // Keep partitions distinct, exactly as enqueue_batch does: several
         // enqueues into one partition within a unit of work must mark it dirty
         // once, not once per message. ids are left as-is - every message is a

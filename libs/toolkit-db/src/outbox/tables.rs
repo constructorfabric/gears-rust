@@ -17,6 +17,7 @@ pub struct OutboxTables {
     processor: String,
     vacuum_counter: String,
     trace: String,
+    partition_counter: String,
     body_id_sequence: String,
     incoming_id_sequence: String,
     idx_incoming_partition: String,
@@ -55,6 +56,7 @@ impl OutboxTables {
             processor: suffixed(&prefix, "processor"),
             vacuum_counter: suffixed(&prefix, "vacuum_counter"),
             trace: suffixed(&prefix, "trace"),
+            partition_counter: suffixed(&prefix, "partition_counter"),
             body_id_sequence: suffixed(&prefix, "body_id_sequence"),
             incoming_id_sequence: suffixed(&prefix, "incoming_id_sequence"),
             idx_incoming_partition: indexed(&prefix, "incoming_partition"),
@@ -112,6 +114,13 @@ impl OutboxTables {
         &self.trace
     }
 
+    /// The channel counters. Its own table because it is its own
+    /// functionality: only the flusher and the audit write it, and no hot
+    /// path touches it.
+    pub(crate) fn partition_counter(&self) -> &str {
+        &self.partition_counter
+    }
+
     pub(crate) fn body_id_sequence(&self) -> &str {
         &self.body_id_sequence
     }
@@ -121,7 +130,7 @@ impl OutboxTables {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn table_names(&self) -> [&str; 8] {
+    pub(crate) fn table_names(&self) -> [&str; 9] {
         [
             self.body(),
             self.partitions(),
@@ -131,6 +140,7 @@ impl OutboxTables {
             self.processor(),
             self.vacuum_counter(),
             self.trace(),
+            self.partition_counter(),
         ]
     }
 
@@ -188,6 +198,7 @@ impl OutboxTables {
             self.processor(),
             self.vacuum_counter(),
             self.trace(),
+            self.partition_counter(),
             self.body_id_sequence(),
             self.incoming_id_sequence(),
             self.idx_incoming_partition(),

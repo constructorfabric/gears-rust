@@ -16,6 +16,7 @@ pub(super) struct OutboxStatements {
     processor: ProcessorStatements,
     vacuum: VacuumStatements,
     sweep: SweepStatements,
+    channels: ChannelStatements,
     dead_letters: DeadLetterStatements,
 }
 
@@ -23,6 +24,7 @@ pub(super) struct RegistrationStatements {
     register_queue_select: String,
     register_queue_insert: String,
     insert_vacuum_counter_row: String,
+    insert_partition_counter_row: String,
 }
 
 pub(super) struct EnqueueStatements {
@@ -72,6 +74,17 @@ pub(super) struct SweepStatements {
     select_collectable_traces: String,
 }
 
+/// Statements that read and write the per-partition channel counters.
+pub(super) struct ChannelStatements {
+    apply_deltas: String,
+    read_queue: String,
+    read_partition: String,
+    any_incoming: String,
+    any_outgoing_past_cursor: String,
+    count_incoming: String,
+    count_outgoing_past_cursor: String,
+}
+
 pub(super) struct VacuumStatements {
     cleanup: VacuumSql,
     bump_counter: String,
@@ -101,6 +114,7 @@ impl OutboxStatements {
             processor: ProcessorStatements::new(dialect, tables),
             vacuum: VacuumStatements::new(dialect, tables),
             sweep: SweepStatements::new(dialect, tables),
+            channels: ChannelStatements::new(dialect, tables),
             dead_letters: DeadLetterStatements::new(tables),
         }
     }
@@ -137,6 +151,10 @@ impl OutboxStatements {
         &self.sweep
     }
 
+    pub(super) fn channels(&self) -> &ChannelStatements {
+        &self.channels
+    }
+
     pub(super) fn processor(&self) -> &ProcessorStatements {
         &self.processor
     }
@@ -156,6 +174,7 @@ impl RegistrationStatements {
             register_queue_select: register_queue_select(dialect, tables),
             register_queue_insert: register_queue_insert(dialect, tables),
             insert_vacuum_counter_row: insert_vacuum_counter_row(dialect, tables),
+            insert_partition_counter_row: insert_partition_counter_row(dialect, tables),
         }
     }
 
@@ -169,6 +188,10 @@ impl RegistrationStatements {
 
     pub(super) fn insert_vacuum_counter_row(&self) -> &str {
         &self.insert_vacuum_counter_row
+    }
+
+    pub(super) fn insert_partition_counter_row(&self) -> &str {
+        &self.insert_partition_counter_row
     }
 }
 
@@ -391,6 +414,148 @@ impl SweepStatements {
     }
 }
 
+/// A `SUM` over a BIGINT column, cast back to something an `i64` can decode.
+///
+/// Postgres widens `SUM(BIGINT)` to `NUMERIC` and `MySQL` to `DECIMAL`, so
+/// without this the recount fails to decode on both - and only `SQLite`, which does not
+/// widen, would ever have shown it.
+fn sum_i64(dialect: Dialect, expr: &str) -> String {
+    match dialect {
+        Dialect::Postgres => format!("CAST({expr} AS BIGINT)"),
+        // BIGINT is not a MySQL cast target.
+        Dialect::MySql => format!("CAST({expr} AS SIGNED)"),
+        Dialect::Sqlite => expr.to_owned(),
+    }
+}
+
+impl ChannelStatements {
+    fn new(dialect: Dialect, tables: &OutboxTables) -> Self {
+        let numbered = |n: usize| match dialect {
+            Dialect::Postgres | Dialect::Sqlite => format!("${n}"),
+            Dialect::MySql => "?".to_owned(),
+        };
+        // `partition` is a MySQL reserved word.
+        let partition_col = match dialect {
+            Dialect::Postgres | Dialect::Sqlite => "p.partition",
+            Dialect::MySql => "p.`partition`",
+        };
+        let projection = format!(
+            "SELECT c.partition_id, \
+                    c.incoming_in_entities, c.incoming_in_bytes, \
+                    c.incoming_out_entities, c.incoming_out_bytes, \
+                    c.outgoing_in_entities, c.outgoing_in_bytes, \
+                    c.outgoing_out_entities, c.outgoing_out_bytes \
+             FROM {counter} c JOIN {partitions} p ON p.id = c.partition_id",
+            counter = tables.partition_counter(),
+            partitions = tables.partitions()
+        );
+        Self {
+            // The only statement that writes a channel counter, and it is
+            // always a delta. The flusher sends what this instance has done;
+            // the audit sends a correction for a channel it has just proved
+            // empty. Arithmetic rather than assignment, so a concurrent
+            // instance's delta composes with it instead of being discarded.
+            apply_deltas: format!(
+                "UPDATE {counter} \
+                 SET incoming_in_entities  = incoming_in_entities  + {p1}, \
+                     incoming_in_bytes     = incoming_in_bytes     + {p2}, \
+                     incoming_out_entities = incoming_out_entities + {p3}, \
+                     incoming_out_bytes    = incoming_out_bytes    + {p4}, \
+                     outgoing_in_entities  = outgoing_in_entities  + {p5}, \
+                     outgoing_in_bytes     = outgoing_in_bytes     + {p6}, \
+                     outgoing_out_entities = outgoing_out_entities + {p7}, \
+                     outgoing_out_bytes    = outgoing_out_bytes    + {p8} \
+                 WHERE partition_id = {p9}",
+                counter = tables.partition_counter(),
+                p1 = numbered(1),
+                p2 = numbered(2),
+                p3 = numbered(3),
+                p4 = numbered(4),
+                p5 = numbered(5),
+                p6 = numbered(6),
+                p7 = numbered(7),
+                p8 = numbered(8),
+                p9 = numbered(9)
+            ),
+            // Every partition of one queue, in partition order. Both admission
+            // predicates need the breakdown: the queue-wide bound is the sum,
+            // and the per-partition guard is each row on its own.
+            read_queue: format!(
+                "{projection} WHERE p.queue = {p1} ORDER BY {partition_col}",
+                p1 = numbered(1)
+            ),
+            read_partition: format!("{projection} WHERE c.partition_id = {p1}", p1 = numbered(1)),
+            // Emptiness, as an index probe rather than a count: the audit only
+            // needs to know whether a channel holds anything, and a count of a
+            // deep channel would cost most exactly when it matters least.
+            any_incoming: format!(
+                "SELECT 1 FROM {incoming} WHERE partition_id = {p1} LIMIT 1",
+                incoming = tables.incoming(),
+                p1 = numbered(1)
+            ),
+            any_outgoing_past_cursor: format!(
+                "SELECT 1 FROM {outgoing} o \
+                  JOIN {processor} r ON r.partition_id = o.partition_id \
+                 WHERE o.partition_id = {p1} AND o.seq > r.processed_seq LIMIT 1",
+                outgoing = tables.outgoing(),
+                processor = tables.processor(),
+                p1 = numbered(1)
+            ),
+            // The exact recount, for the operator remedy only. Never on a
+            // timer. `SUM` over a BIGINT column widens to NUMERIC on Postgres
+            // and DECIMAL on MySQL, neither of which decodes into an i64, so
+            // the cast is not cosmetic.
+            count_incoming: format!(
+                "SELECT COUNT(*) AS entities, \
+                        {sum} AS bytes \
+                 FROM {incoming} WHERE partition_id = {p1}",
+                sum = sum_i64(dialect, "COALESCE(SUM(bytes), 0)"),
+                incoming = tables.incoming(),
+                p1 = numbered(1)
+            ),
+            count_outgoing_past_cursor: format!(
+                "SELECT COUNT(*) AS entities, \
+                        {sum} AS bytes \
+                 FROM {outgoing} o \
+                  JOIN {processor} r ON r.partition_id = o.partition_id \
+                 WHERE o.partition_id = {p1} AND o.seq > r.processed_seq",
+                sum = sum_i64(dialect, "COALESCE(SUM(o.bytes), 0)"),
+                outgoing = tables.outgoing(),
+                processor = tables.processor(),
+                p1 = numbered(1)
+            ),
+        }
+    }
+
+    pub(super) fn apply_deltas(&self) -> &str {
+        &self.apply_deltas
+    }
+
+    pub(super) fn read_queue(&self) -> &str {
+        &self.read_queue
+    }
+
+    pub(super) fn read_partition(&self) -> &str {
+        &self.read_partition
+    }
+
+    pub(super) fn any_incoming(&self) -> &str {
+        &self.any_incoming
+    }
+
+    pub(super) fn any_outgoing_past_cursor(&self) -> &str {
+        &self.any_outgoing_past_cursor
+    }
+
+    pub(super) fn count_incoming(&self) -> &str {
+        &self.count_incoming
+    }
+
+    pub(super) fn count_outgoing_past_cursor(&self) -> &str {
+        &self.count_outgoing_past_cursor
+    }
+}
+
 impl VacuumStatements {
     fn new(dialect: Dialect, tables: &OutboxTables) -> Self {
         Self {
@@ -490,8 +655,8 @@ fn insert_body_and_incoming_cte(dialect: Dialect, tables: &OutboxTables) -> Opti
                INSERT INTO {} (payload, payload_type, trace) \
                VALUES ($1, $2, $3) RETURNING id\
              ) \
-             INSERT INTO {} (partition_id, body_id) \
-             SELECT $4, id FROM b RETURNING id",
+             INSERT INTO {} (partition_id, body_id, bytes) \
+             SELECT $4, id, $5 FROM b RETURNING id",
             tables.body(),
             tables.incoming()
         )),
@@ -533,11 +698,11 @@ fn insert_trace(dialect: Dialect, tables: &OutboxTables) -> String {
 fn insert_incoming(dialect: Dialect, tables: &OutboxTables) -> String {
     match dialect {
         Dialect::Postgres | Dialect::Sqlite => format!(
-            "INSERT INTO {} (partition_id, body_id) VALUES ($1, $2) RETURNING id",
+            "INSERT INTO {} (partition_id, body_id, bytes) VALUES ($1, $2, $3) RETURNING id",
             tables.incoming()
         ),
         Dialect::MySql => format!(
-            "INSERT INTO {} (partition_id, body_id) VALUES (?, ?)",
+            "INSERT INTO {} (partition_id, body_id, bytes) VALUES (?, ?, ?)",
             tables.incoming()
         ),
     }
@@ -1004,7 +1169,7 @@ fn vacuum_cleanup(dialect: Dialect, tables: &OutboxTables) -> VacuumSql {
     match dialect {
         Dialect::Postgres | Dialect::Sqlite => VacuumSql {
             select_outgoing_chunk: format!(
-                "SELECT id, body_id FROM {} \
+                "SELECT id, body_id, bytes FROM {} \
                  WHERE partition_id = $1 AND seq <= $2 \
                  ORDER BY seq LIMIT $3",
                 tables.outgoing()
@@ -1012,7 +1177,7 @@ fn vacuum_cleanup(dialect: Dialect, tables: &OutboxTables) -> VacuumSql {
         },
         Dialect::MySql => VacuumSql {
             select_outgoing_chunk: format!(
-                "SELECT id, body_id FROM {} \
+                "SELECT id, body_id, bytes FROM {} \
                  WHERE partition_id = ? AND seq <= ? \
                  ORDER BY seq LIMIT ?",
                 tables.outgoing()
@@ -1090,9 +1255,16 @@ fn reset_vacuum_counter(dialect: Dialect, tables: &OutboxTables) -> String {
     }
 }
 
-/// One row per partition, created at registration and never deleted.
+fn insert_partition_counter_row(dialect: Dialect, tables: &OutboxTables) -> String {
+    insert_counter_row(dialect, tables.partition_counter())
+}
+
 fn insert_vacuum_counter_row(dialect: Dialect, tables: &OutboxTables) -> String {
-    let table = tables.vacuum_counter();
+    insert_counter_row(dialect, tables.vacuum_counter())
+}
+
+/// One row per partition, created at registration and never deleted.
+fn insert_counter_row(dialect: Dialect, table: &str) -> String {
     match dialect {
         Dialect::Postgres => format!(
             "INSERT INTO {table} (partition_id) \
@@ -1283,6 +1455,41 @@ mod tests {
                 my.sweep().select_collectable_traces(),
             ),
             (
+                "apply_channel_deltas",
+                pg.channels().apply_deltas(),
+                my.channels().apply_deltas(),
+            ),
+            (
+                "read_queue_channels",
+                pg.channels().read_queue(),
+                my.channels().read_queue(),
+            ),
+            (
+                "read_partition_channels",
+                pg.channels().read_partition(),
+                my.channels().read_partition(),
+            ),
+            (
+                "any_incoming",
+                pg.channels().any_incoming(),
+                my.channels().any_incoming(),
+            ),
+            (
+                "any_outgoing_past_cursor",
+                pg.channels().any_outgoing_past_cursor(),
+                my.channels().any_outgoing_past_cursor(),
+            ),
+            (
+                "count_incoming",
+                pg.channels().count_incoming(),
+                my.channels().count_incoming(),
+            ),
+            (
+                "count_outgoing_past_cursor",
+                pg.channels().count_outgoing_past_cursor(),
+                my.channels().count_outgoing_past_cursor(),
+            ),
+            (
                 "advance_processed_seq",
                 pg.processor().advance_processed_seq(),
                 my.processor().advance_processed_seq(),
@@ -1425,6 +1632,11 @@ mod tests {
             pg.vacuum().fetch_dirty_partitions().to_owned(),
             pg.vacuum().cleanup().select_outgoing_chunk.clone(),
             pg.sweep().select_collectable_traces().to_owned(),
+            pg.channels().apply_deltas().to_owned(),
+            pg.channels().read_queue().to_owned(),
+            pg.channels().read_partition().to_owned(),
+            pg.channels().any_incoming().to_owned(),
+            pg.channels().any_outgoing_past_cursor().to_owned(),
         ];
         if let AllocSql::UpdateReturning(sql) = pg.sequencer().allocate_sequences() {
             statements_to_check.push(sql.clone());
@@ -1436,7 +1648,7 @@ mod tests {
             assert_eq!(order, ascending, "placeholders out of textual order: {sql}");
             checked += 1;
         }
-        assert!(checked >= 21, "only {checked} statements checked");
+        assert!(checked >= 26, "only {checked} statements checked");
     }
 
     #[test]
