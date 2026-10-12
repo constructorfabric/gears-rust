@@ -93,7 +93,7 @@ fn typed_values_cannot_bypass_wire_bounds() {
 #[test]
 fn grant_golden_round_trip_preserves_version_generation_and_microseconds() {
     let fixtures: Value =
-        serde_json::from_str(include_str!("../contracts/boundary-fixtures.json")).unwrap();
+        serde_json::from_str(include_str!("fixtures/boundary-fixtures.json")).unwrap();
     let value = &fixtures["golden_envelopes"]
         .as_array()
         .unwrap()

@@ -52,6 +52,21 @@ fn cursor_round_trips_microseconds_and_binary_identity() {
     let token = encode_cursor(binding(&hash), position()).unwrap();
     let decoded = decode_cursor(&token, binding(&hash)).unwrap();
     assert_eq!(decoded, position());
+    // A one-microsecond or identity change of the position is a different token.
+    for moved in [
+        Position {
+            at_micros: position().at_micros + 1,
+            ..position()
+        },
+        Position {
+            id: u(8),
+            ..position()
+        },
+    ] {
+        let other = encode_cursor(binding(&hash), moved).unwrap();
+        assert_ne!(other, token);
+        assert_eq!(decode_cursor(&other, binding(&hash)).unwrap(), moved);
+    }
     // The instant keeps its microseconds exactly, including a negative epoch offset.
     let before = Position::of(
         time::OffsetDateTime::from_unix_timestamp_nanos(-1_000_000_001_500).unwrap(),

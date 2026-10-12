@@ -6,7 +6,7 @@ use serde_json::Value;
 #[test]
 fn independent_etag_and_problem_goldens_match_real_rust_adapters() {
     let fixtures: Value = serde_json::from_str(include_str!(
-        "../../orders-lifecycle-sdk/contracts/boundary-fixtures.json"
+        "../../orders-lifecycle-sdk/tests/fixtures/boundary-fixtures.json"
     ))
     .unwrap();
     for case in fixtures["cases"].as_array().unwrap() {

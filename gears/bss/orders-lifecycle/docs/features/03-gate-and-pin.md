@@ -290,6 +290,24 @@ The implementation MUST expose the [design §3.8](../DESIGN.md#contract-03-3-8) 
 
 - [ ] Fault-injection integration scenarios verify the per-port/predicate signals, missing occupancy fields, activation retry exhaustion and all three alert classes; public refusal responses remain sanitized.
 
+- [ ] Commercial scenario matrix (S3-12, S3-13, S3-13/S5-07). Each row is pending runtime evidence and becomes an executable test fixture when its submit integration lands.
+
+  | Scenario | Sales path and payer | Catalog | Terms / charges | Lines | Owner | Dimension values | Requirements | Venue | Expected |
+  |---|---|---|---|---|---|---|---|---|---|
+  | `self-service-published` | self-service, payer = resource | published | finite / recurring | 1 | available | none, `default` | D-188, D-195 | owner SDK + authenticated submit integration | authorized caller owns resource and payer; authoritative market; finite pin |
+  | `partner-delegated` | partner-placed, payer = resource | published | finite / recurring | 1 | available | none, `default` | D-194, D-199 | owner SDK + authenticated submit integration | PDP validates current delegated authority; provider service identity is not buyer proof |
+  | `third-party-payer` | self-service, payer = third party | published | finite / recurring | 1 | available | none, `default` | D-194, D-199 | owner SDK + authenticated submit integration | authorize all three axes including proposed payer; read payer market |
+  | `catalog-scheduled` | self-service, payer = resource | scheduled | finite / recurring | 1 | available | none, `default` | D-189, D-190 | owner SDK + authenticated submit integration | assess at requested activation date, not wall clock publication alone |
+  | `catalog-superseded` | self-service, payer = resource | superseded | finite / recurring | 1 | available | none, `default` | D-189, D-190 | owner SDK + authenticated submit integration | preserve held selection; ordinary successor does not invalidate a receipt |
+  | `catalog-closed` | self-service, payer = resource | closed | finite / recurring | 1 | available | none, `default` | D-189, D-190 | owner SDK + authenticated submit integration | fresh receiver check refuses explicit closure and compensates before failure acknowledgement |
+  | `catalog-retired` | self-service, payer = resource | retired | finite / recurring | 1 | available | none, `default` | D-189, D-190 | owner SDK + authenticated submit integration | no new sale; receiver mapping must distinguish retirement from expiry |
+  | `rolling-usage` | self-service, payer = resource | published | rolling / usage | 1 | available | none, `default` | D-193, D-197 | owner SDK + authenticated submit integration | unknown future usage is not zero or fabricated TCV |
+  | `mixed-terms-charges` | self-service, payer = resource | published | finite, rolling / recurring, one_time, usage | 3 | available | none, `default` | D-193, D-197 | owner SDK + authenticated submit integration | line-specific cycles; one order TCV carrier; withheld estimate where input is insufficient |
+  | `max-200-lines` | self-service, payer = resource | published | finite / recurring | 200 | available | none, `default` | D-188, D-192 | owner SDK + authenticated submit integration | complete unique roster, 200-line bound; separately enforce whole-version 1 MiB bound |
+  | `over-200-lines` | self-service, payer = resource | published | finite / recurring | 201 | available | none, `default` | D-192 | owner SDK + authenticated submit integration | boundary rejects before remote mutation |
+  | `owner-unavailable` | self-service, payer = resource | published | finite / recurring | 1 | unavailable | none, `default` | D-189, D-197, D-199 | owner SDK + authenticated submit integration | Preview may withhold optional context; submit defers/fails closed and creates no fabricated evidence |
+  | `default-dimension-not-literal-default` | self-service, payer = resource | published | finite / recurring | 1 | available | none, `default` | D-195 | owner SDK + authenticated submit integration | native None and literal default remain distinct evaluation identities |
+
 ## 7. Detailed Behavior Contracts
 
 **Contract namespace 03.** Section numbers inside the detailed contracts below resolve

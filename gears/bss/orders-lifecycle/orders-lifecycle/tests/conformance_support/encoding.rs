@@ -1,4 +1,4 @@
-//! Test-only reference encoder. Runtime audit/idempotency/cursors are later packages.
+//! Test-only reference encoder. Runtime audit/idempotency are later packages.
 use anyhow::{Context, bail, ensure};
 use serde_json::Value;
 use uuid::Uuid;
@@ -324,12 +324,8 @@ pub fn encode(kind: &str, input: &Value) -> anyhow::Result<Vec<u8>> {
             }
             Ok(out)
         }
-        "request" | "cursor" => {
-            let mut out = tagged(if kind == "request" {
-                "VHP-BSS-ORDERS-REQUEST-FIXTURE-v1"
-            } else {
-                "VHP-BSS-ORDERS-CURSOR-FIXTURE-v1"
-            });
+        "request" => {
+            let mut out = tagged("VHP-BSS-ORDERS-REQUEST-FIXTURE-v1");
             out.extend(canonical(input)?.as_bytes());
             Ok(out)
         }

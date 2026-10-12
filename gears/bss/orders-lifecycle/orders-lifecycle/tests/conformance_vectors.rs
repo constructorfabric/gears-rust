@@ -162,36 +162,6 @@ fn request_fingerprint_fixture_binds_each_semantic_input() {
 }
 
 #[test]
-fn cursor_fixture_binds_every_collection_context_and_microsecond_position() {
-    for endpoint in ["orders", "versions", "lines", "acceptances", "audit"] {
-        let base = named(&format!("cursor-{endpoint}"))["input"].clone();
-        let bytes = encoding::encode("cursor", &base).unwrap();
-        for key in [
-            "endpoint",
-            "parent_order_id",
-            "subject_tenant_id",
-            "subject_id",
-            "filters",
-            "sort",
-            "position",
-            "format_version",
-        ] {
-            let mut changed = base.clone();
-            changed[key] = json!("different");
-            assert_ne!(
-                encoding::encode("cursor", &changed).unwrap(),
-                bytes,
-                "{endpoint}/{key}"
-            );
-        }
-    }
-    let mut audit = named("cursor-audit")["input"].clone();
-    let before = encoding::encode("cursor", &audit).unwrap();
-    audit["position"]["created_at_micros"] = json!("1791288000123457");
-    assert_ne!(encoding::encode("cursor", &audit).unwrap(), before);
-}
-
-#[test]
 fn force_request_observation_is_hashed_closed_and_never_a_chain_sequence() {
     let row = named("v3-force-request")["input"].clone();
     let original = encoding::audit(&row).unwrap();
