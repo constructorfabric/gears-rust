@@ -185,7 +185,7 @@ fn default_recon_config_validates() {
 fn default_recon_config_values() {
     let cfg = ReconConfig::default();
     assert_eq!(cfg.recon_tick_secs, 300);
-    assert_eq!(cfg.ar_tolerance_minor_per_k_lines, 1);
+    assert_eq!(cfg.ar_tolerance_increments_per_k_lines, 1);
     assert!(
         !cfg.manifest_enforcement,
         "manifest enforcement default OFF"
@@ -339,4 +339,15 @@ fn recon_lifecycle_knobs_deserialize_from_their_config_spelling() {
     assert_eq!(cfg.purge_max_rows_per_tick, 200_000);
     assert_eq!(cfg.purge_max_tenants_per_tick, 50);
     assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn recon_tolerance_accepts_its_pre_decimal_key_name() {
+    let current: ReconConfig =
+        serde_json::from_value(serde_json::json!({ "ar_tolerance_increments_per_k_lines": 3 }))
+            .unwrap();
+    let legacy: ReconConfig =
+        serde_json::from_value(serde_json::json!({ "ar_tolerance_minor_per_k_lines": 3 })).unwrap();
+    assert_eq!(current.ar_tolerance_increments_per_k_lines, 3);
+    assert_eq!(legacy.ar_tolerance_increments_per_k_lines, 3);
 }

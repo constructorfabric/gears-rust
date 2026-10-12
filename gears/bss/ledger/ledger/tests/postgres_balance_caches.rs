@@ -48,8 +48,8 @@ async fn account_balance_rejects_negative_ar() {
     let err = db
         .execute_raw(exec(format!(
             "INSERT INTO bss.ledger_account_balance
-                (tenant_id, account_id, currency, account_class, normal_side, balance_minor)
-             VALUES ('{tenant_id}', '{account_id}', 'USD', 'AR', 'DR', -5)"
+                (tenant_id, account_id, currency, currency_scale, account_class, normal_side, balance)
+             VALUES ('{tenant_id}', '{account_id}', 'USD', 2, 'AR', 'DR', '-0.05')"
         )))
         .await
         .expect_err("negative AR balance must be rejected by CHECK");
@@ -70,8 +70,8 @@ async fn account_balance_allows_negative_revenue() {
     // may legitimately be negative on the cache row's signed convention.
     db.execute_raw(exec(format!(
         "INSERT INTO bss.ledger_account_balance
-            (tenant_id, account_id, currency, account_class, normal_side, balance_minor)
-         VALUES ('{tenant_id}', '{account_id}', 'USD', 'REVENUE', 'CR', -100)"
+            (tenant_id, account_id, currency, currency_scale, account_class, normal_side, balance)
+         VALUES ('{tenant_id}', '{account_id}', 'USD', 2, 'REVENUE', 'CR', '-1')"
     )))
     .await
     .expect("negative REVENUE balance must be allowed");
@@ -86,8 +86,8 @@ async fn tax_subbalance_allows_negative() {
 
     db.execute_raw(exec(format!(
         "INSERT INTO bss.ledger_tax_subbalance
-            (tenant_id, account_id, tax_jurisdiction, tax_filing_period, balance_minor)
-         VALUES ('{tenant_id}', '{account_id}', 'US-CA', '2026Q2', -42)"
+            (tenant_id, account_id, tax_jurisdiction, tax_filing_period, currency, currency_scale, balance)
+         VALUES ('{tenant_id}', '{account_id}', 'US-CA', '2026Q2', 'USD', 2, '-0.42')"
     )))
     .await
     .expect("tax_subbalance has no aggregate no-negative guard");

@@ -28,7 +28,6 @@ use std::sync::Arc;
 
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice, TaxBreakdown};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::infra::authz::cross_tenant::{CrossTenantGateway, TargetScope};
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
 use bss_ledger::infra::inquiry::{AuditPackExporter, InquiryFilter, InquiryService};
@@ -48,6 +47,16 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
 }
 
 async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
@@ -113,8 +122,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -158,9 +166,8 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
 
 fn revenue_item(amount: i64) -> InvoiceItem {
     InvoiceItem {
-        amount_minor_ex_tax: amount,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(amount),
+        deferred: usd_cents(0),
         revenue_stream: "subscription".to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -175,8 +182,7 @@ fn revenue_item(amount: i64) -> InvoiceItem {
 
 fn tax_breakdown(amount: i64) -> TaxBreakdown {
     TaxBreakdown {
-        amount_minor: amount,
-        currency: "USD".to_owned(),
+        amount: usd_cents(amount),
         tax_jurisdiction: "US-CA".to_owned(),
         tax_filing_period: "2026Q2".to_owned(),
         tax_rate_ref: None,
@@ -283,7 +289,15 @@ async fn filter_export_and_drill() {
         .expect("export_csv");
     let mut lines = csv.lines();
     let header = lines.next().expect("a header row");
-    assert_eq!(header.split(',').count(), 22, "the header has 22 columns");
+    assert_eq!(
+        header.split(',').count(),
+        23,
+        "the header has 23 columns (amount, currency, currency_scale)"
+    );
+    assert!(
+        header.contains(",amount,currency,currency_scale,"),
+        "the money columns are decimal amount + explicit currency and scale: {header}"
+    );
     assert!(
         header.starts_with("entry_id,tenant_id,period_id"),
         "header order"
@@ -291,6 +305,44 @@ async fn filter_export_and_drill() {
     let body_rows = csv.lines().count() - 1;
     assert_eq!(row_count, 6, "two 3-line entries => 6 data rows");
     assert_eq!(body_rows, row_count, "row_count matches the CSV body rows");
+    // The money cells of the data rows: canonical major-unit text, the code and
+    // the stored scale, in their own columns. Each invoice posts AR 12.00 (DR),
+    // revenue 10.00 and tax 2.00 (CR) in USD@2.
+    let names: Vec<&str> = header.split(',').collect();
+    let col = |name: &str| names.iter().position(|n| *n == name).expect("column");
+    let mut money_by_class: Vec<(String, String, String, String)> = lines
+        .map(|row| {
+            let cells: Vec<&str> = row.split(',').collect();
+            assert_eq!(cells.len(), names.len(), "full-width row: {row}");
+            (
+                cells[col("account_class")].to_owned(),
+                cells[col("amount")].to_owned(),
+                cells[col("currency")].to_owned(),
+                cells[col("currency_scale")].to_owned(),
+            )
+        })
+        .collect();
+    money_by_class.sort();
+    let expected = |class: &str, amount: &str| {
+        (
+            class.to_owned(),
+            amount.to_owned(),
+            "USD".to_owned(),
+            "2".to_owned(),
+        )
+    };
+    assert_eq!(
+        money_by_class,
+        vec![
+            expected("AR", "12"),
+            expected("AR", "12"),
+            expected("REVENUE", "10"),
+            expected("REVENUE", "10"),
+            expected("TAX_PAYABLE", "2"),
+            expected("TAX_PAYABLE", "2"),
+        ],
+        "data-row money cells"
+    );
 
     // RFC-4180 quoting: post an invoice whose business id carries a comma, then
     // assert the CSV quotes that field. `source_business_id` (= the invoice id)

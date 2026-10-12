@@ -234,7 +234,9 @@ impl TenantTraversalDepth {
 /// Paired filter engine + expression for a subscription interest.
 #[derive(Debug, Clone)]
 pub struct Filter {
+    /// GTS id of the filter engine that evaluates `expression`.
     pub(crate) engine: GtsInstanceId,
+    /// Expression in the engine's language; validated to 1..=4096 bytes.
     pub(crate) expression: String,
 }
 
@@ -267,11 +269,17 @@ impl Filter {
 /// One interest entry for a subscription JOIN.
 #[derive(Debug, Clone)]
 pub struct SubscriptionInterest {
+    /// Topic the interest subscribes to.
     pub(crate) topic: GtsInstanceId,
+    /// Root tenant whose events are of interest.
     pub(crate) tenant_id: Uuid,
+    /// How far below `tenant_id` the tenant hierarchy is traversed.
     pub(crate) tenant_depth: TenantTraversalDepth,
+    /// How tenant barriers are treated while traversing descendants.
     pub(crate) barrier_mode: BarrierMode,
+    /// Event type patterns to match; empty means all types.
     pub(crate) types: Vec<GtsIdPattern>,
+    /// Optional extra content filter applied to matching events.
     pub(crate) filter: Option<Filter>,
 }
 

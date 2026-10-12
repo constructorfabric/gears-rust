@@ -1,19 +1,9 @@
-//! Pluggable storage-backend abstraction
-//! (`cpt-cf-file-storage-component-backend-abstraction`,
-//! `cpt-cf-file-storage-fr-backend-abstraction`).
+//! Pluggable storage-backend abstraction.
 //!
 //! A backend stores immutable content blobs keyed by an opaque path
 //! (`/{file_id}/{version_id}` by convention). Clients never address a backend
-//! directly — content moves only through the sidecar (backend opacity).
-//!
-//! P1 ships two backend *types* (`cpt-cf-file-storage-fr-backend-capabilities`
-//! target "≥2 backends"): a local filesystem backend and an in-memory backend.
-//! P2 adds an `S3Backend` (ADR-0005 `cpt-cf-file-storage-adr-s3-client-selection`)
-//! on top of those two. ADR-0005 remains `status: proposed` until a team
-//! security review runs (its new external HTTP-signing/XML-parsing
-//! dependencies are the trigger) — the code is safe to build and test on a
-//! branch regardless, but merging it to `main` is gated on that review.
-//! GCS/etc. remain deferred beyond that.
+//! directly; content moves only through the sidecar. Shipped backends: local
+//! filesystem, in-memory and S3.
 
 mod in_memory;
 mod local_fs;
@@ -35,22 +25,14 @@ pub use s3::S3Backend;
 
 use crate::infra::content::hash_mode::ManifestEntry;
 
-/// One part of a multipart completion, as handed to `complete_multipart`:
-/// `(part_number, offset, part_hash, backend_etag)` (ADR-0006). Named to keep
-/// the `StorageBackend` trait signature readable and shared verbatim across
-/// backends.
+/// One part of a multipart completion: `(part_number, offset, part_hash, backend_etag)`.
 pub type MultipartCompletionPart = (u32, u64, [u8; 32], String);
 
-/// Build the ADR-0006 offset-manifest + `root` from the
-/// [`MultipartCompletionPart`] tuples a `complete_multipart` call receives.
-/// Shared by every multipart-capable backend so the canonical wire format is
-/// produced in exactly one place (via [`Manifest::to_wire_string`]) — never
-/// hand-rolled per backend, where a subtle divergence would silently yield a
-/// different `root`.
+/// Build the offset-manifest and its `root` from `complete_multipart` parts (ADR-0006).
 ///
-/// Entries are sorted by ascending offset (identical to ascending part-number
-/// order for any valid plan) before the manifest is assembled, so a caller
-/// that passes parts out of order still produces the canonical manifest.
+/// Shared by all multipart backends so the canonical wire format is produced in one place.
+/// Entries are sorted by ascending offset, so out-of-order parts still yield the canonical
+/// manifest.
 pub(crate) fn build_manifest_and_root(
     parts: &[MultipartCompletionPart],
 ) -> Result<(Manifest, [u8; 32]), DomainError> {
@@ -61,41 +43,37 @@ pub(crate) fn build_manifest_and_root(
             digest: *digest,
         })
         .collect();
-    // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-sort
     entries.sort_by_key(|e| e.offset);
-    // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-sort
     let manifest = Manifest::new(entries)?;
     let root = manifest.root();
-    // @cpt-begin:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-return
     Ok((manifest, root))
-    // @cpt-end:cpt-cf-file-storage-algo-content-hash-modes-build-manifest:p1:inst-buildmanifest-return
 }
 
-/// Optional features a backend may declare
-/// (`cpt-cf-file-storage-fr-backend-capabilities`). Versioning is **not** here —
-/// it is implemented at the `FileStorage` level on every backend.
+/// Optional features a backend may declare. Versioning is not here: it is implemented at
+/// the `FileStorage` level on every backend.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BackendCapabilities {
-    /// Native chunked upload with server-side assembly (P2 multipart).
+    /// Native chunked upload with server-side assembly.
     pub multipart_native: bool,
-    /// Server-side encryption at rest (P3).
+    /// Server-side encryption at rest.
     pub encryption_native: bool,
-    /// Native byte-range reads (otherwise `FileStorage` slices after a full read).
+    /// Native byte-range reads (every backend implements them).
     pub range_native: bool,
     /// Internal-only presigned URLs (backend-to-backend tooling); never exposed.
     pub presigned_url_internal: bool,
     /// Maximum blob size the backend accepts in bytes. `None` = unbounded.
     pub max_size_bytes: Option<u64>,
-    /// Whether content written to this backend survives process restarts /
-    /// crashes (e.g. `local-fs`, S3). `false` for volatile backends (e.g. the
-    /// in-memory dev/test backend) — `migrate_backend` gates moves onto a
-    /// non-durable backend behind an elevated authorization scope.
+    /// Whether content survives process restarts (`false` for the in-memory backend).
+    /// `migrate_backend` gates moves onto a non-durable backend behind an elevated scope.
     pub durable: bool,
 }
 
-/// A storage backend: moves immutable content blobs. All methods are keyed by an
-/// opaque backend path.
+/// A storage backend: moves immutable content blobs, keyed by an opaque backend path.
+///
+/// Paths are produced by the gear, never by clients; implementations must still keep every
+/// access inside their own root/bucket (no `..` or absolute-path escapes).
+/// `get_range` and `size` are required (no whole-blob fallbacks).
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     /// Stable backend identifier (matches `file_versions.backend_id`).
@@ -104,22 +82,14 @@ pub trait StorageBackend: Send + Sync {
     /// The capabilities this backend advertises.
     fn capabilities(&self) -> BackendCapabilities;
 
-    /// Write a blob at `path`. Overwrites are allowed (each version is a fresh
-    /// path, so callers do not rely on write-once semantics here).
+    /// Write a blob at `path`. Overwrites are allowed (each version uses a fresh path).
     async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError>;
 
-    /// Stream a blob into `path`, hashing incrementally and enforcing
-    /// `max_size` as bytes arrive rather than buffering the whole body first
-    /// (`cpt-cf-file-storage-fr-backend-abstraction`, memory-DoS fix). Returns
-    /// `(bytes_written, sha256_digest)`.
+    /// Stream a blob into `path`, hashing incrementally and enforcing `max_size` as bytes
+    /// arrive. Returns `(bytes_written, sha256_digest)`.
     ///
-    /// The default implementation falls back to buffering the entire stream
-    /// in memory (still enforcing `max_size` as chunks arrive, so an
-    /// oversized upload is still rejected — just not memory-bounded) before
-    /// delegating to `put`. This keeps every backend that hasn't been
-    /// upgraded to a true streaming write correct; backends for which
-    /// unbounded memory use during upload is a real concern (e.g.
-    /// `LocalFsBackend`) should override this method.
+    /// The default buffers the whole stream in memory (still enforcing `max_size`) and
+    /// delegates to `put`; backends where that matters (e.g. `LocalFsBackend`) override it.
     async fn put_stream(
         &self,
         path: &str,
@@ -147,19 +117,10 @@ pub trait StorageBackend: Send + Sync {
     /// Read the whole blob at `path`.
     async fn get(&self, path: &str) -> Result<Bytes, DomainError>;
 
-    /// Stream the blob at `path` in chunks, without necessarily buffering the
-    /// whole object in memory at once. Used by `finalize_upload`'s read-back
-    /// verification (`cpt-cf-file-storage-fr-backend-abstraction`,
-    /// memory-safety fix mirroring `put_stream`'s streaming-write bound) to
-    /// recompute the actual size/hash/MIME-sniff-prefix from the real stored
-    /// bytes without re-inflating a potentially huge object into memory.
+    /// Stream the blob at `path` in chunks.
     ///
-    /// The default implementation falls back to `get`, yielding the whole
-    /// blob as a single chunk (`futures::stream::once`) — still correct, just
-    /// not memory-bounded — so every backend that hasn't been upgraded to a
-    /// true streaming read stays correct; backends for which unbounded memory
-    /// use during a read-back is a real concern (e.g. `LocalFsBackend`,
-    /// `S3Backend`) should override this method.
+    /// The default falls back to `get` and yields one chunk; backends with large objects
+    /// (e.g. `LocalFsBackend`, `S3Backend`) override it to avoid buffering.
     async fn get_stream(
         &self,
         path: &str,
@@ -170,59 +131,30 @@ pub trait StorageBackend: Send + Sync {
         Ok(stream)
     }
 
-    /// Read a byte range of the blob at `path`. Default impl reads the whole
-    /// blob then slices; range-native backends should override.
-    async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
-        let full = self.get(path).await?;
-        let total = full.len() as u64;
-        match range.resolve(total) {
-            Some((start, end)) => {
-                let s = usize::try_from(start).unwrap_or(usize::MAX);
-                let e = usize::try_from(end).unwrap_or(usize::MAX);
-                Ok(full.slice(s..=e.min(full.len().saturating_sub(1))))
-            }
-            None => Err(DomainError::validation("range", "unsatisfiable byte range")),
-        }
-    }
+    /// Read a byte range of the blob at `path` without materializing the whole blob.
+    /// An unsatisfiable range is a validation error.
+    async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError>;
 
-    /// The total length in bytes of the blob at `path`, without necessarily
-    /// reading its content. Range-aware callers (e.g. the sidecar's
-    /// `download` handler, P2 1.11) use this to resolve `Range` requests
-    /// against the actual blob length and to build a correct `Content-Range`
-    /// header, without materializing the whole blob first.
-    ///
-    /// The default implementation falls back to `get`, so only backends with
-    /// a cheaper standalone stat (e.g. `LocalFsBackend`'s filesystem
-    /// metadata) need to override it.
-    async fn size(&self, path: &str) -> Result<u64, DomainError> {
-        Ok(self.get(path).await?.len() as u64)
-    }
+    /// Total length in bytes of the blob at `path` (a metadata-only HEAD, no content read).
+    /// Used to resolve `Range` requests, build `Content-Range`, and check the size at finalize.
+    async fn size(&self, path: &str) -> Result<u64, DomainError>;
 
-    /// Delete the blob at `path`. Missing blobs are treated as success
-    /// (idempotent delete).
+    /// Delete the blob at `path`; a missing blob is success (idempotent).
     async fn delete(&self, path: &str) -> Result<(), DomainError>;
 
     /// Whether a blob exists at `path`.
     async fn exists(&self, path: &str) -> Result<bool, DomainError>;
 
-    /// Initiate a multipart upload for `path`. Returns an opaque backend handle.
-    /// Default returns an error — backends must opt-in by overriding this method
-    /// and setting `multipart_native: true` in their capabilities.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
+    /// Initiate a multipart upload for `path`, returning an opaque backend handle.
+    /// Default is an error; backends opt in and set `multipart_native: true`.
     async fn initiate_multipart(&self, _path: &str) -> Result<String, DomainError> {
         Err(DomainError::multipart_not_supported(self.id()))
     }
 
     /// Upload one part. Returns `(backend_etag, part_hash_bytes)`.
     ///
-    /// `part_offset` is the part's start byte offset within the assembled
-    /// object (ADR-0006). It is not used to hash the part — `part_hash` is a
-    /// flat `sha256(data)` exactly as before — but is threaded through so the
-    /// backend can build the offset-manifest at `complete` time without
-    /// re-deriving it from a plan it may not retain.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
+    /// `part_offset` is the part's start offset in the assembled object. The part hash is a
+    /// flat `sha256(data)`; the offset is passed through for the offset-manifest (ADR-0006).
     async fn upload_part(
         &self,
         _path: &str,
@@ -236,18 +168,11 @@ pub trait StorageBackend: Send + Sync {
 
     /// Complete a multipart upload, assembling all uploaded parts in order.
     ///
-    /// `parts` are `(part_number, offset, part_hash, backend_etag)` tuples the
-    /// control plane already collected during upload — the backend MUST build
-    /// the offset-manifest and its `root` from these (ADR-0006 mode 2) rather
-    /// than re-reading the assembled object. The backend still performs its
-    /// own native completion (S3 `CompleteMultipartUpload`, in-memory
-    /// assembly) but never re-`GetObject`s the object just to hash it.
+    /// The backend MUST build the manifest and `root` from `parts` (ADR-0006) rather than
+    /// re-reading the assembled object.
     ///
-    /// Returns `(manifest, root)` where `root = sha256(manifest.to_wire_string())`
-    /// — the control plane stores `root` as the version's `hash_value` and the
-    /// manifest text in `version_hash_manifest`.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
+    /// Returns `(manifest, root)` with `root = sha256(manifest.to_wire_string())`; the
+    /// control plane stores `root` as the version's `hash_value`.
     async fn complete_multipart(
         &self,
         _path: &str,
@@ -258,32 +183,18 @@ pub trait StorageBackend: Send + Sync {
     }
 
     /// Abort a multipart upload, discarding all uploaded parts.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
     async fn abort_multipart(&self, _path: &str, _upload_handle: &str) -> Result<(), DomainError> {
         Err(DomainError::multipart_not_supported(self.id()))
     }
 
-    /// Enumerate all object paths stored by this backend (for orphan
-    /// reconciliation). Returns paths in the same format they are stored in
-    /// `file_versions.backend_path` (e.g. `"/{file_id}/{version_id}"`).
-    ///
-    /// The default implementation returns an empty vec — backends that cannot
-    /// enumerate their contents are treated conservatively (unknown = skip).
-    ///
-    /// @cpt-cf-file-storage-fr-orphan-reconciliation
+    /// Enumerate all stored paths in the `file_versions.backend_path` format (for orphan
+    /// reconciliation). The default is empty: backends that cannot enumerate are skipped.
     async fn list_paths(&self) -> Result<Vec<String>, DomainError> {
         Ok(vec![])
     }
 
-    /// Cheap readiness probe (P2 1.6): confirms the backend can actually
-    /// serve requests right now (e.g. its local-fs root is mounted, its S3
-    /// endpoint is reachable and its credentials are valid), without moving
-    /// any real content. Used by the sidecar's `/readyz` route for k8s
-    /// readiness probing.
-    ///
-    /// The default implementation is always ready — correct for backends
-    /// with no external dependency to probe (e.g. `InMemoryBackend`).
+    /// Cheap readiness probe for the sidecar's `/readyz` (e.g. root mounted, S3 reachable),
+    /// without moving content. The default is always ready.
     async fn is_ready(&self) -> Result<(), DomainError> {
         Ok(())
     }
@@ -303,9 +214,7 @@ impl BackendRegistry {
         default_id: impl Into<String>,
     ) -> Result<Self, DomainError> {
         let default_id = default_id.into();
-        // Fail fast on a duplicated backend id rather than silently keeping the
-        // last one (which would drop a backend invisibly and make resolution
-        // order-dependent).
+        // Fail fast on a duplicate id instead of silently dropping a backend.
         let mut map: BTreeMap<String, Arc<dyn StorageBackend>> = BTreeMap::new();
         for b in backends {
             let id = b.id().to_owned();
@@ -355,9 +264,7 @@ impl BackendRegistry {
             .collect()
     }
 
-    /// Iterate all configured backends as `(id, backend)` pairs. Used by the
-    /// sidecar's `/readyz` probe (P2 1.6), which polls every backend's
-    /// [`StorageBackend::is_ready`] rather than just the default one.
+    /// Iterate all configured backends as `(id, backend)` pairs (used by `/readyz`).
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn StorageBackend>)> {
         self.backends.iter().map(|(id, b)| (id.as_str(), b))
     }

@@ -112,7 +112,7 @@ fn parse_ok(n: usize) -> impl FnOnce(&[u8]) -> ParseResult {
             .map(|i| ProviderRate {
                 base: "EUR".to_owned(),
                 quote: format!("Q{i}"),
-                rate_micro: 1_000_000,
+                rate: bss_ledger_sdk::parse_decimal("1").unwrap(),
                 as_of: OffsetDateTime::from_unix_timestamp(AS_OF_UNIX).unwrap(),
                 provider: PROVIDER.to_owned(),
             })

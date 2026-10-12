@@ -41,6 +41,7 @@ use bss_ledger_sdk::api::LedgerClientV1;
 use bss_ledger_sdk::posting::{
     CreditApplicationApplied, DisputeOutcome, DisputeRecorded, PostingRef, ScheduleChangeRef,
 };
+use bss_ledger_sdk::{CurrencySpec, PostedMoney, parse_decimal};
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
@@ -65,6 +66,12 @@ async fn boot() -> (
     (container, DBProvider::<DbError>::new(tdb))
 }
 
+/// Validated USD@2 money from canonical major-unit text (`"1200"` = 1200 dollars).
+fn usd(text: &str) -> PostedMoney {
+    let spec = CurrencySpec::try_new("USD".to_owned(), 2).expect("USD spec");
+    PostedMoney::try_new(parse_decimal(text).expect("decimal"), spec).expect("posted money")
+}
+
 fn stub_posting_ref() -> PostingRef {
     PostingRef {
         entry_id: Uuid::now_v7(),
@@ -79,6 +86,10 @@ fn stub_posting_ref() -> PostingRef {
 #[derive(Clone, Default)]
 struct RecordingClient {
     calls: Arc<Mutex<Vec<&'static str>>>,
+    /// The credit applications the executor forwarded, in order.
+    credit_applications: Arc<Mutex<Vec<bss_ledger_sdk::CreditApplication>>>,
+    /// The dispute phases the executor forwarded, in order.
+    dispute_phases: Arc<Mutex<Vec<bss_ledger_sdk::RecordDisputePhase>>>,
 }
 
 impl RecordingClient {
@@ -103,12 +114,13 @@ impl LedgerClientV1 for RecordingClient {
     async fn post_credit_application(
         &self,
         _ctx: &SecurityContext,
-        _req: bss_ledger_sdk::CreditApplication,
+        req: bss_ledger_sdk::CreditApplication,
     ) -> Result<CreditApplicationApplied, toolkit::api::canonical_prelude::CanonicalError> {
         self.calls
             .lock()
             .expect("lock")
             .push("post_credit_application");
+        self.credit_applications.lock().expect("lock").push(req);
         Ok(CreditApplicationApplied {
             posting: stub_posting_ref(),
             debits: Vec::new(),
@@ -119,12 +131,13 @@ impl LedgerClientV1 for RecordingClient {
     async fn record_dispute_phase(
         &self,
         _ctx: &SecurityContext,
-        _req: bss_ledger_sdk::RecordDisputePhase,
+        req: bss_ledger_sdk::RecordDisputePhase,
     ) -> Result<DisputeOutcome, toolkit::api::canonical_prelude::CanonicalError> {
         self.calls
             .lock()
             .expect("lock")
             .push("record_dispute_phase");
+        self.dispute_phases.lock().expect("lock").push(req);
         Ok(DisputeOutcome::Recorded(DisputeRecorded {
             posting: stub_posting_ref(),
         }))
@@ -166,7 +179,7 @@ impl LedgerClientV1 for RecordingClient {
         _ctx: &SecurityContext,
         _tenant_id: Uuid,
         _account_id: Uuid,
-    ) -> Result<Option<i64>, toolkit::api::canonical_prelude::CanonicalError> {
+    ) -> Result<Option<PostedMoney>, toolkit::api::canonical_prelude::CanonicalError> {
         unimplemented!()
     }
     async fn list_accounts(
@@ -416,8 +429,7 @@ async fn client_routed_intents_dispatch_to_their_surface() {
             tenant_id: tenant,
             payer_tenant_id: Uuid::now_v7(),
             credit_application_id: "CA-1".to_owned(),
-            currency: "USD".to_owned(),
-            amount_minor: 120_000,
+            amount: usd("1200"),
             credit_grant_event_type: Some("promo".to_owned()),
         }),
     )
@@ -435,8 +447,7 @@ async fn client_routed_intents_dispatch_to_their_surface() {
             invoice_id: Some("INV-1".to_owned()),
             cycle: 1,
             funds_at_open: "withheld".to_owned(),
-            disputed_amount_minor: 120_000,
-            currency: "USD".to_owned(),
+            disputed_amount: usd("1200"),
         }),
     )
     .await
@@ -465,6 +476,22 @@ async fn client_routed_intents_dispatch_to_their_surface() {
             "change_recognition_schedule"
         ]
     );
+    // The intent's money reaches the surface unchanged: amount, currency, scale.
+    let grants = client.credit_applications.lock().expect("lock").clone();
+    let [bss_ledger_sdk::CreditApplication::Grant(grant)] = grants.as_slice() else {
+        panic!("one credit grant forwarded, got {grants:?}");
+    };
+    assert_eq!(grant.money, usd("1200"));
+    assert_eq!(grant.credit_application_id, "CA-1");
+    assert_eq!(grant.credit_grant_event_type, "promo");
+    let phases = client.dispute_phases.lock().expect("lock").clone();
+    let [phase] = phases.as_slice() else {
+        panic!("one dispute phase forwarded, got {phases:?}");
+    };
+    assert_eq!(phase.disputed_amount, usd("1200"));
+    assert_eq!(phase.disputed_amount.currency().scale(), 2);
+    assert_eq!(phase.phase, "LOST");
+    assert_eq!(phase.dispute_id, "DSP-1");
 }
 
 /// Confused-deputy guard: a `Reverse` whose entry no longer resolves under the

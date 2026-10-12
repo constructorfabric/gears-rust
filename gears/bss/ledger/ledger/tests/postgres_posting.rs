@@ -18,16 +18,18 @@
 use std::sync::Arc;
 
 use bss_ledger::domain::error::DomainError;
+use bss_ledger::domain::invoice::reversal::build_reversal;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, EntryKey, NewEntry, NewLine};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
+use bss_ledger::infra::invoice_post::InvoicePostService;
 use bss_ledger::infra::jobs::tieout::TieOutJob;
+use bss_ledger::infra::metrics::test_harness::MetricsHarness;
 use bss_ledger::infra::period_close::PeriodCloseService;
 use bss_ledger::infra::posting::service::{PostSidecar, PostedFacts, PostingService};
 use bss_ledger::infra::storage::entity::unallocated_balance;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{JournalRepo, ReferenceRepo};
-use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
+use bss_ledger_sdk::{AccountClass, EntryView, LineView, MappingStatus, Side, SourceDocType};
 use chrono::NaiveDate;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -43,6 +45,33 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Validated USD scale-2 money from canonical stored text (`"12.34"`).
+fn usd_text(text: &str) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        bss_ledger_sdk::parse_decimal(text).unwrap(),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Read one canonical decimal TEXT money column as USD scale-2 money.
+async fn scalar_money(conn: &DatabaseConnection, sql: &str) -> Option<bss_ledger_sdk::PostedMoney> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| usd_text(&r.try_get_by_index::<String>(0).unwrap()))
 }
 
 /// Scalar i64 read of a single-column, single-row SELECT (bss-qualified).
@@ -93,8 +122,7 @@ async fn setup(
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -155,6 +183,51 @@ async fn setup(
     )
 }
 
+/// Synthesize the `EntryView` of a posted AR/CASH entry from the fixture ids so
+/// a test can drive `build_reversal` without a private read-back mapper. The
+/// reversal path re-reads the stored journal facts by `entry_id`, so only the
+/// identity and the line shape matter here.
+fn original_view(f: &Fixture, entry_id: Uuid, business_id: &str, amount: i64) -> EntryView {
+    let view_line = |account: Uuid, class: AccountClass, side: Side| LineView {
+        line_id: Uuid::now_v7(),
+        ar_status: None,
+        entry_id,
+        payer_tenant_id: f.tenant,
+        account_id: account,
+        account_class: class,
+        gl_code: None,
+        side,
+        money: usd_cents(amount),
+        invoice_id: None,
+        due_date: None,
+        revenue_stream: None,
+        mapping_status: MappingStatus::Resolved,
+        functional_money: None,
+        tax_jurisdiction: None,
+        tax_filing_period: None,
+    };
+    EntryView {
+        entry_id,
+        tenant_id: f.tenant,
+        period_id: f.period_id.clone(),
+        entry_currency: "USD".to_owned(),
+        source_doc_type: SourceDocType::ManualAdjustment,
+        source_business_id: business_id.to_owned(),
+        reverses_entry_id: None,
+        reverses_period_id: None,
+        posted_at_utc: OffsetDateTime::now_utc(),
+        effective_at: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        posted_by_actor_id: f.tenant,
+        origin: "SYSTEM".to_owned(),
+        correlation_id: f.tenant,
+        created_seq: 1,
+        lines: vec![
+            view_line(f.ar_account, AccountClass::Ar, Side::Debit),
+            view_line(f.cash_account, AccountClass::CashClearing, Side::Credit),
+        ],
+    }
+}
+
 /// Build a balanced entry for `fixture` with `business_id`: DR AR / CR CASH,
 /// each `amount`. Pass `swap` to flip the sides (DR CASH / CR AR) so the
 /// entry nets AR negative.
@@ -211,15 +284,12 @@ fn line(f: &Fixture, account: Uuid, class: AccountClass, side: Side, amount: i64
         account_class: class,
         gl_code: None,
         side,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd_cents(amount),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -257,38 +327,38 @@ async fn post_balanced_replay_period_and_negative() {
     assert_eq!(posted.entry_id, first_entry_id);
 
     // account_balance: AR=1000 (DR-normal, DR delta), CASH=1000 (CR-normal, CR delta).
-    let ar_bal = scalar_i64(
+    let ar_bal = scalar_money(
         &raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             f.tenant, f.ar_account
         ),
     )
     .await;
-    assert_eq!(ar_bal, Some(1000), "AR balance");
-    let cash_bal = scalar_i64(
+    assert_eq!(ar_bal, Some(usd_cents(1000)), "AR balance");
+    let cash_bal = scalar_money(
         &raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             f.tenant, f.cash_account
         ),
     )
     .await;
-    assert_eq!(cash_bal, Some(1000), "CASH balance");
+    assert_eq!(cash_bal, Some(usd_cents(1000)), "CASH balance");
 
     // ar_payer_balance = 1000.
-    let payer_bal = scalar_i64(
+    let payer_bal = scalar_money(
         &raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_ar_payer_balance \
+            "SELECT balance FROM bss.ledger_ar_payer_balance \
              WHERE tenant_id='{}' AND payer_tenant_id='{}' AND account_id='{}' AND currency='USD'",
             f.tenant, f.tenant, f.ar_account
         ),
     )
     .await;
-    assert_eq!(payer_bal, Some(1000), "ar_payer_balance");
+    assert_eq!(payer_bal, Some(usd_cents(1000)), "ar_payer_balance");
 
     // idempotency_dedup.result_entry_id populated.
     let dedup_rows = count(
@@ -379,16 +449,20 @@ async fn post_balanced_replay_period_and_negative() {
     );
 
     // AR balance unchanged (the negative post rolled back).
-    let ar_after = scalar_i64(
+    let ar_after = scalar_money(
         &raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             f.tenant, f.ar_account
         ),
     )
     .await;
-    assert_eq!(ar_after, Some(1000), "AR balance unchanged after rollback");
+    assert_eq!(
+        ar_after,
+        Some(usd_cents(1000)),
+        "AR balance unchanged after rollback"
+    );
 }
 
 #[tokio::test]
@@ -538,34 +612,55 @@ async fn reverses_fields_persist_on_a_reversal_post() {
         .await
         .expect("original post must succeed");
 
-    // Reversal: flipped sides (DR CASH / CR AR 2000), header points back at the
-    // original via reverses_entry_id / reverses_period_id; nets AR/CASH to 0.
-    let (mut reversal, reversal_lines) = balanced_entry(&f, "reverses=inv-rev-1", 2000, true);
-    reversal.source_doc_type = SourceDocType::Reversal;
-    reversal.reverses_entry_id = Some(original_entry_id);
-    reversal.reverses_period_id = Some(f.period_id.clone());
-    let reversal_entry_id = reversal.entry_id;
-    service
-        .post(&ctx, &scope, reversal, reversal_lines, None)
+    // Reversal: built by `build_reversal` from the original's view (flipped
+    // sides, DR CASH / CR AR 2000, header pointing back via reverses_entry_id /
+    // reverses_period_id) and posted through the one reversal entry point,
+    // `InvoicePostService::post_reversal`, which re-reads the stored journal
+    // facts of the original instead of trusting caller-supplied money.
+    // `PostingService::post` refuses a `Reversal` entry by design.
+    let view = original_view(&f, original_entry_id, "inv-rev-1", 2000);
+    let reversal = build_reversal(
+        &view,
+        f.period_id.clone(),
+        NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+        f.tenant,
+        f.tenant,
+    )
+    .expect("reversal must build");
+    let harness = MetricsHarness::new();
+    let invoice = InvoicePostService::new(
+        provider.clone(),
+        Arc::new(LedgerEventPublisher::noop()),
+        Arc::new(harness.metrics()),
+        bss_ledger::config::RecognitionConfig::default(),
+        bss_ledger::config::FxConfig::default(),
+    );
+    let posted = invoice
+        .post_reversal(&ctx, &scope, reversal, None)
         .await
         .expect("reversal post must succeed");
+    let reversal_entry_id = posted.entry_id;
 
     // The guarded balances net back to exactly zero (the zero-boundary the
     // arbiter-tuple seed must permit).
-    let ar_bal = scalar_i64(
+    let ar_bal = scalar_money(
         &raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             f.tenant, f.ar_account
         ),
     )
     .await;
-    assert_eq!(ar_bal, Some(0), "AR nets to zero after the full reversal");
-    let cash_bal = scalar_i64(
+    assert_eq!(
+        ar_bal,
+        Some(usd_cents(0)),
+        "AR nets to zero after the full reversal"
+    );
+    let cash_bal = scalar_money(
         &raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             f.tenant, f.cash_account
         ),
@@ -573,7 +668,7 @@ async fn reverses_fields_persist_on_a_reversal_post() {
     .await;
     assert_eq!(
         cash_bal,
-        Some(0),
+        Some(usd_cents(0)),
         "CASH nets to zero after the full reversal"
     );
 
@@ -646,17 +741,18 @@ async fn concurrent_overdraw_of_guarded_account_stays_non_negative() {
         oks <= 1,
         "at most one overdraw may commit against the guarded account: {ra:?} / {rb:?}"
     );
-    let ar = scalar_i64(
+    let ar = scalar_money(
         &raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}'",
             f.tenant, f.ar_account
         ),
     )
     .await;
     assert!(
-        ar.unwrap_or(0) >= 0,
+        ar.as_ref()
+            .is_none_or(|m| m.amount() >= rust_decimal::Decimal::ZERO),
         "guarded AR balance must never be negative, got {ar:?}"
     );
 }
@@ -723,12 +819,7 @@ async fn concurrent_close_never_certifies_a_period_a_post_landed_in() {
             .tie_out_tenant(f.tenant)
             .await
             .unwrap();
-        assert!(
-            report.is_clean(),
-            "a CLOSED period must tie out clean (post={post_res:?} / close={close_res:?}); \
-             report={}",
-            report.summary()
-        );
+        assert!(report.is_clean(), "a CLOSED period must tie out clean");
     }
 }
 
@@ -750,16 +841,20 @@ impl PostSidecar for MarkerSidecar {
         scope: &AccessScope,
         posted: &PostedFacts,
     ) -> Result<(), DomainError> {
-        // Stamp the posted sequence into a counter row (balance_minor) so the
-        // test can read it back and confirm atomic commit with the entry.
+        // Stamp the posted sequence into a counter row (`balance`, as the
+        // canonical decimal text of the integer seq) so the test can read it back
+        // and confirm atomic commit with the entry.
+        let seq_text = posted.created_seq.to_string();
         let am = unallocated_balance::ActiveModel {
             tenant_id: Set(self.tenant),
             payer_tenant_id: Set(self.payer),
             account_id: Set(self.account),
             currency: Set("USD".to_owned()),
-            balance_minor: Set(posted.created_seq),
-            functional_balance_minor: Set(None),
+            currency_scale: Set(2),
+            balance: Set(seq_text.clone()),
+            functional_balance: Set(None),
             functional_currency: Set(None),
+            functional_currency_scale: Set(None),
             last_entry_seq: Set(Some(posted.created_seq)),
             version: Set(0),
         };
@@ -773,10 +868,7 @@ impl PostSidecar for MarkerSidecar {
             unallocated_balance::Column::PayerTenantId,
             unallocated_balance::Column::Currency,
         ])
-        .value(
-            unallocated_balance::Column::BalanceMinor,
-            Expr::value(posted.created_seq),
-        )
+        .value(unallocated_balance::Column::Balance, Expr::value(seq_text))
         .and_then(|oc| {
             oc.value(
                 unallocated_balance::Column::LastEntrySeq,
@@ -844,10 +936,10 @@ async fn post_sidecar_commits_with_entry_and_rolls_back_on_err() {
         .await
         .expect("post with ok sidecar must succeed");
 
-    let marker_seq = scalar_i64(
+    let marker_seq = scalar_money(
         &raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_unallocated_balance \
+            "SELECT balance FROM bss.ledger_unallocated_balance \
              WHERE tenant_id='{}' AND payer_tenant_id='{}' AND account_id='{marker_account}' \
              AND currency='USD'",
             f.tenant, f.tenant
@@ -856,7 +948,7 @@ async fn post_sidecar_commits_with_entry_and_rolls_back_on_err() {
     .await;
     assert_eq!(
         marker_seq,
-        Some(posted.created_seq),
+        Some(usd_text(&posted.created_seq.to_string())),
         "sidecar marker row visible after commit, stamping the posted seq"
     );
 
@@ -898,14 +990,13 @@ fn cross_currency_entry(
 ) -> (NewEntry, Vec<NewLine>) {
     let (entry, mut lines) = balanced_entry(f, business_id, amount, false);
     for l in &mut lines {
-        l.functional_amount_minor = Some(functional);
-        l.functional_currency = Some("USD".to_owned());
+        l.functional_money = Some(usd_cents(functional));
     }
     (entry, lines)
 }
 
 /// Slice 5 B1: a cross-currency post (a functional amount on every line) projects
-/// `functional_balance_minor` / `functional_currency` onto the balance caches. The
+/// `functional_balance` / `functional_currency` onto the balance caches. The
 /// entry balances in BOTH columns; the projector mirrors the transaction sign onto
 /// the functional column (AR is DR-normal, CASH is CR-normal, both +functional).
 #[tokio::test]
@@ -926,11 +1017,16 @@ async fn cross_currency_post_populates_functional_balance() {
         .await
         .expect("cross-currency post must succeed (balances in both columns)");
 
-    for (label, account) in [("AR", f.ar_account), ("CASH", f.cash_account)] {
-        let func = scalar_i64(
+    for label in ["AR", "CASH"] {
+        let account = if label == "AR" {
+            f.ar_account
+        } else {
+            f.cash_account
+        };
+        let func = scalar_money(
             &raw,
             &format!(
-                "SELECT functional_balance_minor FROM bss.ledger_account_balance \
+                "SELECT functional_balance FROM bss.ledger_account_balance \
                  WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
                 f.tenant, account
             ),
@@ -938,8 +1034,8 @@ async fn cross_currency_post_populates_functional_balance() {
         .await;
         assert_eq!(
             func,
-            Some(1100),
-            "{label} functional_balance_minor populated"
+            Some(usd_cents(1100)),
+            "{label} functional_balance populated"
         );
         let ccy = count(
             &raw,
@@ -954,10 +1050,10 @@ async fn cross_currency_post_populates_functional_balance() {
     }
 
     // ar_payer_balance carries the functional value too.
-    let payer_func = scalar_i64(
+    let payer_func = scalar_money(
         &raw,
         &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_ar_payer_balance \
+            "SELECT functional_balance FROM bss.ledger_ar_payer_balance \
              WHERE tenant_id='{}' AND payer_tenant_id='{}' AND account_id='{}' AND currency='USD'",
             f.tenant, f.tenant, f.ar_account
         ),
@@ -965,8 +1061,8 @@ async fn cross_currency_post_populates_functional_balance() {
     .await;
     assert_eq!(
         payer_func,
-        Some(1100),
-        "ar_payer functional_balance_minor populated"
+        Some(usd_cents(1100)),
+        "ar_payer functional_balance populated"
     );
 }
 
@@ -1095,7 +1191,7 @@ async fn post_with_request_hash_same_hash_replays() {
     assert_eq!(entry_count, 1, "replay adds no second entry");
 }
 
-/// Slice 5 B1: a single-currency post leaves `functional_balance_minor` NULL —
+/// Slice 5 B1: a single-currency post leaves `functional_balance` NULL —
 /// the plain `+ functional_delta` on conflict keeps NULL = NULL (no COALESCE), so
 /// existing single-currency grains never spuriously gain a functional value.
 #[tokio::test]
@@ -1121,7 +1217,7 @@ async fn single_currency_post_leaves_functional_null() {
         &raw,
         &format!(
             "SELECT COUNT(*) FROM bss.ledger_account_balance \
-             WHERE tenant_id='{}' AND account_id='{}' AND functional_balance_minor IS NULL",
+             WHERE tenant_id='{}' AND account_id='{}' AND functional_balance IS NULL",
             f.tenant, f.ar_account
         ),
     )

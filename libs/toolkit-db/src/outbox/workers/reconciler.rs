@@ -8,8 +8,8 @@ use tracing::warn;
 use super::super::core::Outbox;
 use super::super::prioritizer::SharedPrioritizer;
 use super::super::store::OutboxStore;
-use super::super::taskward::{Directive, WorkerAction};
 use crate::Db;
+use toolkit_taskward::{Directive, WorkerAction};
 
 #[derive(Debug, FromQueryResult)]
 struct DirtyPartitionRow {

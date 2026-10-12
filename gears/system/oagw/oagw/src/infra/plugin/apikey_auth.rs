@@ -24,6 +24,7 @@ pub struct ApiKeyAuthPlugin {
 }
 
 impl ApiKeyAuthPlugin {
+    /// Create the plugin, resolving secrets through the given credential store.
     #[must_use]
     pub fn new(credstore: Arc<dyn CredStoreClientV1>) -> Self {
         Self { credstore }

@@ -1,14 +1,11 @@
 //! Domain types for upload idempotency.
-//!
-//! @cpt-cf-file-storage-fr-upload-idempotency
 
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::infra::content::hash;
 
-/// The stored response for an idempotency key lookup.
-/// Returned to a retrying caller unchanged.
+/// The stored response for an idempotency key, returned unchanged to a retrying caller.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct IdempotencyRecord {
@@ -23,33 +20,20 @@ pub struct IdempotencyRecord {
     /// JSON-serialized `UploadTicketDto` body.
     pub response_body: String,
     pub response_etag: String,
-    /// SHA-256 over [`compute_request_hash`]'s canonicalized encoding of the
-    /// request that created this record. A replay recomputes this hash from
-    /// the current request and rejects a mismatch as `Conflict` (P2
-    /// remediation 2.1) — see `FileService::create_file`.
+    /// SHA-256 over [`compute_request_hash`]'s encoding of the creating request. A replay
+    /// recomputes it and rejects a mismatch as `Conflict` (see `FileService::create_file`).
     pub request_hash: Vec<u8>,
 }
 
-/// Canonicalize and hash the identity-relevant fields of a `POST /files`
-/// request, for idempotency-replay body-match verification (P2 remediation
-/// 2.1).
+/// Canonicalize and hash the identity-relevant fields of a `POST /files` request, for
+/// idempotency-replay body-match verification.
 ///
-/// Every field is length-prefixed (a 4-byte little-endian length followed by
-/// its bytes) before being fed to the hasher. `hash::sha256_parts` merely
-/// concatenates its inputs with no delimiter between them, so a naive
-/// `sha256_parts(&[name.as_bytes(), gts.as_bytes()])` would hash
-/// `(name="ab", gts="c")` and `(name="a", gts="bc")` identically, letting a
-/// caller dodge the mismatch check by shifting bytes across adjacent fields.
-/// Length-prefixing removes that ambiguity without changing
-/// `sha256_parts`/`sha256` semantics for their other call site
-/// (`domain::etag::content_etag`, which only ever hashes fixed-width UUID
-/// bytes plus a constant prefix — no ambiguity there, and changing the
-/// helper's semantics would alter already-issued `ETags` for no benefit).
+/// Every field is length-prefixed (4-byte little-endian): `hash::sha256_parts` concatenates
+/// without delimiters, so `(name="ab", gts="c")` and `(name="a", gts="bc")` would otherwise
+/// collide. The helper itself is left unchanged because `content_etag` also uses it and
+/// altering it would change already-issued `ETags`.
 ///
-/// `custom_metadata` is sorted by key before hashing so two textually-
-/// identical-but-reordered requests hash identically — the wire order of a
-/// JSON object's keys is not guaranteed stable across two otherwise-equal
-/// requests.
+/// `custom_metadata` is sorted by key so wire key order does not affect the hash.
 #[must_use]
 pub fn compute_request_hash(
     owner_kind: &str,
@@ -75,9 +59,8 @@ pub fn compute_request_hash(
     hash::sha256(&buf)
 }
 
-/// Append `bytes` to `buf`, preceded by its length as 4 little-endian bytes —
-/// an unambiguous field delimiter so no two distinct field sequences can ever
-/// serialize to the same buffer (see [`compute_request_hash`]).
+/// Append `bytes` to `buf`, preceded by its length as 4 little-endian bytes (an
+/// unambiguous delimiter; see [`compute_request_hash`]).
 fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
     #[allow(clippy::cast_possible_truncation)]
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -117,9 +100,6 @@ mod tests {
 
     #[test]
     fn compute_request_hash_does_not_collide_across_field_boundaries() {
-        // (name="ab", gts="c") must not hash the same as (name="a", gts="bc") —
-        // proves the length-prefix delimiter, not naive concatenation, is in
-        // effect.
         let h1 = compute_request_hash("user", Uuid::nil(), "ab", "c", "mime", &[]);
         let h2 = compute_request_hash("user", Uuid::nil(), "a", "bc", "mime", &[]);
         assert_ne!(h1, h2, "field-boundary shift must not collide");

@@ -29,7 +29,7 @@ pub struct Model {
     pub quote_currency: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub provider: String,
-    pub rate_micro: i64,
+    pub rate: String,
     pub as_of: OffsetDateTime,
     pub fallback_order: i32,
     pub updated_at: OffsetDateTime,

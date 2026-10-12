@@ -48,3 +48,4 @@ sidecars:
       - sidecar
     env:
       FS_SIDECAR_BINARY: target/debug/sidecar
+      FS_SIDECAR_INTERNAL_TOKEN: dev-file-storage-internal-secret # dev only

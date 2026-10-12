@@ -90,7 +90,7 @@ Success criteria: no deferred balance ever exists without a schedule; each segme
 ### 1.4 References
 
 - **PRD**: [PRD.md](../PRD.md) — § Posting rules S6, § ASC 606 compliance, § Recognition controls, § Out-of-order events, AC #4/#9/#17/#26, Example A
-- **Design**: [01-repository-foundation.md](./01-repository-foundation.md) — Foundation engine (`PostingService` — one ACID txn per entry, READ COMMITTED; append-only journal + strict line-negation reversal; `IdempotencyGate` — 3-column `idempotency_dedup` PK, idempotent-replay; `MoneyModule` — banker's rounding + residual-cent rules; `BalanceProjector` — upsert + conditional no-negative; `FiscalPeriodGuard`; leaf-partition commit trigger; total fixed lock order; `TieOutJob`). Not restated here; RFC 2119 keywords are normative.
+- **Design**: [01-repository-foundation.md](./01-repository-foundation.md) — Foundation engine (`PostingService` — one ACID txn per entry, READ COMMITTED; append-only journal + strict line-negation reversal; `IdempotencyGate` — 3-column `idempotency_dedup` PK, idempotent-replay; money model — validated major-unit decimals, exact arithmetic, HALF_EVEN only at declared points, residual-increment rules; `BalanceProjector` — version-guarded update + conditional no-negative; `FiscalPeriodGuard`; leaf-partition commit trigger; total fixed lock order; `TieOutJob`). Not restated here; RFC 2119 keywords are normative.
 - **Dependencies**: Foundation / posting-engine-core (slice 1) upstream — posted Contract-liability credit (per stream) + invoice-item link; Contracts, Catalog, Subscriptions upstream (policy/state). Downstream: reconciliation-export (slice 7) — recognized-revenue export to ERP/GL + tie-out.
 - Upstream module PRDs (contracts/catalog/subscriptions) are referenced from [PRD.md](../PRD.md) refs.
 
@@ -130,7 +130,7 @@ Design-introduced names (this feature):
 - audit minimum linkage + invoice-item-link-or-block
 - **obligation-satisfaction (not collections) gating** of runs (AC #21 interaction)
 - Contract>Catalog precedence
-- recognition idempotency/dedup/rerun/residual-cent/ordering/schedule-change control
+- recognition idempotency/dedup/rerun/residual-increment/ordering/schedule-change control
 - recognition reversal/clawback shape
 - per-schedule over-recognition guard (AC #17 interaction)
 - recognition-double-credit alarm
@@ -168,7 +168,7 @@ A scheduled/event run releases due segments for a period. Each released **segmen
 
 **At-most-once per segment per period.** Idempotent per `(tenant, RECOGNITION, schedule_id:segment_no)` (Foundation `IdempotencyGate`); the `recognition_segment` `status=DONE`/`run_id` + the `UNIQUE (schedule, period_id)` key prevent a second credit. The **run** is an orchestration wrapper (dedup `(tenant, period_id, runId)` at the orchestration layer, plus a per-`(tenant, period_id)` advisory lock / single-active-run guard so overlapping runs serialize); each segment is independently at-most-once via the Foundation gate — overlapping **different** runIds cannot double-credit a segment.
 
-**Run gating.** Whether to run keys on **obligation-satisfaction** state, **not** collections/dunning: a collections-suspended payer's schedule keeps recognizing (revenue is earned regardless of collection); only an upstream **cancellation** (obligation ceased) stops/changes the schedule (PRD). **(/ S4-minor) Freshness contract.** The consumed obligation-satisfaction state is **eventually-consistent** (Subscriptions is the SoT); run-gating reads the latest known state at run time. **Fail-safe default:** an **unknown or stale** state is treated as **"not satisfied"** — recognition is delayed (and surfaced at the slice 7 close gate via undone-due-segment blocking), never released early; a stale "satisfied" can only ever release up to `total_deferred_minor` (the per-schedule CHECK caps it). Staleness beyond a configured watermark raises an operational alarm rather than silently delaying revenue.
+**Run gating.** Whether to run keys on **obligation-satisfaction** state, **not** collections/dunning: a collections-suspended payer's schedule keeps recognizing (revenue is earned regardless of collection); only an upstream **cancellation** (obligation ceased) stops/changes the schedule (PRD). **(/ S4-minor) Freshness contract.** The consumed obligation-satisfaction state is **eventually-consistent** (Subscriptions is the SoT); run-gating reads the latest known state at run time. **Fail-safe default:** an **unknown or stale** state is treated as **"not satisfied"** — recognition is delayed (and surfaced at the slice 7 close gate via undone-due-segment blocking), never released early; a stale "satisfied" can only ever release up to `total_deferred` (the per-schedule CHECK caps it). Staleness beyond a configured watermark raises an operational alarm rather than silently delaying revenue.
 
 **Ordering (feature-owned mechanism).** Before releasing the segment for period N, the runner asserts all lower-`period_id` segments of the **same schedule** are `DONE`; if not, the segment is marked **`QUEUED`** and the request returns **202** with body status token `recognition-period-queued` (kebab-case; no SCREAMING_SNAKE code on a 202 — deferral convention uniform across slices 2/3/4). A later run picks up `QUEUED` segments once the predecessor commits. (Queue-vs-commit behavior per PRD; the mechanism is defined here, not inherited.)
 
@@ -199,7 +199,7 @@ A scheduled/event run releases due segments for a period. Each released **segmen
 
 **Actor**: `cpt-cf-bss-ledger-actor-catalog-contracts`
 
-- **Controlled changes.** Rate/period/catch-up/cancellation/reallocation changes require approval where policy demands, an audit trail, and **either** a new schedule **version** (effective-dated) **or** **compensating** journal entries — **never** a silent rewrite of already-released amounts. **A new schedule version is minted with a new `schedule_id`**: the `version` column labels lineage, but the **`schedule_id` is what makes the release key `schedule_id:segment_no` version-distinct** — so a re-versioned schedule's segments can never collide with the prior version's `DONE` segments. A legitimate post-re-version catch-up release is therefore allowed, and a double release under a reused key is structurally impossible. An **S3 credit note** (slice 3) that reduces unreleased deferred revenue is an authorized **prospective-reduction** trigger: it decrements `total_deferred_minor` over the not-yet-released remainder under the shared lock order, never touching already-released segments.
+- **Controlled changes.** Rate/period/catch-up/cancellation/reallocation changes require approval where policy demands, an audit trail, and **either** a new schedule **version** (effective-dated) **or** **compensating** journal entries — **never** a silent rewrite of already-released amounts. **A new schedule version is minted with a new `schedule_id`**: the `version` column labels lineage, but the **`schedule_id` is what makes the release key `schedule_id:segment_no` version-distinct** — so a re-versioned schedule's segments can never collide with the prior version's `DONE` segments. A legitimate post-re-version catch-up release is therefore allowed, and a double release under a reused key is structurally impossible. An **S3 credit note** (slice 3) that reduces unreleased deferred revenue is an authorized **prospective-reduction** trigger: it decrements `total_deferred` over the not-yet-released remainder under the shared lock order, never touching already-released segments.
 - **Cancel/replace decision is upstream** (Contracts/Subscriptions). On a cancel/replace event the ledger marks the schedule `CANCELLED`/`REPLACED` and applies the new schedule **prospectively** or posts compensating entries as instructed (PRD). **Treatment marking — v1 control.** The cancel/replace (`/changes`) event MUST carry the intended **`treatment`** (`prospective` | `separate_contract` | `catch_up`). `prospective` / `separate_contract` apply directly (the usual SaaS series-of-distinct-services case, ASC 606-10-25-13(a)); a **`catch_up`** modification (ASC 606-10-25-13(b) — remaining goods/services not distinct) **and** any **unmarked / unknown** treatment **route to the exception queue** (`MODIFICATION_TREATMENT_REVIEW`) until the VC & contract-modifications successor PRD ships — never silently applied prospectively (PRD § Periodic recognition controls).
 
 **Success Scenarios**:
@@ -272,13 +272,13 @@ A scheduled/event run releases due segments for a period. Each released **segmen
 **Input**: a due `recognition_segment` (predecessors `DONE`, gating satisfied), run context
 **Output**: one balanced `DR CONTRACT_LIABILITY / CR REVENUE` entry + segment stamp + counter increment, atomic
 
-**Atomicity (critical).** Within the **same** Foundation `PostingService` transaction that posts the DR/CR, the runner also stamps the segment (`status=DONE`, `recognized_at`, `run_id`) and increments `recognition_schedule.recognized_minor` by an **in-place delta** — `SERIALIZABLE`/SSI-serialized, NOT a `FOR UPDATE` row lock — (`SET recognized_minor = recognized_minor + amount`, `CHECK` evaluated post-delta). Journal + segment stamp + counter commit or roll back together. `recognition_schedule` and `recognition_segment` are added to the **total fixed write/UPSERT order** (`table_rank` just below the balance caches, ordered by `(tenant_id, schedule_id)` then `segment_no`), so concurrent posts serialize under SSI — Postgres detects the write-write conflict and retries; there is no `FOR UPDATE` row locking. **Merged ordering:** acquire in ascending `table_rank` — the `CONTRACT_LIABILITY` + `REVENUE` `account_balance` rows in the Foundation's existing `(table_rank, tenant_id, account_id, currency, …)` order **first**, then the recognition tables by `(tenant_id, schedule_id, segment_no)`; one global order across all recognition posts.
+**Atomicity (critical).** Within the **same** Foundation `PostingService` transaction that posts the DR/CR, the runner also stamps the segment (`status=DONE`, `recognized_at`, `run_id`) and increments `recognition_schedule.recognized` by a **read → exact add → `UPDATE ... WHERE version = <read version>`** step (canonical decimal text; a stale version retries the whole transaction, at most three attempts) — NOT a `FOR UPDATE` row lock — with the `CHECK` evaluated post-update. Journal + segment stamp + counter commit or roll back together. `recognition_schedule` and `recognition_segment` are added to the **total fixed write/UPSERT order** (`table_rank` just below the balance caches, ordered by `(tenant_id, schedule_id)` then `segment_no`), so concurrent posts serialize under SSI — Postgres detects the write-write conflict and retries; there is no `FOR UPDATE` row locking. **Merged ordering:** acquire in ascending `table_rank` — the `CONTRACT_LIABILITY` + `REVENUE` `account_balance` rows in the Foundation's existing `(table_rank, tenant_id, account_id, currency, …)` order **first**, then the recognition tables by `(tenant_id, schedule_id, segment_no)`; one global order across all recognition posts.
 
-**Authoritative over-recognition guard.** The **per-schedule** `CHECK (recognized_minor ≤ total_deferred_minor)` — the only grain that maps 1:1 to an obligation — is the in-transaction, lock-ordered guard; failure → `OVER_RECOGNITION` (409). The aggregate `CONTRACT_LIABILITY` no-negative `CHECK` (Foundation) is **defense-in-depth** only (it would not catch over-release of one schedule while a sibling keeps the account aggregate positive). Cumulative releases ≤ posted Contract liability is reconciled by the tie-out.
+**Authoritative over-recognition guard.** The **per-schedule** `CHECK (recognized ≤ total_deferred)` (`::numeric` over canonical text on PostgreSQL) — the only grain that maps 1:1 to an obligation — is the in-transaction, lock-ordered guard; failure → `OVER_RECOGNITION` (409). The aggregate `CONTRACT_LIABILITY` no-negative `CHECK` (Foundation) is **defense-in-depth** only (it would not catch over-release of one schedule while a sibling keeps the account aggregate positive). Cumulative releases ≤ posted Contract liability is reconciled by the tie-out.
 
-**Reversal/clawback.** A recognition reversal is a new `DR REVENUE / CR CONTRACT_LIABILITY` entry (its own key `schedule_id:segment_no:reversal`, flow `RECOGNITION`) that decrements `recognized_minor` in the same transaction; Revenue decreasing here is a legitimate reversal, not a sign violation. A reversed segment stays `status=DONE` (its release happened and was compensated); re-recognizing that period requires a **new schedule version**, never a silent re-release under the same key.
+**Reversal/clawback.** A recognition reversal is a new `DR REVENUE / CR CONTRACT_LIABILITY` entry (its own key `schedule_id:segment_no:reversal`, flow `RECOGNITION`) that decrements `recognized` in the same transaction; Revenue decreasing here is a legitimate reversal, not a sign violation. A reversed segment stays `status=DONE` (its release happened and was compensated); re-recognizing that period requires a **new schedule version**, never a silent re-release under the same key.
 
-**Accrual, not cash.** Recognition is independent of any payment/settlement (slice 2). **Residual cent → last segment** of the **schedule version** that owns it (a re-version recomputes residual only over the not-yet-released remainder; already-released segments are never recomputed) (Foundation `MoneyModule`, PRD).
+**Accrual, not cash.** Recognition is independent of any payment/settlement (slice 2). **Declared rounding point:** a straight-line schedule lays out `N` equal segments with `allocate(deferred, &[1; N], Residual::Last)` — each share is the exact `deferred / N` rounded once, HALF_EVEN, at the schedule's stored currency scale, and the exact **residual increment → last segment** of the **schedule version** that owns it (a re-version recomputes the residual only over the not-yet-released remainder; already-released segments are never recomputed) (`bss_money::allocate`, PRD). A share that would come out negative is rejected (`AMOUNT_OUT_OF_RANGE`), never posted.
 
 **Period assignment.** A release entry posts with the **segment's `period_id`** while that fiscal period is OPEN. The period-N close gate (slice 7) blocks while any segment due ≤ N is not `DONE`. A segment that nonetheless misses close posts into the **current open period**, with the original target period recorded as audit linkage — never into a closed period (Foundation `FiscalPeriodGuard`).
 
@@ -288,9 +288,9 @@ A scheduled/event run releases due segments for a period. Each released **segmen
 3. [ ] - `p1` - Post the balanced entry DR `CONTRACT_LIABILITY` / CR `REVENUE` — DR and CR carry the **same** `revenue_stream` - `inst-rel-post`
 4. [ ] - `p1` - Assert (re-asserted at run time) `source_invoice_item_ref` resolves to a posted `CONTRACT_LIABILITY` `journal_line`; **IF** not **RETURN** 422 `RECOGNITION_WITHOUT_INVOICE_LINK` - `inst-rel-link`
 5. [ ] - `p1` - **IF** the segment's `period_id` fiscal period is OPEN: post with that `period_id`; **ELSE** post into the current open period recording the original target period as audit linkage (never a closed period) - `inst-rel-period`
-6. [ ] - `p1` - DB: Same txn — stamp segment `status=DONE`, `recognized_at`, `run_id`; `SET recognized_minor = recognized_minor + amount` (SSI-serialized in-place delta, CHECK post-delta) - `inst-rel-stamp`
-7. [ ] - `p1` - **IF** `CHECK (recognized_minor ≤ total_deferred_minor)` fails: **RETURN** 409 `OVER_RECOGNITION` (whole txn rolls back) - `inst-rel-overrec`
-8. [ ] - `p1` - Attach the residual cent to the **last segment** of the owning schedule version - `inst-rel-residual`
+6. [ ] - `p1` - DB: Same txn — stamp segment `status=DONE`, `recognized_at`, `run_id`; `recognized = recognized + amount` (read, exact decimal add, update guarded by `version`; CHECK post-update) - `inst-rel-stamp`
+7. [ ] - `p1` - **IF** `CHECK (recognized ≤ total_deferred)` fails: **RETURN** 409 `OVER_RECOGNITION` (whole txn rolls back) - `inst-rel-overrec`
+8. [ ] - `p1` - Attach the residual increment to the **last segment** of the owning schedule version - `inst-rel-residual`
 9. [ ] - `p1` - **RETURN** posting reference (journal + stamp + counter atomic) - `inst-rel-return`
 
 ### PO Identification and SSP Allocation
@@ -320,7 +320,7 @@ A scheduled/event run releases due segments for a period. Each released **segmen
 **Input**: revenue-affecting lines of a posting (possibly a multi-stream bundle)
 **Output**: per-stream Contract-liability lines + one schedule per stream; recognition entries stream-matched
 
-Every revenue-affecting line carries a **mandatory revenue-stream classification** (usage / recurring / one-time) — the line-tag **invariant** is enforced in the Foundation; **this feature owns the derivation + the mixed-invoice split**. For a multi-stream bundle, the **Foundation Contract-liability credit is split into one deferred line per stream**, so the `CONTRACT_LIABILITY` balance is tracked per stream; this feature creates **one schedule per stream**, and a recognition segment's `revenue_stream` **MUST equal** the stream of the Contract-liability line it draws down (DR and CR carry the **same** stream). Per-stream Contract liability drains to zero (not just the aggregate). Streams map to distinct natural accounts / sub-accounts / reporting dimensions, not free text. **R6 — ratified 2026-06-10:** streams `usage / recurring / one-time` resolve to a **distinct `account_id` per stream** for both `REVENUE` and `CONTRACT_LIABILITY` (one `tenant_account` row per (class, stream, currency)). Consequences: per-stream balances come free via `account_balance`; the per-stream `CONTRACT_LIABILITY` **no-negative `CHECK` on `account_balance` is now the authoritative per-stream drain guard** (the per-schedule `recognized_minor ≤ total_deferred_minor` `CHECK` remains the per-obligation guard); the per-tenant credit-side hot row splits three ways. Stream **names** remain Finance-confirmable without affecting the mechanism.
+Every revenue-affecting line carries a **mandatory revenue-stream classification** (usage / recurring / one-time) — the line-tag **invariant** is enforced in the Foundation; **this feature owns the derivation + the mixed-invoice split**. For a multi-stream bundle, the **Foundation Contract-liability credit is split into one deferred line per stream**, so the `CONTRACT_LIABILITY` balance is tracked per stream; this feature creates **one schedule per stream**, and a recognition segment's `revenue_stream` **MUST equal** the stream of the Contract-liability line it draws down (DR and CR carry the **same** stream). Per-stream Contract liability drains to zero (not just the aggregate). Streams map to distinct natural accounts / sub-accounts / reporting dimensions, not free text. **R6 — ratified 2026-06-10:** streams `usage / recurring / one-time` resolve to a **distinct `account_id` per stream** for both `REVENUE` and `CONTRACT_LIABILITY` (one `tenant_account` row per (class, stream, currency)). Consequences: per-stream balances come free via `account_balance`; the per-stream `CONTRACT_LIABILITY` **no-negative `CHECK` on `account_balance` is now the authoritative per-stream drain guard** (the per-schedule `recognized ≤ total_deferred` `CHECK` remains the per-obligation guard); the per-tenant credit-side hot row splits three ways. Stream **names** remain Finance-confirmable without affecting the mechanism.
 
 **Steps**:
 1. [ ] - `p1` - Derive the revenue-stream classification (usage / recurring / one-time) for each revenue-affecting line - `inst-dis-derive`
@@ -340,7 +340,7 @@ Every revenue-affecting line carries a **mandatory revenue-stream classification
 **Initial State**: ACTIVE (at-most-one-live per `(tenant_id, source_invoice_id, source_invoice_item_ref, revenue_stream)` via partial UNIQUE)
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** ACTIVE **TO** COMPLETED **WHEN** fully recognized (`recognized_minor == total_deferred_minor`, all segments `DONE`) — terminal; schedule + segments become archivable/partitionable while the `SCHEDULE_BUILD` dedup row persists (build idempotency decoupled from status, no duplicate-build hole) - `inst-st-rs-completed`
+1. [ ] - `p1` - **FROM** ACTIVE **TO** COMPLETED **WHEN** fully recognized (`recognized == total_deferred`, all segments `DONE`) — terminal; schedule + segments become archivable/partitionable while the `SCHEDULE_BUILD` dedup row persists (build idempotency decoupled from status, no duplicate-build hole) - `inst-st-rs-completed`
 2. [ ] - `p1` - **FROM** ACTIVE **TO** REPLACED **WHEN** a controlled change mints a new version — new `schedule_id`, lineage via `version`; release keys can never collide with the prior version's `DONE` segments - `inst-st-rs-replaced`
 3. [ ] - `p1` - **FROM** ACTIVE **TO** CANCELLED **WHEN** an upstream cancel decision arrives (obligation ceased); prospective effect / compensating entries as instructed - `inst-st-rs-cancelled`
 
@@ -388,7 +388,7 @@ The system **MUST** materialize a `recognition_schedule` in the same transaction
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-dod-asc606-recognition-run-release`
 
-The system **MUST** release due segments per period as one balanced entry each (`DR CONTRACT_LIABILITY / CR REVENUE`, same stream both legs), atomically with the segment stamp and the SSI-serialized `recognized_minor` in-place delta, at-most-once per `(tenant, RECOGNITION, schedule_id:segment_no)`, guarded by the per-schedule over-recognition CHECK, ordered per schedule (QUEUED + 202 on out-of-order periods), gated on obligation satisfaction with the fail-safe stale-state default, period-assigned per, with reversal as a new compensating entry under `schedule_id:segment_no:reversal` and residual cent to the last segment of the owning version.
+The system **MUST** release due segments per period as one balanced entry each (`DR CONTRACT_LIABILITY / CR REVENUE`, same stream both legs), atomically with the segment stamp and the version-guarded `recognized` update, at-most-once per `(tenant, RECOGNITION, schedule_id:segment_no)`, guarded by the per-schedule over-recognition CHECK, ordered per schedule (QUEUED + 202 on out-of-order periods), gated on obligation satisfaction with the fail-safe stale-state default, period-assigned per, with reversal as a new compensating entry under `schedule_id:segment_no:reversal` and the residual increment to the last segment of the owning version.
 
 **Implements**:
 - `cpt-cf-bss-ledger-flow-recognition-run`
@@ -433,7 +433,7 @@ The system **MUST** derive the usage/recurring/one-time stream per revenue-affec
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-dod-asc606-recognition-schedule-change`
 
-The system **MUST** apply upstream-decided changes only via new schedule versions (new `schedule_id`, lineage `version`) or compensating entries — never rewriting released amounts — with approval/dual-control and audit trail, route `catch_up` and unmarked treatments to `MODIFICATION_TREATMENT_REVIEW`, apply `prospective`/`separate_contract` directly, support the S3 credit-note prospective reduction of `total_deferred_minor` over the unreleased remainder, and mark schedules `CANCELLED`/`REPLACED` per the upstream decision.
+The system **MUST** apply upstream-decided changes only via new schedule versions (new `schedule_id`, lineage `version`) or compensating entries — never rewriting released amounts — with approval/dual-control and audit trail, route `catch_up` and unmarked treatments to `MODIFICATION_TREATMENT_REVIEW`, apply `prospective`/`separate_contract` directly, support the S3 credit-note prospective reduction of `total_deferred` over the unreleased remainder, and mark schedules `CANCELLED`/`REPLACED` per the upstream decision.
 
 **Implements**:
 - `cpt-cf-bss-ledger-flow-recognition-schedule-change`
@@ -471,13 +471,13 @@ Testing is a **delta over the Foundation testing architecture** (same levels + m
 
 **Integration (testcontainers):**
 
-- [ ] S6 release `DR Contract liability / CR Revenue` with segment stamp + `recognized_minor` increment **atomic in one txn**
+- [ ] S6 release `DR Contract liability / CR Revenue` with segment stamp + `recognized` increment **atomic in one txn**
 - [ ] **No double recognition**: same segment/period twice → one credit via UNIQUE + idempotency + `status=DONE`
 - [ ] **Over-recognition blocked at the per-schedule CHECK even when a sibling schedule keeps the account aggregate positive**
 - [ ] Recognition **without** a resolvable invoice-item link blocked
 - [ ] Schedule change posts a new version / compensating entry, never rewrites released amounts
 - [ ] Multi-stream bundle → per-stream Contract liability drains to zero
-- [ ] Deferred-balance-without-schedule surfaced as an exception; recognition reversal decrements `recognized_minor`
+- [ ] Deferred-balance-without-schedule surfaced as an exception; recognition reversal decrements `recognized`
 - [ ] **Duplicate schedule build** (redelivered/raced) lands on the existing ACTIVE schedule via the partial UNIQUE — never a second `schedule_id`
 - [ ] Release posts with the segment's `period_id` while OPEN; a missed-close segment posts to the current open period with original-period linkage
 - [ ] Schedule build beyond 120 segments fails the post *(pre- baseline; the degrade strategy supersedes hard failure once confirmed — §11.2)*
@@ -514,7 +514,7 @@ Testing is a **delta over the Foundation testing architecture** (same levels + m
 | Availability ≥ 99.9% / immutability | Inherited Foundation | Inherited |
 
 - **Security**: Inherits Foundation: RLS, append-only, PII-minimized events. Triggering runs and applying controlled schedule changes require the billing-poster / finance scope; schedule changes follow dual-control per policy (audit trail mandatory). Policy/SSP/VC snapshots are read by versioned ref only.
-- **Observability**: Metrics: `ledger_recognition_run_duration_seconds` (histogram), `ledger_revenue_recognized_minor{stream}`, `ledger_recognition_double_credit_total`, `ledger_over_recognition_total`, `ledger_recognition_period_queue_depth`, `ledger_schedule_active_total` **(— counts only in-flight `ACTIVE`, excludes terminal `COMPLETED`)**, `ledger_unscheduled_contract_liability_total` (deferred-without-schedule exception). Thresholds wire to the NFR targets + the double-credit/over-recognition alarms.
+- **Observability**: Metrics: `ledger_recognition_run_duration_seconds` (histogram), `ledger_revenue_recognized_total{stream}` (a count of releases, no monetary magnitude), `ledger_recognition_double_credit_total`, `ledger_over_recognition_total`, `ledger_recognition_period_queue_depth`, `ledger_schedule_active_total` **(— counts only in-flight `ACTIVE`, excludes terminal `COMPLETED`)**, `ledger_unscheduled_contract_liability_total` (deferred-without-schedule exception). Thresholds wire to the NFR targets + the double-credit/over-recognition alarms.
 - **Data**: All tables tenant-scoped RLS (C1); full schemas in §9; `COMPLETED` schedules + segments archivable/partitionable.
 - **Compliance**: ASC 606 — inception-pinned SSP allocation (no re-allocation on later SSP changes), modification treatments per ASC 606-10-25-13(a)/(b), accrual-based recognition independent of collections.
 
@@ -542,7 +542,7 @@ True errors only:
 | Code | HTTP status | Meaning |
 |------|-------------|---------|
 | `RECOGNITION_WITHOUT_INVOICE_LINK` | 422 | Recognition without a resolvable posted-invoice-item link (would imply contract-asset accounting, out of scope) |
-| `OVER_RECOGNITION` | 409 | Per-schedule `recognized_minor` CHECK failure |
+| `OVER_RECOGNITION` | 409 | Per-schedule `recognized` CHECK failure |
 | `MISSING_PO_ALLOCATION_GROUP` | 422 | Additive on the Foundation post endpoint (post-hook); only genuinely ambiguous deferred/multi-PO/VC lines |
 | `SSP_SNAPSHOT_REQUIRED` | 422 | Multi-PO without committed SSP snapshot (R3); also opens an exception-queue row + Finance alert |
 
@@ -563,8 +563,9 @@ Adds `recognition_schedule`, `recognition_segment`, `recognition_run`; tenant-sc
 | `subscription_ref` | string | nullable |
 | `revenue_stream` | enum | single stream per schedule |
 | `currency` | char | |
-| `total_deferred_minor` | bigint | |
-| `recognized_minor` | bigint | `CHECK (recognized_minor <= total_deferred_minor)` — the authoritative over-recognition guard |
+| `currency_scale` | smallint | stored posting scale (0–28) of `total_deferred` and `recognized` |
+| `total_deferred` | text (canonical decimal, major units) | |
+| `recognized` | text (canonical decimal, major units) | `CHECK (recognized <= total_deferred)` — the authoritative over-recognition guard; updated by read → exact add → version-guarded update |
 | `policy_ref` | string | deferral+timing policy version (immutable) |
 | `ssp_snapshot_ref` | string | nullable; multi-PO only |
 | `vc_estimate_ref` | string | nullable; variable consideration |
@@ -572,7 +573,7 @@ Adds `recognition_schedule`, `recognition_segment`, `recognition_run`; tenant-sc
 | `status` | enum | `ACTIVE` \| `COMPLETED` \| `REPLACED` \| `CANCELLED` |
 | `version` | bigint | lineage label (release-key distinctness comes from `schedule_id`) |
 
-PK `(tenant_id, schedule_id)`; partial `UNIQUE (tenant_id, source_invoice_id, source_invoice_item_ref, revenue_stream) WHERE status='ACTIVE'` is the **at-most-one-live** guard (one current schedule per business key); `REPLACED` versioning keeps history. Build-idempotency is **decoupled from `status`** — it lives in `idempotency_dedup (tenant, flow=SCHEDULE_BUILD, business_id=source_invoice_id:source_invoice_item_ref:revenue_stream)` (operation-key-vs-row-key split), so a fully-recognized schedule moves to terminal **`COMPLETED`** without opening a duplicate-build hole; `COMPLETED` schedules + segments are **archivable/partitionable**, and the `(invoice_item, stream)` duplicate key stays enforceable **permanently** via `idempotency_dedup`. A schedule is **single-revenue-stream** — a multi-stream bundle yields **one schedule per stream**. The deferred **balance** is the Foundation `CONTRACT_LIABILITY` `account_balance` (per stream); `recognized_minor` tracks cumulative release at the schedule (obligation) grain, updated by atomic in-place delta under the lock order.
+PK `(tenant_id, schedule_id)`; partial `UNIQUE (tenant_id, source_invoice_id, source_invoice_item_ref, revenue_stream) WHERE status='ACTIVE'` is the **at-most-one-live** guard (one current schedule per business key); `REPLACED` versioning keeps history. Build-idempotency is **decoupled from `status`** — it lives in `idempotency_dedup (tenant, flow=SCHEDULE_BUILD, business_id=source_invoice_id:source_invoice_item_ref:revenue_stream)` (operation-key-vs-row-key split), so a fully-recognized schedule moves to terminal **`COMPLETED`** without opening a duplicate-build hole; `COMPLETED` schedules + segments are **archivable/partitionable**, and the `(invoice_item, stream)` duplicate key stays enforceable **permanently** via `idempotency_dedup`. A schedule is **single-revenue-stream** — a multi-stream bundle yields **one schedule per stream**. The deferred **balance** is the Foundation `CONTRACT_LIABILITY` `account_balance` (per stream); `recognized` tracks cumulative release at the schedule (obligation) grain, updated by an exact, version-guarded delta under the lock order.
 
 ### 9.2 recognition_segment
 
@@ -582,12 +583,13 @@ PK `(tenant_id, schedule_id)`; partial `UNIQUE (tenant_id, source_invoice_id, so
 | `schedule_id` | uuid | PK part |
 | `segment_no` | int | PK part; **immutable**; 1:1 with `period_id` |
 | `period_id` | string | or milestone ref; `UNIQUE (tenant_id, schedule_id, period_id)` |
-| `amount_minor` | bigint | |
+| `currency` / `currency_scale` | char / smallint | copied from the schedule |
+| `amount` | text (canonical decimal, major units) | HALF_EVEN share of `total_deferred`; the last segment carries the residual increment |
 | `status` | enum | `PENDING` \| `QUEUED` \| `DONE` |
 | `recognized_at` | timestamptz | null until `DONE` |
 | `run_id` | uuid | null until `DONE` |
 
-PK `(tenant_id, schedule_id, segment_no)`; `UNIQUE (tenant_id, schedule_id, period_id)`; `segment_no` immutable, 1:1 with `period_id` — **dedup grain ≡ UNIQUE grain** (provably identical). Max **120 segments** per schedule (default, §11.2).
+PK `(tenant_id, schedule_id, segment_no)`; `UNIQUE (tenant_id, schedule_id, period_id)`; `segment_no` immutable, 1:1 with `period_id` — **dedup grain ≡ UNIQUE grain** (provably identical). Max **120 segments** per schedule (`recognition.max_segments_per_schedule`, default 120 — unchanged by the decimal cutover, §11.2).
 
 ### 9.3 recognition_run
 
@@ -603,7 +605,7 @@ PK `(tenant_id, period_id, run_id)` (tenant-first composite — the RLS/secure c
 
 ### 9.4 Cross-Table Constraints and Enum Usage
 
-- `CHECK (recognized_minor <= total_deferred_minor)` on `recognition_schedule` — the **authoritative** in-transaction over-recognition guard; the account-level `CONTRACT_LIABILITY` no-negative `CHECK` is defense-in-depth.
+- `CHECK (recognized <= total_deferred)` on `recognition_schedule` — the **authoritative** in-transaction over-recognition guard; the account-level `CONTRACT_LIABILITY` no-negative `CHECK` is defense-in-depth.
 - `source_invoice_item_ref` NOT NULL **and** must resolve to a posted `CONTRACT_LIABILITY` line via `journal_line.invoice_item_ref` (Foundation index `(tenant_id, invoice_id, invoice_item_ref)`).
 - `policy_ref` / `ssp_snapshot_ref` / `vc_estimate_ref` / `vc_method_ref` are immutable version refs (historical immutability).
 - The `source_doc_type` / idempotency `flow` value `RECOGNITION` and the idempotency-only `SCHEDULE_BUILD` (posts no journal entry of its own, `business_id = source_invoice_id:source_invoice_item_ref:revenue_stream`, so the build dedup is independent of `recognition_schedule.status`) are **Foundation-declared**; this feature uses them. Recognition `business_id = schedule_id:segment_no`; reversal `schedule_id:segment_no:reversal`.
@@ -611,7 +613,7 @@ PK `(tenant_id, period_id, run_id)` (tenant-first composite — the RLS/secure c
 
 ## 10. Events and Alarms
 
-Success via the Foundation outbox: `billing.ledger.revenue.recognized` (`scheduleId`, `segment`, `period`, `amountMinor`, `revenueStream`), `billing.ledger.revenue.recognition_reversed`, `billing.ledger.schedule.changed`.
+Success via the Foundation outbox: `billing.ledger.revenue.recognized` (`scheduleId`, `segment`, `period`, `amountMinor` — the parked `v1` integer minor-unit field, filled by exact local conversion until the event schemas move to decimal, `revenueStream`), `billing.ledger.revenue.recognition_reversed`, `billing.ledger.schedule.changed`.
 
 Alarms via the separate committed audit/alarm txn: `billing.ledger.invariant.alarm` with `alarmCategory ∈ {recognition-double-credit, over-recognition, recognition-period-queued}` (distinct categories — over-recognition maps to the negative-balance/AC #17 guard, double-credit to the PRD dedup-failure alarm). PII-free.
 

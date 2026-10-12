@@ -24,6 +24,22 @@ use crate::domain::model::{NewEntry, NewLine, RepoError};
 use crate::infra::storage::entity::idempotency_dedup;
 use time::OffsetDateTime;
 
+/// Classify actual backend contention before reducing a repository diagnostic.
+fn scope_error(error: ScopeError) -> RepoError {
+    if let ScopeError::Db(ref cause) = error
+        && [sea_orm::DbBackend::Postgres, sea_orm::DbBackend::Sqlite]
+            .into_iter()
+            .any(|backend| super::retry::is_driver_contention(backend, cause))
+    {
+        return RepoError::Conflict("idempotency database contention".to_owned());
+    }
+    RepoError::Db(error.to_string())
+}
+
+/// Dedup flow of a recognition schedule change: the claim, the result stamp and
+/// the replay read must name the same row.
+pub(crate) const FLOW_SCHEDULE_CHANGE: &str = "SCHEDULE_CHANGE";
+
 /// Status literal written when a posting first claims a key.
 const STATUS_CLAIMED: &str = "CLAIMED";
 /// Status literal written once the posting is durably recorded.
@@ -134,6 +150,7 @@ impl IdempotencyGate {
             business_id: Set(business_id.to_owned()),
             payload_hash: Set(payload_hash.to_owned()),
             result_entry_id: Set(None),
+            result_schedule_id: Set(None),
             posted_at_utc: Set(None),
             status: Set(seed_status.to_owned()),
             retain_until: Set(None),
@@ -149,7 +166,7 @@ impl IdempotencyGate {
         let inserted = match idempotency_dedup::Entity::insert(am.clone())
             .secure()
             .scope_with_model(&scope, &am)
-            .map_err(|e| RepoError::Db(format!("idempotency claim scope: {e}")))?
+            .map_err(scope_error)?
             .on_conflict_raw(on_conflict)
             .exec(txn)
             .await
@@ -157,7 +174,7 @@ impl IdempotencyGate {
             Ok(_) => true,
             // The key already existed; the conflict swallowed the insert.
             Err(ScopeError::Db(DbErr::RecordNotInserted)) => false,
-            Err(e) => return Err(RepoError::Db(format!("idempotency claim: {e}"))),
+            Err(e) => return Err(scope_error(e)),
         };
 
         if inserted {
@@ -175,7 +192,7 @@ impl IdempotencyGate {
             )
             .one(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("idempotency read-back: {e}")))?
+            .map_err(scope_error)?
             .ok_or_else(|| {
                 RepoError::RowVanished(format!("idempotency_dedup {tenant}/{flow}/{business_id}"))
             })?;
@@ -221,12 +238,91 @@ impl IdempotencyGate {
             )
             .one(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("idempotency read: {e}")))?;
+            .map_err(scope_error)?;
         Ok(row.map(|row| PostingRefRow {
             payload_hash: row.payload_hash,
             result_entry_id: row.result_entry_id,
             status: row.status,
         }))
+    }
+
+    /// Persist the immutable SCHEDULE_CHANGE successor without changing posting statuses.
+    /// Cancel records no successor; the committed claim is its durable completion marker.
+    /// Takes the transaction, like [`Self::claim`]: the stamp must run in the
+    /// claiming transaction.
+    /// # Errors
+    /// Returns a typed storage failure or missing/invalid schedule-change claim.
+    pub(crate) async fn store_schedule_change_result(
+        &self,
+        txn: &DbTx<'_>,
+        tenant: Uuid,
+        change_id: &str,
+        payload_hash: &str,
+        successor: Option<&str>,
+    ) -> Result<(), RepoError> {
+        let scope = AccessScope::for_tenant(tenant);
+        let result = idempotency_dedup::Entity::update_many()
+            .secure()
+            .scope_with(&scope)
+            .col_expr(
+                idempotency_dedup::Column::ResultScheduleId,
+                Expr::value(successor.map(str::to_owned)),
+            )
+            .filter(
+                Condition::all()
+                    .add(idempotency_dedup::Column::TenantId.eq(tenant))
+                    .add(idempotency_dedup::Column::Flow.eq(FLOW_SCHEDULE_CHANGE))
+                    .add(idempotency_dedup::Column::BusinessId.eq(change_id))
+                    .add(idempotency_dedup::Column::PayloadHash.eq(payload_hash))
+                    .add(idempotency_dedup::Column::Status.eq(STATUS_CLAIMED))
+                    .add(idempotency_dedup::Column::ResultEntryId.is_null())
+                    .add(idempotency_dedup::Column::ResultScheduleId.is_null()),
+            )
+            .exec(txn)
+            .await
+            .map_err(scope_error)?;
+        if result.rows_affected != 1 {
+            return Err(RepoError::RowVanished(
+                "schedule change result claim missing or already set".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read only the schedule-change result after caller authorization of the original target.
+    /// The schedule resource ID is not the dedup business ID; use the established tenant key.
+    /// Ordinary posting result APIs remain unchanged.
+    /// # Errors
+    /// Rejects absent/corrupt claim evidence and preserves actual contention.
+    pub(crate) async fn read_schedule_change_result(
+        &self,
+        txn: &DbTx<'_>,
+        tenant: Uuid,
+        change_id: &str,
+    ) -> Result<Option<String>, RepoError> {
+        let scope = AccessScope::for_tenant(tenant);
+        let row = idempotency_dedup::Entity::find()
+            .secure()
+            .scope_with(&scope)
+            .filter(
+                Condition::all()
+                    .add(idempotency_dedup::Column::TenantId.eq(tenant))
+                    .add(idempotency_dedup::Column::Flow.eq(FLOW_SCHEDULE_CHANGE))
+                    .add(idempotency_dedup::Column::BusinessId.eq(change_id)),
+            )
+            .one(txn)
+            .await
+            .map_err(scope_error)?
+            .ok_or_else(|| RepoError::RowVanished("schedule change result claim missing".into()))?;
+        if row.status != STATUS_CLAIMED
+            || row.result_entry_id.is_some()
+            || row.result_schedule_id.as_deref().is_some_and(str::is_empty)
+        {
+            return Err(RepoError::Db(
+                "invalid schedule change result evidence".into(),
+            ));
+        }
+        Ok(row.result_schedule_id)
     }
 
     /// Stamp the result entry id + posted timestamp and flip the status to
@@ -278,7 +374,7 @@ impl IdempotencyGate {
             )
             .exec(txn)
             .await
-            .map_err(|e| RepoError::Db(format!("idempotency finalize: {e}")))?;
+            .map_err(scope_error)?;
 
         if result.rows_affected == 0 {
             return Err(RepoError::RowVanished(format!(
@@ -300,56 +396,46 @@ impl IdempotencyGate {
     /// conflicting reuse of the business key is caught, not swallowed.
     #[must_use]
     pub fn payload_hash(entry: &NewEntry, lines: &[NewLine]) -> String {
-        let mut canon = String::new();
-        canon.push_str(entry.source_doc_type.as_str());
-        canon.push('\u{1f}');
-        canon.push_str(&entry.source_business_id);
-        canon.push('\u{1f}');
-        canon.push_str(&entry.entry_currency);
-        canon.push('\u{1f}');
-        canon.push_str(&entry.effective_at.to_string());
-        canon.push('\u{1f}');
-        canon.push_str(&entry.period_id);
-        canon.push('\u{1e}');
-
-        let mut line_keys: Vec<String> = lines
+        use crate::domain::canonical::{
+            digest32_hex, put, put_money, put_opt_money, put_opt_str, put_opt_uuid, put_str,
+            put_uuid,
+        };
+        let mut canon = b"VHP-BSS-LEDGER-PAYLOAD-v1\x1f".to_vec();
+        put_str(&mut canon, entry.source_doc_type.as_str());
+        put_str(&mut canon, &entry.source_business_id);
+        put_str(&mut canon, &entry.entry_currency);
+        put_str(&mut canon, &entry.effective_at.to_string());
+        put_str(&mut canon, &entry.period_id);
+        let mut keys: Vec<Vec<u8>> = lines
             .iter()
-            .map(|l| {
-                [
-                    l.account_id.to_string(),
-                    l.account_class.as_str().to_owned(),
-                    l.amount_minor.to_string(),
-                    l.currency.clone(),
-                    l.currency_scale.to_string(),
-                    l.side.as_str().to_owned(),
-                    l.payer_tenant_id.to_string(),
-                    l.seller_tenant_id
-                        .map(|u| u.to_string())
-                        .unwrap_or_default(),
-                    l.invoice_id.clone().unwrap_or_default(),
-                    l.due_date.map(|d| d.to_string()).unwrap_or_default(),
-                    l.revenue_stream.clone().unwrap_or_default(),
-                    l.functional_amount_minor
-                        .map(|a| a.to_string())
-                        .unwrap_or_default(),
-                    l.functional_currency.clone().unwrap_or_default(),
-                    l.tax_jurisdiction.clone().unwrap_or_default(),
-                    l.tax_filing_period.clone().unwrap_or_default(),
-                    // As-posted financial dimensions: the wallet sub-grain bucket
-                    // (REUSABLE_CREDIT lines) and the AR dispute sub-class
-                    // (chargeback reclass). A business-key reuse differing only in
-                    // these is a conflict, not a replay — include them so the hash
-                    // flips and `IDEMPOTENCY_PAYLOAD_CONFLICT` fires.
-                    l.credit_grant_event_type.clone().unwrap_or_default(),
-                    l.ar_status.clone().unwrap_or_default(),
-                ]
-                .join("\u{1f}")
+            .map(|line| {
+                let mut key = Vec::new();
+                put_uuid(&mut key, line.account_id);
+                put_str(&mut key, line.account_class.as_str());
+                put_money(&mut key, &line.money);
+                put_str(&mut key, line.side.as_str());
+                put_uuid(&mut key, line.payer_tenant_id);
+                put_opt_uuid(&mut key, line.seller_tenant_id);
+                put_opt_str(&mut key, line.invoice_id.as_deref());
+                put_opt_str(
+                    &mut key,
+                    line.due_date.map(|date| date.to_string()).as_deref(),
+                );
+                put_opt_str(&mut key, line.revenue_stream.as_deref());
+                put_opt_money(&mut key, line.functional_money.as_ref());
+                put_opt_str(&mut key, line.tax_jurisdiction.as_deref());
+                put_opt_str(&mut key, line.tax_filing_period.as_deref());
+                put_opt_str(&mut key, line.credit_grant_event_type.as_deref());
+                put_opt_str(&mut key, line.ar_status.as_deref());
+                key
             })
             .collect();
-        line_keys.sort();
-        canon.push_str(&line_keys.join("\u{1e}"));
-
-        Self::content_hash(&canon)
+        keys.sort();
+        put(&mut canon, &(keys.len() as u64).to_be_bytes());
+        for key in keys {
+            put(&mut canon, &key);
+        }
+        digest32_hex(&canon)
     }
 
     /// FIPS-validated (`aws-lc-rs`) SHA-256 hex digest over an arbitrary
@@ -375,3 +461,7 @@ impl IdempotencyGate {
 #[cfg(test)]
 #[path = "idempotency_tests.rs"]
 mod idempotency_tests;
+
+#[cfg(test)]
+#[path = "idempotency_hash_tests.rs"]
+mod idempotency_hash_tests;

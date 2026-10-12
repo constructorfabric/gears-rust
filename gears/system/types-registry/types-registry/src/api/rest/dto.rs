@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn unselected_fields_are_omitted_and_a_selected_null_is_kept() {
         let dto = EntityDto {
-            gts_id: "gts.cf.core.example.type.v1~".to_owned(),
+            gts_id: toolkit_gts::gts_id!("cf.core.example.type.v1~").to_owned(),
             gts_uuid: Uuid::nil(),
             kind: EntityKindDto::TypeSchema,
             origin: None,
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(dto).expect("serialize"),
             serde_json::json!({
-                "gts_id": "gts.cf.core.example.type.v1~",
+                "gts_id": toolkit_gts::gts_id!("cf.core.example.type.v1~"),
                 "gts_uuid": Uuid::nil(),
                 "kind": "type_schema",
                 "lifecycle_status": "deleted",

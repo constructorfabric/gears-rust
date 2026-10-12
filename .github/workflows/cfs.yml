@@ -13,7 +13,6 @@ on:
       - '.cf-studio/config/**'
       - '.cf-studio-kit.toml'
       - 'studio-kit-gears/**'
-      - 'docs/spec-templates/**'
       - 'Makefile'
   workflow_call:
   workflow_dispatch:
@@ -85,7 +84,7 @@ jobs:
             )"
           fi
 
-          if printf '%s\n' "$changed_files" | grep -Eq '^(studio-kit-gears/|docs/spec-templates/|\.cf-studio-kit\.toml$)'; then
+          if printf '%s\n' "$changed_files" | grep -Eq '^(studio-kit-gears/|\.cf-studio/config/|\.cf-studio-kit\.toml$)'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"

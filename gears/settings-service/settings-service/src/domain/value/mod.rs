@@ -5,6 +5,7 @@ pub mod repo;
 
 use serde_json::Value;
 use time::OffsetDateTime;
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 pub use repo::ValueRepository;
@@ -14,6 +15,7 @@ pub use repo::ValueRepository;
 /// Exactly one of `value` and `secret_ref` is present, which the table check
 /// guarantees: a secret-classified row holds a reference into the Credential
 /// Store and never the plaintext.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredValue {
     /// Surrogate identity.
@@ -42,6 +44,7 @@ pub struct StoredValue {
 }
 
 /// What a write supplies to create a row.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueDraft {
     /// The declaration the value belongs to.

@@ -36,6 +36,7 @@ const GRPC_ATTRS: &[&str] = &[
     "optional",
 ];
 
+/// Expands a parsed `#[grpc_contract]` projection into the cleaned trait and gRPC binding function.
 pub fn generate(model: &GrpcContractModel) -> TokenStream {
     let support = contract_support_path();
     let cleaned_trait = generate_cleaned_trait(model);

@@ -20,7 +20,8 @@ use crate::options::SqliteBackendOptions;
 /// this crate deliberately depends on the SDK alone; the gear compares it
 /// against the configured type at wiring, so a malformed one cannot pass
 /// silently.
-pub const BACKEND_TYPE: &str = "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~";
+pub const BACKEND_TYPE: &str =
+    toolkit_gts::gts_id!("cf.core.events.backend.v1~cf.core.backend.sqlite.v1~");
 
 /// Builds the `SQLite` backend from the settings beside its topic's
 /// `backend.type`.

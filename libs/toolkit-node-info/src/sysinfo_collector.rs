@@ -21,6 +21,7 @@ pub struct SysInfoCollector {
 }
 
 impl SysInfoCollector {
+    /// Creates a collector with a fully refreshed system snapshot.
     pub fn new() -> Self {
         let system = System::new_all();
         Self {

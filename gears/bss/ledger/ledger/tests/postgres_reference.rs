@@ -71,7 +71,7 @@ async fn currency_scale_registry_round_trips() {
     let tenant_id = Uuid::new_v4();
 
     db.execute_raw(exec(format!(
-        "INSERT INTO bss.ledger_currency_scale_registry (tenant_id, currency, minor_units, source)
+        "INSERT INTO bss.ledger_currency_scale_registry (tenant_id, currency, currency_scale, source)
          VALUES ('{tenant_id}', 'USD', 2, 'ISO4217')"
     )))
     .await
@@ -79,14 +79,14 @@ async fn currency_scale_registry_round_trips() {
 
     let row = db
         .query_one_raw(exec(format!(
-            "SELECT minor_units FROM bss.ledger_currency_scale_registry
+            "SELECT currency_scale FROM bss.ledger_currency_scale_registry
              WHERE tenant_id = '{tenant_id}' AND currency = 'USD'"
         )))
         .await
         .unwrap()
         .expect("row must exist");
-    let minor_units: i16 = row.try_get("", "minor_units").unwrap();
-    assert_eq!(minor_units, 2);
+    let currency_scale: i16 = row.try_get("", "currency_scale").unwrap();
+    assert_eq!(currency_scale, 2);
 }
 
 #[tokio::test]

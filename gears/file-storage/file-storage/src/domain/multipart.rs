@@ -1,6 +1,4 @@
 //! Domain types for multipart upload sessions and parts.
-//!
-//! @cpt-cf-file-storage-fr-multipart-upload
 
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
@@ -40,9 +38,6 @@ impl MultipartUploadState {
 }
 
 /// An in-flight multipart upload session.
-///
-/// `declared_size` and `part_size` were added by the
-/// `multipart-coordinator` server-authoritative feature (§6).
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct MultipartUploadSession {
@@ -61,24 +56,18 @@ pub struct MultipartUploadSession {
     pub expires_at: OffsetDateTime,
 }
 
-/// Result of a successful `complete_multipart_upload` (item 3.3): everything
-/// the ADR-0006 assembly step already computes, returned to the caller
-/// instead of being discarded behind a `204 No Content`.
+/// Result of a successful `complete_multipart_upload`.
 ///
-/// `manifest` is included so a client can independently re-verify the
-/// composite hash (`docs/features/content-hash-modes.md` §"Client-Side
-/// Manifest Re-Verification") without a second round-trip. At ~90 bytes per
-/// part this is ~1 MiB at the 10k-part ceiling — acceptable for a one-shot
-/// response.
+/// `manifest` lets a client re-verify the composite hash without a second round-trip
+/// (~90 bytes per part, ~1 MiB at the 10k-part ceiling).
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct CompletedMultipartUpload {
     pub version_id: Uuid,
     pub size: i64,
-    /// Always `"SHA-256"` — the only hash algorithm used by either ADR-0006
-    /// hash mode.
+    /// Always `"SHA-256"`.
     pub hash_algorithm: &'static str,
-    /// The ADR-0006 composite root: `sha256(manifest)`.
+    /// Composite root: `sha256(manifest)`.
     pub content_hash: Vec<u8>,
     /// Always [`HashMode::MultipartCompositeSha256`] for this completion path.
     pub hash_mode: HashMode,
@@ -87,17 +76,11 @@ pub struct CompletedMultipartUpload {
     pub manifest: String,
 }
 
-/// Result of `GET /files/{id}/multipart/{upload_id}` (item 3.4): the
-/// session's current state plus the received/missing parts, with fresh
-/// resume URLs for any part not yet uploaded.
+/// Result of `GET /files/{id}/multipart/{upload_id}`: session state plus received and
+/// missing parts.
 ///
-/// `upload_url` on each [`MissingPart`] is only populated while the session
-/// is still `in_progress` and unexpired -- a terminal (`completed`/`aborted`)
-/// or expired session reports state and part accounting only, no resume
-/// URLs (there is nothing left to resume, or the plan's tokens would outlive
-/// the session's own `expires_at` bound).
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
+/// `upload_url` on each [`MissingPart`] is populated only while the session is
+/// `in_progress` and unexpired; terminal or expired sessions get no resume URLs.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct MultipartUploadStatus {
@@ -109,8 +92,7 @@ pub struct MultipartUploadStatus {
     pub part_size: u64,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
-    /// Parts already reported (via the sidecar's report-part callback), in
-    /// ascending `part_number` order (mirrors `list_multipart_parts`).
+    /// Parts already reported by the sidecar, in ascending `part_number` order.
     pub received: Vec<ReceivedPart>,
     /// Parts not yet reported, in ascending `part_number` order.
     pub missing: Vec<MissingPart>,
@@ -125,18 +107,16 @@ pub struct ReceivedPart {
     pub uploaded_at: OffsetDateTime,
 }
 
-/// One part not yet uploaded, with its planned bounds recomputed from the
-/// session's `(declared_size, part_size)` columns and, when resumable, a
-/// freshly-minted signed upload URL.
+/// One part not yet uploaded: planned bounds recomputed from the session's
+/// `(declared_size, part_size)` and, when resumable, a fresh signed upload URL.
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct MissingPart {
     pub part_number: u32,
     pub offset: u64,
     pub size: u64,
-    /// `Some` only for a live, unexpired `in_progress` session; its token
-    /// `exp` is capped at the session's own `expires_at` rather than a fresh
-    /// full TTL, so a resume URL never outlives the session it resumes.
+    /// `Some` only for a live `in_progress` session; token expiry is capped at the
+    /// session's `expires_at`, so a resume URL never outlives its session.
     pub upload_url: Option<String>,
 }
 
@@ -152,14 +132,8 @@ pub struct MultipartPart {
     pub uploaded_at: OffsetDateTime,
 }
 
-// ── Server-authoritative parts plan (multipart-coordinator feature) ────────────
-
-/// One planned part as returned to the client in the initiate response.
-///
-/// The `upload_url` is a sidecar signed URL containing the exact `size` claim.
-/// The client must `PUT` exactly `size` bytes to `upload_url`.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
+/// One planned part returned in the initiate response. The client must `PUT` exactly
+/// `size` bytes to the signed `upload_url` (which carries the `size` claim).
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct MultipartPartPlan {
@@ -174,14 +148,12 @@ pub struct MultipartPartPlan {
 }
 
 /// The server-authoritative parts plan returned by `POST /files/{id}/multipart`.
-///
-/// @cpt-cf-file-storage-fr-multipart-upload
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct MultipartPlan {
     pub upload_id: Uuid,
     pub version_id: Uuid,
-    /// The hash algorithm used for per-part hashes (`"SHA-256"` in P2).
+    /// The hash algorithm used for per-part hashes (`"SHA-256"`).
     pub part_hash_algorithm: String,
     /// Uniform part size (bytes); the final part may be smaller.
     pub part_size: u64,
@@ -191,44 +163,27 @@ pub struct MultipartPlan {
     pub expires_at: OffsetDateTime,
 }
 
-/// Minimum part size used when the backend does not declare a minimum.
-///
-/// 5 MiB is the S3 minimum for all parts except the last. This value also
-/// doubles as the lower bound of the sane range that a client-supplied
-/// `preferred_part_size` is validated against at the service boundary
-/// (`MultipartService::initiate_multipart_upload`, P2 remediation 2.11).
+/// Minimum part size when the backend declares none: the S3 minimum for all parts but the
+/// last. Also the lower bound for a client-supplied `preferred_part_size`.
 pub const DEFAULT_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
-/// Maximum accepted `preferred_part_size` client hint (P2 remediation 2.11).
-///
-/// 5 GiB is S3's absolute maximum part size. Values above this cannot be a
-/// legitimate part-size preference; they are rejected at the service
-/// boundary before ever reaching [`compute_plan`]. The checked arithmetic in
-/// [`compute_plan`]/[`round_up_to`] below is kept regardless, as
-/// defense-in-depth for callers that bypass that boundary.
+/// Maximum accepted `preferred_part_size` hint: S3's absolute maximum part size. Larger
+/// values are rejected at the service boundary; `compute_plan` still uses checked
+/// arithmetic as defense-in-depth.
 pub const MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
-/// Compute the server-chosen `part_size` and generate the plan skeleton
-/// (without URLs — those are injected by `MultipartService`).
-///
-/// Rules (FEATURE §3):
-/// - `part_size = max(preferred, backend_min)` rounded up to the nearest
-///   multiple of `DEFAULT_MIN_PART_SIZE` (BLAKE3-friendly alignment deferred,
-///   SHA-256 is used in P2).
-/// - `parts = ceil(declared_size / part_size)`.
-/// - The last part's `size` is `declared_size - (parts - 1) * part_size`.
-///
 /// One raw part entry from `compute_plan`: `(part_number, offset, size)`.
 pub type RawPartEntry = (u32, u64, u64);
 
-/// Returns `(part_size, parts_count)` ready to be used by the caller.
+/// Compute the server-chosen `part_size` and the plan skeleton (URLs are injected by
+/// `MultipartService`). Returns `(part_size, parts)`.
+///
+/// `part_size = max(preferred, backend_min)` rounded up to a multiple of the minimum;
+/// `parts = ceil(declared_size / part_size)`; the last part holds the remainder.
 ///
 /// # Errors
-/// Returns [`DomainError::Validation`] if the part-size arithmetic would
-/// overflow `u64`. Callers are expected to have already validated
-/// `preferred_part_size` against a sane range (P2 remediation 2.11); this is
-/// a defense-in-depth guard against a huge/adversarial value reaching this
-/// function by another path, rather than panicking or silently wrapping.
+/// Returns [`DomainError::Validation`] if the part-size arithmetic overflows `u64`
+/// (defense-in-depth; callers validate `preferred_part_size` first).
 pub fn compute_plan(
     declared_size: u64,
     preferred_part_size: Option<u64>,
@@ -236,7 +191,6 @@ pub fn compute_plan(
 ) -> Result<(u64, Vec<RawPartEntry>), DomainError> {
     let min = backend_min_part_size.unwrap_or(DEFAULT_MIN_PART_SIZE);
     let preferred = preferred_part_size.unwrap_or(min);
-    // Part size = max(preferred, backend_min), rounded up to the nearest `min`.
     let raw = preferred.max(min);
     let part_size = round_up_to(raw, min).ok_or_else(|| {
         DomainError::validation(
@@ -270,11 +224,7 @@ pub fn compute_plan(
     Ok((part_size, parts))
 }
 
-/// Round `value` up to the next multiple of `align` (≥ 1).
-///
-/// Uses checked arithmetic: returns `None` on overflow instead of
-/// panicking (under overflow-checks) or silently wrapping to a tiny value
-/// (P2 remediation 2.11).
+/// Round `value` up to the next multiple of `align`; `None` on overflow.
 fn round_up_to(value: u64, align: u64) -> Option<u64> {
     if align == 0 {
         return Some(value);
@@ -286,24 +236,15 @@ fn round_up_to(value: u64, align: u64) -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// P2 remediation 2.11: a near-`u64::MAX` value must not panic (under
-    /// overflow-checks) or silently wrap to a tiny `part_size` — it must be
-    /// reported as `None` so the caller can turn it into a domain error.
-    /// `round_up_to` is private, so this is a same-module unit test rather
-    /// than an integration test in `tests/multipart_test.rs`.
     #[test]
     fn round_up_to_does_not_overflow_on_max_input() {
         assert_eq!(round_up_to(u64::MAX, DEFAULT_MIN_PART_SIZE), None);
         assert_eq!(round_up_to(u64::MAX, u64::MAX), Some(u64::MAX));
         assert_eq!(round_up_to(1, u64::MAX), Some(u64::MAX));
-        // Sanity: ordinary inputs still round up correctly.
         assert_eq!(round_up_to(7, 5), Some(10));
         assert_eq!(round_up_to(10, 5), Some(10));
     }
 
-    /// `compute_plan` must surface the overflow as a domain error instead of
-    /// panicking, even when called directly with an adversarial
-    /// `preferred_part_size` that bypasses the service-boundary validation.
     #[test]
     fn compute_plan_returns_validation_error_on_overflowing_preferred_part_size() {
         let err = compute_plan(u64::MAX, Some(u64::MAX), None).unwrap_err();

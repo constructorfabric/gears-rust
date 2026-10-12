@@ -1,8 +1,8 @@
 //! Repo-facing domain types: posting inputs, read-back records, and the
-//! repository error. `i64` minor units throughout (decision C); SDK enums
+//! repository error. Validated major-unit money throughout; SDK enums
 //! carry the typed literals, stored as their canonical strings.
 
-use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
+use bss_ledger_sdk::{AccountClass, MappingStatus, PostedMoney, Side, SourceDocType};
 use chrono::NaiveDate;
 use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
@@ -57,8 +57,7 @@ pub struct NewEntry {
 }
 
 /// A journal line to insert (truth-table detail). Mirrors the
-/// `journal_line` columns; `amount_minor`/`functional_amount_minor` are
-/// integer minor units.
+/// `journal_line` columns, with validated transaction and functional money.
 #[domain_model]
 #[derive(Clone, Debug)]
 pub struct NewLine {
@@ -70,17 +69,12 @@ pub struct NewLine {
     pub account_class: AccountClass,
     pub gl_code: Option<String>,
     pub side: Side,
-    pub amount_minor: i64,
-    pub currency: String,
-    /// Minor-unit scale (digits after the decimal). `u8`: a small non-negative
-    /// count by construction; persisted as `smallint` at the entity boundary.
-    pub currency_scale: u8,
+    pub money: PostedMoney,
     pub invoice_id: Option<String>,
     pub due_date: Option<NaiveDate>,
     pub revenue_stream: Option<String>,
     pub mapping_status: MappingStatus,
-    pub functional_amount_minor: Option<i64>,
-    pub functional_currency: Option<String>,
+    pub functional_money: Option<PostedMoney>,
     pub tax_jurisdiction: Option<String>,
     pub tax_filing_period: Option<String>,
     pub tax_rate_ref: Option<String>,
@@ -135,15 +129,12 @@ pub struct LineRecord {
     pub account_class: String,
     pub gl_code: Option<String>,
     pub side: String,
-    pub amount_minor: i64,
-    pub currency: String,
-    pub currency_scale: i16,
+    pub money: PostedMoney,
     pub invoice_id: Option<String>,
     pub due_date: Option<NaiveDate>,
     pub revenue_stream: Option<String>,
     pub mapping_status: String,
-    pub functional_amount_minor: Option<i64>,
-    pub functional_currency: Option<String>,
+    pub functional_money: Option<PostedMoney>,
     pub tax_jurisdiction: Option<String>,
     pub tax_filing_period: Option<String>,
     pub tax_rate_ref: Option<String>,
@@ -164,11 +155,7 @@ pub struct LineRecord {
 pub struct CurrencyScaleRow {
     pub tenant_id: Uuid,
     pub currency: String,
-    pub minor_units: i16,
-    /// Per-currency plausible maximum in MAJOR units (resolved; the default
-    /// 10^12 stands in when the request omits it). Governs the i64 headroom
-    /// guard at registration.
-    pub plausible_max_major: i64,
+    pub currency_scale: u8,
     pub source: String,
 }
 
@@ -216,13 +203,29 @@ pub struct FiscalPeriodRow {
 #[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum RepoError {
+    /// A new repository input violates its shape or operation contract.
+    #[error("invalid ledger request: {0}")]
+    InvalidRequest(String),
+    /// A stale version or classified database contention requires a fresh transaction.
+    #[error("concurrent ledger modification: {0}")]
+    Conflict(String),
     /// Underlying database / scope failure.
     #[error("ledger repo db error: {0}")]
     Db(String),
+    /// A caller-supplied value or an exact result violates the money contract.
+    #[error(transparent)]
+    Money(#[from] bss_ledger_sdk::MoneyError),
+    /// Stored money is malformed, noncanonical or violates its currency contract.
+    /// The diagnostic is internal and must never be returned to a client.
+    #[error("ledger repo: invalid stored money: {0}")]
+    InvalidStoredMoney(String),
+    /// Tenant approval policy is outside the ratified configuration contract.
+    #[error("invalid approval policy: {0}")]
+    ApprovalPolicyOutOfRange(String),
     /// A just-inserted row could not be read back (invariant breach).
     #[error("ledger repo: row vanished after insert: {0}")]
     RowVanished(String),
-    /// Currency scale would overflow i64 headroom at registration (A4/I-10).
+    /// Currency scale is outside the supported 0..=28 range.
     #[error("ledger repo: currency scale out of range: {0}")]
     ScaleOutOfRange(String),
     /// Scale change rejected: postings exist for the currency (maps to
@@ -235,10 +238,12 @@ pub enum RepoError {
     /// maps this to `ALLOCATION_EXCEEDS_SETTLED`.
     #[error("ledger repo: payment money-out cap exceeded: {0}")]
     MoneyOutCapExceeded(String),
-    /// A dispute-outcome advance matched no row that was still `OPENED` at the
-    /// requested cycle — the dispute was concurrently resolved (a `won`/`lost`
-    /// race) or the outcome targets a stale cycle. The sidecar maps this to
-    /// `INVALID_DISPUTE_PHASE` (a non-retryable precondition failure), NOT a 500.
+    /// The scoped read already observes a missing dispute or an illegal phase,
+    /// cycle or payment identity for opening/resolving. Maps to a non-retryable
+    /// InvalidDisputeTransition. A CAS race after a valid read is Conflict.
     #[error("ledger repo: dispute not OPENED at the requested cycle: {0}")]
     DisputeNotOpen(String),
+    /// Valid recognition state rejects a requested lifecycle operation.
+    #[error("ledger repo: recognition policy conflict: {0}")]
+    RecognitionPolicyConflict(String),
 }

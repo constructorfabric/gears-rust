@@ -9,12 +9,17 @@ pub mod gear;
 pub use gear::ApiGateway;
 
 // === INTERNAL MODULES ===
+/// Embedded static assets (docs UI bundles).
 mod assets;
+/// Gateway configuration types.
 mod config;
+/// CORS layer construction from [`CorsConfig`].
 mod cors;
+/// HTTP middleware stack: auth, throttling, metrics, access logging and related layers.
 pub mod middleware;
 mod proxy;
 mod router_cache;
+/// Built-in web endpoints: health checks and the API docs page.
 mod web;
 
 // === RE-EXPORTS ===

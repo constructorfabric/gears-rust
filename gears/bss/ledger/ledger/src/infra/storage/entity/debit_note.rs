@@ -4,11 +4,11 @@
 //! Tenant-scoped via `SecureORM`; the resource col is the business
 //! `debit_note_id` (mirrors `recognition_schedule`'s `schedule_id`).
 //!
-//! `amount_minor` is incl-tax; `recognized_part_minor` + `deferred_part_minor`
+//! `amount` is incl-tax; `recognized_part` + `deferred_part`
 //! are the ex-tax split parts — as with `credit_note`, they do NOT sum to
-//! `amount_minor`, so there is deliberately no `recognized + deferred == amount`
+//! `amount`, so there is deliberately no `recognized + deferred == amount`
 //! CHECK. A debit note raises the invoice's headroom
-//! (`invoice_exposure.debit_note_total_minor += amount`) under the lock order.
+//! (`invoice_exposure.debit_note_total += amount`) under the lock order.
 
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
@@ -30,9 +30,10 @@ pub struct Model {
     pub debit_note_id: String,
     pub origin_invoice_id: String,
     pub currency: String,
-    pub amount_minor: i64,
-    pub recognized_part_minor: i64,
-    pub deferred_part_minor: i64,
+    pub currency_scale: i16,
+    pub amount: String,
+    pub recognized_part: String,
+    pub deferred_part: String,
     pub created_at_utc: OffsetDateTime,
 }
 

@@ -32,3 +32,4 @@ pub mod retention;
 pub mod seller_guard;
 pub mod storage;
 pub mod tenant_lifecycle;
+pub(crate) mod v1_payload;

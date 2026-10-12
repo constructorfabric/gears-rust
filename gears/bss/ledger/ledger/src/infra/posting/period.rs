@@ -60,14 +60,14 @@ pub fn classify_clock_skew(posted_at_utc: OffsetDateTime, now: OffsetDateTime) -
 }
 
 /// Period-gate outcome error.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum PeriodError {
     /// The period is missing or not `OPEN` — posting is refused.
     #[error("fiscal period is closed or absent")]
     Closed,
     /// Underlying storage failure.
     #[error("fiscal period guard db error: {0}")]
-    Db(String),
+    Db(toolkit_db::DbError),
 }
 
 /// Guards posting against a closed/absent fiscal period.
@@ -106,7 +106,7 @@ impl FiscalPeriodGuard {
             .scope_with(&scope)
             .one(txn)
             .await
-            .map_err(|e| PeriodError::Db(format!("pin_open: {e}")))?;
+            .map_err(|e| PeriodError::Db(super::error_transport::scope_to_db(e)))?;
 
         match row {
             Some(p) if p.status == PERIOD_STATUS_OPEN => Ok(()),

@@ -710,6 +710,7 @@ pub struct TypeProvisioningServiceImpl {
 }
 
 impl TypeProvisioningServiceImpl {
+    /// Create the service reading instances from the given types-registry client.
     pub fn new(registry: Arc<dyn TypesRegistryClient>) -> Self {
         Self { registry }
     }

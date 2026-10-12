@@ -1,0 +1,108 @@
+replicaCount: 1
+
+image:
+  registry: ghcr.io
+  repository: constructorfabric/api-contracts
+  tag: "dev"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  automount: true
+  annotations: {}
+
+command: ["/app/gear"]
+args: ["--config", "/app/config/gear.yaml"]
+
+service:
+  type: ClusterIP
+  port: 9097
+
+grpc:
+  enabled: false
+  port: 50051
+
+# DirectoryService gRPC endpoint.
+directoryEndpoint: "http://flight-control:50051"
+
+# Projected token for platform-plane authentication.
+saToken:
+  enabled: true
+  audience: toolkit-internal
+  mountPath: /var/run/secrets/tokens/toolkit-internal
+  fileName: token
+  expirationSeconds: 3600
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 3
+    periodSeconds: 10
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    failureThreshold: 6
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+podLabels: {}
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+nodeSelector: {}
+affinity: {}
+tolerations: []
+
+config:
+  mountPath: /app/config/gear.yaml
+  fileName: gear.yaml
+  data:
+    server:
+      home_dir: "/app/data"
+    logging:
+      default:
+        console_format: "json"
+        console_level: info
+    oop_http:
+      listen_addr: "0.0.0.0:{{ .Values.service.port }}"
+      advertise_uri: 'http://{{ include "toolkit-common.fullname" . }}:{{ .Values.service.port }}'
+      internal_auth:
+        provider: kube
+        audiences: ["toolkit-internal"]
+        token_path: '{{ .Values.saToken.mountPath }}/{{ .Values.saToken.fileName }}'
+    gears:
+      api-contracts:
+        config: {}
+      authn-resolver:
+        config:
+          vendor: "constructorfabric"
+      static-authn-plugin:
+        config:
+          vendor: "constructorfabric"
+          priority: 100
+          mode: accept_all
+      types-registry:
+        config: {}
+

@@ -10,6 +10,17 @@ use bss_ledger_sdk::{AccountClass, Side};
 use uuid::Uuid;
 
 use super::*;
+use bss_ledger_sdk::money::{CurrencySpec, PostedMoney};
+use rust_decimal::Decimal;
+/// Original USD fixtures expressed economically at their real scale of two.
+fn m(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(cents, 2),
+        CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
 use crate::domain::error::DomainError;
 
 /// A baseline request for `(pattern, phase, two_stage)` over `amount`. Pattern B
@@ -28,8 +39,7 @@ fn req(pattern: RefundPattern, phase: RefundPhase, two_stage: bool, amount: i64)
         pattern,
         payment_id: "pay-1".to_owned(),
         invoice_id,
-        currency: "USD".to_owned(),
-        amount_minor: amount,
+        amount: m(amount),
         two_stage,
         // Default to a first-order OUTBOUND refund; the refund-of-refund tests
         // override `direction` + `relates_to_refund_id` explicitly.
@@ -39,20 +49,31 @@ fn req(pattern: RefundPattern, phase: RefundPhase, two_stage: bool, amount: i64)
 }
 
 fn assert_balanced(plan: &RefundLegPlan) {
-    let dr: i64 = plan
-        .legs
-        .iter()
-        .filter(|l| l.side == Side::Debit)
-        .map(|l| l.amount_minor)
-        .sum();
-    let cr: i64 = plan
-        .legs
-        .iter()
-        .filter(|l| l.side == Side::Credit)
-        .map(|l| l.amount_minor)
-        .sum();
+    let dr = sum_posted(
+        &plan
+            .legs
+            .iter()
+            .filter(|l| l.side == Side::Debit)
+            .map(|l| l.amount.clone())
+            .collect::<Vec<_>>(),
+        m(0).currency().clone(),
+    )
+    .unwrap();
+    let cr = sum_posted(
+        &plan
+            .legs
+            .iter()
+            .filter(|l| l.side == Side::Credit)
+            .map(|l| l.amount.clone())
+            .collect::<Vec<_>>(),
+        m(0).currency().clone(),
+    )
+    .unwrap();
     assert_eq!(dr, cr, "plan must balance: {plan:?}");
-    assert!(plan.legs.iter().all(|l| l.amount_minor > 0), "no zero legs");
+    assert!(
+        plan.legs.iter().all(|l| l.amount.amount() > Decimal::ZERO),
+        "no zero legs"
+    );
     // The §4.4 invariant: a refund NEVER debits CONTRACT_LIABILITY.
     assert!(
         plan.legs
@@ -194,22 +215,30 @@ fn two_stage_clearing_credit_then_debit_nets_to_zero() {
         amount,
     ))
     .unwrap();
-    let clearing_delta = |plan: &RefundLegPlan| -> i64 {
+    let clearing_delta = |plan: &RefundLegPlan| -> Decimal {
         plan.legs
             .iter()
             .filter(|l| l.account_class == AccountClass::RefundClearing)
             .map(|l| match l.side {
                 // CR a credit-normal clearing liability raises it; DR drains it.
-                Side::Credit => l.amount_minor,
-                Side::Debit => -l.amount_minor,
+                Side::Credit => l.amount.amount(),
+                Side::Debit => -l.amount.amount(),
             })
             .sum()
     };
-    assert_eq!(clearing_delta(&s1), amount, "stage-1 opens the clearing");
-    assert_eq!(clearing_delta(&s2), -amount, "stage-2 drains the clearing");
+    assert_eq!(
+        clearing_delta(&s1),
+        m(amount).amount(),
+        "stage-1 opens the clearing"
+    );
+    assert_eq!(
+        clearing_delta(&s2),
+        -m(amount).amount(),
+        "stage-2 drains the clearing"
+    );
     assert_eq!(
         clearing_delta(&s1) + clearing_delta(&s2),
-        0,
+        Decimal::ZERO,
         "REFUND_CLEARING nets to zero across both stages"
     );
 }
@@ -469,4 +498,72 @@ fn clawback_single_step_restores_pattern_debit_from_cash() {
             .all(|l| l.account_class != AccountClass::RefundClearing),
         "single-step claw-back has no REFUND_CLEARING leg"
     );
+}
+
+#[test]
+fn fractional_refund_matrix_preserves_direction_sides_and_money() {
+    for pattern in [RefundPattern::AUnallocated, RefundPattern::BRestoreAr] {
+        for (phase, two_stage) in [
+            (RefundPhase::Initiated, true),
+            (RefundPhase::Initiated, false),
+            (RefundPhase::Confirmed, true),
+        ] {
+            let outbound = req(pattern, phase, two_stage, 1234);
+            let out = build_refund_legs(&outbound).unwrap();
+            let mut claw = outbound.clone();
+            claw.direction = RefundDirection::Clawback;
+            claw.relates_to_refund_id = Some("prior".to_owned());
+            let back = build_refund_legs(&claw).unwrap();
+            assert_eq!(out.legs.len(), 2);
+            assert_eq!(back.legs.len(), 2);
+            for leg in &out.legs {
+                assert_eq!(leg.amount, m(1234));
+                let inverse = back
+                    .legs
+                    .iter()
+                    .find(|l| l.account_class == leg.account_class)
+                    .unwrap();
+                assert_eq!(inverse.amount, leg.amount);
+                assert_ne!(inverse.side, leg.side);
+            }
+            assert_eq!(out.clearing_state, back.clearing_state);
+        }
+        for phase in [
+            RefundPhase::Rejected,
+            RefundPhase::Voided,
+            RefundPhase::UnknownFinal,
+        ] {
+            for two_stage in [false, true] {
+                assert!(matches!(
+                    build_refund_legs(&req(pattern, phase, two_stage, 1234)),
+                    Err(DomainError::InvalidRequest(_))
+                ));
+            }
+        }
+    }
+}
+#[test]
+fn refund_bound_and_zero_preserve_stored_spec() {
+    for (code, scale) in [("JPY", 0), ("USD", 2), ("KWD", 3), ("BTC", 8), ("USD", 28)] {
+        let mut r = req(
+            RefundPattern::AUnallocated,
+            RefundPhase::Initiated,
+            false,
+            0,
+        );
+        let spec = CurrencySpec::try_new(code.to_owned(), scale).unwrap();
+        r.amount = PostedMoney::try_new(
+            "9999999999999999999999999999".parse().unwrap(),
+            spec.clone(),
+        )
+        .unwrap();
+        let p = build_refund_legs(&r).unwrap();
+        assert!(
+            p.legs
+                .iter()
+                .all(|l| l.amount == r.amount && l.amount.currency() == &spec)
+        );
+        r.amount = PostedMoney::try_new(Decimal::ZERO, spec).unwrap();
+        assert!(build_refund_legs(&r).unwrap().legs.is_empty());
+    }
 }

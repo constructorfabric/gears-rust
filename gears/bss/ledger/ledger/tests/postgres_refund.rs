@@ -46,7 +46,6 @@ use bss_ledger::domain::adjustment::refund::{
 use bss_ledger::domain::approval::intent::ApprovalIntent;
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
 use bss_ledger::infra::adjustment::refund_service::{RefundHandler, RefundOutcome};
@@ -56,7 +55,8 @@ use bss_ledger::infra::events::publisher::LedgerEventPublisher;
 use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
-use bss_ledger_sdk::{AccountClass, Side};
+use bss_ledger_sdk::{AccountClass, CurrencySpec, PostedMoney, Side, canonical_decimal};
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -76,6 +76,28 @@ async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+}
+
+async fn scalar_text(conn: &DatabaseConnection, sql: &str) -> Option<String> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| r.try_get_by_index::<String>(0).unwrap())
+}
+
+/// The USD@2 currency spec every fixture here posts in.
+fn usd_spec() -> CurrencySpec {
+    CurrencySpec::try_new("USD".to_owned(), 2).unwrap()
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(Decimal::new(cents, 2), usd_spec()).unwrap()
+}
+
+/// The canonical stored text of a USD cent count (`300` ⇒ `"3"`, `1` ⇒ `"0.01"`).
+fn text(cents: i64) -> String {
+    canonical_decimal(Decimal::new(cents, 2))
 }
 
 /// Provisioned seller for the refund flow: the chart classes a refund touches —
@@ -134,8 +156,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -192,7 +213,7 @@ fn refund_handler(provider: &DBProvider<DbError>) -> RefundHandler {
 }
 
 /// Settle `gross` (fee 0) for `payment_id` — seeds the `payment_settlement` row
-/// (`settled_minor = gross`) the refund resolves as its origin.
+/// (`settled = gross`) the refund resolves as its origin.
 async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gross: i64) {
     settle_svc(provider)
         .settle(
@@ -202,9 +223,8 @@ async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gr
                 tenant_id: s.tenant,
                 payer_tenant_id: s.payer,
                 payment_id: payment_id.to_owned(),
-                gross_minor: gross,
-                fee_minor: 0,
-                currency: "USD".to_owned(),
+                gross: usd(gross),
+                fee: usd(0),
                 effective_at: None,
             },
         )
@@ -212,11 +232,12 @@ async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gr
         .expect("settle must succeed");
 }
 
-async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64> {
-    scalar_i64(
+/// The canonical stored `balance` text of an account (`None` ⇒ no balance row).
+async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<String> {
+    scalar_text(
         raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             s.tenant, account
         ),
@@ -260,8 +281,8 @@ async fn settlement_counter(
     s: &Seller,
     payment_id: &str,
     col: &str,
-) -> Option<i64> {
-    scalar_i64(
+) -> Option<String> {
+    scalar_text(
         raw,
         &format!(
             "SELECT {col} FROM bss.ledger_payment_settlement \
@@ -272,18 +293,18 @@ async fn settlement_counter(
     .await
 }
 
-/// Read the `payment_allocation_refund.refunded_minor` for a `(payment, invoice)` —
+/// Read the `payment_allocation_refund.refunded` for a `(payment, invoice)` —
 /// the Pattern-B per-invoice cap counter.
 async fn allocation_refunded(
     raw: &DatabaseConnection,
     s: &Seller,
     payment_id: &str,
     invoice_id: &str,
-) -> Option<i64> {
-    scalar_i64(
+) -> Option<String> {
+    scalar_text(
         raw,
         &format!(
-            "SELECT refunded_minor FROM bss.ledger_payment_allocation_refund \
+            "SELECT refunded FROM bss.ledger_payment_allocation_refund \
              WHERE tenant_id='{}' AND payment_id='{payment_id}' AND invoice_id='{invoice_id}'",
             s.tenant
         ),
@@ -309,8 +330,8 @@ async fn refund_clearing_state(
 }
 
 /// Seed a `payment_allocation_refund` row directly (the per-`(payment, invoice)`
-/// cap basis a Pattern-B refund draws against) — `allocated_minor = allocated`,
-/// `refunded_minor = 0`. Stands in for the allocation that would have applied this
+/// cap basis a Pattern-B refund draws against) — `allocated = allocated`,
+/// `refunded = 0`. Stands in for the allocation that would have applied this
 /// payment to the invoice (the `AllocationSidecar` seeds this row in the real flow;
 /// seeding it directly keeps the refund cap test self-contained).
 async fn seed_allocation_refund(
@@ -322,23 +343,27 @@ async fn seed_allocation_refund(
 ) {
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_payment_allocation_refund \
-         (tenant_id, payment_id, invoice_id, allocated_minor, refunded_minor, version) \
-         VALUES ('{}','{payment_id}','{invoice_id}',{allocated},0,0)",
-        s.tenant
+         (tenant_id, payment_id, invoice_id, currency, currency_scale, allocated, refunded, version) \
+         VALUES ('{}','{payment_id}','{invoice_id}','USD',2,'{}','0',0)",
+        s.tenant,
+        text(allocated)
     )))
     .await
     .unwrap();
 }
 
-/// Bump `payment_settlement.allocated_minor` directly to model a prior allocation
-/// of `amount` from the pool (so a Pattern-A refund's `refunded_unallocated` cap +
-/// the spendable-headroom CHECK have a non-trivial allocated base). Mirrors what
-/// `add_allocated` does, without wiring the whole allocation flow.
+/// Set `payment_settlement.allocated` directly to model a prior allocation of
+/// `amount` (cents) from the pool (so a Pattern-A refund's `refunded_unallocated`
+/// cap + the spendable-headroom CHECK have a non-trivial allocated base). Mirrors
+/// what `add_allocated` does on a freshly settled row (`allocated = 0`), without
+/// wiring the whole allocation flow; the column is canonical decimal text, so the
+/// value is written whole rather than summed in SQL.
 async fn bump_allocated(raw: &DatabaseConnection, s: &Seller, payment_id: &str, amount: i64) {
     raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_payment_settlement \
-         SET allocated_minor = allocated_minor + {amount}, version = version + 1 \
+         SET allocated = '{}', version = version + 1 \
          WHERE tenant_id='{}' AND payment_id='{payment_id}'",
+        text(amount),
         s.tenant
     )))
     .await
@@ -364,8 +389,7 @@ fn refund_req(
         pattern,
         payment_id: payment_id.to_owned(),
         invoice_id: invoice_id.map(ToOwned::to_owned),
-        currency: "USD".to_owned(),
-        amount_minor: amount,
+        amount: usd(amount),
         two_stage: true,
         // First-order OUTBOUND refund by default; the refund-of-refund tests build
         // claw-backs via `clawback_req`.
@@ -417,8 +441,8 @@ async fn pattern_a_two_stage_drains_refund_clearing_to_zero() {
 
     // Settle 1000 → UNALLOCATED holds 1000 (CR), CASH_CLEARING holds 1000 (DR).
     settle(&provider, &s, "PAY-A", 1000).await;
-    assert_eq!(bal(&raw, &s, s.unallocated).await, Some(1000));
-    assert_eq!(bal(&raw, &s, s.cash).await, Some(1000));
+    assert_eq!(bal(&raw, &s, s.unallocated).await, Some(text(1000)));
+    assert_eq!(bal(&raw, &s, s.cash).await, Some(text(1000)));
 
     // Stage-1 initiated: DR UNALLOCATED 300 · CR REFUND_CLEARING 300.
     refund_handler(&provider)
@@ -440,12 +464,12 @@ async fn pattern_a_two_stage_drains_refund_clearing_to_zero() {
         .expect("stage-1 posts");
     assert_eq!(
         bal(&raw, &s, s.unallocated).await,
-        Some(700),
+        Some(text(700)),
         "UNALLOCATED drawn down by the refund"
     );
     assert_eq!(
         bal(&raw, &s, s.refund_clearing).await,
-        Some(300),
+        Some(text(300)),
         "stage-1 opens the REFUND_CLEARING balance"
     );
     assert_eq!(refund_rows(&raw, &s, "PSP-A", "initiated").await, Some(1));
@@ -470,12 +494,12 @@ async fn pattern_a_two_stage_drains_refund_clearing_to_zero() {
         .expect("stage-2 posts");
     assert_eq!(
         bal(&raw, &s, s.refund_clearing).await,
-        Some(0),
+        Some(text(0)),
         "stage-2 drains REFUND_CLEARING back to zero"
     );
     assert_eq!(
         bal(&raw, &s, s.cash).await,
-        Some(700),
+        Some(text(700)),
         "CASH_CLEARING reduced by the disbursed cash (1000 − 300)"
     );
     assert_eq!(refund_rows(&raw, &s, "PSP-A", "confirmed").await, Some(1));
@@ -523,10 +547,10 @@ async fn pattern_b_two_stage_restores_ar_then_drains_clearing() {
         .expect("stage-1 posts");
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(400),
+        Some(text(400)),
         "AR restored (the receivable re-opens)"
     );
-    assert_eq!(bal(&raw, &s, s.refund_clearing).await, Some(400));
+    assert_eq!(bal(&raw, &s, s.refund_clearing).await, Some(text(400)));
 
     // Stage-2 confirmed drains REFUND_CLEARING → CASH_CLEARING.
     refund_handler(&provider)
@@ -548,12 +572,12 @@ async fn pattern_b_two_stage_restores_ar_then_drains_clearing() {
         .expect("stage-2 posts");
     assert_eq!(
         bal(&raw, &s, s.refund_clearing).await,
-        Some(0),
+        Some(text(0)),
         "stage-2 drains REFUND_CLEARING to zero"
     );
     assert_eq!(
         bal(&raw, &s, s.cash).await,
-        Some(600),
+        Some(text(600)),
         "cash disbursed (1000 − 400)"
     );
     assert_eq!(
@@ -621,7 +645,12 @@ async fn refund_currency_mismatch_is_rejected() {
         None,
         100,
     );
-    req.currency = "EUR".to_owned(); // refund currency ≠ the USD settlement
+    // Refund currency ≠ the USD settlement (same scale, so the code check fires).
+    req.amount = PostedMoney::try_new(
+        Decimal::new(100, 2),
+        CurrencySpec::try_new("EUR".to_owned(), 2).unwrap(),
+    )
+    .unwrap();
     let err = refund_handler(&provider)
         .post_refund(&ctx, &scope, req)
         .await
@@ -661,7 +690,7 @@ async fn refund_stage_is_idempotent_on_psp_phase() {
         .await
         .expect("first post");
     assert!(!first.replayed, "first post is fresh");
-    assert_eq!(bal(&raw, &s, s.refund_clearing).await, Some(250));
+    assert_eq!(bal(&raw, &s, s.refund_clearing).await, Some(text(250)));
 
     // Replay the SAME (psp_refund_id, phase) ⇒ idempotent: the engine returns the
     // prior posting, the sidecar does not run again, and the books are unchanged.
@@ -672,7 +701,7 @@ async fn refund_stage_is_idempotent_on_psp_phase() {
     assert!(replay.replayed, "second post is a replay");
     assert_eq!(
         bal(&raw, &s, s.refund_clearing).await,
-        Some(250),
+        Some(text(250)),
         "no second books effect on replay"
     );
     assert_eq!(
@@ -697,7 +726,7 @@ async fn stage1_initiation_reserves_refunded_cap_both_patterns() {
     let scope = AccessScope::for_tenant(s.tenant);
 
     settle(&provider, &s, "PAY-CAP", 1000).await;
-    // Pattern A stage-1: reserves refunded_minor AND refunded_unallocated_minor.
+    // Pattern A stage-1: reserves refunded AND refunded_unallocated.
     refund_handler(&provider)
         .post_refund(
             &ctx,
@@ -716,14 +745,14 @@ async fn stage1_initiation_reserves_refunded_cap_both_patterns() {
         .await
         .expect("stage-1 reserves the cap");
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-CAP", "refunded_minor").await,
-        Some(300),
-        "stage-1 bumps total money-out refunded_minor"
+        settlement_counter(&raw, &s, "PAY-CAP", "refunded").await,
+        Some(text(300)),
+        "stage-1 bumps total money-out refunded"
     );
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-CAP", "refunded_unallocated_minor").await,
-        Some(300),
-        "Pattern A also bumps the spendable-headroom refunded_unallocated_minor"
+        settlement_counter(&raw, &s, "PAY-CAP", "refunded_unallocated").await,
+        Some(text(300)),
+        "Pattern A also bumps the spendable-headroom refunded_unallocated"
     );
 
     // Stage-2 confirmed must NOT move the counters (the cash was capped at stage-1).
@@ -745,14 +774,14 @@ async fn stage1_initiation_reserves_refunded_cap_both_patterns() {
         .await
         .expect("stage-2 drains clearing");
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-CAP", "refunded_minor").await,
-        Some(300),
-        "stage-2 confirmed leaves refunded_minor unchanged (no double count)"
+        settlement_counter(&raw, &s, "PAY-CAP", "refunded").await,
+        Some(text(300)),
+        "stage-2 confirmed leaves refunded unchanged (no double count)"
     );
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-CAP", "refunded_unallocated_minor").await,
-        Some(300),
-        "stage-2 confirmed leaves refunded_unallocated_minor unchanged"
+        settlement_counter(&raw, &s, "PAY-CAP", "refunded_unallocated").await,
+        Some(text(300)),
+        "stage-2 confirmed leaves refunded_unallocated unchanged"
     );
 }
 
@@ -797,9 +826,9 @@ async fn stage1_over_settled_is_refund_exceeds_settled() {
     );
     assert_eq!(bal(&raw, &s, s.refund_clearing).await, None);
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-OVER", "refunded_minor").await,
-        Some(0),
-        "the rejected reservation left refunded_minor at 0"
+        settlement_counter(&raw, &s, "PAY-OVER", "refunded").await,
+        Some(text(0)),
+        "the rejected reservation left refunded at 0"
     );
 }
 
@@ -878,7 +907,7 @@ async fn pattern_b_per_invoice_cap_blocks_over_allocated() {
     seed_allocation_refund(&raw, &s, "PAY-PB", "INV-PB", 400).await;
 
     // A Pattern-B refund of 400 fits the per-invoice cap (refunded 400 <= allocated
-    // 400) and bumps payment_allocation_refund.refunded_minor.
+    // 400) and bumps payment_allocation_refund.refunded.
     refund_handler(&provider)
         .post_refund(
             &ctx,
@@ -898,8 +927,8 @@ async fn pattern_b_per_invoice_cap_blocks_over_allocated() {
         .expect("Pattern-B refund within the per-invoice cap succeeds");
     assert_eq!(
         allocation_refunded(&raw, &s, "PAY-PB", "INV-PB").await,
-        Some(400),
-        "Pattern B bumps the per-(payment, invoice) refunded_minor"
+        Some(text(400)),
+        "Pattern B bumps the per-(payment, invoice) refunded"
     );
 
     // A further Pattern-B refund of 1 ⇒ refunded 401 > 400 allocated ⇒ the
@@ -958,15 +987,15 @@ async fn rejected_stage1_reverses_and_frees_cap() {
         )
         .await
         .expect("stage-1 posts + reserves cap");
-    assert_eq!(bal(&raw, &s, s.unallocated).await, Some(650));
-    assert_eq!(bal(&raw, &s, s.refund_clearing).await, Some(350));
+    assert_eq!(bal(&raw, &s, s.unallocated).await, Some(text(650)));
+    assert_eq!(bal(&raw, &s, s.refund_clearing).await, Some(text(350)));
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-REJ", "refunded_minor").await,
-        Some(350)
+        settlement_counter(&raw, &s, "PAY-REJ", "refunded").await,
+        Some(text(350))
     );
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-REJ", "refunded_unallocated_minor").await,
-        Some(350)
+        settlement_counter(&raw, &s, "PAY-REJ", "refunded_unallocated").await,
+        Some(text(350))
     );
 
     // PSP rejected the initiated refund: the stage-1 reversal line-negates
@@ -994,24 +1023,24 @@ async fn rejected_stage1_reverses_and_frees_cap() {
     // REFUND_CLEARING drained to zero; UNALLOCATED restored to the pre-refund 1000.
     assert_eq!(
         bal(&raw, &s, s.refund_clearing).await,
-        Some(0),
+        Some(text(0)),
         "the reversal drains REFUND_CLEARING to zero"
     );
     assert_eq!(
         bal(&raw, &s, s.unallocated).await,
-        Some(1000),
+        Some(text(1000)),
         "the reversal restores the drawn-down UNALLOCATED pool"
     );
     // The caps are released back to the pre-initiation 0 (the cap is freed).
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-REJ", "refunded_minor").await,
-        Some(0),
-        "the reversal frees refunded_minor back to 0"
+        settlement_counter(&raw, &s, "PAY-REJ", "refunded").await,
+        Some(text(0)),
+        "the reversal frees refunded back to 0"
     );
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-REJ", "refunded_unallocated_minor").await,
-        Some(0),
-        "the reversal frees refunded_unallocated_minor back to 0"
+        settlement_counter(&raw, &s, "PAY-REJ", "refunded_unallocated").await,
+        Some(text(0)),
+        "the reversal frees refunded_unallocated back to 0"
     );
     // The reversal refund row is REVERSED and links the stage-1 entry.
     assert_eq!(
@@ -1242,7 +1271,7 @@ async fn refund_over_threshold_gates_then_a_second_actor_approve_posts_it() {
     // No books moved yet (UNALLOCATED still holds the full settled 200_000).
     assert_eq!(
         bal(&raw, &s, s.unallocated).await,
-        Some(200_000),
+        Some(text(200_000)),
         "gating must not move the books"
     );
     assert_eq!(refund_rows(&raw, &s, "PSP-DC", "initiated").await, Some(0));
@@ -1273,19 +1302,19 @@ async fn refund_over_threshold_gates_then_a_second_actor_approve_posts_it() {
     );
     assert_eq!(
         bal(&raw, &s, s.unallocated).await,
-        Some(50_000),
+        Some(text(50_000)),
         "approve drew UNALLOCATED down by the refund (200_000 − 150_000)"
     );
     assert_eq!(
         bal(&raw, &s, s.refund_clearing).await,
-        Some(150_000),
+        Some(text(150_000)),
         "the stage-1 REFUND_CLEARING balance opened on approve"
     );
     assert_eq!(refund_rows(&raw, &s, "PSP-DC", "initiated").await, Some(1));
-    // The money-out cap was taken (refunded_minor bumped under the settlement lock).
+    // The money-out cap was taken (refunded bumped under the settlement lock).
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-DC", "refunded_minor").await,
-        Some(150_000),
+        settlement_counter(&raw, &s, "PAY-DC", "refunded").await,
+        Some(text(150_000)),
         "the stage-1 reservation moved the money-out cap on approve"
     );
     // The approval is now APPROVED, approver stamped.
@@ -1364,7 +1393,7 @@ async fn preparer_cannot_self_approve_their_refund() {
     );
     assert_eq!(
         bal(&raw, &s, s.unallocated).await,
-        Some(200_000),
+        Some(text(200_000)),
         "the books are untouched"
     );
     let row = svc
@@ -1415,7 +1444,7 @@ async fn refund_under_threshold_posts_inline_without_an_approval() {
     );
     assert_eq!(
         bal(&raw, &s, s.unallocated).await,
-        Some(150_000),
+        Some(text(150_000)),
         "the inline refund drew UNALLOCATED down immediately (200_000 − 50_000)"
     );
     assert_eq!(
@@ -1457,7 +1486,7 @@ async fn age_clawback_row(raw: &DatabaseConnection, s: &Seller) {
 }
 
 /// Claw-back AFTER a matching outbound refund stage-1: the decrement nets
-/// `refunded_minor` back down (so the total money-out cap reflects the NET refunded
+/// `refunded` back down (so the total money-out cap reflects the NET refunded
 /// and does not falsely trip), and REFUND_CLEARING drains in the opposite direction.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
@@ -1471,7 +1500,7 @@ async fn clawback_after_outbound_decrements_net_refunded() {
 
     settle(&provider, &s, "PAY-CB", 1000).await;
 
-    // Outbound stage-1 refund of 400 → refunded_minor = 400; UNALLOCATED 1000→600.
+    // Outbound stage-1 refund of 400 → refunded = 400; UNALLOCATED 1000→600.
     refund_handler(&provider)
         .post_refund(
             &ctx,
@@ -1490,13 +1519,13 @@ async fn clawback_after_outbound_decrements_net_refunded() {
         .await
         .expect("outbound stage-1 posts");
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-CB", "refunded_minor").await,
-        Some(400)
+        settlement_counter(&raw, &s, "PAY-CB", "refunded").await,
+        Some(text(400))
     );
-    assert_eq!(bal(&raw, &s, s.unallocated).await, Some(600));
-    assert_eq!(bal(&raw, &s, s.refund_clearing).await, Some(400));
+    assert_eq!(bal(&raw, &s, s.unallocated).await, Some(text(600)));
+    assert_eq!(bal(&raw, &s, s.refund_clearing).await, Some(text(400)));
 
-    // Claw-back stage-1 of 400 (the PSP returned the cash): DECREMENTS refunded_minor
+    // Claw-back stage-1 of 400 (the PSP returned the cash): DECREMENTS refunded
     // 400→0 (net refunded), inverts the legs (DR REFUND_CLEARING · CR UNALLOCATED)
     // so REFUND_CLEARING drains 400→0 and UNALLOCATED is restored 600→1000.
     refund_handler(&provider)
@@ -1518,18 +1547,18 @@ async fn clawback_after_outbound_decrements_net_refunded() {
         .await
         .expect("in-order claw-back posts");
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-CB", "refunded_minor").await,
-        Some(0),
+        settlement_counter(&raw, &s, "PAY-CB", "refunded").await,
+        Some(text(0)),
         "claw-back decrements money-out back to the NET refunded (400 − 400)"
     );
     assert_eq!(
         bal(&raw, &s, s.refund_clearing).await,
-        Some(0),
+        Some(text(0)),
         "claw-back drains REFUND_CLEARING the opposite way"
     );
     assert_eq!(
         bal(&raw, &s, s.unallocated).await,
-        Some(1000),
+        Some(text(1000)),
         "claw-back restores the drawn-down UNALLOCATED"
     );
     // The claw-back refund row carries the relates_to link.
@@ -1588,7 +1617,7 @@ async fn additional_outbound_refund_of_refund_increments_under_cap() {
         .expect("first outbound posts");
 
     // An ADDITIONAL OUTBOUND refund-of-refund of 200 (direction = Outbound, with a
-    // relates_to link): INCREMENTS refunded_minor 300→500 under the same cap.
+    // relates_to link): INCREMENTS refunded 300→500 under the same cap.
     let mut additional = refund_req(
         &s,
         "RF-2",
@@ -1606,8 +1635,8 @@ async fn additional_outbound_refund_of_refund_increments_under_cap() {
         .await
         .expect("additional-outbound posts");
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-AO", "refunded_minor").await,
-        Some(500),
+        settlement_counter(&raw, &s, "PAY-AO", "refunded").await,
+        Some(text(500)),
         "additional-outbound increments under the SAME money-out cap (300 + 200)"
     );
     assert_eq!(
@@ -1619,7 +1648,7 @@ async fn additional_outbound_refund_of_refund_increments_under_cap() {
 
 /// An OUT-OF-ORDER claw-back (no matching outbound refund stage-1 yet): the decrement
 /// would underflow → DEFERRED to the REFUND_CLAWBACK queue (NOT aborted, NOT applied),
-/// `refunded_minor` untouched. After the matching outbound lands, the drain applies it.
+/// `refunded` untouched. After the matching outbound lands, the drain applies it.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn out_of_order_clawback_defers_then_applies_after_outbound() {
@@ -1632,7 +1661,7 @@ async fn out_of_order_clawback_defers_then_applies_after_outbound() {
 
     settle(&provider, &s, "PAY-OOO", 1000).await;
 
-    // Claw-back of 400 arrives FIRST (no outbound yet) → refunded_minor would go
+    // Claw-back of 400 arrives FIRST (no outbound yet) → refunded would go
     // 0 − 400 < 0 → DEFER. The call surfaces RefundClawbackDeferred (not a hard
     // error), nothing posts, and the row is QUEUED.
     let deferred = refund_handler(&provider)
@@ -1657,8 +1686,8 @@ async fn out_of_order_clawback_defers_then_applies_after_outbound() {
         "out-of-order claw-back defers (not a hard fail): {deferred:?}"
     );
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-OOO", "refunded_minor").await,
-        Some(0),
+        settlement_counter(&raw, &s, "PAY-OOO", "refunded").await,
+        Some(text(0)),
         "the deferred claw-back applied NO decrement"
     );
     assert_eq!(
@@ -1672,7 +1701,7 @@ async fn out_of_order_clawback_defers_then_applies_after_outbound() {
         "no refund row posted"
     );
 
-    // The matching OUTBOUND refund stage-1 lands → refunded_minor 0→400.
+    // The matching OUTBOUND refund stage-1 lands → refunded 0→400.
     refund_handler(&provider)
         .post_refund(
             &ctx,
@@ -1691,11 +1720,11 @@ async fn out_of_order_clawback_defers_then_applies_after_outbound() {
         .await
         .expect("outbound posts");
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-OOO", "refunded_minor").await,
-        Some(400)
+        settlement_counter(&raw, &s, "PAY-OOO", "refunded").await,
+        Some(text(400))
     );
 
-    // Drain the claw-back queue: the decrement now FITS → APPLIED (refunded_minor
+    // Drain the claw-back queue: the decrement now FITS → APPLIED (refunded
     // 400→0), the queue row flips →APPLIED, the claw-back refund row posts.
     let report = refund_handler(&provider)
         .drain_clawbacks(&ctx, &scope, s.tenant, 100)
@@ -1703,8 +1732,8 @@ async fn out_of_order_clawback_defers_then_applies_after_outbound() {
         .expect("drain succeeds");
     assert_eq!(report.applied, 1, "the reconciled claw-back applied");
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-OOO", "refunded_minor").await,
-        Some(0),
+        settlement_counter(&raw, &s, "PAY-OOO", "refunded").await,
+        Some(text(0)),
         "the drained claw-back decremented to the net refunded"
     );
     assert_eq!(clawback_queue_rows(&raw, &s, "QUEUED").await, 0);
@@ -1771,8 +1800,8 @@ async fn never_reconciled_clawback_is_cancelled_and_escalated() {
     );
     assert_eq!(clawback_queue_rows(&raw, &s, "QUEUED").await, 0);
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-ORPH", "refunded_minor").await,
-        Some(0),
+        settlement_counter(&raw, &s, "PAY-ORPH", "refunded").await,
+        Some(text(0)),
         "the never-reconciled claw-back applied NO decrement (the CHECK never fired)"
     );
 }
@@ -1868,7 +1897,7 @@ async fn unknown_final_parks_refund_clearing_to_suspense_and_audits() {
         .expect("stage-1 posts");
     assert_eq!(
         bal(&raw, &s, s.refund_clearing).await,
-        Some(300),
+        Some(text(300)),
         "stage-1 opens the REFUND_CLEARING balance"
     );
 
@@ -1900,14 +1929,14 @@ async fn unknown_final_parks_refund_clearing_to_suspense_and_audits() {
     // REFUND_CLEARING drained to zero (DR cancelled the stage-1 CR) …
     assert_eq!(
         bal(&raw, &s, s.refund_clearing).await,
-        Some(0),
+        Some(text(0)),
         "unknown_final drains REFUND_CLEARING to zero"
     );
     // … parked onto SUSPENSE (CR SUSPENSE 300, credit-normal → +300) pending
     // reconciliation — NOT booked to loss/gain (the outcome is unknown) …
     assert_eq!(
         bal(&raw, &s, s.suspense).await,
-        Some(300),
+        Some(text(300)),
         "the stuck clearing was parked to SUSPENSE pending reconciliation"
     );
     // … a refund row recorded SETTLED on the unknown_final phase grain …
@@ -1937,7 +1966,9 @@ async fn unknown_final_parks_refund_clearing_to_suspense_and_audits() {
     assert_eq!(call.reason_code.as_deref(), Some("REFUND_UNKNOWN_FINAL"));
     assert!(call.actor_ref.is_some(), "the acting subject is captured");
     assert_eq!(call.before_after["disposition"], "REFUND_UNKNOWN_FINAL");
-    assert_eq!(call.before_after["after"]["parked_minor"], 300);
+    assert_eq!(call.before_after["after"]["parked"], text(300));
+    assert_eq!(call.before_after["currency"], "USD");
+    assert_eq!(call.before_after["currency_scale"], 2);
     assert_eq!(call.before_after["after"]["park_account_class"], "SUSPENSE");
 
     // Idempotent replay: re-posting the same disposition does NOT double-park (the
@@ -1962,7 +1993,7 @@ async fn unknown_final_parks_refund_clearing_to_suspense_and_audits() {
         .expect("replay is idempotent");
     assert_eq!(
         bal(&raw, &s, s.suspense).await,
-        Some(300),
+        Some(text(300)),
         "no double park on replay"
     );
     assert_eq!(
@@ -2035,11 +2066,12 @@ async fn open_dispute(
     payment_id: &str,
     disputed: i64,
 ) {
+    let disputed = text(disputed);
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_dispute \
-         (tenant_id, dispute_id, payment_id, currency, variant, last_phase, cycle, \
-          disputed_amount_minor, cash_hold_minor, version) \
-         VALUES ('{}','{dispute_id}','{payment_id}','USD','CASH_HOLD','OPENED',1,{disputed},{disputed},0)",
+         (tenant_id, dispute_id, payment_id, currency, currency_scale, variant, last_phase, cycle, \
+          disputed_amount, cash_hold, version) \
+         VALUES ('{}','{dispute_id}','{payment_id}','USD',2,'CASH_HOLD','OPENED',1,'{disputed}','{disputed}',0)",
         s.tenant
     )))
     .await
@@ -2108,12 +2140,12 @@ async fn quarantine_then_settle_drains_and_posts() {
     );
     assert_eq!(
         bal(&raw, &s, s.refund_clearing).await,
-        Some(300),
+        Some(text(300)),
         "the de-quarantined stage-1 opened REFUND_CLEARING"
     );
     assert_eq!(
         bal(&raw, &s, s.unallocated).await,
-        Some(700),
+        Some(text(700)),
         "UNALLOCATED drawn down by the now-posted refund"
     );
     assert_eq!(refund_rows(&raw, &s, "PSP-Q", "initiated").await, Some(1));
@@ -2466,8 +2498,8 @@ async fn applied_clawback_replay_returns_posted() {
         .await;
     assert_eq!(clawback_queue_rows(&raw, &s, "QUEUED").await, 1);
 
-    // The matching outbound lands (refunded_minor 0→400), then drain applies the
-    // claw-back (refunded_minor 400→0, dedup →POSTED, queue row →APPLIED).
+    // The matching outbound lands (refunded 0→400), then drain applies the
+    // claw-back (refunded 400→0, dedup →POSTED, queue row →APPLIED).
     handler
         .post_refund(
             &ctx,
@@ -2492,9 +2524,9 @@ async fn applied_clawback_replay_returns_posted() {
     assert_eq!(report.applied, 1);
     assert_eq!(clawback_queue_rows(&raw, &s, "APPLIED").await, 1);
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-CBP", "refunded_minor").await,
-        Some(0),
-        "the applied claw-back netted refunded_minor back to zero"
+        settlement_counter(&raw, &s, "PAY-CBP", "refunded").await,
+        Some(text(0)),
+        "the applied claw-back netted refunded back to zero"
     );
 
     // Re-submit the now-APPLIED claw-back: the short-circuit reads POSTED ⇒ returns
@@ -2522,8 +2554,8 @@ async fn applied_clawback_replay_returns_posted() {
         "the applied claw-back returns the prior posting (replayed)"
     );
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-CBP", "refunded_minor").await,
-        Some(0),
+        settlement_counter(&raw, &s, "PAY-CBP", "refunded").await,
+        Some(text(0)),
         "no second decrement on replay"
     );
 }

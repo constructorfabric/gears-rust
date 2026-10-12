@@ -176,7 +176,13 @@ impl ApprovalSourceV1 for PricingApprovalSource {
                 has_more: false,
             });
         }
-        let (ctx, scope) = self.read_scope(ctx).await?;
+        // The read grant and the two flag grants are asked at once (one PDP round trip).
+        // Authenticated first, so an anonymous caller still answers 401 before any PDP question.
+        let ctx = require_authenticated(Some(Extension(ctx.clone())))?;
+        let ((ctx, scope), (approve_scope, submit_scope)) = tokio::try_join!(
+            self.read_scope(&ctx),
+            super::approval_flag_scopes(&self.enforcer, &ctx),
+        )?;
         let filter = super::unit_narrowing(
             q.narrowing.state.as_deref(),
             q.narrowing.kind.as_deref(),
@@ -194,14 +200,6 @@ impl ApprovalSourceV1 for PricingApprovalSource {
             Some(after) => page.with_cursor(keyset_cursor(after, direction)?),
             None => page.with_order(submission_order(direction)),
         };
-        let (approve_scope, submit_scope) = (
-            crate::authz::grant_scope(&self.enforcer, &ctx, actions::APPROVE)
-                .await
-                .map_err(authz_failure)?,
-            crate::authz::grant_scope(&self.enforcer, &ctx, actions::SUBMIT)
-                .await
-                .map_err(authz_failure)?,
-        );
         let request = approvals::UnitListRequest {
             filter,
             page,

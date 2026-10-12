@@ -62,11 +62,17 @@ async fn pin_open_admits_open_rejects_closed_and_missing() {
     .await
     .unwrap();
     let closed = run_pin(&provider, &guard, tenant, legal_entity, period_id).await;
-    assert_eq!(closed, Err(PeriodError::Closed));
+    assert!(
+        matches!(closed, Err(PeriodError::Closed)),
+        "closed period must refuse: {closed:?}"
+    );
 
     // Missing period → Closed.
     let missing = run_pin(&provider, &guard, tenant, legal_entity, "209912").await;
-    assert_eq!(missing, Err(PeriodError::Closed));
+    assert!(
+        matches!(missing, Err(PeriodError::Closed)),
+        "missing period must refuse as closed: {missing:?}"
+    );
 }
 
 /// Pin a period inside one transaction, returning the guard's typed result

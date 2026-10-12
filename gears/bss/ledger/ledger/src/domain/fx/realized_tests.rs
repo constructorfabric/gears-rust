@@ -7,37 +7,61 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
+use bss_ledger_sdk::money::CurrencySpec;
+fn money(minor: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::from_i128_with_scale(i128::from(minor), 2),
+        CurrencySpec::try_new("USD".into(), 2).unwrap(),
+    )
+    .unwrap()
+}
 
 /// A `ClosingLeg` literal.
 fn leg(
     side: Side,
-    carried_functional_minor: i64,
-    carried_transaction_minor: i64,
-    relieved_transaction_minor: i64,
+    carried_functional: i64,
+    carried_transaction: i64,
+    relieved_transaction: i64,
 ) -> ClosingLeg {
     ClosingLeg {
         side,
-        carried_functional_minor,
-        carried_transaction_minor,
-        relieved_transaction_minor,
+        carried_functional: money(carried_functional),
+        carried_transaction: money(carried_transaction),
+        relieved_transaction: money(relieved_transaction),
     }
 }
 
 /// Assert the close entry's functional column balances: Σ DR (relief legs + FX
 /// line) == Σ CR. This is the invariant `realize` must guarantee by construction.
 fn assert_functional_balances(legs: &[ClosingLeg], r: &RealizedFx) {
-    let mut dr: i128 = 0;
-    let mut cr: i128 = 0;
-    for (leg, &f) in legs.iter().zip(&r.leg_functional_minor) {
+    let mut dr = ExactAmount::from_decimal(Decimal::ZERO);
+    let mut cr = ExactAmount::from_decimal(Decimal::ZERO);
+    for (leg, f) in legs.iter().zip(&r.leg_functional) {
         match leg.side {
-            Side::Debit => dr += i128::from(f),
-            Side::Credit => cr += i128::from(f),
+            Side::Debit => {
+                dr = dr
+                    .checked_add(&ExactAmount::from_decimal(f.amount()))
+                    .unwrap();
+            }
+            Side::Credit => {
+                cr = cr
+                    .checked_add(&ExactAmount::from_decimal(f.amount()))
+                    .unwrap();
+            }
         }
     }
-    if let Some(fx) = r.fx_line {
+    if let Some(fx) = &r.fx_line {
         match fx.side {
-            Side::Debit => dr += i128::from(fx.functional_minor),
-            Side::Credit => cr += i128::from(fx.functional_minor),
+            Side::Debit => {
+                dr = dr
+                    .checked_add(&ExactAmount::from_decimal(fx.functional.amount()))
+                    .unwrap();
+            }
+            Side::Credit => {
+                cr = cr
+                    .checked_add(&ExactAmount::from_decimal(fx.functional.amount()))
+                    .unwrap();
+            }
         }
     }
     assert_eq!(dr, cr, "functional column must balance (DR == CR)");
@@ -54,12 +78,12 @@ fn example_c_full_close_nets_240_usd_loss() {
     ];
     let r = realize(&legs).unwrap();
     // Full close → each leg relieves its whole carried functional.
-    assert_eq!(r.leg_functional_minor, vec![12_960, 13_200]);
+    assert_eq!(r.leg_functional, vec![money(12_960), money(13_200)]);
     assert_eq!(
         r.fx_line,
         Some(RealizedFxLine {
             side: Side::Debit,
-            functional_minor: 240,
+            functional: money(240),
         }),
         "net 2.40 USD realized LOSS on the DR side"
     );
@@ -79,7 +103,7 @@ fn gain_direction_credits_short_emits_credit_fx() {
         r.fx_line,
         Some(RealizedFxLine {
             side: Side::Credit,
-            functional_minor: 240,
+            functional: money(240),
         }),
         "credits short → realized GAIN on the CR side"
     );
@@ -106,12 +130,12 @@ fn partial_close_relieves_wac_prorata_half() {
         leg(Side::Credit, 13_200, 12_000, 6_000), // 13200 * 6000/12000 = 6600
     ];
     let r = realize(&legs).unwrap();
-    assert_eq!(r.leg_functional_minor, vec![6_480, 6_600]);
+    assert_eq!(r.leg_functional, vec![money(6_480), money(6_600)]);
     assert_eq!(
         r.fx_line,
         Some(RealizedFxLine {
             side: Side::Debit,
-            functional_minor: 120,
+            functional: money(120),
         }),
         "half close → half the realized loss (1.20)"
     );
@@ -126,8 +150,8 @@ fn blended_grain_two_rates_relieves_at_wac() {
     let legs = [leg(Side::Debit, 26_160, 24_000, 12_000)];
     let r = realize(&legs).unwrap();
     assert_eq!(
-        r.leg_functional_minor,
-        vec![13_080],
+        r.leg_functional,
+        vec![money(13_080)],
         "relief is the grain's blended WAC, not a per-settlement rate"
     );
     // One unbalanced leg → the whole relief is the realized FX (DR relief short on
@@ -136,7 +160,7 @@ fn blended_grain_two_rates_relieves_at_wac() {
         r.fx_line,
         Some(RealizedFxLine {
             side: Side::Credit,
-            functional_minor: 13_080,
+            functional: money(13_080),
         })
     );
     assert_functional_balances(&legs, &r);
@@ -150,8 +174,8 @@ fn full_close_relieves_exact_carried_no_drift() {
         let l = leg(Side::Debit, cf, ct, ct);
         let r = realize(std::slice::from_ref(&l)).unwrap();
         assert_eq!(
-            r.leg_functional_minor,
-            vec![cf],
+            r.leg_functional,
+            vec![money(cf)],
             "a full close relieves the exact carried functional ({cf}/{ct})"
         );
     }
@@ -166,9 +190,10 @@ fn each_leg_uses_its_own_carried_no_cross_grain_average() {
         leg(Side::Debit, 12_960, 12_000, 12_000),  // Unallocated @1.08
     ];
     let r = realize(&legs).unwrap();
-    assert_eq!(r.leg_functional_minor[0], 13_200, "AR keeps its own carry");
+    assert_eq!(r.leg_functional[0], money(13_200), "AR keeps its own carry");
     assert_eq!(
-        r.leg_functional_minor[1], 12_960,
+        r.leg_functional[1],
+        money(12_960),
         "Unallocated keeps its own carry (not (13200+12960)/2 = 13080)"
     );
 }
@@ -176,7 +201,7 @@ fn each_leg_uses_its_own_carried_no_cross_grain_average() {
 #[test]
 fn empty_close_is_a_no_op() {
     let r = realize(&[]).unwrap();
-    assert!(r.leg_functional_minor.is_empty());
+    assert!(r.leg_functional.is_empty());
     assert_eq!(r.fx_line, None);
 }
 
@@ -211,5 +236,89 @@ fn negative_carried_functional_rejected() {
     assert_eq!(
         realize(&[leg(Side::Debit, -1, 12_000, 12_000)]),
         Err(RealizedFxError::NegativeCarriedFunctional)
+    );
+}
+
+#[test]
+fn wac_metadata_must_match_even_on_zero() {
+    let wrong_scale = PostedMoney::try_new(
+        Decimal::ZERO,
+        CurrencySpec::try_new("USD".into(), 3).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        carried_relief(&money(0), &money(100), &wrong_scale),
+        Err(RealizedFxError::Exact(ExactError::Money(
+            bss_ledger_sdk::money::MoneyError::ScaleMismatch
+        )))
+    );
+    let mut legs = [
+        leg(Side::Debit, 0, 100, 100),
+        leg(Side::Credit, 0, 100, 100),
+    ];
+    legs[1].carried_functional = PostedMoney::try_new(
+        Decimal::ZERO,
+        CurrencySpec::try_new("EUR".into(), 2).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        realize(&legs),
+        Err(RealizedFxError::Exact(ExactError::Money(
+            bss_ledger_sdk::money::MoneyError::CurrencyMismatch
+        )))
+    );
+    legs[1].carried_functional = wrong_scale;
+    assert_eq!(
+        realize(&legs),
+        Err(RealizedFxError::Exact(ExactError::Money(
+            bss_ledger_sdk::money::MoneyError::ScaleMismatch
+        )))
+    );
+}
+
+#[test]
+fn wide_independent_full_close_cancels_and_final_net_overflow_rejects() {
+    let huge = PostedMoney::try_new(
+        Decimal::from_str_exact("9999999999999999999999999999").unwrap(),
+        CurrencySpec::try_new("USD".into(), 0).unwrap(),
+    )
+    .unwrap();
+    let make = |side| ClosingLeg {
+        side,
+        carried_functional: huge.clone(),
+        carried_transaction: money(7),
+        relieved_transaction: money(7),
+    };
+    let legs = [
+        make(Side::Debit),
+        make(Side::Debit),
+        make(Side::Credit),
+        make(Side::Credit),
+    ];
+    let r = realize(&legs).unwrap();
+    assert_eq!(r.leg_functional, vec![huge.clone(); 4]);
+    assert_eq!(r.fx_line, None);
+    assert_functional_balances(&legs, &r);
+    assert_eq!(
+        realize(&legs[..2]),
+        Err(RealizedFxError::Exact(ExactError::Money(
+            bss_ledger_sdk::money::MoneyError::AmountOutOfRange
+        )))
+    );
+}
+
+#[test]
+fn exact_wac_nonterminating_ratio_and_half_even() {
+    assert_eq!(
+        carried_relief(&money(100), &money(3), &money(1)).unwrap(),
+        money(33)
+    );
+    assert_eq!(
+        carried_relief(&money(1), &money(2), &money(1)).unwrap(),
+        money(0)
+    );
+    assert_eq!(
+        carried_relief(&money(3), &money(2), &money(1)).unwrap(),
+        money(2)
     );
 }

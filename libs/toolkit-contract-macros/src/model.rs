@@ -1,11 +1,20 @@
+/// Parsed form of a `#[contract]` trait, the input to contract codegen.
 pub struct ContractModel {
+    /// Owning gear name.
     pub gear: String,
+    /// Contract version string.
     pub version: String,
+    /// Identifier of the contract trait.
     pub trait_name: syn::Ident,
+    /// Visibility of the contract trait, reused on generated items.
     pub vis: syn::Visibility,
+    /// Supertraits declared on the contract trait.
     pub supertraits: syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    /// Contract methods in declaration order.
     pub methods: Vec<MethodModel>,
+    /// Attributes (including docs) carried over to the emitted trait.
     pub attrs: Vec<syn::Attribute>,
+    /// Contract kind derived from the trait-name suffix.
     pub kind: ContractKind,
 }
 
@@ -13,9 +22,13 @@ pub struct ContractModel {
 /// macro crate. Codegen converts it back to absolute-path token form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContractKind {
+    /// Trait name ends in `Api`: a public cross-gear API.
     Api,
+    /// Trait name ends in `Embedded`: an in-process-only contract.
     Embedded,
+    /// Trait name ends in `Backend`: a pluggable backend contract.
     Backend,
+    /// Trait name ends in `Extension`: an extension-point contract.
     Extension,
 }
 
@@ -62,26 +75,39 @@ impl ContractKind {
     }
 }
 
+/// A contract method as parsed from the trait.
 pub struct MethodModel {
+    /// Method identifier.
     pub name: syn::Ident,
+    /// Whether the method is unary or server-streaming.
     pub kind: MethodKind,
     /// How a server-streaming method's stream is obtained. Meaningless when
     /// `kind` is [`MethodKind::Unary`], where it stays at its default.
     pub open: StreamOpen,
+    /// Idempotency classification from the method attributes.
     pub idempotency: Idempotency,
+    /// Parameters of the method, excluding the receiver.
     pub params: Vec<ParamModel>,
+    /// Success type extracted from the `Result` return type.
     pub output_type: syn::Type,
+    /// Error type extracted from the `Result` return type.
     pub error_type: syn::Type,
+    /// Attributes (including docs) carried over to the emitted method.
     pub attrs: Vec<syn::Attribute>,
+    /// Original method signature, used to re-emit the trait method.
     pub sig: syn::Signature,
     /// `true` when the trait declares a default body — peers MAY omit
     /// this method (`PoC` convention).
     pub optional: bool,
 }
 
+/// A parameter of a contract method.
 pub struct ParamModel {
+    /// Parameter name.
     pub name: syn::Ident,
+    /// Parameter type.
     pub ty: syn::Type,
+    /// Semantic role of the parameter (wire field or security context).
     pub role: ParamRole,
 }
 
@@ -91,14 +117,19 @@ pub struct ParamModel {
 /// re-running a name/type heuristic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ParamRole {
+    /// Ordinary parameter serialised on the wire.
     #[default]
     Wire,
+    /// Security-context parameter, injected by the transport rather than sent as a field.
     SecurityContext,
 }
 
+/// Whether a contract method returns a single response or a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodKind {
+    /// Single request/response call.
     Unary,
+    /// Server-streaming call yielding a sequence of items.
     ServerStreaming,
 }
 
@@ -203,9 +234,13 @@ impl StreamFraming {
     }
 }
 
+/// Idempotency classification of a contract method, mirroring the runtime IR enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Idempotency {
+    /// Read-only call without side effects.
     SafeRead,
+    /// Write that is safe to repeat with the same effect.
     IdempotentWrite,
+    /// Write that is not safe to repeat.
     NonIdempotentWrite,
 }

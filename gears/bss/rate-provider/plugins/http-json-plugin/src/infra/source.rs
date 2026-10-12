@@ -3,16 +3,16 @@
 
 use std::borrow::Cow;
 
+use crate::infra::exact_json::ExactJson;
 use async_trait::async_trait;
 use bss_ledger_sdk::{CurrencyPair, ProviderRate, RateProviderError, RateProviderV1};
-use bss_rate_provider_sdk::conversion::rate_to_micro;
+use bss_rate_provider_sdk::conversion::parse_rate;
 use bss_rate_provider_sdk::currency::normalize_currency;
 use bss_rate_provider_sdk::error::map_http_error;
 use bss_rate_provider_sdk::fetch::fetch_and_parse;
 use bss_rate_provider_sdk::metrics::SharedFetchMetrics;
 use bss_rate_provider_sdk::publication_time::reject_future_publication_time;
 use secrecy::ExposeSecret;
-use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use toolkit_http::{HttpClient, RequestBuilder};
@@ -25,7 +25,7 @@ const API_KEY_HEADER: &str = "X-API-Key";
 
 /// Walk a dotted path (`a.b.c`) through nested JSON objects.
 #[must_use]
-pub fn json_lookup<'a>(value: &'a Value, dotted: &str) -> Option<&'a Value> {
+pub fn json_lookup<'a>(value: &'a ExactJson, dotted: &str) -> Option<&'a ExactJson> {
     let mut current = value;
     for segment in dotted.split('.') {
         current = current.get(segment)?;
@@ -51,7 +51,7 @@ pub fn json_lookup<'a>(value: &'a Value, dotted: &str) -> Option<&'a Value> {
 /// [`RateProviderError::Internal`] if the `rates`/`as_of` paths are absent, the
 /// configured `base` is not ISO-4217-shaped, or no entry maps.
 pub fn map_json_document(
-    body: &Value,
+    body: &ExactJson,
     mapping: &Mapping,
     provider: &str,
 ) -> Result<Vec<ProviderRate>, RateProviderError> {
@@ -62,7 +62,7 @@ pub fn map_json_document(
         ))
     })?;
     let as_of_raw = json_lookup(body, &mapping.as_of)
-        .and_then(Value::as_str)
+        .and_then(ExactJson::as_str)
         .ok_or_else(|| {
             RateProviderError::Internal(format!("as_of path '{}' missing", mapping.as_of))
         })?;
@@ -70,7 +70,7 @@ pub fn map_json_document(
         RateProviderError::Internal(format!("as_of '{as_of_raw}' not RFC3339: {e}"))
     })?;
     let rates_obj = json_lookup(body, &mapping.rates)
-        .and_then(Value::as_object)
+        .and_then(ExactJson::as_object)
         .ok_or_else(|| {
             RateProviderError::Internal(format!(
                 "rates path '{}' missing or not an object",
@@ -108,7 +108,7 @@ pub fn map_json_document(
 /// which currency of which feed started failing, or why.
 fn map_entry(
     quote: &str,
-    entry: &Value,
+    entry: &ExactJson,
     mapping: &Mapping,
     base: &str,
     as_of: OffsetDateTime,
@@ -132,8 +132,10 @@ fn map_entry(
         None
     })?;
     let rate_str: Cow<'_, str> = match rate_val {
-        Value::String(s) => Cow::Borrowed(s.as_str()),
-        Value::Number(n) => Cow::Owned(n.to_string()),
+        ExactJson::String(s) => Cow::Borrowed(s.as_str()),
+        // The exact token the provider wrote; `parse_rate` decides whether it is a
+        // bounded exact decimal.
+        ExactJson::Number(token) => number_token_text(token),
         _ => {
             tracing::warn!(
                 provider,
@@ -143,11 +145,11 @@ fn map_entry(
             return None;
         }
     };
-    match rate_to_micro(&rate_str) {
-        Ok(rate_micro) => Some(ProviderRate {
+    match parse_rate(&rate_str) {
+        Ok(rate) => Some(ProviderRate {
             base: base.to_owned(),
             quote: normalized_quote,
-            rate_micro,
+            rate,
             as_of,
             provider: provider.to_owned(),
         }),
@@ -236,7 +238,7 @@ impl RateProviderV1 for HttpJsonRateProvider {
     ) -> Result<Vec<ProviderRate>, RateProviderError> {
         let request = self.with_auth(self.client.get(&self.settings.base_url));
         fetch_and_parse(request, &self.settings.id, self.metrics.as_ref(), |bytes| {
-            let body: Value = serde_json::from_slice(bytes)
+            let body = ExactJson::parse(bytes)
                 .map_err(|e| RateProviderError::Internal(format!("invalid JSON: {e}")))?;
             let mut rates = map_json_document(&body, &self.settings.mapping, &self.settings.id)?;
             // One `as_of` is parsed per document and copied onto every rate, so
@@ -320,6 +322,71 @@ impl RateProviderV1 for HttpJsonRateProvider {
         }
         Ok(())
     }
+}
+
+/// Plain decimal text of a JSON number token. An exponent-form token (`3.6e-06`,
+/// as Python's `json` writes small floats) is expanded by moving the decimal point
+/// in the digit string, so no digit is rounded; `parse_rate` then applies its
+/// exactness and size bounds to the expanded text. A token longer than the 64-byte
+/// quote limit, or with an exponent beyond ±100, is passed through unexpanded and
+/// refused. A string quote is never expanded.
+fn number_token_text(token: &str) -> Cow<'_, str> {
+    expand_exponent(token).map_or(Cow::Borrowed(token), Cow::Owned)
+}
+
+/// Exact plain-decimal form of an exponent-form JSON number, or `None` when the
+/// token has no exponent, is malformed, exceeds 64 bytes, or has `|exponent| > 100`.
+fn expand_exponent(token: &str) -> Option<String> {
+    const MAX_TOKEN_BYTES: usize = 64;
+    const MAX_EXPONENT: i64 = 100;
+    if token.len() > MAX_TOKEN_BYTES {
+        return None;
+    }
+    let (mantissa, exponent) = token.split_once(['e', 'E'])?;
+    let exponent: i64 = exponent.parse().ok()?;
+    if exponent.abs() > MAX_EXPONENT {
+        return None;
+    }
+    let (negative, unsigned) = mantissa
+        .strip_prefix('-')
+        .map_or((false, mantissa), |rest| (true, rest));
+    let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if integer.is_empty()
+        || !integer.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = format!("{integer}{fraction}");
+    // Position of the decimal point within `digits` after applying the exponent.
+    let point = i64::try_from(integer.len()).ok()? + exponent;
+    let (whole, frac) = if point <= 0 {
+        let zeros = usize::try_from(-point).ok()?;
+        ("0".to_owned(), format!("{}{digits}", "0".repeat(zeros)))
+    } else {
+        let point = usize::try_from(point).ok()?;
+        if point >= digits.len() {
+            (
+                format!("{digits}{}", "0".repeat(point - digits.len())),
+                String::new(),
+            )
+        } else {
+            (digits[..point].to_owned(), digits[point..].to_owned())
+        }
+    };
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let frac = frac.trim_end_matches('0');
+    let mut out = String::with_capacity(whole.len() + frac.len() + 2);
+    if negative {
+        out.push('-');
+    }
+    out.push_str(whole);
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
+    }
+    Some(out)
 }
 
 #[cfg(test)]

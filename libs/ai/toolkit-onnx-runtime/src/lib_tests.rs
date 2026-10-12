@@ -115,7 +115,7 @@ async fn callers_take_the_session_one_at_a_time() {
     }
     let log = shared.run_blocking_for_test();
     for pair in log.chunks(2) {
-        assert_eq!(pair[0], pair[1], "no two callers interleaved: {log:?}");
+        assert_eq!(pair[0], pair[1], "no two callers interleaved");
     }
 }
 

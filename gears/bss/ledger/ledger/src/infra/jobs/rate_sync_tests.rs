@@ -3,8 +3,8 @@
 //! The fetch-handling branches (no adapter / configured-provider failure / empty
 //! fetch) all return BEFORE the per-tenant fan-out touches the DB, so they run
 //! against a bare in-memory SQLite provider + a `noop()` publisher. The
-//! tenant-fan-out path reads `fiscal_calendar` and upserts `ledger_fx_rate`, so it
-//! is a Docker-gated `#[ignore]` testcontainer test.
+//! fan-out runs against the actual migrated SQLite schema; the inherited PostgreSQL
+//! test remains Docker-gated and uses the same exact major-unit quote fixtures.
 //!
 //! Ignored Docker tests run with
 //! `cargo test -p cf-gears-bss-ledger --lib 'infra::jobs::rate_sync::tests' -- --ignored`.
@@ -85,11 +85,11 @@ impl RateProviderV1 for FakeProvider {
 /// which is where the value the job stores actually comes from. Left distinct
 /// from any fake's id on purpose: an assertion on the stored provenance then
 /// fails loudly if the stamping step is ever dropped.
-fn rate(base: &str, quote: &str, rate_micro: i64) -> ProviderRate {
+fn rate(base: &str, quote: &str, rate: &str) -> ProviderRate {
     ProviderRate {
         base: base.to_owned(),
         quote: quote.to_owned(),
-        rate_micro,
+        rate: rust_decimal::Decimal::from_str_exact(rate).unwrap(),
         as_of: OffsetDateTime::now_utc(),
         provider: "unstamped".to_owned(),
     }
@@ -215,10 +215,7 @@ async fn fans_rates_out_to_every_provisioned_tenant() {
     // A provider that publishes two pairs.
     let provider = Arc::new(FakeProvider {
         id: "ecb".to_owned(),
-        outcome: Outcome::Ok(vec![
-            rate("EUR", "USD", 1_100_000),
-            rate("GBP", "USD", 1_250_000),
-        ]),
+        outcome: Outcome::Ok(vec![rate("EUR", "USD", "1.1"), rate("GBP", "USD", "1.25")]),
     });
     let repo = FxRepo::new(dbp.clone());
     let publisher = Arc::new(LedgerEventPublisher::noop());
@@ -235,9 +232,99 @@ async fn fans_rates_out_to_every_provisioned_tenant() {
         let eur = repo.latest_rates(t, "EUR", "USD").await.unwrap();
         assert_eq!(eur.len(), 1, "EUR->USD upserted for {t}");
         assert_eq!(eur[0].provider, "ecb");
-        assert_eq!(eur[0].rate_micro, 1_100_000);
+        assert_eq!(
+            eur[0].rate,
+            rust_decimal::Decimal::from_str_exact("1.1").unwrap()
+        );
         let gbp = repo.latest_rates(t, "GBP", "USD").await.unwrap();
         assert_eq!(gbp.len(), 1, "GBP->USD upserted for {t}");
-        assert_eq!(gbp[0].rate_micro, 1_250_000);
+        assert_eq!(
+            gbp[0].rate,
+            rust_decimal::Decimal::from_str_exact("1.25").unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_fanout_keeps_digits_and_drops_invalid_producer_quotes() {
+    use crate::domain::model::FiscalCalendarRow;
+    use crate::infra::posting::retry::AttemptError;
+    let db = connect_db("sqlite::memory:", ConnectOpts::default())
+        .await
+        .unwrap();
+    toolkit_db::migration_runner::run_migrations_for_testing(&db, Migrator::migrations())
+        .await
+        .unwrap();
+    let dbp = DBProvider::new(db.clone());
+    let reference = ReferenceRepo::new(dbp.clone());
+    let tenants = [Uuid::now_v7(), Uuid::now_v7()];
+    db.transaction_ref_mapped_with_config(toolkit_db::secure::TxConfig::serializable(), |tx| {
+        let reference = reference.clone();
+        Box::pin(async move {
+            for tenant in tenants {
+                reference
+                    .upsert_fiscal_calendar_if_absent_txn(
+                        tx,
+                        FiscalCalendarRow {
+                            tenant_id: tenant,
+                            legal_entity_id: tenant,
+                            fiscal_tz: "UTC".into(),
+                            granularity: "MONTH".into(),
+                            fy_start_month: 1,
+                            functional_currency: None,
+                        },
+                    )
+                    .await?;
+            }
+            Ok::<_, AttemptError>(())
+        })
+    })
+    .await
+    .unwrap();
+    let provider = Arc::new(FakeProvider {
+        id: "actual-source".into(),
+        outcome: Outcome::Ok(vec![
+            rate("EUR", "USD", "1.123456789012345678901234567"),
+            rate("JPY", "EUR", "0.0000001"),
+            rate("GBP", "USD", "0"),
+            rate("CHF", "USD", "-1"),
+            rate("AUD", "USD", "12345678901234567890123456789"),
+        ]),
+    });
+    let repo = FxRepo::new(dbp.clone());
+    let job = RateSyncJob::new(
+        dbp,
+        provider,
+        repo.clone(),
+        Arc::new(LedgerEventPublisher::noop()),
+    );
+    let report = job.run().await.unwrap();
+    assert_eq!(
+        report,
+        RateSyncReport {
+            fetched: true,
+            rates: 5,
+            tenants: 2,
+            failed_tenants: 0
+        }
+    );
+    for tenant in tenants {
+        let rows = repo.latest_rates(tenant, "EUR", "USD").await.unwrap();
+        assert_eq!(rows[0].rate.to_string(), "1.123456789012345678901234567");
+        assert_eq!(rows[0].provider, "actual-source");
+        assert_eq!(
+            repo.latest_rates(tenant, "JPY", "EUR").await.unwrap()[0]
+                .rate
+                .to_string(),
+            "0.0000001"
+        );
+        for currency in ["GBP", "CHF", "AUD"] {
+            assert!(
+                repo.latest_rates(tenant, currency, "USD")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }

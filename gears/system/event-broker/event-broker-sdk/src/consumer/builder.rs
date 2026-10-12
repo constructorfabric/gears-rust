@@ -57,26 +57,44 @@ impl ConsumerOffsetManager for LocalDbOffsetManager {
 // ---- Builder ----
 
 pub struct ConsumerBuilder<M = ()> {
+    /// Consumer group the subscription joins; required before the consumer can start.
     pub(crate) group: Option<ConsumerGroupRef>,
+    /// Topics to consume; kept in sync with `subscription_interests` when those are set.
     pub(crate) topics: Vec<GtsInstanceId>,
+    /// Per-topic interests (tenant scope, type patterns, filter) sent on JOIN.
     pub(crate) subscription_interests: Vec<SubscriptionInterest>,
+    /// Root tenant whose events are consumed; `None` means the nil tenant id.
     pub(crate) tenant_id: Option<Uuid>,
+    /// How far below `tenant_id` the tenant hierarchy is traversed.
     pub(crate) tenant_depth: TenantTraversalDepth,
+    /// Whether traversal stops at self-managed tenant boundaries.
     pub(crate) barrier_mode: BarrierMode,
+    /// Event type patterns applied to every topic without an explicit interest.
     pub(crate) event_type_patterns: Vec<GtsIdPattern>,
+    /// Number of parallel consumer workers (sessions) the runtime spawns.
     pub(crate) parallelism: u32,
+    /// Client agent string reported to the broker on JOIN.
     pub(crate) client_agent: String,
+    /// Session timeout passed to the broker on JOIN; `None` leaves the broker default.
     pub(crate) session_timeout: Option<Duration>,
+    /// Optional content filter applied to every subscription interest.
     pub(crate) filter: Option<Filter>,
+    /// Initial delay of the reconnect/retry backoff.
     pub(crate) retry_base: Duration,
+    /// Upper bound of the reconnect/retry backoff.
     pub(crate) retry_max: Duration,
+    /// Settings profile providing the base buffering, batching and retry defaults.
     pub(crate) profile: ConsumerProfile,
+    /// Explicit per-setting overrides layered on top of `profile`.
     pub(crate) settings_overrides: ConsumerSettingsOverrides,
+    /// How offsets are committed after handlers complete.
     pub(crate) commit_mode: ConsumerCommitMode,
     /// Drop-on-Nth-heartbeat threshold: disconnect + re-JOIN after K consecutive heartbeats
     /// with no intervening events. Default: 10 (≈ 50 s of silence at 5 s broker cadence).
     pub(crate) heartbeat_drop_threshold: usize,
+    /// Runtime listeners notified of consumer lifecycle events.
     pub(crate) listeners: Vec<Arc<dyn ConsumerRuntimeListener>>,
+    /// Offset manager state; `()` until `offset_manager` selects one.
     pub(crate) offset_manager: M,
     /// Broker client resolved from ClientHub or supplied by tests.
     pub(crate) broker: Option<Arc<dyn EventBrokerApi>>,
@@ -267,6 +285,7 @@ impl<M> ConsumerBuilder<M> {
 }
 
 impl<M> ConsumerBuilder<M> {
+    /// Resolves the profile plus overrides into validated settings.
     pub(crate) fn effective_settings(&self) -> Result<ConsumerSettings, EventBrokerError> {
         let settings = ConsumerSettings::resolve(self.profile.clone(), self.settings_overrides);
         settings.validate()?;
@@ -309,28 +328,41 @@ impl ConsumerBuilder<()> {
 // ---- Terminal handler states ----
 
 pub struct ConsumerReady<M, H> {
+    /// Builder carrying the consumer configuration.
     pub(crate) builder: ConsumerBuilder<M>,
+    /// Handler invoked for each event.
     pub(crate) handler: H,
 }
 
 pub struct ConsumerBatchReady<M, H> {
+    /// Builder carrying the consumer configuration.
     pub(crate) builder: ConsumerBuilder<M>,
+    /// Handler invoked for each batch of events.
     pub(crate) handler: H,
 }
 
 pub struct ConsumerRoutedReady<M, H> {
+    /// Builder carrying the consumer configuration.
     pub(crate) builder: ConsumerBuilder<M>,
+    /// Fallback handler for events matching no route.
     pub(crate) default_handler: H,
+    /// Whether `default_handler` was explicitly supplied rather than a placeholder.
     pub(crate) has_default_handler: bool,
+    /// Routes in registration order; `route_handlers[i]` serves `routes[i]`.
     pub(crate) routes: Vec<ConsumerRoute>,
+    /// Handlers for the routes, index-aligned with `routes`.
     pub(crate) route_handlers: Vec<Arc<dyn ConsumerHandler>>,
 }
 
 #[cfg(feature = "db")]
 pub struct TxConsumerRoutedReady<M: CommitOffsetInTx + 'static> {
+    /// Builder carrying the consumer configuration.
     pub(crate) builder: ConsumerBuilder<WithTx<M>>,
+    /// Handler for events no route matches.
     pub(crate) default_handler: Option<Arc<dyn TxConsumerHandler<M>>>,
+    /// Routes in registration order; `route_handlers[i]` serves `routes[i]`.
     pub(crate) routes: Vec<ConsumerRoute>,
+    /// Handlers for the routes, index-aligned with `routes`.
     pub(crate) route_handlers: Vec<Arc<dyn TxConsumerHandler<M>>>,
 }
 

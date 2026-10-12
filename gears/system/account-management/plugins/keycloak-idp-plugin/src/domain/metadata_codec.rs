@@ -46,8 +46,11 @@ pub struct TenantIdpMetadataV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RealmBinding {
+    /// Tenant lives in a pre-existing shared realm (as a group).
     Shared,
+    /// Tenant is bound to a pre-existing realm provided by the operator.
     Adopted,
+    /// A dedicated realm was created by the plugin for the tenant.
     Created,
 }
 
@@ -67,15 +70,25 @@ impl RealmBinding {
     }
 }
 
+/// Failure decoding a persisted tenant `IdP` metadata blob.
 #[domain_model]
 #[derive(Debug, Error)]
 pub enum DecodeError {
+    /// The blob carries no `version` discriminator.
     #[error("metadata blob has no 'version' key")]
     MissingVersion,
+    /// The blob's `version` is not one this plugin understands.
     #[error("unsupported metadata version: {observed}")]
-    UnsupportedVersion { observed: String },
+    UnsupportedVersion {
+        /// Version string found in the blob.
+        observed: String,
+    },
+    /// The blob is not valid for its declared version.
     #[error("malformed metadata blob: {detail}")]
-    Malformed { detail: String },
+    Malformed {
+        /// Deserialization failure detail.
+        detail: String,
+    },
 }
 
 /// Stable metric-label form of a [`DecodeError`] variant, used by the

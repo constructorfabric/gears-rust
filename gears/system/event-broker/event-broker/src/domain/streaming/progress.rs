@@ -11,6 +11,7 @@
 //! stub - into every scheduling test. The session composes the two instead.
 
 use std::time::Duration;
+use toolkit::domain_model;
 
 use tokio::time::Instant;
 
@@ -18,6 +19,7 @@ use tokio::time::Instant;
 ///
 /// A configuration carrier: public fields and a `Default`, built from the
 /// operator's config at wiring time rather than parsed here.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressConfig {
     /// Events a partition may examine without delivering before a report is
@@ -39,6 +41,7 @@ impl Default for ProgressConfig {
 }
 
 /// The frontier-report timer for one stream.
+#[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct ProgressPolicy {
     drift_threshold: usize,

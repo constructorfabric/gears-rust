@@ -880,6 +880,32 @@ fn integrity_check_in_progress_maps_to_429_with_quota_violation() {
     assert_eq!(ctx.violations[0].subject, "integrity_check");
 }
 
+/// Quota admission sources share the same AM 429 envelope and subject.
+/// Recovery prose is not a machine-readable retry contract.
+#[test]
+fn service_account_quota_exceeded_maps_to_429_with_service_accounts_subject() {
+    let canonical = round_trip(DomainError::ServiceAccountQuotaExceeded {
+        detail: crate::domain::service_account::SA_QUOTA_MESSAGE.to_owned(),
+    });
+    assert_eq!(canonical.status_code(), 429);
+    assert_eq!(
+        canonical.resource_type(),
+        Some(account_management_sdk::gts::SERVICE_ACCOUNT_RESOURCE_TYPE)
+    );
+    let CanonicalError::ResourceExhausted { ctx, .. } = canonical else {
+        panic!("expected ResourceExhausted variant");
+    };
+    assert_eq!(ctx.violations.len(), 1);
+    assert_eq!(
+        ctx.violations[0].subject,
+        account_management_sdk::quota::SERVICE_ACCOUNTS
+    );
+    assert_eq!(
+        ctx.violations[0].description,
+        crate::domain::service_account::SA_QUOTA_MESSAGE
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Internal (HTTP 500)
 // ---------------------------------------------------------------------------

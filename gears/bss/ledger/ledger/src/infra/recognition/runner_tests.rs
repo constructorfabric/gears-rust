@@ -14,15 +14,15 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::*;
+use crate::infra::posting::service::decimal_tests::money;
 
 fn segment() -> ReleasableSegment {
     ReleasableSegment {
         schedule_id: "sched-7".to_owned(),
         segment_no: 3,
         period_id: "202607".to_owned(),
-        amount_minor: 2_500,
+        amount: money("25", "USD", 2),
         revenue_stream: "recurring".to_owned(),
-        currency: "USD".to_owned(),
     }
 }
 
@@ -74,10 +74,10 @@ fn entry_is_dr_contract_liability_cr_revenue_same_stream_equal_amount() {
     assert_eq!(cr.revenue_stream.as_deref(), Some("recurring"));
 
     // Equal amounts ⇒ balanced (Σ DR == Σ CR), the schedule currency on both.
-    assert_eq!(dr.amount_minor, 2_500);
-    assert_eq!(cr.amount_minor, 2_500);
-    assert_eq!(dr.currency, "USD");
-    assert_eq!(cr.currency, "USD");
+    assert_eq!(dr.money, money("25", "USD", 2));
+    assert_eq!(cr.money, money("25", "USD", 2));
+    assert_eq!(dr.money.currency().code(), "USD");
+    assert_eq!(cr.money.currency().code(), "USD");
 
     // Lines are bound from the chart later — the builder emits the nil placeholder.
     assert_eq!(dr.account_id, Uuid::nil());
@@ -137,65 +137,137 @@ fn reversal_business_id_is_schedule_colon_segment_colon_reversal() {
     );
 }
 
-#[test]
-fn reversal_entry_is_dr_revenue_cr_contract_liability_same_stream_equal_amount() {
-    let ctx = SecurityContext::anonymous();
-    let entry = build_reversal_entry(&ctx, Uuid::from_u128(1), &segment());
-
-    assert_eq!(entry.source_doc_type, SourceDocType::Recognition);
-    assert_eq!(entry.source_business_id, "sched-7:3:reversal");
-    assert_eq!(entry.lines.len(), 2, "exactly two legs");
-
-    let dr = entry
-        .lines
-        .iter()
-        .find(|l| l.side == Side::Debit)
-        .expect("a DR leg");
-    let cr = entry
-        .lines
-        .iter()
-        .find(|l| l.side == Side::Credit)
-        .expect("a CR leg");
-
-    // The MIRROR of the release: DR REVENUE (give back the recognized revenue) /
-    // CR CONTRACT_LIABILITY (restore the deferred balance).
-    assert_eq!(dr.account_class, AccountClass::Revenue);
-    assert_eq!(cr.account_class, AccountClass::ContractLiability);
-
-    // Both legs carry the same stream + currency; equal amounts ⇒ balanced.
-    assert_eq!(dr.revenue_stream.as_deref(), Some("recurring"));
-    assert_eq!(cr.revenue_stream.as_deref(), Some("recurring"));
-    assert_eq!(dr.amount_minor, 2_500);
-    assert_eq!(cr.amount_minor, 2_500);
-    assert_eq!(dr.currency, "USD");
-    assert_eq!(cr.currency, "USD");
-
-    // A reversal reverses nothing via the header's reverse-link (it is a fresh
-    // compensating entry keyed on the `:reversal` business id, not a strict
-    // line-negation reversal); account ids are bound from the chart later.
-    assert!(entry.reverses_entry_id.is_none());
-    assert_eq!(dr.account_id, Uuid::nil());
-    assert_eq!(cr.account_id, Uuid::nil());
+fn schedule_state() -> ScheduleState {
+    ScheduleState {
+        tenant_id: Uuid::from_u128(1),
+        schedule_id: "sched-7".to_owned(),
+        payer_tenant_id: Uuid::from_u128(2),
+        source_invoice_id: "INV-1".to_owned(),
+        source_invoice_item_ref: "item-1".to_owned(),
+        po_allocation_group: None,
+        subscription_ref: None,
+        revenue_stream: "recurring".to_owned(),
+        total_deferred: money("100", "USD", 2),
+        recognized: money("25", "USD", 2),
+        policy_ref: "policy".to_owned(),
+        ssp_snapshot_ref: None,
+        vc_estimate_ref: None,
+        vc_method_ref: None,
+        status: "ACTIVE".to_owned(),
+        version: 1,
+    }
 }
 
+fn segment_state() -> SegmentState {
+    SegmentState {
+        tenant_id: Uuid::from_u128(1),
+        schedule_id: "sched-7".to_owned(),
+        segment_no: 3,
+        period_id: "202607".to_owned(),
+        amount: money("25", "USD", 2),
+        version: 1,
+        status: "DONE".to_owned(),
+        recognized_at: None,
+        run_id: None,
+    }
+}
+
+fn release_line(class: &str, side: &str, amount: &str) -> crate::domain::model::LineRecord {
+    crate::domain::model::LineRecord {
+        line_id: Uuid::now_v7(),
+        entry_id: Uuid::from_u128(9),
+        tenant_id: Uuid::from_u128(1),
+        period_id: "202607".to_owned(),
+        payer_tenant_id: Uuid::nil(),
+        seller_tenant_id: None,
+        resource_tenant_id: None,
+        account_id: Uuid::now_v7(),
+        account_class: class.to_owned(),
+        gl_code: None,
+        side: side.to_owned(),
+        money: money(amount, "USD", 2),
+        invoice_id: None,
+        due_date: None,
+        revenue_stream: Some("recurring".to_owned()),
+        mapping_status: "RESOLVED".to_owned(),
+        functional_money: None,
+        tax_jurisdiction: None,
+        tax_filing_period: None,
+        tax_rate_ref: None,
+        legal_entity_id: None,
+        invoice_item_ref: None,
+        sku_or_plan_ref: None,
+        price_id: None,
+        pricing_snapshot_ref: None,
+        po_allocation_group: None,
+        credit_grant_event_type: None,
+        ar_status: None,
+    }
+}
+
+fn original(lines: Vec<crate::domain::model::LineRecord>) -> crate::domain::model::EntryRecord {
+    crate::domain::model::EntryRecord {
+        entry_id: Uuid::from_u128(9),
+        tenant_id: Uuid::from_u128(1),
+        legal_entity_id: Uuid::nil(),
+        period_id: "202607".to_owned(),
+        entry_currency: "USD".to_owned(),
+        source_doc_type: "RECOGNITION".to_owned(),
+        source_business_id: "sched-7:3".to_owned(),
+        reverses_entry_id: None,
+        reverses_period_id: None,
+        posted_at_utc: time::OffsetDateTime::UNIX_EPOCH,
+        effective_at: NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+        origin: "SYSTEM".to_owned(),
+        posted_by_actor_id: Uuid::nil(),
+        correlation_id: Uuid::nil(),
+        rounding_evidence: serde_json::json!({}),
+        created_seq: 1,
+        lines,
+    }
+}
+
+/// The original-release check sums the stored release by parsed class and side:
+/// a DR liability / CR revenue pair equal to the segment passes.
 #[test]
-fn due_pending_segment_projects_into_releasable() {
-    let due = DuePendingSegment {
-        schedule_id: "s1".to_owned(),
-        segment_no: 1,
-        period_id: "202606".to_owned(),
-        amount_minor: 100,
-        revenue_stream: "usage".to_owned(),
-        currency: "EUR".to_owned(),
-        total_deferred_minor: 1_200,
-        recognized_minor: 0,
-    };
-    let r: ReleasableSegment = due.into();
-    assert_eq!(r.schedule_id, "s1");
-    assert_eq!(r.segment_no, 1);
-    assert_eq!(r.revenue_stream, "usage");
-    assert_eq!(r.currency, "EUR");
-    assert_eq!(r.amount_minor, 100);
+fn original_release_with_the_segment_amount_passes() {
+    let entry = original(vec![
+        release_line("CONTRACT_LIABILITY", "DR", "25"),
+        release_line("REVENUE", "CR", "25"),
+        // Lines of other classes are ignored.
+        release_line("AR", "DR", "999"),
+    ]);
+    assert!(validate_original_release(&entry, &schedule_state(), &segment_state()).is_ok());
+}
+
+/// An unknown stored side or class is an invariant failure, never a silent
+/// credit; swapped sides make the totals disagree with the segment.
+#[test]
+fn original_release_with_unknown_or_swapped_side_or_class_is_internal() {
+    for lines in [
+        vec![
+            release_line("CONTRACT_LIABILITY", "XX", "25"),
+            release_line("REVENUE", "CR", "25"),
+        ],
+        vec![
+            release_line("CONTRACT_LIABILITY", "DR", "25"),
+            release_line("NOT_A_CLASS", "CR", "25"),
+        ],
+        vec![
+            release_line("CONTRACT_LIABILITY", "CR", "25"),
+            release_line("REVENUE", "DR", "25"),
+        ],
+        vec![
+            release_line("CONTRACT_LIABILITY", "DR", "25"),
+            release_line("REVENUE", "CR", "24"),
+        ],
+    ] {
+        let entry = original(lines);
+        assert!(matches!(
+            validate_original_release(&entry, &schedule_state(), &segment_state()),
+            Err(DomainError::Internal(_))
+        ));
+    }
 }
 
 // ── NOTE — Group F4 testcontainers coverage (NOT in this pure-unit file) ──

@@ -1,123 +1,171 @@
-"""E2E tests for OAGW body validation guardrails."""
+"""E2E tests for OAGW body validation guardrails.
+
+Raw sockets are used throughout because httpx/h11 validates Content-Length
+client-side. Two of these rejections are produced in front of OAGW (hyper and
+the api-gateway body limit); they are kept, named as such, so the layering
+stays visible and a change in it fails loudly.
+"""
 import asyncio
+import json
 from urllib.parse import urlparse
 
 import httpx
 import pytest
 
-from .helpers import create_route, create_upstream, delete_upstream, unique_alias
+from .helpers import create_route, create_upstream, unique_alias
+
+# Must match `oagw.config.max_body_size_bytes` in config/e2e-local.yaml.
+OAGW_MAX_BODY_BYTES = 1_048_576
 
 
-async def _raw_http_request(host: str, port: int, raw_request: bytes, timeout: float = 10.0) -> str:
-    """Send a raw HTTP request and return the raw response as a string."""
+async def _raw_http_request(
+    host: str, port: int, raw_request: bytes, timeout: float = 10.0, half_close: bool = False,
+) -> tuple[int, dict, bytes]:
+    """Send a raw HTTP request and return (status, lowercased headers, body)."""
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(host, port), timeout=timeout,
     )
     writer.write(raw_request)
     await writer.drain()
-    response = await asyncio.wait_for(reader.read(8192), timeout=timeout)
-    writer.close()
-    return response.decode("utf-8", errors="replace")
+    if half_close:
+        writer.write_eof()
+    try:
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout)
+        lines = head.decode("latin-1").split("\r\n")
+        status = int(lines[0].split(" ", 2)[1])
+        headers = {}
+        for line in lines[1:]:
+            name, _, value = line.partition(":")
+            if name:
+                headers[name.strip().lower()] = value.strip()
+        length = int(headers.get("content-length", "0"))
+        body = await asyncio.wait_for(reader.readexactly(length), timeout=timeout)
+    finally:
+        writer.close()
+    return status, headers, body
 
 
-def _parse_status_code(raw_response: str) -> int:
-    """Extract the HTTP status code from a raw response."""
-    # e.g. "HTTP/1.1 400 Bad Request\r\n..."
-    first_line = raw_response.split("\r\n", 1)[0]
-    return int(first_line.split(" ", 2)[1])
+def _raw_post(base_url: str, path: str, headers: dict, content_length: str, body: str) -> tuple[str, int, bytes]:
+    parsed = urlparse(base_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 80
+    raw = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {content_length}\r\n"
+        + "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        + "\r\n"
+        + body
+    ).encode()
+    return host, port, raw
+
+
+async def _echo_upstream(client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup, prefix):
+    alias = unique_alias(prefix)
+    upstream = cleanup.upstream(oagw_headers, await create_upstream(
+        client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
+    ))
+    await create_route(
+        client, oagw_base_url, oagw_headers, upstream["id"], ["POST"], "/echo",
+    )
+    return alias
 
 
 @pytest.mark.asyncio
-async def test_invalid_content_length_returns_400(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+async def test_invalid_content_length_rejected_by_http_server(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Non-integer Content-Length returns 400."""
-    alias = unique_alias("body-cl")
+    """A non-integer Content-Length gets hyper's bare 400, before OAGW runs.
+
+    OAGW's own check for this (scenario 7.4-A) is unreachable over REST; it is
+    covered in-process by `e2e_invalid_content_length_returns_400` in
+    `oagw/tests/e2e_smoke_test.rs`.
+    """
     async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
-        )
-        uid = upstream["id"]
-        await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["POST"], "/v1/test",
+        alias = await _echo_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup, "body-cl",
         )
 
-        # httpx/h11 rejects invalid Content-Length client-side, so use raw socket.
-        parsed = urlparse(oagw_base_url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 80
+    status, headers, body = await _raw_http_request(*_raw_post(
+        oagw_base_url, f"/oagw/v1/proxy/{alias}/echo", oagw_headers, "not-a-number", '{"test": true}',
+    ))
+    assert status == 400
+    assert "x-oagw-error-source" not in headers
+    assert "content-type" not in headers
+    assert headers.get("content-length") == "0" and body == b""
 
-        header_lines = []
-        if "Authorization" in oagw_headers:
-            header_lines.append(f"Authorization: {oagw_headers['Authorization']}")
 
-        raw = (
-            f"POST /oagw/v1/proxy/{alias}/v1/test HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: not-a-number\r\n"
-            + "".join(f"{h}\r\n" for h in header_lines)
-            + "\r\n"
-            + '{"test": true}'
-        ).encode()
+@pytest.mark.scenario("negative-7.4-well-known-header-validation-errors-400", part="B")
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="P-05: a body shorter than its Content-Length is reported as "
+           "413 PAYLOAD_TOO_LARGE ('exceeds maximum')",
+)
+async def test_content_length_mismatch_returns_400(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 7.4-B: a body that ends short of its Content-Length is not labelled "too large".
 
-        resp_raw = await _raw_http_request(host, port, raw)
-        status = _parse_status_code(resp_raw)
-        assert status == 400, (
-            f"Expected 400 for invalid Content-Length, got {status}: {resp_raw[:500]}"
+    P-05 decides only the labelling, so this pins a gateway client error that
+    isn't the size error; scenario 7.4-B's exact 400 is not asserted.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias = await _echo_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup, "body-mismatch",
         )
 
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+    # Declare 999 bytes, send 7, then half-close so the body read ends early.
+    status, headers, body = await _raw_http_request(*_raw_post(
+        oagw_base_url, f"/oagw/v1/proxy/{alias}/echo", oagw_headers, "999", '{"a":1}',
+    ), half_close=True)
+    assert 400 <= status < 500 and status != 413, (status, body[:300])
+    assert headers.get("content-type", "").startswith("application/problem+json")
+    assert headers.get("x-oagw-error-source") == "gateway"
+    violations = json.loads(body).get("context", {}).get("field_violations", [])
+    assert all(v.get("reason") != "PAYLOAD_TOO_LARGE" for v in violations), body[:300]
 
 
+@pytest.mark.asyncio
+async def test_body_exceeding_gateway_limit_returns_413(oagw_base_url, mock_upstream):
+    """The api-gateway body limit (64 MB) answers before authentication and OAGW.
+
+    No token and no upstream are needed: the 413 is `about:blank` problem+json
+    from the toolkit error middleware, without `x-oagw-error-source`.
+    """
+    _ = mock_upstream
+    status, headers, body = await _raw_http_request(*_raw_post(
+        oagw_base_url, f"/oagw/v1/proxy/{unique_alias('body-gw')}/echo", {}, "200000000", "small body",
+    ))
+    assert status == 413
+    assert headers.get("content-type", "").startswith("application/problem+json")
+    assert "x-oagw-error-source" not in headers
+    problem = json.loads(body)
+    assert problem["type"] == "about:blank" and problem["status"] == 413
+
+
+@pytest.mark.scenario("negative-8.1-maximum-body-size-limit-enforced")
 @pytest.mark.asyncio
 async def test_body_exceeding_limit_returns_413(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Content-Length exceeding the api-gateway body limit returns 413.
-
-    The rejection happens at the api-gateway's `RequestBodyLimitLayer`
-    (e2e default: 64 MB, see config/e2e-local.yaml) before the request
-    reaches the oagw proxy handler — that layer emits a plain-text 413.
-    A request that hits oagw's own 100 MB body cap surfaces as a
-    canonical-error 413 (the `out_of_range` category carrying a 413 wire
-    override), but is unreachable here because the gateway limit is lower
-    than oagw's.
-    """
-    alias = unique_alias("body-big")
+    """Scenario 8.1: a declared body over OAGW's own cap is a gateway 413."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
-        )
-        uid = upstream["id"]
-        await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["POST"], "/v1/test",
+        alias = await _echo_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup, "body-big",
         )
 
-        # Declare 200MB but send a tiny body. Use raw socket because httpx/h11
-        # validates Content-Length vs actual body size.
-        parsed = urlparse(oagw_base_url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 80
-
-        header_lines = []
-        if "Authorization" in oagw_headers:
-            header_lines.append(f"Authorization: {oagw_headers['Authorization']}")
-
-        raw = (
-            f"POST /oagw/v1/proxy/{alias}/v1/test HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: 200000000\r\n"
-            + "".join(f"{h}\r\n" for h in header_lines)
-            + "\r\n"
-            + "small body"
-        ).encode()
-
-        resp_raw = await _raw_http_request(host, port, raw)
-        status = _parse_status_code(resp_raw)
-        assert status == 413, (
-            f"Expected 413 for oversized Content-Length, got {status}: {resp_raw[:500]}"
-        )
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+    status, headers, body = await _raw_http_request(*_raw_post(
+        oagw_base_url, f"/oagw/v1/proxy/{alias}/echo", oagw_headers,
+        str(OAGW_MAX_BODY_BYTES + 1), "small body",
+    ))
+    assert status == 413, body[:300]
+    assert headers.get("content-type", "").startswith("application/problem+json")
+    assert headers.get("x-oagw-error-source") == "gateway"
+    problem = json.loads(body)
+    assert problem["status"] == 413
+    reasons = [v["reason"] for v in problem["context"]["field_violations"]]
+    assert reasons == ["PAYLOAD_TOO_LARGE"]
+    assert str(OAGW_MAX_BODY_BYTES) in problem["detail"]

@@ -97,7 +97,8 @@ Two obligations distinguish it from the user surface, and both come from the fac
 - Caller not authorized for `{tenant_id}` — `permission_denied`; no tenant read, no provider call.
 - `{tenant_id}` does not resolve to an `active` tenant, or lies outside the caller's subtree — `not_found` / `validation`; no provider call. An out-of-subtree tenant is reported as absent, so tenant topology is not disclosed.
 - Request exceeds an AM boundary cap (empty / oversized name, too many scopes, oversized scope) — `validation`; no provider call.
-- Provider rejects the request with nothing retained (name already live in the tenant, name syntax, scope outside the allowlist, quota) — `invalid_argument` attributed to `request`, carrying AM's fixed message.
+- Provider rejects the request with nothing retained (name already live in the tenant, name syntax, scope outside the allowlist) — `invalid_argument` attributed to `request`, carrying AM's fixed message.
+- Tenant already holds as many accounts as the provider allows — `resource_exhausted` (429) with quota subject `service_accounts`, carrying AM's fixed, source-independent message; nothing retained. Recovery depends on the quota policy.
 - Provider outcome is ambiguous — `aborted` (409) with `reason = AMBIGUOUS_OUTCOME`; see `flow-service-accounts-reconcile`.
 - Provider fails cleanly — `service_unavailable`; nothing retained, so the same request may be retried.
 - Deployment's adapter ships no service-account support — `unimplemented` (501); never a simulated success.
@@ -225,7 +226,7 @@ This is the caller-side recovery flow the 409 `AMBIGUOUS_OUTCOME` response exist
 
 **Input**: Operation name (`provision_service_account` / `list_service_accounts` / `rotate_service_account_secret` / `revoke_service_account`), the resolved `TenantContext`, and the operation-specific payload.
 
-**Output**: Contract-level outcome: success with the provider-returned credentials or summaries, or one of the five failure categories (`InvalidInput`, `NotFound`, `CleanFailure`, `Ambiguous`, `UnsupportedOperation`).
+**Output**: Contract-level outcome: success with the provider-returned credentials or summaries, or one of the six failure categories (`InvalidInput`, `QuotaExceeded`, `NotFound`, `CleanFailure`, `Ambiguous`, `UnsupportedOperation`).
 
 **Steps**:
 
@@ -237,11 +238,12 @@ This is the caller-side recovery flow the 409 `AMBIGUOUS_OUTCOME` response exist
 2. [ ] - `p1` - Package the operation payload with the resolved `TenantContext` — `(tenant_id, tenant_name, tenant_type, metadata)`, where `metadata` is the plugin-private blob AM replays from `tenant_idp_metadata` so the adapter can route to its own vendor-side realm or organization - `inst-algo-sa-contract-invocation-package-request`
 3. [ ] - `p1` - Invoke the resolved operation exactly once per logical request; retry, backoff, and rate-limiting policy belong to the adapter - `inst-algo-sa-contract-invocation-invoke`
 4. [ ] - `p1` - **IF** the provider reported `InvalidInput` **RETURN** `(reject, invalid_argument)` attributed to `request` as a whole - `inst-algo-sa-contract-invocation-invalid-input-return`
-5. [ ] - `p1` - **IF** the provider reported `NotFound` **RETURN** `(reject, not_found)`, leaving the caller's flow to decide whether absence is a failure (rotate) or a success (revoke) - `inst-algo-sa-contract-invocation-not-found-return`
-6. [ ] - `p1` - **IF** the provider reported `CleanFailure` **RETURN** `(reject, service_unavailable)` — nothing was retained, so retrying the same request is safe - `inst-algo-sa-contract-invocation-clean-failure-return`
-7. [ ] - `p1` - **IF** the provider reported `Ambiguous` for a retaining or mutating operation **RETURN** `(reject, aborted, reason=AMBIGUOUS_OUTCOME)` — never success, and never the retry-same signal a `service_unavailable` carries; the non-retaining `list` flow explicitly remaps this category to `service_unavailable` because replaying a read is safe - `inst-algo-sa-contract-invocation-ambiguous-return`
-8. [ ] - `p1` - **IF** the provider reported `UnsupportedOperation` **RETURN** `(reject, unimplemented)` — the deployment's adapter implements no machine-identity management - `inst-algo-sa-contract-invocation-unsupported-return`
-9. [ ] - `p1` - **ELSE** **RETURN** success with the provider-returned credentials or summaries - `inst-algo-sa-contract-invocation-success-return`
+5. [ ] - `p1` - **IF** the provider reported `QuotaExceeded` **RETURN** `(reject, resource_exhausted, subject=service_accounts)` — the tenant holds as many accounts as the provider allows; nothing was retained; use the shared AM quota message without provider diagnostics or a guaranteed recovery action - `inst-algo-sa-contract-invocation-quota-exceeded-return`
+6. [ ] - `p1` - **IF** the provider reported `NotFound` **RETURN** `(reject, not_found)`, leaving the caller's flow to decide whether absence is a failure (rotate) or a success (revoke) - `inst-algo-sa-contract-invocation-not-found-return`
+7. [ ] - `p1` - **IF** the provider reported `CleanFailure` **RETURN** `(reject, service_unavailable)` — nothing was retained, so retrying the same request is safe - `inst-algo-sa-contract-invocation-clean-failure-return`
+8. [ ] - `p1` - **IF** the provider reported `Ambiguous` for a retaining or mutating operation **RETURN** `(reject, aborted, reason=AMBIGUOUS_OUTCOME)` — never success, and never the retry-same signal a `service_unavailable` carries; the non-retaining `list` flow explicitly remaps this category to `service_unavailable` because replaying a read is safe - `inst-algo-sa-contract-invocation-ambiguous-return`
+9. [ ] - `p1` - **IF** the provider reported `UnsupportedOperation` **RETURN** `(reject, unimplemented)` — the deployment's adapter implements no machine-identity management - `inst-algo-sa-contract-invocation-unsupported-return`
+10. [ ] - `p1` - **ELSE** **RETURN** success with the provider-returned credentials or summaries - `inst-algo-sa-contract-invocation-success-return`
 
 ### Adapter Text Discard
 
@@ -255,7 +257,7 @@ This is the caller-side recovery flow the 409 `AMBIGUOUS_OUTCOME` response exist
 
 > This is the one place the machine-identity boundary is deliberately stricter than the user half, which forwards an FNV digest of the provider `detail` for operator correlation. Filtering was tried and removed: a credential such as `secret=abc123` is ordinary ASCII graphic text, so no character filter, length cap, or control-character strip can separate it from operator prose — each only launders or bounds a leak. The consequence for implementors is stated normatively in the SPI contract: **an adapter MUST log its own diagnostics in-process**, where it alone knows what is safe to emit.
 
-1. [x] - `p1` - Select the fixed message for the known failure category — invalid-input, upstream-unavailable, ambiguous-reconcile, or unsupported — and discard the provider's `detail` entirely; an unknown future category uses the internal mapping-gap answer from step 5 - `inst-algo-sa-text-discard-select-fixed-message`
+1. [x] - `p1` - Select the fixed message for the known failure category — invalid-input, quota-reached, upstream-unavailable, ambiguous-reconcile, or unsupported — and discard the provider's `detail` entirely; an unknown future category uses the internal mapping-gap answer from step 5 - `inst-algo-sa-text-discard-select-fixed-message`
 2. [x] - `p1` - Discard any adapter-attributed `field`; attribute every provider-sourced rejection to `request` as a whole - `inst-algo-sa-text-discard-neutral-field`
 3. [x] - `p1` - Record one log line carrying the category label, the discarded text's length, and whether a field was attributed — never the text or the field value, so no subscriber, file, or aggregator can hold what the response withholds - `inst-algo-sa-text-discard-safe-metadata-log`
 4. [x] - `p1` - **IF** the failure is a routine reported absence (how an idempotent revoke confirms its work) emit no record of its own; **IF** it is a caller-attributable rejection record it at debug level, not at the default level an operator watches for provider trouble - `inst-algo-sa-text-discard-log-level`

@@ -1,5 +1,5 @@
 //! Enforce currency-scale immutability at the DB layer (design §3.7 /
-//! MoneyModule): `minor_units` for a `(tenant, currency)` is **immutable once
+//! MoneyModule): `currency_scale` for a `(tenant, currency)` is **immutable once
 //! any posting exists** (`CURRENCY_SCALE_LOCKED`). The application path already
 //! refuses a scale change once a `journal_line` exists for the currency
 //! (`ReferenceRepo::upsert_currency_scale` → `RepoError::CurrencyScaleLocked`),
@@ -8,7 +8,8 @@
 //! sibling of the journal / fx-snapshot append-only guards, which likewise pair
 //! an app-level assert with a DB trigger.
 //!
-//! The guard fires ONLY when `minor_units` actually changes AND a posting for
+//! First registration must agree with transaction and functional scales already
+//! stored by fallback postings. The update guard fires ONLY when `currency_scale` actually changes AND a posting for
 //! the `(tenant, currency)` exists — a same-value upsert (the gear's
 //! `ON CONFLICT DO UPDATE` rewrites the column to its current value) and a
 //! pre-posting scale correction both pass. `SQLite` (non-production test
@@ -27,20 +28,32 @@ pub struct Migration;
 const PG_UP_STATEMENTS: &[&str] = &[
     "CREATE OR REPLACE FUNCTION bss.reject_currency_scale_change() RETURNS trigger AS $$
         BEGIN
-            IF NEW.minor_units IS DISTINCT FROM OLD.minor_units
-               AND EXISTS (
-                   SELECT 1 FROM bss.ledger_journal_line
-                   WHERE tenant_id = OLD.tenant_id AND currency = OLD.currency
-               )
-            THEN
-                RAISE EXCEPTION 'currency scale locked: minor_units for (%, %) is immutable once a posting exists',
-                    OLD.tenant_id, OLD.currency;
+            IF TG_OP = 'UPDATE' THEN
+                IF NEW.currency_scale IS DISTINCT FROM OLD.currency_scale
+                   AND EXISTS (
+                       SELECT 1 FROM bss.ledger_journal_line
+                       WHERE tenant_id = OLD.tenant_id
+                         AND (currency = OLD.currency OR functional_currency = OLD.currency)
+                   )
+                THEN
+                    RAISE EXCEPTION 'currency scale locked: currency_scale for (%, %) is immutable once a posting exists',
+                        OLD.tenant_id, OLD.currency;
+                END IF;
+            ELSIF EXISTS (
+                SELECT 1 FROM bss.ledger_journal_line
+                WHERE tenant_id = NEW.tenant_id
+                  AND ((currency = NEW.currency AND currency_scale <> NEW.currency_scale)
+                    OR (functional_currency = NEW.currency
+                        AND functional_currency_scale IS DISTINCT FROM NEW.currency_scale))
+            ) THEN
+                RAISE EXCEPTION 'currency scale locked: registration for (%, %) differs from stored posting metadata',
+                    NEW.tenant_id, NEW.currency;
             END IF;
             RETURN NEW;
         END;
         $$ LANGUAGE plpgsql",
     "CREATE TRIGGER trg_currency_scale_immutable
-        BEFORE UPDATE ON bss.ledger_currency_scale_registry
+        BEFORE INSERT OR UPDATE ON bss.ledger_currency_scale_registry
         FOR EACH ROW EXECUTE FUNCTION bss.reject_currency_scale_change()",
 ];
 

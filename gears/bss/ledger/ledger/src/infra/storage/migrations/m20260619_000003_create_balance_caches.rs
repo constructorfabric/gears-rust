@@ -18,51 +18,56 @@ const PG_UP_STATEMENTS: &[&str] = &[
     "CREATE TABLE bss.ledger_account_balance (
         tenant_id      uuid        NOT NULL,
         account_id     uuid        NOT NULL,
-        currency       varchar(16) NOT NULL,
+        currency                varchar(16) NOT NULL,
         account_class  text        NOT NULL,
         normal_side    text        NOT NULL CHECK (normal_side IN ('DR','CR')),
-        balance_minor  bigint      NOT NULL DEFAULT 0,
-        last_entry_seq bigint,
-        version        bigint      NOT NULL DEFAULT 0,
+        balance                     text      NOT NULL DEFAULT '0' CHECK (bss.ledger_decimal_valid(balance, currency_scale)),
+        last_entry_seq          bigint,
+        version                 bigint      NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, account_id, currency),
         CONSTRAINT chk_account_balance_no_negative CHECK (
             account_class NOT IN
                 ('AR','CASH_CLEARING','UNALLOCATED','CONTRACT_LIABILITY','DISPUTE_HOLD','REFUND_CLEARING')
-            OR balance_minor >= 0)
+            OR balance::numeric >= 0)
     )",
     "CREATE TABLE bss.ledger_ar_invoice_balance (
         tenant_id          uuid        NOT NULL,
         payer_tenant_id    uuid        NOT NULL,
         account_id         uuid        NOT NULL,
         invoice_id         varchar(128) NOT NULL,
-        currency           varchar(16) NOT NULL,
-        balance_minor      bigint      NOT NULL DEFAULT 0,
+        currency                varchar(16) NOT NULL,
+        balance                     text      NOT NULL DEFAULT '0' CHECK (bss.ledger_decimal_valid(balance, currency_scale)),
         original_posted_at timestamptz,
         due_date           date,
-        last_entry_seq     bigint,
-        version            bigint      NOT NULL DEFAULT 0,
+        last_entry_seq          bigint,
+        version                 bigint      NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, payer_tenant_id, account_id, invoice_id),
-        CONSTRAINT chk_ar_invoice_balance_no_negative CHECK (balance_minor >= 0)
+        CONSTRAINT chk_ar_invoice_balance_no_negative CHECK (balance::numeric >= 0)
     )",
     "CREATE TABLE bss.ledger_ar_payer_balance (
         tenant_id       uuid        NOT NULL,
         payer_tenant_id uuid        NOT NULL,
         account_id      uuid        NOT NULL,
-        currency        varchar(16) NOT NULL,
-        balance_minor   bigint      NOT NULL DEFAULT 0,
-        last_entry_seq  bigint,
-        version         bigint      NOT NULL DEFAULT 0,
+        currency                varchar(16) NOT NULL,
+        balance                     text      NOT NULL DEFAULT '0' CHECK (bss.ledger_decimal_valid(balance, currency_scale)),
+        last_entry_seq          bigint,
+        version                 bigint      NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, payer_tenant_id, account_id, currency),
-        CONSTRAINT chk_ar_payer_balance_no_negative CHECK (balance_minor >= 0)
+        CONSTRAINT chk_ar_payer_balance_no_negative CHECK (balance::numeric >= 0)
     )",
     "CREATE TABLE bss.ledger_tax_subbalance (
         tenant_id         uuid         NOT NULL,
         account_id        uuid         NOT NULL,
         tax_jurisdiction  varchar(128) NOT NULL,
         tax_filing_period varchar(32)  NOT NULL,
-        balance_minor     bigint       NOT NULL DEFAULT 0,
-        last_entry_seq    bigint,
-        version           bigint       NOT NULL DEFAULT 0,
+        balance                     text       NOT NULL DEFAULT '0' CHECK (bss.ledger_decimal_valid(balance, currency_scale)),
+        last_entry_seq          bigint,
+        version                 bigint       NOT NULL DEFAULT 0,
+        currency                varchar(16) NOT NULL,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, account_id, tax_jurisdiction, tax_filing_period)
     )",
     "CREATE TABLE bss.ledger_unallocated_balance (
@@ -70,13 +75,15 @@ const PG_UP_STATEMENTS: &[&str] = &[
         payer_tenant_id         uuid        NOT NULL,
         account_id              uuid        NOT NULL,
         currency                varchar(16) NOT NULL,
-        balance_minor           bigint      NOT NULL DEFAULT 0,
-        functional_balance_minor bigint,
+        balance                     text      NOT NULL DEFAULT '0' CHECK (bss.ledger_decimal_valid(balance, currency_scale)),
+        functional_balance          text CHECK (bss.ledger_decimal_valid(functional_balance, functional_currency_scale)),
         functional_currency     varchar(16),
         last_entry_seq          bigint,
         version                 bigint      NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+        functional_currency_scale   smallint CHECK (functional_currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, payer_tenant_id, currency),
-        CONSTRAINT chk_unallocated_balance_no_negative CHECK (balance_minor >= 0)
+        CONSTRAINT chk_unallocated_balance_no_negative CHECK (balance::numeric >= 0)
     )",
     "CREATE TABLE bss.ledger_reusable_credit_subbalance (
         tenant_id               uuid        NOT NULL,
@@ -85,13 +92,15 @@ const PG_UP_STATEMENTS: &[&str] = &[
         currency                varchar(16) NOT NULL,
         credit_grant_event_type text        NOT NULL,
         first_granted_at        timestamptz,
-        balance_minor           bigint      NOT NULL DEFAULT 0,
-        functional_balance_minor bigint,
+        balance                     text      NOT NULL DEFAULT '0' CHECK (bss.ledger_decimal_valid(balance, currency_scale)),
+        functional_balance          text CHECK (bss.ledger_decimal_valid(functional_balance, functional_currency_scale)),
         functional_currency     varchar(16),
         last_entry_seq          bigint,
         version                 bigint      NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+        functional_currency_scale   smallint CHECK (functional_currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, payer_tenant_id, currency, credit_grant_event_type),
-        CONSTRAINT chk_reusable_credit_subbalance_no_negative CHECK (balance_minor >= 0)
+        CONSTRAINT chk_reusable_credit_subbalance_no_negative CHECK (balance::numeric >= 0)
     )",
 ];
 
@@ -111,53 +120,70 @@ const PG_DOWN_STATEMENTS: &[&str] = &[
 
 const SQLITE_UP_STATEMENTS: &[&str] = &[
     "CREATE TABLE ledger_account_balance (
-        tenant_id      text        NOT NULL,
-        account_id     text        NOT NULL,
-        currency       varchar(16) NOT NULL,
+        tenant_id               text        NOT NULL,
+        account_id              text        NOT NULL,
+        currency                varchar(16) NOT NULL,
         account_class  text        NOT NULL,
         normal_side    text        NOT NULL CHECK (normal_side IN ('DR','CR')),
-        balance_minor  bigint      NOT NULL DEFAULT 0,
-        last_entry_seq bigint,
-        version        bigint      NOT NULL DEFAULT 0,
+        balance                     text      NOT NULL DEFAULT '0' CHECK (length(balance) BETWEEN 1 AND 31),
+        last_entry_seq          bigint,
+        version                 bigint      NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+        functional_balance          text CHECK (length(functional_balance) BETWEEN 1 AND 31),
+        functional_currency     varchar(16),
+        functional_currency_scale   smallint CHECK (functional_currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, account_id, currency),
         CONSTRAINT chk_account_balance_no_negative CHECK (
             account_class NOT IN
                 ('AR','CASH_CLEARING','UNALLOCATED','CONTRACT_LIABILITY','DISPUTE_HOLD','REFUND_CLEARING')
-            OR balance_minor >= 0)
+            OR substr(balance, 1, 1) <> '-'),
+        CONSTRAINT chk_ledger_account_balance_money_metadata CHECK ((functional_balance IS NULL) = (functional_currency IS NULL) AND (functional_balance IS NULL) = (functional_currency_scale IS NULL))
     )",
     "CREATE TABLE ledger_ar_invoice_balance (
-        tenant_id          text        NOT NULL,
-        payer_tenant_id    text        NOT NULL,
-        account_id         text        NOT NULL,
+        tenant_id               text        NOT NULL,
+        payer_tenant_id         text        NOT NULL,
+        account_id              text        NOT NULL,
         invoice_id         varchar(128) NOT NULL,
-        currency           varchar(16) NOT NULL,
-        balance_minor      bigint      NOT NULL DEFAULT 0,
+        currency                varchar(16) NOT NULL,
+        balance                     text      NOT NULL DEFAULT '0' CHECK (length(balance) BETWEEN 1 AND 31),
         original_posted_at text,
         due_date           date,
-        last_entry_seq     bigint,
-        version            bigint      NOT NULL DEFAULT 0,
+        last_entry_seq          bigint,
+        version                 bigint      NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+        functional_balance          text CHECK (length(functional_balance) BETWEEN 1 AND 31),
+        functional_currency     varchar(16),
+        functional_currency_scale   smallint CHECK (functional_currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, payer_tenant_id, account_id, invoice_id),
-        CONSTRAINT chk_ar_invoice_balance_no_negative CHECK (balance_minor >= 0)
+        CONSTRAINT chk_ar_invoice_balance_no_negative CHECK (substr(balance, 1, 1) <> '-'),
+        CONSTRAINT chk_ledger_ar_invoice_balance_money_metadata CHECK ((functional_balance IS NULL) = (functional_currency IS NULL) AND (functional_balance IS NULL) = (functional_currency_scale IS NULL))
     )",
     "CREATE TABLE ledger_ar_payer_balance (
-        tenant_id       text        NOT NULL,
-        payer_tenant_id text        NOT NULL,
-        account_id      text        NOT NULL,
-        currency        varchar(16) NOT NULL,
-        balance_minor   bigint      NOT NULL DEFAULT 0,
-        last_entry_seq  bigint,
-        version         bigint      NOT NULL DEFAULT 0,
+        tenant_id               text        NOT NULL,
+        payer_tenant_id         text        NOT NULL,
+        account_id              text        NOT NULL,
+        currency                varchar(16) NOT NULL,
+        balance                     text      NOT NULL DEFAULT '0' CHECK (length(balance) BETWEEN 1 AND 31),
+        last_entry_seq          bigint,
+        version                 bigint      NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+        functional_balance          text CHECK (length(functional_balance) BETWEEN 1 AND 31),
+        functional_currency     varchar(16),
+        functional_currency_scale   smallint CHECK (functional_currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, payer_tenant_id, account_id, currency),
-        CONSTRAINT chk_ar_payer_balance_no_negative CHECK (balance_minor >= 0)
+        CONSTRAINT chk_ar_payer_balance_no_negative CHECK (substr(balance, 1, 1) <> '-'),
+        CONSTRAINT chk_ledger_ar_payer_balance_money_metadata CHECK ((functional_balance IS NULL) = (functional_currency IS NULL) AND (functional_balance IS NULL) = (functional_currency_scale IS NULL))
     )",
     "CREATE TABLE ledger_tax_subbalance (
-        tenant_id         text         NOT NULL,
-        account_id        text         NOT NULL,
+        tenant_id               text         NOT NULL,
+        account_id              text         NOT NULL,
         tax_jurisdiction  varchar(128) NOT NULL,
         tax_filing_period varchar(32)  NOT NULL,
-        balance_minor     bigint       NOT NULL DEFAULT 0,
-        last_entry_seq    bigint,
-        version           bigint       NOT NULL DEFAULT 0,
+        balance                     text       NOT NULL DEFAULT '0' CHECK (length(balance) BETWEEN 1 AND 31),
+        last_entry_seq          bigint,
+        version                 bigint       NOT NULL DEFAULT 0,
+        currency                varchar(16) NOT NULL,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, account_id, tax_jurisdiction, tax_filing_period)
     )",
     "CREATE TABLE ledger_unallocated_balance (
@@ -165,13 +191,16 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         payer_tenant_id         text        NOT NULL,
         account_id              text        NOT NULL,
         currency                varchar(16) NOT NULL,
-        balance_minor           bigint      NOT NULL DEFAULT 0,
-        functional_balance_minor bigint,
+        balance                     text      NOT NULL DEFAULT '0' CHECK (length(balance) BETWEEN 1 AND 31),
+        functional_balance          text CHECK (length(functional_balance) BETWEEN 1 AND 31),
         functional_currency     varchar(16),
         last_entry_seq          bigint,
         version                 bigint      NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+        functional_currency_scale   smallint CHECK (functional_currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, payer_tenant_id, currency),
-        CONSTRAINT chk_unallocated_balance_no_negative CHECK (balance_minor >= 0)
+        CONSTRAINT chk_unallocated_balance_no_negative CHECK (substr(balance, 1, 1) <> '-'),
+        CONSTRAINT chk_ledger_unallocated_balance_money_metadata CHECK ((functional_balance IS NULL) = (functional_currency IS NULL) AND (functional_balance IS NULL) = (functional_currency_scale IS NULL))
     )",
     "CREATE TABLE ledger_reusable_credit_subbalance (
         tenant_id               text        NOT NULL,
@@ -180,13 +209,16 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         currency                varchar(16) NOT NULL,
         credit_grant_event_type text        NOT NULL,
         first_granted_at        text,
-        balance_minor           bigint      NOT NULL DEFAULT 0,
-        functional_balance_minor bigint,
+        balance                     text      NOT NULL DEFAULT '0' CHECK (length(balance) BETWEEN 1 AND 31),
+        functional_balance          text CHECK (length(functional_balance) BETWEEN 1 AND 31),
         functional_currency     varchar(16),
         last_entry_seq          bigint,
         version                 bigint      NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+        functional_currency_scale   smallint CHECK (functional_currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, payer_tenant_id, currency, credit_grant_event_type),
-        CONSTRAINT chk_reusable_credit_subbalance_no_negative CHECK (balance_minor >= 0)
+        CONSTRAINT chk_reusable_credit_subbalance_no_negative CHECK (substr(balance, 1, 1) <> '-'),
+        CONSTRAINT chk_ledger_reusable_credit_subbalance_money_metadata CHECK ((functional_balance IS NULL) = (functional_currency IS NULL) AND (functional_balance IS NULL) = (functional_currency_scale IS NULL))
     )",
 ];
 

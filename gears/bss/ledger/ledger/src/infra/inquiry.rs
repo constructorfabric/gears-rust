@@ -122,16 +122,20 @@ pub struct LineRow {
     pub account_class: String,
     pub gl_code: Option<String>,
     pub side: String,
-    pub amount_minor: i64,
-    pub currency: String,
+    /// The posted amount with its currency and stored scale.
+    pub money: bss_ledger_sdk::PostedMoney,
     pub invoice_id: Option<String>,
     pub revenue_stream: Option<String>,
     pub legal_entity_id: Option<Uuid>,
 }
 
-impl From<journal_line::Model> for LineRow {
-    fn from(m: journal_line::Model) -> Self {
-        Self {
+impl TryFrom<journal_line::Model> for LineRow {
+    type Error = RepoError;
+
+    /// Decode the stored money exactly; corrupt text is a repository integrity
+    /// error, never a silently wrong export figure.
+    fn try_from(m: journal_line::Model) -> Result<Self, RepoError> {
+        Ok(Self {
             line_id: m.line_id,
             entry_id: m.entry_id,
             payer_tenant_id: m.payer_tenant_id,
@@ -139,12 +143,15 @@ impl From<journal_line::Model> for LineRow {
             account_class: m.account_class,
             gl_code: m.gl_code,
             side: m.side,
-            amount_minor: m.amount_minor,
-            currency: m.currency,
+            money: crate::infra::storage::money_text::decode_money(
+                &m.amount,
+                &m.currency,
+                m.currency_scale,
+            )?,
             invoice_id: m.invoice_id,
             revenue_stream: m.revenue_stream,
             legal_entity_id: m.legal_entity_id,
-        }
+        })
     }
 }
 
@@ -331,7 +338,10 @@ async fn drill_on<C: DBRunner>(
         .all(conn)
         .await
         .map_err(|e| RepoError::Db(format!("drill journal_line: {e}")))?;
-    let lines = line_rows.into_iter().map(LineRow::from).collect();
+    let lines = line_rows
+        .into_iter()
+        .map(LineRow::try_from)
+        .collect::<Result<Vec<_>, RepoError>>()?;
 
     // Linked: entries that reverse THIS entry (reversal / mapping-correction
     // link back via `reverses_entry_id`), plus the entry THIS one reverses.
@@ -564,7 +574,7 @@ async fn export_csv_on<C: DBRunner>(
             lines_by_entry
                 .entry(m.entry_id)
                 .or_default()
-                .push(LineRow::from(m));
+                .push(LineRow::try_from(m)?);
         }
     }
 
@@ -594,8 +604,8 @@ async fn export_csv_on<C: DBRunner>(
 /// The audit-pack CSV header (column order = the row order in [`push_row`]).
 const CSV_HEADER: &str = "entry_id,tenant_id,period_id,legal_entity_id,posted_at_utc,\
 source_doc_type,source_business_id,origin,posted_by_actor_id,correlation_id,reverses_entry_id,\
-created_seq,line_id,payer_tenant_id,account_id,account_class,gl_code,side,amount_minor,currency,\
-invoice_id,revenue_stream";
+created_seq,line_id,payer_tenant_id,account_id,account_class,gl_code,side,amount,currency,\
+currency_scale,invoice_id,revenue_stream";
 
 /// Append one CSV data row (an `(entry, line)` pair; `line = None` emits the
 /// entry dims with the line columns blank) to `out`, RFC-4180-quoting each
@@ -626,14 +636,15 @@ fn push_row(out: &mut String, entry: &EntryRow, line: Option<&LineRow>) {
             line.account_class.clone(),
             line.gl_code.clone().unwrap_or_default(),
             line.side.clone(),
-            line.amount_minor.to_string(),
-            line.currency.clone(),
+            bss_ledger_sdk::canonical_decimal(line.money.amount()),
+            line.money.currency().code().to_owned(),
+            line.money.currency().scale().to_string(),
             line.invoice_id.clone().unwrap_or_default(),
             line.revenue_stream.clone().unwrap_or_default(),
         ]);
     } else {
-        // Ten blank line columns (line_id .. revenue_stream).
-        for _ in 0..10 {
+        // Eleven blank line columns (line_id .. revenue_stream).
+        for _ in 0..11 {
             fields.push(String::new());
         }
     }

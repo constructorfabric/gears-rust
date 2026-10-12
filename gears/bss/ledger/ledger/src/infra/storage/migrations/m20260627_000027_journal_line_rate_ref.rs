@@ -1,15 +1,7 @@
-//! Add `journal_line.rate_snapshot_ref` (FK → `ledger_fx_rate_snapshot`, the
-//! locked FX rate frozen on the line) and tighten the relaxed amount CHECK so a
-//! functional-only line (`amount_minor = 0`) must carry a POSITIVE
-//! `functional_amount_minor` (the DR/CR side carries the sign; a zero/negative
-//! functional-only line is a posting bug). `journal_line` is append-only;
-//! `ADD COLUMN` / `ADD CONSTRAINT` are DDL, not row mutations, so the seal
-//! trigger does not block them (see the P1 `ar_status` migration).
-//!
-//! `SQLite` (non-production test backend) cannot DROP a table-level CHECK
-//! without a full table rebuild, so the tightening is Postgres-only there and
-//! the FK is omitted; the column is added on both backends, and the app-level
-//! balance guard re-asserts the `> 0` rule on `SQLite`.
+//! Add the locked FX snapshot reference and require a positive functional leg
+//! when transaction money is zero. PostgreSQL adds the tenant-scoped snapshot FK
+//! and final amount constraint here. SQLite's m002 fresh declaration already
+//! carries the final sign/zero check; this migration adds its reference column.
 
 use sea_orm::{ConnectionTrait, Statement};
 use sea_orm_migration::prelude::*;
@@ -27,7 +19,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
     // MATCH SIMPLE skips the check when rate_snapshot_ref IS NULL (single-currency).
     // `NOT VALID` on both adds: existing rows are known-valid (legacy lines carry a
     // NULL `rate_snapshot_ref` — the FK is MATCH SIMPLE, skipped on NULL — and a
-    // positive `amount_minor`, satisfying the tightened CHECK), so Postgres skips
+    // positive `amount`, satisfying the tightened CHECK), so Postgres skips
     // the validating full-table scan (no ACCESS EXCLUSIVE rewrite on a large
     // append-only journal). Both constraints still enforce every NEW write.
     "ALTER TABLE bss.ledger_journal_line
@@ -37,7 +29,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
     "ALTER TABLE bss.ledger_journal_line DROP CONSTRAINT chk_journal_line_amount",
     "ALTER TABLE bss.ledger_journal_line
         ADD CONSTRAINT chk_journal_line_amount
-        CHECK (amount_minor > 0 OR (amount_minor = 0 AND functional_amount_minor > 0)) NOT VALID",
+        CHECK (amount::numeric > 0 OR (amount::numeric = 0 AND functional_amount IS NOT NULL AND functional_amount::numeric > 0)) NOT VALID",
 ];
 
 const PG_DOWN_STATEMENTS: &[&str] = &[
@@ -45,7 +37,7 @@ const PG_DOWN_STATEMENTS: &[&str] = &[
     // Restore the P1 relaxed form (IS NOT NULL).
     "ALTER TABLE bss.ledger_journal_line
         ADD CONSTRAINT chk_journal_line_amount
-        CHECK (amount_minor > 0 OR (amount_minor = 0 AND functional_amount_minor IS NOT NULL))",
+        CHECK (amount::numeric > 0 OR (amount::numeric = 0 AND functional_amount IS NOT NULL))",
     "ALTER TABLE bss.ledger_journal_line DROP CONSTRAINT IF EXISTS fk_journal_line_rate_snapshot",
     "ALTER TABLE bss.ledger_journal_line DROP COLUMN IF EXISTS rate_snapshot_ref",
 ];

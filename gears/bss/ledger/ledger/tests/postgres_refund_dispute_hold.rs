@@ -47,7 +47,6 @@ use bss_ledger::domain::adjustment::refund::{
 use bss_ledger::domain::approval::intent::ApprovalIntent;
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
 use bss_ledger::infra::adjustment::refund_service::RefundHandler;
@@ -56,7 +55,8 @@ use bss_ledger::infra::events::publisher::LedgerEventPublisher;
 use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
-use bss_ledger_sdk::{AccountClass, Side};
+use bss_ledger_sdk::{AccountClass, CurrencySpec, PostedMoney, Side, canonical_decimal};
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -76,6 +76,28 @@ async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+}
+
+async fn scalar_text(conn: &DatabaseConnection, sql: &str) -> Option<String> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| r.try_get_by_index::<String>(0).unwrap())
+}
+
+/// The USD@2 currency spec every fixture here posts in.
+fn usd_spec() -> CurrencySpec {
+    CurrencySpec::try_new("USD".to_owned(), 2).unwrap()
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(Decimal::new(cents, 2), usd_spec()).unwrap()
+}
+
+/// The canonical stored text of a USD cent count (`300` ⇒ `"3"`, `1` ⇒ `"0.01"`).
+fn text(cents: i64) -> String {
+    canonical_decimal(Decimal::new(cents, 2))
 }
 
 /// Provisioned seller for the refund flow: the chart classes a refund touches —
@@ -132,8 +154,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -186,7 +207,7 @@ fn refund_handler(provider: &DBProvider<DbError>) -> RefundHandler {
 }
 
 /// Settle `gross` (fee 0) for `payment_id` — seeds the `payment_settlement` row
-/// (`settled_minor = gross`) the refund resolves as its origin.
+/// (`settled = gross`) the refund resolves as its origin.
 async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gross: i64) {
     settle_svc(provider)
         .settle(
@@ -196,9 +217,8 @@ async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gr
                 tenant_id: s.tenant,
                 payer_tenant_id: s.payer,
                 payment_id: payment_id.to_owned(),
-                gross_minor: gross,
-                fee_minor: 0,
-                currency: "USD".to_owned(),
+                gross: usd(gross),
+                fee: usd(0),
                 effective_at: None,
             },
         )
@@ -206,11 +226,12 @@ async fn settle(provider: &DBProvider<DbError>, s: &Seller, payment_id: &str, gr
         .expect("settle must succeed");
 }
 
-async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64> {
-    scalar_i64(
+/// The canonical stored `balance` text of an account (`None` ⇒ no balance row).
+async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<String> {
+    scalar_text(
         raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             s.tenant, account
         ),
@@ -238,8 +259,8 @@ async fn settlement_counter(
     s: &Seller,
     payment_id: &str,
     col: &str,
-) -> Option<i64> {
-    scalar_i64(
+) -> Option<String> {
+    scalar_text(
         raw,
         &format!(
             "SELECT {col} FROM bss.ledger_payment_settlement \
@@ -309,7 +330,7 @@ async fn dispute_hold_queue_rows(raw: &DatabaseConnection, s: &Seller, status: &
 /// Seed an OPEN dispute on `payment_id` directly (the simplest reliable way to put
 /// the origin payment sub judice). `last_phase = 'OPENED'` is what
 /// `read_open_dispute_for_payment` filters on; `variant = 'CASH_HOLD'` +
-/// `cash_hold_minor <= disputed_amount_minor` satisfy the table CHECKs.
+/// `cash_hold <= disputed_amount` satisfy the table CHECKs.
 async fn open_dispute(
     raw: &DatabaseConnection,
     s: &Seller,
@@ -317,11 +338,12 @@ async fn open_dispute(
     payment_id: &str,
     disputed: i64,
 ) {
+    let disputed = text(disputed);
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_dispute \
-         (tenant_id, dispute_id, payment_id, currency, variant, last_phase, cycle, \
-          disputed_amount_minor, cash_hold_minor, version) \
-         VALUES ('{}','{dispute_id}','{payment_id}','USD','CASH_HOLD','OPENED',1,{disputed},{disputed},0)",
+         (tenant_id, dispute_id, payment_id, currency, currency_scale, variant, last_phase, cycle, \
+          disputed_amount, cash_hold, version) \
+         VALUES ('{}','{dispute_id}','{payment_id}','USD',2,'CASH_HOLD','OPENED',1,'{disputed}','{disputed}',0)",
         s.tenant
     )))
     .await
@@ -359,8 +381,7 @@ fn refund_req(
         pattern,
         payment_id: payment_id.to_owned(),
         invoice_id: invoice_id.map(ToOwned::to_owned),
-        currency: "USD".to_owned(),
-        amount_minor: amount,
+        amount: usd(amount),
         two_stage: true,
         // First-order OUTBOUND refund by default; the claw-back test builds the
         // `Clawback` variant via `clawback_req`.
@@ -416,7 +437,7 @@ async fn forward_refund_on_payment_with_open_dispute_is_held() {
 
     // Settle 1000 → UNALLOCATED holds 1000 (CR), CASH_CLEARING holds 1000 (DR).
     settle(&provider, &s, "PAY-DH", 1000).await;
-    assert_eq!(bal(&raw, &s, s.unallocated).await, Some(1000));
+    assert_eq!(bal(&raw, &s, s.unallocated).await, Some(text(1000)));
 
     // Open a dispute on PAY-DH (the disputed funds are now sub judice).
     open_dispute(&raw, &s, "DISP-DH", "PAY-DH", 1000).await;
@@ -466,7 +487,7 @@ async fn forward_refund_on_payment_with_open_dispute_is_held() {
     );
     assert_eq!(
         bal(&raw, &s, s.unallocated).await,
-        Some(1000),
+        Some(text(1000)),
         "a held refund does NOT draw the UNALLOCATED pool down"
     );
     assert_eq!(
@@ -480,13 +501,13 @@ async fn forward_refund_on_payment_with_open_dispute_is_held() {
         "a held refund has no clearing_state (no row at all)"
     );
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-DH", "refunded_minor").await,
-        Some(0),
-        "a held refund reserves NO money-out cap (refunded_minor unchanged)"
+        settlement_counter(&raw, &s, "PAY-DH", "refunded").await,
+        Some(text(0)),
+        "a held refund reserves NO money-out cap (refunded unchanged)"
     );
     assert_eq!(
-        settlement_counter(&raw, &s, "PAY-DH", "refunded_unallocated_minor").await,
-        Some(0),
+        settlement_counter(&raw, &s, "PAY-DH", "refunded_unallocated").await,
+        Some(text(0)),
         "a held refund moves NO spendable-headroom cap either"
     );
 
@@ -514,12 +535,12 @@ async fn forward_refund_on_payment_with_open_dispute_is_held() {
         .expect("with the dispute resolved WON the forward refund posts inline");
     assert_eq!(
         bal(&raw, &s, s.refund_clearing).await,
-        Some(300),
+        Some(text(300)),
         "post-resolution the stage-1 REFUND_CLEARING balance opens"
     );
     assert_eq!(
         bal(&raw, &s, s.unallocated).await,
-        Some(700),
+        Some(text(700)),
         "post-resolution UNALLOCATED is drawn down by the now-allowed refund"
     );
 }
@@ -757,12 +778,12 @@ async fn dispute_hold_drain_won_redrives_and_posts() {
     assert_eq!(dispute_hold_queue_rows(&raw, &s, "QUEUED").await, 0);
     assert_eq!(
         bal(&raw, &s, s.refund_clearing).await,
-        Some(300),
+        Some(text(300)),
         "the released stage-1 opened REFUND_CLEARING"
     );
     assert_eq!(
         bal(&raw, &s, s.unallocated).await,
-        Some(700),
+        Some(text(700)),
         "UNALLOCATED drawn down by the now-posted refund"
     );
     assert_eq!(refund_rows(&raw, &s, "PSP-WON", "initiated").await, Some(1));
@@ -828,7 +849,7 @@ async fn dispute_hold_drain_lost_cancels_never_posts() {
     );
     assert_eq!(
         bal(&raw, &s, s.unallocated).await,
-        Some(1000),
+        Some(text(1000)),
         "the UNALLOCATED pool is untouched"
     );
     assert_eq!(

@@ -1,6 +1,7 @@
 //! Pricing resource labels and the deny-by-default PEP gate.
 
 use authz_resolver_sdk::PolicyEnforcer;
+use authz_resolver_sdk::models::TenantMode;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use toolkit_security::{AccessScope, ScopeFilter, SecurityContext, pep_properties};
 use uuid::Uuid;
@@ -204,6 +205,15 @@ pub struct ResourceRef(pub Uuid);
 /// sites, spelled `true` at every one of them, and readable at none without a
 /// `/* require_constraints */` comment beside it.
 ///
+/// **The caller's tenant only (D-523).** Every request asks for
+/// [`TenantMode::RootOnly`], so the PDP answers `EQ(owner_tenant_id, subject tenant)` and
+/// never expands the subject's subtree. The gear serves one tenant's catalog and no other
+/// tenant's, and every repository pins the caller's tenant beside the scope, so the subtree
+/// added no row: it only cost an `IN` list of every descendant tenant, deleted ones
+/// included, on every scope check — thousands of bind parameters under a root tenant with
+/// thousands of descendants, and a deny once the PDP's expansion cap is crossed. An `EQ`
+/// also stays decidable in memory, which [`scope_holds`] needs for `caller_can_approve`.
+///
 /// # Errors
 ///
 /// [`AuthzError::Denied`] when the PDP denies or returns uncompilable
@@ -218,7 +228,9 @@ pub async fn access_scope(
 ) -> Result<AccessScope, AuthzError> {
     let owner_tenant_id = owner_tenant_id.map(|t| t.0);
     let resource_id = resource_id.map(|r| r.0);
-    let mut request = AccessRequest::new().require_constraints(true);
+    let mut request = AccessRequest::new()
+        .require_constraints(true)
+        .tenant_mode(TenantMode::RootOnly);
     if let Some(tenant) = owner_tenant_id {
         request = request.resource_property(pep_properties::OWNER_TENANT_ID, tenant);
     }
@@ -371,3 +383,7 @@ fn denied(attempt: DeniedAttempt) -> AuthzError {
     );
     AuthzError::Denied(Box::new(attempt))
 }
+
+#[cfg(test)]
+#[path = "authz_tests.rs"]
+mod authz_tests;

@@ -17,7 +17,9 @@ use uuid::Uuid;
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct ProvisionedUpstream {
+    /// Tenant that owns the upstream, or `None` for the default/root tenant.
     pub tenant_id: Option<Uuid>,
+    /// Create request materialized from the registry instance.
     pub request: CreateUpstreamRequest,
 }
 
@@ -28,7 +30,9 @@ pub struct ProvisionedUpstream {
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct ProvisionedRoute {
+    /// Tenant that owns the route, or `None` for the default/root tenant.
     pub tenant_id: Option<Uuid>,
+    /// Create request materialized from the registry instance.
     pub request: CreateRouteRequest,
 }
 

@@ -18,17 +18,23 @@
 
 use sea_orm_migration::prelude::*;
 
-// Prefixes, not identifiers: DE0901 reads any `gts.`-prefixed literal as a
-// whole id and counts four tokens where a complete one has five.
+// Prefixes, not identifiers: `gts_id!` validates a complete id, and these stop
+// at `type_`, so they are built from `GTS_ID_PREFIX` and the namespace tail.
 //
 // Written out rather than taken from `settings-service-sdk`: a migration is a
 // record of one move that already happened. If the catalogue is ever renamed
 // again, this must still rewrite `toolkit` to `core` on the databases that
 // stopped there, not chase whatever the constant then holds.
-#[allow(unknown_lints, de0901_gts_string_pattern)]
-const OLD: &str = "gts.cf.toolkit.settings.type_";
-#[allow(unknown_lints, de0901_gts_string_pattern)]
-const NEW: &str = "gts.cf.core.settings.type_";
+
+/// The value-type prefix before the move, in the `toolkit` namespace.
+fn old_prefix() -> String {
+    format!("{}cf.toolkit.settings.type_", toolkit_gts::GTS_ID_PREFIX)
+}
+
+/// The value-type prefix after the move, in the gear's own `core` namespace.
+fn new_prefix() -> String {
+    format!("{}cf.core.settings.type_", toolkit_gts::GTS_ID_PREFIX)
+}
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -37,11 +43,11 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        rewrite(manager, OLD, NEW).await
+        rewrite(manager, &old_prefix(), &new_prefix()).await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        rewrite(manager, NEW, OLD).await
+        rewrite(manager, &new_prefix(), &old_prefix()).await
     }
 }
 

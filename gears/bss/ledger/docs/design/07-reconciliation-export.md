@@ -142,7 +142,7 @@ Inherits Slices 1–6 (incl. B1 tax-presentation **resolved = gross** at posting
 | X1 | Export idempotency key | `(tenantId, sourceId, exportTarget, transactionId)`; export grain per Design (often invoice or journal entry). A re-export of the same key yields **identical business amounts** (AC #12); same key + different business amounts → alarm + block that key. (PRD spells the key with `invoiceId`; Design generalizes to `sourceId` under the PRD grain-per-Design allowance.) | PRD |
 | X2 | Operating mode | **Default Mode A** (ERP = GL of record, BSS = authoritative subledger + exporter); BSS owns export replay + BSS-originated corrections; Finance owns GL-side true-up (RD-bss-erp). Mode is **deployment config**. **RACI made permanent 2026-06-10** (no longer an interim default). | PRD |
 | X3 | Tax presentation **views** | Posting is **gross** (B1 resolved). Reconciliation supports **both gross and net/tax-split** views; **ratified 2026-06-10:** the per-jurisdiction view matrix is **Tax Engine config**, Slice 7 is a read-side consumer; default gross until the matrix fills. | PRD |
-| X4 | AR tie-out tolerance | ≤ **1 minor unit per 1,000 posted lines** for rounding-only variance, **statutory floors override**; immaterial-rounding bucket + statutory registry per Design. | PRD |
+| X4 | AR tie-out tolerance | ≤ **1 posting increment (`10^-currency_scale`) per 1,000 posted lines**, evaluated **per currency bucket**, for rounding-only variance (`recon.ar_tolerance_increments_per_k_lines`, default `1`; previously `N minor units`), **statutory floors override**; immaterial-rounding bucket + statutory registry per Design. | PRD |
 | X5 | ERP export SLA / period-close window | **Ratified 2026-06-10:** journal-post → ERP ack **p95 ≤ 15 min** (X5a); close window **≤ 3 business days** (X5b). | PRD |
 
 ### 1.7 Naming Conventions
@@ -240,7 +240,7 @@ REST per `rest-api-design`, behind the inbound API gateway (reads); exports go v
 **Actor**: `cpt-cf-bss-ledger-actor-revenue-assurance` (also scheduled daily/period by the system)
 
 **Success Scenarios**:
-- A reconciliation check runs for the period/scope, records `variance_minor` + `within_tolerance`, and completes `DONE`
+- A reconciliation check runs for the period/scope, records `variance` (per-currency money buckets, or a missing-invoice count) + `within_tolerance`, and completes `DONE`
 - Result is readable at `GET /v1/ledger/reconciliation-runs/{runId}` and on the recon dashboard
 
 **Error Scenarios**:
@@ -251,11 +251,11 @@ REST per `rest-api-design`, behind the inbound API gateway (reads); exports go v
 1. [ ] - `p1` - API: POST /v1/ledger/reconciliation-runs (period/scope, `check_type`), idempotent per `(tenant, period_id, check_type, runId)` - `inst-recon-api`
 2. [ ] - `p1` - DB: INSERT `reconciliation_run` (status=RUNNING, tenant-scoped RLS) - `inst-recon-insert`
 3. [ ] - `p1` - Algorithm: dispatch by `check_type` — AR_DERIVED → `cpt-cf-bss-ledger-algo-recon-ar-derived-tie-out`; LEDGER_ERP / GL → `cpt-cf-bss-ledger-algo-recon-ledger-erp`; PAYMENTS_PSP → `cpt-cf-bss-ledger-algo-recon-payments-psp-tie`; INVOICE_COMPLETENESS → `cpt-cf-bss-ledger-algo-recon-invoice-completeness` - `inst-recon-dispatch`
-4. [ ] - `p1` - DB: UPDATE `reconciliation_run` with `variance_minor`, `within_tolerance` (tolerance per X4; statutory floors override), status=DONE (or FAILED) - `inst-recon-record`
+4. [ ] - `p1` - DB: UPDATE `reconciliation_run` with `variance` (tagged JSON: `{"kind": "money", "by_currency": [MoneyDto, ...]}` or `{"kind": "missing_invoices", "count": n}`), `within_tolerance` (tolerance per X4 per currency bucket; statutory floors override), status=DONE (or FAILED) - `inst-recon-record`
 5. [ ] - `p1` - **IF** variance exceeds tolerance - `inst-recon-if-variance`
    1. [ ] - `p1` - DB: INSERT `exception_queue` row (`RECON_MISMATCH` or check-specific type); alert + ticket Revenue Assurance; feed the close gate (**blocks close**) - `inst-recon-exception`
    2. [ ] - `p1` - Raise `reconciliation-variance` alarm (Warn → Page; Slice 6 catalog) - `inst-recon-alarm`
-6. [ ] - `p1` - Emit `billing.ledger.reconciliation.completed` (`check_type`, `variance`) via the Slice 1 outbox - `inst-recon-event`
+6. [ ] - `p1` - Emit `billing.ledger.reconciliation.completed` (`check_type`, `variance`) via the Slice 1 outbox; the parked `v1` payload still carries an integer `variance_minor` — the minor units of the first non-zero currency bucket in deterministic currency order, or the missing-invoice count — until the event schemas move to decimal with the broker integration; the stored run and the REST view keep every bucket - `inst-recon-event`
 7. [ ] - `p1` - **RETURN** run result (variance report; gross and net/tax-split views per X3) - `inst-recon-return`
 
 ### Finance-Initiated Period Close
@@ -365,7 +365,7 @@ Tenant-scoped by default (cross-tenant rollups are Slice-6 elevated, audited). C
 | **Payments ↔ PSP** | Ledger Cash/clearing + **`REFUND_CLEARING`** (each stage-1 refund tied to its PSP refund settlement/outcome) + unallocated pool vs PSP settlement reports (net of allocations) | Variance **beyond a rounding tolerance** (shares the X4 budget — exact-match is brittle for cross-system penny rounding) → exception; unrelieved stage-1 clearing past the aging thresholds → `STUCK_REFUND_CLEARING` |
 | **GL / invoice-completeness** *(anchored to the block-close missed-posting obligation; the invoice-completeness leg is specified below)* | **GL:** BSS GL postings vs ERP ack. **Invoice-completeness:** the **independent** Invoice/Orchestration **issued-invoice manifest** (issued `invoiceId` set + control totals) vs the set posted to the ledger | GL: missed-posting / incompleteness exception. Invoice-completeness: a `MISSED_POSTING` exception per missing `invoiceId` → **blocks close** |
 
-Variance/tolerance: X4 (rounding-only ≤ 1 minor unit per 1,000 lines; statutory floors override). FX-consistency-vs-external-rate variance (the Slice 5 deferred control) lives here. Tax: reconciliation supports **gross and net/tax-split views** (X3); per-`(rate, jurisdiction, filing-period)` disaggregation from Slice 3 feeds filing reconciliation.
+Variance/tolerance: X4 (rounding-only ≤ 1 posting increment per 1,000 lines, per currency bucket; statutory floors override). FX-consistency-vs-external-rate variance (the Slice 5 deferred control) lives here. Tax: reconciliation supports **gross and net/tax-split views** (X3); per-`(rate, jurisdiction, filing-period)` disaggregation from Slice 3 feeds filing reconciliation.
 
 ### AR to Derived Tie-Out
 
@@ -373,14 +373,14 @@ Variance/tolerance: X4 (rounding-only ≤ 1 minor unit per 1,000 lines; statutor
 
 **Input**: tenant, period/scope; AR cache; posted `journal_line`s
 
-**Output**: `variance_minor` + `within_tolerance`; out-of-tolerance → exception + close block
+**Output**: `variance` (money buckets by currency) + `within_tolerance`; out-of-tolerance → exception + close block
 
 **Steps**:
 1. [ ] - `p1` - DB: read the AR balance cache for the scope - `inst-ar-read-cache`
 2. [ ] - `p1` - DB: recompute the derived AR projection as the sum of **actual AR-class `journal_line` deltas** — signs from the posted lines, **not** inferred from flow/phase names - `inst-ar-recompute`
 3. [ ] - `p1` - Apply the formula: (S1 + S4 + AR-restoring refunds + chargeback Lost/Partial-or-split + AR-restoring reversals) − S2 allocations − S3 credit notes − CreditApplication Apply-to-AR − reversing entries - `inst-ar-formula`
 4. [ ] - `p1` - Exclude AR-neutral shapes: the dispute-opened sub-class move, the AR-reclass variant of chargeback-Won, and the Grant-credit wallet shape - `inst-ar-exclusions`
-5. [ ] - `p1` - Compare cache vs projection; evaluate tolerance per X4 (≤ 1 minor unit per 1,000 posted lines rounding-only; statutory floors override; immaterial-rounding bucket + statutory registry) - `inst-ar-tolerance`
+5. [ ] - `p1` - Compare cache vs projection with exact decimal arithmetic, one bucket per currency; evaluate tolerance per X4 (≤ `recon.ar_tolerance_increments_per_k_lines` posting increments of that currency per 1,000 posted lines, rounding-only; statutory floors override; immaterial-rounding bucket + statutory registry). A grain whose stored amount is not canonical text, that mixes scales inside one grain, or that breaches the exact-arithmetic budget is marked **untrusted**: always a variance and a hard defect that no tolerance absorbs - `inst-ar-tolerance`
 6. [ ] - `p1` - **IF** variance > tolerance: alert + ticket Revenue Assurance + **block close** - `inst-ar-block`
 7. [ ] - `p1` - **RETURN** variance result (cumulative per payer at the AR-class grain — the tie-out is not period-isolated) - `inst-ar-return`
 
@@ -561,7 +561,7 @@ PK `(tenant_id, source_id, export_target, transaction_id)` — the idempotency k
 | `tenant_id` | uuid | tenant-scoped (RLS) |
 | `period_id` | string | period scope |
 | `check_type` | enum | `AR_DERIVED \| LEDGER_ERP \| PAYMENTS_PSP \| GL \| INVOICE_COMPLETENESS` |
-| `variance_minor` | bigint | per X4 |
+| `variance` | json | tagged: `{"kind": "money", "by_currency": [{amount, currency, currency_scale}, ...]}` or `{"kind": "missing_invoices", "count": n}`; per X4 |
 | `within_tolerance` | bool | per X4 |
 | `status` | enum | `RUNNING \| DONE \| FAILED` |
 | `at_utc` | timestamptz | run timestamp |
@@ -576,7 +576,7 @@ An out-of-tolerance run opens an `exception_queue` row and feeds the close gate.
    - not returned at all → skipped while `recon.unregistered_tenants = skip` (default; with the AM-backed plugin that is a tenant hard-deleted from `public.tenants`), reconciled under `reconcile` (for a non-authoritative plugin such as `static-tr-plugin`, which knows only its configured list).
 
    An answer the tick cannot trust is fail-safe toward coverage — the tick reconciles the full candidate set and purges nothing, counting the fallback in `ledger_reconciliation_lifecycle_unavailable_total{reason}`. Two answers qualify: a read that *fails* (`read_failed`), and a read that succeeds but recognises *none* of a non-empty candidate set (`none_recognised` — what a caller-scoped plugin such as `single-tenant-tr-plugin` returns for the tick's anonymous context). Silently under-reconciling would blind the close gate.
-2. **Reclaims the soft-deleted remainder's uneventful runs** — `DONE`, `within_tolerance = true`, `variance_minor = 0`. Only a positive `Deleted` answer makes a tenant purgeable; an unregistered tenant is never purged, since an omission from the resolver's answer is not proof of deletion. Runs that recorded any variance, and unfinalized (`RUNNING`/`FAILED`) rows, are **never** purged for any tenant: those are the evidence that something was once wrong. The eligibility predicate is applied to both the batch selection and the delete. The delete is per-tenant, so it rides the `(tenant_id, run_id)` PK; it is bounded per statement (5,000 rows), per tick (`recon.purge_max_rows_per_tick`), and per tenants visited (`recon.purge_max_tenants_per_tick`, default 500), and rotates through the deleted set across ticks. The purge is **off by default** (`purge_max_rows_per_tick = 0`): stopping the growth needs no deletes, so reclamation is enabled per environment once the gate is seen classifying correctly there (`200_000` drains a multi-GB backlog within a day at the default cadence). Failed purge statements are counted in `ledger_reconciliation_purge_failed_total`.
+2. **Reclaims the soft-deleted remainder's uneventful runs** — `DONE`, `within_tolerance = true`, a zero `variance` (every currency bucket zero, or a zero count). Only a positive `Deleted` answer makes a tenant purgeable; an unregistered tenant is never purged, since an omission from the resolver's answer is not proof of deletion. Runs that recorded any variance, and unfinalized (`RUNNING`/`FAILED`) rows, are **never** purged for any tenant: those are the evidence that something was once wrong. The eligibility predicate is applied to both the batch selection and the delete. The delete is per-tenant, so it rides the `(tenant_id, run_id)` PK; it is bounded per statement (5,000 rows), per tick (`recon.purge_max_rows_per_tick`), and per tenants visited (`recon.purge_max_tenants_per_tick`, default 500), and rotates through the deleted set across ticks. The purge is **off by default** (`purge_max_rows_per_tick = 0`): stopping the growth needs no deletes, so reclamation is enabled per environment once the gate is seen classifying correctly there (`200_000` drains a multi-GB backlog within a day at the default cadence). Failed purge statements are counted in `ledger_reconciliation_purge_failed_total`.
 
 Rows accumulated for tenants that were hard-deleted before the purge reached them are not reclaimed by the tick (they are unregistered, not `Deleted`); a one-time purge by the same predicate, scoped to tenant ids absent from `public.tenants`, covers that backlog.
 
@@ -797,7 +797,7 @@ Success via the Slice 1 outbox: `billing.ledger.export.acked`, `billing.ledger.r
 
 ### 8.2 Feature Metrics
 
-`ledger_reconciliation_variance_minor{check_type}`, `ledger_reconciliation_runs_total` / `_out_of_tolerance_total`, `ledger_reconciliation_retired_tenants{state}` / `ledger_reconciliation_runs_purged_total` / `ledger_reconciliation_lifecycle_unavailable_total{reason}` / `ledger_reconciliation_purge_failed_total` (the tenant-lifecycle gate's backlog, drain progress and failure signals, [§5.2](#52-reconciliation_run)), `ledger_export_acked_total` / `_failed_total`, `ledger_export_failed_age_seconds`, `ledger_export_payload_conflict_total`, `ledger_period_close_blocked_total{reason}`, `ledger_period_close_duration_days`, `ledger_exception_queue_depth{type}`. Thresholds wire to [§8.3](#83-nfr-mapping) + the recon-variance / failed-export alarms.
+`ledger_reconciliation_money_variance_currencies{check_type}` (a count of non-zero currency buckets — no monetary magnitude), `ledger_reconciliation_missing_invoices`, `ledger_reconciliation_runs_total` / `_out_of_tolerance_total`, `ledger_reconciliation_retired_tenants{state}` / `ledger_reconciliation_runs_purged_total` / `ledger_reconciliation_lifecycle_unavailable_total{reason}` / `ledger_reconciliation_purge_failed_total` (the tenant-lifecycle gate's backlog, drain progress and failure signals, [§5.2](#52-reconciliation_run)), `ledger_export_acked_total` / `_failed_total`, `ledger_export_failed_age_seconds`, `ledger_export_payload_conflict_total`, `ledger_period_close_blocked_total{reason}`, `ledger_period_close_duration_days`, `ledger_exception_queue_depth{type}`. Thresholds wire to [§8.3](#83-nfr-mapping) + the recon-variance / failed-export alarms.
 
 ### 8.3 NFR Mapping
 
@@ -831,7 +831,7 @@ Inherits Slices 1–6 open items. Slice-7-specific:
 | Period close window | **≤ 3 business days** from period end to close-complete | ✅ Ratified 2026-06-10 | Finance |
 | Operating mode + variance-ownership RACI | Mode A default; RACI **permanent**: tenant Finance — GL-side true-up; BSS — export re-drive + BSS-originated corrections (S3/S4/reversal, no shadow-edit) | ✅ Ratified 2026-06-10 | Product + Architecture |
 | Export grain | per Design (invoice or journal entry) | ✅ Accepted default | — |
-| AR tie-out tolerance | ≤ 1 minor unit / 1,000 lines; statutory floors | ✅ Accepted default | — |
+| AR tie-out tolerance | ≤ 1 posting increment / 1,000 lines per currency (`recon.ar_tolerance_increments_per_k_lines`); statutory floors | ✅ Accepted default | — |
 | Upstream→ledger invoice completeness | Independent Invoice/Orchestration **issued-invoice manifest** (issued `invoiceId` set + control totals) reconciled `issued − posted`; gap → close-blocking `MISSED_POSTING`; near-real-time watermark + Page alarm **and** pre-close gate | ✅ Direction A accepted 2026-06-16; **🔴 manifest-feed delivery is launch-blocking — to be scheduled with Invoice/Orchestration; check inert until then** | Architecture + Invoice/Orchestration |
 | Close-after-bill-run signal | close gate checks a per-`(tenant, period)` **bill-run-finished** assertion (call-driven control signal from Orchestration); blocks close without it — replaces runbook-only | ✅ In-ledger gate designed 2026-06-17; **signal delivery to be scheduled with Invoice/Orchestration (launch-blocking with)** | Architecture + Invoice/Orchestration |
 | Ledger↔ERP recon depth | **MVP = ack-level**; full BSS-TB vs ERP-TB reconciliation + the inbound **ERP trial-balance feed** (cadence, ERP→BSS mapping, storage) **deferred post-MVP**; the same-key-different-amount duplicate-key fallback is post-MVP too (connector-capability gap stated) | 🔮 **Deferred post-MVP** — ack-level ships; TB recon + ERP-TB feed designed later | Architecture + ERP-integration |

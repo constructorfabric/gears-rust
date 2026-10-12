@@ -32,7 +32,6 @@ use super::store::OutboxStore;
 use super::strategy::{LeasedStrategy, ProcessContext, ProcessingStrategy, TransactionalStrategy};
 use super::subscription::TraceMailbox;
 use super::tables::OutboxTables;
-use super::taskward::{Directive, WorkerAction};
 use super::trace::TraceState;
 use super::types::{LeaseConfig, OutboxConfig, SequencerConfig, WorkerTuning};
 use super::workers::sequencer::Sequencer;
@@ -40,6 +39,7 @@ use super::{Outbox, OutboxError, Partitions};
 use crate::migration_runner::run_migrations_for_testing;
 use crate::outbox::{OutboxMessageId, Wake};
 use crate::{ConnectOpts, Db, connect_db};
+use toolkit_taskward::{Directive, WorkerAction};
 
 // ======================================================================
 // Snapshot structs
@@ -6028,8 +6028,8 @@ async fn saturated_partition_fully_drained_across_cycles() {
 
 #[tokio::test]
 async fn processor_semaphore_limits_concurrency() {
-    use super::taskward::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
     use tokio::sync::Semaphore;
+    use toolkit_taskward::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
 
     // Create a semaphore with 2 permits
     let sem = Arc::new(Semaphore::new(2));
@@ -6161,8 +6161,8 @@ async fn vacuum_concurrent_workers_safe() {
 
 #[tokio::test]
 async fn priority_bulkhead_prefers_shared_when_available() {
-    use super::taskward::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
     use tokio::sync::Semaphore;
+    use toolkit_taskward::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
 
     let guaranteed = Arc::new(Semaphore::new(4));
     let shared = Arc::new(Semaphore::new(2));
@@ -6191,8 +6191,8 @@ async fn priority_bulkhead_prefers_shared_when_available() {
 
 #[tokio::test]
 async fn priority_bulkhead_falls_back_to_guaranteed_when_shared_exhausted() {
-    use super::taskward::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
     use tokio::sync::Semaphore;
+    use toolkit_taskward::{BackoffConfig, Bulkhead, BulkheadConfig, ConcurrencyLimit};
 
     let guaranteed = Arc::new(Semaphore::new(4));
     let shared = Arc::new(Semaphore::new(2));

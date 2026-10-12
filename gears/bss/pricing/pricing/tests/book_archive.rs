@@ -886,27 +886,28 @@ async fn unarchive_rereserves_the_live_skus_and_lists_the_others() {
 /// under the old tag then meets the committed version.
 #[tokio::test]
 async fn an_unarchive_answers_its_book_when_the_released_entries_cannot_be_read() {
+    use sea_orm::{ConnectionTrait, Database};
     let (f, catalog) = plan_support::setup().await;
     let book = new_book(&f, "unread").await;
     let entry = door_entry(&f, book, catalog.sku(SkuType::Recurring)).await;
     archive(&f, book).await;
-    // While the door drives the re-reservation, the entry's row stops decoding: the read of the
-    // released entries after the drive fails.
+    // The unarchive's own write makes the entry's row stop decoding, after its transaction read
+    // the entries: the read of the released entries after the commit fails. A trigger rather than
+    // a hook in the drive, which the door cuts at its deadline before the hook's write lands.
     let hex = entry.simple().to_string().to_uppercase();
-    *catalog.on_reserve_sql.lock().unwrap() = Some((
-        String::from(&f.dsn),
-        format!(
-            "UPDATE pricing_price_book_entry SET created_at = 'not a time' \
-             WHERE id = '{entry}' OR hex(id) = '{hex}'"
-        ),
-    ));
+    let raw = Database::connect(&f.dsn).await.unwrap();
+    raw.execute_unprepared(&format!(
+        "CREATE TRIGGER unread_entry AFTER UPDATE OF archived_at ON pricing_price_book \
+         WHEN NEW.archived_at IS NULL BEGIN \
+         UPDATE pricing_price_book_entry SET created_at = 'not a time' \
+         WHERE id = '{entry}' OR hex(id) = '{hex}'; END"
+    ))
+    .await
+    .unwrap();
+    raw.close().await.unwrap();
     let tag = book_tag(&f, book).await;
     let (s, b, new_tag) = mark(&f, book, "unarchive", Some(&tag)).await;
     assert_eq!(s, 200, "the unarchive committed: {b}");
-    assert!(
-        catalog.on_reserve_sql.lock().unwrap().is_none(),
-        "the drive met the hook"
-    );
     assert!(b["archived_at"].is_null(), "{b}");
     assert!(
         b["released_entries"].is_null(),

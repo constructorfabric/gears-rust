@@ -1,209 +1,139 @@
-//! `RecognitionRunner` — the ASC 606 S6 **release** mechanism (design §4.3,
-//! Group D1). It turns a due `PENDING` recognition segment into recognized
-//! revenue by posting **one balanced entry** through the Slice 1
-//! [`PostingService`]:
-//!
-//! | Line | Side | Account class |
-//! |------|------|---------------|
-//! | Recognize | DR | `CONTRACT_LIABILITY` (the segment's stream) |
-//! | Revenue   | CR | `REVENUE` (the **same** stream) |
-//!
-//! `amount_minor` is the segment's amount, `currency` the schedule's currency,
-//! and both legs carry the schedule's `revenue_stream` (per-stream disaggregation,
-//! §4.5 — DR and CR draw the same stream). Each line's chart `account_id` is bound
-//! from the provisioned chart of accounts via [`load_chart`] + [`ChartIndex::resolve`]
-//! (mirroring [the invoice-post bind path](crate::infra::invoice_post)); the
-//! per-line scale is resolved from the currency registry, exactly as the
-//! settlement / invoice posts.
-//!
-//! **Atomicity + at-most-once.** The post threads a
-//! [`RecognitionStampSidecar`](crate::infra::recognition::sidecar::RecognitionStampSidecar)
-//! so the journal entry, the `recognized_minor += amount` counter bump (under the
-//! per-schedule over-recognition cap CHECK → [`DomainError::OverRecognition`] 409),
-//! and the segment `→ DONE` stamp all commit in the SAME serializable transaction
-//! or roll back together (§4.3). The entry's `source_doc_type = RECOGNITION` +
-//! `source_business_id = "{schedule_id}:{segment_no}"` key the Slice 1
-//! `IdempotencyGate`, so the release is at-most-once per
-//! `(tenant, RECOGNITION, schedule_id:segment_no)` — a replay returns the prior
-//! [`PostingRef`] without re-crediting (and the sidecar never runs on a replay).
-//!
-//! **Scope.** [`Self::run_period`] releases the due `PENDING` segments for a
-//! `(tenant, period_id)` in ascending `(schedule_id, segment_no)` order, applying
-//! the E1 out-of-order → `QUEUED` guard, the E3 missed-close reassignment, and
-//! the E4 obligation gate. The single-active-run orchestration + `recognition_run`
-//! row live in the [`RecognitionRunService`](super::run_service). Group F adds:
-//! [`Self::release_reversal`] (the `DR Revenue / CR CL` clawback keyed
-//! `schedule_id:segment_no:reversal`, decrementing `recognized_minor`); the §9
-//! recognition metrics (recognized-minor on release, queue-depth on a park); and
-//! the EXPLICIT `RECOGNITION_PERIOD_QUEUED` (a park) + `RECOGNITION_DOUBLE_CREDIT`
-//! (a detected re-credit) alarms — the `OVER_RECOGNITION` alarm is the posting
-//! engine's (it fires on the rolled-back release). `effective_at` is the first
-//! day of the segment's own `period_id` month (the natural-period convention);
-//! the OPEN-period gate is the foundation's (the post fails `PeriodClosed` if the
-//! segment's period is not open).
+//! Recognition releases each segment in one complete serializable retry attempt.
+//! Due rows are advisory identities. Mutable money, status, predecessors, periods
+//! and registry gates are rebuilt on that attempt. A period run resolves the
+//! chart of accounts once per pass (account ids are immutable; the posting
+//! transaction re-checks each bound account is still OPEN), while a direct
+//! single-segment release resolves it inside its attempt. Historical reversals
+//! restore the complete original journal through the core stored-evidence seam.
+//! Publishers remain parked; no broker or transactional outbox guarantee is made.
 
-use std::sync::Arc;
-
-use bss_ledger_sdk::{
-    AccountClass, MappingStatus, PostEntry, PostLine, PostingRef, Side, SourceDocType,
-};
-use chrono::NaiveDate;
-use toolkit_db::secure::AccessScope;
-use toolkit_db::{DBProvider, DbError};
-use toolkit_security::SecurityContext;
-use uuid::Uuid;
-
+use crate::domain::canonical::{digest32_hex, put_money, put_str};
 use crate::domain::error::DomainError;
 use crate::domain::model::{NewEntry, NewLine};
 use crate::domain::ports::metrics::LedgerMetricsPort;
 use crate::domain::ports::obligation_state::{
     AlwaysSatisfiedObligationState, ObligationContext, ObligationStateResolver,
 };
-use crate::domain::status::SEGMENT_STATUS_DONE;
-use crate::infra::currency_scale::CurrencyScaleResolver;
+use crate::domain::status::{
+    SCHEDULE_STATUS_ACTIVE, SEGMENT_STATUS_DONE, SEGMENT_STATUS_PENDING, SEGMENT_STATUS_QUEUED,
+};
 use crate::infra::events::payloads::{
     AffectedItem, AlarmCategory, AlarmSeverity, LedgerInvariantAlarm,
 };
 use crate::infra::events::publisher::LedgerEventPublisher;
-use crate::infra::posting::chart::{ChartIndex, load_chart};
-use crate::infra::posting::service::{PostSidecar, PostingService};
+use crate::infra::posting::chart::{ChartIndex, load_chart_in};
+use crate::infra::posting::idempotency::IdempotencyGate;
+use crate::infra::posting::retry::{AttemptError, RetryOp, retry_transaction_for};
+use crate::infra::posting::service::{ClaimSpec, PostSidecar, PostingService};
+use crate::infra::recognition::repo_errors::map_recognition_repo_err;
 use crate::infra::recognition::sidecar::{RecognitionReversalSidecar, RecognitionStampSidecar};
-use crate::infra::storage::repo::recognition_repo::DuePendingSegment;
-use crate::infra::storage::repo::{RecognitionRepo, ReferenceRepo};
+use crate::infra::storage::repo::recognition_repo::{
+    DuePendingSegment, RecognitionRepo, ScheduleState, SegmentState,
+};
+use crate::infra::storage::repo::{JournalRepo, PaymentRepo, ReferenceRepo};
+use bss_ledger_sdk::{
+    AccountClass, MappingStatus, PostEntry, PostLine, PostedMoney, PostingRef, Side, SourceDocType,
+};
+use chrono::NaiveDate;
+use std::sync::Arc;
 use time::OffsetDateTime;
-
-/// Origin literal stamped on posts made through this service (mirrors the
-/// invoice-post / settlement orchestrators).
+use toolkit_db::secure::{AccessScope, DbTx};
+use toolkit_db::{DBProvider, DbError};
+use toolkit_security::SecurityContext;
+use uuid::Uuid;
 const ORIGIN_SYSTEM: &str = "SYSTEM";
 
-/// A single segment to release: the schedule/segment identity + the stream /
-/// currency / amount the `DR CL / CR Revenue` entry posts with. Built from a
-/// [`DuePendingSegment`] read, or supplied directly by a caller that already
-/// holds the context (the Group E orchestrator / the Group F job).
+/// Advisory candidate. Only schedule and segment identities drive authoritative reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleasableSegment {
     pub schedule_id: String,
     pub segment_no: i32,
     pub period_id: String,
-    pub amount_minor: i64,
+    pub amount: PostedMoney,
     pub revenue_stream: String,
-    pub currency: String,
 }
-
 impl From<DuePendingSegment> for ReleasableSegment {
     fn from(s: DuePendingSegment) -> Self {
         Self {
             schedule_id: s.schedule_id,
             segment_no: s.segment_no,
             period_id: s.period_id,
-            amount_minor: s.amount_minor,
+            amount: s.amount,
             revenue_stream: s.revenue_stream,
-            currency: s.currency,
         }
     }
 }
-
-/// The outcome of releasing one segment: the segment's id + the resulting
-/// [`PostingRef`] (`replayed = true` when the release was an idempotent replay of
-/// a prior run — at-most-once held).
+/// Committed release or replay reference.
 #[derive(Clone, Debug)]
 pub struct ReleasedSegment {
     pub schedule_id: String,
     pub segment_no: i32,
     pub posting: PostingRef,
 }
-
-/// A small summary of a `run_period` pass: how many due segments were released
-/// (fresh + replayed) and the per-segment posting refs. The ordering-gap /
-/// QUEUED accounting is Group E; for Group D this just tallies the releases.
+/// Per-pass accounting; each release commits independently.
 #[derive(Clone, Debug, Default)]
 pub struct RunPeriodSummary {
-    /// Segments released on THIS pass (a fresh post, `replayed = false`).
     pub released: usize,
-    /// Segments that were already released (an idempotent `RECOGNITION` replay).
     pub replayed: usize,
-    /// Segments parked `QUEUED` this pass (E1 ordering — a lower-period
-    /// predecessor was not yet `DONE`, so the segment is delayed, not released).
     pub queued: usize,
-    /// Segments skipped this pass by the E4 obligation gate (the obligation was
-    /// not satisfied — delayed, never released early). v1 never skips (the
-    /// default resolver always proceeds).
     pub skipped: usize,
-    /// The per-segment release outcomes, in release order.
     pub segments: Vec<ReleasedSegment>,
 }
-
-/// Releases due recognition segments through the Slice 1 posting engine. Holds
-/// only what it needs: the chart reader ([`ReferenceRepo`]), the per-line scale
-/// resolver, the [`PostingService`], and the [`RecognitionRepo`] (the due-segment
-/// read + the in-txn counter/stamp writes the sidecar drives).
-pub struct RecognitionRunner {
-    posting: PostingService,
-    reference: ReferenceRepo,
-    resolver: CurrencyScaleResolver,
-    recognition: RecognitionRepo,
-    /// E4 run-gating: consulted per segment before release (a NOT-satisfied
-    /// obligation delays the release). v1 default = always-satisfied (proceed).
-    obligation: Arc<dyn ObligationStateResolver>,
-    /// Metrics sink (design §9): the recognized-minor counter on each release,
-    /// the over-recognition + double-credit counters + the queue-depth gauge on
-    /// their paths, and the run-duration histogram (emitted by the run-service).
-    /// Held behind the port so unit tests pass [`NoopLedgerMetrics`].
-    metrics: Arc<dyn LedgerMetricsPort>,
-    /// Publisher for the out-of-band recognition alarms the runner raises
-    /// EXPLICITLY (the `RECOGNITION_PERIOD_QUEUED` park + the
-    /// `RECOGNITION_DOUBLE_CREDIT` stamp breach). The `OVER_RECOGNITION` alarm is
-    /// raised by the posting engine's `alarm_for` (it fires on the rolled-back
-    /// release), so the runner does not double-emit it.
-    publisher: Arc<LedgerEventPublisher>,
+/// A committed operation may post, park, or leave an ineligible candidate untouched.
+enum SegmentOutcome {
+    Posted(PostingRef, String),
+    Queued(String),
+    Skipped,
 }
 
+/// Owns the per-segment transaction budget and post-commit observations.
+#[derive(Clone)]
+pub struct RecognitionRunner {
+    db: DBProvider<DbError>,
+    posting: PostingService,
+    reference: ReferenceRepo,
+    recognition: Arc<RecognitionRepo>,
+    journal: JournalRepo,
+    /// Carried account balances (the S6 functional-money gate).
+    payments: PaymentRepo,
+    idempotency: IdempotencyGate,
+    obligation: Arc<dyn ObligationStateResolver>,
+    metrics: Arc<dyn LedgerMetricsPort>,
+    publisher: Arc<LedgerEventPublisher>,
+}
 impl RecognitionRunner {
-    /// Build the runner over one database provider + the event publisher +
-    /// the metrics sink (threaded into the posting engine + the §9 recognition
-    /// metrics). Mirrors
-    /// [`crate::infra::invoice_post::InvoicePostService::new`] /
-    /// [`crate::infra::payment::settle::SettlementService::new`].
+    /// Bind all dependencies to the same database.
     #[must_use]
     pub fn new(
         db: DBProvider<DbError>,
         publisher: Arc<LedgerEventPublisher>,
         metrics: Arc<dyn LedgerMetricsPort>,
     ) -> Self {
-        let posting = PostingService::new(db.clone(), Arc::clone(&publisher));
+        let posting = PostingService::new(db.clone(), publisher.clone());
         let reference = ReferenceRepo::new(db.clone());
-        let resolver = CurrencyScaleResolver::new(ReferenceRepo::new(db.clone()));
-        let recognition = RecognitionRepo::new(db);
+        let recognition = Arc::new(RecognitionRepo::new(db.clone()));
+        let journal = JournalRepo::new(db.clone());
+        let payments = PaymentRepo::new(db.clone());
         Self {
+            db,
             posting,
             reference,
-            resolver,
             recognition,
-            // v1: no Subscriptions feed — proceed (design §4.3). The real
-            // fail-safe reader replaces this when the feed lands (Slice 7).
+            journal,
+            payments,
+            idempotency: IdempotencyGate::new(),
             obligation: Arc::new(AlwaysSatisfiedObligationState),
             metrics,
             publisher,
         }
     }
-
-    /// Release the due `PENDING` segments for `(tenant, period_id)` in ascending
-    /// `(schedule_id, segment_no)` order (Group D — the ordering GAP guard that a
-    /// predecessor segment be `DONE` is Group E). Each segment is released via
-    /// [`Self::release_segment`]; a release error short-circuits the pass and
-    /// propagates (the segments already released stay committed — each is its own
-    /// atomic post). Returns a [`RunPeriodSummary`] tallying fresh vs replayed
-    /// releases + the per-segment refs.
-    ///
-    /// `run_id` labels every release of this pass on its segment row + the posted
-    /// entry's audit linkage; the caller mints it (the Group E orchestration owns
-    /// the `recognition_run` row + the single-active-run lock — Group D just
-    /// threads the id through).
+    /// Discover candidates, then independently commit each authoritative decision.
     ///
     /// # Errors
     /// Any [`DomainError`] a per-segment release raises ([`DomainError::OverRecognition`],
-    /// [`DomainError::PeriodClosed`], [`DomainError::AccountClosed`], …) or
-    /// [`DomainError::Internal`] on an infrastructure fault.
+    /// [`DomainError::PeriodClosed`], [`DomainError::AccountClosed`], …), the mapped repository
+    /// error when the due-segment scan fails, or [`DomainError::Internal`] on an infrastructure
+    /// fault.
     pub async fn run_period(
         &self,
         ctx: &SecurityContext,
@@ -212,147 +142,69 @@ impl RecognitionRunner {
         period_id: &str,
         run_id: Uuid,
     ) -> Result<RunPeriodSummary, DomainError> {
-        // TODO(slice-7): `list_due_pending_segments` is an unbounded feed — a
-        // per-pass cap needs continuation semantics (resume cursor) so a
-        // pathological backlog can't load an unbounded set into one pass; out of
-        // scope here.
         let due = self
             .recognition
             .list_due_pending_segments(scope, tenant, period_id)
             .await
-            .map_err(|e| DomainError::Internal(format!("list due segments: {e}")))?;
-
-        // E3 missed-close (§4.3 E-2): a segment whose own target period has
-        // CLOSED posts into the tenant's current open period instead (its target
-        // stays on the segment row for audit). Resolved once per pass.
-        let current_open = self
-            .recognition
-            .current_open_period(scope, tenant)
-            .await
-            .map_err(|e| DomainError::Internal(format!("current open period: {e}")))?;
-
-        // Load the chart of accounts ONCE per pass (tenant-scoped + stable across
-        // the pass): every segment binds its `DR CL / CR REVENUE` legs from the
-        // same chart, so a per-segment `load_chart` (a full chart scan) would be a
-        // needless N+1 against an immutable-within-the-pass projection. Bind it by
-        // reference into each release.
-        let chart = load_chart(&self.reference, scope, tenant).await?;
-
+            .map_err(map_recognition_repo_err)?;
         let mut summary = RunPeriodSummary::default();
-        for seg in due {
-            let seg: ReleasableSegment = seg.into();
-
-            // E4 run-gating: release only when the performance obligation is
-            // satisfied — never early. A NOT-satisfied obligation delays the
-            // segment (left PENDING; a later run retries). v1 default proceeds.
-            let obligation = ObligationContext {
-                tenant_id: tenant,
-                schedule_id: seg.schedule_id.clone(),
-                subscription_ref: None,
-            };
-            if !self.obligation.is_satisfied(&obligation).await {
-                summary.skipped += 1;
-                continue;
-            }
-
-            // E1 ordering (§4.6): a lower-`period_id` predecessor of the SAME
-            // schedule that is not yet `DONE` ⇒ park this segment `QUEUED` (do
-            // NOT release out of order); a later run drains it once the
-            // predecessor commits.
-            let undone = self
-                .recognition
-                .count_predecessors_not_done(scope, tenant, &seg.schedule_id, &seg.period_id)
-                .await
-                .map_err(|e| DomainError::Internal(format!("predecessor check: {e}")))?;
-            if undone > 0 {
-                self.recognition
-                    .mark_segment_queued(scope, tenant, &seg.schedule_id, seg.segment_no)
-                    .await
-                    .map_err(|e| DomainError::Internal(format!("mark queued: {e}")))?;
-                summary.queued += 1;
-                // F3: one Warn `RECOGNITION_PERIOD_QUEUED` alarm per parked segment
-                // (best-effort, out-of-band) — a later run drains it once the
-                // predecessor commits, so it is re-detected until the gap closes.
-                self.emit_period_queued(
+        // One chart scan per pass, not one per segment and attempt inside each
+        // serializable transaction: ids are immutable and the posting transaction
+        // re-checks each bound account is OPEN.
+        let chart = if due.is_empty() {
+            None
+        } else {
+            let conn = self
+                .db
+                .conn()
+                .map_err(|e| DomainError::Internal(format!("recognition chart connection: {e}")))?;
+            Some(Arc::new(
+                load_chart_in(&self.reference, &conn, scope, tenant).await?,
+            ))
+        };
+        for candidate in due {
+            let candidate = ReleasableSegment::from(candidate);
+            match self
+                .release_operation_with_chart(
                     ctx,
+                    scope,
                     tenant,
-                    &seg.schedule_id,
-                    seg.segment_no,
-                    &seg.period_id,
+                    &candidate,
+                    period_id,
+                    run_id,
+                    chart.clone(),
                 )
-                .await;
-                continue;
-            }
-
-            // E3 missed-close: if the segment's own target period is closed
-            // (strictly before the current open period), release into the current
-            // open period — the segment row keeps its original `period_id` as the
-            // audit target. Otherwise release into the segment's own period. (The
-            // "do not release a FUTURE period early" bound is the caller's: the
-            // Group F job targets the CURRENT period, so `list_due_pending_segments`
-            // — `period_id <= target` — never enumerates a future segment. See
-            // `RecognitionRunJob` / H1.)
-            let release_seg = match &current_open {
-                Some(open) if seg.period_id.as_str() < open.as_str() => ReleasableSegment {
-                    period_id: open.clone(),
-                    ..seg.clone()
-                },
-                _ => seg.clone(),
-            };
-            let posting = match self
-                .release_segment_with_chart(ctx, scope, tenant, &chart, &release_seg, run_id)
-                .await
+                .await?
             {
-                Ok(posting) => posting,
-                Err(e) => {
-                    // §9 `ledger_over_recognition_total`: count the per-schedule cap
-                    // breach here (the `OVER_RECOGNITION` alarm is the posting
-                    // engine's `alarm_for`; this is the dedicated counter). Other
-                    // rejections are not over-recognition.
-                    if matches!(e, DomainError::OverRecognition(_)) {
-                        self.metrics.over_recognition();
+                SegmentOutcome::Posted(posting, _) => {
+                    if posting.replayed {
+                        summary.replayed += 1;
+                    } else {
+                        summary.released += 1;
                     }
-                    return Err(e);
+                    summary.segments.push(ReleasedSegment {
+                        schedule_id: candidate.schedule_id,
+                        segment_no: candidate.segment_no,
+                        posting,
+                    });
                 }
-            };
-            if posting.replayed {
-                summary.replayed += 1;
-            } else {
-                summary.released += 1;
+                SegmentOutcome::Queued(_) => summary.queued += 1,
+                SegmentOutcome::Skipped => summary.skipped += 1,
             }
-            summary.segments.push(ReleasedSegment {
-                schedule_id: seg.schedule_id,
-                segment_no: seg.segment_no,
-                posting,
-            });
         }
-        // F3: observe the segments this pass parked QUEUED out-of-order as the
-        // recognition-period queue-depth gauge (design §9). NOTE: this records
-        // THIS pass's parked count, not the standing backlog, and
-        // the gauge is unlabelled — so concurrent passes (the per-tenant ticker + a
-        // REST trigger, across tenants) clobber each other's last write. It signals
-        // "a pass just parked N", not "N are queued now". An accurate backlog gauge
-        // needs a per-tenant label + a `COUNT(status='QUEUED')` read (follow-up).
         self.metrics
             .recognition_period_queue_depth(i64::try_from(summary.queued).unwrap_or(i64::MAX));
         Ok(summary)
     }
-
-    /// Release ONE due segment: build the balanced `DR CONTRACT_LIABILITY /
-    /// CR REVENUE` entry (both on the segment's stream, the schedule's currency,
-    /// `amount_minor = segment.amount_minor`), bind each leg's chart `account_id`,
-    /// resolve per-line scale, and post through [`PostingService`] threading the
-    /// [`RecognitionStampSidecar`] (the `recognized_minor` delta + segment `DONE`
-    /// stamp commit in the same txn). Idempotent on
-    /// `(tenant, RECOGNITION, schedule_id:segment_no)` — a replay returns the prior
-    /// [`PostingRef`] (`replayed = true`) without re-crediting.
+    /// Release a discovered identity; caller money is advisory and never posted.
+    /// Direct callers receive a policy error if the fresh decision parks or skips.
     ///
     /// # Errors
-    /// [`DomainError::OverRecognition`] when the per-schedule cap CHECK rejects the
-    /// release; [`DomainError::AccountClosed`] when the stream's `CONTRACT_LIABILITY`
-    /// / `REVENUE` account is not provisioned; any foundation rejection
-    /// (period-closed / negative-balance / …) or [`DomainError::Internal`] on an
-    /// infrastructure fault.
+    /// [`DomainError::RecognitionPolicyConflict`] when the fresh in-transaction decision parks
+    /// or skips the segment instead of posting it; otherwise any [`DomainError`] the release
+    /// raises (a foundation rejection such as [`DomainError::PeriodClosed`] or
+    /// [`DomainError::AccountClosed`], or [`DomainError::Internal`] on an infrastructure
+    /// fault).
     pub async fn release_segment(
         &self,
         ctx: &SecurityContext,
@@ -361,222 +213,531 @@ impl RecognitionRunner {
         segment: &ReleasableSegment,
         run_id: Uuid,
     ) -> Result<PostingRef, DomainError> {
-        // Standalone release (a single-segment caller / a test): load the chart
-        // once, then delegate to the chart-bound path. A `run_period` pass loads
-        // the chart ONCE for the whole pass and calls
-        // [`Self::release_segment_with_chart`] directly (no per-segment scan).
-        let chart = load_chart(&self.reference, scope, tenant).await?;
-        self.release_segment_with_chart(ctx, scope, tenant, &chart, segment, run_id)
-            .await
+        match self
+            .release_operation(ctx, scope, tenant, segment, &segment.period_id, run_id)
+            .await?
+        {
+            SegmentOutcome::Posted(posting, _) => Ok(posting),
+            _ => Err(DomainError::RecognitionPolicyConflict(
+                "segment is not releasable on this pass".into(),
+            )),
+        }
     }
-
-    /// Release ONE due segment against an ALREADY-LOADED chart of accounts — the
-    /// pass-internal release path. Identical to [`Self::release_segment`] but
-    /// takes the tenant chart by reference (hoisted once per `run_period` pass,
-    /// stable across it) instead of scanning the chart per segment.
-    ///
-    /// # Errors
-    /// Same as [`Self::release_segment`].
-    async fn release_segment_with_chart(
+    /// One whole-operation retry that resolves the chart inside its attempt.
+    async fn release_operation(
         &self,
         ctx: &SecurityContext,
         scope: &AccessScope,
         tenant: Uuid,
-        chart: &ChartIndex,
-        segment: &ReleasableSegment,
+        candidate: &ReleasableSegment,
+        target_period: &str,
         run_id: Uuid,
-    ) -> Result<PostingRef, DomainError> {
-        // Build the balanced two-line entry (nil placeholder account_ids; bound
-        // below from the chart, like every other post path).
-        let entry = build_recognition_entry(ctx, tenant, segment);
-
-        // Bind each leg's chart account_id (per-stream CONTRACT_LIABILITY / REVENUE
-        // resolve on the segment's stream) from the passed-in chart.
-        let mut bound = entry;
+    ) -> Result<SegmentOutcome, DomainError> {
+        self.release_operation_with_chart(
+            ctx,
+            scope,
+            tenant,
+            candidate,
+            target_period,
+            run_id,
+            None,
+        )
+        .await
+    }
+    /// One whole-operation retry; no retry-owning posting wrapper is nested here.
+    /// `chart` is the pass's chart (a period run); `None` resolves it inside the
+    /// attempt (a direct release).
+    async fn release_operation_with_chart(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        tenant: Uuid,
+        candidate: &ReleasableSegment,
+        target_period: &str,
+        run_id: Uuid,
+        chart: Option<Arc<ChartIndex>>,
+    ) -> Result<SegmentOutcome, DomainError> {
+        // E4 run gating, resolved before the serializable transaction opens: an
+        // outbound obligation port must never hold a transaction open while it
+        // answers. The answer is applied inside the attempt after the replay and
+        // status checks, so an already-posted release still replays; a
+        // NOT-satisfied obligation delays a releasable segment (left PENDING; a
+        // later run retries).
+        let subscription_ref = self
+            .recognition
+            .read_schedule(scope, tenant, &candidate.schedule_id)
+            .await
+            .map_err(map_recognition_repo_err)?
+            .and_then(|schedule| schedule.subscription_ref);
+        let obligation = ObligationContext {
+            tenant_id: tenant,
+            schedule_id: candidate.schedule_id.clone(),
+            subscription_ref,
+        };
+        let obligation_satisfied = self.obligation.is_satisfied(&obligation).await;
+        let svc = self.clone();
+        let ctx_txn = ctx.clone();
+        let scope_txn = scope.clone();
+        let alarm_candidate = candidate.clone();
+        let candidate = candidate.clone();
+        let target_period = target_period.to_owned();
+        let op = RetryOp::new("recognition release", Some(tenant));
+        let outcome = retry_transaction_for(&self.db.db(), op, move |txn| {
+            let svc = svc.clone();
+            let ctx = ctx_txn.clone();
+            let scope = scope_txn.clone();
+            let candidate = candidate.clone();
+            let target_period = target_period.clone();
+            let chart = chart.clone();
+            Box::pin(async move {
+                svc.release_once(
+                    txn,
+                    &ctx,
+                    &scope,
+                    tenant,
+                    &candidate,
+                    &target_period,
+                    run_id,
+                    chart.as_deref(),
+                    obligation_satisfied,
+                )
+                .await
+            })
+        })
+        .await;
+        match &outcome {
+            Ok(SegmentOutcome::Posted(posting, stream)) if !posting.replayed => {
+                self.metrics.revenue_recognized(stream);
+            }
+            Ok(SegmentOutcome::Queued(period)) => {
+                self.emit_period_queued(
+                    ctx,
+                    tenant,
+                    &alarm_candidate.schedule_id,
+                    alarm_candidate.segment_no,
+                    period,
+                )
+                .await;
+            }
+            Err(DomainError::OverRecognition(_)) => self.metrics.over_recognition(),
+            _ => {}
+        }
+        if let Err(error) = &outcome {
+            self.emit_post_error(ctx, scope, tenant, &alarm_candidate, error, true)
+                .await;
+        }
+        outcome
+    }
+    /// Authorize target before reading claim evidence; terminal state still authorizes replay.
+    async fn observed(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+        tenant: Uuid,
+        id: &str,
+        no: i32,
+    ) -> Result<(ScheduleState, SegmentState), AttemptError> {
+        let schedule = self
+            .recognition
+            .read_schedule_in_txn(txn, scope, tenant, id)
+            .await
+            .map_err(map_recognition_repo_err)?
+            .ok_or_else(|| {
+                DomainError::RecognitionPolicyConflict(
+                    "schedule unavailable in caller scope".into(),
+                )
+            })?;
+        let segment = self
+            .recognition
+            .read_segment_of(txn, scope, &schedule, no)
+            .await
+            .map_err(map_recognition_repo_err)?
+            .ok_or_else(|| {
+                DomainError::RecognitionPolicyConflict("segment unavailable in caller scope".into())
+            })?;
+        Ok((schedule, segment))
+    }
+    /// Immutable evidence replay precedes chart, registry, period and eligibility gates.
+    async fn replay(
+        &self,
+        txn: &DbTx<'_>,
+        tenant: Uuid,
+        business: &str,
+        hash: &str,
+    ) -> Result<Option<PostingRef>, AttemptError> {
+        let Some(prior) = self
+            .idempotency
+            .read(txn, tenant, SourceDocType::Recognition.as_str(), business)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if prior.payload_hash != hash {
+            return Err(
+                DomainError::IdempotencyConflict("recognition evidence differs".into()).into(),
+            );
+        }
+        if prior.status != crate::infra::posting::idempotency::STATUS_POSTED {
+            return Err(
+                DomainError::Internal("recognition claim has no committed posting".into()).into(),
+            );
+        }
+        let entry_id = prior
+            .result_entry_id
+            .ok_or_else(|| DomainError::Internal("recognition posting result is absent".into()))?;
+        Ok(Some(PostingRef {
+            entry_id,
+            created_seq: 0,
+            replayed: true,
+        }))
+    }
+    async fn release_once(
+        &self,
+        txn: &DbTx<'_>,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        tenant: Uuid,
+        candidate: &ReleasableSegment,
+        target_period: &str,
+        run_id: Uuid,
+        chart: Option<&ChartIndex>,
+        obligation_satisfied: bool,
+    ) -> Result<SegmentOutcome, AttemptError> {
+        let (schedule, segment) = self
+            .observed(
+                txn,
+                scope,
+                tenant,
+                &candidate.schedule_id,
+                candidate.segment_no,
+            )
+            .await?;
+        let business = recognition_business_id(&segment.schedule_id, segment.segment_no);
+        let hash = release_hash(&schedule, &segment);
+        if let Some(posting) = self.replay(txn, tenant, &business, &hash).await? {
+            return Ok(SegmentOutcome::Posted(posting, schedule.revenue_stream));
+        }
+        if schedule.status != SCHEDULE_STATUS_ACTIVE
+            || !(segment.status == SEGMENT_STATUS_PENDING
+                || segment.status == SEGMENT_STATUS_QUEUED)
+            || segment.period_id.as_str() > target_period
+            || !obligation_satisfied
+        {
+            return Ok(SegmentOutcome::Skipped);
+        }
+        if self
+            .recognition
+            .count_predecessors_not_done_in(
+                txn,
+                scope,
+                tenant,
+                &segment.schedule_id,
+                &segment.period_id,
+            )
+            .await
+            .map_err(map_recognition_repo_err)?
+            > 0
+        {
+            self.recognition
+                .mark_segment_queued_in(
+                    txn,
+                    scope,
+                    tenant,
+                    &segment.schedule_id,
+                    segment.segment_no,
+                )
+                .await
+                .map_err(map_recognition_repo_err)?;
+            return Ok(SegmentOutcome::Queued(segment.period_id));
+        }
+        let open = self
+            .recognition
+            .current_open_period_in(txn, scope, tenant)
+            .await
+            .map_err(map_recognition_repo_err)?;
+        let period = open
+            .filter(|p| segment.period_id < *p)
+            .unwrap_or_else(|| segment.period_id.clone());
+        let fresh = ReleasableSegment {
+            schedule_id: schedule.schedule_id.clone(),
+            segment_no: segment.segment_no,
+            period_id: period.clone(),
+            amount: segment.amount.clone(),
+            revenue_stream: schedule.revenue_stream.clone(),
+        };
+        let loaded;
+        let chart = if let Some(chart) = chart {
+            chart
+        } else {
+            loaded = load_chart_in(&self.reference, txn, scope, tenant).await?;
+            &loaded
+        };
+        let mut bound = build_recognition_entry(ctx, tenant, &fresh);
         for line in &mut bound.lines {
             line.account_id = resolve_line(chart, line).ok_or_else(|| {
                 DomainError::AccountClosed(format!(
                     "no provisioned account for class {} / stream {:?} / currency {}",
                     line.account_class.as_str(),
                     line.revenue_stream,
-                    line.currency
+                    line.money.currency().code()
                 ))
             })?;
         }
-
-        // Map to the engine's NewEntry/NewLine (resolving per-line scale) + post,
-        // threading the stamp sidecar so the counter bump + segment DONE stamp
-        // commit atomically with the entry.
+        // S6 historical functional allocation is explicitly deferred. Detect actual
+        // carried account evidence, never infer it from a current rate or registry.
+        for line in &bound.lines {
+            if self
+                .payments
+                .read_account_carried_in(
+                    txn,
+                    scope,
+                    tenant,
+                    line.account_id,
+                    line.money.currency().code(),
+                )
+                .await?
+                .is_some_and(|carried| carried.functional_balance.is_some())
+            {
+                return Err(DomainError::FxOperationUnsupported("recognition of carried functional money requires an approved S6 allocation policy".into()).into());
+            }
+        }
         let sidecar: Arc<dyn PostSidecar> = Arc::new(RecognitionStampSidecar {
             tenant_id: tenant,
-            schedule_id: segment.schedule_id.clone(),
+            schedule_id: schedule.schedule_id,
             segment_no: segment.segment_no,
-            // The entry's period — the segment's own, or the current-open period
-            // when E-2 reassigned it (the caller passes the reassigned segment).
-            period_id: segment.period_id.clone(),
-            amount_minor: segment.amount_minor,
-            revenue_stream: segment.revenue_stream.clone(),
-            currency: segment.currency.clone(),
+            period_id: period,
+            amount: segment.amount,
+            revenue_stream: schedule.revenue_stream.clone(),
+            expected_schedule_version: schedule.version,
+            expected_segment_version: segment.version,
             run_id,
-            // The runner holds the publisher + ctx; thread them in so the
-            // `revenue.recognized` event publishes in the SAME release txn.
-            publisher: Arc::clone(&self.publisher),
+            recognition_repo: self.recognition.clone(),
+            publisher: self.publisher.clone(),
             ctx: ctx.clone(),
         });
-        let posting = match self.post_bound(ctx, scope, bound, sidecar).await {
-            Ok(posting) => posting,
-            Err(err) => {
-                // F3 (best-effort): a concurrent run that already released this
-                // segment leaves the per-segment `RECOGNITION` claim present, so
-                // the loser normally returns an idempotent replay BEFORE the
-                // sidecar — no double-credit. If instead the loser reached the
-                // sidecar and its `stamp_segment_done` matched no PENDING/QUEUED
-                // row (the segment is already `DONE`), that is a detected
-                // double-credit attempt: raise the `RECOGNITION_DOUBLE_CREDIT`
-                // alarm + counter. The original error still propagates (the post
-                // rolled back — no second credit landed).
-                self.detect_double_credit(ctx, scope, tenant, segment, &err)
-                    .await;
-                return Err(err);
-            }
-        };
-        // F3: count the recognized revenue moved CONTRACT_LIABILITY → REVENUE on a
-        // FRESH release (a replay re-credits nothing, so it is not counted). The
-        // stream label is the schedule's revenue stream (design §9).
-        if !posting.replayed {
-            self.metrics
-                .revenue_recognized_minor(segment.amount_minor, &segment.revenue_stream);
-        }
-        Ok(posting)
+        let lines = bound.lines.into_iter().map(new_line).collect();
+        let entry = posting_header(
+            ctx,
+            tenant,
+            &fresh.period_id,
+            fresh.amount.currency().code(),
+            business,
+        );
+        let posting = self
+            .posting
+            .post_once(
+                ctx,
+                txn,
+                scope,
+                entry,
+                lines,
+                Some(sidecar),
+                ClaimSpec::fresh_with_request_hash(hash),
+            )
+            .await?;
+        Ok(SegmentOutcome::Posted(posting, schedule.revenue_stream))
     }
-
-    /// Reverse / claw back ONE already-released segment (design §4.3, Group F1):
-    /// post the compensating `DR REVENUE / CR CONTRACT_LIABILITY` entry (the
-    /// mirror of [`Self::release_segment`] — same stream / currency / amount as
-    /// the original release) through [`PostingService`], threading the
-    /// [`RecognitionReversalSidecar`] so the `recognized_minor -= amount`
-    /// decrement commits in the SAME txn. Idempotent on
-    /// `(tenant, RECOGNITION, schedule_id:segment_no:reversal)` — a replay returns
-    /// the prior [`PostingRef`] without re-reversing. **The reversed segment stays
-    /// `DONE`** (its release happened and was compensated; re-recognizing the
-    /// period needs a new schedule version, Phase 3) — this method does NOT touch
-    /// the `recognition_segment` row.
-    ///
-    /// No REST endpoint in v1: a reversal is invoked by the Phase 3
-    /// schedule-change / correction path (or a maintenance caller); this is the
-    /// mechanism it builds on.
+    /// Reverse the durable original release, preserving its actual E2 posting period
+    /// and full transaction/functional journal evidence. Caller amounts are ignored.
     ///
     /// # Errors
-    /// [`DomainError::OverRecognition`] when the decrement would drive
-    /// `recognized_minor` below zero (a reversal larger than the cumulative
-    /// recognized — the non-negative cap CHECK rejects it);
-    /// [`DomainError::AccountClosed`] when the stream's `REVENUE` /
-    /// `CONTRACT_LIABILITY` account is not provisioned; any foundation rejection
-    /// (period-closed / …) or [`DomainError::Internal`] on an infra fault.
+    /// [`DomainError::RecognitionPolicyConflict`] when the original release claim is absent or
+    /// the segment is not in a reversible state; [`DomainError::Internal`] when the original
+    /// claim carries no posted result, on corrupt stored evidence, or on an infrastructure
+    /// fault; otherwise any [`DomainError`] the reversal posting raises.
     pub async fn release_reversal(
         &self,
         ctx: &SecurityContext,
         scope: &AccessScope,
         tenant: Uuid,
-        segment: &ReleasableSegment,
+        candidate: &ReleasableSegment,
     ) -> Result<PostingRef, DomainError> {
-        // Build the balanced reversing entry (DR REVENUE / CR CONTRACT_LIABILITY —
-        // opposite of the release), keyed `schedule_id:segment_no:reversal`.
-        let entry = build_reversal_entry(ctx, tenant, segment);
-
-        // Bind each leg's chart account_id (same per-stream classes as the
-        // release, just opposite sides).
-        let chart = load_chart(&self.reference, scope, tenant).await?;
-        let mut bound = entry;
-        for line in &mut bound.lines {
-            line.account_id = resolve_line(&chart, line).ok_or_else(|| {
-                DomainError::AccountClosed(format!(
-                    "no provisioned account for class {} / stream {:?} / currency {}",
-                    line.account_class.as_str(),
-                    line.revenue_stream,
-                    line.currency
-                ))
-            })?;
+        let svc = self.clone();
+        let ctx_txn = ctx.clone();
+        let scope_txn = scope.clone();
+        let candidate_txn = candidate.clone();
+        let op = RetryOp::new("recognition reversal", Some(tenant));
+        let result = retry_transaction_for(&self.db.db(), op, move |txn| {
+            let svc = svc.clone();
+            let ctx = ctx_txn.clone();
+            let scope = scope_txn.clone();
+            let candidate = candidate_txn.clone();
+            Box::pin(async move {
+                let (schedule, segment) = svc
+                    .observed(
+                        txn,
+                        &scope,
+                        tenant,
+                        &candidate.schedule_id,
+                        candidate.segment_no,
+                    )
+                    .await?;
+                let original_business =
+                    recognition_business_id(&candidate.schedule_id, candidate.segment_no);
+                let prior = svc
+                    .idempotency
+                    .read(
+                        txn,
+                        tenant,
+                        SourceDocType::Recognition.as_str(),
+                        &original_business,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        DomainError::RecognitionPolicyConflict("original release is absent".into())
+                    })?;
+                let original_id = prior
+                    .result_entry_id
+                    .filter(|_| prior.status == crate::infra::posting::idempotency::STATUS_POSTED)
+                    .ok_or_else(|| {
+                        DomainError::Internal("original release has no posted result".into())
+                    })?;
+                let original = svc
+                    .journal
+                    .find_entry_with_lines_in(txn, &scope, tenant, original_id)
+                    .await?
+                    .ok_or_else(|| {
+                        DomainError::RecognitionPolicyConflict(
+                            "original release unavailable in caller scope".into(),
+                        )
+                    })?;
+                if original.source_doc_type != SourceDocType::Recognition.as_str()
+                    || original.source_business_id != original_business
+                    || original.reverses_entry_id.is_some()
+                    || original.lines.is_empty()
+                {
+                    return Err(DomainError::Internal(
+                        "original release identity is inconsistent".into(),
+                    )
+                    .into());
+                }
+                validate_original_release(&original, &schedule, &segment)?;
+                let business = reversal_business_id(&candidate.schedule_id, candidate.segment_no);
+                let hash = reversal_hash(&prior.payload_hash, original_id, &original.period_id);
+                if let Some(posting) = svc.replay(txn, tenant, &business, &hash).await? {
+                    return Ok(posting);
+                }
+                let mut entry = posting_header(
+                    &ctx,
+                    tenant,
+                    &original.period_id,
+                    &original.entry_currency,
+                    business,
+                );
+                entry.rounding_evidence = original.rounding_evidence.clone();
+                entry.reverses_entry_id = Some(original_id);
+                entry.reverses_period_id = Some(original.period_id.clone());
+                let sidecar: Arc<dyn PostSidecar> = Arc::new(RecognitionReversalSidecar {
+                    tenant_id: tenant,
+                    schedule_id: schedule.schedule_id,
+                    segment_no: segment.segment_no,
+                    period_id: original.period_id,
+                    amount: segment.amount,
+                    revenue_stream: schedule.revenue_stream,
+                    expected_schedule_version: schedule.version,
+                    expected_segment_version: segment.version,
+                    recognition_repo: svc.recognition.clone(),
+                    publisher: svc.publisher.clone(),
+                    ctx: ctx.clone(),
+                });
+                svc.posting
+                    .post_reversal_once(
+                        &ctx,
+                        txn,
+                        &scope,
+                        entry,
+                        Some(sidecar),
+                        ClaimSpec::fresh_with_request_hash(hash),
+                    )
+                    .await
+            })
+        })
+        .await;
+        if let Err(error) = &result {
+            self.emit_post_error(ctx, scope, tenant, candidate, error, false)
+                .await;
         }
-
-        // Thread the reversal sidecar: it DECREMENTS `recognized_minor` (negative
-        // delta, under the non-negative cap CHECK) and leaves the segment row
-        // untouched (`status = DONE` stays).
-        let sidecar: Arc<dyn PostSidecar> = Arc::new(RecognitionReversalSidecar {
-            tenant_id: tenant,
-            schedule_id: segment.schedule_id.clone(),
-            segment_no: segment.segment_no,
-            period_id: segment.period_id.clone(),
-            amount_minor: segment.amount_minor,
-            revenue_stream: segment.revenue_stream.clone(),
-            currency: segment.currency.clone(),
-            // The runner holds the publisher + ctx; thread them in so the
-            // `revenue.recognition_reversed` event publishes in the SAME reversal
-            // txn.
-            publisher: Arc::clone(&self.publisher),
-            ctx: ctx.clone(),
-        });
-        self.post_bound(ctx, scope, bound, sidecar).await
+        result
     }
-
-    /// Best-effort `RECOGNITION_DOUBLE_CREDIT` detection on a failed release: if
-    /// the failed segment is now `DONE` (a concurrent run already released it),
-    /// raise the alarm + counter. Re-reads the segment once (scoped); a read
-    /// failure is swallowed (this is a best-effort diagnostic on an already-failed
-    /// release, never a second error). Only the `stamp_segment_done` invariant
-    /// breach (an `Internal` error) is a double-credit candidate — an
-    /// `OverRecognition` / `AccountClosed` / period rejection is unrelated, so
-    /// those skip the probe. (Do NOT widen the probe to
-    /// `OverRecognition`. A same-segment second credit is caught by the per-segment
-    /// `RECOGNITION` idempotency claim BEFORE the post, so an `OverRecognition` cap
-    /// trip is a cross-segment over-recognition — not a double-credit; alarming it
-    /// `RECOGNITION_DOUBLE_CREDIT` would be a false positive.)
-    async fn detect_double_credit(
+    /// Emit alarms after the complete attempt fails and its transaction rolls back.
+    async fn emit_post_error(
         &self,
         ctx: &SecurityContext,
         scope: &AccessScope,
         tenant: Uuid,
         segment: &ReleasableSegment,
-        err: &DomainError,
+        error: &DomainError,
+        detect_double_credit: bool,
     ) {
-        if !matches!(err, DomainError::Internal(_)) {
-            return;
+        if let Some((category, severity, code)) = crate::infra::posting::service::alarm_for(error) {
+            self.publisher
+                .emit_invariant_alarm(
+                    ctx,
+                    LedgerInvariantAlarm {
+                        category,
+                        severity,
+                        tenant_id: tenant,
+                        scope: format!(
+                            "tenant:{tenant}/flow:RECOGNITION/business:{}:{}",
+                            segment.schedule_id, segment.segment_no
+                        ),
+                        code: code.into(),
+                        detail: error.to_string(),
+                        affected: Vec::new(),
+                    },
+                )
+                .await;
         }
-        let already_done = self
-            .recognition
-            .list_segments(scope, tenant, &segment.schedule_id)
-            .await
-            .ok()
-            .into_iter()
-            .flatten()
-            .any(|s| s.segment_no == segment.segment_no && s.status == SEGMENT_STATUS_DONE);
-        if !already_done {
-            return;
+        if detect_double_credit && matches!(error, DomainError::Internal(_)) {
+            // Best-effort post-failure detection retains the existing DONE probe.
+            let done = self
+                .recognition
+                .list_segments(scope, tenant, &segment.schedule_id)
+                .await
+                .ok()
+                .into_iter()
+                .flatten()
+                .any(|row| {
+                    row.segment_no == segment.segment_no && row.status == SEGMENT_STATUS_DONE
+                });
+            if done {
+                self.metrics.recognition_double_credit();
+                let actual_minor = crate::infra::v1_payload::v1_minor_units_for(
+                    &segment.amount,
+                    "actual_minor",
+                    &format_args!(
+                        "recognition double-credit schedule {} segment {} tenant {tenant}",
+                        segment.schedule_id, segment.segment_no
+                    ),
+                );
+                self.publisher
+                    .emit_invariant_alarm(
+                        ctx,
+                        LedgerInvariantAlarm {
+                            category: AlarmCategory::RecognitionDoubleCredit,
+                            severity: AlarmSeverity::Critical,
+                            tenant_id: tenant,
+                            scope: format!(
+                                "tenant:{tenant}/flow:RECOGNITION/business:{}:{}",
+                                segment.schedule_id, segment.segment_no
+                            ),
+                            code: AlarmCategory::RecognitionDoubleCredit.as_str().to_owned(),
+                            detail: format!(
+                                "second credit attempted for an already-DONE segment \
+                                 (schedule={}, segment={}): {error}",
+                                segment.schedule_id, segment.segment_no
+                            ),
+                            affected: vec![AffectedItem {
+                                id: format!("{}:{}", segment.schedule_id, segment.segment_no),
+                                currency: segment.amount.currency().code().to_owned(),
+                                expected_minor: 0,
+                                actual_minor,
+                            }],
+                        },
+                    )
+                    .await;
+            }
         }
-        self.metrics.recognition_double_credit();
-        let code = AlarmCategory::RecognitionDoubleCredit.as_str().to_owned();
-        let alarm = LedgerInvariantAlarm {
-            category: AlarmCategory::RecognitionDoubleCredit,
-            severity: AlarmSeverity::Critical,
-            tenant_id: tenant,
-            scope: format!(
-                "tenant:{tenant}/flow:RECOGNITION/business:{}:{}",
-                segment.schedule_id, segment.segment_no
-            ),
-            code,
-            detail: format!(
-                "second credit attempted for an already-DONE segment \
-                 (schedule={}, segment={})",
-                segment.schedule_id, segment.segment_no
-            ),
-            affected: vec![AffectedItem {
-                id: format!("{}:{}", segment.schedule_id, segment.segment_no),
-                currency: segment.currency.clone(),
-                expected_minor: 0,
-                actual_minor: segment.amount_minor,
-            }],
-        };
-        self.publisher.emit_invariant_alarm(ctx, alarm).await;
     }
 
     /// Emit one out-of-band `RECOGNITION_PERIOD_QUEUED` `Warn` alarm for a segment
@@ -605,53 +766,119 @@ impl RecognitionRunner {
         };
         self.publisher.emit_invariant_alarm(ctx, alarm).await;
     }
-
-    /// Map an already-account-bound recognition [`PostEntry`] to the engine's
-    /// `NewEntry`/`NewLine` (resolving each line's scale) and post with the stamp
-    /// sidecar. Mirrors the settlement orchestrator's `post_bound`.
-    async fn post_bound(
-        &self,
-        ctx: &SecurityContext,
-        scope: &AccessScope,
-        entry: PostEntry,
-        sidecar: Arc<dyn PostSidecar>,
-    ) -> Result<PostingRef, DomainError> {
-        let new_entry = NewEntry {
-            entry_id: entry.entry_id,
-            tenant_id: entry.tenant_id,
-            // v1: one legal entity per tenant — derived server-side.
-            legal_entity_id: entry.tenant_id,
-            period_id: entry.period_id.clone(),
-            entry_currency: entry.entry_currency.clone(),
-            source_doc_type: entry.source_doc_type,
-            source_business_id: entry.source_business_id.clone(),
-            reverses_entry_id: entry.reverses_entry_id,
-            reverses_period_id: entry.reverses_period_id.clone(),
-            posted_at_utc: OffsetDateTime::now_utc(),
-            effective_at: entry.effective_at,
-            origin: ORIGIN_SYSTEM.to_owned(),
-            posted_by_actor_id: entry.posted_by_actor_id,
-            correlation_id: entry.correlation_id,
-            rounding_evidence: serde_json::Value::Null,
-            // Slice 5: recognition is translation, not a re-lock (S6 does NOT
-            // re-lock, spec §3.2); the schedule currency is as posted. None here.
-            rate_snapshot_ref: None,
-        };
-        let mut new_lines: Vec<NewLine> = Vec::with_capacity(entry.lines.len());
-        for line in entry.lines {
-            let scale = self
-                .resolver
-                .resolve(scope, entry.tenant_id, &line.currency)
-                .await
-                .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))?;
-            new_lines.push(new_line(line, scale));
+}
+/// Prove the historical journal's complete release amount without rebuilding its legs.
+fn validate_original_release(
+    original: &crate::domain::model::EntryRecord,
+    schedule: &ScheduleState,
+    segment: &SegmentState,
+) -> Result<(), DomainError> {
+    use crate::domain::exact_money::{ExactAmount, map_exact_error, matching_spec};
+    use bss_ledger_sdk::{AccountClass, Side};
+    use std::str::FromStr;
+    let mut liability = ExactAmount::from_decimal(rust_decimal::Decimal::ZERO);
+    let mut revenue = ExactAmount::from_decimal(rust_decimal::Decimal::ZERO);
+    for line in &original.lines {
+        // Stored literals are parsed, so an unexpected class or side is an
+        // invariant failure instead of silently taking the credit branch.
+        let class = AccountClass::from_str(&line.account_class).map_err(|_| {
+            DomainError::Internal(format!(
+                "original release line has an unknown account class {:?}",
+                line.account_class
+            ))
+        })?;
+        if !matches!(
+            class,
+            AccountClass::ContractLiability | AccountClass::Revenue
+        ) {
+            continue;
         }
-        self.posting
-            .post(ctx, scope, new_entry, new_lines, Some(sidecar))
-            .await
+        let side = Side::from_str(&line.side).map_err(|_| {
+            DomainError::Internal(format!(
+                "original release line has an unknown side {:?}",
+                line.side
+            ))
+        })?;
+        // Both specs are persisted evidence. Disagreement is corruption,
+        // not a caller-input mismatch; omit the stored values from the error.
+        matching_spec(&line.money, &segment.amount).map_err(|_| {
+            DomainError::Internal("stored original release metadata is inconsistent".into())
+        })?;
+        if line.revenue_stream.as_deref() != Some(schedule.revenue_stream.as_str()) {
+            return Err(DomainError::Internal(
+                "original release stream differs from segment".into(),
+            ));
+        }
+        let value = ExactAmount::from_decimal(line.money.amount());
+        // A release debits the liability and credits revenue.
+        let (total, increasing) = match class {
+            AccountClass::ContractLiability => (&mut liability, Side::Debit),
+            _ => (&mut revenue, Side::Credit),
+        };
+        *total = if side == increasing {
+            total.checked_add(&value)
+        } else {
+            total.checked_sub(&value)
+        }
+        .map_err(map_exact_error)?;
     }
+    let expected = ExactAmount::from_decimal(segment.amount.amount());
+    if liability != expected || revenue != expected {
+        return Err(DomainError::Internal(
+            "original release money differs from segment".into(),
+        ));
+    }
+    Ok(())
 }
 
+/// Stable release evidence excludes versions, run IDs and E2's mutable open period.
+fn release_hash(schedule: &ScheduleState, segment: &SegmentState) -> String {
+    let mut bytes = Vec::new();
+    put_str(&mut bytes, "ledger.recognition-release.v1");
+    put_str(&mut bytes, &schedule.tenant_id.to_string());
+    put_str(&mut bytes, &schedule.schedule_id);
+    put_str(&mut bytes, &segment.segment_no.to_string());
+    put_str(&mut bytes, &segment.period_id);
+    put_money(&mut bytes, &segment.amount);
+    put_str(&mut bytes, &schedule.revenue_stream);
+    digest32_hex(&bytes)
+}
+/// Immutable original claim and original journal identity bind the reversal request.
+fn reversal_hash(original_hash: &str, original: Uuid, period: &str) -> String {
+    let mut bytes = Vec::new();
+    put_str(&mut bytes, "ledger.recognition-reversal.v1");
+    put_str(&mut bytes, original_hash);
+    put_str(&mut bytes, &original.to_string());
+    put_str(&mut bytes, period);
+    digest32_hex(&bytes)
+}
+/// Recognition header for the actual posting period.
+fn posting_header(
+    ctx: &SecurityContext,
+    tenant: Uuid,
+    period: &str,
+    currency: &str,
+    business: String,
+) -> NewEntry {
+    NewEntry {
+        entry_id: Uuid::now_v7(),
+        tenant_id: tenant,
+        legal_entity_id: tenant,
+        period_id: period.into(),
+        entry_currency: currency.into(),
+        source_doc_type: SourceDocType::Recognition,
+        source_business_id: business,
+        reverses_entry_id: None,
+        reverses_period_id: None,
+        posted_at_utc: OffsetDateTime::now_utc(),
+        effective_at: first_day_of_period(period),
+        origin: ORIGIN_SYSTEM.into(),
+        posted_by_actor_id: ctx.subject_id(),
+        correlation_id: Uuid::now_v7(),
+        rounding_evidence: serde_json::Value::Null,
+        rate_snapshot_ref: None,
+    }
+}
 /// The `RECOGNITION` idempotency business id for one released segment:
 /// `"{schedule_id}:{segment_no}"` (design §4.1 / §7). Set as the entry's
 /// `source_business_id`; with `source_doc_type = RECOGNITION` it keys the Slice 1
@@ -673,7 +900,7 @@ fn reversal_business_id(schedule_id: &str, segment_no: i32) -> String {
 /// Build the balanced `DR CONTRACT_LIABILITY / CR REVENUE` [`PostEntry`] for one
 /// segment release. Both legs carry the segment's `revenue_stream` (per-stream
 /// disaggregation, §4.5) and the schedule's `currency`; the amounts are equal
-/// (`amount_minor`), so `Σ DR == Σ CR` exactly. Account ids are nil placeholders
+/// (`amount`), so `Σ DR == Σ CR` exactly. Account ids are nil placeholders
 /// (bound from the chart by the caller). The `effective_at` is the first day of
 /// the segment's `period_id` month (Group D natural-period convention; the
 /// OPEN-period gate + E-2 reassignment are the foundation's / Group E's).
@@ -689,43 +916,9 @@ fn build_recognition_entry(
         entry_id: Uuid::now_v7(),
         tenant_id: tenant,
         period_id: segment.period_id.clone(),
-        entry_currency: segment.currency.clone(),
+        entry_currency: segment.amount.currency().code().to_owned(),
         source_doc_type: SourceDocType::Recognition,
         source_business_id: recognition_business_id(&segment.schedule_id, segment.segment_no),
-        effective_at,
-        posted_by_actor_id: ctx.subject_id(),
-        correlation_id: Uuid::now_v7(),
-        reverses_entry_id: None,
-        reverses_period_id: None,
-        lines: vec![dr, cr],
-    }
-}
-
-/// Build the balanced **reversal** `DR REVENUE / CR CONTRACT_LIABILITY`
-/// [`PostEntry`] for one segment clawback (design §4.3) — the mirror of
-/// [`build_recognition_entry`]: the SAME stream both legs, the schedule's
-/// currency, equal amounts (`amount_minor`), so `Σ DR == Σ CR` exactly. Keyed
-/// `schedule_id:segment_no:reversal` under `RECOGNITION`. Account ids are nil
-/// placeholders (bound from the chart by the caller). The `effective_at` is the
-/// first day of the segment's `period_id` month (the same natural-period
-/// convention as the release; the OPEN-period gate is the foundation's).
-fn build_reversal_entry(
-    ctx: &SecurityContext,
-    tenant: Uuid,
-    segment: &ReleasableSegment,
-) -> PostEntry {
-    let effective_at = first_day_of_period(&segment.period_id);
-    // Opposite sides of the release: DR REVENUE (give back the recognized
-    // revenue) / CR CONTRACT_LIABILITY (restore the deferred balance).
-    let dr = recognition_line(segment, AccountClass::Revenue, Side::Debit);
-    let cr = recognition_line(segment, AccountClass::ContractLiability, Side::Credit);
-    PostEntry {
-        entry_id: Uuid::now_v7(),
-        tenant_id: tenant,
-        period_id: segment.period_id.clone(),
-        entry_currency: segment.currency.clone(),
-        source_doc_type: SourceDocType::Recognition,
-        source_business_id: reversal_business_id(&segment.schedule_id, segment.segment_no),
         effective_at,
         posted_by_actor_id: ctx.subject_id(),
         correlation_id: Uuid::now_v7(),
@@ -753,14 +946,12 @@ fn recognition_line(segment: &ReleasableSegment, class: AccountClass, side: Side
         account_class: class,
         gl_code: None,
         side,
-        amount_minor: segment.amount_minor,
-        currency: segment.currency.clone(),
+        money: segment.amount.clone(),
         invoice_id: None,
         due_date: None,
         revenue_stream: Some(segment.revenue_stream.clone()),
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -822,14 +1013,14 @@ fn parse_period(period_id: &str) -> Option<(i32, u32)> {
 fn resolve_line(chart: &ChartIndex, line: &PostLine) -> Option<Uuid> {
     chart.resolve(
         line.account_class,
-        &line.currency,
+        line.money.currency().code(),
         line.revenue_stream.as_deref(),
     )
 }
 
-/// Map one SDK [`PostLine`] + its resolved scale to the engine's [`NewLine`]
+/// Map one SDK [`PostLine`] with its stored money spec to the engine's [`NewLine`]
 /// (mirrors `invoice_post::new_line` / `settle::new_line`).
-fn new_line(line: PostLine, scale: u8) -> NewLine {
+fn new_line(line: PostLine) -> NewLine {
     NewLine {
         line_id: line.line_id,
         payer_tenant_id: line.payer_tenant_id,
@@ -839,15 +1030,12 @@ fn new_line(line: PostLine, scale: u8) -> NewLine {
         account_class: line.account_class,
         gl_code: line.gl_code,
         side: line.side,
-        amount_minor: line.amount_minor,
-        currency: line.currency,
-        currency_scale: scale,
+        money: line.money,
         invoice_id: line.invoice_id,
         due_date: line.due_date,
         revenue_stream: line.revenue_stream,
         mapping_status: line.mapping_status,
-        functional_amount_minor: line.functional_amount_minor,
-        functional_currency: line.functional_currency,
+        functional_money: line.functional_money,
         tax_jurisdiction: line.tax_jurisdiction,
         tax_filing_period: line.tax_filing_period,
         tax_rate_ref: line.tax_rate_ref,
@@ -865,3 +1053,11 @@ fn new_line(line: PostLine, scale: u8) -> NewLine {
 #[cfg(test)]
 #[path = "runner_tests.rs"]
 mod runner_tests;
+
+#[cfg(test)]
+#[path = "runner_decimal_tests.rs"]
+pub(crate) mod decimal_tests;
+
+#[cfg(test)]
+#[path = "runner_reversal_tests.rs"]
+mod reversal_tests;

@@ -45,6 +45,7 @@ use crate::domain::error::{DomainError, UnsupportedResource};
 use crate::domain::idp::{
     SA_AMBIGUOUS_MESSAGE, SA_INVALID_INPUT_MESSAGE, SA_UNSUPPORTED_MESSAGE, SA_UPSTREAM_MESSAGE,
 };
+use crate::domain::service_account::SA_QUOTA_MESSAGE;
 use crate::domain::service_account::service::ServiceAccountService;
 use crate::domain::service_account::test_support::idp::{ADAPTER_DETAIL, FAKE_SECRET};
 use crate::domain::service_account::test_support::{
@@ -457,6 +458,25 @@ async fn create_maps_invalid_input_to_fixed_message_and_drops_adapter_text() {
         panic!("expected ServiceAccountInvalidInput");
     };
     assert_eq!(detail, SA_INVALID_INPUT_MESSAGE);
+    assert!(!detail.contains(ADAPTER_DETAIL));
+}
+
+#[tokio::test]
+async fn create_maps_quota_exceeded_to_its_own_429_error_and_drops_adapter_text() {
+    let (svc, idp, tenant_id) = active_tenant_fixture();
+    idp.set_create_outcome(FakeServiceAccountOutcome::QuotaExceeded);
+
+    let err = svc
+        .create(&ctx(), tenant_id, "ci".to_owned(), vec![])
+        .await
+        .expect_err("provider refuses: tenant full");
+
+    // Quota exhaustion is distinct from invalid input. The shared AM
+    // message must not forward the provider's untrusted diagnostics.
+    let DomainError::ServiceAccountQuotaExceeded { detail } = err else {
+        panic!("expected ServiceAccountQuotaExceeded");
+    };
+    assert_eq!(detail, SA_QUOTA_MESSAGE);
     assert!(!detail.contains(ADAPTER_DETAIL));
 }
 

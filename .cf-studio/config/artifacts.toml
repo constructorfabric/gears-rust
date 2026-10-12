@@ -22,6 +22,10 @@ reason = "Ignore 'gears/bss/libs' — not a module, only a grouping for shared B
 patterns = ["gears/bss/libs"]
 
 [[ignore]]
+reason = "Ignore 'gears/bss/docs' — BSS-wide architecture decisions shared by the BSS gears (ADR/), not a module; each gear's own design set stays under gears/bss/$system/docs."
+patterns = ["gears/bss/docs", "gears/bss/docs/*"]
+
+[[ignore]]
 reason = "Ignore 'coord' shared utility library (distributed-lease primitive; infrastructure crate, not an SDLC-documented product module — no PRD/DESIGN required, README-documented)."
 patterns = ["gears/bss/libs/coord/*"]
 
@@ -32,6 +36,10 @@ patterns = ["gears/bss/libs/approval/*"]
 [[ignore]]
 reason = "Ignore 'rest' shared utility library (weak ETag and If-None-Match for BSS list and reference reads; infrastructure crate used by products, pricing and approvals, documented in their design sets, not an SDLC-documented product module)."
 patterns = ["gears/bss/libs/rest/*"]
+
+[[ignore]]
+reason = "Ignore 'money' shared utility library (validated decimal money, exact arithmetic and canonical decimal text; infrastructure crate used by ledger, rate-provider and pricing, documented in their design sets and its README, not an SDLC-documented product module)."
+patterns = ["gears/bss/libs/money/*"]
 
 [[ignore]]
 reason = "Ignore 'fixtures' joint golden conformance corpus (cf-gears-bss-fixtures + its conformance harness; test-support infrastructure crates consumed by the BSS gears, not an SDLC-documented product module — no PRD/DESIGN required, README-documented). Same class as 'coord' above."
@@ -139,7 +147,7 @@ patterns = [
 ]
 
 [[ignore]]
-reason = "Ignore file-storage codebase and features — the feature docs declare CDSL flows (multipart collide/reclaim, policy-set, retention-create) that were reworked in the file-storage feature branch and cannot be validated against the current main code until the code MR (2/3) lands; the matching code/tests/sdk markers stay in sync with them there. Same shape as the oagw entry above. PRD/DESIGN/ADR/DECOMPOSITION and non-flow feature docs stay validated via autodetect."
+reason = "Ignore file-storage codebase and features — the gear's Rust sources carry no @cpt traceability markers, so the feature docs' CDSL flows (multipart collide/reclaim, policy-set, retention-create) have no code anchors to validate against. Same shape as the oagw entry above. PRD/DESIGN/ADR/DECOMPOSITION and non-flow feature docs stay validated via autodetect."
 patterns = [
   "gears/file-storage/file-storage/src/*",
   "gears/file-storage/file-storage/tests/*",
@@ -345,6 +353,23 @@ extensions = [".rs"]
 [[systems.autodetect.codebase]]
 name = "Nested SDK Examples"
 path = "{system_root}/{system}-sdk/examples"
+extensions = [".rs"]
+
+# Plugin crates that carry the gear's own name and a role suffix
+# (gears/system/$system/plugins/$system-<role>-plugin) realize the gear's plugin
+# contracts and carry @cpt markers for the parent gear's feature IDs. They ship no
+# docs of their own, so their code belongs to the parent scope. Codebase paths are
+# literal (no globs), one entry per role. Plugins named after a vendor or backend
+# (static-idp-plugin, keycloak-idp-plugin, timescaledb-usage-collector-plugin) are
+# not affected; the ones with their own docs keep their child scopes below.
+[[systems.autodetect.codebase]]
+name = "Storage Plugin"
+path = "{system_root}/plugins/{system}-storage-plugin/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Storage Plugin Tests"
+path = "{system_root}/plugins/{system}-storage-plugin/tests"
 extensions = [".rs"]
 
 # Nested sub-plugin scope: account-management/docs/tr-plugin/ carries its own PRD/DESIGN/ADR.
@@ -574,7 +599,7 @@ kit = "gears"
 
 [[systems.autodetect]]
 kit = "gears"
-system_root = "{project_root}/docs/spec-templates/examples/$system"
+system_root = "{project_root}/studio-kit-gears/examples/$system"
 artifacts_root = "{system_root}"
 codebase = []
 

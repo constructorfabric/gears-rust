@@ -62,10 +62,15 @@ pub(crate) mod pep {
 
     /// Action vocabulary mirroring DESIGN §4.2 line 1363.
     pub mod actions {
+        /// Action name for creating a tenant.
         pub const CREATE: &str = "create";
+        /// Action name for reading a tenant.
         pub const READ: &str = "read";
+        /// Action name for updating a tenant.
         pub const UPDATE: &str = "update";
+        /// Action name for deleting a tenant.
         pub const DELETE: &str = "delete";
+        /// Action name for listing a tenant's children.
         pub const LIST_CHILDREN: &str = "list_children";
 
         /// Every action in this vocabulary — see the note on the user

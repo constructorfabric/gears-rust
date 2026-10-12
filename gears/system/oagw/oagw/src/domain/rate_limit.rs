@@ -38,6 +38,7 @@ pub struct RateLimitOutcome {
     pub reset_epoch: u64,
 }
 
+/// In-memory token-bucket rate limiter keyed by bucket-key strings.
 #[domain_model]
 pub struct RateLimiter {
     buckets: DashMap<String, Bucket>,
@@ -261,19 +262,28 @@ impl Bucket {
 /// The resource type that owns the rate-limit configuration.
 #[domain_model]
 pub enum RateLimitResource {
+    /// Rate limit configured on an upstream.
     Upstream,
+    /// Rate limit configured on a route.
     Route,
 }
 
 /// Context needed to build a scope-aware rate-limit key.
 #[allow(unknown_lints, de0309_must_have_domain_model)] // short-lived param container with lifetime, not a domain entity
 pub struct RateLimitKeyContext<'a> {
+    /// Kind of resource that owns the rate-limit configuration.
     pub resource: RateLimitResource,
+    /// ID of the owning upstream or route.
     pub resource_id: &'a Uuid,
+    /// Configured rate-limit scope, which decides which identity parts form the key.
     pub scope: &'a RateLimitScope,
+    /// Tenant of the calling subject.
     pub tenant_id: &'a Uuid,
+    /// Calling subject, used for per-user scoped keys.
     pub subject_id: &'a Uuid,
+    /// Client IP address, used for per-IP scoped keys when known.
     pub client_ip: Option<&'a str>,
+    /// Rate-limit window length; part of the key so different windows do not share buckets.
     pub window: &'a Window,
 }
 
@@ -350,6 +360,7 @@ fn window_to_secs(window: &Window) -> f64 {
 }
 
 impl RateLimiter {
+    /// Create an empty limiter with no buckets.
     #[must_use]
     pub fn new() -> Self {
         Self {

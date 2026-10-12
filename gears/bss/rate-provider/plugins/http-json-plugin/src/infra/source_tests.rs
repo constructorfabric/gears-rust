@@ -4,6 +4,12 @@ use bss_ledger_sdk::RateProviderError;
 use serde_json::json;
 
 use super::{json_lookup, map_json_document};
+use crate::infra::exact_json::ExactJson;
+
+/// A test document from a `json!` value (numbers print as their shortest f64 form).
+fn doc(value: &serde_json::Value) -> ExactJson {
+    ExactJson::parse(&serde_json::to_vec(value).unwrap()).unwrap()
+}
 use crate::config::Mapping;
 
 /// The `provider_id` the mapper stamps onto every rate under test.
@@ -20,8 +26,11 @@ fn mapping() -> Mapping {
 
 #[test]
 fn dotted_lookup_walks_objects() {
-    let value = json!({"a": {"b": {"c": 1}}});
-    assert_eq!(json_lookup(&value, "a.b.c"), Some(&json!(1)));
+    let value = doc(&json!({"a": {"b": {"c": 1}}}));
+    assert_eq!(
+        json_lookup(&value, "a.b.c"),
+        Some(&ExactJson::Number("1".into()))
+    );
     assert_eq!(json_lookup(&value, "a.x"), None);
 }
 
@@ -31,11 +40,11 @@ fn maps_entries_to_provider_rates() {
         "date": "2026-07-21T00:00:00Z",
         "rates": { "EUR": {"value": "0.92"}, "GBP": {"value": "0.78"} }
     });
-    let rates = map_json_document(&body, &mapping(), PROVIDER).unwrap();
+    let rates = map_json_document(&doc(&body), &mapping(), PROVIDER).unwrap();
     assert_eq!(rates.len(), 2);
     let eur = rates.iter().find(|r| r.quote == "EUR").unwrap();
     assert_eq!(eur.base, "USD");
-    assert_eq!(eur.rate_micro, 920_000);
+    assert_eq!(eur.rate.to_string(), "0.92");
 }
 
 #[test]
@@ -46,7 +55,7 @@ fn every_rate_is_stamped_with_the_serving_provider_id() {
         "date": "2026-07-21T00:00:00Z",
         "rates": { "EUR": {"value": "0.92"} }
     });
-    let rates = map_json_document(&body, &mapping(), "bank-x").unwrap();
+    let rates = map_json_document(&doc(&body), &mapping(), "bank-x").unwrap();
     assert!(rates.iter().all(|r| r.provider == "bank-x"));
 }
 
@@ -54,7 +63,7 @@ fn every_rate_is_stamped_with_the_serving_provider_id() {
 fn zero_mappable_entries_is_internal_error() {
     let body = json!({ "date": "2026-07-21T00:00:00Z", "rates": {} });
     assert!(matches!(
-        map_json_document(&body, &mapping(), PROVIDER),
+        map_json_document(&doc(&body), &mapping(), PROVIDER),
         Err(RateProviderError::Internal(_))
     ));
 }
@@ -65,7 +74,7 @@ fn unmappable_entry_is_skipped_not_fatal() {
         "date": "2026-07-21T00:00:00Z",
         "rates": { "EUR": {"value": "0.92"}, "BAD": {"nope": 1} }
     });
-    let rates = map_json_document(&body, &mapping(), PROVIDER).unwrap();
+    let rates = map_json_document(&doc(&body), &mapping(), PROVIDER).unwrap();
     assert_eq!(rates.len(), 1);
 }
 
@@ -78,7 +87,7 @@ fn all_entries_present_but_all_unmappable_is_internal_error() {
         "rates": { "EUR": {"nope": 1}, "GBP": {"value": "not-a-number"} }
     });
     assert!(matches!(
-        map_json_document(&body, &mapping(), PROVIDER),
+        map_json_document(&doc(&body), &mapping(), PROVIDER),
         Err(RateProviderError::Internal(_))
     ));
 }
@@ -89,8 +98,31 @@ fn numeric_rate_is_accepted_as_well_as_string() {
         "date": "2026-07-21T00:00:00Z",
         "rates": { "EUR": {"value": 0.92} }
     });
+    let rates = map_json_document(&doc(&body), &mapping(), PROVIDER).unwrap();
+    assert_eq!(rates[0].rate.to_string(), "0.92");
+}
+
+#[test]
+fn numeric_tokens_in_exponent_form_are_expanded_exactly_strings_are_not() {
+    // Python's `json` writes 0.0000036 as `3.6e-06`; the token is expanded exactly.
+    let body = ExactJson::parse(
+        br#"{"date": "2026-07-21T00:00:00Z",
+             "rates": {"EUR": {"value": 3.6e-06}, "GBP": {"value": 0.0000036}}}"#,
+    )
+    .unwrap();
     let rates = map_json_document(&body, &mapping(), PROVIDER).unwrap();
-    assert_eq!(rates[0].rate_micro, 920_000);
+    assert!(
+        rates.iter().all(|r| r.rate.to_string() == "0.0000036"),
+        "{rates:?}"
+    );
+    // A string quote is taken as the provider wrote it: exponent text stays refused.
+    let body = doc(&json!({
+        "date": "2026-07-21T00:00:00Z",
+        "rates": { "EUR": {"value": "3.6e-6"}, "USD": {"value": "1.1"} }
+    }));
+    let rates = map_json_document(&body, &mapping(), PROVIDER).unwrap();
+    assert_eq!(rates.len(), 1);
+    assert_eq!(rates[0].rate.to_string(), "1.1");
 }
 
 #[test]
@@ -108,7 +140,7 @@ fn a_rate_that_is_neither_string_nor_number_is_skipped() {
             "JPY": {"value": ["160.85"]}
         }
     });
-    let rates = map_json_document(&body, &mapping(), PROVIDER).unwrap();
+    let rates = map_json_document(&doc(&body), &mapping(), PROVIDER).unwrap();
     assert_eq!(rates.len(), 1, "only the readable rate survives");
     assert_eq!(rates[0].quote, "EUR");
 }
@@ -119,7 +151,7 @@ fn missing_as_of_path_is_internal_error() {
     // mis-timestamp every rate and pass every other test in this file.
     let body = json!({ "rates": { "EUR": {"value": "0.92"} } });
     assert!(matches!(
-        map_json_document(&body, &mapping(), PROVIDER),
+        map_json_document(&doc(&body), &mapping(), PROVIDER),
         Err(RateProviderError::Internal(_))
     ));
 }
@@ -131,7 +163,7 @@ fn non_rfc3339_as_of_is_internal_error() {
         "rates": { "EUR": {"value": "0.92"} }
     });
     assert!(matches!(
-        map_json_document(&body, &mapping(), PROVIDER),
+        map_json_document(&doc(&body), &mapping(), PROVIDER),
         Err(RateProviderError::Internal(_))
     ));
 }
@@ -143,7 +175,7 @@ fn non_string_as_of_is_internal_error() {
         "rates": { "EUR": {"value": "0.92"} }
     });
     assert!(matches!(
-        map_json_document(&body, &mapping(), PROVIDER),
+        map_json_document(&doc(&body), &mapping(), PROVIDER),
         Err(RateProviderError::Internal(_))
     ));
 }
@@ -152,7 +184,7 @@ fn non_string_as_of_is_internal_error() {
 fn missing_rates_path_is_internal_error() {
     let body = json!({ "date": "2026-07-21T00:00:00Z" });
     assert!(matches!(
-        map_json_document(&body, &mapping(), PROVIDER),
+        map_json_document(&doc(&body), &mapping(), PROVIDER),
         Err(RateProviderError::Internal(_))
     ));
 }
@@ -161,7 +193,7 @@ fn missing_rates_path_is_internal_error() {
 fn rates_path_that_is_not_an_object_is_internal_error() {
     let body = json!({ "date": "2026-07-21T00:00:00Z", "rates": ["EUR", "GBP"] });
     assert!(matches!(
-        map_json_document(&body, &mapping(), PROVIDER),
+        map_json_document(&doc(&body), &mapping(), PROVIDER),
         Err(RateProviderError::Internal(_))
     ));
 }
@@ -179,7 +211,7 @@ fn non_iso4217_shaped_quote_is_skipped_not_stored() {
             "": {"value": "1.0"}
         }
     });
-    let rates = map_json_document(&body, &mapping(), PROVIDER).unwrap();
+    let rates = map_json_document(&doc(&body), &mapping(), PROVIDER).unwrap();
     assert_eq!(rates.len(), 1, "only the well-formed quote survives");
     assert_eq!(rates[0].quote, "EUR");
 }
@@ -190,7 +222,7 @@ fn lowercase_quote_is_normalized_to_uppercase() {
         "date": "2026-07-21T00:00:00Z",
         "rates": { "eur": {"value": "0.92"} }
     });
-    let rates = map_json_document(&body, &mapping(), PROVIDER).unwrap();
+    let rates = map_json_document(&doc(&body), &mapping(), PROVIDER).unwrap();
     assert_eq!(rates[0].quote, "EUR");
 }
 
@@ -207,7 +239,7 @@ fn misconfigured_base_currency_fails_the_whole_document() {
         ..mapping()
     };
     assert!(matches!(
-        map_json_document(&body, &bad_base, PROVIDER),
+        map_json_document(&doc(&body), &bad_base, PROVIDER),
         Err(RateProviderError::Internal(_))
     ));
 }
@@ -222,6 +254,82 @@ fn lowercase_configured_base_is_normalized_to_uppercase() {
         base: "usd".to_owned(),
         ..mapping()
     };
-    let rates = map_json_document(&body, &lower_base, PROVIDER).unwrap();
+    let rates = map_json_document(&doc(&body), &lower_base, PROVIDER).unwrap();
     assert_eq!(rates[0].base, "USD");
+}
+
+#[test]
+fn original_numeric_tokens_preserve_all_provider_digits() {
+    let body = ExactJson::parse(
+        br#"{
+        "date": "2026-07-21T00:00:00Z",
+        "rates": {
+            "EUR": {"value": 1.123456789123456789123456789},
+            "GBP": {"value": 0.0000001}
+        }
+    }"#,
+    )
+    .unwrap();
+    let rates = map_json_document(&body, &mapping(), PROVIDER).unwrap();
+    assert_eq!(
+        rates
+            .iter()
+            .find(|r| r.quote == "EUR")
+            .unwrap()
+            .rate
+            .to_string(),
+        "1.123456789123456789123456789"
+    );
+    assert_eq!(
+        rates
+            .iter()
+            .find(|r| r.quote == "GBP")
+            .unwrap()
+            .rate
+            .to_string(),
+        "0.0000001"
+    );
+}
+
+#[test]
+fn invalid_numeric_tokens_are_skipped_without_rounding_into_contract() {
+    let body = ExactJson::parse(
+        br#"{
+        "date":"2026-07-21T00:00:00Z",
+        "rates":{
+            "EUR":{"value":1.0000000000000000000000000001},
+            "GBP":{"value":0.00000000000000000000000000001},
+            "JPY":{"value":10000000000000000000000000000},
+            "CAD":{"value":0},
+            "CHF":{"value":-1},
+            "USD":{"value":"1.123456789"}
+        }
+    }"#,
+    )
+    .unwrap();
+    let rates = map_json_document(&body, &mapping(), PROVIDER).unwrap();
+    assert_eq!(rates.len(), 1);
+    assert_eq!(rates[0].quote, "USD");
+    assert_eq!(rates[0].rate.to_string(), "1.123456789");
+}
+
+#[test]
+fn exponent_tokens_expand_without_rounding_and_respect_the_quote_limits() {
+    use super::expand_exponent;
+    assert_eq!(expand_exponent("3.6e-06").as_deref(), Some("0.0000036"));
+    assert_eq!(expand_exponent("1.5E+2").as_deref(), Some("150"));
+    assert_eq!(expand_exponent("-2.50e1").as_deref(), Some("-25"));
+    assert_eq!(expand_exponent("1.25"), None);
+    assert_eq!(expand_exponent("1e-101"), None);
+    assert_eq!(expand_exponent(&format!("1.{}e0", "0".repeat(70))), None);
+    // Digits beyond the carrier are kept, so parse_rate refuses them instead of rounding.
+    let body = ExactJson::parse(
+        br#"{"date": "2026-07-21T00:00:00Z",
+             "rates": {"EUR": {"value": 1.00000000000000000000000000001e0},
+                       "USD": {"value": 1.1}}}"#,
+    )
+    .unwrap();
+    let rates = map_json_document(&body, &mapping(), PROVIDER).unwrap();
+    assert_eq!(rates.len(), 1);
+    assert_eq!(rates[0].quote, "USD");
 }

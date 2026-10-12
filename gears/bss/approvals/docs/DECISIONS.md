@@ -32,7 +32,7 @@
 | AP-D-7 | M | The inbox unit carries whether the caller may reject or withdraw it | DECIDED 2026-10-02 · Owner, 2026-10-02 (ask 63); extended by AP-D-11 |
 | AP-D-8 | M | The inbox publishes `$orderby` through the toolkit | DECIDED 2026-10-02 · amends AP-D-2 |
 | AP-D-10 | M | The list and the counts answer 304 | DECIDED 2026-10-03 · Owner, 2026-10-03 (asks 56, 57); extends AP-D-2; amended 2026-10-04 (`no-cache`, not `no-store`) |
-| AP-D-11 | M | The inbox names its submitters and voters | DECIDED 2026-10-03 · Owner, 2026-10-02 (ask 32: names on the server, through AM); extends AP-D-7, AP-D-10; amended 2026-10-03 (one lookup per card, declared system actors) |
+| AP-D-11 | M | The inbox names its submitters and voters | DECIDED 2026-10-03 · Owner, 2026-10-02 (ask 32: names on the server, through AM); extends AP-D-7, AP-D-10; amended 2026-10-03 (one lookup per card, declared system actors); amended 2026-10-04 (a resolved name is reused for five minutes per caller) |
 
 ## Entries
 
@@ -173,7 +173,7 @@ an Account Management read per id of its own.
 - **Votes.** A vote returns the owning gear's answer unchanged (AP-D-4), and a gear's write answer names nobody
   (pricing D-519, products P-D-262).
 - **Caching.** The names are part of the list's body, so its weak `ETag` covers them (AP-D-10): a rename changes the
-  tag. The card is not conditional. Nothing is stored or cached.
+  tag once the name is read again. The card is not conditional. Nothing is stored. Amended 2026-10-04: the resolver (`cf-gears-bss-rest` `actor_names`, through `ActorNames::from_hub`) keeps a resolved name in process memory for five minutes, for the caller AM gave it to and nobody else: the key is the caller's tenant and subject and the actor. A refused, absent or failed lookup is not kept, and nothing is kept for an anonymous caller. The cache holds at most 10,000 names. A list or card that a caller reopens within five minutes asks AM nothing.
 - **The tests.** `api/rest/doors_tests.rs`: `the_inbox_names_its_submitters_and_voters_in_one_lookup`,
   `an_unavailable_directory_leaves_the_names_null_on_a_200` and `a_renamed_submitter_changes_the_list_tag`.
 

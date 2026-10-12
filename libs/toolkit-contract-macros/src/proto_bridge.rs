@@ -55,6 +55,7 @@ use syn::{
 
 use crate::support::contract_support_path;
 
+/// Expands `#[derive(ProtoBridge)]` into conversions between the type and its generated proto stub.
 pub fn generate(input: &DeriveInput) -> syn::Result<TokenStream> {
     let stub_path = parse_stub_path(input)?;
     let bridge = match &input.data {

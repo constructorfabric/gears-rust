@@ -2,7 +2,7 @@
 use crate::{authz::AuthzError, infra::storage::RepoError};
 use toolkit_canonical_errors::CanonicalError;
 
-#[toolkit_canonical_errors::resource_error("gts.cf.bss.pricing.acceptance.v1~")]
+#[toolkit_canonical_errors::resource_error(gts_id!("cf.bss.pricing.acceptance.v1~"))]
 struct AcceptanceResource;
 
 /// Named missing dependencies are configuration errors, never commercial refusals.

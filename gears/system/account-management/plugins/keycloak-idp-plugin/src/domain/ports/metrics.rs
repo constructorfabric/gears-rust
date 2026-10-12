@@ -42,14 +42,19 @@ use crate::domain::metadata_codec::{DecodeError, RealmBinding, version_observed_
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserOp {
+    /// Provision a user.
     ProvisionUser,
+    /// Deprovision (delete) a user.
     DeprovisionUser,
+    /// Update a user.
     UpdateUser,
+    /// List users.
     ListUsers,
 }
 
 impl UserOp {
     #[must_use]
+    /// Static label string emitted on the metric for this value.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ProvisionUser => "provision_user",
@@ -65,12 +70,15 @@ impl UserOp {
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenTier {
+    /// Inline static secret from configuration.
     StaticEnv,
+    /// Per-realm secret resolved via `OpenBao`.
     OpenBao,
 }
 
 impl TokenTier {
     #[must_use]
+    /// Static label string emitted on the metric for this value.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::StaticEnv => "static_env",
@@ -84,12 +92,15 @@ impl TokenTier {
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenRefreshOutcome {
+    /// Token refresh succeeded.
     Success,
+    /// Token refresh failed.
     Error,
 }
 
 impl TokenRefreshOutcome {
     #[must_use]
+    /// Static label string emitted on the metric for this value.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
@@ -102,15 +113,21 @@ impl TokenRefreshOutcome {
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaOp {
+    /// Create a service account.
     Create,
+    /// Rotate a service-account secret.
     RotateSecret,
+    /// Revoke a service account.
     Revoke,
+    /// List service accounts.
     List,
+    /// Purge all service accounts of a tenant.
     Purge,
 }
 
 impl SaOp {
     #[must_use]
+    /// Static label string emitted on the metric for this value.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Create => "sa_create",
@@ -126,12 +143,15 @@ impl SaOp {
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredstoreOp {
+    /// Write a secret.
     Put,
+    /// Delete a secret.
     Delete,
 }
 
 impl CredstoreOp {
     #[must_use]
+    /// Static label string emitted on the metric for this value.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Put => "put",
@@ -144,12 +164,15 @@ impl CredstoreOp {
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredstoreOutcome {
+    /// Write succeeded.
     Ok,
+    /// Write failed.
     Error,
 }
 
 impl CredstoreOutcome {
     #[must_use]
+    /// Static label string emitted on the metric for this value.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
@@ -163,21 +186,33 @@ impl CredstoreOutcome {
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginOp {
+    /// Provision a tenant.
     ProvisionTenant,
+    /// Deprovision a tenant.
     DeprovisionTenant,
+    /// Provision a user.
     ProvisionUser,
+    /// Deprovision (delete) a user.
     DeprovisionUser,
+    /// Update a user.
     UpdateUser,
+    /// List users.
     ListUsers,
+    /// Service-account create.
     SaCreate,
+    /// Service-account secret rotation.
     SaRotateSecret,
+    /// Service-account revoke.
     SaRevoke,
+    /// Service-account list.
     SaList,
+    /// Service-account purge.
     SaPurge,
 }
 
 impl PluginOp {
     #[must_use]
+    /// Static label string emitted on the metric for this value.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ProvisionTenant => "provision_tenant",
@@ -213,23 +248,41 @@ impl PluginOp {
 pub struct FailureVariant(&'static str);
 
 impl FailureVariant {
+    /// Label constant for `config`.
     pub const CONFIG: Self = Self("config");
+    /// Label constant for `credstore_read`.
     pub const CREDSTORE_READ: Self = Self("credstore_read");
+    /// Label constant for `metadata_decode`.
     pub const METADATA_DECODE: Self = Self("metadata_decode");
+    /// Label constant for `kc_rest`.
     pub const KC_REST: Self = Self("kc_rest");
+    /// Label constant for `ambiguous_created`.
     pub const AMBIGUOUS_CREATED: Self = Self("ambiguous_created");
+    /// Label constant for `created_realm_exists`.
     pub const CREATED_REALM_EXISTS: Self = Self("created_realm_exists");
+    /// Label constant for `bootstrap_perms_missing`.
     pub const BOOTSTRAP_PERMS_MISSING: Self = Self("bootstrap_perms_missing");
+    /// Label constant for `deprovision_not_found`.
     pub const DEPROVISION_NOT_FOUND: Self = Self("deprovision_not_found");
+    /// Label constant for `deprovision_retryable`.
     pub const DEPROVISION_RETRYABLE: Self = Self("deprovision_retryable");
+    /// Label constant for `deprovision_terminal`.
     pub const DEPROVISION_TERMINAL: Self = Self("deprovision_terminal");
+    /// Label constant for `user_op_rejected`.
     pub const USER_OP_REJECTED: Self = Self("user_op_rejected");
+    /// Label constant for `user_op_unavailable`.
     pub const USER_OP_UNAVAILABLE: Self = Self("user_op_unavailable");
+    /// Label constant for `user_op_unsupported`.
     pub const USER_OP_UNSUPPORTED: Self = Self("user_op_unsupported");
+    /// Label constant for `sa_invalid_input`.
     pub const SA_INVALID_INPUT: Self = Self("sa_invalid_input");
+    /// Label constant for `sa_not_found`.
     pub const SA_NOT_FOUND: Self = Self("sa_not_found");
+    /// Label constant for `sa_quota_exceeded`.
+    pub const SA_QUOTA_EXCEEDED: Self = Self("sa_quota_exceeded");
 
     #[must_use]
+    /// Static label string emitted on the metric for this value.
     pub const fn as_str(self) -> &'static str {
         self.0
     }
@@ -255,10 +308,13 @@ impl From<&PluginError> for FailureVariant {
 pub struct VersionObserved(Cow<'static, str>);
 
 impl VersionObserved {
+    /// Label constant for `missing`.
     pub const MISSING: Self = Self(Cow::Borrowed("missing"));
+    /// Label constant for `malformed`.
     pub const MALFORMED: Self = Self(Cow::Borrowed("malformed"));
 
     #[must_use]
+    /// Static label string emitted on the metric for this value.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -291,9 +347,11 @@ impl From<&DecodeError> for VersionObserved {
 pub struct EndpointClass(&'static str);
 
 impl EndpointClass {
+    /// Label constant for `unknown`.
     pub const UNKNOWN: Self = Self("unknown");
 
     #[must_use]
+    /// Static label string emitted on the metric for this value.
     pub const fn as_str(self) -> &'static str {
         self.0
     }
@@ -306,9 +364,13 @@ impl EndpointClass {
 /// Tenant-lifecycle telemetry — `provision_tenant` latency,
 /// realm-binding count, deprovision-missing-metadata trigger.
 pub trait TenantLifecycleMetricsPort: Send + Sync + 'static {
+    /// Record `provision_tenant` latency in seconds, labelled by realm binding.
     fn provision_tenant_duration(&self, realm_binding: RealmBinding, secs: f64);
+    /// Record that a tenant was bound to `realm_name` under `realm_binding`.
     fn realm_bound(&self, realm_binding: RealmBinding, realm_name: &str);
+    /// Record that a tenant was unbound from `realm_name` under `realm_binding`.
     fn realm_unbound(&self, realm_binding: RealmBinding, realm_name: &str);
+    /// Count a deprovision that found no persisted metadata (treated as already absent).
     fn deprovision_missing_metadata(&self);
 }
 
@@ -319,12 +381,15 @@ pub trait TenantLifecycleMetricsPort: Send + Sync + 'static {
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrphanCompensationOutcome {
+    /// Compensation `delete_user` succeeded.
     Ok,
+    /// Compensation `delete_user` failed, leaving a dangling user.
     Failed,
 }
 
 impl OrphanCompensationOutcome {
     #[must_use]
+    /// Static label string emitted on the metric for this value.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
@@ -336,6 +401,7 @@ impl OrphanCompensationOutcome {
 /// User-op telemetry — `provision_user` / `deprovision_user` /
 /// `list_users` latency + orphan-user compensation counter.
 pub trait UserOpMetricsPort: Send + Sync + 'static {
+    /// Record the latency in seconds of a user operation.
     fn user_op_duration(&self, op: UserOp, secs: f64);
     /// Increment the orphan-compensation counter labelled by `outcome`.
     /// Dashboards alert on `outcome=failed` — a KC user dangling
@@ -353,19 +419,24 @@ pub trait UserOpMetricsPort: Send + Sync + 'static {
 /// the one **reserved** method — declared without emitters so the
 /// follow-up PR wiring the KC HTTP layer does not need to reshape DI.
 pub trait KcAdminMetricsPort: Send + Sync + 'static {
+    /// Record a single Keycloak Admin call latency in seconds (reserved; no emitters yet).
     fn kc_admin_request_duration(&self, endpoint_class: EndpointClass, secs: f64);
+    /// Count a Keycloak admin-token refresh for `realm` by tier and outcome.
     fn kc_admin_token_refresh(&self, outcome: TokenRefreshOutcome, tier: TokenTier, realm: &str);
+    /// Count a credential refresh for `realm` by tier and outcome.
     fn credential_refresh(&self, outcome: TokenRefreshOutcome, tier: TokenTier, realm: &str);
 }
 
 /// `CredStore` (`OpenBao`) write telemetry.
 pub trait CredstoreMetricsPort: Send + Sync + 'static {
+    /// Count a credential-store write by operation and outcome.
     fn credstore_write(&self, op: CredstoreOp, outcome: CredstoreOutcome);
 }
 
 /// Tenant metadata-codec telemetry — malformed / unsupported-version
 /// blob counter.
 pub trait MetadataCodecMetricsPort: Send + Sync + 'static {
+    /// Count a metadata decode failure labelled by the observed version.
     fn metadata_decode_failure(&self, version_observed: VersionObserved);
 }
 
@@ -373,11 +444,13 @@ pub trait MetadataCodecMetricsPort: Send + Sync + 'static {
 /// and the `(op, failure_variant)` tuple is the stable dimension
 /// dashboards key on.
 pub trait FailureMetricsPort: Send + Sync + 'static {
+    /// Count a plugin failure for `op` labelled by the failure variant.
     fn failure(&self, op: PluginOp, variant: FailureVariant);
 }
 
 /// Service-account op telemetry — create / `rotate_secret` / revoke / list latency.
 pub trait SaOpMetricsPort: Send + Sync + 'static {
+    /// Record the latency in seconds of a service-account operation.
     fn sa_op_duration(&self, op: SaOp, secs: f64);
 }
 

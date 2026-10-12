@@ -112,7 +112,7 @@ Each review type has a dedicated prompt file and checklist:
 
 | Review type | Prompt | Checklist |
 |-------------|--------|-----------|
-| Code Review | `studio-kit-gears/scripts/prompts/pr/code-review.md` | `docs/checklists/CODING.md` |
-| Design Review | `studio-kit-gears/scripts/prompts/pr/design-review.md` | `docs/checklists/DESIGN.md` |
-| ADR Review | `studio-kit-gears/scripts/prompts/pr/adr-review.md` | `docs/checklists/ADR.md` |
-| PRD Review | `studio-kit-gears/scripts/prompts/pr/prd-review.md` | `docs/checklists/PRD.md` |
+| Code Review | `studio-kit-gears/scripts/prompts/pr/code-review.md` | `studio-kit-gears/codebase/checklist.md` |
+| Design Review | `studio-kit-gears/scripts/prompts/pr/design-review.md` | `studio-kit-gears/artifacts/DESIGN/checklist.md` |
+| ADR Review | `studio-kit-gears/scripts/prompts/pr/adr-review.md` | `studio-kit-gears/artifacts/ADR/checklist.md` |
+| PRD Review | `studio-kit-gears/scripts/prompts/pr/prd-review.md` | `studio-kit-gears/artifacts/PRD/checklist.md` |

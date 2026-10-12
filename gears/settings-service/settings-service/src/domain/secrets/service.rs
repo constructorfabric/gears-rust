@@ -8,6 +8,7 @@
 //! here is cached: the effective cache keeps holding the reference only.
 
 use std::sync::Arc;
+use toolkit_macros::domain_model;
 
 use secrecy::SecretString;
 use settings_service_sdk::gts::VALUE_SCHEMA;
@@ -28,6 +29,7 @@ use crate::field;
 
 /// Resolves a [`SecretHandle`] to plaintext for an authorized machine caller.
 // @cpt-dod:cpt-cf-settings-service-dod-secret-values-machine-path:p1
+#[domain_model]
 pub struct SecretResolver<D, V, A, S> {
     resolver: Arc<ValueResolver<D, V, A>>,
     secrets: Arc<dyn SecretManager>,

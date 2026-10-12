@@ -2,7 +2,9 @@
 //! `bss.check_entry_balanced` trigger enforces, reproduced in app code so
 //! the engine errors deterministically on both backends and before COMMIT.
 
-use bss_ledger_sdk::Side;
+use crate::domain::exact_money::ExactAmount;
+use bss_ledger_sdk::{PostedMoney, Side};
+use rust_decimal::Decimal;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -13,18 +15,28 @@ use crate::domain::error::DomainError;
 #[derive(Clone, Debug)]
 pub struct LineFacts {
     pub side: Side,
-    pub amount_minor: i64,
-    pub currency: String,
-    pub currency_scale: u8,
+    pub money: PostedMoney,
     pub payer_tenant_id: Uuid,
-    pub functional_amount_minor: Option<i64>,
+    pub functional_money: Option<PostedMoney>,
 }
 
 impl LineFacts {
     /// A functional-only line carries no transaction-currency amount.
     fn is_functional_only(&self) -> bool {
-        self.amount_minor == 0 && self.functional_amount_minor.is_some()
+        is_functional_only(&self.money, self.functional_money.as_ref())
     }
+}
+
+/// The engine's functional-only admission rule: a line with a zero transaction
+/// amount and a functional value carries no transaction value, so it may be in
+/// another currency than the entry. The one predicate the engine and the
+/// reversal builder (`domain::invoice::reversal`) share.
+#[must_use]
+pub(crate) fn is_functional_only(
+    money: &PostedMoney,
+    functional_money: Option<&PostedMoney>,
+) -> bool {
+    money.amount().is_zero() && functional_money.is_some()
 }
 
 /// A structural posting-invariant breach. Projected into a [`DomainError`]
@@ -60,19 +72,16 @@ impl From<PostingViolation> for DomainError {
             PostingViolation::MixedPayer => {
                 Self::MixedPayer("entry spans more than one payer tenant".to_owned())
             }
-            // A wrong per-line scale changes the implied magnitude of the
-            // amount — surfaced as out-of-range (wire `AMOUNT_OUT_OF_RANGE`)
-            // rather than a balance fault, preserving the prior contract.
+            // Preserve the named scale mismatch at the API boundary.
             PostingViolation::InconsistentScale => Self::InconsistentScale(
                 "lines in the same currency carry different scales".to_owned(),
             ),
             PostingViolation::Unbalanced => {
                 Self::Unbalanced("entry does not net to zero per currency".to_owned())
             }
-            // CurrencyMismatch has no dedicated variant — a line in another
-            // currency cannot net to zero, so it surfaces as unbalanced.
+            // Currency mismatch is distinct from an unequal monetary sum.
             PostingViolation::CurrencyMismatch => {
-                Self::Unbalanced("line currency does not match the entry currency".to_owned())
+                Self::CurrencyMismatch("line currency does not match the entry currency".to_owned())
             }
             PostingViolation::AmountOutOfRange => Self::AmountOutOfRange(
                 "line amount must be positive, or zero with a functional amount".to_owned(),
@@ -101,79 +110,82 @@ pub fn validate_balanced_entry(
     if lines.is_empty() {
         return Err(PostingViolation::Empty);
     }
-    // chk_journal_line_amount, reproduced before COMMIT: every amount must be
-    // positive, or exactly zero with a POSITIVE functional amount (functional-only
-    // line — the DR/CR side carries the sign, so the functional amount is > 0).
-    if lines.iter().any(|l| {
-        l.amount_minor < 0
-            || (l.amount_minor == 0 && !matches!(l.functional_amount_minor, Some(f) if f > 0))
+    // Preserve the existing positive transaction / positive functional-only rule.
+    if lines.iter().any(|line| {
+        line.money.amount() < Decimal::ZERO
+            || (line.money.amount().is_zero()
+                && line
+                    .functional_money
+                    .as_ref()
+                    .is_none_or(|f| f.amount() <= Decimal::ZERO))
     }) {
         return Err(PostingViolation::AmountOutOfRange);
     }
     let first_payer = lines[0].payer_tenant_id;
-    if lines.iter().any(|l| l.payer_tenant_id != first_payer) {
+    if lines.iter().any(|line| line.payer_tenant_id != first_payer) {
         return Err(PostingViolation::MixedPayer);
     }
     if lines
         .iter()
-        .any(|l| l.currency != entry_currency && !l.is_functional_only())
+        .any(|line| line.money.currency().code() != entry_currency && !line.is_functional_only())
     {
         return Err(PostingViolation::CurrencyMismatch);
     }
-    // One scale per currency: the registry resolves a single scale per
-    // currency and the currency-keyed balance caches hold one magnitude, so a
-    // line whose scale disagrees would corrupt the cached magnitude even if the
-    // entry nets to zero. `PostingService::post` is `pub` and trusts the
-    // caller-supplied `currency_scale`, so this guards that surface too.
-    let mut scale_by_ccy: std::collections::HashMap<&str, u8> = std::collections::HashMap::new();
-    for l in lines {
-        if let Some(&s) = scale_by_ccy.get(l.currency.as_str())
-            && s != l.currency_scale
-        {
+    let mut groups = std::collections::HashMap::new();
+    for line in lines {
+        let spec = line.money.currency();
+        let (scale, net) = groups
+            .entry(spec.code())
+            .or_insert_with(|| (spec.scale(), ExactAmount::from_decimal(Decimal::ZERO)));
+        if *scale != spec.scale() {
             return Err(PostingViolation::InconsistentScale);
         }
-        scale_by_ccy
-            .entry(l.currency.as_str())
-            .or_insert(l.currency_scale);
+        *net = add_signed(net, &line.money, line.side)?;
     }
-    // Net per (currency, scale) group must be exactly zero.
-    let mut groups: std::collections::HashMap<(&str, u8), i128> = std::collections::HashMap::new();
-    for l in lines {
-        let signed = match l.side {
-            Side::Debit => i128::from(l.amount_minor),
-            Side::Credit => -i128::from(l.amount_minor),
-        };
-        *groups
-            .entry((l.currency.as_str(), l.currency_scale))
-            .or_insert(0) += signed;
-    }
-    if groups.values().any(|net| *net != 0) {
+    let zero = ExactAmount::from_decimal(Decimal::ZERO);
+    if groups.values().any(|(_, net)| *net != zero) {
         return Err(PostingViolation::Unbalanced);
     }
-    // FX dual-column functional balance (NULL-aware; mirrors bss.check_entry_balanced).
-    // f = count(functional Some): f=0 → single-currency, skip; f=len → enforce
-    // SUM(DR.functional) == SUM(CR.functional); 0<f<len → partial-functional bug.
     let func_count = lines
         .iter()
-        .filter(|l| l.functional_amount_minor.is_some())
+        .filter(|line| line.functional_money.is_some())
         .count();
     if func_count > 0 && func_count < lines.len() {
         return Err(PostingViolation::FunctionalPartial);
     }
-    if func_count == lines.len() {
-        let mut func_net: i128 = 0;
-        for l in lines {
-            let f = i128::from(l.functional_amount_minor.unwrap_or(0));
-            func_net += match l.side {
-                Side::Debit => f,
-                Side::Credit => -f,
+    if let Some(first) = lines[0].functional_money.as_ref() {
+        let mut net = zero.clone();
+        for line in lines {
+            let Some(money) = line.functional_money.as_ref() else {
+                return Err(PostingViolation::FunctionalPartial);
             };
+            if money.currency().code() != first.currency().code() {
+                return Err(PostingViolation::CurrencyMismatch);
+            }
+            if money.currency().scale() != first.currency().scale() {
+                return Err(PostingViolation::InconsistentScale);
+            }
+            net = add_signed(&net, money, line.side)?;
         }
-        if func_net != 0 {
+        if net != zero {
             return Err(PostingViolation::FunctionalUnbalanced);
         }
     }
     Ok(())
+}
+
+/// Add a journal leg without narrowing intermediate totals to a posted amount.
+fn add_signed(
+    net: &ExactAmount,
+    money: &PostedMoney,
+    side: Side,
+) -> Result<ExactAmount, PostingViolation> {
+    let value = ExactAmount::from_decimal(money.amount());
+    match side {
+        Side::Debit => net.checked_add(&value),
+        Side::Credit => net.checked_sub(&value),
+    }
+    .map_err(|_| PostingViolation::AmountOutOfRange)
 }
 
 #[cfg(test)]

@@ -43,15 +43,12 @@ fn line(id: u128, amount: i64) -> NewLine {
         account_class: AccountClass::Ar,
         gl_code: None,
         side: Side::Debit,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: money(&rust_decimal::Decimal::new(amount, 2).to_string(), "USD", 2),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -164,7 +161,7 @@ fn genesis_is_tenant_bound() {
 #[test]
 fn byte_reproducibility_vector() {
     use std::fmt::Write as _;
-    const EXPECTED: &str = "b943d061aa92913945784ef003bc6b43cc8c9a800fdd758bbe1a53ee39d994ec";
+    const EXPECTED: &str = "82e2d3419b98af3707b85f60c051fc712b0651f17b8052f3c2fe520dc44ee948";
     let e = entry();
     let ls = vec![line(10, 100), line(11, -100)];
     let digest = chain_row_hash(&e, &ls, &[0u8; 32]);
@@ -173,4 +170,47 @@ fn byte_reproducibility_vector() {
         let _ = write!(hex, "{b:02x}");
     }
     assert_eq!(hex, EXPECTED, "tamper-chain encoding changed — got {hex}");
+}
+
+fn money(text: &str, code: &str, scale: u8) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        bss_ledger_sdk::parse_decimal(text).unwrap(),
+        bss_ledger_sdk::CurrencySpec::try_new(code.to_owned(), scale).unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn decimal_money_framing_is_canonical_and_metadata_sensitive() {
+    let e = entry();
+    let mut a = line(10, 1000);
+    a.money = money("10.000", "USD", 3);
+    let mut b = a.clone();
+    b.money = money("10", "USD", 3);
+    assert_eq!(
+        chain_row_hash(&e, &[a.clone()], &PREV),
+        chain_row_hash(&e, &[b.clone()], &PREV)
+    );
+    b.money = money("10", "USD", 2);
+    assert_ne!(
+        chain_row_hash(&e, &[a.clone()], &PREV),
+        chain_row_hash(&e, &[b.clone()], &PREV)
+    );
+    b.money = money("10", "EUR", 3);
+    assert_ne!(
+        chain_row_hash(&e, &[a.clone()], &PREV),
+        chain_row_hash(&e, &[b.clone()], &PREV)
+    );
+    a.functional_money = Some(money("0", "EUR", 2));
+    b = a.clone();
+    b.functional_money = Some(money("0", "EUR", 3));
+    assert_ne!(
+        chain_row_hash(&e, &[a.clone()], &PREV),
+        chain_row_hash(&e, &[b.clone()], &PREV)
+    );
+    b.functional_money = None;
+    assert_ne!(
+        chain_row_hash(&e, &[a], &PREV),
+        chain_row_hash(&e, &[b], &PREV)
+    );
 }

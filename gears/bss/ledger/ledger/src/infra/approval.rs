@@ -6,3 +6,5 @@
 
 pub mod executor;
 pub mod service;
+
+pub mod stored_intent;

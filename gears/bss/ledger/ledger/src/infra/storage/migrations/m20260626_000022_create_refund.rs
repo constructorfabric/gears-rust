@@ -49,12 +49,13 @@ const PG_UP_STATEMENTS: &[&str] = &[
         payment_id            varchar(128)  NOT NULL,
         invoice_id            varchar(128),
         currency              varchar(16)   NOT NULL,
-        amount_minor          bigint        NOT NULL,
+        amount                      text        NOT NULL CHECK (bss.ledger_decimal_valid(amount, currency_scale)),
         clearing_state        varchar(16)   NOT NULL,
         relates_to_refund_id  varchar(128),
         reverses_entry_id     uuid,
         created_at_utc        timestamptz   NOT NULL,
         version               bigint        NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, refund_id),
         CONSTRAINT chk_ledger_refund_phase CHECK (phase IN
             ('initiated','confirmed','rejected','voided','unknown_final')),
@@ -62,7 +63,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
             ('A_UNALLOCATED','B_RESTORE_AR')),
         CONSTRAINT chk_ledger_refund_clearing_state CHECK (clearing_state IN
             ('PENDING','SETTLED','REVERSED')),
-        CONSTRAINT chk_ledger_refund_amount_nonneg CHECK (amount_minor >= 0)
+        CONSTRAINT chk_ledger_refund_amount_nonneg CHECK (amount::numeric >= 0)
     )",
     "CREATE UNIQUE INDEX uq_ledger_refund_psp_phase
         ON bss.ledger_refund (tenant_id, psp_refund_id, phase)",
@@ -85,12 +86,13 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
         payment_id            varchar(128)  NOT NULL,
         invoice_id            varchar(128),
         currency              varchar(16)   NOT NULL,
-        amount_minor          bigint        NOT NULL,
+        amount                      text        NOT NULL CHECK (length(amount) BETWEEN 1 AND 31),
         clearing_state        varchar(16)   NOT NULL,
         relates_to_refund_id  varchar(128),
         reverses_entry_id     text,
         created_at_utc        text          NOT NULL,
         version               bigint        NOT NULL DEFAULT 0,
+        currency_scale              smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
         PRIMARY KEY (tenant_id, refund_id),
         CONSTRAINT chk_ledger_refund_phase CHECK (phase IN
             ('initiated','confirmed','rejected','voided','unknown_final')),
@@ -98,7 +100,7 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
             ('A_UNALLOCATED','B_RESTORE_AR')),
         CONSTRAINT chk_ledger_refund_clearing_state CHECK (clearing_state IN
             ('PENDING','SETTLED','REVERSED')),
-        CONSTRAINT chk_ledger_refund_amount_nonneg CHECK (amount_minor >= 0)
+        CONSTRAINT chk_ledger_refund_amount_nonneg CHECK (substr(amount, 1, 1) <> '-')
     )",
     "CREATE UNIQUE INDEX uq_ledger_refund_psp_phase
         ON ledger_refund (tenant_id, psp_refund_id, phase)",

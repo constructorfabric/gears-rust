@@ -22,14 +22,18 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use bss_ledger_sdk::{AccountClass, PostEntry, PostLine, PostingRef};
+use bss_ledger_sdk::{AccountClass, PostEntry, PostLine, PostedMoney, PostingRef};
 use chrono::Datelike;
+use rust_decimal::Decimal;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::exact_money::{
+    ExactAmount, map_exact_error, matching_spec, subtract_posted, zero_posted,
+};
 use crate::domain::fx::realized::carried_relief;
 use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine};
@@ -37,7 +41,6 @@ use crate::domain::payment::settlement_return::{
     SettlementReturnInput, build_settlement_return_entry,
 };
 use crate::domain::ports::metrics::{LedgerMetricsPort, PostFlow, PostResult};
-use crate::infra::currency_scale::CurrencyScaleResolver;
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::exception::ExceptionRouter;
 use crate::infra::payment::sidecar::SettlementReturnSidecar;
@@ -53,7 +56,6 @@ const ORIGIN_SYSTEM: &str = "SYSTEM";
 pub struct SettlementReturnService {
     posting: PostingService,
     reference: ReferenceRepo,
-    resolver: CurrencyScaleResolver,
     // The payment counter repo: reads the settlement pre-build to size the
     // proportional `fee_share` for the symmetric reverse (Model N, D1).
     payment_repo: PaymentRepo,
@@ -79,12 +81,10 @@ impl SettlementReturnService {
     ) -> Self {
         let posting = PostingService::new(db.clone(), Arc::clone(&publisher));
         let reference = ReferenceRepo::new(db.clone());
-        let resolver = CurrencyScaleResolver::new(ReferenceRepo::new(db.clone()));
         let payment_repo = PaymentRepo::new(db);
         Self {
             posting,
             reference,
-            resolver,
             payment_repo,
             publisher,
             metrics,
@@ -156,18 +156,18 @@ impl SettlementReturnService {
         // decrements — this loop only re-aligns the out-of-txn `fee_share` read
         // with the committed state. Bounded so a true over-return can't spin.
         const MAX_RECOMPUTE: u32 = 8;
-        let mut prev_snapshot: Option<(i64, i64)> = None;
+        let mut prev_snapshot: Option<(PostedMoney, PostedMoney)> = None;
         for _ in 0..=MAX_RECOMPUTE {
             // 1. Read the settlement and size the proportional fee slice this
             //    return reverses (Model N, D1): `fee_share = fee × amount /
             //    settled` (i128 intermediate; against the CURRENT remaining
             //    balances). Also returns the `(settled, fee)` snapshot the retry
             //    guard below compares to tell a genuine over-return from a race.
-            let (fee_share_minor, snapshot) = self.fee_share(scope, &input).await?;
+            let (fee_share, snapshot) = self.fee_share(scope, &input).await?;
 
             // 2. Build the balanced symmetric-reverse entry (validates amount > 0
             //    and 0 <= fee_share <= amount).
-            let mut entry = build_settlement_return_entry(&input, fee_share_minor)?;
+            let mut entry = build_settlement_return_entry(&input, &fee_share)?;
 
             // 3. Overwrite the placeholder header fields the pure builder emits.
             overwrite_header(&mut entry, ctx, input.effective_at);
@@ -180,7 +180,7 @@ impl SettlementReturnService {
                         "no provisioned account for class {} / stream {:?} / currency {}",
                         line.account_class.as_str(),
                         line.revenue_stream,
-                        line.currency
+                        line.money.currency().code()
                     ))
                 })?;
             }
@@ -190,7 +190,7 @@ impl SettlementReturnService {
             //     pool's functional at the locked rate, so this symmetric reverse
             //     relieves that SAME carried basis (no new lock, no realized FX).
             //     Single-currency pool ⇒ leaves functional NULL on every leg.
-            self.stamp_fx_carry_forward(scope, &input, fee_share_minor, &mut entry.lines)
+            self.stamp_fx_carry_forward(scope, &input, &fee_share, &mut entry.lines)
                 .await?;
 
             // 5. Post, threading the return sidecar so BOTH `settled_minor` and
@@ -200,9 +200,9 @@ impl SettlementReturnService {
                 tenant: input.tenant_id,
                 payment_id: input.payment_id.clone(),
                 psp_return_id: input.psp_return_id.clone(),
-                amount_minor: input.amount_minor,
-                fee_share_minor,
-                currency: input.currency.clone(),
+                amount: input.amount.clone(),
+                fee_share,
+                payment: self.payment_repo.clone(),
                 publisher: Arc::clone(&self.publisher),
                 ctx: ctx.clone(),
             });
@@ -213,7 +213,7 @@ impl SettlementReturnService {
                 // counters under us — re-size and retry. The SAME snapshot twice
                 // is a genuine over-return — propagate it.
                 Err(DomainError::SettlementReturnOverAllocated(_))
-                    if prev_snapshot != Some(snapshot) =>
+                    if prev_snapshot.as_ref() != Some(&snapshot) =>
                 {
                     prev_snapshot = Some(snapshot);
                 }
@@ -270,7 +270,7 @@ impl SettlementReturnService {
         &self,
         scope: &AccessScope,
         input: &SettlementReturnInput,
-    ) -> Result<(i64, (i64, i64)), DomainError> {
+    ) -> Result<(PostedMoney, (PostedMoney, PostedMoney)), DomainError> {
         let settlement = self
             .payment_repo
             .read_settlement(scope, input.tenant_id, &input.payment_id)
@@ -289,40 +289,22 @@ impl SettlementReturnService {
         // `input.currency`. A mismatch (mistyped or malicious) would post foreign
         // legs against the original payment's counters — reject before sizing
         // (mirrors `AllocateService`'s settlement-currency gate).
-        if settlement.currency != input.currency {
-            return Err(DomainError::CurrencyMismatch(format!(
-                "settlement-return currency {} != settled currency {} for payment {}",
-                input.currency, settlement.currency, input.payment_id
-            )));
-        }
+        settled_spec_check(input, &settlement.settled)?;
+        matching_spec(&settlement.settled, &settlement.fee)?;
         // Guard against a zero settled total: it would both be a contract
         // violation (nothing was ever settled) and a divide-by-zero below.
-        if settlement.settled_minor <= 0 {
+        if settlement.settled.amount() <= Decimal::ZERO {
             return Err(DomainError::Internal(format!(
-                "settlement return on payment {} has settled_minor={} \
+                "settlement return on payment {} has settled={} \
                  (cannot size the fee share against a zero/negative settlement)",
-                input.payment_id, settlement.settled_minor
+                input.payment_id,
+                settlement.settled.amount()
             )));
         }
-        // i128 intermediate: `fee × amount` can exceed i64 for large minor-unit
-        // values; the quotient is provably back in i64 range (`fee_share <= fee
-        // <= settled <= i64::MAX`), so `try_from` never errors here — guard it
-        // defensively rather than an unchecked `as` cast (clippy
-        // cast_possible_truncation).
-        let fee_share_raw = i128::from(settlement.fee_minor) * i128::from(input.amount_minor)
-            / i128::from(settlement.settled_minor);
-        let fee_share_minor = i64::try_from(fee_share_raw).map_err(|_| {
-            DomainError::Internal(format!(
-                "settlement return fee_share {fee_share_raw} overflows i64 (payment {})",
-                input.payment_id
-            ))
-        })?;
+        let fee_share = pro_rata_fee_share(&settlement.fee, &input.amount, &settlement.settled)?;
         // The `(settled, fee)` snapshot the build was sized against — the retry
         // guard compares it across attempts to separate a race from an over-return.
-        Ok((
-            fee_share_minor,
-            (settlement.settled_minor, settlement.fee_minor),
-        ))
+        Ok((fee_share, (settlement.settled, settlement.fee)))
     }
 
     /// Stamp the functional carry-forward on the symmetric-reverse legs (Slice 5,
@@ -348,7 +330,7 @@ impl SettlementReturnService {
         &self,
         scope: &AccessScope,
         input: &SettlementReturnInput,
-        fee_share_minor: i64,
+        fee_share: &PostedMoney,
         lines: &mut [PostLine],
     ) -> Result<(), DomainError> {
         let pool = self
@@ -357,52 +339,54 @@ impl SettlementReturnService {
                 scope,
                 input.tenant_id,
                 input.payer_tenant_id,
-                &input.currency,
+                input.amount.currency().code(),
             )
             .await
             .map_err(|e| DomainError::Internal(format!("read unallocated carried: {e}")))?;
+        // An absent pool is a single-currency position too: leave functional NULL.
+        let Some(pool) = pool else {
+            return Ok(());
+        };
 
         // Single-currency pool ⇒ leave functional NULL on every leg.
-        let (Some(pool_functional), Some(functional_ccy)) =
-            (pool.functional_balance_minor, pool.functional_currency)
-        else {
+        let Some(pool_functional) = pool.functional_balance else {
             return Ok(());
         };
 
         // A non-positive pool or an over-claw ⇒ skip; the post is rejected on the
         // transaction balance before it commits, so leaving functional NULL is safe.
-        if pool.balance_minor <= 0 || input.amount_minor > pool.balance_minor {
+        matching_spec(&pool.balance, &input.amount)?;
+        if pool.balance.amount() <= Decimal::ZERO || input.amount.amount() > pool.balance.amount() {
             return Ok(());
         }
 
         // Relieve the pool (DR UNALLOCATED) at its WAC, then split the SAME basis
         // across the CR legs so the functional column nets to zero: the fee leg
         // pro-rata, the cash leg the exact residual.
-        let dr_func = carried_relief(pool_functional, pool.balance_minor, input.amount_minor)
-            .map_err(|e| {
+        let dr_func =
+            carried_relief(&pool_functional, &pool.balance, &input.amount).map_err(|e| {
                 DomainError::Internal(format!("settlement-return FX carry-forward: {e}"))
             })?;
-        let fee_func = if fee_share_minor > 0 {
-            carried_relief(pool_functional, pool.balance_minor, fee_share_minor).map_err(|e| {
+        let fee_func = if fee_share.amount() > Decimal::ZERO {
+            carried_relief(&pool_functional, &pool.balance, fee_share).map_err(|e| {
                 DomainError::Internal(format!("settlement-return FX fee carry-forward: {e}"))
             })?
         } else {
-            0
+            zero_posted(&dr_func)?
         };
-        let cash_func = dr_func - fee_func;
+        let cash_func = subtract_posted(&dr_func, &fee_func)?;
 
         for line in lines.iter_mut() {
             let func = match line.account_class {
-                AccountClass::Unallocated => dr_func,
-                AccountClass::PspFeeExpense => fee_func,
-                AccountClass::CashClearing => cash_func,
+                AccountClass::Unallocated => dr_func.clone(),
+                AccountClass::PspFeeExpense => fee_func.clone(),
+                AccountClass::CashClearing => cash_func.clone(),
                 // The builder emits only those three classes; an unexpected leg
                 // would surface as FUNCTIONAL_PARTIAL at the balance trigger
                 // (fail loud, never silently drift).
                 _ => continue,
             };
-            line.functional_amount_minor = Some(func);
-            line.functional_currency = Some(functional_ccy.clone());
+            line.functional_money = Some(func);
         }
         Ok(())
     }
@@ -442,12 +426,7 @@ impl SettlementReturnService {
         };
         let mut new_lines: Vec<NewLine> = Vec::with_capacity(entry.lines.len());
         for line in entry.lines {
-            let scale = self
-                .resolver
-                .resolve(scope, entry.tenant_id, &line.currency)
-                .await
-                .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))?;
-            new_lines.push(new_line(line, scale));
+            new_lines.push(new_line(line));
         }
         self.posting
             .post(ctx, scope, new_entry, new_lines, Some(sidecar))
@@ -492,14 +471,41 @@ fn overwrite_header(
 fn resolve_line(chart: &ChartIndex, line: &PostLine) -> Option<Uuid> {
     chart.resolve(
         line.account_class,
-        &line.currency,
+        line.money.currency().code(),
         line.revenue_stream.as_deref(),
     )
 }
 
 /// Map one SDK [`PostLine`] + its resolved scale to the engine's [`NewLine`]
 /// (mirrors `settle::new_line`).
-fn new_line(line: PostLine, scale: u8) -> NewLine {
+/// The return must carry the settlement's stored currency AND scale: a mismatch
+/// is a named rejection, never an implicit conversion.
+fn settled_spec_check(
+    input: &SettlementReturnInput,
+    settled: &PostedMoney,
+) -> Result<(), DomainError> {
+    let request = input.amount.currency();
+    let origin = settled.currency();
+    if request.code() != origin.code() {
+        return Err(DomainError::CurrencyMismatch(format!(
+            "settlement-return currency {} != settled currency {} for payment {}",
+            request.code(),
+            origin.code(),
+            input.payment_id
+        )));
+    }
+    if request.scale() != origin.scale() {
+        return Err(DomainError::InconsistentScale(format!(
+            "settlement-return currency scale {} != settled scale {} for payment {}",
+            request.scale(),
+            origin.scale(),
+            input.payment_id
+        )));
+    }
+    Ok(())
+}
+
+fn new_line(line: PostLine) -> NewLine {
     NewLine {
         line_id: line.line_id,
         payer_tenant_id: line.payer_tenant_id,
@@ -509,15 +515,12 @@ fn new_line(line: PostLine, scale: u8) -> NewLine {
         account_class: line.account_class,
         gl_code: line.gl_code,
         side: line.side,
-        amount_minor: line.amount_minor,
-        currency: line.currency,
-        currency_scale: scale,
+        money: line.money,
         invoice_id: line.invoice_id,
         due_date: line.due_date,
         revenue_stream: line.revenue_stream,
         mapping_status: line.mapping_status,
-        functional_amount_minor: line.functional_amount_minor,
-        functional_currency: line.functional_currency,
+        functional_money: line.functional_money,
         tax_jurisdiction: line.tax_jurisdiction,
         tax_filing_period: line.tax_filing_period,
         tax_rate_ref: line.tax_rate_ref,
@@ -531,3 +534,25 @@ fn new_line(line: PostLine, scale: u8) -> NewLine {
         ar_status: line.ar_status,
     }
 }
+
+/// The fee share of a return: the pro-rata allocation `fee × amount ÷ settled`,
+/// an exact ratio rounded once `HALF_EVEN` at the settlement's posting scale.
+///
+/// # Errors
+/// A zero `settled` (division by zero) or an exact-arithmetic budget breach,
+/// mapped through the exact-money error vocabulary.
+fn pro_rata_fee_share(
+    fee: &PostedMoney,
+    amount: &PostedMoney,
+    settled: &PostedMoney,
+) -> Result<PostedMoney, DomainError> {
+    ExactAmount::from_decimal(fee.amount())
+        .checked_mul(&ExactAmount::from_decimal(amount.amount()))
+        .and_then(|v| v.checked_div(&ExactAmount::from_decimal(settled.amount())))
+        .and_then(|v| v.round_half_even(settled.currency().clone()))
+        .map_err(map_exact_error)
+}
+
+#[cfg(test)]
+#[path = "settlement_return_fee_tests.rs"]
+mod fee_tests;

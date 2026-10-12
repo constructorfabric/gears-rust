@@ -470,7 +470,7 @@ After reconciliation confirms provider state, an absent identity **MUST** permit
 
 - [ ] `p1` - **ID**: `cpt-cf-keycloak-idp-plugin-fr-service-account-failure-contract`
 
-The plugin **MUST** classify every failed service-account call into the `IdpServiceAccountFailure` taxonomy: `InvalidInput` (bad name, disallowed scope, quota exceeded, taken client id — permanent, no vendor state retained by the call), `NotFound` (absent or foreign target; success-equivalent for revoke), `CleanFailure` (pre-mutation failure, retry harmless), and `Ambiguous` (transport uncertainty after a mutation may have landed — never reported as success, never containing a credential). The enum is `#[non_exhaustive]` and additionally carries `UnsupportedOperation`, which is what the default implementations return while this surface is unimplemented.
+The plugin **MUST** classify every failed service-account call into the `IdpServiceAccountFailure` taxonomy: `InvalidInput` (bad name, disallowed scope, taken client id — permanent, no vendor state retained by the call), `QuotaExceeded` (the tenant already owns its quota of clients — no vendor state retained, clears once the tenant revokes one), `NotFound` (absent or foreign target; success-equivalent for revoke), `CleanFailure` (pre-mutation failure, retry harmless), and `Ambiguous` (transport uncertainty after a mutation may have landed — never reported as success, never containing a credential). The enum is `#[non_exhaustive]` and additionally carries `UnsupportedOperation`, which is what the default implementations return while this surface is unimplemented.
 
 - **Rationale**: Credential mutation requires clear retry and recovery behavior with no invented variants.
 - **Actors**: `cpt-cf-keycloak-idp-plugin-actor-service-account-consumer`, `cpt-cf-keycloak-idp-plugin-actor-platform-operator`
@@ -800,7 +800,8 @@ Account Management sends the tenant context, user identifier, and partial update
 - The plugin retains no plaintext credential; the consumer owns durable custody.
 
 **Alternative Flows**:
-- **Name taken, scope disallowed, or quota exceeded**: The plugin returns `InvalidInput` without mutation.
+- **Name taken or scope disallowed**: The plugin returns `InvalidInput` without mutation.
+- **Quota exceeded**: The plugin returns `QuotaExceeded` without mutation; AM answers 429.
 - **Allowlisted scope missing from the realm**: The plugin returns a clean failure naming the scope for the operator.
 - **Corrupt or incomplete account at rotation**: The plugin returns `InvalidInput` with revoke-and-recreate guidance instead of a credential.
 - **Uncertain creation or rotation**: The plugin returns a stage-attributed `Ambiguous` outcome with no credential.

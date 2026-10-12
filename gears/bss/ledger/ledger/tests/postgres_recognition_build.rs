@@ -37,7 +37,6 @@ use bss_ledger::config::{FxConfig, RecognitionConfig};
 use bss_ledger::domain::error::DomainError;
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice, TaxBreakdown};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::recognition::input::{RecognitionInput, RecognitionTiming};
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
 use bss_ledger::infra::invoice_post::InvoicePostService;
@@ -56,6 +55,33 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Validated USD scale-2 money from canonical stored text (`"12.34"`).
+fn usd_text(text: &str) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        bss_ledger_sdk::parse_decimal(text).unwrap(),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Read one canonical decimal TEXT money column as USD scale-2 money.
+async fn scalar_money(conn: &DatabaseConnection, sql: &str) -> Option<bss_ledger_sdk::PostedMoney> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| usd_text(&r.try_get_by_index::<String>(0).unwrap()))
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
@@ -131,8 +157,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -185,9 +210,8 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
 /// spec over `periods` and an `invoice_item_ref` (required for a deferred line).
 fn recognized_item(amount: i64, periods: u32, item_ref: &str) -> InvoiceItem {
     InvoiceItem {
-        amount_minor_ex_tax: amount,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(amount),
+        deferred: usd_cents(0),
         revenue_stream: "subscription".to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -216,9 +240,8 @@ fn recognized_item(amount: i64, periods: u32, item_ref: &str) -> InvoiceItem {
 /// A plain `subscription` item, fully recognized now (no recognition spec).
 fn plain_item(amount: i64) -> InvoiceItem {
     InvoiceItem {
-        amount_minor_ex_tax: amount,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(amount),
+        deferred: usd_cents(0),
         revenue_stream: "subscription".to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -261,11 +284,15 @@ fn svc(
     )
 }
 
-async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64> {
-    scalar_i64(
+async fn bal(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    account: Uuid,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             s.tenant, account
         ),
@@ -308,30 +335,40 @@ async fn deferred_invoice_materializes_schedule_in_one_txn() {
     assert!(!posted.replayed);
 
     // Balances: AR 1200 debit, Contract-liability 1200 credit, Revenue 0.
-    assert_eq!(bal(&raw, &s, s.ar).await, Some(1200), "AR = gross");
+    assert_eq!(
+        bal(&raw, &s, s.ar).await,
+        Some(usd_cents(1200)),
+        "AR = gross"
+    );
     assert_eq!(
         bal(&raw, &s, s.contract_liability).await,
-        Some(1200),
+        Some(usd_cents(1200)),
         "the whole amount deferred to Contract-liability"
     );
     // Revenue line posts 0 ⇒ either no balance row or a 0 balance; both are fine.
     assert!(
-        matches!(bal(&raw, &s, s.revenue).await, None | Some(0)),
+        bal(&raw, &s, s.revenue)
+            .await
+            .is_none_or(|m| m.amount().is_zero()),
         "nothing recognized now"
     );
 
     // Schedule + segments materialized in the same txn.
     assert_eq!(schedule_count(&raw, &s, "INV-DEF").await, 1, "one schedule");
-    let total_deferred = scalar_i64(
+    let total_deferred = scalar_money(
         &raw,
         &format!(
-            "SELECT total_deferred_minor FROM bss.ledger_recognition_schedule \
+            "SELECT total_deferred FROM bss.ledger_recognition_schedule \
              WHERE tenant_id='{}' AND source_invoice_id='INV-DEF'",
             s.tenant
         ),
     )
     .await;
-    assert_eq!(total_deferred, Some(1200), "schedule total = deferred");
+    assert_eq!(
+        total_deferred,
+        Some(usd_cents(1200)),
+        "schedule total = deferred"
+    );
     let segs = count(
         &raw,
         &format!(
@@ -344,10 +381,10 @@ async fn deferred_invoice_materializes_schedule_in_one_txn() {
     )
     .await;
     assert_eq!(segs, 12, "12 straight-line segments");
-    let seg_sum = scalar_i64(
+    let seg_sum = scalar_money(
         &raw,
         &format!(
-            "SELECT SUM(seg.amount_minor)::bigint FROM bss.ledger_recognition_segment seg \
+            "SELECT COALESCE(SUM(seg.amount::numeric), 0)::text FROM bss.ledger_recognition_segment seg \
              JOIN bss.ledger_recognition_schedule sch \
                ON sch.tenant_id = seg.tenant_id AND sch.schedule_id = seg.schedule_id \
              WHERE sch.tenant_id='{}' AND sch.source_invoice_id='INV-DEF'",
@@ -355,7 +392,11 @@ async fn deferred_invoice_materializes_schedule_in_one_txn() {
         ),
     )
     .await;
-    assert_eq!(seg_sum, Some(1200), "segments sum to the deferred amount");
+    assert_eq!(
+        seg_sum,
+        Some(usd_cents(1200)),
+        "segments sum to the deferred amount"
+    );
 }
 
 #[tokio::test]
@@ -498,12 +539,12 @@ async fn non_deferred_invoice_posts_with_no_schedule_or_cl_line() {
 
     assert_eq!(
         bal(&raw, &s, s.ar).await,
-        Some(1000),
+        Some(usd_cents(1000)),
         "AR = the full amount"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue).await,
-        Some(1000),
+        Some(usd_cents(1000)),
         "the whole amount recognizes now"
     );
     assert_eq!(
@@ -577,9 +618,8 @@ async fn list_schedules_filters_by_invoice_and_stream_and_is_tenant_scoped() {
         .expect("post A (subscription) must succeed");
     // Schedule B: INV-OTHER / support / item-2 (800 ex-tax, fully deferred).
     let support_item = InvoiceItem {
-        amount_minor_ex_tax: 800,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(800),
+        deferred: usd_cents(0),
         revenue_stream: "support".to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -625,7 +665,7 @@ async fn list_schedules_filters_by_invoice_and_stream_and_is_tenant_scoped() {
     assert_eq!(sched_a.revenue_stream, "subscription");
     assert_eq!(sched_a.source_invoice_item_ref, "item-1");
     assert_eq!(sched_a.status, "ACTIVE");
-    assert_eq!(sched_a.total_deferred_minor, 1200);
+    assert_eq!(sched_a.total_deferred, usd_cents(1200));
     let id_a = sched_a.schedule_id.clone();
     let id_b = all
         .iter()

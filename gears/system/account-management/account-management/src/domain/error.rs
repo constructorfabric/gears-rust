@@ -156,9 +156,9 @@ pub enum DomainError {
 
     /// The `IdP` rejected a service-account request with no
     /// provider-side state retained: a name that violates the adapter's
-    /// structural rules, a name already live in the tenant, a scope
-    /// outside the allowlist, or a provider quota. Permanent — the same
-    /// input will not start working.
+    /// structural rules, a name already live in the tenant, or a scope
+    /// outside the allowlist. Permanent — the same input will not start
+    /// working. A quota refusal is [`Self::ServiceAccountQuotaExceeded`].
     ///
     /// Distinct from [`Self::IdpInvalidInput`] (which rides the tenant
     /// resource type and carries the plugin's dotted-path `field`) on
@@ -403,6 +403,15 @@ pub enum DomainError {
     /// (mid-flight contention surfaced after partial work completed).
     #[error("integrity repair aborted: lease lost to a peer")]
     IntegrityCheckLeaseLost,
+
+    /// A service-account create exceeded the tenant's account limit.
+    /// Maps to HTTP 429 under the stable `service_accounts` quota subject,
+    /// independently of the admission source. A quota refusal is distinct
+    /// from invalid input and from an unavailable admission service.
+    /// `detail` is AM-owned text from [`crate::domain::service_account`],
+    /// never provider diagnostics.
+    #[error("service-account quota reached: {detail}")]
+    ServiceAccountQuotaExceeded { detail: String },
 
     // ---- Internal (HTTP 500) ----
     /// The durable platform-root row disagrees with the configured root ID or

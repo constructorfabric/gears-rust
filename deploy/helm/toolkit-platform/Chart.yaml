@@ -1,0 +1,23 @@
+apiVersion: v2
+name: toolkit-platform
+description: Deploys the CF/Gears platform.
+type: application
+version: 0.1.0
+appVersion: "dev"
+dependencies:
+  - name: flight-control
+    version: 0.1.0
+    repository: "file://../../../apps/cf-gears-flight-control/deploy/helm/flight-control"
+    condition: flight-control.enabled
+  - name: hello
+    version: 0.1.0
+    repository: "file://../../../examples/toolkit/hello/deploy/helm/hello"
+    condition: hello.enabled
+  - name: api-contracts
+    version: 0.1.0
+    repository: "file://../../../examples/toolkit/api-contracts/deploy/helm/api-contracts"
+    condition: api-contracts.enabled
+  - name: api-contracts-consumer
+    version: 0.1.0
+    repository: "file://../../../examples/toolkit/api-contracts/deploy/helm/api-contracts-consumer"
+    condition: api-contracts-consumer.enabled

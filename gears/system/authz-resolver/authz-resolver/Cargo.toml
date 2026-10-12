@@ -58,3 +58,4 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
+toolkit-gts = { workspace = true }

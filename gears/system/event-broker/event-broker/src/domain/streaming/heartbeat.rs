@@ -6,10 +6,12 @@
 //! production indirection to pay for.
 
 use std::time::Duration;
+use toolkit::domain_model;
 
 use tokio::time::Instant;
 
 /// The idle-cadence timer for one stream.
+#[domain_model]
 #[derive(Debug, Clone, Copy)]
 pub struct HeartbeatSchedule {
     interval: Duration,

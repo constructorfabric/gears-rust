@@ -81,9 +81,10 @@
 | P-D-258 | H | A published usage SKU keeps its metering | DECIDED 2026-10-02 · Owner, 2026-10-02; run 9.13; amends P-D-232, P-D-251 |
 | P-D-259 | H | A usage SKU sells a derived usage type, and its unit is that type's | DECIDED 2026-10-02 · Owner, 2026-10-02; run 9.13; amends P-D-207, P-D-229, P-D-232, P-D-251 |
 | P-D-261 | M | The SKU, derived-type and category lists answer 304 | DECIDED 2026-10-03 · Owner, 2026-10-03 (asks 56, 57); extends P-D-247; amended 2026-10-04 (the derived-type list revalidates; `no-cache`, not `no-store`) |
-| P-D-262 | M | Every actor id a read shows carries its current name (twin of pricing D-519) | DECIDED 2026-10-03 · Owner, 2026-10-02 (ask 32: names on the server, through AM); extends P-D-213, P-D-224, P-D-231; amended 2026-10-03 (one lookup per inbox card) |
+| P-D-262 | M | Every actor id a read shows carries its current name (twin of pricing D-519) | DECIDED 2026-10-03 · Owner, 2026-10-02 (ask 32: names on the server, through AM); extends P-D-213, P-D-224, P-D-231; amended 2026-10-03 (one lookup per inbox card); amended 2026-10-04 (a resolved name is reused for five minutes per caller) |
 | P-D-263 | M | A retired SKU or category can be archived, and its list hides it by default (twin of pricing D-522) | DECIDED 2026-10-03 · Owner, 2026-10-03 ("archived"; ask 58b); extends P-D-208, P-D-210, P-D-211, P-D-215; amended 2026-10-03 (branch review) |
 | P-D-264 | M | A text function on `lifecycle` filters by the lifecycles it matches | DECIDED 2026-10-03 · Owner, 2026-10-03 ("yes, add it"); amends P-D-249 |
+| P-D-265 | M | The PEP gate asks the PDP for the caller's tenant only (twin of pricing D-523) | DECIDED 2026-10-04 · Owner, 2026-10-04 (the approval lists under a root tenant) |
 
 ## Entries
 
@@ -2089,8 +2090,8 @@ Management read per id of its own.
   So no write answer names anyone: its `*_name` fields are null.
 - **The SDK.** `bss_products_sdk::models::Sku` does not gain the name: it is a read-side field of the REST answer, and
   the SDK still reads that answer.
-- **No storage, no cache.** Products stores no name and caches none. A renamed user reads the new name on the next
-  read. The names are part of the body, so the weak `ETag` of `GET /skus` and `GET /derived-usage-types` covers them
+- **No storage; a short cache (amended 2026-10-04).** Products stores no name. A renamed user reads the new name within
+  five minutes: the resolver (`cf-gears-bss-rest` `actor_names`, through `ActorNames::from_hub`) keeps a resolved name in process memory for five minutes, for the caller AM gave it to and nobody else: the key is the caller's tenant and subject and the actor. A refused, absent or failed lookup is not kept, and nothing is kept for an anonymous caller. The cache holds at most 10,000 names. A list or card that a caller reopens within five minutes asks AM nothing. The names are part of the body, so the weak `ETag` of `GET /skus` and `GET /derived-usage-types` covers them
   (P-D-261): a rename changes the tag. Both lists answer `Cache-Control: private, no-cache` (the derived-type list
   since P-D-261's amendment of 2026-10-04), so a rename shows on the next read.
 - **The tests.** `api/rest/actor_names_tests.rs`: every read above names its actors with one directory call, the system
@@ -2181,3 +2182,16 @@ P-D-215. Amended by the branch review, 2026-10-03.
 - **The tests.** `api/rest/sku_list_tests.rs`: `a_text_function_on_lifecycle_keeps_the_lifecycles_it_matches`, and the text-function cases of `a_due_lifecycle_is_filtered_through_the_case_or_refused`, `a_lifecycle_term_narrows_on_either_side_of_and` and `the_counts_follow_the_list_without_its_lifecycle_terms`. On Postgres: `tests/postgres_sku_list.rs`, `a_text_function_on_lifecycle_filters_through_the_case_on_postgres`.
 
 **Source:** Owner, 2026-10-03 ("yes, add it"). Amends P-D-249.
+
+#### P-D-265 [M] The PEP gate asks the PDP for the caller's tenant only (twin of pricing D-523)
+
+**Status:** DECIDED 2026-10-04.
+
+- **The cost.** `authz::access_scope` asked the PDP in the default tenant mode, `subtree`. For a collection the PDP then answers `IN(owner_tenant_id, every descendant of the subject's tenant)` (`docs/arch/authorization/AUTHZ_USAGE_SCENARIOS.md`, rule R8). Under a root tenant with thousands of descendants, deleted ones included, every scope check carried thousands of bind parameters and cost 100–250 ms. The PDP denies a list longer than its expansion cap.
+- **The rule.** Every request asks for `TenantMode::RootOnly` (rule R7): the PDP answers `EQ(owner_tenant_id, subject tenant)` and resolves no descendant. For a read this `EQ` is the SQL filter.
+- **What a reader sees.** The registry serves one tenant's SKUs, categories, units and derived types and no other tenant's (`cpt-cf-bss-products-nfr-tenant-isolation`: no cross-tenant reads). A parent tenant's lists now hold its own rows only, as the design states.
+- **What it keeps.** An `EQ` is decidable in memory, so `scope_holds` still answers `caller_can_approve`. The write gate's membership assertion is unchanged: a write names the caller's tenant.
+- **Not taken.** The tenant-hierarchy capability (`InTenantSubtree` compiled against `tenant_closure`, scenario S01) would keep the subtree without the list, but it needs the closure table on the gear's connection and is not decidable in memory.
+- **The tests.** `authz_tests::every_request_asks_for_the_callers_tenant_only`: a read and a write each ask for `RootOnly`.
+
+**Source:** Owner, 2026-10-04, after the approval lists measured 1.5–4 s under a root tenant. Twin of pricing D-523.

@@ -31,8 +31,8 @@ fn a_bare_list_gets_the_default_keyset_order() {
 
 #[test]
 fn a_callers_orderby_is_left_alone() {
-    let out = query_with_default_order(&ordered_by("balance_minor"), "account_id");
-    assert!(out.order.equals_signed_tokens("+balance_minor"));
+    let out = query_with_default_order(&ordered_by("account_class"), "account_id");
+    assert!(out.order.equals_signed_tokens("+account_class"));
 }
 
 // ---------------------------------------------------------------------------
@@ -41,16 +41,16 @@ fn a_callers_orderby_is_left_alone() {
 
 // The defect this exists for: `paginate_odata` appends exactly one tiebreaker,
 // so a caller's `$orderby` would leave the balances walk ordered by
-// `[balance_minor, account_id]` — and an account held in two currencies has two
+// `[account_class, account_id]` — and an account held in two currencies has two
 // rows sharing that pair, one of which falls out at a page boundary. The
 // `currency` suffix completes the `(tenant_id, account_id, currency)` key.
 #[test]
 fn the_suffix_completes_a_composite_key_behind_a_callers_orderby() {
     let out = query_with_unique_order(
-        &ordered_by("balance_minor"),
+        &ordered_by("account_class"),
         &[BalanceFilterField::Currency],
     );
-    assert!(out.order.equals_signed_tokens("+balance_minor,+currency"));
+    assert!(out.order.equals_signed_tokens("+account_class,+currency"));
 }
 
 #[test]
@@ -66,13 +66,13 @@ fn the_suffix_lands_behind_the_default_order_too() {
 #[test]
 fn applying_the_suffix_twice_changes_nothing() {
     let once = query_with_unique_order(
-        &ordered_by("balance_minor"),
+        &ordered_by("account_class"),
         &[BalanceFilterField::Currency],
     );
     let twice = query_with_unique_order(&once, &[BalanceFilterField::Currency]);
     // `ODataOrderBy` is not `PartialEq`; its `Display` is the readable form.
     assert_eq!(twice.order.to_string(), once.order.to_string());
-    assert!(twice.order.equals_signed_tokens("+balance_minor,+currency"));
+    assert!(twice.order.equals_signed_tokens("+account_class,+currency"));
 }
 
 /// Same skip, reached the other way: a caller who already ordered by the
@@ -91,8 +91,8 @@ fn a_suffix_field_the_caller_already_ordered_by_is_not_duplicated() {
 #[test]
 fn an_empty_suffix_leaves_the_order_untouched() {
     let empty: [BalanceFilterField; 0] = [];
-    let out = query_with_unique_order(&ordered_by("balance_minor"), &empty);
-    assert!(out.order.equals_signed_tokens("+balance_minor"));
+    let out = query_with_unique_order(&ordered_by("account_class"), &empty);
+    assert!(out.order.equals_signed_tokens("+account_class"));
 }
 
 /// A multi-field suffix appends in the order given — the key halves of a
@@ -100,12 +100,12 @@ fn an_empty_suffix_leaves_the_order_untouched() {
 #[test]
 fn a_multi_field_suffix_keeps_the_order_it_was_given() {
     let out = query_with_unique_order(
-        &ordered_by("balance_minor"),
+        &ordered_by("account_class"),
         &[BalanceFilterField::AccountId, BalanceFilterField::Currency],
     );
     assert!(
         out.order
-            .equals_signed_tokens("+balance_minor,+account_id,+currency")
+            .equals_signed_tokens("+account_class,+account_id,+currency")
     );
 }
 
@@ -123,9 +123,128 @@ fn the_suffix_field_names_come_from_the_filter_roster() {
 /// helper rewrites the order and nothing else.
 #[test]
 fn the_rest_of_the_query_rides_through() {
-    let query = ordered_by("balance_minor").with_limit(7);
+    let query = ordered_by("account_class").with_limit(7);
     let out = query_with_unique_order(&query, &[BalanceFilterField::Currency]);
     assert_eq!(out.limit, Some(7));
     assert!(out.cursor.is_none());
     assert!(out.filter.is_none());
+}
+
+/// Stored journal row with all independent metadata populated.
+fn money_line(
+    amount: &str,
+    currency: &str,
+    scale: i16,
+    side: &str,
+) -> crate::infra::storage::entity::journal_line::Model {
+    use crate::infra::storage::entity::journal_line;
+    use uuid::Uuid;
+    journal_line::Model {
+        line_id: Uuid::new_v4(),
+        entry_id: Uuid::new_v4(),
+        tenant_id: Uuid::new_v4(),
+        period_id: "2026-10".to_owned(),
+        payer_tenant_id: Uuid::new_v4(),
+        seller_tenant_id: None,
+        resource_tenant_id: None,
+        account_id: Uuid::new_v4(),
+        account_class: "UNALLOCATED".to_owned(),
+        gl_code: None,
+        side: side.to_owned(),
+        amount: amount.to_owned(),
+        currency: currency.to_owned(),
+        currency_scale: scale,
+        invoice_id: None,
+        due_date: None,
+        revenue_stream: None,
+        mapping_status: "MAPPED".to_owned(),
+        functional_amount: None,
+        functional_currency: None,
+        functional_currency_scale: None,
+        tax_jurisdiction: None,
+        tax_filing_period: None,
+        tax_rate_ref: None,
+        legal_entity_id: None,
+        invoice_item_ref: None,
+        sku_or_plan_ref: None,
+        price_id: None,
+        pricing_snapshot_ref: None,
+        po_allocation_group: None,
+        credit_grant_event_type: None,
+        ar_status: None,
+        rate_snapshot_ref: None,
+    }
+}
+
+#[test]
+fn journal_projection_preserves_historical_and_functional_scale() {
+    let mut row = money_line("1.001", "EUR", 3, "CR");
+    row.functional_amount = Some("0".to_owned());
+    row.functional_currency = Some("JPY".to_owned());
+    row.functional_currency_scale = Some(0);
+    let record = super::line_to_record(row.clone()).unwrap();
+    assert_eq!(record.money.currency().scale(), 3);
+    assert_eq!(record.functional_money.unwrap().currency().scale(), 0);
+    row.functional_currency_scale = None;
+    assert!(matches!(
+        super::line_to_record(row),
+        Err(crate::domain::model::RepoError::InvalidStoredMoney(_))
+    ));
+}
+
+#[test]
+fn settlement_total_is_currency_qualified_and_validates_scale() {
+    let eur = bss_ledger_sdk::CurrencySpec::try_new("EUR".to_owned(), 2).unwrap();
+    let lines = [
+        money_line("5", "EUR", 2, "CR"),
+        money_line("1", "EUR", 2, "DR"),
+    ];
+    assert_eq!(
+        super::settled_total(&lines, &eur)
+            .unwrap()
+            .amount()
+            .to_string(),
+        "4"
+    );
+    let conflict = [money_line("1", "EUR", 3, "DR")];
+    assert!(matches!(
+        super::settled_total(&conflict, &eur),
+        Err(crate::domain::model::RepoError::Money(
+            bss_ledger_sdk::MoneyError::ScaleMismatch
+        ))
+    ));
+    let wrong_currency = [money_line("1", "USD", 2, "CR")];
+    assert!(matches!(
+        super::settled_total(&wrong_currency, &eur),
+        Err(crate::domain::model::RepoError::Money(
+            bss_ledger_sdk::MoneyError::CurrencyMismatch
+        ))
+    ));
+    let empty = super::settled_total(&[], &eur).unwrap();
+    assert_eq!(empty.amount(), rust_decimal::Decimal::ZERO);
+    assert_eq!(empty.currency(), &eur);
+}
+
+#[test]
+fn settlement_total_narrows_only_after_all_cancellation() {
+    let eur = bss_ledger_sdk::CurrencySpec::try_new("EUR".to_owned(), 2).unwrap();
+    let max = "99999999999999999999999999.99";
+    let lines = [
+        money_line(max, "EUR", 2, "CR"),
+        money_line(max, "EUR", 2, "CR"),
+        money_line(max, "EUR", 2, "DR"),
+    ];
+    assert_eq!(
+        super::settled_total(&lines, &eur)
+            .unwrap()
+            .amount()
+            .to_string(),
+        max
+    );
+    assert!(matches!(
+        super::settled_total(&lines[..2], &eur),
+        Err(crate::domain::model::RepoError::Money(
+            bss_ledger_sdk::MoneyError::AmountOutOfRange
+        ))
+    ));
 }

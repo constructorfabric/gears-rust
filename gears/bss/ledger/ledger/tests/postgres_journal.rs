@@ -23,7 +23,6 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::JournalRepo;
@@ -35,9 +34,24 @@ use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
 
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
 /// Build an `ODataQuery` carrying just a `$filter` expression (parsed from the
 /// OData text), the way the REST `OData` extractor would. An empty query
 /// (`ODataQuery::default()`) lists everything in scope.
+/// The canonical stored TEXT of a cent count (`1000` ⇒ `"10"`, `5` ⇒ `"0.05"`).
+fn cents_text(minor: i64) -> String {
+    bss_ledger_sdk::canonical_decimal(rust_decimal::Decimal::new(minor, 2))
+}
+
 fn odata_filter(expr: &str) -> ODataQuery {
     let parsed = toolkit_odata::parse_filter_string(expr)
         .expect("test $filter must parse")
@@ -97,9 +111,10 @@ async fn insert_line(
     txn.execute_raw(exec(format!(
         "INSERT INTO bss.ledger_journal_line
             (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id,
-             account_class, side, amount_minor, currency, currency_scale, mapping_status)
+             account_class, side, amount, currency, currency_scale, mapping_status)
          VALUES ('{line_id}', '{entry_id}', '{tenant_id}', '{period_id}', '{tenant_id}',
-                 '{tenant_id}', 'AR', '{side}', {amount}, '{currency}', 2, 'RESOLVED')"
+                 '{tenant_id}', 'AR', '{side}', '{amount}', '{currency}', 2, 'RESOLVED')",
+        amount = cents_text(amount)
     )))
     .await
     .unwrap();
@@ -121,10 +136,11 @@ async fn insert_line_payer(
     txn.execute_raw(exec(format!(
         "INSERT INTO bss.ledger_journal_line
             (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id,
-             account_class, side, amount_minor, currency, currency_scale, mapping_status)
+             account_class, side, amount, currency, currency_scale, mapping_status)
          VALUES ('{}', '{entry_id}', '{tenant_id}', '{period_id}', '{payer_tenant_id}',
-                 '{tenant_id}', 'AR', '{side}', {amount}, '{currency}', 2, 'RESOLVED')",
-        Uuid::new_v4()
+                 '{tenant_id}', 'AR', '{side}', '{amount}', '{currency}', 2, 'RESOLVED')",
+        Uuid::new_v4(),
+        amount = cents_text(amount)
     )))
     .await
     .unwrap();
@@ -274,7 +290,7 @@ async fn append_only_rejects_update_and_delete() {
 
     let upd = db
         .execute_raw(exec(format!(
-            "UPDATE bss.ledger_journal_line SET amount_minor = 5 WHERE line_id = '{line_id}'"
+            "UPDATE bss.ledger_journal_line SET amount = '0.05' WHERE line_id = '{line_id}'"
         )))
         .await
         .expect_err("UPDATE on append-only line must be rejected");
@@ -436,15 +452,12 @@ fn read_line(
         account_class: class,
         gl_code: None,
         side,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd_cents(amount),
         invoice_id: invoice_id.map(str::to_owned),
         due_date: invoice_id.map(|_| f.due_date),
         revenue_stream: revenue_stream.map(str::to_owned),
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: tax.map(|(j, _)| j.to_owned()),
         tax_filing_period: tax.map(|(_, p)| p.to_owned()),
         tax_rate_ref: None,
@@ -489,8 +502,7 @@ async fn setup_posted_invoice(url: &str) -> (DatabaseConnection, DBProvider<DbEr
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -623,14 +635,17 @@ async fn a_one_row_walk_under_account_class_visits_both_currencies_of_an_account
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: f.tenant,
             currency: "EUR".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
         .unwrap();
     let in_eur = |mut line: NewLine| {
-        line.currency = "EUR".to_owned();
+        line.money = bss_ledger_sdk::PostedMoney::try_new(
+            line.money.amount(),
+            bss_ledger_sdk::CurrencySpec::try_new("EUR".to_owned(), 2).unwrap(),
+        )
+        .unwrap();
         line
     };
     let entry = NewEntry {
@@ -807,7 +822,7 @@ async fn reads_return_entry_lines_balances_and_ar_invoice() {
         .iter()
         .find(|b| b.account_id == f.ar_account)
         .expect("AR balance present");
-    assert_eq!(ar.balance_minor, 1200, "AR balance = gross 1200");
+    assert_eq!(ar.balance, "12", "AR balance = gross 12.00");
 
     // list_balances filtered by class = REVENUE (OData `$filter`).
     let rev_only = repo
@@ -819,7 +834,7 @@ async fn reads_return_entry_lines_balances_and_ar_invoice() {
         .await
         .expect("list revenue balance");
     assert_eq!(rev_only.items.len(), 1, "only the revenue balance");
-    assert_eq!(rev_only.items[0].balance_minor, 1000);
+    assert_eq!(rev_only.items[0].balance, "10");
 
     // list_ar_invoice_balances: the AR-invoice grain with its due_date.
     let ar_invoices = repo
@@ -828,7 +843,7 @@ async fn reads_return_entry_lines_balances_and_ar_invoice() {
         .expect("list ar invoice balances");
     assert_eq!(ar_invoices.len(), 1, "one AR-invoice row");
     assert_eq!(ar_invoices[0].invoice_id, f.invoice_id);
-    assert_eq!(ar_invoices[0].balance_minor, 1200);
+    assert_eq!(ar_invoices[0].balance, "12");
     // Decision P: the projector now threads the AR LINE's due_date onto the
     // ar_invoice_balance cache row (first-write-wins), so the cache read
     // surfaces the same date `build_invoice_entry` stamped — closing the latent

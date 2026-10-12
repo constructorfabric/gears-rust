@@ -1071,3 +1071,12 @@ pattern = "Traceability"
 description = "Links to future PRD and DESIGN."
 required = true
 multiple = false
+
+# CDSL clarity rules (S.6, S.7, CL.1-CL.4) are advisory for Gears FEATURE documents:
+# operators such as `==` and typed identifiers keep a step precise, so the kit
+# reports them as warnings instead of gating validation on them.
+[artifacts.FEATURE.validation.severity]
+"cdsl-language-operator" = "warning"
+"cdsl-not-plain-english" = "warning"
+"cdsl-type-annotation" = "warning"
+"cdsl-code-syntax" = "warning"

@@ -188,7 +188,7 @@ async fn period_closure(
             });
             let facts = OperationFacts {
                 kind: ApprovalKind::PeriodReopen,
-                amount_usd_eq_minor: None,
+                amount: None,
                 effective_at: None,
                 has_outstanding_balance: false,
             };

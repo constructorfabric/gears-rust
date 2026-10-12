@@ -15,8 +15,10 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub rate_id: Uuid,
     pub base_currency: String,
+    pub base_currency_scale: i16,
     pub quote_currency: String,
-    pub rate_micro: i64,
+    pub quote_currency_scale: i16,
+    pub rate: String,
     pub as_of: OffsetDateTime,
     pub provider: String,
     pub stale: bool,

@@ -35,8 +35,8 @@
 //!   exceed its open balance; enforced here by [`validate_credit_targets`] against
 //!   the open candidate set the orchestrator supplies.
 //!
-//! Pure throughout (no infra / DB imports — dylint DE0301): sums fold through
-//! `i128` to dodge an intermediate overflow. The emitted lines carry a placeholder
+//! Pure throughout (no infra / DB imports — dylint DE0301): sums and caps use
+//! exact fractions, with only final posted amounts narrowed. The emitted lines carry a placeholder
 //! nil `account_id` (the `crate::infra` orchestrator binds the real chart row from
 //! `(account_class, currency)` before posting) and placeholder header fields it
 //! likewise overwrites (`period_id`, `posted_by_actor_id`, `correlation_id`, and
@@ -44,6 +44,11 @@
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, PostEntry, PostLine, Side, SourceDocType};
 
+use crate::domain::exact_money::{
+    ExactAmount, map_exact_error, matching_currency, matching_spec, sum_posted,
+};
+use bss_ledger_sdk::PostedMoney;
+use rust_decimal::Decimal;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -66,10 +71,8 @@ pub struct GrantInput {
     pub payer_tenant_id: Uuid,
     /// The `CREDIT_APPLY` idempotency business id (`source_business_id`).
     pub credit_application_id: String,
-    /// ISO currency of the grant (every line shares it).
-    pub currency: String,
-    /// Amount to park into the wallet in minor units. Must be `> 0`.
-    pub amount_minor: i64,
+    /// Amount to park into the wallet in major units. Must be `> 0`.
+    pub amount: PostedMoney,
     /// The wallet sub-grain bucket the credit accrues to (carried on the
     /// `REUSABLE_CREDIT` line). Must be non-empty.
     pub credit_grant_event_type: String,
@@ -86,13 +89,13 @@ pub struct GrantInput {
 pub struct CreditSubgrain {
     /// The sub-grain bucket (matches a grant's `credit_grant_event_type`).
     pub credit_grant_event_type: String,
-    /// Remaining available credit in this sub-grain, minor units. Non-positive
+    /// Remaining available credit in this sub-grain, major units. Non-positive
     /// availabilities are skipped during the fill.
-    pub available_minor: i64,
+    pub available: PostedMoney,
 }
 
 /// One per-sub-grain debit the apply will post: a `REUSABLE_CREDIT` draw-down of
-/// `amount_minor` from the named sub-grain. Always `> 0` (the planner never emits
+/// `amount` from the named sub-grain. Always `> 0` (the planner never emits
 /// a zero debit). Consumed by [`build_apply_entry`].
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,8 +103,8 @@ pub struct CreditDebit {
     /// The sub-grain this draw-down comes from (carried onto the DR
     /// `REUSABLE_CREDIT` line's `credit_grant_event_type`).
     pub credit_grant_event_type: String,
-    /// Amount drawn from this sub-grain in minor units (always `> 0`).
-    pub amount_minor: i64,
+    /// Amount drawn from this sub-grain in major units (always `> 0`).
+    pub amount: PostedMoney,
 }
 
 /// Build the balanced credit-grant entry for `input`.
@@ -115,13 +118,14 @@ pub struct CreditDebit {
 /// (= amount)`.
 ///
 /// # Errors
-/// [`DomainError::InvalidRequest`] when `amount_minor <= 0` or
+/// Money metadata conflicts and final posting-range failures retain their named domain errors.
+/// [`DomainError::InvalidRequest`] when `amount <= 0` or
 /// `credit_grant_event_type` is empty (an unrepresentable / unbucketed grant).
 pub fn build_grant_entry(input: &GrantInput) -> Result<PostEntry, DomainError> {
-    if input.amount_minor <= 0 {
+    if input.amount.amount() <= Decimal::ZERO {
         return Err(DomainError::InvalidRequest(format!(
-            "credit grant amount_minor must be > 0, got {}",
-            input.amount_minor
+            "credit grant amount must be > 0, got {}",
+            input.amount
         )));
     }
     if input.credit_grant_event_type.is_empty() {
@@ -134,7 +138,7 @@ pub fn build_grant_entry(input: &GrantInput) -> Result<PostEntry, DomainError> {
     // currency; only the class / side / amount / event-type differ per line.
     let line = |account_class: AccountClass,
                 side: Side,
-                amount_minor: i64,
+                amount: PostedMoney,
                 credit_grant_event_type: Option<String>| PostLine {
         line_id: Uuid::now_v7(),
         payer_tenant_id: input.payer_tenant_id,
@@ -144,14 +148,12 @@ pub fn build_grant_entry(input: &GrantInput) -> Result<PostEntry, DomainError> {
         account_class,
         gl_code: None,
         side,
-        amount_minor,
-        currency: input.currency.clone(),
+        money: amount,
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -171,13 +173,13 @@ pub fn build_grant_entry(input: &GrantInput) -> Result<PostEntry, DomainError> {
         line(
             AccountClass::Unallocated,
             Side::Debit,
-            input.amount_minor,
+            input.amount.clone(),
             None,
         ),
         line(
             AccountClass::ReusableCredit,
             Side::Credit,
-            input.amount_minor,
+            input.amount.clone(),
             Some(input.credit_grant_event_type.clone()),
         ),
     ];
@@ -189,7 +191,7 @@ pub fn build_grant_entry(input: &GrantInput) -> Result<PostEntry, DomainError> {
         // posting (period, actor/correlation, and a real effective date for the
         // `None` case) — mirrors the nil account_id.
         period_id: String::new(),
-        entry_currency: input.currency.clone(),
+        entry_currency: input.amount.currency().code().to_owned(),
         source_doc_type: SourceDocType::CreditApply,
         source_business_id: input.credit_application_id.clone(),
         effective_at: input.effective_at.map_or(
@@ -204,64 +206,75 @@ pub fn build_grant_entry(input: &GrantInput) -> Result<PostEntry, DomainError> {
     })
 }
 
-/// Plan a wallet spend of `amount_minor` across `subgrains` IN THE GIVEN ORDER
+/// Plan a wallet spend of `amount` across `subgrains` IN THE GIVEN ORDER
 /// (the caller sorts oldest-grant-first; this never reorders).
 ///
 /// Walks `subgrains` in order, taking `give = min(remaining, available)` from
-/// each, skipping any with `available_minor <= 0`, and stopping once `remaining`
+/// each, skipping any with `available <= 0`, and stopping once `remaining`
 /// hits zero. Returns the per-sub-grain debits in fill order, positive amounts
 /// only (never a zero debit). The wallet-side cap is enforced here: the sub-grain
 /// availabilities must cover the full amount.
 ///
 /// # Errors
-/// [`DomainError::CreditExceedsWallet`] when `Σ available_minor < amount_minor`
+/// [`DomainError::CreditExceedsWallet`] when `Σ available < amount`
 /// (the wallet cannot cover the spend); [`DomainError::InvalidRequest`] when
-/// `amount_minor <= 0` (an unrepresentable spend).
+/// `amount <= 0` (an unrepresentable spend).
 pub fn plan_wallet_debit(
     subgrains: &[CreditSubgrain],
-    amount_minor: i64,
+    amount: &PostedMoney,
 ) -> Result<Vec<CreditDebit>, DomainError> {
-    if amount_minor <= 0 {
-        return Err(DomainError::InvalidRequest(format!(
-            "wallet debit amount_minor must be > 0, got {amount_minor}"
-        )));
-    }
-
-    // Total available across the sub-grains (the wallet cap). Widened to i128
-    // while folding to dodge an intermediate overflow; non-positive availabilities
-    // contribute nothing to spendable capacity, so clamp them at 0 here exactly as
-    // the fill below skips them.
-    let available_total: i128 = subgrains
-        .iter()
-        .map(|s| i128::from(s.available_minor.max(0)))
-        .sum();
-    if available_total < i128::from(amount_minor) {
-        return Err(DomainError::CreditExceedsWallet(format!(
-            "wallet debit {amount_minor} exceeds available {available_total}"
-        )));
-    }
-
-    // Fill in the given order: each sub-grain gives min(remaining, available),
-    // skipping non-positive availabilities, stopping at 0. The cap check above
-    // guarantees `remaining` reaches 0 before the list is exhausted.
-    let mut remaining = amount_minor;
-    let mut out: Vec<CreditDebit> = Vec::new();
     for sg in subgrains {
-        if remaining == 0 {
+        matching_spec(amount, &sg.available)?;
+    }
+    if amount.amount() <= Decimal::ZERO {
+        return Err(DomainError::InvalidRequest(format!(
+            "wallet debit must be > 0, got {amount}"
+        )));
+    }
+    let mut capacity = ExactAmount::from_decimal(Decimal::ZERO);
+    for sg in subgrains {
+        if sg.available.amount() > Decimal::ZERO {
+            capacity = capacity
+                .checked_add(&ExactAmount::from_decimal(sg.available.amount()))
+                .map_err(map_exact_error)?;
+        }
+    }
+    let mut remaining = ExactAmount::from_decimal(amount.amount());
+    if capacity
+        .checked_sub(&remaining)
+        .map_err(map_exact_error)?
+        .is_negative()
+    {
+        return Err(DomainError::CreditExceedsWallet(format!(
+            "wallet debit {amount} exceeds available {capacity}"
+        )));
+    }
+    let zero = ExactAmount::from_decimal(Decimal::ZERO);
+    let mut out = Vec::new();
+    for sg in subgrains {
+        if remaining == zero {
             break;
         }
-        // Nothing available ⇒ nothing to draw (and never a negative debit).
-        if sg.available_minor <= 0 {
+        if sg.available.amount() <= Decimal::ZERO {
             continue;
         }
-        let give = remaining.min(sg.available_minor);
-        if give > 0 {
-            out.push(CreditDebit {
-                credit_grant_event_type: sg.credit_grant_event_type.clone(),
-                amount_minor: give,
-            });
-            remaining -= give;
-        }
+        let available = ExactAmount::from_decimal(sg.available.amount());
+        let give = if remaining
+            .checked_sub(&available)
+            .map_err(map_exact_error)?
+            .is_negative()
+        {
+            remaining.clone()
+        } else {
+            available
+        };
+        remaining = remaining.checked_sub(&give).map_err(map_exact_error)?;
+        out.push(CreditDebit {
+            credit_grant_event_type: sg.credit_grant_event_type.clone(),
+            amount: give
+                .into_posted_exact(amount.currency().clone())
+                .map_err(map_exact_error)?,
+        });
     }
     Ok(out)
 }
@@ -272,26 +285,39 @@ pub fn plan_wallet_debit(
 /// check (the wallet-side cap is [`plan_wallet_debit`], not a single lump) and a
 /// `CreditExceedsOpenAr` error.
 ///
-/// Each target must name a present candidate with `open_minor > 0`, carry `0 <
-/// amount_minor <= that candidate's open_minor`, and appear at most once. On
+/// Each target must name a present candidate with `open > 0`, carry `0 <
+/// amount <= that candidate's open`, and appear at most once. On
 /// success the validated targets are returned in the caller's order (the order
 /// the resulting CR AR lines are built in) — never reordered or coalesced.
 ///
 /// # Errors
 /// [`DomainError::CreditExceedsOpenAr`] when any target names an unknown or closed
-/// (`open_minor <= 0`) candidate, exceeds that candidate's open balance, is
+/// (`open <= 0`) candidate, exceeds that candidate's open balance, is
 /// non-positive, or repeats an invoice.
 pub fn validate_credit_targets(
     candidates: &[Candidate],
     targets: &[Allocated],
 ) -> Result<Vec<Allocated>, DomainError> {
+    // Empty sets have no invented currency. Any supplied values define the context.
+    if let Some(basis) = candidates
+        .first()
+        .map(|c| &c.open)
+        .or_else(|| targets.first().map(|t| &t.amount))
+    {
+        for c in candidates {
+            matching_spec(basis, &c.open)?;
+        }
+        for t in targets {
+            matching_spec(basis, &t.amount)?;
+        }
+    }
     let mut seen: Vec<&str> = Vec::with_capacity(targets.len());
     for target in targets {
         // Reject a duplicate invoice_id: two targets for the same receivable are
         // ambiguous (which CR AR line wins?), so the apply path must not emit one.
         if seen.contains(&target.invoice_id.as_str()) {
             return Err(DomainError::CreditExceedsOpenAr(format!(
-                "duplicate invoice {} in credit targets",
+                "duplicate invoice {:?} in credit targets",
                 target.invoice_id
             )));
         }
@@ -299,10 +325,10 @@ pub fn validate_credit_targets(
 
         // Each target must be representable and positive — a zero/negative
         // application is meaningless.
-        if target.amount_minor <= 0 {
+        if target.amount.amount() <= Decimal::ZERO {
             return Err(DomainError::CreditExceedsOpenAr(format!(
-                "credit target for invoice {} must be > 0, got {}",
-                target.invoice_id, target.amount_minor
+                "credit target for invoice {:?} must be > 0, got {}",
+                target.invoice_id, target.amount
             )));
         }
 
@@ -313,20 +339,20 @@ pub fn validate_credit_targets(
             .find(|c| c.invoice_id == target.invoice_id)
             .ok_or_else(|| {
                 DomainError::CreditExceedsOpenAr(format!(
-                    "credit target names invoice {} which is not an open candidate",
+                    "credit target names invoice {:?} which is not an open candidate",
                     target.invoice_id
                 ))
             })?;
-        if candidate.open_minor <= 0 {
+        if candidate.open.amount() <= Decimal::ZERO {
             return Err(DomainError::CreditExceedsOpenAr(format!(
-                "credit target names invoice {} which is closed (open {})",
-                target.invoice_id, candidate.open_minor
+                "credit target names invoice {:?} which is closed (open {})",
+                target.invoice_id, candidate.open
             )));
         }
-        if target.amount_minor > candidate.open_minor {
+        if target.amount.amount() > candidate.open.amount() {
             return Err(DomainError::CreditExceedsOpenAr(format!(
-                "credit target for invoice {} ({}) exceeds its open balance ({})",
-                target.invoice_id, target.amount_minor, candidate.open_minor
+                "credit target for invoice {:?} ({}) exceeds its open balance ({})",
+                target.invoice_id, target.amount, candidate.open
             )));
         }
     }
@@ -348,13 +374,13 @@ pub struct ApplyInput {
     pub payer_tenant_id: Uuid,
     /// The `CREDIT_APPLY` idempotency business id (`source_business_id`).
     pub credit_application_id: String,
-    /// ISO currency of the application (every line shares it).
-    pub currency: String,
+    /// Declared currency and stored scale; every debit and target must match both.
+    pub currency: bss_ledger_sdk::CurrencySpec,
     /// The DR side: per-sub-grain wallet draw-downs (from `plan_wallet_debit`).
-    /// Must be non-empty and every `amount_minor` must be `> 0`.
+    /// Must be non-empty and every `amount` must be `> 0`.
     pub debits: Vec<CreditDebit>,
     /// The CR side: per-invoice receivable shares (from `validate_credit_targets`).
-    /// Must be non-empty and every `amount_minor` must be `> 0`.
+    /// Must be non-empty and every `amount` must be `> 0`.
     pub targets: Vec<Allocated>,
     /// Application instant. `None` ⇒ a placeholder effective date the orchestrator
     /// overwrites before posting (see module docs).
@@ -377,6 +403,12 @@ pub struct ApplyInput {
 /// two sides are equal (it sizes the debit plan to the targets); this is the
 /// balance backstop that refuses to post an unbalanced entry.
 pub fn build_apply_entry(input: &ApplyInput) -> Result<PostEntry, DomainError> {
+    for debit in &input.debits {
+        matching_currency(&input.currency, debit.amount.currency())?;
+    }
+    for target in &input.targets {
+        matching_currency(&input.currency, target.amount.currency())?;
+    }
     if input.debits.is_empty() {
         return Err(DomainError::InvalidRequest(
             "credit apply has no debits".to_owned(),
@@ -388,37 +420,30 @@ pub fn build_apply_entry(input: &ApplyInput) -> Result<PostEntry, DomainError> {
         ));
     }
     for debit in &input.debits {
-        if debit.amount_minor <= 0 {
+        if debit.amount.amount() <= Decimal::ZERO {
             return Err(DomainError::InvalidRequest(format!(
-                "credit apply debit for sub-grain {} must be > 0, got {}",
-                debit.credit_grant_event_type, debit.amount_minor
+                "credit apply debit for sub-grain {:?} must be > 0, got {}",
+                debit.credit_grant_event_type, debit.amount
             )));
         }
     }
     for target in &input.targets {
-        if target.amount_minor <= 0 {
+        if target.amount.amount() <= Decimal::ZERO {
             return Err(DomainError::InvalidRequest(format!(
-                "credit apply target for invoice {} must be > 0, got {}",
-                target.invoice_id, target.amount_minor
+                "credit apply target for invoice {:?} must be > 0, got {}",
+                target.invoice_id, target.amount
             )));
         }
     }
 
-    // Σ DR (wallet draw-downs) must equal Σ CR (receivable shares). Both folds are
-    // widened to i128 to dodge an intermediate overflow before the comparison.
-    let debit_total: i128 = input
-        .debits
-        .iter()
-        .map(|d| i128::from(d.amount_minor))
-        .sum();
-    let credit_total: i128 = input
-        .targets
-        .iter()
-        .map(|t| i128::from(t.amount_minor))
-        .sum();
+    // The specs were checked above; the sums fold the amounts by reference.
+    let debit_total = sum_posted(input.debits.iter().map(|d| &d.amount), &input.currency)
+        .map_err(map_exact_error)?;
+    let credit_total = sum_posted(input.targets.iter().map(|t| &t.amount), &input.currency)
+        .map_err(map_exact_error)?;
     if debit_total != credit_total {
         return Err(DomainError::InvalidRequest(format!(
-            "credit apply does not balance: Σ debits {debit_total} != Σ targets {credit_total}"
+            "credit apply does not balance: {debit_total} != {credit_total}"
         )));
     }
 
@@ -426,7 +451,7 @@ pub fn build_apply_entry(input: &ApplyInput) -> Result<PostEntry, DomainError> {
     // currency; only the class / side / amount / invoice_id / event-type differ.
     let line = |account_class: AccountClass,
                 side: Side,
-                amount_minor: i64,
+                amount: PostedMoney,
                 invoice_id: Option<String>,
                 credit_grant_event_type: Option<String>| PostLine {
         line_id: Uuid::now_v7(),
@@ -437,14 +462,12 @@ pub fn build_apply_entry(input: &ApplyInput) -> Result<PostEntry, DomainError> {
         account_class,
         gl_code: None,
         side,
-        amount_minor,
-        currency: input.currency.clone(),
+        money: amount,
         invoice_id,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -465,7 +488,7 @@ pub fn build_apply_entry(input: &ApplyInput) -> Result<PostEntry, DomainError> {
         lines.push(line(
             AccountClass::ReusableCredit,
             Side::Debit,
-            debit.amount_minor,
+            debit.amount.clone(),
             None,
             Some(debit.credit_grant_event_type.clone()),
         ));
@@ -474,7 +497,7 @@ pub fn build_apply_entry(input: &ApplyInput) -> Result<PostEntry, DomainError> {
         lines.push(line(
             AccountClass::Ar,
             Side::Credit,
-            target.amount_minor,
+            target.amount.clone(),
             Some(target.invoice_id.clone()),
             None,
         ));
@@ -487,7 +510,7 @@ pub fn build_apply_entry(input: &ApplyInput) -> Result<PostEntry, DomainError> {
         // posting (period, actor/correlation, and a real effective date for the
         // `None` case) — mirrors the nil account_id.
         period_id: String::new(),
-        entry_currency: input.currency.clone(),
+        entry_currency: input.currency.code().to_owned(),
         source_doc_type: SourceDocType::CreditApply,
         source_business_id: input.credit_application_id.clone(),
         effective_at: input.effective_at.map_or(

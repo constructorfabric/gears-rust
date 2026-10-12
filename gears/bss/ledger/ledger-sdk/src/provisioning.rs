@@ -1,9 +1,10 @@
 //! Seller-provisioning request/response value types for the in-process
 //! data-access API. Infrastructure-free: the REST DTOs (in the gear) own
-//! serde/utoipa and map onto these. All amounts are `i64` minor units.
+//! serde/utoipa and map onto these. Money contracts use major units.
 
 use uuid::Uuid;
 
+use crate::CurrencySpec;
 use crate::enums::{AccountClass, Side};
 
 /// Fiscal-calendar granularity. MVP supports monthly periods only.
@@ -55,17 +56,10 @@ pub struct ProvisionAccount {
 /// One non-ISO currency-scale row to seed.
 #[derive(Clone, Debug)]
 pub struct ProvisionCurrencyScale {
-    pub currency: String,
-    /// Minor-unit scale (digits after the decimal point), e.g. `2` for USD,
-    /// `8` for BTC. Always a small non-negative number — `u8` makes a negative
-    /// or absurdly large scale unrepresentable.
-    pub minor_units: u8,
+    /// The currency code and its posting scale (0..=28, e.g. `2` for USD and
+    /// `8` for BTC), validated by construction.
+    pub currency: CurrencySpec,
     pub source: String,
-    /// Per-currency plausible maximum in MAJOR units, governing the `i64`
-    /// headroom guard at registration. `None` requests the default `10^12`
-    /// (max scale 6); a higher-precision currency (e.g. BTC scale 8) passes
-    /// a smaller cap (e.g. `21_000_000`) so its scale fits the headroom.
-    pub plausible_max_major: Option<i64>,
 }
 
 /// A full seller-provisioning request: the chart of accounts, non-ISO

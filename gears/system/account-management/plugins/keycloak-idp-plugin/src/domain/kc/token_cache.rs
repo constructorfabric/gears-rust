@@ -13,7 +13,10 @@ use dashmap::DashMap;
 use secrecy::SecretString;
 use toolkit_macros::domain_model;
 
+/// Per-realm cache of admin tokens, keyed by realm name.
 pub type RealmTokenEntries = DashMap<String, Arc<CachedToken>>;
+/// Per-realm in-flight refresh locks, keyed by realm name, used to
+/// single-flight concurrent token refreshes.
 pub type RealmInflightEntries = DashMap<String, Arc<tokio::sync::Mutex<()>>>;
 
 /// In-memory cached admin token + its realm-relative base URL.

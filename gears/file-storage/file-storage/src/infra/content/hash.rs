@@ -1,34 +1,17 @@
-//! Content hashing. P1 is locked to SHA-256 (ADR-0002); the hash backs version
-//! identity checks, the `expected_hash` upload constraint, and the opaque `ETag`.
+//! Content hashing (SHA-256, ADR-0002): version identity checks, the `expected_hash` upload
+//! constraint and the opaque `ETag`.
 //!
-//! **Not a cryptographic security control** (with one exception). This hash's
-//! job is integrity — catching storage/transport corruption and confirming a
-//! file was split into parts and uploaded/reassembled correctly — plus
-//! content-addressed identity/dedup. It is not used for signatures, key
-//! derivation, or password storage. The one exception is the `expected_hash`
-//! upload-verification path, which *is* security-relevant (it defends against
-//! a client falsely claiming a different object than it actually uploaded)
-//! and stays on SHA-256. Because the purpose is non-adversarial integrity/
-//! identity rather than a defended security boundary, it is **excluded from
-//! the FIPS claim** per `SECURITY.md §9` / file-storage ADR-0006 — not
-//! because of any non-Approved algorithm (there isn't one; both modes are
-//! SHA-256), but because it isn't a FIPS-scoped security function in the
-//! first place.
+//! This is an integrity/identity hash, not a signature or key-derivation primitive, and is
+//! excluded from the FIPS claim (ADR-0006); the `expected_hash` check also stays on SHA-256.
+//! Content hashing has two modes (both SHA-256): whole-object, implemented here, and the
+//! multipart offset-manifest composite (see `hash_mode`).
 //!
-//! Per ADR-0006, content hashing has two modes, both SHA-256: (1) whole-object
-//! `sha256(whole object)` for single-part uploads, and (2) a multipart
-//! offset-manifest composite over per-part SHA-256 digests. This module
-//! implements the whole-object mode.
-//!
-//! This is the **single** SHA-256 call site in the gear: it is on the DE0708
-//! FIPS-hasher allow-list (see `SECURITY.md §9`), so all `sha2` usage is
-//! confined here and reviewable in one place. Content addressing/integrity is
-//! the non-signature use the allow-list covers; the signed-URL signing
-//! primitive lives behind its own provider abstraction (ADR-0004).
+//! This is the only SHA-256 call site in the gear (the DE0708 FIPS-hasher allow-list); the
+//! signed-URL signing primitive lives behind its own provider abstraction (ADR-0004).
 
 use sha2::{Digest, Sha256};
 
-/// The P1 hash algorithm label stored on every version row.
+/// The hash algorithm label stored on every version row.
 pub const ALGORITHM: &str = "SHA-256";
 
 /// Compute the SHA-256 digest of `bytes` (32 raw bytes).
@@ -45,9 +28,8 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(sha256(bytes))
 }
 
-/// Compute the SHA-256 digest over a sequence of byte slices, hashed in order.
-/// Used to derive the opaque content `ETag` from a domain tag plus identifiers
-/// without allocating a concatenated buffer.
+/// SHA-256 over a sequence of byte slices, hashed in order (no concatenated buffer);
+/// used to derive the opaque content `ETag`.
 #[must_use]
 pub fn sha256_parts(parts: &[&[u8]]) -> Vec<u8> {
     let mut hasher = Sha256::new();
@@ -57,15 +39,10 @@ pub fn sha256_parts(parts: &[&[u8]]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-/// Convert a SHA-256 digest (`sha256`/`sha256_parts`/`Hasher::finalize` all
-/// return a `Vec<u8>` for historical/allocation reasons) into a fixed-size
-/// array, for call sites (e.g. `StorageBackend::put_stream`) that want a
-/// `Copy`-able, statically-sized digest type instead.
+/// Convert a SHA-256 digest `Vec` into a fixed-size array.
 ///
 /// # Panics
-/// Panics if `digest` is not exactly 32 bytes. This is an internal-invariant
-/// check, not a reachable runtime condition: every digest producer in this
-/// module is SHA-256, which always yields 32 bytes.
+/// Panics if `digest` is not exactly 32 bytes (an internal invariant; SHA-256 always yields 32).
 #[must_use]
 pub fn digest_to_array(digest: Vec<u8>) -> [u8; 32] {
     digest

@@ -1,31 +1,5 @@
-//! Direct-split invoice-entry builder (architecture §5.1, **Variant A** +
-//! Slice 4 deferral split). Turns an invoice into a balanced [`PostEntry`]:
-//!
-//! - **DR AR** — one line for the gross receivable (`Σ items ex-tax + Σ tax`).
-//! - **CR Revenue** — one line per `revenue_stream` (grouped sum of the
-//!   *recognized-now* portion of the ex-tax item amounts in that stream —
-//!   `amount − deferred`), carrying the resolved [`MappedLine`] class/status.
-//! - **CR Contract-liability** — one line per `revenue_stream` whose items
-//!   defer a non-zero amount (the grouped `Σ deferred` in that stream), same
-//!   `revenue_stream` as the Revenue line (per-stream disaggregation, §3.5).
-//! - **CR Tax** — one line per [`TaxBreakdown`], carrying its tax dims.
-//!
-//! **The deferral split (Slice 4, design §3.1 / Variant A) is driven entirely by
-//! [`InvoiceItem::deferred_minor`]** — the per-item deferred amount the
-//! recognition derivation ([`crate::domain::recognition`]) computes *before* the
-//! builder and threads in on each item. `deferred_minor == 0` for **every** item
-//! (the default, and the only case before Slice 4) emits NO Contract-liability
-//! line and is **byte-identical** to the prior Variant-A output — the public
-//! invoice-post contract is unchanged for non-deferred invoices.
-//!
-//! Money is pure `i64` summation: `Σ DR == Σ CR` exactly, no proportional split
-//! and no residual rounding (the segment residual is the recognition builder's
-//! concern; here `deferred` is already an exact per-item i64). Scale is NOT set
-//! here — the foundation `CurrencyScaleResolver` fills each line's
-//! `currency_scale` at post time, so every amount stays in the invoice's own
-//! minor units. The emitted lines carry a placeholder nil `account_id`; the
-//! posting glue binds the real chart row from
-//! `(account_class, currency, revenue_stream)` before posting.
+//! Exact major-unit invoice builder. Billing supplies posted tax and deferral amounts.
+//! Groups retain their existing dimensions and first-item source references.
 
 use std::collections::BTreeMap;
 
@@ -34,7 +8,10 @@ use chrono::NaiveDate;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use crate::domain::exact_money::{ExactAmount, ExactError, sum_posted};
 use crate::domain::invoice::mapping::MappedLine;
+use bss_ledger_sdk::money::{CurrencySpec, PostedMoney};
+use rust_decimal::Decimal;
 
 /// One billable line of an invoice, ex-tax. Carries the revenue dimensions the
 /// ledger posts on (`revenue_stream`, the optional Catalog/Contract mapping
@@ -46,20 +23,18 @@ use crate::domain::invoice::mapping::MappedLine;
 // from the storage + SDK contract.
 #[allow(clippy::struct_field_names)]
 pub struct InvoiceItem {
-    /// Ex-tax amount in the invoice's minor units. Must be `>= 0`.
-    pub amount_minor_ex_tax: i64,
-    /// The portion of [`Self::amount_minor_ex_tax`] deferred to
+    /// Ex-tax amount in the invoice's major units. Must be `>= 0`.
+    pub amount_ex_tax: PostedMoney,
+    /// The portion of [`Self::amount_ex_tax`] deferred to
     /// `CONTRACT_LIABILITY` (Slice 4). The recognition derivation
     /// ([`crate::domain::recognition::builder::ScheduleBuilder`]) computes this
     /// *before* the builder and threads it onto the item; the builder credits
     /// `amount − deferred` to Revenue and `deferred` to Contract-liability on the
     /// SAME `revenue_stream`. `0` (the default, and absence-of-recognition) ⇒ the
     /// whole amount recognizes now and NO Contract-liability line is emitted
-    /// (byte-identical to the pre-Slice-4 Variant-A output). Invariant:
-    /// `0 <= deferred_minor <= amount_minor_ex_tax`.
-    pub deferred_minor: i64,
-    /// ISO currency of the item (every item + tax shares the invoice currency).
-    pub currency: String,
+    /// (same accounting split as the pre-Slice-4 Variant-A output). Invariant:
+    /// `0 <= deferred <= amount_ex_tax`.
+    pub deferred: PostedMoney,
     /// Revenue stream this item books to — the grouping key for the CR Revenue
     /// lines, and (with the class) the chart-resolution key.
     pub revenue_stream: String,
@@ -72,13 +47,13 @@ pub struct InvoiceItem {
     /// Catalog GL code carried onto the posted line (audit / downstream GL).
     pub gl_code: Option<String>,
     /// The optional per-item ASC 606 recognition spec (Slice 4). `None` ⇒ the
-    /// item is fully recognized now (`deferred_minor` stays `0`, today's
+    /// item is fully recognized now (`deferred` stays `0`, today's
     /// Variant-A behaviour). When present, the orchestrator
-    /// ([`crate::infra::invoice_post`]) derives [`Self::deferred_minor`] + the
+    /// ([`crate::infra::invoice_post`]) derives [`Self::deferred`] + the
     /// schedule plan from it via the recognition
     /// [`ScheduleBuilder`](crate::domain::recognition::builder::ScheduleBuilder)
     /// *before* the builder runs. Carried on the domain item (not consumed by the
-    /// pure builder, which reads only the already-derived `deferred_minor`) so
+    /// pure builder, which reads only the already-derived `deferred`) so
     /// the orchestrator has the per-item context the derivation needs.
     pub recognition: Option<crate::domain::recognition::input::RecognitionInput>,
     /// Source-document refs threaded onto the journal line for lineage.
@@ -93,10 +68,8 @@ pub struct InvoiceItem {
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaxBreakdown {
-    /// Tax amount in the invoice's minor units. Must be `>= 0`.
-    pub amount_minor: i64,
-    /// ISO currency (matches the invoice currency).
-    pub currency: String,
+    /// Tax amount in the invoice's major units. Must be `>= 0`.
+    pub amount: PostedMoney,
     /// Filing jurisdiction (e.g. `"US-CA"`) — a `TAX_PAYABLE` sub-balance dim.
     pub tax_jurisdiction: String,
     /// Filing period (e.g. `"2026Q2"`) — the second `TAX_PAYABLE` sub-balance dim.
@@ -137,103 +110,137 @@ pub struct PostedInvoice {
     pub correlation_id: Uuid,
 }
 
+/// An invoice cannot be built from invalid money or incomplete mapping.
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InvoiceError {
+    /// There is no real currency specification for an empty invoice.
+    #[error("empty invoice")]
+    EmptyInvoice,
+    /// Mapping is positional and must cover every item exactly once.
+    #[error("one mapped line is required per invoice item")]
+    MappingLengthMismatch,
+    /// Ex-tax and tax amounts must be nonnegative.
+    #[error("invoice amount must be nonnegative")]
+    NegativeAmount,
+    /// Deferral must be between zero and the ex-tax item amount.
+    #[error("deferred amount must be between zero and item amount")]
+    InvalidDeferral,
+    /// Exact computation or final bounded money failed.
+    #[error(transparent)]
+    Exact(#[from] ExactError),
+}
+
+/// Validate code and stored scale before comparison or arithmetic, including zeros.
+fn matching(value: &PostedMoney, spec: &CurrencySpec) -> Result<(), ExactError> {
+    Ok(value.currency().ensure_same(spec)?)
+}
+
 impl PostedInvoice {
-    /// Entry currency = the invoice currency. Taken from the first item, else
-    /// the first tax breakdown; `None` for a degenerate empty invoice (rejected
-    /// downstream by the foundation empty-entry invariant).
+    /// Real entry currency, or none for an empty invoice.
     #[must_use]
     pub fn currency(&self) -> Option<&str> {
         self.items
             .first()
-            .map(|i| i.currency.as_str())
-            .or_else(|| self.tax.first().map(|t| t.currency.as_str()))
+            .map(|i| i.amount_ex_tax.currency().code())
+            .or_else(|| self.tax.first().map(|t| t.amount.currency().code()))
     }
 
-    /// Gross receivable in minor units: `Σ items ex-tax + Σ tax`. Pure `i64`
-    /// summation (widened to `i128` while folding to avoid an intermediate
-    /// overflow), the exact total the single DR AR line carries.
-    #[must_use]
-    pub fn gross_minor(&self) -> i64 {
-        let items: i128 = self
+    /// Validate all metadata and input signs before any comparison or fold.
+    fn validated_spec(&self) -> Result<CurrencySpec, InvoiceError> {
+        let spec = self
+            .items
+            .first()
+            .map(|i| i.amount_ex_tax.currency())
+            .or_else(|| self.tax.first().map(|t| t.amount.currency()))
+            .ok_or(InvoiceError::EmptyInvoice)?
+            .clone();
+        for item in &self.items {
+            matching(&item.amount_ex_tax, &spec)?;
+            matching(&item.deferred, &spec)?;
+        }
+        for tax in &self.tax {
+            matching(&tax.amount, &spec)?;
+        }
+        for item in &self.items {
+            if item.amount_ex_tax.amount() < Decimal::ZERO {
+                return Err(InvoiceError::NegativeAmount);
+            }
+            if item.deferred.amount() < Decimal::ZERO
+                || item.deferred.amount() > item.amount_ex_tax.amount()
+            {
+                return Err(InvoiceError::InvalidDeferral);
+            }
+        }
+        if self.tax.iter().any(|t| t.amount.amount() < Decimal::ZERO) {
+            return Err(InvoiceError::NegativeAmount);
+        }
+        Ok(spec)
+    }
+
+    /// Tax-inclusive gross, folded exactly and narrowed only at the final total.
+    /// # Errors
+    /// Rejects empty invoices, metadata/sign/deferral violations, and final overflow.
+    pub fn gross(&self) -> Result<PostedMoney, InvoiceError> {
+        let spec = self.validated_spec()?;
+        let values: Vec<_> = self
             .items
             .iter()
-            .map(|i| i128::from(i.amount_minor_ex_tax))
-            .sum();
-        let tax: i128 = self.tax.iter().map(|t| i128::from(t.amount_minor)).sum();
-        // The foundation headroom guard keeps a single invoice within i64; a
-        // pathological overflow saturates rather than panicking (the unbalanced
-        // / amount guards then reject the entry).
-        i64::try_from(items + tax).unwrap_or(i64::MAX)
+            .map(|i| i.amount_ex_tax.clone())
+            .chain(self.tax.iter().map(|t| t.amount.clone()))
+            .collect();
+        Ok(sum_posted(&values, spec)?)
     }
 }
 
-/// Build the balanced direct-split entry for `inv`, using `mapped[i]` as the
-/// resolved GL target of `inv.items[i]` (positional; lengths must match).
-///
-/// Lines: one DR AR (gross), one CR Revenue per distinct
-/// `(account_class, gl_code, mapping_status, revenue_stream)` group (summing the
-/// *recognized-now* `amount − deferred` of each item), one CR Contract-liability
-/// per `revenue_stream` whose items defer a non-zero amount (summing the per-item
-/// `deferred_minor`), one CR Tax per [`TaxBreakdown`]. The AR carries
-/// `invoice_id` + `due_date`; every Revenue / Contract-liability line carries its
-/// `revenue_stream`; every Tax line carries its dims. `source_doc_type =
-/// INVOICE_POST`, `source_business_id = invoice_id`, `reverses_* = None`.
-///
-/// **Deferral (Slice 4):** each item's [`InvoiceItem::deferred_minor`] (computed
-/// upstream by the recognition derivation) splits its stream's credit into
-/// Revenue (`amount − deferred`) + Contract-liability (`deferred`), same stream
-/// on both. When every item defers `0` (the default) NO Contract-liability line
-/// is emitted and the output is byte-identical to the pre-Slice-4 Variant-A
-/// entry. `Σ DR == Σ CR` stays exact (`i64`): the split only re-labels part of an
-/// already-balanced credit.
-///
-/// # Panics
-/// Debug-asserts `mapped.len() == inv.items.len()`; in release a length
-/// mismatch silently maps only the overlapping prefix (the glue always passes a
-/// 1:1 vector).
-#[must_use]
-pub fn build_invoice_entry(inv: &PostedInvoice, mapped: &[MappedLine]) -> PostEntry {
-    debug_assert_eq!(
-        mapped.len(),
-        inv.items.len(),
-        "one MappedLine per invoice item"
-    );
+/// Build the balanced invoice with deterministic revenue and deferred groups.
+/// # Errors
+/// Rejects missing mappings, invalid input money and overflowing final totals.
+pub fn build_invoice_entry(
+    inv: &PostedInvoice,
+    mapped: &[MappedLine],
+) -> Result<PostEntry, InvoiceError> {
+    if mapped.len() != inv.items.len() {
+        return Err(InvoiceError::MappingLengthMismatch);
+    }
+    let spec = inv.validated_spec()?;
+    let gross = inv.gross()?;
     let entry_id = Uuid::now_v7();
-    let currency = inv.currency().unwrap_or_default().to_owned();
+    let currency = spec.code().to_owned();
 
     // Worst case: 1 AR + one Revenue + one Contract-liability per item + one Tax
     // per breakdown.
     let mut lines: Vec<PostLine> = Vec::with_capacity(1 + 2 * inv.items.len() + inv.tax.len());
 
-    // DR AR — the gross receivable (incl. tax). Single payer per entry.
-    lines.push(PostLine {
-        line_id: Uuid::now_v7(),
-        payer_tenant_id: inv.payer_tenant_id,
-        seller_tenant_id: Some(inv.seller_tenant_id),
-        resource_tenant_id: inv.resource_tenant_id,
-        account_id: Uuid::nil(),
-        account_class: AccountClass::Ar,
-        gl_code: None,
-        side: Side::Debit,
-        amount_minor: inv.gross_minor(),
-        currency: currency.clone(),
-        invoice_id: Some(inv.invoice_id.clone()),
-        due_date: inv.due_date,
-        revenue_stream: None,
-        mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
-        tax_jurisdiction: None,
-        tax_filing_period: None,
-        tax_rate_ref: None,
-        invoice_item_ref: None,
-        sku_or_plan_ref: None,
-        price_id: None,
-        pricing_snapshot_ref: None,
-        po_allocation_group: None,
-        credit_grant_event_type: None,
-        ar_status: None,
-    });
+    // DR AR — the gross receivable (incl. tax). Omit zero postings.
+    if gross.amount() > Decimal::ZERO {
+        lines.push(PostLine {
+            line_id: Uuid::now_v7(),
+            payer_tenant_id: inv.payer_tenant_id,
+            seller_tenant_id: Some(inv.seller_tenant_id),
+            resource_tenant_id: inv.resource_tenant_id,
+            account_id: Uuid::nil(),
+            account_class: AccountClass::Ar,
+            gl_code: None,
+            side: Side::Debit,
+            money: gross,
+            invoice_id: Some(inv.invoice_id.clone()),
+            due_date: inv.due_date,
+            revenue_stream: None,
+            mapping_status: MappingStatus::Resolved,
+            functional_money: None,
+            tax_jurisdiction: None,
+            tax_filing_period: None,
+            tax_rate_ref: None,
+            invoice_item_ref: None,
+            sku_or_plan_ref: None,
+            price_id: None,
+            pricing_snapshot_ref: None,
+            po_allocation_group: None,
+            credit_grant_event_type: None,
+            ar_status: None,
+        });
+    }
 
     // CR Revenue — grouped by (class, gl_code, status, stream) so a SUSPENSE /
     // PENDING item never merges into a resolved revenue stream. Each item
@@ -245,23 +252,12 @@ pub fn build_invoice_entry(inv: &PostedInvoice, mapped: &[MappedLine]) -> PostEn
     // CR Contract-liability — the deferred portion, grouped by `revenue_stream`
     // only (the class is fixed `CONTRACT_LIABILITY`; the chart resolves it per
     // stream). Empty when every item defers `0`, so NO Contract-liability line is
-    // emitted and the entry is byte-identical to the pre-Slice-4 output.
+    // emitted and the accounting split matches the pre-Slice-4 output.
     let mut deferred: BTreeMap<String, DeferredAgg> = BTreeMap::new();
     for (item, m) in inv.items.iter().zip(mapped.iter()) {
-        // Clamp defensively: the recognition derivation guarantees
-        // `0 <= deferred <= amount`, but a malformed input must never produce a
-        // negative recognized-now credit (which would unbalance the entry) — the
-        // orchestrator validates the invariant before calling, and the
-        // foundation unbalanced guard is the backstop.
-        //
-        // `.max(0)` on the upper bound so a (rejected-at-the-boundary but
-        // domain-constructible) negative `amount_minor_ex_tax` cannot make this
-        // `clamp(0, negative)` panic with `min > max`; a negative amount then
-        // clamps deferred to 0 and the unbalanced guard rejects the entry.
-        let deferred_minor = item
-            .deferred_minor
-            .clamp(0, item.amount_minor_ex_tax.max(0));
-        let recognized_now = item.amount_minor_ex_tax - deferred_minor;
+        let deferred_amount = ExactAmount::from_decimal(item.deferred.amount());
+        let recognized_now =
+            ExactAmount::from_decimal(item.amount_ex_tax.amount()).checked_sub(&deferred_amount)?;
 
         // Key on the stored string forms (the SDK enums are not `Ord`, and a
         // BTreeMap key must be — the strings give a deterministic, stable line
@@ -273,21 +269,21 @@ pub fn build_invoice_entry(inv: &PostedInvoice, mapped: &[MappedLine]) -> PostEn
             revenue_stream: item.revenue_stream.clone(),
         };
         let agg = revenue.entry(key).or_insert_with(|| RevenueAgg {
-            amount_minor: 0,
+            amount: ExactAmount::from_decimal(Decimal::ZERO),
             account_class: m.account_class,
             gl_code: m.gl_code.clone(),
             mapping_status: m.mapping_status,
             // First item in the group seeds the line-level source refs.
             refs: ItemRefs::from(item),
         });
-        agg.amount_minor += i128::from(recognized_now);
+        agg.amount = agg.amount.checked_add(&recognized_now)?;
 
         // Fold the deferred remainder into its stream's Contract-liability line.
-        if deferred_minor > 0 {
+        if item.deferred.amount() > Decimal::ZERO {
             let cl = deferred
                 .entry(item.revenue_stream.clone())
                 .or_insert_with(|| DeferredAgg {
-                    amount_minor: 0,
+                    amount: ExactAmount::from_decimal(Decimal::ZERO),
                     // FORWARD-DEPENDENCY: the per-stream merge
                     // seeds refs from the FIRST deferring item, but `derive_recognition`
                     // mints one schedule PER item. With ≥2 deferring items in one
@@ -303,7 +299,7 @@ pub fn build_invoice_entry(inv: &PostedInvoice, mapped: &[MappedLine]) -> PostEn
                     // multi-item-per-stream test is the pending coverage.
                     refs: ItemRefs::from(item),
                 });
-            cl.amount_minor += i128::from(deferred_minor);
+            cl.amount = cl.amount.checked_add(&deferred_amount)?;
         }
     }
     for (key, agg) in revenue {
@@ -312,7 +308,7 @@ pub fn build_invoice_entry(inv: &PostedInvoice, mapped: &[MappedLine]) -> PostEn
         // deferred amount is carried by the CONTRACT_LIABILITY line below. (CL is
         // already only emitted for `deferred > 0`, so a fully-deferred item yields
         // a lone CONTRACT_LIABILITY credit, balanced against the AR/tax debit.)
-        if agg.amount_minor == 0 {
+        if agg.amount == ExactAmount::from_decimal(Decimal::ZERO) {
             continue;
         }
         lines.push(PostLine {
@@ -324,15 +320,13 @@ pub fn build_invoice_entry(inv: &PostedInvoice, mapped: &[MappedLine]) -> PostEn
             account_class: agg.account_class,
             gl_code: agg.gl_code,
             side: Side::Credit,
-            amount_minor: i64::try_from(agg.amount_minor).unwrap_or(i64::MAX),
-            currency: currency.clone(),
+            money: agg.amount.into_posted_exact(spec.clone())?,
             invoice_id: Some(inv.invoice_id.clone()),
             due_date: None,
             // Every Revenue line carries its stream (the DB CHECK requires it).
             revenue_stream: Some(key.revenue_stream),
             mapping_status: agg.mapping_status,
-            functional_amount_minor: None,
-            functional_currency: None,
+            functional_money: None,
             tax_jurisdiction: None,
             tax_filing_period: None,
             tax_rate_ref: None,
@@ -364,14 +358,12 @@ pub fn build_invoice_entry(inv: &PostedInvoice, mapped: &[MappedLine]) -> PostEn
             account_class: AccountClass::ContractLiability,
             gl_code: None,
             side: Side::Credit,
-            amount_minor: i64::try_from(agg.amount_minor).unwrap_or(i64::MAX),
-            currency: currency.clone(),
+            money: agg.amount.into_posted_exact(spec.clone())?,
             invoice_id: Some(inv.invoice_id.clone()),
             due_date: None,
             revenue_stream: Some(revenue_stream),
             mapping_status: MappingStatus::Resolved,
-            functional_amount_minor: None,
-            functional_currency: None,
+            functional_money: None,
             tax_jurisdiction: None,
             tax_filing_period: None,
             tax_rate_ref: None,
@@ -387,6 +379,9 @@ pub fn build_invoice_entry(inv: &PostedInvoice, mapped: &[MappedLine]) -> PostEn
 
     // CR Tax — one line per breakdown, carrying the filing dims.
     for t in &inv.tax {
+        if t.amount.amount().is_zero() {
+            continue;
+        }
         lines.push(PostLine {
             line_id: Uuid::now_v7(),
             payer_tenant_id: inv.payer_tenant_id,
@@ -396,14 +391,12 @@ pub fn build_invoice_entry(inv: &PostedInvoice, mapped: &[MappedLine]) -> PostEn
             account_class: AccountClass::TaxPayable,
             gl_code: None,
             side: Side::Credit,
-            amount_minor: t.amount_minor,
-            currency: currency.clone(),
+            money: t.amount.clone(),
             invoice_id: Some(inv.invoice_id.clone()),
             due_date: None,
             revenue_stream: None,
             mapping_status: MappingStatus::Resolved,
-            functional_amount_minor: None,
-            functional_currency: None,
+            functional_money: None,
             tax_jurisdiction: Some(t.tax_jurisdiction.clone()),
             tax_filing_period: Some(t.tax_filing_period.clone()),
             tax_rate_ref: t.tax_rate_ref.clone(),
@@ -417,7 +410,7 @@ pub fn build_invoice_entry(inv: &PostedInvoice, mapped: &[MappedLine]) -> PostEn
         });
     }
 
-    PostEntry {
+    Ok(PostEntry {
         entry_id,
         tenant_id: inv.seller_tenant_id,
         period_id: inv.period_id.clone(),
@@ -430,7 +423,7 @@ pub fn build_invoice_entry(inv: &PostedInvoice, mapped: &[MappedLine]) -> PostEn
         reverses_entry_id: None,
         reverses_period_id: None,
         lines,
-    }
+    })
 }
 
 /// Grouping key for the CR Revenue lines — the stored *string* forms of the
@@ -445,12 +438,11 @@ struct RevenueKey {
     revenue_stream: String,
 }
 
-/// Running fold of one revenue group: summed ex-tax amount (`i128` to avoid an
-/// intermediate overflow), the typed dims to emit on the line, and the first
+/// Running fold of one revenue group: summed ex-tax amount (exact until final narrowing), the typed dims to emit on the line, and the first
 /// item's source refs.
 #[domain_model]
 struct RevenueAgg {
-    amount_minor: i128,
+    amount: ExactAmount,
     account_class: AccountClass,
     gl_code: Option<String>,
     mapping_status: MappingStatus,
@@ -458,12 +450,12 @@ struct RevenueAgg {
 }
 
 /// Running fold of one stream's deferred (Contract-liability) credit: the summed
-/// deferred amount (`i128` to avoid an intermediate overflow) and the first
+/// deferred amount (exact until final narrowing) and the first
 /// deferring item's source refs. The class is fixed (`CONTRACT_LIABILITY`) and
 /// the stream is the map key, so neither is stored here.
 #[domain_model]
 struct DeferredAgg {
-    amount_minor: i128,
+    amount: ExactAmount,
     refs: ItemRefs,
 }
 

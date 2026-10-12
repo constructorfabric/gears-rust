@@ -12,6 +12,7 @@ pub const KIND_SKU_RETIRE: &str = "sku_retire";
 /// A kind of approval unit products records (P-D-227). No CHECK holds the stored column: the
 /// repository reads it through this set, so a unit of another kind is a corrupt row, never
 /// judged or served as one of these.
+#[toolkit_macros::domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[expect(
     clippy::enum_variant_names,

@@ -409,9 +409,10 @@ impl FxConfig {
 /// Reconciliation & period-close tunables (Slice 7 Phase 3, design §4.3 / §4.5).
 ///
 /// `recon_tick_secs` is the cadence of the `ReconciliationJob` ticker (near-real-time
-/// invoice-completeness watermark + the periodic AR/PSP checks). `ar_tolerance_minor_per_k_lines`
-/// is the AR↔derived rounding tolerance X4 (≤ N minor units per 1,000 posted lines; statutory
-/// floors override — not modelled here). `manifest_enforcement` / `bill_run_enforcement` gate
+/// invoice-completeness watermark + the periodic AR/PSP checks).
+/// `ar_tolerance_increments_per_k_lines` is the AR↔derived rounding tolerance X4 (≤ N posting
+/// increments — `10^-currency_scale` of each currency — per 1,000 posted lines, checked
+/// independently per currency; statutory floors override — not modelled here). `manifest_enforcement` / `bill_run_enforcement` gate
 /// whether the issued-invoice-manifest completeness check and the bill-run-finished assertion
 /// BLOCK period close — default OFF (fail-safe) until the launch-blocking cross-team feeds are
 /// live (design §0 decision 3 / §4.5 residual risk). `close_lock_timeout_ms` bounds the close
@@ -426,9 +427,13 @@ pub struct ReconConfig {
     /// tighter than the daily fiscal jobs so a missed posting / variance surfaces well
     /// before the close window.
     pub recon_tick_secs: u64,
-    /// AR↔derived tie-out tolerance: max minor units of rounding-only variance per 1,000
-    /// posted lines (X4). Default `1`.
-    pub ar_tolerance_minor_per_k_lines: u32,
+    /// AR↔derived tie-out tolerance: max posting increments (`10^-currency_scale`, so
+    /// `0.01` for a scale-2 currency and `1` for a scale-0 currency) of rounding-only
+    /// variance per 1,000 posted lines (X4), evaluated per currency. Default `1`.
+    /// The pre-decimal key name stays accepted, so an existing config keeps
+    /// loading (one posting increment is one former minor unit).
+    #[serde(alias = "ar_tolerance_minor_per_k_lines")]
+    pub ar_tolerance_increments_per_k_lines: u32,
     /// Block period close on an unresolved invoice-completeness gap (`MISSED_POSTING`).
     /// Default `false` (the manifest feed is launch-blocking cross-team; inert until live).
     pub manifest_enforcement: bool,
@@ -482,7 +487,7 @@ impl Default for ReconConfig {
     fn default() -> Self {
         Self {
             recon_tick_secs: 300,
-            ar_tolerance_minor_per_k_lines: 1,
+            ar_tolerance_increments_per_k_lines: 1,
             manifest_enforcement: false,
             bill_run_enforcement: false,
             close_lock_timeout_ms: 5_000,

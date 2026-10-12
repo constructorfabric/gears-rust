@@ -17,7 +17,7 @@ jobs:
       - name: Disable Git autocrlf
         run: git config --global core.autocrlf false
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Find CRLF
         run: |

@@ -10,3 +10,6 @@ pub mod idempotency;
 pub mod period;
 pub mod projector;
 pub mod service;
+
+pub(crate) mod error_transport;
+pub(crate) mod retry;

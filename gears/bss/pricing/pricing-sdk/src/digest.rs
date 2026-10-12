@@ -16,16 +16,21 @@ use rust_decimal::Decimal;
 use std::collections::{BTreeMap, BTreeSet};
 use toolkit_canonical_errors::CanonicalError;
 
-#[toolkit_canonical_errors::resource_error("gts.cf.bss.pricing.plan.v1~")]
+#[toolkit_canonical_errors::resource_error(gts_id!("cf.bss.pricing.plan.v1~"))]
 struct BindingResource;
 
 /// Restricted JSON: numeric meaning is always exact text before serialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CanonicalValue {
+    /// JSON `null`.
     Null,
+    /// JSON boolean.
     Bool(bool),
+    /// JSON string; also carries exact decimal and identifier text.
     String(String),
+    /// JSON array, encoded in element order.
     Array(Vec<Self>),
+    /// JSON object, encoded with keys sorted by UTF-16 code units.
     Object(BTreeMap<String, Self>),
 }
 use CanonicalValue as V;
@@ -111,11 +116,13 @@ fn encode(value: &V, out: &mut String) {
         }
     }
 }
+/// Encodes a value as canonical JSON bytes.
 pub(crate) fn canonical_json_bytes(value: &V) -> Vec<u8> {
     let mut out = String::new();
     encode(value, &mut out);
     out.into_bytes()
 }
+/// SHA-256 over the canonical `{domain, payload}` envelope, domain-separating digests.
 pub(crate) fn hash_document(domain: &str, payload: V) -> Digest {
     let bytes = canonical_json_bytes(&object([("domain", text(domain)), ("payload", payload)]));
     let hashed = sha256(&SHA256, &bytes);

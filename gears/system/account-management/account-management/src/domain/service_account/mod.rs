@@ -40,6 +40,12 @@
 pub mod service;
 // @cpt-end:cpt-cf-account-management-dod-service-accounts-no-local-storage:p1:inst-dod-sa-no-local-storage-module
 
+/// Public quota-refusal message shared by AM admission sources.
+///
+/// The quota subject identifies the limit; recovery depends on its policy.
+/// Do not expose provider diagnostics or promise that revocation is sufficient.
+pub(crate) const SA_QUOTA_MESSAGE: &str = "the tenant has reached its service-account limit";
+
 #[cfg(test)]
 pub(crate) mod test_support;
 

@@ -1,18 +1,5 @@
-//! Idempotency-replay authorization + identity-scoping tests (P2 remediation
-//! 0.10).
-//!
-//! `TenantOnlyAuthorizer` (used by `tests/multipart_test.rs`'s idempotency
-//! block) ignores `action` entirely, so it can never deny `WRITE` for a
-//! specific caller — it can't exercise "a caller whose WRITE was revoked
-//! mid-window must not be able to replay a stored ticket". This file
-//! duplicates a minimal `ScopedTestAuthorizer` test double (the pattern
-//! established in `tests/policy_authz_test.rs` / `tests/list_authz_test.rs`;
-//! each `tests/*.rs` file compiles as its own integration-test crate, so
-//! cross-file reuse would require a shared harness restructuring that's more
-//! invasive than the few lines duplicated below) that can deny `WRITE` for a
-//! specific *subject* — `create_file`'s authorize call always passes
-//! `file_id: None`, so the existing `deny_write_for_file` variant (keyed on
-//! `file_id`) can't be reused as-is.
+//! Idempotency-replay authorization and identity scoping.
+//! `ScopedTestAuthorizer` can deny `WRITE` per subject (`create_file` passes `file_id: None`).
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -38,11 +25,7 @@ use file_storage_sdk::{NewFile, OwnerKind};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
-// ── ScopedTestAuthorizer (minimal duplicate: WRITE deny keyed on subject,
-//    not file_id — see module docs) ─────────────────────────────────────────
-
-/// Grants `READ`/`WRITE`/`DELETE` unconditionally, *unless* a specific
-/// `subject_id` has been marked write-denied via `deny_write_for_subject`.
+/// Grants everything unless a `subject_id` has been marked write-denied.
 #[derive(Default)]
 struct ScopedTestAuthorizer {
     deny_write_for_subject: Mutex<Option<Uuid>>,
@@ -53,13 +36,10 @@ impl ScopedTestAuthorizer {
         Self::default()
     }
 
-    /// Mark a specific `subject_id` as `WRITE`-denied (all other subjects and
-    /// actions stay allowed). Used to simulate "the caller's WRITE grant was
-    /// revoked mid-window".
+    /// Mark `subject_id` as `WRITE`-denied.
     ///
     /// # Panics
-    /// Panics if the internal mutex is poisoned (a prior panic while held) —
-    /// not expected in single-threaded test bodies.
+    /// Panics if the mutex is poisoned.
     fn deny_write_for_subject(&self, subject_id: Uuid) {
         *self.deny_write_for_subject.lock().expect("lock poisoned") = Some(subject_id);
     }
@@ -84,8 +64,6 @@ impl Authorizer for ScopedTestAuthorizer {
         Ok(AccessScope::for_tenant(ctx.subject_tenant_id()))
     }
 }
-
-// ── test harness ─────────────────────────────────────────────────────────────
 
 async fn build_db() -> Arc<DBProvider<DbError>> {
     let mut path = std::env::temp_dir();
@@ -151,12 +129,7 @@ fn new_file(owner_id: Uuid) -> NewFile {
     }
 }
 
-// ── idempotency_replay_requires_authorization ───────────────────────────────
-
-/// A stored idempotency ticket must never be replayed to a caller whose
-/// `WRITE` grant has since been revoked. Before the 0.10 fix, the idempotency
-/// lookup + early return ran *before* `authorize(...)`, so a revoked caller
-/// could still retrieve a live signed upload URL.
+/// A revoked caller must not replay a stored ticket (authorize runs before the lookup).
 #[tokio::test]
 async fn idempotency_replay_requires_authorization() {
     let h = build_harness().await;
@@ -165,14 +138,12 @@ async fn idempotency_replay_requires_authorization() {
     let ctx_caller = ctx(tenant, subject);
     let key = "idem-authz-1".to_owned();
 
-    // Seed a ticket while WRITE is still granted.
     let first = h
         .file_svc
         .create_file(&ctx_caller, new_file(subject), Some(key.clone()))
         .await
         .expect("initial create should succeed while authorized");
 
-    // Revoke WRITE for this subject, then replay the same key.
     h.authz.deny_write_for_subject(subject);
     let replay = h
         .file_svc
@@ -183,17 +154,11 @@ async fn idempotency_replay_requires_authorization() {
         matches!(replay, Err(DomainError::Forbidden)),
         "expected Forbidden on replay after WRITE was revoked, got {replay:?}"
     );
-    // Sanity: the seeded ticket is real and distinct from any leaked value.
     assert_ne!(first.file_id, Uuid::nil());
 }
 
-// ── idempotency_key_scoped_to_subject ───────────────────────────────────────
-
-/// One caller's idempotency key must never surface another caller's ticket,
-/// even when both request bodies share the same `(owner_kind, owner_id, key)`
-/// tuple. The key is scoped by the request-body `owner_id`, not the caller,
-/// so a caller who guesses/reuses the tuple must be denied — not handed the
-/// original caller's stored ticket.
+/// The key is scoped to the caller: another caller reusing the same `(owner_kind, owner_id, key)`
+/// must be denied, not handed the stored ticket.
 #[tokio::test]
 async fn idempotency_key_scoped_to_subject() {
     let h = build_harness().await;
@@ -203,8 +168,7 @@ async fn idempotency_key_scoped_to_subject() {
     let ctx_a = ctx(tenant, subject_a);
     let ctx_b = ctx(tenant, subject_b);
 
-    // Both requests target the same owner_id (e.g. a shared resource owner)
-    // and the same key.
+    // Both requests share owner_id and key.
     let owner_id = subject_a;
     let key = "shared-key".to_owned();
 
@@ -214,8 +178,6 @@ async fn idempotency_key_scoped_to_subject() {
         .await
         .expect("caller A creates and stores the idempotency ticket");
 
-    // Caller B replays the same (owner_id, key) tuple. B must not receive A's
-    // ticket.
     let result_b = h
         .file_svc
         .create_file(&ctx_b, new_file(owner_id), Some(key.clone()))
@@ -229,7 +191,6 @@ async fn idempotency_key_scoped_to_subject() {
         Err(other) => panic!("unexpected error for caller B's replay: {other:?}"),
     }
 
-    // Caller A's own replay must still work unchanged.
     let replay_a = h
         .file_svc
         .create_file(&ctx_a, new_file(owner_id), Some(key))

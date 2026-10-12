@@ -1,13 +1,3 @@
-//! Tests for finalize-time server-side re-verification of size/hash (P2 0.1).
-//!
-//! Both finalize entry points — the user-context `finalize_upload` and the
-//! token-authenticated `finalize_upload_by_token` — must never persist a
-//! `size`/`hash_value` that was not independently derived from the bytes
-//! actually present at the version's backend path. A finalize call for a
-//! version with no prior successful `PUT`, or with a claimed size/hash that
-//! doesn't match the real blob, must be rejected and must leave the version
-//! row `pending`.
-
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
 use std::sync::Arc;
@@ -61,9 +51,7 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
     Arc::new(DBProvider::new(db))
 }
 
-/// Build `FileService` plus the raw `InMemoryBackend` handle (so tests can
-/// directly control `backend.get`/`put`) and the `Store` (for direct DB
-/// assertions on the version row).
+/// Returns the raw backend and `Store` so tests control the object and inspect the version row.
 async fn build_service() -> (Arc<FileService>, Arc<dyn StorageBackend>, Store) {
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -91,13 +79,7 @@ async fn build_service() -> (Arc<FileService>, Arc<dyn StorageBackend>, Store) {
     (svc, backend, store)
 }
 
-/// Build `FileService` + `MultipartService` sharing one store/backend, using
-/// a caller-supplied `Issuer` (P2 0.1 remaining handler-level tests below
-/// need a *real* signed token — unlike the service-layer tests above, which
-/// hand-build `Claims` and call `finalize_upload_by_token` directly,
-/// bypassing token verification). `svc.verifier()` (mirroring
-/// `handlers::finalize_version`'s own wiring in `routes.rs`) derives from
-/// this same issuer, so a token it mints verifies correctly.
+/// Shares one `Issuer` so handler-level tests can mint tokens the service's verifier accepts.
 async fn build_full_service_with_issuer(
     issuer: Arc<Issuer>,
 ) -> (
@@ -140,7 +122,6 @@ async fn build_full_service_with_issuer(
     (svc, msvc, backend, store)
 }
 
-/// Build an `x-fs-token`-only `HeaderMap` (no `x-fs-internal-token`).
 fn headers_with_token(token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -173,19 +154,12 @@ fn new_file_with_mime(mime_type: &str) -> NewFile {
     }
 }
 
-// Minimal PNG signature (8-byte magic) — recognized by `infer` as `image/png`.
 const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-// `%PDF-1.4` header — recognized by `infer` as `application/pdf`.
 const PDF_MAGIC: &[u8] = b"%PDF-1.4\n";
 
-/// The canonical backend path a pending version is created at
-/// (mirrors `FileService::backend_path`, `pub(super)` so not directly
-/// reachable from an external test crate).
 fn backend_path(file_id: Uuid, version_id: Uuid) -> String {
     format!("/{file_id}/{version_id}")
 }
-
-// -- 1. finalize_upload: no prior PUT is rejected ----------------------------
 
 #[tokio::test]
 async fn finalize_without_prior_put_is_rejected() {
@@ -193,7 +167,6 @@ async fn finalize_without_prior_put_is_rejected() {
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
 
-    // Nothing was ever `put` to the backend for this version.
     let err = svc
         .finalize_upload(&ctx, ticket.file_id, ticket.version_id, 100, vec![0u8; 32])
         .await
@@ -211,8 +184,6 @@ async fn finalize_without_prior_put_is_rejected() {
     assert_eq!(version.status, VersionStatus::Pending);
     assert_eq!(version.size, 0);
 }
-
-// -- 2. finalize_upload: size mismatch is rejected ---------------------------
 
 #[tokio::test]
 async fn finalize_size_mismatch_is_rejected() {
@@ -249,10 +220,9 @@ async fn finalize_size_mismatch_is_rejected() {
     assert_eq!(version.status, VersionStatus::Pending);
 }
 
-// -- 3. finalize_upload: hash mismatch is rejected ---------------------------
-
+/// Finalize trusts the sidecar-reported hash and does not recompute it.
 #[tokio::test]
-async fn finalize_hash_mismatch_is_rejected() {
+async fn finalize_persists_reported_hash() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
@@ -263,24 +233,26 @@ async fn finalize_hash_mismatch_is_rejected() {
         .await
         .unwrap();
 
-    let err = svc
-        .finalize_upload(&ctx, ticket.file_id, ticket.version_id, 5, vec![0u8; 32])
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, DomainError::HashMismatch { .. }),
-        "expected HashMismatch, got {err:?}"
-    );
+    let reported_hash = vec![0xabu8; 32];
+    svc.finalize_upload(
+        &ctx,
+        ticket.file_id,
+        ticket.version_id,
+        5,
+        reported_hash.clone(),
+    )
+    .await
+    .unwrap();
 
     let version = store
         .get_version(ticket.file_id, ticket.version_id)
         .await
         .unwrap()
-        .expect("version row must still exist");
-    assert_eq!(version.status, VersionStatus::Pending);
+        .expect("version row must exist");
+    assert_eq!(version.status, VersionStatus::Available);
+    assert_eq!(version.size, 5);
+    assert_eq!(version.hash_value, reported_hash);
 }
-
-// -- 4. finalize_upload: matching size+hash succeeds, persists read-back ----
 
 #[tokio::test]
 async fn finalize_matching_size_and_hash_succeeds() {
@@ -311,17 +283,10 @@ async fn finalize_matching_size_and_hash_succeeds() {
         .unwrap()
         .expect("version row must exist");
     assert_eq!(version.status, VersionStatus::Available);
-    // `finalize_upload` persists the caller's `hash_value` only after
-    // `Store::verify_content_hash` has proven it byte-for-byte equal to
-    // `sha256` of the read-back blob, so this independently recomputed hash
-    // must match the persisted value regardless of which of the two
-    // (guaranteed-identical) values the implementation happens to persist.
     let independently_recomputed = hash::sha256(&known_bytes);
     assert_eq!(version.size, true_size);
     assert_eq!(version.hash_value, independently_recomputed);
 }
-
-// -- 5. finalize_upload_by_token: no prior PUT is rejected -------------------
 
 #[tokio::test]
 async fn finalize_by_token_without_prior_put_is_rejected() {
@@ -329,8 +294,7 @@ async fn finalize_by_token_without_prior_put_is_rejected() {
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
 
-    // Hand-build claims mirroring how `handlers::finalize_version` constructs
-    // them after verifying the signed token (op == Put, file/version match).
+    // Claims mirror what `handlers::finalize_version` builds after verifying a signed token.
     let claims = Claims {
         op: Op::Put,
         file_id: ticket.file_id,
@@ -362,16 +326,10 @@ async fn finalize_by_token_without_prior_put_is_rejected() {
     assert_eq!(version.status, VersionStatus::Pending);
 }
 
-// -- 6. VersionRepo::finalize: second call on an Available row is a no-op ---
-// (P2 0.4 — status-guard CAS)
-
+/// Second `finalize` on an `Available` row is a no-op (status-guarded CAS). `file_versions.file_id`
+/// has an FK to `files`, so a real parent file is created first.
 #[tokio::test]
 async fn version_repo_finalize_twice_second_call_returns_false() {
-    // `file_versions.file_id` carries a `REFERENCES files (file_id)` FK, so a
-    // repo-level version row still needs a real parent file row. Build the db
-    // directly (rather than via `build_service()`) so this test keeps its own
-    // `DBProvider` handle for `.conn()`, and go through a `FileService` on the
-    // same db just once to create that parent file row.
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
@@ -467,9 +425,7 @@ async fn version_repo_finalize_twice_second_call_returns_false() {
     assert_eq!(row.status, VersionStatus::Available);
 }
 
-// -- 7. finalize_upload: already-finalized version yields Conflict (409) ----
-// (P2 0.4 — distinguishes double-finalize from a genuinely missing row)
-
+/// Replays the same correct size/hash so it reaches the repo-level CAS, which must conflict.
 #[tokio::test]
 async fn finalize_upload_after_already_available_returns_conflict() {
     let (svc, backend, store) = build_service().await;
@@ -483,7 +439,6 @@ async fn finalize_upload_after_already_available_returns_conflict() {
     let true_size = i64::try_from(known_bytes.len()).unwrap();
     let true_hash = hash::sha256(&known_bytes);
 
-    // First finalize succeeds, version -> Available.
     svc.finalize_upload(
         &ctx,
         ticket.file_id,
@@ -494,14 +449,6 @@ async fn finalize_upload_after_already_available_returns_conflict() {
     .await
     .unwrap();
 
-    // A second finalize call for the same version, replaying the SAME
-    // (now-correct) size/hash so it clears the read-back checks and reaches
-    // the repo-level CAS — which must reject it as a conflict, not silently
-    // re-accept it. (A claim that doesn't match the real blob would instead
-    // be rejected earlier by the size/hash read-back check in this same
-    // function — that path is already covered by
-    // `finalize_size_mismatch_is_rejected`/`finalize_hash_mismatch_is_rejected`
-    // above; this test isolates the CAS guard specifically.)
     let err = svc
         .finalize_upload(
             &ctx,
@@ -517,7 +464,6 @@ async fn finalize_upload_after_already_available_returns_conflict() {
         "expected Conflict, got {err:?}"
     );
 
-    // The DB row must still hold the FIRST call's values.
     let version = store
         .get_version(ticket.file_id, ticket.version_id)
         .await
@@ -528,9 +474,7 @@ async fn finalize_upload_after_already_available_returns_conflict() {
     assert_eq!(version.hash_value, true_hash);
 }
 
-// -- 8. finalize_upload: content not matching the declared MIME is rejected -
-// (P2 1.10 — declared MIME is validated against the read-back blob)
-
+/// Declared `image/png` but PDF bytes uploaded (policy bypass attempt); version must stay pending.
 #[tokio::test]
 async fn finalize_rejects_content_not_matching_declared_mime() {
     let (svc, backend, store) = build_service().await;
@@ -540,8 +484,6 @@ async fn finalize_rejects_content_not_matching_declared_mime() {
         .await
         .unwrap();
 
-    // Presigned/declared as `image/png`, but the bytes actually uploaded are
-    // a recognizably different signature (PDF) — a policy-bypass attempt.
     let path = backend_path(ticket.file_id, ticket.version_id);
     backend
         .put(&path, Bytes::from_static(PDF_MAGIC))
@@ -566,7 +508,6 @@ async fn finalize_rejects_content_not_matching_declared_mime() {
         "expected MimeMismatch, got {err:?}"
     );
 
-    // The version must NOT have been finalized: still pending, not available.
     let version = store
         .get_version(ticket.file_id, ticket.version_id)
         .await
@@ -579,17 +520,11 @@ async fn finalize_rejects_content_not_matching_declared_mime() {
     );
 }
 
-// -- 9. finalize_upload: matching content persists the validated MIME -------
-// (P2 1.10 — positive control: stored mime_type is the sniffed/canonical
-// type, not merely the client's literal declared string)
-
+/// Declared with a `charset` parameter so the stored value proves the sniffed type was persisted.
 #[tokio::test]
 async fn finalize_persists_validated_mime() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    // Declare with a `charset` parameter that the SNIFFED canonical type will
-    // not carry, so a passing assertion on the stored value proves the
-    // *validated* type was persisted rather than the raw declared string.
     let ticket = svc
         .create_file(&ctx, new_file_with_mime("image/png; charset=binary"), None)
         .await
@@ -626,23 +561,13 @@ async fn finalize_persists_validated_mime() {
     );
 }
 
-// -- 10. finalize_upload: read-back streams a large object correctly --------
-// (CodeRabbit follow-up — finalize's read-back must verify size/hash by
-// streaming the object rather than buffering it whole; this exercises that
-// path end-to-end with an object well beyond a single small chunk and
-// asserts the persisted size/hash are exactly the ones an incremental
-// SHA-256 over the real bytes would produce)
-
 #[tokio::test]
 async fn finalize_streams_readback_without_buffering_whole_blob() {
     let (svc, backend, store) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
 
-    // 4 MiB of non-trivial (non-all-zero) content — large enough that a
-    // regression back to whole-blob buffering would still "work" here, but a
-    // streaming implementation must produce the exact same size/hash as an
-    // incremental hash over the same bytes.
+    // 4 MiB of non-uniform content, well beyond a single chunk.
     let large_bytes: Vec<u8> = (0..4 * 1024 * 1024)
         .map(|i| u8::try_from(i % 251).unwrap())
         .collect();
@@ -674,13 +599,6 @@ async fn finalize_streams_readback_without_buffering_whole_blob() {
     assert_eq!(version.hash_value, true_hash);
 }
 
-// -- 11. handlers::finalize_version: internal-secret gate (P2 0.1 remaining) -
-//
-// These exercise the axum handler directly (unlike tests 1-10 above, which
-// call `FileService`/`finalize_upload*` directly), so the interim
-// gear-local shared-secret check added to `handlers::finalize_version` /
-// `handlers::report_multipart_part` is actually on the call path.
-
 #[tokio::test]
 async fn finalize_with_internal_secret_required_rejects_missing_header() {
     let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
@@ -706,7 +624,7 @@ async fn finalize_with_internal_secret_required_rejects_missing_header() {
         .expect("issue token");
 
     let verifier = Arc::new(svc.verifier());
-    let finalize_auth = Arc::new(FinalizeAuth::new(Some("interim-shared-secret".to_owned())));
+    let finalize_auth = Arc::new(FinalizeAuth::new("interim-shared-secret".to_owned()));
     // Deliberately no `x-fs-internal-token` header.
     let headers = headers_with_token(&token);
 
@@ -725,8 +643,6 @@ async fn finalize_with_internal_secret_required_rejects_missing_header() {
     )
     .await;
 
-    // `impl IntoResponse` (the `Ok` side) isn't `Debug`, so `expect_err` can't
-    // be used here — a `let...else` avoids it without matching manually.
     let Err(err) = result else {
         panic!("missing internal-token header must be rejected");
     };
@@ -770,7 +686,7 @@ async fn finalize_with_internal_secret_required_accepts_matching_header() {
 
     let verifier = Arc::new(svc.verifier());
     let secret = "interim-shared-secret";
-    let finalize_auth = Arc::new(FinalizeAuth::new(Some(secret.to_owned())));
+    let finalize_auth = Arc::new(FinalizeAuth::new(secret.to_owned()));
 
     let mut headers = headers_with_token(&token);
     headers.insert(
@@ -843,7 +759,7 @@ async fn report_part_with_internal_secret_required_rejects_missing_header() {
         .expect("issue token");
 
     let verifier = Arc::new(svc.verifier());
-    let finalize_auth = Arc::new(FinalizeAuth::new(Some("interim-shared-secret".to_owned())));
+    let finalize_auth = Arc::new(FinalizeAuth::new("interim-shared-secret".to_owned()));
     // Deliberately no `x-fs-internal-token` header.
     let headers = headers_with_token(&token);
 
@@ -863,8 +779,6 @@ async fn report_part_with_internal_secret_required_rejects_missing_header() {
     )
     .await;
 
-    // `impl IntoResponse` (the `Ok` side) isn't `Debug`, so `expect_err` can't
-    // be used here — a `let...else` avoids it without matching manually.
     let Err(err) = result else {
         panic!("missing internal-token header must be rejected");
     };

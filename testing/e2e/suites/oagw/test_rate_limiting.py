@@ -1,199 +1,168 @@
-"""E2E tests for OAGW rate limiting — token bucket, sliding window, scoping."""
+"""E2E tests for OAGW rate limiting — token bucket, sliding window, scoping.
+
+Each test varies one thing (algorithm, scope, cost, refill) and pins the
+values that identify it: statuses in order, `Retry-After`, and the
+rate-limit header values, so a limiter that ignores scope, never refills,
+runs the wrong algorithm or reports wrong numbers fails.
+"""
+import asyncio
+
 import httpx
 import pytest
 
-from .helpers import create_route, create_upstream, delete_upstream, unique_alias
+from .helpers import assert_problem, create_route, create_upstream, unique_alias
+
+# Response header names. R-17 (IETF RateLimit headers) renames these; keep
+# the names here so that change is one edit and absence checks can't go
+# vacuous by testing a name nobody sends.
+RL_LIMIT = "x-ratelimit-limit"
+RL_REMAINING = "x-ratelimit-remaining"
+RL_RESET = "x-ratelimit-reset"
+RL_HEADER_PREFIX = "x-ratelimit-"
 
 
-@pytest.mark.asyncio
-async def test_rate_limit_first_request_succeeds(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
-):
-    """First request within rate limit succeeds."""
-    alias = unique_alias("rl-ok")
-    rate_limit = {
+def _rl(rate: int, window: str = "minute", capacity: int | None = None, **extra) -> dict:
+    """Build a token-bucket rate_limit payload; `extra` overrides any field."""
+    rl: dict = {
         "algorithm": "token_bucket",
-        "sustained": {"rate": 1, "window": "minute"},
-        "burst": {"capacity": 1},
+        "sustained": {"rate": rate, "window": window},
+        "burst": {"capacity": rate if capacity is None else capacity},
         "scope": "tenant",
         "strategy": "reject",
-        "cost": 1,
     }
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url,
-            alias=alias, rate_limit=rate_limit,
-        )
-        uid = upstream["id"]
-        await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["GET"], "/v1/models",
-        )
-
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
-        )
-        assert resp.status_code == 200
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+    rl.update(extra)
+    return rl
 
 
+def _rl_headers(resp: httpx.Response) -> list[str]:
+    return sorted(h for h in resp.headers if h.lower().startswith(RL_HEADER_PREFIX))
+
+
+def _assert_rate_limited(resp: httpx.Response) -> int:
+    """Assert an OAGW 429 and return its Retry-After in seconds."""
+    assert_problem(resp, 429, category="resource_exhausted")
+    return int(resp.headers["retry-after"])
+
+
+async def _limited_upstream(client, base, headers, mock_url, cleanup, prefix, rate_limit, paths=("/v1/models",)):
+    alias = unique_alias(prefix)
+    upstream = cleanup.upstream(headers, await create_upstream(
+        client, base, headers, mock_url, alias=alias, rate_limit=rate_limit,
+    ))
+    for path in paths:
+        await create_route(client, base, headers, upstream["id"], ["GET"], path)
+    return alias, upstream
+
+
+async def _get(client, base, alias, headers, path="/v1/models"):
+    return await client.get(f"{base}/oagw/v1/proxy/{alias}{path}", headers=headers)
+
+
+@pytest.mark.scenario("positive-18.1-token-bucket-sustained-burst")
 @pytest.mark.asyncio
 async def test_rate_limit_exceeded_returns_429(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Second request exceeding burst returns 429 with Retry-After."""
-    alias = unique_alias("rl-429")
-    rate_limit = {
-        "algorithm": "token_bucket",
-        "sustained": {"rate": 1, "window": "minute"},
-        "burst": {"capacity": 1},
-        "scope": "tenant",
-        "strategy": "reject",
-        "cost": 1,
-    }
+    """Scenario 18.1: the request past capacity gets a gateway 429 with a real Retry-After."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url,
-            alias=alias, rate_limit=rate_limit,
-        )
-        uid = upstream["id"]
-        await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["GET"], "/v1/models",
+        alias, _ = await _limited_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            "rl-429", _rl(1, cost=1),
         )
 
-        # First request consumes the single token.
-        resp1 = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
-        )
-        assert resp1.status_code == 200
+        first = await _get(client, oagw_base_url, alias, oagw_headers)
+        assert first.status_code == 200
+        assert first.headers.get("x-oagw-error-source") == "upstream"
+        assert first.headers.get(RL_LIMIT) == "1"
+        assert first.headers.get(RL_REMAINING) == "0"
 
-        # Second request should be rate-limited.
-        resp2 = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
-        )
-        assert resp2.status_code == 429, (
-            f"Expected 429 on second request, got {resp2.status_code}: {resp2.text[:500]}"
-        )
-        assert resp2.headers.get("x-oagw-error-source") == "gateway"
-        assert "retry-after" in resp2.headers, "Missing Retry-After header on 429"
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+        second = await _get(client, oagw_base_url, alias, oagw_headers)
+        # One token per minute: the next one is about a minute away.
+        assert 55 <= _assert_rate_limited(second) <= 60
 
 
+@pytest.mark.scenario("positive-18.1-token-bucket-sustained-burst")
 @pytest.mark.asyncio
 async def test_token_bucket_burst_capacity_and_headers(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Scenario 18.1: burst allows requests up to capacity; response includes
-    X-RateLimit-* headers; 11th request returns 429 with Retry-After."""
-    alias = unique_alias("rl-burst")
-    rate_limit = {
-        "algorithm": "token_bucket",
-        "sustained": {"rate": 5, "window": "hour"},
-        "burst": {"capacity": 10},
-        "scope": "tenant",
-        "strategy": "reject",
-        "response_headers": True,
-    }
+    """Scenario 18.1: burst allows `capacity` requests, counting down in the headers."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url,
-            alias=alias, rate_limit=rate_limit,
-        )
-        uid = upstream["id"]
-        await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["GET"], "/v1/models",
+        alias, _ = await _limited_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            "rl-burst", _rl(5, window="hour", capacity=10, response_headers=True),
         )
 
-        # Send 10 requests — all should succeed (burst capacity = 10).
         for i in range(10):
-            resp = await client.get(
-                f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-                headers=oagw_headers,
-            )
-            assert resp.status_code == 200, (
-                f"Request {i+1}/10 should succeed, got {resp.status_code}"
-            )
+            resp = await _get(client, oagw_base_url, alias, oagw_headers)
+            assert resp.status_code == 200, f"request {i + 1}/10: {resp.status_code}"
+            assert resp.headers.get(RL_LIMIT) == "10"
+            assert resp.headers.get(RL_REMAINING) == str(9 - i)
+            assert RL_RESET in resp.headers
 
-        # Verify rate limit headers on the last success.
-        assert "x-ratelimit-limit" in resp.headers, "Missing X-RateLimit-Limit"
-        assert "x-ratelimit-remaining" in resp.headers, "Missing X-RateLimit-Remaining"
-        assert "x-ratelimit-reset" in resp.headers, "Missing X-RateLimit-Reset"
-
-        # 11th request — should be rate limited.
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
-        )
-        assert resp.status_code == 429, (
-            f"Expected 429 on 11th request, got {resp.status_code}"
-        )
-        assert "retry-after" in resp.headers, "Missing Retry-After on 429"
-        assert resp.headers.get("x-oagw-error-source") == "gateway"
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+        resp = await _get(client, oagw_base_url, alias, oagw_headers)
+        # 5 tokens per hour: one token every 720 s, minus the time the burst took.
+        assert 715 <= _assert_rate_limited(resp) <= 720
 
 
+@pytest.mark.scenario("positive-18.1-token-bucket-sustained-burst")
 @pytest.mark.asyncio
-async def test_response_headers_disabled(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+@pytest.mark.timeout(15)
+async def test_token_bucket_refills(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Scenario 18.1.1: response_headers=false suppresses X-RateLimit-* on
-    success but Retry-After is still sent on 429."""
-    alias = unique_alias("rl-nohdr")
-    rate_limit = {
-        "algorithm": "token_bucket",
-        "sustained": {"rate": 1, "window": "minute"},
-        "burst": {"capacity": 1},
-        "scope": "tenant",
-        "strategy": "reject",
-        "response_headers": False,
-    }
+    """Scenario 18.1 step 3: an exhausted bucket serves again after the refill interval."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url,
-            alias=alias, rate_limit=rate_limit,
-        )
-        uid = upstream["id"]
-        await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["GET"], "/v1/models",
+        alias, _ = await _limited_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            "rl-refill", _rl(1, window="second", capacity=3),
         )
 
-        # First request succeeds — no X-RateLimit-* headers.
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
+        # 1/second: the burst only has to finish within a second to exhaust it.
+        statuses = [(await _get(client, oagw_base_url, alias, oagw_headers)).status_code for _ in range(4)]
+        assert statuses == [200] * 3 + [429]
+
+        await asyncio.sleep(1.2)
+        assert (await _get(client, oagw_base_url, alias, oagw_headers)).status_code == 200
+
+
+@pytest.mark.scenario("positive-18.1.1-rate-limit-response-headers-can-be-disabled")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_headers", [True, False])
+async def test_response_headers_toggle(
+    response_headers, oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 18.1.1: `response_headers` controls the rate-limit headers on 200 and 429.
+
+    `Retry-After` is always sent on a 429. The `True` case is the control
+    that shows the absence check means something.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias, _ = await _limited_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            "rl-hdr", _rl(1, response_headers=response_headers),
         )
+        expected = [RL_LIMIT, RL_REMAINING, RL_RESET] if response_headers else []
+
+        resp = await _get(client, oagw_base_url, alias, oagw_headers)
         assert resp.status_code == 200
-        assert "x-ratelimit-limit" not in resp.headers, (
-            "X-RateLimit-Limit should be absent when response_headers=false"
-        )
-        assert "x-ratelimit-remaining" not in resp.headers
-        assert "x-ratelimit-reset" not in resp.headers
+        assert _rl_headers(resp) == sorted(expected)
 
-        # Second request — 429 with Retry-After (always present).
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
-        )
-        assert resp.status_code == 429
-        assert "retry-after" in resp.headers, (
-            "Retry-After must be present on 429 even with response_headers=false"
-        )
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+        resp = await _get(client, oagw_base_url, alias, oagw_headers)
+        _assert_rate_limited(resp)
+        assert _rl_headers(resp) == sorted(expected)
 
 
+@pytest.mark.scenario("negative-18.2-sliding-window-strictness")
 @pytest.mark.asyncio
 async def test_sliding_window_basic_enforcement(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Scenario 18.2 (adapted): sliding window algorithm enforces rate limit.
-    Uses minute-scale window to avoid sub-second timing sensitivity."""
-    alias = unique_alias("rl-sw")
+    """Scenario 18.2: a sliding window allows `rate` per window, then waits out the window.
+
+    A token bucket with the same numbers would answer `Retry-After: 30`
+    (one of two tokens refills halfway through the minute).
+    """
     rate_limit = {
         "algorithm": "sliding_window",
         "sustained": {"rate": 2, "window": "minute"},
@@ -201,324 +170,228 @@ async def test_sliding_window_basic_enforcement(
         "strategy": "reject",
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url,
-            alias=alias, rate_limit=rate_limit,
-        )
-        uid = upstream["id"]
-        await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["GET"], "/v1/models",
+        alias, _ = await _limited_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup, "rl-sw", rate_limit,
         )
 
-        # First two requests succeed.
         for i in range(2):
-            resp = await client.get(
-                f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-                headers=oagw_headers,
-            )
-            assert resp.status_code == 200, (
-                f"Request {i+1}/2 should succeed, got {resp.status_code}"
-            )
+            resp = await _get(client, oagw_base_url, alias, oagw_headers)
+            assert resp.status_code == 200, f"request {i + 1}/2: {resp.status_code}"
 
-        # Third request — rejected by sliding window.
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
-        )
-        assert resp.status_code == 429, (
-            f"Expected 429 on 3rd request, got {resp.status_code}"
-        )
-        assert resp.headers.get("x-oagw-error-source") == "gateway"
-        assert "retry-after" in resp.headers
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+        resp = await _get(client, oagw_base_url, alias, oagw_headers)
+        assert 59 <= _assert_rate_limited(resp) <= 60
 
 
+@pytest.mark.scenario("negative-18.2-sliding-window-strictness")
 @pytest.mark.asyncio
-async def test_scope_global(
-    oagw_base_url, hierarchy_root_headers, hierarchy_l1a_headers,
-    hierarchy_l1b_headers, mock_upstream_url, mock_upstream,
+async def test_sliding_window_no_boundary_burst(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Scenario 18.3: scope=global is accepted and enforces a shared counter.
+    """Scenario N18.2: the window slides, so waiting part of it earns nothing back.
 
-    Global scope means the counter key omits tenant/user/IP, so all requests
-    to this upstream share one bucket regardless of caller identity.
-    Proved by exhausting the bucket with requests from two different tenants.
+    At 2/second, a token bucket refills 1.2 tokens in 0.6 s and serves the
+    third request; the sliding window still counts both earlier requests
+    (the three requests then have ~400 ms of latency budget together).
     """
-    alias = unique_alias("rl-global")
     rate_limit = {
-        "algorithm": "token_bucket",
-        "sustained": {"rate": 2, "window": "minute"},
-        "burst": {"capacity": 2},
-        "scope": "global",
-        "strategy": "reject",
-        "sharing": "inherit",
-        "budget": {"mode": "shared", "total": 2},
-    }
-    uids: list[tuple[dict, str]] = []
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            # Parent upstream with global-scoped rate limit.
-            parent = await create_upstream(
-                client, oagw_base_url, hierarchy_root_headers, mock_upstream_url,
-                alias=alias, rate_limit=rate_limit,
-            )
-            uids.append((hierarchy_root_headers, parent["id"]))
-
-            # Children bind to the same alias (inherit parent rate limit).
-            child_a = await create_upstream(
-                client, oagw_base_url, hierarchy_l1a_headers, mock_upstream_url,
-                alias=alias,
-            )
-            uids.append((hierarchy_l1a_headers, child_a["id"]))
-
-            child_b = await create_upstream(
-                client, oagw_base_url, hierarchy_l1b_headers, mock_upstream_url,
-                alias=alias,
-            )
-            uids.append((hierarchy_l1b_headers, child_b["id"]))
-
-            await create_route(
-                client, oagw_base_url, hierarchy_root_headers,
-                parent["id"], ["GET"], "/v1/models",
-            )
-
-            # Tenant l1a: first request succeeds (1 of 2 tokens consumed).
-            resp = await client.get(
-                f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-                headers=hierarchy_l1a_headers,
-            )
-            assert resp.status_code == 200
-
-            # Tenant l1b: request succeeds (2 of 2 tokens consumed).
-            resp = await client.get(
-                f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-                headers=hierarchy_l1b_headers,
-            )
-            assert resp.status_code == 200
-
-            # Tenant l1a again: 429 — proves the global bucket is shared
-            # across tenants, not isolated per-tenant.
-            resp = await client.get(
-                f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-                headers=hierarchy_l1a_headers,
-            )
-            assert resp.status_code == 429, (
-                f"Global scope should share one bucket across tenants, got {resp.status_code}"
-            )
-        finally:
-            for hdrs, uid in reversed(uids):
-                await delete_upstream(client, oagw_base_url, hdrs, uid)
-
-
-@pytest.mark.asyncio
-async def test_scope_route_isolation(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
-):
-    """Scenario 18.3: scope=route gives each route its own rate-limit bucket."""
-    alias = unique_alias("rl-route")
-    route_rl = {
-        "algorithm": "token_bucket",
-        "sustained": {"rate": 1, "window": "minute"},
-        "burst": {"capacity": 1},
-        "scope": "route",
-        "strategy": "reject",
-    }
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        # Upstream without rate limit; rate limit lives on each route.
-        upstream = await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url,
-            alias=alias,
-        )
-        uid = upstream["id"]
-        await create_route(
-            client, oagw_base_url, oagw_headers, uid,
-            ["GET"], "/v1/models", rate_limit=route_rl,
-        )
-        await create_route(
-            client, oagw_base_url, oagw_headers, uid,
-            ["GET"], "/health", rate_limit=route_rl,
-        )
-
-        # Route A — allowed (own bucket).
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
-        )
-        assert resp.status_code == 200
-
-        # Route B — allowed (separate bucket).
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/health",
-            headers=oagw_headers,
-        )
-        assert resp.status_code == 200
-
-        # Route A again — rejected (exhausted).
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
-        )
-        assert resp.status_code == 429, "Route A should be rate-limited"
-
-        # Route B again — rejected (exhausted).
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/health",
-            headers=oagw_headers,
-        )
-        assert resp.status_code == 429, "Route B should be rate-limited"
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
-
-
-@pytest.mark.asyncio
-async def test_scope_tenant_isolation(
-    oagw_base_url, hierarchy_root_headers, hierarchy_l1a_headers,
-    hierarchy_l1b_headers, mock_upstream_url, mock_upstream,
-):
-    """Tenant-scoped rate limits give each tenant an independent bucket."""
-    alias = unique_alias("rl-tenant-iso")
-    rate_limit = {
-        "algorithm": "token_bucket",
-        "sustained": {"rate": 1, "window": "minute"},
-        "burst": {"capacity": 1},
+        "algorithm": "sliding_window",
+        "sustained": {"rate": 2, "window": "second"},
         "scope": "tenant",
         "strategy": "reject",
-        "sharing": "inherit",
     }
-    uids: list[tuple[dict, str]] = []
     async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            # Parent upstream with inheritable rate limit.
-            parent = await create_upstream(
-                client, oagw_base_url, hierarchy_root_headers, mock_upstream_url,
-                alias=alias, rate_limit=rate_limit,
-            )
-            uids.append((hierarchy_root_headers, parent["id"]))
+        alias, _ = await _limited_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup, "rl-sw-edge", rate_limit,
+        )
 
-            # Children bind to the same alias (inherit parent rate limit).
-            child_a = await create_upstream(
-                client, oagw_base_url, hierarchy_l1a_headers, mock_upstream_url,
-                alias=alias,
-            )
-            uids.append((hierarchy_l1a_headers, child_a["id"]))
+        for _ in range(2):
+            assert (await _get(client, oagw_base_url, alias, oagw_headers)).status_code == 200
+        await asyncio.sleep(0.6)
+        resp = await _get(client, oagw_base_url, alias, oagw_headers)
+        assert _assert_rate_limited(resp) == 1
 
-            child_b = await create_upstream(
-                client, oagw_base_url, hierarchy_l1b_headers, mock_upstream_url,
-                alias=alias,
-            )
-            uids.append((hierarchy_l1b_headers, child_b["id"]))
 
+@pytest.mark.scenario("positive-18.3-rate-limit-scope-variants")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        # One bucket for everyone: l1b is refused once l1a used the token.
+        ("global", [200, 429, 429]),
+        # One bucket per tenant: l1b still has its own token.
+        ("tenant", [200, 429, 200]),
+    ],
+)
+async def test_scope_across_tenants(
+    scope, expected, oagw_base_url, hierarchy_root_headers, hierarchy_l1a_headers,
+    hierarchy_l1b_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 18.3 (`global`, `tenant`): the scope alone decides bucket sharing.
+
+    Both children call the root's upstream directly, with no bindings or
+    budget of their own, so the scope is the only thing that differs.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias, _ = await _limited_upstream(
+            client, oagw_base_url, hierarchy_root_headers, mock_upstream_url, cleanup,
+            f"rl-{scope}", _rl(1, scope=scope, sharing="inherit"),
+        )
+
+        statuses = [
+            (await _get(client, oagw_base_url, alias, h)).status_code
+            for h in (hierarchy_l1a_headers, hierarchy_l1a_headers, hierarchy_l1b_headers)
+        ]
+        assert statuses == expected
+
+
+@pytest.mark.scenario("positive-18.3-rate-limit-scope-variants")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        ("user", [200, 429, 200]),
+        ("tenant", [200, 429, 429]),
+    ],
+)
+async def test_scope_user_within_tenant(
+    scope, expected, oagw_base_url, oagw_headers, tenant_a_reviewer_headers,
+    mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 18.3 (`user`): two subjects in one tenant get separate buckets."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias, _ = await _limited_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            f"rl-{scope}", _rl(1, scope=scope),
+        )
+
+        statuses = [
+            (await _get(client, oagw_base_url, alias, h)).status_code
+            for h in (oagw_headers, oagw_headers, tenant_a_reviewer_headers)
+        ]
+        assert statuses == expected
+
+
+@pytest.mark.asyncio
+async def test_route_level_limits_are_per_route(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """A limit set on each route gives each route its own bucket, whatever the scope."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias = unique_alias("rl-route")
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
+        ))
+        for path in ("/v1/models", "/health"):
             await create_route(
-                client, oagw_base_url, hierarchy_root_headers,
-                parent["id"], ["GET"], "/v1/models",
+                client, oagw_base_url, oagw_headers, upstream["id"],
+                ["GET"], path, rate_limit=_rl(1, scope="route"),
             )
 
-            # Tenant l1a: first request succeeds, second is rate-limited.
-            resp = await client.get(
-                f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-                headers=hierarchy_l1a_headers,
-            )
-            assert resp.status_code == 200
-
-            resp = await client.get(
-                f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-                headers=hierarchy_l1a_headers,
-            )
-            assert resp.status_code == 429, (
-                f"Tenant l1a should be rate-limited, got {resp.status_code}"
-            )
-
-            # Tenant l1b: first request still succeeds (independent bucket).
-            resp = await client.get(
-                f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-                headers=hierarchy_l1b_headers,
-            )
-            assert resp.status_code == 200, (
-                f"Tenant l1b should have its own bucket, got {resp.status_code}"
-            )
-        finally:
-            for hdrs, uid in reversed(uids):
-                await delete_upstream(client, oagw_base_url, hdrs, uid)
+        statuses = [
+            (await _get(client, oagw_base_url, alias, oagw_headers, path)).status_code
+            for path in ("/v1/models", "/health", "/v1/models", "/health")
+        ]
+        assert statuses == [200, 200, 429, 429]
 
 
+@pytest.mark.scenario("positive-18.3-rate-limit-scope-variants")
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="R-08: scope=route on an upstream-level limit acts as one bucket "
+           "for every route",
+)
+async def test_scope_route_on_upstream_limit(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 18.3 (`route`): an upstream-level limit with scope=route is per route."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias, _ = await _limited_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            "rl-up-route", _rl(1, scope="route"), paths=("/v1/models", "/health"),
+        )
+
+        statuses = [
+            (await _get(client, oagw_base_url, alias, oagw_headers, path)).status_code
+            for path in ("/v1/models", "/health", "/v1/models")
+        ]
+        assert statuses == [200, 200, 429]
+
+
+@pytest.mark.scenario("positive-18.4-weighted-cost-per-route")
 @pytest.mark.asyncio
 async def test_weighted_cost(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Scenario 18.4: cost=10 consumes entire 10-token budget in one request."""
-    alias = unique_alias("rl-cost")
-    rate_limit = {
-        "algorithm": "token_bucket",
-        "sustained": {"rate": 10, "window": "minute"},
-        "burst": {"capacity": 10},
-        "scope": "tenant",
-        "strategy": "reject",
-        "cost": 10,
-    }
+    """Scenario 18.4: each request draws `cost` tokens."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        upstream = await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url,
-            alias=alias, rate_limit=rate_limit,
-        )
-        uid = upstream["id"]
-        await create_route(
-            client, oagw_base_url, oagw_headers, uid, ["GET"], "/v1/models",
+        alias, _ = await _limited_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            "rl-cost", _rl(10, cost=4),
         )
 
-        # First request consumes all 10 tokens.
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
-        )
-        assert resp.status_code == 200
+        remaining = []
+        for _ in range(2):
+            resp = await _get(client, oagw_base_url, alias, oagw_headers)
+            assert resp.status_code == 200
+            remaining.append(resp.headers.get(RL_REMAINING))
+        assert remaining == ["6", "2"]
+        _assert_rate_limited(await _get(client, oagw_base_url, alias, oagw_headers))
 
-        # Second request — no tokens left.
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
-        )
-        assert resp.status_code == 429
 
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+@pytest.mark.scenario("positive-18.4-weighted-cost-per-route")
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="R-14: a route rate_limit carrying only `cost` is rejected (422)",
+)
+async def test_weighted_cost_per_route(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 18.4: routes with different costs draw on the upstream's one bucket."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias = unique_alias("rl-cost-rt")
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
+            rate_limit=_rl(10),
+        ))
+        for path, cost in (("/v1/models", 10), ("/health", 1)):
+            resp = await client.post(
+                f"{oagw_base_url}/oagw/v1/routes",
+                headers=oagw_headers,
+                json={
+                    "upstream_id": upstream["id"],
+                    "match": {"http": {"methods": ["GET"], "path": path}},
+                    "enabled": True,
+                    "tags": [],
+                    "priority": 0,
+                    "rate_limit": {"cost": cost},
+                },
+            )
+            # Today's R-14 failure: the cost-only route is refused (422).
+            assert resp.status_code == 201, resp.text[:300]
+
+        assert (await _get(client, oagw_base_url, alias, oagw_headers, "/v1/models")).status_code == 200
+        _assert_rate_limited(await _get(client, oagw_base_url, alias, oagw_headers, "/health"))
 
 
 @pytest.mark.asyncio
 async def test_route_level_rate_limit(
-    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Rate limit configured on the route (not upstream) is enforced."""
-    alias = unique_alias("rl-rtlvl")
-    route_rl = {
-        "algorithm": "token_bucket",
-        "sustained": {"rate": 1, "window": "minute"},
-        "burst": {"capacity": 1},
-        "scope": "tenant",
-        "strategy": "reject",
-    }
+    """A limit on the route alone (none on the upstream) is enforced."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        # Upstream has no rate limit.
-        upstream = await create_upstream(
-            client, oagw_base_url, oagw_headers, mock_upstream_url,
-            alias=alias,
-        )
-        uid = upstream["id"]
+        alias = unique_alias("rl-rtlvl")
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
+        ))
         await create_route(
-            client, oagw_base_url, oagw_headers, uid,
-            ["GET"], "/v1/models", rate_limit=route_rl,
+            client, oagw_base_url, oagw_headers, upstream["id"],
+            ["GET"], "/v1/models", rate_limit=_rl(1),
         )
 
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
-        )
-        assert resp.status_code == 200
-
-        resp = await client.get(
-            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models",
-            headers=oagw_headers,
-        )
-        assert resp.status_code == 429, "Route-level rate limit should enforce"
-        assert resp.headers.get("x-oagw-error-source") == "gateway"
-
-        await delete_upstream(client, oagw_base_url, oagw_headers, uid)
+        assert (await _get(client, oagw_base_url, alias, oagw_headers)).status_code == 200
+        resp = await _get(client, oagw_base_url, alias, oagw_headers)
+        assert 55 <= _assert_rate_limited(resp) <= 60

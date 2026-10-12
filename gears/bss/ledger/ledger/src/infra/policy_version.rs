@@ -179,7 +179,7 @@ impl PolicyVersionGuard {
             .filter(cond)
             .all(txn)
             .await
-            .map_err(|e| infra(format!("policy-version read original lines: {e}")))?;
+            .map_err(crate::infra::posting::error_transport::scope_to_db)?;
 
         if original_rows.is_empty() {
             // A correction must point at a real prior posting; no lines means a

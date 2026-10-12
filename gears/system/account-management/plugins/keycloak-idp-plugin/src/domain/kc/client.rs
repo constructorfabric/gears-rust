@@ -13,6 +13,8 @@ use crate::domain::error::PluginError;
 use crate::domain::kc::token_cache::CachedToken;
 use crate::domain::kc::transport::KcTransport;
 
+/// Keycloak Admin REST client bound to one realm's cached bearer token and
+/// a [`KcTransport`].
 #[domain_model]
 #[derive(Clone)]
 pub struct KcAdminClient {
@@ -21,6 +23,7 @@ pub struct KcAdminClient {
 }
 
 impl KcAdminClient {
+    /// Create a client over `transport` authorised by the cached `token`.
     #[must_use]
     pub fn new(transport: Arc<dyn KcTransport>, token: Arc<CachedToken>) -> Self {
         Self { transport, token }

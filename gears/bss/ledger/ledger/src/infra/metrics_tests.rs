@@ -114,7 +114,9 @@ fn recognition_run_metrics_are_observable() {
     let h = MetricsHarness::new();
     let m = h.metrics();
     m.recognition_run_duration(0.02);
-    m.revenue_recognized_minor(1_200, "subscription");
+    m.revenue_recognized("subscription");
+    m.revenue_recognized("subscription");
+    m.revenue_recognized("usage");
     m.over_recognition();
     m.recognition_double_credit();
     h.force_flush();
@@ -122,14 +124,19 @@ fn recognition_run_metrics_are_observable() {
         h.histogram_count("ledger_recognition_run_duration_seconds", &[]),
         1
     );
-    // The recognized-minor counter sums the released amount under the stream label.
+    // Each call counts one release; streams remain separate.
     assert_eq!(
         h.counter_value(
-            "ledger_revenue_recognized_minor",
+            "ledger_revenue_recognized_total",
             &[("stream", "subscription")]
         ),
-        1_200
+        2
     );
+    assert_eq!(
+        h.counter_value("ledger_revenue_recognized_total", &[("stream", "usage")]),
+        1
+    );
+    assert_eq!(h.counter_value("ledger_revenue_recognized_total", &[]), 0);
     assert_eq!(h.counter_value("ledger_over_recognition_total", &[]), 1);
     assert_eq!(
         h.counter_value("ledger_recognition_double_credit_total", &[]),
@@ -229,15 +236,30 @@ fn refund_group_f_counters_are_observable() {
     let m = h.metrics();
     let tenant = uuid::Uuid::now_v7();
     // The unknown_final disposition + a stage-1 orphan are bare counters; the
-    // clearing balance/age are per-tenant gauges (recorded, not summed here).
+    // clearing grain count/age are per-tenant gauges.
     m.refund_unknown_final();
     m.refund_unknown_final();
     m.stage1_refund_orphan();
-    m.refund_clearing_balance_minor(tenant, 500);
+    m.refund_clearing_open_grains(tenant, 3);
     m.refund_clearing_aged_seconds(tenant, 700_000.0);
     h.force_flush();
     assert_eq!(h.counter_value("ledger_refund_unknown_final_total", &[]), 2);
     assert_eq!(h.counter_value("ledger_stage1_refund_orphan_total", &[]), 1);
+    let tenant_text = tenant.to_string();
+    assert_eq!(
+        h.count_gauge_value(
+            "ledger_refund_clearing_open_grains",
+            &[("tenant", &tenant_text)]
+        ),
+        Some(3)
+    );
+    assert_eq!(
+        h.age_gauge_value(
+            "ledger_refund_clearing_aged_seconds",
+            &[("tenant", &tenant_text)]
+        ),
+        Some(700_000.0)
+    );
 }
 
 #[test]
@@ -271,12 +293,13 @@ fn refund_group_g_counter_is_labelled_by_phase_and_pattern() {
 fn reconciliation_slice7_metrics_are_observable() {
     let h = MetricsHarness::new();
     let m = h.metrics();
-    // Two runs of the same check type; one breaches tolerance. The variance gauge
-    // records the latest signed observed value (last write wins per attribute set).
+    // Two runs of the same check type; one breaches tolerance. Money variance
+    // counts nonzero currency buckets, separately from missing invoices.
     m.reconciliation_run("ar_subledger_vs_gl");
     m.reconciliation_run("ar_subledger_vs_gl");
     m.reconciliation_out_of_tolerance("ar_subledger_vs_gl");
-    m.reconciliation_variance_minor("ar_subledger_vs_gl", -1_500);
+    m.reconciliation_money_variance_currencies("ar_subledger_vs_gl", 2);
+    m.reconciliation_missing_invoices(7);
     // A blocked close (by reason) + an exception-queue depth (by type) gauge.
     m.period_close_blocked("open_exceptions");
     m.exception_queue_depth("unmatched_settlement", 4);
@@ -308,11 +331,11 @@ fn reconciliation_slice7_metrics_are_observable() {
         1
     );
     assert_eq!(
-        h.gauge_value(
-            "ledger_reconciliation_variance_minor",
+        h.count_gauge_value(
+            "ledger_reconciliation_money_variance_currencies",
             &[("check_type", "ar_subledger_vs_gl")]
         ),
-        -1_500
+        Some(2)
     );
     assert_eq!(
         h.counter_value(
@@ -398,4 +421,132 @@ fn fx_rate_sync_duration_is_observable_and_unlabelled() {
         h.histogram_count("ledger_fx_rate_sync_duration_seconds", &[]),
         2
     );
+}
+
+#[test]
+fn realized_fx_counts_postings_separately_by_currency_and_direction() {
+    let h = MetricsHarness::new();
+    let m = h.metrics();
+    m.fx_realized("USD", "gain");
+    m.fx_realized("USD", "gain");
+    m.fx_realized("USD", "loss");
+    m.fx_realized("EUR", "gain");
+    h.force_flush();
+    assert_eq!(
+        h.counter_value(
+            "ledger_fx_realized_total",
+            &[("functional_currency", "USD"), ("direction", "gain")]
+        ),
+        2
+    );
+    assert_eq!(
+        h.counter_value(
+            "ledger_fx_realized_total",
+            &[("functional_currency", "USD"), ("direction", "loss")]
+        ),
+        1
+    );
+    assert_eq!(
+        h.counter_value(
+            "ledger_fx_realized_total",
+            &[("functional_currency", "EUR"), ("direction", "gain")]
+        ),
+        1
+    );
+    assert_eq!(
+        h.counter_value(
+            "ledger_fx_realized_total",
+            &[("functional_currency", "EUR"), ("direction", "loss")]
+        ),
+        0
+    );
+}
+
+#[test]
+fn refund_open_grains_replace_and_reset_per_tenant() {
+    let h = MetricsHarness::new();
+    let m = h.metrics();
+    let first = uuid::Uuid::now_v7();
+    let second = uuid::Uuid::now_v7();
+    let first_text = first.to_string();
+    let second_text = second.to_string();
+    m.refund_clearing_open_grains(first, 3);
+    m.refund_clearing_open_grains(first, 2);
+    m.refund_clearing_open_grains(second, 4);
+    h.force_flush();
+    assert_eq!(
+        h.count_gauge_value(
+            "ledger_refund_clearing_open_grains",
+            &[("tenant", &first_text)]
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        h.count_gauge_value(
+            "ledger_refund_clearing_open_grains",
+            &[("tenant", &second_text)]
+        ),
+        Some(4)
+    );
+    assert_eq!(
+        h.count_gauge_value("ledger_refund_clearing_open_grains", &[]),
+        None
+    );
+    m.refund_clearing_open_grains(first, 0);
+    h.force_flush();
+    assert_eq!(
+        h.count_gauge_value(
+            "ledger_refund_clearing_open_grains",
+            &[("tenant", &first_text)]
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        h.count_gauge_value(
+            "ledger_refund_clearing_open_grains",
+            &[("tenant", &second_text)]
+        ),
+        Some(4)
+    );
+}
+
+#[test]
+fn reconciliation_currency_buckets_and_missing_invoices_replace_and_reset_independently() {
+    let h = MetricsHarness::new();
+    let m = h.metrics();
+    let name = "ledger_reconciliation_money_variance_currencies";
+    let first = [("check_type", "ar_subledger_vs_gl")];
+    let second = [("check_type", "psp_vs_clearing")];
+    m.reconciliation_money_variance_currencies("ar_subledger_vs_gl", 3);
+    m.reconciliation_money_variance_currencies("ar_subledger_vs_gl", 2);
+    m.reconciliation_money_variance_currencies("psp_vs_clearing", 1);
+    m.reconciliation_missing_invoices(8);
+    m.reconciliation_missing_invoices(7);
+    h.force_flush();
+    assert_eq!(h.count_gauge_value(name, &first), Some(2));
+    assert_eq!(h.count_gauge_value(name, &second), Some(1));
+    assert_eq!(h.count_gauge_value(name, &[]), None);
+    assert_eq!(
+        h.count_gauge_value("ledger_reconciliation_missing_invoices", &[]),
+        Some(7)
+    );
+    assert_eq!(
+        h.count_gauge_value("ledger_reconciliation_missing_invoices", &first),
+        None
+    );
+    m.reconciliation_money_variance_currencies("ar_subledger_vs_gl", 0);
+    h.force_flush();
+    assert_eq!(h.count_gauge_value(name, &first), Some(0));
+    assert_eq!(h.count_gauge_value(name, &second), Some(1));
+    assert_eq!(
+        h.count_gauge_value("ledger_reconciliation_missing_invoices", &[]),
+        Some(7)
+    );
+    m.reconciliation_missing_invoices(0);
+    h.force_flush();
+    assert_eq!(
+        h.count_gauge_value("ledger_reconciliation_missing_invoices", &[]),
+        Some(0)
+    );
+    assert_eq!(h.count_gauge_value(name, &second), Some(1));
 }

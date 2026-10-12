@@ -49,6 +49,7 @@ use uuid::Uuid;
 use crate::api::local_client::map_odata_page_err;
 use crate::api::rest::auth_context::require_authenticated;
 use crate::api::rest::canonical_json::CanonicalJson;
+use crate::api::rest::dto::parse_money;
 use crate::api::rest::dto::{
     DisputePhaseQueuedResponse, DisputeView, RecordDisputePhaseRequest, RecordDisputePhaseResponse,
 };
@@ -265,6 +266,10 @@ async fn record_dispute_phase(
     if body.phase.eq_ignore_ascii_case("lost")
         && let Some(approval) = &state.approval
     {
+        // The same validated money the SDK lowering produces; a malformed value
+        // is the same 400 `into_sdk` raises below, just earlier.
+        let disputed_amount = parse_money("disputed_amount", body.disputed_amount.clone())
+            .map_err(CanonicalError::from)?;
         let loss_intent = crate::domain::approval::intent::ApprovalIntent::ChargebackLoss(
             crate::domain::approval::intent::ChargebackLossIntent {
                 tenant_id: body.tenant_id,
@@ -274,13 +279,12 @@ async fn record_dispute_phase(
                 invoice_id: body.invoice_id.clone(),
                 cycle: body.cycle.unwrap_or(1),
                 funds_at_open: body.funds_at_open.clone(),
-                disputed_amount_minor: body.disputed_amount_minor,
-                currency: body.currency.clone(),
+                disputed_amount: disputed_amount.clone(),
             },
         );
         let loss_facts = crate::domain::approval::policy::OperationFacts {
             kind: crate::domain::approval::ApprovalKind::ChargebackLoss,
-            amount_usd_eq_minor: Some(body.disputed_amount_minor),
+            amount: Some(disputed_amount),
             effective_at: None,
             has_outstanding_balance: false,
         };
@@ -353,13 +357,15 @@ async fn get_dispute(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    // `read_dispute` returns `Result<Option<dispute::Model>, DomainError>` — the
-    // same reader the refund dispute-hold pre-read uses; reused here for the by-id
-    // read (no second by-id query). A scoped-out / absent row is a canonical 404.
+    // `read_dispute` returns the decoded `DisputeState` — the same reader the
+    // refund dispute-hold pre-read uses; reused here for the by-id read (no second
+    // by-id query). A scoped-out / absent row is a canonical 404; a storage fault
+    // (including corrupt stored money) is an `Internal` whose text stays server-side.
     let dispute = state
         .dispute_repo
         .read_dispute(&scope, tenant_id, &dispute_id)
-        .await?
+        .await
+        .map_err(|e| crate::domain::error::DomainError::Internal(format!("read dispute: {e}")))?
         .ok_or_else(|| dispute_not_found(&dispute_id))?;
     Ok(Json(DisputeView::from(dispute)))
 }

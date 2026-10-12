@@ -83,7 +83,9 @@ impl PayerStateRepo {
                 Condition::all()
                     .add(ar_payer_balance::Column::TenantId.eq(tenant))
                     .add(ar_payer_balance::Column::PayerTenantId.eq(payer_tenant_id))
-                    .add(ar_payer_balance::Column::BalanceMinor.ne(0)),
+                    // Canonical decimal text: a zero balance is exactly `"0"`, so a
+                    // text inequality is an exact non-zero test (no numeric cast).
+                    .add(ar_payer_balance::Column::Balance.ne("0")),
             )
             .one(&conn)
             .await
@@ -146,3 +148,7 @@ impl PayerStateRepo {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "payer_state_repo_balance_tests.rs"]
+mod balance_tests;

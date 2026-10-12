@@ -1,9 +1,21 @@
 use super::*;
 
+/// Preserve the original USD scale-2 economic fixtures, expressed in major units.
+fn fixture(value: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(value, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+fn expected(value: i64) -> Decimal {
+    Decimal::new(value, 2)
+}
+
 fn split(id: &str, amount: i64) -> Allocated {
     Allocated {
         invoice_id: id.to_owned(),
-        amount_minor: amount,
+        amount: fixture(amount),
     }
 }
 
@@ -13,27 +25,27 @@ fn input(splits: Vec<Allocated>) -> AllocationInput {
         payer_tenant_id: Uuid::now_v7(),
         payment_id: "PAY-1".to_owned(),
         allocation_id: Uuid::now_v7(),
-        currency: "USD".to_owned(),
+        currency: bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
         splits,
         effective_at: None,
     }
 }
 
-fn sum_dr(entry: &PostEntry) -> i128 {
+fn sum_dr(entry: &PostEntry) -> Decimal {
     entry
         .lines
         .iter()
         .filter(|l| l.side == Side::Debit)
-        .map(|l| i128::from(l.amount_minor))
+        .map(|l| l.money.amount())
         .sum()
 }
 
-fn sum_cr(entry: &PostEntry) -> i128 {
+fn sum_cr(entry: &PostEntry) -> Decimal {
     entry
         .lines
         .iter()
         .filter(|l| l.side == Side::Credit)
-        .map(|l| i128::from(l.amount_minor))
+        .map(|l| l.money.amount())
         .sum()
 }
 
@@ -50,31 +62,31 @@ fn two_splits_dr_unallocated_plus_cr_ar_per_invoice() {
     let unalloc = &entry.lines[0];
     assert_eq!(unalloc.account_class, AccountClass::Unallocated);
     assert_eq!(unalloc.side, Side::Debit);
-    assert_eq!(unalloc.amount_minor, 500);
+    assert_eq!(unalloc.money.amount(), expected(500));
     assert_eq!(unalloc.invoice_id, None);
 
     // CR AR per split, in splits order, each carrying its invoice_id.
     let ar_a = &entry.lines[1];
     assert_eq!(ar_a.account_class, AccountClass::Ar);
     assert_eq!(ar_a.side, Side::Credit);
-    assert_eq!(ar_a.amount_minor, 300);
+    assert_eq!(ar_a.money.amount(), expected(300));
     assert_eq!(ar_a.invoice_id, Some("A".to_owned()));
 
     let ar_b = &entry.lines[2];
     assert_eq!(ar_b.account_class, AccountClass::Ar);
     assert_eq!(ar_b.side, Side::Credit);
-    assert_eq!(ar_b.amount_minor, 200);
+    assert_eq!(ar_b.money.amount(), expected(200));
     assert_eq!(ar_b.invoice_id, Some("B".to_owned()));
 
     // Balanced: Σ DR (500) == Σ CR (500).
-    assert_eq!(sum_dr(&entry), 500);
-    assert_eq!(sum_cr(&entry), 500);
+    assert_eq!(sum_dr(&entry), expected(500));
+    assert_eq!(sum_cr(&entry), expected(500));
     assert_eq!(sum_dr(&entry), sum_cr(&entry));
 
     // Every line carries the payer, currency, and seller.
     for l in &entry.lines {
         assert_eq!(l.payer_tenant_id, inp.payer_tenant_id);
-        assert_eq!(l.currency, "USD");
+        assert_eq!(l.money.currency().code(), "USD");
         assert_eq!(l.seller_tenant_id, Some(inp.tenant_id));
     }
 }
@@ -101,7 +113,7 @@ fn non_positive_split_amount_is_rejected() {
 fn candidate(id: &str, open: i64) -> Candidate {
     Candidate {
         invoice_id: id.to_owned(),
-        open_minor: open,
+        open: fixture(open),
         original_posted_at: None,
     }
 }
@@ -112,7 +124,7 @@ fn caller_split_happy_preserves_order_and_amounts() {
     // Caller order (B before A) is preserved verbatim — never reordered to
     // the candidate order; under-allocating the lump is allowed.
     let caller = vec![split("B", 200), split("A", 250)];
-    let out = validate_caller_split(&candidates, &caller, 500).unwrap();
+    let out = validate_caller_split(&candidates, &caller, &fixture(500)).unwrap();
     assert_eq!(out, caller, "validated splits returned in caller order");
 }
 
@@ -122,14 +134,14 @@ fn caller_split_full_open_and_full_lump_is_allowed() {
     // (`<=`), so they pass.
     let candidates = vec![candidate("A", 300), candidate("B", 200)];
     let caller = vec![split("A", 300), split("B", 200)];
-    assert!(validate_caller_split(&candidates, &caller, 500).is_ok());
+    assert!(validate_caller_split(&candidates, &caller, &fixture(500)).is_ok());
 }
 
 #[test]
 fn caller_split_over_open_is_rejected() {
     let candidates = vec![candidate("A", 300)];
     // 301 > A's open 300.
-    let err = validate_caller_split(&candidates, &[split("A", 301)], 1000).unwrap_err();
+    let err = validate_caller_split(&candidates, &[split("A", 301)], &fixture(1000)).unwrap_err();
     assert!(
         matches!(err, DomainError::AllocationSplitInvalid(_)),
         "{err:?}"
@@ -140,8 +152,12 @@ fn caller_split_over_open_is_rejected() {
 fn caller_split_over_lump_is_rejected() {
     let candidates = vec![candidate("A", 300), candidate("B", 300)];
     // Each share is within its open balance, but 300 + 300 > lump 500.
-    let err =
-        validate_caller_split(&candidates, &[split("A", 300), split("B", 300)], 500).unwrap_err();
+    let err = validate_caller_split(
+        &candidates,
+        &[split("A", 300), split("B", 300)],
+        &fixture(500),
+    )
+    .unwrap_err();
     assert!(
         matches!(err, DomainError::AllocationSplitInvalid(_)),
         "{err:?}"
@@ -151,7 +167,7 @@ fn caller_split_over_lump_is_rejected() {
 #[test]
 fn caller_split_unknown_invoice_is_rejected() {
     let candidates = vec![candidate("A", 300)];
-    let err = validate_caller_split(&candidates, &[split("Z", 100)], 1000).unwrap_err();
+    let err = validate_caller_split(&candidates, &[split("Z", 100)], &fixture(1000)).unwrap_err();
     assert!(
         matches!(err, DomainError::AllocationSplitInvalid(_)),
         "{err:?}"
@@ -162,7 +178,7 @@ fn caller_split_unknown_invoice_is_rejected() {
 fn caller_split_closed_candidate_is_rejected() {
     // A present but fully-paid (open 0) candidate is not a valid target.
     let candidates = vec![candidate("A", 0)];
-    let err = validate_caller_split(&candidates, &[split("A", 1)], 1000).unwrap_err();
+    let err = validate_caller_split(&candidates, &[split("A", 1)], &fixture(1000)).unwrap_err();
     assert!(
         matches!(err, DomainError::AllocationSplitInvalid(_)),
         "{err:?}"
@@ -172,8 +188,12 @@ fn caller_split_closed_candidate_is_rejected() {
 #[test]
 fn caller_split_duplicate_invoice_is_rejected() {
     let candidates = vec![candidate("A", 300)];
-    let err =
-        validate_caller_split(&candidates, &[split("A", 100), split("A", 50)], 1000).unwrap_err();
+    let err = validate_caller_split(
+        &candidates,
+        &[split("A", 100), split("A", 50)],
+        &fixture(1000),
+    )
+    .unwrap_err();
     assert!(
         matches!(err, DomainError::AllocationSplitInvalid(_)),
         "{err:?}"
@@ -183,13 +203,13 @@ fn caller_split_duplicate_invoice_is_rejected() {
 #[test]
 fn caller_split_non_positive_amount_is_rejected() {
     let candidates = vec![candidate("A", 300), candidate("B", 300)];
-    let err = validate_caller_split(&candidates, &[split("A", 0)], 1000).unwrap_err();
+    let err = validate_caller_split(&candidates, &[split("A", 0)], &fixture(1000)).unwrap_err();
     assert!(
         matches!(err, DomainError::AllocationSplitInvalid(_)),
         "{err:?}"
     );
 
-    let err = validate_caller_split(&candidates, &[split("B", -5)], 1000).unwrap_err();
+    let err = validate_caller_split(&candidates, &[split("B", -5)], &fixture(1000)).unwrap_err();
     assert!(
         matches!(err, DomainError::AllocationSplitInvalid(_)),
         "{err:?}"
@@ -203,7 +223,7 @@ fn caller_split_empty_is_ok_but_builds_nothing() {
     // as it does for an empty precedence result.
     let candidates = vec![candidate("A", 300)];
     assert_eq!(
-        validate_caller_split(&candidates, &[], 500).unwrap(),
+        validate_caller_split(&candidates, &[], &fixture(500)).unwrap(),
         vec![]
     );
 }

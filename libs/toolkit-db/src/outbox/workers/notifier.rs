@@ -24,9 +24,9 @@ use tracing::warn;
 
 use super::super::core::Outbox;
 use super::super::store::OutboxStore;
-use super::super::taskward::{Directive, WorkerAction};
 use super::super::types::OutboxError;
 use crate::Db;
+use toolkit_taskward::{Directive, WorkerAction};
 
 #[derive(Debug, FromQueryResult)]
 struct MailRow {

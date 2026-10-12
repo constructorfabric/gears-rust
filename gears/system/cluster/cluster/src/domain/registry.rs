@@ -46,6 +46,7 @@ use cluster_sdk::{
 /// profiles on one DSN report **one** id here, and it needs no change to this
 /// type to do it — which is the point of recording identity rather than
 /// configuration here.
+#[toolkit::domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InstanceId(usize);
 
@@ -68,6 +69,7 @@ impl InstanceId {
 /// one instance — one pool, one reaper, one `StopHook`. Within a single profile
 /// the ids normally differ: an auto-filled SDK default is a distinct instance
 /// layered *over* the profile's cache instance, not the cache instance itself.
+#[toolkit::domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProfileInstanceRefs {
     /// The instance serving this profile's cache.
@@ -89,6 +91,7 @@ pub struct ProfileInstanceRefs {
 /// The set is returned by [`ClusterWiring::from_config`](crate::ClusterWiring::from_config) and holds strong `Arc`s
 /// to every instance a profile is built from, which keeps those
 /// instances alive for as long as a profile references them (§5.3).
+#[toolkit::domain_model]
 pub struct BoundProfile {
     /// The profile name, as registered in the hub scope `cluster:{name}`.
     pub name: String,
@@ -254,6 +257,7 @@ const UNKNOWN_PROFILE: &str = "<unknown>";
 /// enumerate profiles — `DescribeProfiles`, the admin route, the readiness
 /// aggregate — reads a consistent set rather than several racing lookups, and
 /// can report the `generation` it read.
+#[toolkit::domain_model]
 pub struct RegistrySnapshot {
     /// Incremented on every swap, so a client can detect that the server's
     /// profile set changed under it (§5.6).
@@ -280,6 +284,7 @@ pub struct RegistrySnapshot {
 /// request path, which keeps a 10k ops/s path inside a 5 ms budget — and
 /// what comes back is the *real* backend `Arc`, with no wrapper interposed
 /// (invariant I14).
+#[toolkit::domain_model]
 pub struct ProfileRegistry {
     inner: ArcSwap<RegistrySnapshot>,
 }

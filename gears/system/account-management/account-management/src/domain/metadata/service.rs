@@ -136,13 +136,16 @@ pub(crate) mod pep {
     /// field is reserved for surfacing the ancestor that produced the
     /// value) and audit log enrichment, not in the policy verb.
     pub mod actions {
+        /// Action name for reading a metadata entry.
         pub const READ: &str = "read";
+        /// Action name for listing metadata entries.
         pub const LIST: &str = "list";
         /// `Metadata.write` per DESIGN §`cpt-cf-account-management-fr-tenant-metadata-permissions`.
         /// Used by the upsert flow; PUT and the future PATCH share
         /// the same action — distinguishing them is up to the PDP,
         /// not AM.
         pub const WRITE: &str = "write";
+        /// Action name for deleting a metadata entry.
         pub const DELETE: &str = "delete";
 
         /// Every action in this vocabulary — see the note on the user

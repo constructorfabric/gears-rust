@@ -23,7 +23,10 @@ use toolkit::api::canonical_prelude::CanonicalError;
 /// Problem-JSON 400 with `field=body` and a reason code derived from the
 /// underlying [`JsonRejection`] variant.
 #[derive(Debug, Clone)]
-pub(crate) struct CanonicalJson<T>(pub T);
+pub(crate) struct CanonicalJson<T>(
+    /// The wrapped, deserialized request body.
+    pub T,
+);
 
 impl<T, S> FromRequest<S> for CanonicalJson<T>
 where

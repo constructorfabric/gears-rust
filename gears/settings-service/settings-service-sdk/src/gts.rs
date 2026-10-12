@@ -13,7 +13,7 @@
 ///
 /// A setting key is this followed by the setting's own derived type (ADR-002).
 /// The schema registered under it is [`setting_type_base_schema`] below.
-pub const SETTING_TYPE_BASE: &str = "gts.cf.core.settings.setting_type.v1~";
+pub const SETTING_TYPE_BASE: &str = toolkit_gts::gts_id!("cf.core.settings.setting_type.v1~");
 
 // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-9
 /// The schema of the abstract base every concrete setting type derives from.
@@ -53,13 +53,13 @@ toolkit_gts::inventory::submit! {
 }
 // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-9
 
-pub const DECLARATION_SCHEMA: &str = "gts.cf.core.settings.declaration.v1~";
+pub const DECLARATION_SCHEMA: &str = toolkit_gts::gts_id!("cf.core.settings.declaration.v1~");
 
 /// A stored setting value at some scope — what a setting currently *holds*.
-pub const VALUE_SCHEMA: &str = "gts.cf.core.settings.value.v1~";
+pub const VALUE_SCHEMA: &str = toolkit_gts::gts_id!("cf.core.settings.value.v1~");
 
 /// A settings category.
-pub const CATEGORY_SCHEMA: &str = "gts.cf.core.settings.category.v1~";
+pub const CATEGORY_SCHEMA: &str = toolkit_gts::gts_id!("cf.core.settings.category.v1~");
 
 /// Typed view of the wire `resource_type` strings above.
 #[derive(Debug, Clone, PartialEq, Eq)]

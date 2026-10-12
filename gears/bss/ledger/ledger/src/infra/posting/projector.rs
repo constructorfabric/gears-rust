@@ -9,8 +9,9 @@
 //! - `ar_payer_balance` `(tenant, payer, account, currency)` — `AR` lines;
 //! - `ar_invoice_balance` `(tenant, payer, account, invoice)` — `AR` lines
 //!   carrying an `invoice_id`;
+//! - `unallocated_balance` `(tenant, payer, currency)` — unapplied cash;
 //! - `reusable_credit_subbalance`
-//!   `(tenant, payer, account, currency, credit_grant_event_type)` —
+//!   `(tenant, payer, currency, credit_grant_event_type)` —
 //!   `REUSABLE_CREDIT` lines (the wallet sub-grain);
 //! - `tax_subbalance` `(tenant, account, jurisdiction, filing)` —
 //!   `TAX_PAYABLE` lines carrying both tax dims.
@@ -20,12 +21,17 @@
 
 use std::collections::HashMap;
 
+use super::retry::{insert_to_repo, scope_to_repo};
+use crate::domain::exact_money::{ExactAmount, ExactError};
+use crate::domain::model::RepoError;
+use crate::infra::storage::money_text::{decode_money, decode_optional_money, encode_amount};
 use bss_ledger_sdk::{AccountClass, Side};
+use bss_ledger_sdk::{CurrencySpec, MoneyError, PostedMoney};
 use chrono::NaiveDate;
-use sea_orm::ExprTrait;
+use rust_decimal::Decimal;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter};
-use toolkit_db::secure::{AccessScope, DbTx, SecureEntityExt, SecureInsertExt, SecureOnConflict};
+use toolkit_db::secure::{AccessScope, DbTx, SecureEntityExt, SecureInsertExt, SecureUpdateExt};
 use uuid::Uuid;
 
 use crate::domain::model::{NewEntry, NewLine};
@@ -37,14 +43,17 @@ use crate::infra::storage::entity::{
 use time::OffsetDateTime;
 
 /// Projection error.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ProjectError {
+    /// Validated money, stored-data, or scope error (preserves typed conflicts).
+    #[error(transparent)]
+    Repo(#[from] RepoError),
+    /// A stale cache version requires a fresh whole transaction.
+    #[error("concurrent cache modification")]
+    Conflict,
     /// A guarded balance would go negative after applying a delta.
-    #[error("balance for account {account_id} would go negative ({balance_minor})")]
-    NegativeBalance {
-        account_id: Uuid,
-        balance_minor: i64,
-    },
+    #[error("balance for account {account_id} would go negative ({balance})")]
+    NegativeBalance { account_id: Uuid, balance: String },
     /// An account's `normal_side` was not supplied in the lookup map.
     #[error("missing normal_side for account {0}")]
     MissingNormalSide(Uuid),
@@ -54,22 +63,16 @@ pub enum ProjectError {
     /// balance, which the DB NOT-NULL CHECK does not catch (it tests NULL, not "").
     #[error("REUSABLE_CREDIT line {0} missing credit_grant_event_type")]
     MissingCreditEventType(Uuid),
+    /// Exact arithmetic exceeded its digit budget (an internal invariant breach).
+    #[error("balance projector arithmetic: {0}")]
+    Arithmetic(#[source] ExactError),
     /// Underlying storage failure.
     #[error("balance projector db error: {0}")]
     Db(String),
-    /// A coalesced money delta exceeded `i64` while summing an entry's same-grain
-    /// legs — the one money path that previously saturated. Surfaced as a clean
-    /// amount-class rejection rather than a silently-wrong saturated balance.
-    #[error("coalesced money delta overflowed i64 for account {account_id} ({currency}, {field})")]
-    Overflow {
-        account_id: Uuid,
-        currency: String,
-        field: &'static str,
-    },
 }
 
 /// One derived cache mutation, keyed by its grain. `table_rank` orders the
-/// four cache tables; the remaining key parts order rows within a table so
+/// six cache tables; the remaining key parts order rows within a table so
 /// concurrent posts acquire row locks in a single global order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GrainDelta {
@@ -83,24 +86,11 @@ struct GrainDelta {
     tax_filing_period: String,
     account_class: AccountClass,
     normal_side: Side,
-    delta: i64,
-    /// FX functional-column delta (Slice 5): the signed `functional_amount_minor`
-    /// summed in parallel with `delta`, projected onto `functional_balance_minor`.
-    /// `0` with `functional_currency = None` on single-currency grains, where the
-    /// functional cache column stays NULL (functional ≡ transaction by identity).
-    functional_delta: i64,
-    /// The grain's functional (legal-entity reporting) currency; `Some` only on
-    /// cross-currency grains. Drives `functional_currency` on the cache row.
-    functional_currency: Option<String>,
-    /// AR-invoice grain only (chargeback `ar_status` seam): the signed disputed
-    /// sub-delta routed to `ar_invoice_balance.disputed_minor`, parallel to
-    /// `delta` (which nets `balance_minor`). It is the line's signed amount
-    /// (`delta`) when the AR line carries `ar_status = DISPUTED`, else `0`. A
-    /// balanced reclass (`DR AR DISPUTED` + `CR AR ACTIVE`, same grain) thus nets
-    /// ZERO on `balance_minor` (AR-class-neutral) while moving `+amount` onto
-    /// `disputed_minor`; a `won` reversal (`DR AR ACTIVE` + `CR AR DISPUTED`)
-    /// nets `-amount`. Every non-AR-invoice grain carries `0`.
-    disputed_delta: i64,
+    delta: ExactAmount,
+    currency_spec: CurrencySpec,
+    functional_delta: ExactAmount,
+    functional_currency: Option<CurrencySpec>,
+    disputed_delta: ExactAmount,
     /// AR-invoice grain only (decision P): the entry's posted-at and the line's
     /// due date, stamped first-write-wins onto `ar_invoice_balance` so the
     /// oldest-first allocation precedence has a stable post date. Other grains
@@ -132,16 +122,31 @@ type GrainSortKey<'a> = (
 );
 
 impl GrainDelta {
-    /// The canonical ordering key: `(table_rank, tenant, account, currency,
-    /// payer, invoice)` — extended with the tax dims and the credit-grant event
-    /// type for total order.
+    /// Sort by business identity only: non-key axes are constant placeholders.
+    /// In particular, currency/scale cannot split an invoice or tax grain, and
+    /// resolved account attributes cannot split payer wallet grains.
     fn sort_key(&self) -> GrainSortKey<'_> {
         (
             self.table_rank,
             self.tenant_id,
-            self.account_id,
-            &self.currency,
-            self.payer_tenant_id,
+            if matches!(
+                self.table_rank,
+                GrainTable::Unallocated | GrainTable::ReusableCredit
+            ) {
+                Uuid::nil()
+            } else {
+                self.account_id
+            },
+            if matches!(self.table_rank, GrainTable::ArInvoice | GrainTable::Tax) {
+                ""
+            } else {
+                &self.currency
+            },
+            if matches!(self.table_rank, GrainTable::Account | GrainTable::Tax) {
+                Uuid::nil()
+            } else {
+                self.payer_tenant_id
+            },
             &self.invoice_id,
             &self.tax_jurisdiction,
             &self.tax_filing_period,
@@ -150,37 +155,8 @@ impl GrainDelta {
     }
 }
 
-/// The cache table a [`GrainDelta`] targets, in canonical **lock order**:
-/// `derive(Ord)` ranks by declaration order, so concurrent posts acquire row
-/// locks in one global order (design §4.3 / §7) and the `match` in `project` is
-/// exhaustive by construction — a new grain kind cannot be added without also
-/// adding its upsert arm (the compiler enforces it; there is no wildcard arm).
-///
-/// The recognition tables sit just below the balance caches: a recognition post
-/// (Slice 4) locks the `CONTRACT_LIABILITY` + `REVENUE` `account_balance` rows
-/// first, then the schedule, then the segment, by `(tenant_id, schedule_id,
-/// segment_no)`. Those two variants (and their `match` arms) are added here,
-/// after `Tax`, when the `RecognitionRunner` starts projecting recognition grains.
-///
-/// **Canonical procedural lock order (design §4.7) — the full chain a Slice-3
-/// adjustment handler observes, of which only the balance-cache ranks below are
-/// `GrainTable` variants:**
-/// `payment_settlement → account_balance → ar_invoice_balance → ar_payer_balance
-/// → unallocated_balance → reusable_credit_subbalance → tax_subbalance →
-/// recognition_schedule → recognition_segment → invoice_exposure →
-/// payment_allocation_refund`, then by `(tenant_id, …key…)`.
-///
-/// The tail four — `recognition_schedule`/`recognition_segment` (Slice 4) and
-/// `invoice_exposure`/`payment_allocation_refund` (Slice 3) — are NOT
-/// `BalanceProjector` balance grains: they are single-row counter/stamp grains
-/// touched by an in-place delta in the respective handler (e.g.
-/// `CreditNoteHandler` bumps `invoice_exposure.credit_note_total_minor` then
-/// `payment_allocation_refund.refunded_minor`), so they carry no `GrainTable`
-/// rank and the projector ranks stay balance-only (`grain_lock_order_ranks_are_pinned`
-/// pins exactly the balance set). The cross-table order among these tail tables
-/// is enforced PROCEDURALLY by each handler's acquisition order — the same
-/// discipline recognition uses (m11 docstring), extended with the two Slice-3
-/// ranks appended last so there is no inversion vs Slices 1/2/4.
+/// Cache acquisition order, preserved across all six writers.
+/// Workflow repositories must acquire their own grains consistently with this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum GrainTable {
     Account,
@@ -192,13 +168,16 @@ enum GrainTable {
 }
 
 /// Projects posted lines into the derived balance caches.
-#[derive(Clone, Default)]
-pub struct BalanceProjector;
+#[derive(Clone)]
+pub struct BalanceProjector {
+    backend: sea_orm::DbBackend,
+}
 
 impl BalanceProjector {
+    /// Bind error classification to the provider backend.
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn new(backend: sea_orm::DbBackend) -> Self {
+        Self { backend }
     }
 
     /// Derive per-grain signed deltas, sort them into the canonical lock
@@ -211,9 +190,6 @@ impl BalanceProjector {
     /// `normal_sides`; [`ProjectError::NegativeBalance`] if a guarded balance
     /// would go negative; [`ProjectError::Db`] on a storage failure.
     ///
-    /// # Panics
-    /// Never in practice — the internal `unreachable!` guards against a grain
-    /// carrying an unknown table rank, which the derivation cannot produce.
     pub async fn project(
         &self,
         txn: &DbTx<'_>,
@@ -248,6 +224,7 @@ impl BalanceProjector {
         Ok(())
     }
 
+    /// Read the secured grain and publish one literal, version-guarded post-state.
     async fn upsert_account_balance(
         &self,
         txn: &DbTx<'_>,
@@ -255,127 +232,96 @@ impl BalanceProjector {
         g: &GrainDelta,
         seq: i64,
     ) -> Result<(), ProjectError> {
-        // Pre-check the projected balance for guarded classes BEFORE the
-        // upsert: the DB no-negative CHECK would otherwise abort the whole
-        // transaction, so the app-level guard fires first for a clean error.
-        // The read takes no row lock (none used anywhere in this codebase);
-        // under a concurrent race the P1 conditional CHECK is the backstop —
-        // it aborts the txn so a negative balance can never persist.
-        let guarded = g.account_class.is_guarded();
-        let seed = if guarded {
-            let current = account_balance::Entity::find()
-                .filter(
-                    Condition::all()
-                        .add(account_balance::Column::TenantId.eq(g.tenant_id))
-                        .add(account_balance::Column::AccountId.eq(g.account_id))
-                        .add(account_balance::Column::Currency.eq(g.currency.clone())),
+        use account_balance::{ActiveModel, Column, Entity};
+        let key = Condition::all()
+            .add(Column::TenantId.eq(g.tenant_id))
+            .add(Column::AccountId.eq(g.account_id))
+            .add(Column::Currency.eq(g.currency.clone()));
+        let existing = Entity::find()
+            .filter(key.clone())
+            .secure()
+            .scope_with(scope)
+            .one(txn)
+            .await
+            .map_err(|e| scope_to_repo(e, self.backend))?;
+        let stored = existing
+            .as_ref()
+            .map(|r| decode_money(&r.balance, &r.currency, r.currency_scale))
+            .transpose()?;
+        let functional = existing
+            .as_ref()
+            .map(|r| {
+                decode_optional_money(
+                    r.functional_balance.as_deref(),
+                    r.functional_currency.as_deref(),
+                    r.functional_currency_scale,
                 )
+            })
+            .transpose()?
+            .flatten();
+        if let Some(r) = &existing {
+            if r.account_id != g.account_id {
+                return Err(cache_account_mismatch(g, r.account_id));
+            }
+            if r.account_class != g.account_class.as_str()
+                || r.normal_side != g.normal_side.as_str()
+            {
+                return Err(ProjectError::Db(
+                    "cache account classification mismatch".into(),
+                ));
+            }
+        }
+        let (balance, functional_balance) =
+            final_balances(g, stored.as_ref(), functional.as_ref())?;
+        if let Some(r) = existing {
+            let next = next_version(r.version)?;
+            let result = Entity::update_many()
                 .secure()
                 .scope_with(scope)
-                .one(txn)
+                .filter(key.add(Column::Version.eq(r.version)))
+                .col_expr(Column::Balance, Expr::value(encode_amount(&balance)))
+                .col_expr(Column::Version, Expr::value(next))
+                .col_expr(Column::LastEntrySeq, Expr::value(Some(seq)))
+                .col_expr(
+                    Column::FunctionalBalance,
+                    Expr::value(functional_balance.as_ref().map(encode_amount)),
+                )
+                .exec(txn)
                 .await
-                .map_err(|e| ProjectError::Db(format!("account_balance pre-read: {e}")))?
-                .map_or(0_i64, |r| r.balance_minor);
-            let projected = current.saturating_add(g.delta);
-            if projected < 0 {
-                return Err(ProjectError::NegativeBalance {
-                    account_id: g.account_id,
-                    balance_minor: projected,
-                });
-            }
-            // Seed the INSERT tuple with the projected (post-state) balance, not
-            // the bare delta: Postgres evaluates the no-negative CHECK against the
-            // INSERT VALUES tuple during ON CONFLICT arbitration, so a negative
-            // delta (a legitimate net-down of a guarded balance, e.g. a reversal)
-            // would be rejected on the arbiter tuple even though the DO UPDATE
-            // path nets a non-negative result. The fresh-insert seed equals the
-            // delta (current == 0), preserving first-post semantics; the conflict
-            // path discards this seed and applies the atomic `+ delta` below.
-            projected
+                .map_err(|e| scope_to_repo(e, self.backend))?;
+            require_one(result.rows_affected)?;
         } else {
-            g.delta
-        };
-
-        let am = account_balance::ActiveModel {
-            tenant_id: Set(g.tenant_id),
-            account_id: Set(g.account_id),
-            currency: Set(g.currency.clone()),
-            account_class: Set(g.account_class.as_str().to_owned()),
-            normal_side: Set(g.normal_side.as_str().to_owned()),
-            balance_minor: Set(seed),
-            // Slice 5: functional columns are populated ONLY on cross-currency
-            // posts (functional_currency = Some); single-currency posts leave them
-            // NULL (functional ≡ transaction by identity). A plain `.add` on the
-            // conflict path keeps NULL = NULL (no COALESCE).
-            functional_balance_minor: Set(g
-                .functional_currency
-                .as_ref()
-                .map(|_| g.functional_delta)),
-            functional_currency: Set(g.functional_currency.clone()),
-            last_entry_seq: Set(Some(seq)),
-            version: Set(0),
-        };
-        let mut on_conflict = SecureOnConflict::<account_balance::Entity>::columns([
-            account_balance::Column::TenantId,
-            account_balance::Column::AccountId,
-            account_balance::Column::Currency,
-        ]);
-        // The conflict path nets atomically with `existing + delta` (NOT the
-        // seed): two racing posts then serialize at the row and the no-negative
-        // CHECK on the resulting row is the backstop against a concurrent
-        // overdraw the lockless pre-read could not see.
-        on_conflict = on_conflict
-            .value(
-                account_balance::Column::BalanceMinor,
-                Expr::col((
-                    account_balance::Entity,
-                    account_balance::Column::BalanceMinor,
-                ))
-                .add(g.delta),
-            )
-            .and_then(|oc| {
-                oc.value(
-                    account_balance::Column::Version,
-                    Expr::col((account_balance::Entity, account_balance::Column::Version)).add(1),
-                )
-            })
-            .and_then(|oc| {
-                oc.value(
-                    account_balance::Column::LastEntrySeq,
-                    Expr::value(Some(seq)),
-                )
-            })
-            // Slice 5: net the functional column with a PLAIN `+ functional_delta`
-            // (NOT COALESCE) so a single-currency row's NULL stays NULL.
-            .and_then(|oc| {
-                oc.value(
-                    account_balance::Column::FunctionalBalanceMinor,
-                    Expr::col((
-                        account_balance::Entity,
-                        account_balance::Column::FunctionalBalanceMinor,
-                    ))
-                    .add(g.functional_delta),
-                )
-            })
-            .and_then(|oc| {
-                oc.value(
-                    account_balance::Column::FunctionalCurrency,
-                    Expr::value(g.functional_currency.clone()),
-                )
-            })
-            .map_err(|e| ProjectError::Db(format!("account_balance on_conflict: {e}")))?;
-
-        account_balance::Entity::insert(am.clone())
-            .secure()
-            .scope_with_model(scope, &am)
-            .map_err(|e| ProjectError::Db(format!("account_balance scope: {e}")))?
-            .on_conflict(on_conflict)
-            .exec_with_returning(txn)
-            .await
-            .map_err(|e| ProjectError::Db(format!("account_balance upsert: {e}")))?;
+            let am = ActiveModel {
+                tenant_id: Set(g.tenant_id),
+                account_id: Set(g.account_id),
+                currency: Set(g.currency.clone()),
+                currency_scale: Set(i16::from(g.currency_spec.scale())),
+                account_class: Set(g.account_class.as_str().to_owned()),
+                normal_side: Set(g.normal_side.as_str().to_owned()),
+                balance: Set(encode_amount(&balance)),
+                functional_balance: Set(functional_balance.as_ref().map(encode_amount)),
+                functional_currency: Set(g
+                    .functional_currency
+                    .as_ref()
+                    .map(|c| c.code().to_owned())),
+                functional_currency_scale: Set(g
+                    .functional_currency
+                    .as_ref()
+                    .map(|c| i16::from(c.scale()))),
+                last_entry_seq: Set(Some(seq)),
+                version: Set(0),
+            };
+            Entity::insert(am.clone())
+                .secure()
+                .scope_with_model(scope, &am)
+                .map_err(|e| scope_to_repo(e, self.backend))?
+                .exec(txn)
+                .await
+                .map_err(|e| insert_to_repo(e, self.backend))?;
+        }
         Ok(())
     }
-
+    /// Read the secured grain and publish one literal, version-guarded post-state.
     async fn upsert_ar_payer(
         &self,
         txn: &DbTx<'_>,
@@ -383,107 +329,89 @@ impl BalanceProjector {
         g: &GrainDelta,
         seq: i64,
     ) -> Result<(), ProjectError> {
-        // AR is a guarded class — pre-check the projected balance (see
-        // `upsert_account_balance` for why this precedes the upsert). The seed
-        // is the projected post-state, not the bare delta, so a net-down does
-        // not trip the no-negative CHECK on the INSERT arbiter tuple.
-        let current = ar_payer_balance::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(ar_payer_balance::Column::TenantId.eq(g.tenant_id))
-                    .add(ar_payer_balance::Column::PayerTenantId.eq(g.payer_tenant_id))
-                    .add(ar_payer_balance::Column::AccountId.eq(g.account_id))
-                    .add(ar_payer_balance::Column::Currency.eq(g.currency.clone())),
-            )
+        use ar_payer_balance::{ActiveModel, Column, Entity};
+        let key = Condition::all()
+            .add(Column::TenantId.eq(g.tenant_id))
+            .add(Column::PayerTenantId.eq(g.payer_tenant_id))
+            .add(Column::AccountId.eq(g.account_id))
+            .add(Column::Currency.eq(g.currency.clone()));
+        let existing = Entity::find()
+            .filter(key.clone())
             .secure()
             .scope_with(scope)
             .one(txn)
             .await
-            .map_err(|e| ProjectError::Db(format!("ar_payer_balance pre-read: {e}")))?
-            .map_or(0_i64, |r| r.balance_minor);
-        let projected = current.saturating_add(g.delta);
-        if projected < 0 {
-            return Err(ProjectError::NegativeBalance {
-                account_id: g.account_id,
-                balance_minor: projected,
-            });
+            .map_err(|e| scope_to_repo(e, self.backend))?;
+        let stored = existing
+            .as_ref()
+            .map(|r| decode_money(&r.balance, &r.currency, r.currency_scale))
+            .transpose()?;
+        let functional = existing
+            .as_ref()
+            .map(|r| {
+                decode_optional_money(
+                    r.functional_balance.as_deref(),
+                    r.functional_currency.as_deref(),
+                    r.functional_currency_scale,
+                )
+            })
+            .transpose()?
+            .flatten();
+        if let Some(r) = &existing
+            && r.account_id != g.account_id
+        {
+            return Err(cache_account_mismatch(g, r.account_id));
         }
-
-        let am = ar_payer_balance::ActiveModel {
-            tenant_id: Set(g.tenant_id),
-            payer_tenant_id: Set(g.payer_tenant_id),
-            account_id: Set(g.account_id),
-            currency: Set(g.currency.clone()),
-            balance_minor: Set(projected),
-            // Slice 5: functional columns populated only on cross-currency posts
-            // (Some); single-currency leaves them NULL. Plain `.add` on conflict
-            // keeps NULL = NULL.
-            functional_balance_minor: Set(g
-                .functional_currency
-                .as_ref()
-                .map(|_| g.functional_delta)),
-            functional_currency: Set(g.functional_currency.clone()),
-            last_entry_seq: Set(Some(seq)),
-            version: Set(0),
-        };
-        let mut on_conflict = SecureOnConflict::<ar_payer_balance::Entity>::columns([
-            ar_payer_balance::Column::TenantId,
-            ar_payer_balance::Column::PayerTenantId,
-            ar_payer_balance::Column::AccountId,
-            ar_payer_balance::Column::Currency,
-        ]);
-        on_conflict = on_conflict
-            .value(
-                ar_payer_balance::Column::BalanceMinor,
-                Expr::col((
-                    ar_payer_balance::Entity,
-                    ar_payer_balance::Column::BalanceMinor,
-                ))
-                .add(g.delta),
-            )
-            .and_then(|oc| {
-                oc.value(
-                    ar_payer_balance::Column::Version,
-                    Expr::col((ar_payer_balance::Entity, ar_payer_balance::Column::Version)).add(1),
+        let (balance, functional_balance) =
+            final_balances(g, stored.as_ref(), functional.as_ref())?;
+        if let Some(r) = existing {
+            let next = next_version(r.version)?;
+            let result = Entity::update_many()
+                .secure()
+                .scope_with(scope)
+                .filter(key.add(Column::Version.eq(r.version)))
+                .col_expr(Column::Balance, Expr::value(encode_amount(&balance)))
+                .col_expr(Column::Version, Expr::value(next))
+                .col_expr(Column::LastEntrySeq, Expr::value(Some(seq)))
+                .col_expr(
+                    Column::FunctionalBalance,
+                    Expr::value(functional_balance.as_ref().map(encode_amount)),
                 )
-            })
-            .and_then(|oc| {
-                oc.value(
-                    ar_payer_balance::Column::LastEntrySeq,
-                    Expr::value(Some(seq)),
-                )
-            })
-            // Slice 5: plain `+ functional_delta` (NOT COALESCE) — single-currency
-            // NULL stays NULL.
-            .and_then(|oc| {
-                oc.value(
-                    ar_payer_balance::Column::FunctionalBalanceMinor,
-                    Expr::col((
-                        ar_payer_balance::Entity,
-                        ar_payer_balance::Column::FunctionalBalanceMinor,
-                    ))
-                    .add(g.functional_delta),
-                )
-            })
-            .and_then(|oc| {
-                oc.value(
-                    ar_payer_balance::Column::FunctionalCurrency,
-                    Expr::value(g.functional_currency.clone()),
-                )
-            })
-            .map_err(|e| ProjectError::Db(format!("ar_payer_balance on_conflict: {e}")))?;
-
-        ar_payer_balance::Entity::insert(am.clone())
-            .secure()
-            .scope_with_model(scope, &am)
-            .map_err(|e| ProjectError::Db(format!("ar_payer_balance scope: {e}")))?
-            .on_conflict(on_conflict)
-            .exec_with_returning(txn)
-            .await
-            .map_err(|e| ProjectError::Db(format!("ar_payer_balance upsert: {e}")))?;
+                .exec(txn)
+                .await
+                .map_err(|e| scope_to_repo(e, self.backend))?;
+            require_one(result.rows_affected)?;
+        } else {
+            let am = ActiveModel {
+                tenant_id: Set(g.tenant_id),
+                payer_tenant_id: Set(g.payer_tenant_id),
+                account_id: Set(g.account_id),
+                currency: Set(g.currency.clone()),
+                currency_scale: Set(i16::from(g.currency_spec.scale())),
+                balance: Set(encode_amount(&balance)),
+                functional_balance: Set(functional_balance.as_ref().map(encode_amount)),
+                functional_currency: Set(g
+                    .functional_currency
+                    .as_ref()
+                    .map(|c| c.code().to_owned())),
+                functional_currency_scale: Set(g
+                    .functional_currency
+                    .as_ref()
+                    .map(|c| i16::from(c.scale()))),
+                last_entry_seq: Set(Some(seq)),
+                version: Set(0),
+            };
+            Entity::insert(am.clone())
+                .secure()
+                .scope_with_model(scope, &am)
+                .map_err(|e| scope_to_repo(e, self.backend))?
+                .exec(txn)
+                .await
+                .map_err(|e| insert_to_repo(e, self.backend))?;
+        }
         Ok(())
     }
-
+    /// Read the secured grain and publish one literal, version-guarded post-state.
     async fn upsert_ar_invoice(
         &self,
         txn: &DbTx<'_>,
@@ -491,144 +419,115 @@ impl BalanceProjector {
         g: &GrainDelta,
         seq: i64,
     ) -> Result<(), ProjectError> {
-        // AR invoice rows are guarded — pre-check the projected balance. The
-        // seed is the projected post-state, not the bare delta, so a net-down
-        // (e.g. a reversal or payment) does not trip the no-negative CHECK on
-        // the INSERT arbiter tuple. The same pre-read also yields the current
-        // `disputed_minor` so the INSERT tuple seeds its projected post-state
-        // (the chargeback `ar_status` sub-balance; see below).
-        let existing = ar_invoice_balance::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(ar_invoice_balance::Column::TenantId.eq(g.tenant_id))
-                    .add(ar_invoice_balance::Column::PayerTenantId.eq(g.payer_tenant_id))
-                    .add(ar_invoice_balance::Column::AccountId.eq(g.account_id))
-                    .add(ar_invoice_balance::Column::InvoiceId.eq(g.invoice_id.clone())),
-            )
+        use ar_invoice_balance::{ActiveModel, Column, Entity};
+        let key = Condition::all()
+            .add(Column::TenantId.eq(g.tenant_id))
+            .add(Column::PayerTenantId.eq(g.payer_tenant_id))
+            .add(Column::AccountId.eq(g.account_id))
+            .add(Column::InvoiceId.eq(g.invoice_id.clone()));
+        let existing = Entity::find()
+            .filter(key.clone())
             .secure()
             .scope_with(scope)
             .one(txn)
             .await
-            .map_err(|e| ProjectError::Db(format!("ar_invoice_balance pre-read: {e}")))?;
-        let current = existing.as_ref().map_or(0_i64, |r| r.balance_minor);
-        let current_disputed = existing.as_ref().map_or(0_i64, |r| r.disputed_minor);
-        let projected = current.saturating_add(g.delta);
-        if projected < 0 {
-            return Err(ProjectError::NegativeBalance {
-                account_id: g.account_id,
-                balance_minor: projected,
-            });
+            .map_err(|e| scope_to_repo(e, self.backend))?;
+        let stored = existing
+            .as_ref()
+            .map(|r| decode_money(&r.balance, &r.currency, r.currency_scale))
+            .transpose()?;
+        let functional = existing
+            .as_ref()
+            .map(|r| {
+                decode_optional_money(
+                    r.functional_balance.as_deref(),
+                    r.functional_currency.as_deref(),
+                    r.functional_currency_scale,
+                )
+            })
+            .transpose()?
+            .flatten();
+        if let Some(r) = &existing
+            && r.account_id != g.account_id
+        {
+            return Err(cache_account_mismatch(g, r.account_id));
         }
-        // The disputed sub-balance moves by `disputed_delta` and stays the
-        // disputed slice of the (unchanged-by-a-reclass) open AR. Its own DB
-        // CHECKs are the guard — `disputed_minor >= 0` and
-        // `disputed_minor <= balance_minor` — NOT the balance_minor no-negative
-        // path; we seed the INSERT tuple with the projected post-state so a
-        // net-down (a `won` reversal) does not trip those CHECKs on the arbiter
-        // tuple, exactly as `balance_minor` does above.
-        let projected_disputed = current_disputed.saturating_add(g.disputed_delta);
-
-        let am = ar_invoice_balance::ActiveModel {
-            tenant_id: Set(g.tenant_id),
-            payer_tenant_id: Set(g.payer_tenant_id),
-            account_id: Set(g.account_id),
-            invoice_id: Set(g.invoice_id.clone()),
-            currency: Set(g.currency.clone()),
-            balance_minor: Set(projected),
-            disputed_minor: Set(projected_disputed),
-            // Slice 5: functional columns populated only on cross-currency posts
-            // (Some); single-currency leaves them NULL. Plain `.add` on conflict
-            // keeps NULL = NULL.
-            functional_balance_minor: Set(g
-                .functional_currency
-                .as_ref()
-                .map(|_| g.functional_delta)),
-            functional_currency: Set(g.functional_currency.clone()),
-            // Decision P (first-write-wins): the INSERT tuple stamps the
-            // original post date + due date; the `on_conflict` builder below
-            // deliberately omits both columns, so a later net-down (payment /
-            // reversal) never overwrites them.
-            original_posted_at: Set(Some(g.posted_at)),
-            due_date: Set(g.due_date),
-            last_entry_seq: Set(Some(seq)),
-            version: Set(0),
-        };
-        let mut on_conflict = SecureOnConflict::<ar_invoice_balance::Entity>::columns([
-            ar_invoice_balance::Column::TenantId,
-            ar_invoice_balance::Column::PayerTenantId,
-            ar_invoice_balance::Column::AccountId,
-            ar_invoice_balance::Column::InvoiceId,
-        ]);
-        on_conflict = on_conflict
-            .value(
-                ar_invoice_balance::Column::BalanceMinor,
-                Expr::col((
-                    ar_invoice_balance::Entity,
-                    ar_invoice_balance::Column::BalanceMinor,
-                ))
-                .add(g.delta),
-            )
-            // The conflict path nets `disputed_minor` atomically with
-            // `existing + disputed_delta` (parallel to `balance_minor`): two
-            // racing posts serialize at the row and the `disputed_minor >= 0` /
-            // `<= balance_minor` CHECKs on the resulting row are the backstop.
-            .and_then(|oc| {
-                oc.value(
-                    ar_invoice_balance::Column::DisputedMinor,
-                    Expr::col((
-                        ar_invoice_balance::Entity,
-                        ar_invoice_balance::Column::DisputedMinor,
-                    ))
-                    .add(g.disputed_delta),
+        let (balance, functional_balance) =
+            final_balances(g, stored.as_ref(), functional.as_ref())?;
+        let stored_disputed = existing
+            .as_ref()
+            .map(|r| decode_money(&r.disputed, &r.currency, r.currency_scale))
+            .transpose()?;
+        if let (Some(total), Some(disputed)) = (stored.as_ref(), stored_disputed.as_ref())
+            && (disputed.amount() < Decimal::ZERO || disputed.amount() > total.amount())
+        {
+            return Err(
+                RepoError::InvalidStoredMoney("disputed balance outside total".into()).into(),
+            );
+        }
+        let disputed = final_amount(
+            &g.disputed_delta,
+            stored_disputed.as_ref(),
+            &g.currency_spec,
+        )?;
+        if disputed.amount() < Decimal::ZERO || disputed.amount() > balance.amount() {
+            return Err(ProjectError::Db(
+                "disputed balance must be within total balance".into(),
+            ));
+        }
+        if let Some(r) = existing {
+            let next = next_version(r.version)?;
+            let result = Entity::update_many()
+                .secure()
+                .scope_with(scope)
+                .filter(key.add(Column::Version.eq(r.version)))
+                .col_expr(Column::Balance, Expr::value(encode_amount(&balance)))
+                .col_expr(Column::Version, Expr::value(next))
+                .col_expr(Column::LastEntrySeq, Expr::value(Some(seq)))
+                .col_expr(
+                    Column::FunctionalBalance,
+                    Expr::value(functional_balance.as_ref().map(encode_amount)),
                 )
-            })
-            .and_then(|oc| {
-                oc.value(
-                    ar_invoice_balance::Column::Version,
-                    Expr::col((
-                        ar_invoice_balance::Entity,
-                        ar_invoice_balance::Column::Version,
-                    ))
-                    .add(1),
-                )
-            })
-            .and_then(|oc| {
-                oc.value(
-                    ar_invoice_balance::Column::LastEntrySeq,
-                    Expr::value(Some(seq)),
-                )
-            })
-            // Slice 5: plain `+ functional_delta` (NOT COALESCE) — single-currency
-            // NULL stays NULL.
-            .and_then(|oc| {
-                oc.value(
-                    ar_invoice_balance::Column::FunctionalBalanceMinor,
-                    Expr::col((
-                        ar_invoice_balance::Entity,
-                        ar_invoice_balance::Column::FunctionalBalanceMinor,
-                    ))
-                    .add(g.functional_delta),
-                )
-            })
-            .and_then(|oc| {
-                oc.value(
-                    ar_invoice_balance::Column::FunctionalCurrency,
-                    Expr::value(g.functional_currency.clone()),
-                )
-            })
-            .map_err(|e| ProjectError::Db(format!("ar_invoice_balance on_conflict: {e}")))?;
-
-        ar_invoice_balance::Entity::insert(am.clone())
-            .secure()
-            .scope_with_model(scope, &am)
-            .map_err(|e| ProjectError::Db(format!("ar_invoice_balance scope: {e}")))?
-            .on_conflict(on_conflict)
-            .exec_with_returning(txn)
-            .await
-            .map_err(|e| ProjectError::Db(format!("ar_invoice_balance upsert: {e}")))?;
+                .col_expr(Column::Disputed, Expr::value(encode_amount(&disputed)))
+                .exec(txn)
+                .await
+                .map_err(|e| scope_to_repo(e, self.backend))?;
+            require_one(result.rows_affected)?;
+        } else {
+            let am = ActiveModel {
+                tenant_id: Set(g.tenant_id),
+                payer_tenant_id: Set(g.payer_tenant_id),
+                account_id: Set(g.account_id),
+                invoice_id: Set(g.invoice_id.clone()),
+                currency: Set(g.currency.clone()),
+                currency_scale: Set(i16::from(g.currency_spec.scale())),
+                balance: Set(encode_amount(&balance)),
+                disputed: Set(encode_amount(&disputed)),
+                functional_balance: Set(functional_balance.as_ref().map(encode_amount)),
+                functional_currency: Set(g
+                    .functional_currency
+                    .as_ref()
+                    .map(|c| c.code().to_owned())),
+                functional_currency_scale: Set(g
+                    .functional_currency
+                    .as_ref()
+                    .map(|c| i16::from(c.scale()))),
+                original_posted_at: Set(Some(g.posted_at)),
+                due_date: Set(g.due_date),
+                last_entry_seq: Set(Some(seq)),
+                version: Set(0),
+            };
+            Entity::insert(am.clone())
+                .secure()
+                .scope_with_model(scope, &am)
+                .map_err(|e| scope_to_repo(e, self.backend))?
+                .exec(txn)
+                .await
+                .map_err(|e| insert_to_repo(e, self.backend))?;
+        }
         Ok(())
     }
-
+    /// Read the secured grain and publish one literal, version-guarded post-state.
     async fn upsert_unallocated(
         &self,
         txn: &DbTx<'_>,
@@ -636,110 +535,88 @@ impl BalanceProjector {
         g: &GrainDelta,
         seq: i64,
     ) -> Result<(), ProjectError> {
-        // UNALLOCATED is a guarded class — pre-check the projected balance (see
-        // `upsert_account_balance` for why this precedes the upsert). The seed is
-        // the projected post-state, not the bare delta, so a net-down (an
-        // allocation DR against unapplied cash) does not trip the no-negative
-        // CHECK on the INSERT arbiter tuple.
-        let current = unallocated_balance::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(unallocated_balance::Column::TenantId.eq(g.tenant_id))
-                    .add(unallocated_balance::Column::PayerTenantId.eq(g.payer_tenant_id))
-                    .add(unallocated_balance::Column::AccountId.eq(g.account_id))
-                    .add(unallocated_balance::Column::Currency.eq(g.currency.clone())),
-            )
+        use unallocated_balance::{ActiveModel, Column, Entity};
+        let key = Condition::all()
+            .add(Column::TenantId.eq(g.tenant_id))
+            .add(Column::PayerTenantId.eq(g.payer_tenant_id))
+            .add(Column::Currency.eq(g.currency.clone()));
+        let existing = Entity::find()
+            .filter(key.clone())
             .secure()
             .scope_with(scope)
             .one(txn)
             .await
-            .map_err(|e| ProjectError::Db(format!("unallocated_balance pre-read: {e}")))?
-            .map_or(0_i64, |r| r.balance_minor);
-        let projected = current.saturating_add(g.delta);
-        if projected < 0 {
-            return Err(ProjectError::NegativeBalance {
-                account_id: g.account_id,
-                balance_minor: projected,
-            });
+            .map_err(|e| scope_to_repo(e, self.backend))?;
+        let stored = existing
+            .as_ref()
+            .map(|r| decode_money(&r.balance, &r.currency, r.currency_scale))
+            .transpose()?;
+        let functional = existing
+            .as_ref()
+            .map(|r| {
+                decode_optional_money(
+                    r.functional_balance.as_deref(),
+                    r.functional_currency.as_deref(),
+                    r.functional_currency_scale,
+                )
+            })
+            .transpose()?
+            .flatten();
+        if let Some(r) = &existing
+            && r.account_id != g.account_id
+        {
+            return Err(cache_account_mismatch(g, r.account_id));
         }
-
-        let am = unallocated_balance::ActiveModel {
-            tenant_id: Set(g.tenant_id),
-            payer_tenant_id: Set(g.payer_tenant_id),
-            account_id: Set(g.account_id),
-            currency: Set(g.currency.clone()),
-            balance_minor: Set(projected),
-            // Slice 5: cross-currency only (Some); single-currency stays NULL.
-            // Plain `.add` on conflict keeps NULL = NULL.
-            functional_balance_minor: Set(g
-                .functional_currency
-                .as_ref()
-                .map(|_| g.functional_delta)),
-            functional_currency: Set(g.functional_currency.clone()),
-            last_entry_seq: Set(Some(seq)),
-            version: Set(0),
-        };
-        let mut on_conflict = SecureOnConflict::<unallocated_balance::Entity>::columns([
-            unallocated_balance::Column::TenantId,
-            unallocated_balance::Column::PayerTenantId,
-            unallocated_balance::Column::Currency,
-        ]);
-        on_conflict = on_conflict
-            .value(
-                unallocated_balance::Column::BalanceMinor,
-                Expr::col((
-                    unallocated_balance::Entity,
-                    unallocated_balance::Column::BalanceMinor,
-                ))
-                .add(g.delta),
-            )
-            .and_then(|oc| {
-                oc.value(
-                    unallocated_balance::Column::Version,
-                    Expr::col((
-                        unallocated_balance::Entity,
-                        unallocated_balance::Column::Version,
-                    ))
-                    .add(1),
+        let (balance, functional_balance) =
+            final_balances(g, stored.as_ref(), functional.as_ref())?;
+        if let Some(r) = existing {
+            let next = next_version(r.version)?;
+            let result = Entity::update_many()
+                .secure()
+                .scope_with(scope)
+                .filter(key.add(Column::Version.eq(r.version)))
+                .col_expr(Column::Balance, Expr::value(encode_amount(&balance)))
+                .col_expr(Column::Version, Expr::value(next))
+                .col_expr(Column::LastEntrySeq, Expr::value(Some(seq)))
+                .col_expr(
+                    Column::FunctionalBalance,
+                    Expr::value(functional_balance.as_ref().map(encode_amount)),
                 )
-            })
-            .and_then(|oc| {
-                oc.value(
-                    unallocated_balance::Column::LastEntrySeq,
-                    Expr::value(Some(seq)),
-                )
-            })
-            // Slice 5: plain `+ functional_delta` (NOT COALESCE) — single-currency
-            // NULL stays NULL.
-            .and_then(|oc| {
-                oc.value(
-                    unallocated_balance::Column::FunctionalBalanceMinor,
-                    Expr::col((
-                        unallocated_balance::Entity,
-                        unallocated_balance::Column::FunctionalBalanceMinor,
-                    ))
-                    .add(g.functional_delta),
-                )
-            })
-            .and_then(|oc| {
-                oc.value(
-                    unallocated_balance::Column::FunctionalCurrency,
-                    Expr::value(g.functional_currency.clone()),
-                )
-            })
-            .map_err(|e| ProjectError::Db(format!("unallocated_balance on_conflict: {e}")))?;
-
-        unallocated_balance::Entity::insert(am.clone())
-            .secure()
-            .scope_with_model(scope, &am)
-            .map_err(|e| ProjectError::Db(format!("unallocated_balance scope: {e}")))?
-            .on_conflict(on_conflict)
-            .exec_with_returning(txn)
-            .await
-            .map_err(|e| ProjectError::Db(format!("unallocated_balance upsert: {e}")))?;
+                .exec(txn)
+                .await
+                .map_err(|e| scope_to_repo(e, self.backend))?;
+            require_one(result.rows_affected)?;
+        } else {
+            let am = ActiveModel {
+                tenant_id: Set(g.tenant_id),
+                payer_tenant_id: Set(g.payer_tenant_id),
+                account_id: Set(g.account_id),
+                currency: Set(g.currency.clone()),
+                currency_scale: Set(i16::from(g.currency_spec.scale())),
+                balance: Set(encode_amount(&balance)),
+                functional_balance: Set(functional_balance.as_ref().map(encode_amount)),
+                functional_currency: Set(g
+                    .functional_currency
+                    .as_ref()
+                    .map(|c| c.code().to_owned())),
+                functional_currency_scale: Set(g
+                    .functional_currency
+                    .as_ref()
+                    .map(|c| i16::from(c.scale()))),
+                last_entry_seq: Set(Some(seq)),
+                version: Set(0),
+            };
+            Entity::insert(am.clone())
+                .secure()
+                .scope_with_model(scope, &am)
+                .map_err(|e| scope_to_repo(e, self.backend))?
+                .exec(txn)
+                .await
+                .map_err(|e| insert_to_repo(e, self.backend))?;
+        }
         Ok(())
     }
-
+    /// Read the secured grain and publish one literal, version-guarded post-state.
     async fn upsert_reusable_credit(
         &self,
         txn: &DbTx<'_>,
@@ -747,127 +624,91 @@ impl BalanceProjector {
         g: &GrainDelta,
         seq: i64,
     ) -> Result<(), ProjectError> {
-        // REUSABLE_CREDIT is NOT an `AccountClass::GUARDED` class, so
-        // `account_balance` does not pre-check it — the wallet-overdraw invariant
-        // (a balance may never be spent below zero) lives ONLY on this sub-grain:
-        // here as the app-level pre-check, and the `chk_reusable_credit_subbalance_no_negative`
-        // DB CHECK as the serializable backstop against a concurrent overdraw the
-        // lockless pre-read cannot see. The seed is the projected post-state, not
-        // the bare delta, so a net-down (a spend against an existing wallet
-        // balance) does not trip the no-negative CHECK on the INSERT arbiter
-        // tuple (see `upsert_account_balance` for the full arbitration rationale).
-        let current = reusable_credit_subbalance::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(reusable_credit_subbalance::Column::TenantId.eq(g.tenant_id))
-                    .add(reusable_credit_subbalance::Column::PayerTenantId.eq(g.payer_tenant_id))
-                    .add(reusable_credit_subbalance::Column::AccountId.eq(g.account_id))
-                    .add(reusable_credit_subbalance::Column::Currency.eq(g.currency.clone()))
-                    .add(
-                        reusable_credit_subbalance::Column::CreditGrantEventType
-                            .eq(g.credit_grant_event_type.clone()),
-                    ),
-            )
+        use reusable_credit_subbalance::{ActiveModel, Column, Entity};
+        let key = Condition::all()
+            .add(Column::TenantId.eq(g.tenant_id))
+            .add(Column::PayerTenantId.eq(g.payer_tenant_id))
+            .add(Column::Currency.eq(g.currency.clone()))
+            .add(Column::CreditGrantEventType.eq(g.credit_grant_event_type.clone()));
+        let existing = Entity::find()
+            .filter(key.clone())
             .secure()
             .scope_with(scope)
             .one(txn)
             .await
-            .map_err(|e| ProjectError::Db(format!("reusable_credit_subbalance pre-read: {e}")))?
-            .map_or(0_i64, |r| r.balance_minor);
-        let projected = current.saturating_add(g.delta);
-        if projected < 0 {
-            return Err(ProjectError::NegativeBalance {
-                account_id: g.account_id,
-                balance_minor: projected,
-            });
+            .map_err(|e| scope_to_repo(e, self.backend))?;
+        let stored = existing
+            .as_ref()
+            .map(|r| decode_money(&r.balance, &r.currency, r.currency_scale))
+            .transpose()?;
+        let functional = existing
+            .as_ref()
+            .map(|r| {
+                decode_optional_money(
+                    r.functional_balance.as_deref(),
+                    r.functional_currency.as_deref(),
+                    r.functional_currency_scale,
+                )
+            })
+            .transpose()?
+            .flatten();
+        if let Some(r) = &existing
+            && r.account_id != g.account_id
+        {
+            return Err(cache_account_mismatch(g, r.account_id));
         }
-
-        let am = reusable_credit_subbalance::ActiveModel {
-            tenant_id: Set(g.tenant_id),
-            payer_tenant_id: Set(g.payer_tenant_id),
-            account_id: Set(g.account_id),
-            currency: Set(g.currency.clone()),
-            credit_grant_event_type: Set(g.credit_grant_event_type.clone()),
-            // First-write-wins recency stamp: the INSERT tuple records the first
-            // grant's posted-at; the `on_conflict` builder below deliberately
-            // omits this column, so later grants/spends never overwrite it
-            // (exactly like `ar_invoice_balance.original_posted_at`).
-            first_granted_at: Set(g.first_granted_at),
-            balance_minor: Set(projected),
-            // Slice 5: cross-currency only (Some); single-currency stays NULL.
-            // Plain `.add` on conflict keeps NULL = NULL.
-            functional_balance_minor: Set(g
-                .functional_currency
-                .as_ref()
-                .map(|_| g.functional_delta)),
-            functional_currency: Set(g.functional_currency.clone()),
-            last_entry_seq: Set(Some(seq)),
-            version: Set(0),
-        };
-        let mut on_conflict = SecureOnConflict::<reusable_credit_subbalance::Entity>::columns([
-            reusable_credit_subbalance::Column::TenantId,
-            reusable_credit_subbalance::Column::PayerTenantId,
-            reusable_credit_subbalance::Column::Currency,
-            reusable_credit_subbalance::Column::CreditGrantEventType,
-        ]);
-        on_conflict = on_conflict
-            .value(
-                reusable_credit_subbalance::Column::BalanceMinor,
-                Expr::col((
-                    reusable_credit_subbalance::Entity,
-                    reusable_credit_subbalance::Column::BalanceMinor,
-                ))
-                .add(g.delta),
-            )
-            .and_then(|oc| {
-                oc.value(
-                    reusable_credit_subbalance::Column::Version,
-                    Expr::col((
-                        reusable_credit_subbalance::Entity,
-                        reusable_credit_subbalance::Column::Version,
-                    ))
-                    .add(1),
+        let (balance, functional_balance) =
+            final_balances(g, stored.as_ref(), functional.as_ref())?;
+        if let Some(r) = existing {
+            let next = next_version(r.version)?;
+            let result = Entity::update_many()
+                .secure()
+                .scope_with(scope)
+                .filter(key.add(Column::Version.eq(r.version)))
+                .col_expr(Column::Balance, Expr::value(encode_amount(&balance)))
+                .col_expr(Column::Version, Expr::value(next))
+                .col_expr(Column::LastEntrySeq, Expr::value(Some(seq)))
+                .col_expr(
+                    Column::FunctionalBalance,
+                    Expr::value(functional_balance.as_ref().map(encode_amount)),
                 )
-            })
-            .and_then(|oc| {
-                oc.value(
-                    reusable_credit_subbalance::Column::LastEntrySeq,
-                    Expr::value(Some(seq)),
-                )
-            })
-            // Slice 5: plain `+ functional_delta` (NOT COALESCE) — single-currency
-            // NULL stays NULL.
-            .and_then(|oc| {
-                oc.value(
-                    reusable_credit_subbalance::Column::FunctionalBalanceMinor,
-                    Expr::col((
-                        reusable_credit_subbalance::Entity,
-                        reusable_credit_subbalance::Column::FunctionalBalanceMinor,
-                    ))
-                    .add(g.functional_delta),
-                )
-            })
-            .and_then(|oc| {
-                oc.value(
-                    reusable_credit_subbalance::Column::FunctionalCurrency,
-                    Expr::value(g.functional_currency.clone()),
-                )
-            })
-            .map_err(|e| {
-                ProjectError::Db(format!("reusable_credit_subbalance on_conflict: {e}"))
-            })?;
-
-        reusable_credit_subbalance::Entity::insert(am.clone())
-            .secure()
-            .scope_with_model(scope, &am)
-            .map_err(|e| ProjectError::Db(format!("reusable_credit_subbalance scope: {e}")))?
-            .on_conflict(on_conflict)
-            .exec_with_returning(txn)
-            .await
-            .map_err(|e| ProjectError::Db(format!("reusable_credit_subbalance upsert: {e}")))?;
+                .exec(txn)
+                .await
+                .map_err(|e| scope_to_repo(e, self.backend))?;
+            require_one(result.rows_affected)?;
+        } else {
+            let am = ActiveModel {
+                tenant_id: Set(g.tenant_id),
+                payer_tenant_id: Set(g.payer_tenant_id),
+                account_id: Set(g.account_id),
+                currency: Set(g.currency.clone()),
+                currency_scale: Set(i16::from(g.currency_spec.scale())),
+                credit_grant_event_type: Set(g.credit_grant_event_type.clone()),
+                first_granted_at: Set(g.first_granted_at),
+                balance: Set(encode_amount(&balance)),
+                functional_balance: Set(functional_balance.as_ref().map(encode_amount)),
+                functional_currency: Set(g
+                    .functional_currency
+                    .as_ref()
+                    .map(|c| c.code().to_owned())),
+                functional_currency_scale: Set(g
+                    .functional_currency
+                    .as_ref()
+                    .map(|c| i16::from(c.scale()))),
+                last_entry_seq: Set(Some(seq)),
+                version: Set(0),
+            };
+            Entity::insert(am.clone())
+                .secure()
+                .scope_with_model(scope, &am)
+                .map_err(|e| scope_to_repo(e, self.backend))?
+                .exec(txn)
+                .await
+                .map_err(|e| insert_to_repo(e, self.backend))?;
+        }
         Ok(())
     }
-
+    /// Read the secured grain and publish one literal, version-guarded post-state.
     async fn upsert_tax(
         &self,
         txn: &DbTx<'_>,
@@ -875,294 +716,328 @@ impl BalanceProjector {
         g: &GrainDelta,
         seq: i64,
     ) -> Result<(), ProjectError> {
-        let am = tax_subbalance::ActiveModel {
-            tenant_id: Set(g.tenant_id),
-            account_id: Set(g.account_id),
-            tax_jurisdiction: Set(g.tax_jurisdiction.clone()),
-            tax_filing_period: Set(g.tax_filing_period.clone()),
-            balance_minor: Set(g.delta),
-            last_entry_seq: Set(Some(seq)),
-            version: Set(0),
-        };
-        let mut on_conflict = SecureOnConflict::<tax_subbalance::Entity>::columns([
-            tax_subbalance::Column::TenantId,
-            tax_subbalance::Column::AccountId,
-            tax_subbalance::Column::TaxJurisdiction,
-            tax_subbalance::Column::TaxFilingPeriod,
-        ]);
-        on_conflict = on_conflict
-            .value(
-                tax_subbalance::Column::BalanceMinor,
-                Expr::col((tax_subbalance::Entity, tax_subbalance::Column::BalanceMinor))
-                    .add(g.delta),
-            )
-            .and_then(|oc| {
-                oc.value(
-                    tax_subbalance::Column::Version,
-                    Expr::col((tax_subbalance::Entity, tax_subbalance::Column::Version)).add(1),
-                )
-            })
-            .and_then(|oc| oc.value(tax_subbalance::Column::LastEntrySeq, Expr::value(Some(seq))))
-            .map_err(|e| ProjectError::Db(format!("tax_subbalance on_conflict: {e}")))?;
-
-        // tax_subbalance has no no-negative CHECK and is not a guarded class.
-        tax_subbalance::Entity::insert(am.clone())
+        use tax_subbalance::{ActiveModel, Column, Entity};
+        let key = Condition::all()
+            .add(Column::TenantId.eq(g.tenant_id))
+            .add(Column::AccountId.eq(g.account_id))
+            .add(Column::TaxJurisdiction.eq(g.tax_jurisdiction.clone()))
+            .add(Column::TaxFilingPeriod.eq(g.tax_filing_period.clone()));
+        let existing = Entity::find()
+            .filter(key.clone())
             .secure()
-            .scope_with_model(scope, &am)
-            .map_err(|e| ProjectError::Db(format!("tax_subbalance scope: {e}")))?
-            .on_conflict(on_conflict)
-            .exec_with_returning(txn)
+            .scope_with(scope)
+            .one(txn)
             .await
-            .map_err(|e| ProjectError::Db(format!("tax_subbalance upsert: {e}")))?;
+            .map_err(|e| scope_to_repo(e, self.backend))?;
+        let stored = existing
+            .as_ref()
+            .map(|r| decode_money(&r.balance, &r.currency, r.currency_scale))
+            .transpose()?;
+        let functional = None;
+        if let Some(r) = &existing
+            && r.account_id != g.account_id
+        {
+            return Err(cache_account_mismatch(g, r.account_id));
+        }
+        let (balance, _) = final_balances(g, stored.as_ref(), functional.as_ref())?;
+        if let Some(r) = existing {
+            let next = next_version(r.version)?;
+            let result = Entity::update_many()
+                .secure()
+                .scope_with(scope)
+                .filter(key.add(Column::Version.eq(r.version)))
+                .col_expr(Column::Balance, Expr::value(encode_amount(&balance)))
+                .col_expr(Column::Version, Expr::value(next))
+                .col_expr(Column::LastEntrySeq, Expr::value(Some(seq)))
+                .exec(txn)
+                .await
+                .map_err(|e| scope_to_repo(e, self.backend))?;
+            require_one(result.rows_affected)?;
+        } else {
+            let am = ActiveModel {
+                currency: Set(g.currency.clone()),
+                currency_scale: Set(i16::from(g.currency_spec.scale())),
+                tenant_id: Set(g.tenant_id),
+                account_id: Set(g.account_id),
+                tax_jurisdiction: Set(g.tax_jurisdiction.clone()),
+                tax_filing_period: Set(g.tax_filing_period.clone()),
+                balance: Set(encode_amount(&balance)),
+                last_entry_seq: Set(Some(seq)),
+                version: Set(0),
+            };
+            Entity::insert(am.clone())
+                .secure()
+                .scope_with_model(scope, &am)
+                .map_err(|e| scope_to_repo(e, self.backend))?
+                .exec(txn)
+                .await
+                .map_err(|e| insert_to_repo(e, self.backend))?;
+        }
         Ok(())
     }
 }
 
-/// Derive the sorted per-grain deltas for an entry's lines (pure;
-/// unit-testable). Each line always touches `account_balance`; `AR` lines
-/// additionally touch the payer (always) and invoice (when present) grains;
-/// `TAX_PAYABLE` lines with both tax dims touch the tax grain.
+/// Reject stale writes, including unexpected multiple-row updates.
+fn require_one(rows: u64) -> Result<(), ProjectError> {
+    if rows == 1 {
+        Ok(())
+    } else {
+        Err(ProjectError::Conflict)
+    }
+}
+
+/// Versions are counters, never saturating money or wrapping integers.
+fn next_version(version: i64) -> Result<i64, ProjectError> {
+    version
+        .checked_add(1)
+        .ok_or_else(|| ProjectError::Db("cache version overflow".into()))
+}
+
+/// Preserve named money errors while keeping arithmetic-budget failures internal.
+impl From<ExactError> for ProjectError {
+    fn from(value: ExactError) -> Self {
+        match value {
+            ExactError::Money(e) => Self::Repo(RepoError::Money(e)),
+            e => Self::Arithmetic(e),
+        }
+    }
+}
+
+/// Validate metadata before arithmetic; scales never create an additional grain.
+fn match_currency(a: &CurrencySpec, b: &CurrencySpec) -> Result<(), ProjectError> {
+    a.ensure_same(b).map_err(|e| RepoError::Money(e).into())
+}
+
+/// Optional functional metadata is immutable, including absence.
+fn match_functional(
+    a: Option<&CurrencySpec>,
+    b: Option<&CurrencySpec>,
+) -> Result<(), ProjectError> {
+    match (a, b) {
+        (Some(a), Some(b)) => match_currency(a, b),
+        (None, None) => Ok(()),
+        _ => Err(RepoError::Money(MoneyError::CurrencyMismatch).into()),
+    }
+}
+
+/// Add the original stored value before the sole bounded narrowing step.
+fn final_amount(
+    delta: &ExactAmount,
+    stored: Option<&PostedMoney>,
+    currency: &CurrencySpec,
+) -> Result<PostedMoney, ProjectError> {
+    if let Some(stored) = stored {
+        match_currency(currency, stored.currency())?;
+    }
+    Ok(delta
+        .checked_add(&ExactAmount::from_decimal(
+            stored.map_or(Decimal::ZERO, PostedMoney::amount),
+        ))?
+        .into_posted_exact(currency.clone())?)
+}
+
+/// The grain's business key, for diagnostics: table, tenant, payer, currency and
+/// whichever of invoice, credit-grant event type and tax dims the table keys on.
+fn grain_label(g: &GrainDelta) -> String {
+    use std::fmt::Write as _;
+    let mut label = format!(
+        "{:?} tenant {} payer {} currency {}",
+        g.table_rank, g.tenant_id, g.payer_tenant_id, g.currency
+    );
+    for (name, value) in [
+        ("invoice", &g.invoice_id),
+        ("credit_grant_event_type", &g.credit_grant_event_type),
+        ("tax_jurisdiction", &g.tax_jurisdiction),
+        ("tax_filing_period", &g.tax_filing_period),
+    ] {
+        if !value.is_empty() {
+            let _ = write!(label, " {name} {value}");
+        }
+    }
+    label
+}
+
+/// A cached row whose key omits `account_id` (or matched it) holds another
+/// account than the posting line: name the grain and both accounts.
+fn cache_account_mismatch(g: &GrainDelta, cached_account: Uuid) -> ProjectError {
+    ProjectError::Db(format!(
+        "projector: cached row for {} holds account {cached_account}, the posting targets account {}",
+        grain_label(g),
+        g.account_id
+    ))
+}
+
+/// Validate both metadata sets before computing correlated post-state values.
+/// A stored balance means the row exists; the tax grain carries no functional
+/// balance, so its functional metadata is neither checked nor produced.
+fn final_balances(
+    g: &GrainDelta,
+    stored: Option<&PostedMoney>,
+    functional: Option<&PostedMoney>,
+) -> Result<(PostedMoney, Option<PostedMoney>), ProjectError> {
+    let tax = g.table_rank == GrainTable::Tax;
+    if let Some(stored) = stored {
+        match_currency(&g.currency_spec, stored.currency())?;
+    }
+    if stored.is_some() && !tax {
+        match_functional(
+            g.functional_currency.as_ref(),
+            functional.map(PostedMoney::currency),
+        )?;
+    }
+    let balance = final_amount(&g.delta, stored, &g.currency_spec)?;
+    if (g.account_class.is_guarded() || g.table_rank == GrainTable::ReusableCredit)
+        && balance.amount() < Decimal::ZERO
+    {
+        return Err(ProjectError::NegativeBalance {
+            account_id: g.account_id,
+            balance: encode_amount(&balance),
+        });
+    }
+    let functional = if tax {
+        None
+    } else {
+        g.functional_currency
+            .as_ref()
+            .map(|c| final_amount(&g.functional_delta, functional, c))
+            .transpose()?
+    };
+    Ok((balance, functional))
+}
+
+/// Derive signed terms and coalesce by actual business identity in deterministic order.
 fn derive_grains(
     entry: &NewEntry,
     lines: &[NewLine],
     normal_sides: &HashMap<Uuid, Side>,
 ) -> Result<Vec<GrainDelta>, ProjectError> {
-    let tenant = entry.tenant_id;
-    let posted_at = entry.posted_at_utc;
-    let mut grains: Vec<GrainDelta> = Vec::new();
-
+    let mut grains = Vec::new();
     for line in lines {
         let normal_side = *normal_sides
             .get(&line.account_id)
             .ok_or(ProjectError::MissingNormalSide(line.account_id))?;
-        let delta = if line.side == normal_side {
-            line.amount_minor
-        } else {
-            -line.amount_minor
+        let signed = |money: &PostedMoney| {
+            ExactAmount::from_decimal(if line.side == normal_side {
+                money.amount()
+            } else {
+                -money.amount()
+            })
         };
-        // FX (Slice 5): mirror the transaction sign onto the functional column.
-        // Present only on cross-currency lines; single-currency lines contribute
-        // 0 / None so the functional cache column stays NULL.
-        let functional_delta = line
-            .functional_amount_minor
-            .map_or(0, |f| if line.side == normal_side { f } else { -f });
-        let functional_currency = line.functional_currency.clone();
-
-        grains.push(GrainDelta {
+        let base = GrainDelta {
             table_rank: GrainTable::Account,
-            tenant_id: tenant,
+            tenant_id: entry.tenant_id,
             account_id: line.account_id,
-            currency: line.currency.clone(),
+            currency: line.money.currency().code().to_owned(),
             payer_tenant_id: line.payer_tenant_id,
             invoice_id: String::new(),
             tax_jurisdiction: String::new(),
             tax_filing_period: String::new(),
             account_class: line.account_class,
             normal_side,
-            delta,
-            functional_delta,
-            functional_currency: functional_currency.clone(),
-            disputed_delta: 0,
-            posted_at,
+            delta: signed(&line.money),
+            currency_spec: line.money.currency().clone(),
+            functional_delta: line
+                .functional_money
+                .as_ref()
+                .map_or_else(|| ExactAmount::from_decimal(Decimal::ZERO), signed),
+            functional_currency: line.functional_money.as_ref().map(|m| m.currency().clone()),
+            disputed_delta: ExactAmount::from_decimal(Decimal::ZERO),
+            posted_at: entry.posted_at_utc,
             due_date: None,
             credit_grant_event_type: String::new(),
             first_granted_at: None,
-        });
-
-        if line.account_class == AccountClass::Ar {
-            // Chargeback `ar_status` seam: a `DISPUTED` AR line routes its signed
-            // amount (`delta`: DR +, CR −) onto `disputed_minor`; every other AR
-            // line leaves it untouched. The disputed sub-balance is tracked at
-            // the invoice grain only (`ar_invoice_balance.disputed_minor`), so
-            // the payer grain carries `0`.
-            let disputed_delta = if line.ar_status.as_deref() == Some(AR_STATUS_DISPUTED) {
-                delta
-            } else {
-                0
-            };
-            grains.push(GrainDelta {
-                table_rank: GrainTable::ArPayer,
-                tenant_id: tenant,
-                account_id: line.account_id,
-                currency: line.currency.clone(),
-                payer_tenant_id: line.payer_tenant_id,
-                invoice_id: String::new(),
-                tax_jurisdiction: String::new(),
-                tax_filing_period: String::new(),
-                account_class: line.account_class,
-                normal_side,
-                delta,
-                functional_delta,
-                functional_currency: functional_currency.clone(),
-                disputed_delta: 0,
-                posted_at,
-                due_date: None,
-                credit_grant_event_type: String::new(),
-                first_granted_at: None,
-            });
-            if let Some(invoice_id) = &line.invoice_id {
+        };
+        grains.push(base.clone());
+        match line.account_class {
+            AccountClass::Ar => {
                 grains.push(GrainDelta {
-                    table_rank: GrainTable::ArInvoice,
-                    tenant_id: tenant,
-                    account_id: line.account_id,
-                    currency: line.currency.clone(),
-                    payer_tenant_id: line.payer_tenant_id,
-                    invoice_id: invoice_id.clone(),
-                    tax_jurisdiction: String::new(),
-                    tax_filing_period: String::new(),
-                    account_class: line.account_class,
-                    normal_side,
-                    delta,
-                    functional_delta,
-                    functional_currency: functional_currency.clone(),
-                    disputed_delta,
-                    // Decision P: stamp the entry's posted-at + the line's due
-                    // date; `upsert_ar_invoice` writes them first-write-wins.
-                    posted_at,
-                    due_date: line.due_date,
-                    credit_grant_event_type: String::new(),
-                    first_granted_at: None,
+                    table_rank: GrainTable::ArPayer,
+                    ..base.clone()
+                });
+                if let Some(invoice_id) = &line.invoice_id {
+                    grains.push(GrainDelta {
+                        table_rank: GrainTable::ArInvoice,
+                        invoice_id: invoice_id.clone(),
+                        disputed_delta: if line.ar_status.as_deref() == Some(AR_STATUS_DISPUTED) {
+                            base.delta.clone()
+                        } else {
+                            ExactAmount::from_decimal(Decimal::ZERO)
+                        },
+                        due_date: line.due_date,
+                        ..base
+                    });
+                }
+            }
+            AccountClass::Unallocated => grains.push(GrainDelta {
+                table_rank: GrainTable::Unallocated,
+                ..base
+            }),
+            AccountClass::ReusableCredit => {
+                let event = line
+                    .credit_grant_event_type
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .ok_or(ProjectError::MissingCreditEventType(line.line_id))?;
+                grains.push(GrainDelta {
+                    table_rank: GrainTable::ReusableCredit,
+                    credit_grant_event_type: event,
+                    first_granted_at: Some(entry.posted_at_utc),
+                    ..base
                 });
             }
-        }
-
-        if line.account_class == AccountClass::Unallocated {
-            grains.push(GrainDelta {
-                table_rank: GrainTable::Unallocated,
-                tenant_id: tenant,
-                account_id: line.account_id,
-                currency: line.currency.clone(),
-                payer_tenant_id: line.payer_tenant_id,
-                invoice_id: String::new(),
-                tax_jurisdiction: String::new(),
-                tax_filing_period: String::new(),
-                account_class: line.account_class,
-                normal_side,
-                delta,
-                functional_delta,
-                functional_currency: functional_currency.clone(),
-                disputed_delta: 0,
-                posted_at,
-                due_date: None,
-                credit_grant_event_type: String::new(),
-                first_granted_at: None,
-            });
-        }
-
-        if line.account_class == AccountClass::ReusableCredit {
-            // The credit-grant event type sub-divides the wallet (a PK dim). A
-            // missing/empty value would key a phantom "" sub-balance, so reject
-            // rather than default — the DB NOT-NULL CHECK tests NULL, not "", so
-            // it would not catch the empty string. `first_granted_at` is stamped
-            // first-write-wins by the upsert.
-            let credit_grant_event_type = line
-                .credit_grant_event_type
-                .clone()
-                .filter(|s| !s.is_empty())
-                .ok_or(ProjectError::MissingCreditEventType(line.line_id))?;
-            grains.push(GrainDelta {
-                table_rank: GrainTable::ReusableCredit,
-                tenant_id: tenant,
-                account_id: line.account_id,
-                currency: line.currency.clone(),
-                payer_tenant_id: line.payer_tenant_id,
-                invoice_id: String::new(),
-                tax_jurisdiction: String::new(),
-                tax_filing_period: String::new(),
-                account_class: line.account_class,
-                normal_side,
-                delta,
-                functional_delta,
-                functional_currency: functional_currency.clone(),
-                disputed_delta: 0,
-                posted_at,
-                due_date: None,
-                credit_grant_event_type,
-                first_granted_at: Some(posted_at),
-            });
-        }
-
-        if line.account_class == AccountClass::TaxPayable
-            && let (Some(juris), Some(filing)) = (&line.tax_jurisdiction, &line.tax_filing_period)
-        {
-            grains.push(GrainDelta {
-                table_rank: GrainTable::Tax,
-                tenant_id: tenant,
-                account_id: line.account_id,
-                currency: line.currency.clone(),
-                payer_tenant_id: line.payer_tenant_id,
-                invoice_id: String::new(),
-                tax_jurisdiction: juris.clone(),
-                tax_filing_period: filing.clone(),
-                account_class: line.account_class,
-                normal_side,
-                delta,
-                functional_delta,
-                functional_currency: functional_currency.clone(),
-                disputed_delta: 0,
-                posted_at,
-                due_date: None,
-                credit_grant_event_type: String::new(),
-                first_granted_at: None,
-            });
+            AccountClass::TaxPayable => {
+                if let (Some(j), Some(f)) = (&line.tax_jurisdiction, &line.tax_filing_period) {
+                    grains.push(GrainDelta {
+                        table_rank: GrainTable::Tax,
+                        tax_jurisdiction: j.clone(),
+                        tax_filing_period: f.clone(),
+                        ..base
+                    });
+                }
+            }
+            _ => {}
         }
     }
-
     grains.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
-
-    // Coalesce grains that map to the SAME cache row (equal sort key) by summing
-    // their deltas, so the no-negative guard and the upsert see the entry's NET
-    // effect per grain. Without this, a balanced multi-line entry touching one
-    // guarded account (e.g. a -100 leg then a +150 leg, net +50) would be
-    // rejected on the intermediate running balance, order-dependently.
-    let mut coalesced: Vec<GrainDelta> = Vec::with_capacity(grains.len());
+    let mut result: Vec<GrainDelta> = Vec::new();
     for g in grains {
-        if let Some(last) = coalesced.last_mut()
+        if let Some(last) = result.last_mut()
             && last.sort_key() == g.sort_key()
         {
-            // Checked, not saturating: a money delta that overflows `i64` is a
-            // hard rejection (surfaced as AmountOutOfRange / 422 at the call-site),
-            // never a silently-clamped balance. Same grain (equal sort key) ⇒ same
-            // account/currency, captured once for the error.
-            let acc = last.account_id;
-            let ccy = last.currency.clone();
-            last.delta = last
-                .delta
-                .checked_add(g.delta)
-                .ok_or_else(|| ProjectError::Overflow {
-                    account_id: acc,
-                    currency: ccy.clone(),
-                    field: "delta",
-                })?;
-            // The disputed sub-delta coalesces in parallel: an AR reclass's two
-            // same-grain legs net ZERO on `delta` (balance_minor) while summing
-            // their `disputed_delta` to the net disputed move (`+D` opened, `-D`
-            // won).
-            last.disputed_delta = last
-                .disputed_delta
-                .checked_add(g.disputed_delta)
-                .ok_or_else(|| ProjectError::Overflow {
-                    account_id: acc,
-                    currency: ccy.clone(),
-                    field: "disputed_delta",
-                })?;
-            last.functional_delta = last
-                .functional_delta
-                .checked_add(g.functional_delta)
-                .ok_or(ProjectError::Overflow {
-                    account_id: acc,
-                    currency: ccy,
-                    field: "functional_delta",
-                })?;
-            if last.functional_currency.is_none() {
-                last.functional_currency.clone_from(&g.functional_currency);
+            match_currency(&last.currency_spec, &g.currency_spec)?;
+            match_functional(
+                last.functional_currency.as_ref(),
+                g.functional_currency.as_ref(),
+            )?;
+            if last.account_id != g.account_id
+                || last.account_class != g.account_class
+                || last.normal_side != g.normal_side
+            {
+                return Err(ProjectError::Db(format!(
+                    "projector: entry lines disagree on account for one grain ({}): \
+                     account {} {} {} vs account {} {} {}",
+                    grain_label(&g),
+                    last.account_id,
+                    last.account_class.as_str(),
+                    last.normal_side.as_str(),
+                    g.account_id,
+                    g.account_class.as_str(),
+                    g.normal_side.as_str(),
+                )));
             }
-            continue;
+            last.delta = last.delta.checked_add(&g.delta)?;
+            last.disputed_delta = last.disputed_delta.checked_add(&g.disputed_delta)?;
+            last.functional_delta = last.functional_delta.checked_add(&g.functional_delta)?;
+        } else {
+            result.push(g);
         }
-        coalesced.push(g);
     }
-    Ok(coalesced)
+    Ok(result)
 }
+
+#[cfg(test)]
+#[path = "projector_decimal_tests.rs"]
+mod projector_decimal_tests;
 
 #[cfg(test)]
 #[path = "projector_tests.rs"]

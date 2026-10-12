@@ -81,6 +81,7 @@ This table maps non-functional requirements from PRD to specific design/architec
 | `cpt-cf-construct-adr-construct-is-a-gear` | Construct is a gear that owns its state and the rules around the model step |
 | `cpt-cf-construct-adr-graph-storage-as-is` | Construct uses graph storage as it is, including its compare-and-set on writes and its soft delete |
 | `cpt-cf-construct-adr-one-model-interface` | Construct calls models through one small interface. The chat completions adapter comes first; the LLM gateway adapter follows when the gateway runs |
+| `cpt-cf-construct-adr-no-weights` | Construct stores no weight and does not rank facts. The Profile reader returns a subject's readable facts in no order of importance |
 
 ### 1.3 Architecture Layers
 
@@ -383,7 +384,7 @@ Connectors need one simple intake that tells them at once whether a record is ta
 
 Takes one record per request. Refuses what is plainly wrong before any model call: a broken envelope or type, a repeat, a connector that is off, personalization off, or an erasure under way. It finds a repeat by the record's identity in `construct__record_ids`, also a repeat of a deleted fact's record. The table holds one row per tenant, connector and record identity. Inserting the identity is the repeat check, so two copies sent at once cannot both be received. Connectors on or off comes from the settings service; personalization and an erasure under way come from the subject settings table. A refusal names the type, the place in the record and the broken rule. Answers received, repeat or refused. Processing then runs in the background, best effort. A record that fails later is dropped, and the drop is an audit event without content.
 
-A received record's content lives only in memory. If an instance of Construct stops before the record is processed, the record is lost, without an audit event. Its identity stays in `construct__record_ids`, so a resend is a repeat. A connector that needs the record processed sends it again with a new identity. This follows from best effort.
+A received record's content lives only in memory. Construct does not write it to any store, even for a short time, such as an outbox: a record can hold sensitive data that the checks would block. If an instance of Construct stops before the record is processed, the record is lost, without an audit event: only the stopped instance knew that the record was still in process. Its identity stays in `construct__record_ids`, so a resend is a repeat. A connector that needs the record processed sends it again with a new identity. This follows from best effort.
 
 ##### Responsibility boundaries
 

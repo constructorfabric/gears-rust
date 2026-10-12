@@ -1,5 +1,6 @@
 //! SKU, category, approval-unit and derived-usage-type authorization catalog and shared PEP gate.
 use authz_resolver_sdk::PolicyEnforcer;
+use authz_resolver_sdk::models::TenantMode;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
@@ -87,6 +88,15 @@ pub enum AuthzError {
 /// subject, its tenant, the resource type, the action, the target tenant and the
 /// reason (RS-20): the 403 carries only the reason.
 ///
+/// **The caller's tenant only (P-D-265).** Every request asks for
+/// [`TenantMode::RootOnly`], so the PDP answers `EQ(owner_tenant_id, subject tenant)` — the
+/// read's SQL filter — and never expands the subject's subtree. The registry serves one
+/// tenant's SKUs and no other tenant's, so the subtree added no row the gear may show: it
+/// only cost an `IN` list of every descendant tenant, deleted ones included, on every scope
+/// check — thousands of bind parameters under a root tenant with thousands of descendants,
+/// and a deny once the PDP's expansion cap is crossed. An `EQ` also stays decidable in memory,
+/// which `scope_holds` needs for `caller_can_approve`.
+///
 /// # Errors
 ///
 /// [`AuthzError::Denied`] when the PDP denies or returns uncompilable
@@ -98,7 +108,9 @@ pub async fn access_scope(
     action: &str,
     owner_tenant_id: Option<Uuid>,
 ) -> Result<AccessScope, AuthzError> {
-    let mut request = AccessRequest::new().require_constraints(true);
+    let mut request = AccessRequest::new()
+        .require_constraints(true)
+        .tenant_mode(TenantMode::RootOnly);
     if let Some(tenant) = owner_tenant_id {
         request = request.resource_property(pep_properties::OWNER_TENANT_ID, tenant);
     }

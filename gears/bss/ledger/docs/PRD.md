@@ -101,7 +101,7 @@ Industry alignment: an append-only journal with compensating entries matches aud
 > Targets below are measurable business outcomes. Numeric thresholds marked *(commit)* are owned by PM Team and tracked in §15 Open Questions / §7.1; until committed they carry the draft target shown.
 
 - **Posting integrity**: 100% of posted journal entries are balanced per tenant (zero zero-sum violations reaching production) — verified continuously via the §6.8 invariant alarm.
-- **AR auditability**: AR ledger ties out to the derived AR projection within reconciliation tolerance (draft: ≤ 1 minor unit per 1,000 posted lines, §6.7) on the daily reconciliation job; variance above tolerance blocks period close.
+- **AR auditability**: AR ledger ties out to the derived AR projection within reconciliation tolerance (draft: ≤ 1 posting increment of the currency, `10^-currency_scale`, per 1,000 posted lines, §6.7) on the daily reconciliation job; variance above tolerance blocks period close.
 - **ASC 606 readiness**: 100% of deferred invoice lines carry PO/allocation-group lineage resolvable to a recognition schedule (no recognition journal without invoice-item linkage).
 - **Export reliability**: idempotent, replay-safe ERP/GL export with a journal-post → ERP-ack SLA *(commit; draft target tracked in §7.1)* and zero dropped posted facts on export failure.
 - **Recovery**: meet RTO ≤ 60 min / RPO ≤ 5 min per region for the posting path (§7.1).
@@ -273,7 +273,7 @@ Industry alignment: an append-only journal with compensating entries matches aud
 - **Multi-tenant isolation**: a single posted journal entry MUST NOT mix lines from more than one payer tenant; balances, reconciliation, export, audit, and inquiry are tenant-scoped by default. Cross-tenant aggregation requires elevated, audited context.
 - **Data residency**: posted journal lines for a residency-pinned tenant (e.g. EU-only) MUST NOT cross the residency boundary in primary, replica, or DR storage; the authoritative posting clock is the in-region posting service.
 - **Time**: all posting timestamps stored in **UTC**; period assignment uses the tenant fiscal-calendar timezone; local display in Presentation only.
-- **Money type**: posted lines MUST use a fixed-precision decimal type (no binary float); tamper-evident authoritative store in production.
+- **Money type**: posted lines MUST carry a validated decimal amount in major currency units (no binary float, no integer minor units) together with the currency code and the stored currency scale; tamper-evident authoritative store in production.
 
 <!-- migration-note: legacy "System boundaries" ASCII flow preserved here as operational context. -->
 
@@ -658,7 +658,7 @@ Unmatched settled payments **MUST** remain in unallocated (aged with alerts); mi
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-ledger-fr-money-rounding-scale`
 
-Posted amounts **MUST** use a fixed-precision decimal at the currency's ISO 4217 minor-unit scale with **banker's rounding (half-to-even)** as platform default, applied identically across S1–S6 and exports. Internal compute may carry up to 4 extra decimals but **MUST NOT** leak into posted truth; tenant rounding override only with recorded, audited evidence; over-range **MUST** hard-error.
+Posted amounts **MUST** be validated decimals in major currency units (`12.34 EUR` at scale 2) that are exact multiples of the currency's posting increment `10^-currency_scale` (ISO 4217 minor digits by default, 0–28 supported). The ledger **MUST** reject an amount that is not such a multiple (`0.047 EUR` at scale 2) and **MUST NOT** round an incoming posting. Where the ledger itself derives amounts (allocation shares, FX translation, recognition segments) it **MUST** round once, **banker's rounding (half-to-even)**, at the stored currency scale, identically across S1–S6 and exports. Internal compute **MUST** be exact (fractions, no truncated division) and **MUST NOT** leak into posted truth; tenant rounding override only with recorded, audited evidence; over-range (28 significant digits, magnitude `10^28`) **MUST** hard-error.
 
 **Rationale**: Deterministic money arithmetic is auditor-verifiable and prevents drift.
 
@@ -1061,8 +1061,8 @@ Explicit dispositions for checklist domains not otherwise addressed (no silent o
 **16. Money, rounding, and decimal scale**
 - **Given** any posting in any flow (S1–S6)
 - **When** the entry is committed
-- **Then** posted amounts MUST conform to currency scale; banker's rounding default; tenant override only with recorded evidence
-- **And** internal compute scale MUST NOT leak into posted truth
+- **Then** posted amounts MUST be exact multiples of the currency's posting increment, rejected (never rounded) otherwise; ledger-derived amounts use banker's rounding by default; tenant override only with recorded evidence
+- **And** internal exact compute MUST NOT leak into posted truth
 
 **17. Negative-balance invariants**
 - **Given** the account class sign rules

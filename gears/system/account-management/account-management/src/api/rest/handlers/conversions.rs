@@ -29,6 +29,7 @@ use crate::domain::conversion::model::ConversionRequest;
 use crate::domain::conversion::service::{ConversionCaller, ConversionService};
 use crate::domain::error::DomainError;
 
+/// Concrete [`ConversionService`] type the conversion handlers are wired against.
 pub(crate) type ConcreteConversionService = ConversionService;
 
 // =====================================================================

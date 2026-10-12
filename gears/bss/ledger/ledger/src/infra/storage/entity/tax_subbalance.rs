@@ -13,6 +13,8 @@ use uuid::Uuid;
     no_type
 )]
 pub struct Model {
+    pub currency: String,
+    pub currency_scale: i16,
     #[sea_orm(primary_key, auto_increment = false)]
     pub tenant_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
@@ -21,7 +23,7 @@ pub struct Model {
     pub tax_jurisdiction: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub tax_filing_period: String,
-    pub balance_minor: i64,
+    pub balance: String,
     pub last_entry_seq: Option<i64>,
     pub version: i64,
 }

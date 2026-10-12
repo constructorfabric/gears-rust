@@ -9,11 +9,13 @@ use syn::{
     punctuated::Punctuated,
 };
 
+/// Implementation of the `api_dto` attribute macro.
 mod api_dto;
 mod domain_model;
 mod expand_vars;
 mod grpc_client;
 mod temporary;
+/// Implementation of the `temporary` attribute macro.
 mod utils;
 
 /// Configuration parsed from #[gear(...)] attribute

@@ -1,8 +1,10 @@
 //! `LedgerLocalClient` — the in-process implementation of
 //! [`LedgerClientV1`] published in `ClientHub`. It maps the SDK
 //! request DTOs (`PostEntry`/`PostLine`) onto the gear-internal
-//! `NewEntry`/`NewLine`, resolving each line's `currency_scale` through the
-//! [`CurrencyScaleResolver`], then delegates to [`PostingService`].
+//! `NewEntry`/`NewLine` (each line carries validated decimal money with its
+//! currency and stored scale; the posting service checks that scale against
+//! the currency registry in the posting transaction), then delegates to
+//! [`PostingService`].
 
 use std::str::FromStr;
 
@@ -12,32 +14,26 @@ use bss_ledger_sdk::{
     AllocationQueued, AllocationSplit, AllocationView, ArInvoiceBalanceView, BalanceView,
     ChangeRecognitionSchedule, CloseOutcome, CreditApplication, CreditApplicationApplied,
     CreditDebitView, DisputeOutcome, DisputeQueued, DisputeRecorded, EntryView, LineView,
-    MappingStatus, ODataQuery, Page, PostEntry, PostingRef, ProvisionOutcome, ProvisionRequest,
-    RecognitionRunOutcome, RecognitionScheduleList, RecognitionScheduleSegmentView,
-    RecognitionScheduleSummaryView, RecognitionScheduleView, RecordDisputePhase, ReturnPayment,
-    RevenueDisaggregation, RevenueDisaggregationEntry, RevenueDisaggregationQuery,
-    ScheduleChangeRef, SettlePayment, Side, SourceDocType, TriggerRecognitionRun, UnallocatedView,
+    MappingStatus, ODataQuery, Page, PostEntry, PostedMoney, PostingRef, ProvisionOutcome,
+    ProvisionRequest, RecognitionRunOutcome, RecognitionScheduleList,
+    RecognitionScheduleSegmentView, RecognitionScheduleSummaryView, RecognitionScheduleView,
+    RecordDisputePhase, ReturnPayment, RevenueDisaggregation, RevenueDisaggregationEntry,
+    RevenueDisaggregationQuery, ScheduleChangeRef, SettlePayment, Side, SourceDocType,
+    TriggerRecognitionRun, UnallocatedView,
 };
-use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit_db::secure::SecureEntityExt;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::api::rest::error::authz_error_to_canonical;
-use crate::domain::error::DomainError;
 use crate::domain::model::{EntryRecord, LineRecord, NewEntry, NewLine};
-use crate::infra::currency_scale::CurrencyScaleResolver;
 use crate::infra::period_close::PeriodCloseService;
 use crate::infra::posting::service::PostingService;
 use crate::infra::provisioning::service::ProvisioningService;
-use crate::infra::storage::entity::{
-    account_balance, ar_invoice_balance, journal_line, payment_allocation, recognition_schedule,
-    recognition_segment,
-};
 use crate::infra::storage::repo::JournalRepo;
 use crate::infra::storage::repo::journal_repo::OdataPageError;
+use crate::infra::storage::repo::recognition_repo::{ScheduleState, SegmentState};
 use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through the in-process client until a
@@ -48,7 +44,6 @@ const ORIGIN_SYSTEM: &str = "SYSTEM";
 pub struct LedgerLocalClient {
     posting: PostingService,
     db: DBProvider<DbError>,
-    resolver: CurrencyScaleResolver,
     provisioning: ProvisioningService,
     period_close: PeriodCloseService,
     // Payment money-in (settle a receipt into the unallocated pool) and money-out
@@ -56,7 +51,7 @@ pub struct LedgerLocalClient {
     // engine + publisher + metrics clones.
     settle_service: crate::infra::payment::settle::SettlementService,
     // Settlement return (money-in reversal): claws a settled receipt back out of
-    // the pool, decrementing `settled_minor`. Same deps as `settle_service`.
+    // the pool, decrementing `settled`. Same deps as `settle_service`.
     settlement_return_service: crate::infra::payment::settlement_return::SettlementReturnService,
     // Chargeback dispute (open / win / lose): records a dispute phase, seeding /
     // advancing the `ledger_dispute` state. Same deps as `settle_service`.
@@ -112,8 +107,6 @@ impl LedgerLocalClient {
         close_control: crate::infra::period_close::CloseControlFeeds,
     ) -> Self {
         let posting = PostingService::new(db.clone(), std::sync::Arc::clone(&publisher));
-        let resolver =
-            CurrencyScaleResolver::new(crate::infra::storage::repo::ReferenceRepo::new(db.clone()));
         let provisioning = ProvisioningService::new(db.clone());
         let period_close = PeriodCloseService::new(
             db.clone(),
@@ -189,7 +182,6 @@ impl LedgerLocalClient {
         Self {
             posting,
             db,
-            resolver,
             provisioning,
             period_close,
             settle_service,
@@ -299,30 +291,14 @@ impl LedgerClientV1 for LedgerLocalClient {
             rate_snapshot_ref: None,
         };
 
-        let mut new_lines: Vec<NewLine> = Vec::with_capacity(entry.lines.len());
-        for line in entry.lines {
-            // Functional FX columns must be a consistent pair on this direct
-            // in-process post path: there is no RateLocker here to derive one
-            // from the other (`rate_snapshot_ref` is `None`), so a `Some` amount
-            // with a `None` currency (or vice versa) would persist a
-            // half-populated, unauditable dual column the projector then reads
-            // inconsistently. Reject the mismatch as a 400.
-            if line.functional_amount_minor.is_some() != line.functional_currency.is_some() {
-                return Err(DomainError::InvalidRequest(
-                    "functional_amount_minor and functional_currency must both be set or both be \
-                     null on a direct post"
-                        .to_owned(),
-                )
-                .into());
-            }
-            let scale = self
-                .resolver
-                .resolve(&scope, entry.tenant_id, &line.currency)
-                .await
-                .map_err(|e| {
-                    CanonicalError::internal(format!("currency scale resolve: {e}")).create()
-                })?;
-            new_lines.push(NewLine {
+        // Each SDK line already carries validated decimal money with its
+        // currency and stored scale (the SDK type cannot be built otherwise);
+        // the posting service checks that scale against the currency registry
+        // inside the posting transaction, so no second resolve happens here.
+        let new_lines: Vec<NewLine> = entry
+            .lines
+            .into_iter()
+            .map(|line| NewLine {
                 line_id: line.line_id,
                 payer_tenant_id: line.payer_tenant_id,
                 seller_tenant_id: line.seller_tenant_id,
@@ -331,15 +307,12 @@ impl LedgerClientV1 for LedgerLocalClient {
                 account_class: line.account_class,
                 gl_code: line.gl_code,
                 side: line.side,
-                amount_minor: line.amount_minor,
-                currency: line.currency,
-                currency_scale: scale,
+                money: line.money,
                 invoice_id: line.invoice_id,
                 due_date: line.due_date,
                 revenue_stream: line.revenue_stream,
                 mapping_status: line.mapping_status,
-                functional_amount_minor: line.functional_amount_minor,
-                functional_currency: line.functional_currency,
+                functional_money: line.functional_money,
                 tax_jurisdiction: line.tax_jurisdiction,
                 tax_filing_period: line.tax_filing_period,
                 tax_rate_ref: line.tax_rate_ref,
@@ -351,8 +324,8 @@ impl LedgerClientV1 for LedgerLocalClient {
                 po_allocation_group: line.po_allocation_group,
                 credit_grant_event_type: line.credit_grant_event_type,
                 ar_status: line.ar_status,
-            });
-        }
+            })
+            .collect();
 
         self.posting
             .post(ctx, &scope, new_entry, new_lines, None)
@@ -365,7 +338,7 @@ impl LedgerClientV1 for LedgerLocalClient {
         ctx: &SecurityContext,
         tenant_id: Uuid,
         account_id: Uuid,
-    ) -> Result<Option<i64>, CanonicalError> {
+    ) -> Result<Option<PostedMoney>, CanonicalError> {
         // Read scope: the PDP returns the caller's compiled `In` scope, which
         // SecureORM binds to `tenant_id` (SQL-level BOLA). `require_constraints`
         // is true so an unconstrained allow fail-closes rather than leaking.
@@ -380,24 +353,10 @@ impl LedgerClientV1 for LedgerLocalClient {
         )
         .await
         .map_err(authz_error_to_canonical)?;
-        let conn = self
-            .db
-            .conn()
-            .map_err(|e| CanonicalError::internal(format!("conn: {e}")).create())?;
-        let row = account_balance::Entity::find()
-            .secure()
-            .scope_with(&scope)
-            .filter(
-                // Single-currency account (v1: one account per currency), so the
-                // (tenant, account) grain identifies exactly one balance row.
-                Condition::all()
-                    .add(account_balance::Column::TenantId.eq(tenant_id))
-                    .add(account_balance::Column::AccountId.eq(account_id)),
-            )
-            .one(&conn)
+        JournalRepo::new(self.db.clone())
+            .read_account_balance(&scope, tenant_id, account_id)
             .await
-            .map_err(|e| CanonicalError::internal(format!("read account_balance: {e}")).create())?;
-        Ok(row.map(|r| r.balance_minor))
+            .map_err(|e| CanonicalError::internal(format!("read account balance: {e}")).create())
     }
 
     async fn list_accounts(
@@ -484,7 +443,7 @@ impl LedgerClientV1 for LedgerLocalClient {
         let items = page
             .items
             .into_iter()
-            .map(line_model_to_view)
+            .map(line_record_to_view)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Page {
             items,
@@ -499,19 +458,12 @@ impl LedgerClientV1 for LedgerLocalClient {
         query: &ODataQuery,
     ) -> Result<Page<BalanceView>, CanonicalError> {
         let scope = self.read_entry_scope(ctx).await?;
-        let page = JournalRepo::new(self.db.clone())
-            .list_balances(&scope, tenant_id, query)
+        // The repository decodes each row straight into the SDK view (money at
+        // its stored scale, class parsed from the stored literal).
+        JournalRepo::new(self.db.clone())
+            .list_balance_records(&scope, tenant_id, query)
             .await
-            .map_err(map_odata_page_err)?;
-        let items = page
-            .items
-            .into_iter()
-            .map(balance_model_to_view)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Page {
-            items,
-            page_info: page.page_info,
-        })
+            .map_err(map_odata_page_err)
     }
 
     async fn list_ar_invoice_balances(
@@ -521,13 +473,12 @@ impl LedgerClientV1 for LedgerLocalClient {
         payer_tenant_id: Option<Uuid>,
     ) -> Result<Vec<ArInvoiceBalanceView>, CanonicalError> {
         let scope = self.read_entry_scope(ctx).await?;
-        let rows = JournalRepo::new(self.db.clone())
-            .list_ar_invoice_balances(&scope, tenant_id, payer_tenant_id)
+        JournalRepo::new(self.db.clone())
+            .list_ar_invoice_records(&scope, tenant_id, payer_tenant_id)
             .await
             .map_err(|e| {
                 CanonicalError::internal(format!("list ar invoice balances: {e}")).create()
-            })?;
-        Ok(rows.into_iter().map(ar_invoice_model_to_view).collect())
+            })
     }
 
     async fn provision(
@@ -605,16 +556,15 @@ impl LedgerClientV1 for LedgerLocalClient {
         )
         .await
         .map_err(authz_error_to_canonical)?;
-        // `scale` is NOT threaded onto the domain input — the per-line currency
-        // scale resolver (over the provisioned currency config) is authoritative;
-        // the caller's `req.scale` is advisory only.
+        // The pair carries one currency and stored scale; the service
+        // validates that scale against the provisioned currency config.
+        let (gross, fee) = req.amounts.into_parts();
         let input = crate::domain::payment::settlement::SettlementInput {
             tenant_id: req.tenant_id,
             payer_tenant_id: req.payer_tenant_id,
             payment_id: req.payment_id,
-            gross_minor: req.gross_minor,
-            fee_minor: req.fee_minor,
-            currency: req.currency,
+            gross,
+            fee,
             effective_at: req.effective_at,
         };
         self.settle_service
@@ -641,15 +591,12 @@ impl LedgerClientV1 for LedgerLocalClient {
         )
         .await
         .map_err(authz_error_to_canonical)?;
-        // `scale` is advisory (see `settle_payment`) — the per-line currency-scale
-        // resolver is authoritative; the caller's `req.scale` is not threaded.
         let input = crate::domain::payment::settlement_return::SettlementReturnInput {
             tenant_id: req.tenant_id,
             payer_tenant_id: req.payer_tenant_id,
             payment_id: req.payment_id,
             psp_return_id: req.psp_return_id,
-            amount_minor: req.amount_minor,
-            currency: req.currency,
+            amount: req.money,
             effective_at: req.effective_at,
         };
         self.settlement_return_service
@@ -678,7 +625,6 @@ impl LedgerClientV1 for LedgerLocalClient {
         .map_err(authz_error_to_canonical)?;
         // Parse the wire phase / funds-fact literals at the boundary (a bad
         // literal is `InvalidArgument` ⇒ 400, not a deep post-path fault).
-        // `scale` is advisory (see `settle_payment`) — not threaded.
         let phase = crate::domain::payment::chargeback::DisputePhase::parse(&req.phase)
             .ok_or_else(|| {
                 CanonicalError::from(crate::domain::error::DomainError::InvalidRequest(format!(
@@ -704,8 +650,7 @@ impl LedgerClientV1 for LedgerLocalClient {
             cycle: req.cycle,
             phase,
             funds_at_open,
-            disputed_amount_minor: req.disputed_amount_minor,
-            currency: req.currency,
+            disputed_amount: req.disputed_amount,
             effective_at: req.effective_at,
         };
         // The service returns either an inline post (`Recorded`) or a durable
@@ -748,9 +693,6 @@ impl LedgerClientV1 for LedgerLocalClient {
         )
         .await
         .map_err(authz_error_to_canonical)?;
-        // `scale` is advisory (see `settle_payment`) — not threaded onto the
-        // request; the resolver is authoritative.
-        let currency = req.currency.clone();
         // Mode B (§4.4 F-5): a caller-supplied split bypasses the precedence
         // decision and is validated against the open candidates by the service.
         let caller_splits = req.splits.map(|splits| {
@@ -758,7 +700,7 @@ impl LedgerClientV1 for LedgerLocalClient {
                 .into_iter()
                 .map(|s| crate::domain::payment::precedence::Allocated {
                     invoice_id: s.invoice_id,
-                    amount_minor: s.amount_minor,
+                    amount: s.money,
                 })
                 .collect()
         });
@@ -767,8 +709,7 @@ impl LedgerClientV1 for LedgerLocalClient {
             payer_tenant_id: req.payer_tenant_id,
             payment_id: req.payment_id,
             allocation_id: req.allocation_id,
-            lump_minor: req.lump_minor,
-            currency: req.currency,
+            lump: req.lump,
             hint_invoice_id: req.hint_invoice_id,
             caller_splits,
         };
@@ -783,8 +724,8 @@ impl LedgerClientV1 for LedgerLocalClient {
             .map_err(CanonicalError::from)?
         {
             crate::infra::payment::allocate::AllocationOutcome::Applied(applied) => {
-                // Positive-amount splits only; the per-invoice currency is the
-                // request currency and `allocated_at_utc` is the apply instant
+                // Positive-amount splits only; each split carries the request's
+                // currency and scale, and `allocated_at_utc` is the apply instant
                 // (the sidecar stamps the same `now` on the persisted rows).
                 // `policy_ref` is the ref the service stamped — a precedence policy
                 // id for the decided path, or `caller-split.v1` for a Mode B split.
@@ -794,8 +735,7 @@ impl LedgerClientV1 for LedgerLocalClient {
                     .into_iter()
                     .map(|s| AllocationView {
                         invoice_id: s.invoice_id,
-                        amount_minor: s.amount_minor,
-                        currency: currency.clone(),
+                        money: s.amount,
                         allocated_at_utc: OffsetDateTime::now_utc(),
                         precedence_policy_ref: policy_ref.clone(),
                     })
@@ -862,14 +802,17 @@ impl LedgerClientV1 for LedgerLocalClient {
         )
         .await
         .map_err(authz_error_to_canonical)?;
-        let balance_minor = crate::infra::storage::repo::PaymentRepo::new(self.db.clone())
-            .read_unallocated(&scope, tenant_id, payer_tenant_id, &currency)
+        // An absent pool reads as zero at the registry scale and an unprovisioned
+        // currency is refused; the payment service owns that rule (the same
+        // absent-pool rule as the grant cap), the repository only reads rows.
+        let balance = self
+            .credit_service
+            .read_unallocated_balance(&scope, tenant_id, payer_tenant_id, &currency)
             .await
-            .map_err(|e| CanonicalError::internal(format!("read unallocated: {e}")).create())?;
+            .map_err(CanonicalError::from)?;
         Ok(UnallocatedView {
             payer_tenant_id,
-            currency,
-            balance_minor,
+            balance,
         })
     }
 
@@ -891,8 +834,6 @@ impl LedgerClientV1 for LedgerLocalClient {
         )
         .await
         .map_err(authz_error_to_canonical)?;
-        // `scale` is advisory (see `allocate_payment`) — not threaded onto the
-        // request; the per-line currency-scale resolver is authoritative.
         let outcome = match req {
             CreditApplication::Grant(g) => {
                 self.credit_service
@@ -903,8 +844,7 @@ impl LedgerClientV1 for LedgerLocalClient {
                             tenant_id: g.tenant_id,
                             payer_tenant_id: g.payer_tenant_id,
                             credit_application_id: g.credit_application_id,
-                            currency: g.currency,
-                            amount_minor: g.amount_minor,
+                            amount: g.money,
                             credit_grant_event_type: g.credit_grant_event_type,
                         },
                     )
@@ -927,7 +867,7 @@ impl LedgerClientV1 for LedgerLocalClient {
                                 .into_iter()
                                 .map(|s| crate::domain::payment::precedence::Allocated {
                                     invoice_id: s.invoice_id,
-                                    amount_minor: s.amount_minor,
+                                    amount: s.money,
                                 })
                                 .collect(),
                         },
@@ -946,7 +886,7 @@ impl LedgerClientV1 for LedgerLocalClient {
                 .into_iter()
                 .map(|d| CreditDebitView {
                     credit_grant_event_type: d.credit_grant_event_type,
-                    amount_minor: d.amount_minor,
+                    money: d.amount,
                 })
                 .collect(),
             applications: outcome
@@ -954,7 +894,7 @@ impl LedgerClientV1 for LedgerLocalClient {
                 .into_iter()
                 .map(|t| AllocationSplit {
                     invoice_id: t.invoice_id,
-                    amount_minor: t.amount_minor,
+                    money: t.amount,
                 })
                 .collect(),
         })
@@ -1009,8 +949,7 @@ impl LedgerClientV1 for LedgerLocalClient {
                 .map(|r| RevenueDisaggregationEntry {
                     period_id: r.period_id,
                     revenue_stream: r.revenue_stream,
-                    recognized_minor: r.recognized_minor,
-                    currency: r.currency,
+                    recognized: r.recognized,
                 })
                 .collect(),
         })
@@ -1111,17 +1050,16 @@ impl LedgerClientV1 for LedgerLocalClient {
 /// the SDK [`RecognitionScheduleView`] lifecycle view. The segments arrive ordered
 /// by `segment_no` from [`RecognitionRepo::list_segments`].
 fn recognition_schedule_to_view(
-    schedule: recognition_schedule::Model,
-    segments: Vec<recognition_segment::Model>,
+    schedule: ScheduleState,
+    segments: Vec<SegmentState>,
 ) -> RecognitionScheduleView {
     RecognitionScheduleView {
         schedule_id: schedule.schedule_id,
         status: schedule.status,
         version: schedule.version,
         revenue_stream: schedule.revenue_stream,
-        currency: schedule.currency,
-        total_deferred_minor: schedule.total_deferred_minor,
-        recognized_minor: schedule.recognized_minor,
+        total_deferred: schedule.total_deferred,
+        recognized: schedule.recognized,
         source_invoice_id: schedule.source_invoice_id,
         source_invoice_item_ref: schedule.source_invoice_item_ref,
         po_allocation_group: schedule.po_allocation_group,
@@ -1132,7 +1070,7 @@ fn recognition_schedule_to_view(
             .map(|seg| RecognitionScheduleSegmentView {
                 segment_no: seg.segment_no,
                 period_id: seg.period_id,
-                amount_minor: seg.amount_minor,
+                money: seg.amount,
                 status: seg.status,
             })
             .collect(),
@@ -1141,31 +1079,20 @@ fn recognition_schedule_to_view(
 
 /// Map a `recognition_schedule` row into the SDK [`RecognitionScheduleSummaryView`]
 /// header (no segments) — the row shape of the list/discovery surface.
-fn recognition_schedule_to_summary(
-    schedule: recognition_schedule::Model,
-) -> RecognitionScheduleSummaryView {
+fn recognition_schedule_to_summary(schedule: ScheduleState) -> RecognitionScheduleSummaryView {
     RecognitionScheduleSummaryView {
         schedule_id: schedule.schedule_id,
         status: schedule.status,
         version: schedule.version,
         revenue_stream: schedule.revenue_stream,
-        currency: schedule.currency,
-        total_deferred_minor: schedule.total_deferred_minor,
-        recognized_minor: schedule.recognized_minor,
+        total_deferred: schedule.total_deferred,
+        recognized: schedule.recognized,
         source_invoice_id: schedule.source_invoice_id,
         source_invoice_item_ref: schedule.source_invoice_item_ref,
         po_allocation_group: schedule.po_allocation_group,
         subscription_ref: schedule.subscription_ref,
         policy_ref: schedule.policy_ref,
     }
-}
-
-/// Stored `currency_scale` (`i16` at the DB boundary) → the SDK's `u8`. The
-/// scale is always a small non-negative number (≤ the ISO headroom); a
-/// negative or out-of-range stored value (impossible by construction) clamps
-/// to `0` rather than panicking.
-fn scale_to_u8(scale: i16) -> u8 {
-    u8::try_from(scale.max(0)).unwrap_or(0)
 }
 
 /// Parse a stored enum literal into its SDK enum, mapping an unknown literal to
@@ -1189,15 +1116,12 @@ fn line_record_to_view(r: LineRecord) -> Result<LineView, CanonicalError> {
         account_class: parse_enum(&r.account_class, AccountClass::from_str)?,
         gl_code: r.gl_code,
         side: parse_enum(&r.side, Side::from_str)?,
-        amount_minor: r.amount_minor,
-        currency: r.currency,
-        currency_scale: scale_to_u8(r.currency_scale),
+        money: r.money,
         invoice_id: r.invoice_id,
         due_date: r.due_date,
         revenue_stream: r.revenue_stream,
         mapping_status: parse_enum(&r.mapping_status, MappingStatus::from_str)?,
-        functional_amount_minor: r.functional_amount_minor,
-        functional_currency: r.functional_currency,
+        functional_money: r.functional_money,
         tax_jurisdiction: r.tax_jurisdiction,
         tax_filing_period: r.tax_filing_period,
         ar_status: r.ar_status,
@@ -1230,65 +1154,14 @@ fn entry_record_to_view(r: EntryRecord) -> Result<EntryView, CanonicalError> {
     })
 }
 
-/// Map a `journal_line` row (from `list_lines`) into an SDK [`LineView`]. The
-/// stored enum literals were written + validated by this gear on the way in; an
-/// unknown one here is data corruption and fails loud (`Internal`), never a
-/// silently wrong class/side/status.
-fn line_model_to_view(m: journal_line::Model) -> Result<LineView, CanonicalError> {
-    Ok(LineView {
-        line_id: m.line_id,
-        entry_id: m.entry_id,
-        payer_tenant_id: m.payer_tenant_id,
-        account_id: m.account_id,
-        account_class: parse_enum(&m.account_class, AccountClass::from_str)?,
-        gl_code: m.gl_code,
-        side: parse_enum(&m.side, Side::from_str)?,
-        amount_minor: m.amount_minor,
-        currency: m.currency,
-        currency_scale: scale_to_u8(m.currency_scale),
-        invoice_id: m.invoice_id,
-        due_date: m.due_date,
-        revenue_stream: m.revenue_stream,
-        mapping_status: parse_enum(&m.mapping_status, MappingStatus::from_str)?,
-        functional_amount_minor: m.functional_amount_minor,
-        functional_currency: m.functional_currency,
-        tax_jurisdiction: m.tax_jurisdiction,
-        tax_filing_period: m.tax_filing_period,
-        ar_status: m.ar_status,
-    })
-}
-
-/// Map an `account_balance` row into an SDK [`BalanceView`].
-fn balance_model_to_view(m: account_balance::Model) -> Result<BalanceView, CanonicalError> {
-    Ok(BalanceView {
-        account_id: m.account_id,
-        account_class: parse_enum(&m.account_class, AccountClass::from_str)?,
-        currency: m.currency,
-        balance_minor: m.balance_minor,
-        functional_balance_minor: m.functional_balance_minor,
-        functional_currency: m.functional_currency,
-    })
-}
-
-/// Map an `ar_invoice_balance` row into an SDK [`ArInvoiceBalanceView`].
-fn ar_invoice_model_to_view(m: ar_invoice_balance::Model) -> ArInvoiceBalanceView {
-    ArInvoiceBalanceView {
-        payer_tenant_id: m.payer_tenant_id,
-        account_id: m.account_id,
-        invoice_id: m.invoice_id,
-        currency: m.currency,
-        balance_minor: m.balance_minor,
-        due_date: m.due_date,
-    }
-}
-
 /// Map a `payment_allocation` row (from `list_payment_allocations`) into an SDK
 /// [`AllocationView`].
-fn payment_allocation_to_view(m: payment_allocation::Model) -> AllocationView {
+fn payment_allocation_to_view(
+    m: crate::infra::storage::repo::payment_repo::StoredAllocation,
+) -> AllocationView {
     AllocationView {
         invoice_id: m.invoice_id,
-        amount_minor: m.amount_minor,
-        currency: m.currency,
+        money: m.amount,
         allocated_at_utc: m.allocated_at_utc,
         precedence_policy_ref: m.precedence_policy_ref,
     }
@@ -1312,3 +1185,7 @@ pub(crate) fn map_odata_page_err(err: OdataPageError) -> CanonicalError {
 #[cfg(test)]
 #[path = "local_client_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "local_client_unallocated_tests.rs"]
+mod unallocated_tests;

@@ -3,7 +3,9 @@ pub mod builder;
 pub mod errors;
 pub mod filter;
 pub mod limits;
+/// Internal `OData` filter representations.
 pub(crate) mod odata_filters;
+/// Internal `OData` filter parsing.
 mod odata_parse;
 pub mod page;
 pub mod pagination;
@@ -454,13 +456,16 @@ impl CursorV1 {
 }
 
 // base64url helpers (no padding)
+/// URL-safe base64 encoding without padding, used for cursor tokens.
 mod base64_url {
     use base64::Engine;
 
+    /// Encodes bytes as URL-safe base64 without padding.
     pub fn encode(bytes: &[u8]) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
+    /// Decodes URL-safe base64 without padding.
     pub fn decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s)
     }

@@ -1,0 +1,38 @@
+# Out-of-process (loopback) E2E suite — self-managed.
+#
+# This suite verifies the Profile 2 (Host + Workers) OoP wiring on loopback: it
+# boots flight-control (edge + DirectoryService) and three OoP gear processes on
+# loopback, discovered via the directory and fronted by the built-in edge — the
+# same OoP software path a Profile 3 (Kubernetes) deployment shares, minus pods
+# and an external gateway. It then asserts the cross-process seams that no unit
+# test or in-process E2E can reach, organized one concern per file:
+#   - test_edge_routing.py: directory-synced routing + tenant-plane gating of
+#       gear routes — anonymous cross-process proxy (hello), missing-bearer 401,
+#       unexposed route not published (404), unknown route (404 with bearer /
+#       401 without), and (method, path) routing (wrong method -> 405).
+#   - test_edge_composition.py: the flight-control composition serves its built-in
+#       edge endpoints (/healthz, /readyz, /health, /openapi.json, /docs), which
+#       api-gateway's isolated unit tests do not cover. Whether the edge should
+#       AGGREGATE proxied gears' specs/health is an open design question, not
+#       asserted (DESIGN vs. ADR-0007).
+#   - test_contract_calls.py: a ToolKit contract (`#[toolkit::contract]`) call
+#       over REST across the OoP boundary (consumer -> provider, discovered via
+#       the directory) plus how the receiving gear rejects malformed (400) /
+#       incomplete (422) input, not a 500.
+#   - test_lifecycle.py: dynamic lifecycle driven by stopping/starting gears —
+#       * route (de)registration: a gracefully stopped gear deregisters and the
+#         edge drops its route; a restart re-registers it
+#       * eventual readiness (ADR-0005): a gear with an unresolved dependency
+#         reports /readyz 503 (unresolved_deps), then flips to 200 once resolved
+#       * contract-call resilience (ADR-0005): with its provider down, a consumer
+#         charge degrades to a clean 503 (problem+json) and recovers after restart
+#
+# It owns its own lifecycle (multiple distinct binaries), so it is NOT run by the
+# shared `make e2e-local`. Run it directly:
+#
+#   make e2e-oop
+#
+# The suite's conftest.py builds the required binaries and manages the processes;
+# it does not use run_e2e.py's single-binary launcher.
+suite: oop
+launcher: pytest

@@ -13,7 +13,9 @@ pub use gear::OutboundApiGatewayGear;
 pub mod api;
 #[doc(hidden)]
 pub mod config;
+/// Domain layer: models, services, ports and repository traits.
 pub(crate) mod domain;
+/// Infrastructure layer: proxy, plugins, metrics and storage.
 pub(crate) mod infra;
 
 #[cfg(any(test, feature = "test-utils"))]

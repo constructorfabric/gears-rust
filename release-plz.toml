@@ -203,6 +203,11 @@ changelog_update = false
 git_release_enable = false
 
 [[package]]
+name = "cf-gears-toolkit-taskward"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
 name = "cf-gears-toolkit-utils"
 changelog_update = false
 git_release_enable = false

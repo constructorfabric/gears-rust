@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 # The fixed cross-gear contract the sources implement (RateProviderError / ProviderRate).
 bss-ledger-sdk = { workspace = true }
+bss-money = { workspace = true }
 # GTS PluginV1 base + the `#[gts_type_schema]` / `gts_id!` macros for the source-plugin spec.
 toolkit-gts = { workspace = true }
 # The macro expansion references the `gts` crate directly (same as other -sdk crates).
@@ -36,7 +37,7 @@ toolkit-http = { workspace = true, features = ["otel"] }
 http = { workspace = true }
 # OTel metrics seam for the shared fetch metrics.
 opentelemetry = { workspace = true }
-# Exact-decimal parse + banker's rounding for rate_micro (never f64).
+# Exact decimal quote carrier (never f64).
 rust_decimal = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

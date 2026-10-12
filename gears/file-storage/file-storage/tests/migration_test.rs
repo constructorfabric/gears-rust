@@ -1,10 +1,3 @@
-//! Schema-level tests for the P1 initial migration, run against a real
-//! in-memory SQLite database (~1ms per DB). These verify that the SQL itself is
-//! correct — every `CHECK` constraint, the partial unique "current version"
-//! index, composite primary keys, and `ON DELETE CASCADE` — without needing a
-//! running server. PostgreSQL-dialect behaviour (domain types, schema
-//! namespace, FK RESTRICT) is covered by E2E tests, not here.
-
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
@@ -16,19 +9,16 @@ use file_storage::Migrator;
 const TENANT: &str = "00000000-0000-0000-0000-0000000000a1";
 const OWNER: &str = "00000000-0000-0000-0000-0000000000b1";
 const FILE: &str = "00000000-0000-0000-0000-0000000000c1";
-/// Version id used by the ADR-0006 content-hash-modes tests appended at the
-/// end of this file.
 const VERSION: &str = "00000000-0000-0000-0000-0000000000d1";
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
-/// 32 zero bytes — the only hash length the P1 `SHA-256` CHECK accepts.
 const HASH32: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 fn stmt(db: &DatabaseConnection, sql: impl Into<String>) -> Statement {
     Statement::from_string(db.get_database_backend(), sql.into())
 }
 
-/// Fresh in-memory SQLite with the P1 migration applied and FK enforcement on
-/// (SQLite leaves foreign keys off by default, so cascade would silently no-op).
+/// Fresh in-memory SQLite with migrations applied and FK enforcement on (SQLite defaults to off,
+/// so cascades would silently no-op).
 async fn migrated_db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:")
         .await
@@ -74,8 +64,6 @@ async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
         .expect("i64 column c")
 }
 
-// ── schema existence / lifecycle ─────────────────────────────────────────────
-
 #[tokio::test]
 async fn migration_creates_all_three_tables() {
     let db = migrated_db().await;
@@ -106,8 +94,6 @@ async fn migration_up_down_up_roundtrip() {
         .await;
     assert!(back.is_ok(), "files must exist again after re-up: {back:?}");
 }
-
-// ── files CHECK constraints ──────────────────────────────────────────────────
 
 #[tokio::test]
 async fn files_accepts_user_and_app_owner_kinds() {
@@ -175,8 +161,6 @@ async fn files_content_id_is_nullable_until_first_bind() {
     );
 }
 
-// ── file_versions CHECK constraints ──────────────────────────────────────────
-
 #[tokio::test]
 async fn file_versions_accepts_valid_row() {
     let db = migrated_db().await;
@@ -224,7 +208,6 @@ async fn file_versions_rejects_unknown_status() {
 async fn file_versions_rejects_non_sha256_algorithm_in_p1() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
-    // BLAKE3 is only widened in by the P2 migration; P1 is locked to SHA-256.
     let res = db
         .execute_raw(stmt(
             &db,
@@ -258,8 +241,6 @@ async fn file_versions_rejects_wrong_hash_length() {
         "hash_value length CHECK must reject 4 bytes: {res:?}"
     );
 }
-
-// ── partial unique index: at most one current version per file ───────────────
 
 #[tokio::test]
 async fn file_versions_allows_only_one_current_per_file() {
@@ -312,8 +293,6 @@ async fn file_versions_allows_current_per_distinct_file() {
     );
 }
 
-// ── custom metadata composite PK ─────────────────────────────────────────────
-
 #[tokio::test]
 async fn custom_metadata_rejects_duplicate_key_per_file() {
     let db = migrated_db().await;
@@ -338,16 +317,8 @@ async fn custom_metadata_rejects_duplicate_key_per_file() {
     );
 }
 
-// ── idempotency_keys additive columns (P2 remediation) ───────────────────────
-
-/// P2 remediation 2.1: `request_hash` binds a replay to the request body that
-/// created it. The column must be additive-safe — an INSERT that omits it
-/// (as every pre-2.1 write path effectively did) must succeed and default to
-/// an empty blob, never a constraint violation, and never NULL (a NULL would
-/// compare unequal to itself in a naive check, and more importantly could
-/// never legitimately match a freshly computed 32-byte SHA-256 either way —
-/// but `NOT NULL DEFAULT` is the deliberate choice so a pre-migration/omitted
-/// row fails closed on any future replay rather than silently passing).
+/// `request_hash` is `NOT NULL DEFAULT` empty blob: an INSERT omitting it succeeds, and such a row
+/// fails closed on any replay.
 #[tokio::test]
 async fn idempotency_keys_request_hash_column_exists_with_default() {
     let db = migrated_db().await;
@@ -384,18 +355,7 @@ async fn idempotency_keys_request_hash_column_exists_with_default() {
     );
 }
 
-// ── policies partial unique indexes (P2 remediation 2.4) ─────────────────────
-
-/// P2 remediation 2.4: `policies_user_scope_unique_idx` enforces at most one
-/// row per `(tenant_id, 'user', scope_owner_id)`. Two concurrent `PUT
-/// /policy` calls for the same user scope used to be able to leave two rows
-/// (delete-then-insert with no transaction and no unique constraint); this
-/// index turns the second writer's insert into a hard constraint violation
-/// instead. `policies.tenant_id` / `scope_owner_id` are declared `TEXT` in
-/// this gear's SQLite DDL (see `m20260701_000001_p2_initial.rs`), not
-/// `BLOB`, so plain quoted UUID string literals are the correct raw-SQL
-/// representation here (unlike `hash_value`/`request_hash`, which are
-/// declared `BLOB` and need `X'...'` literals).
+/// `policies` ids are `TEXT` in the SQLite DDL, so UUIDs are plain quoted literals.
 #[tokio::test]
 async fn policies_unique_index_rejects_duplicate_scope_tuple() {
     let db = migrated_db().await;
@@ -426,11 +386,8 @@ async fn policies_unique_index_rejects_duplicate_scope_tuple() {
     );
 }
 
-/// P2 remediation 2.4: `policies_tenant_scope_unique_idx` enforces at most
-/// one row per `(tenant_id, 'tenant')` (i.e. `scope_owner_id IS NULL`). A
-/// plain `UNIQUE (tenant_id, scope, scope_owner_id)` index would NOT catch
-/// this — Postgres/SQLite both treat every `NULL` as distinct — hence the
-/// dedicated partial index scoped to `scope_owner_id IS NULL`.
+/// A plain `UNIQUE` would not catch this (NULLs are distinct); hence the partial index on
+/// `scope_owner_id IS NULL`.
 #[tokio::test]
 async fn policies_unique_index_rejects_duplicate_tenant_scope() {
     let db = migrated_db().await;
@@ -460,10 +417,6 @@ async fn policies_unique_index_rejects_duplicate_tenant_scope() {
     );
 }
 
-/// Sanity check that the partial indexes don't over-constrain: two different
-/// tenants can each have their own user-scope row for the same owner id, and
-/// a tenant-scope row coexists fine with user-scope rows for the same
-/// tenant.
 #[tokio::test]
 async fn policies_unique_index_allows_distinct_scopes() {
     let db = migrated_db().await;
@@ -482,30 +435,14 @@ async fn policies_unique_index_allows_distinct_scopes() {
     assert_eq!(count(&db, "SELECT COUNT(*) AS c FROM policies").await, 3);
 }
 
-/// P2 remediation 2.4 follow-up (CodeRabbit finding on PR #4184): the two
-/// partial unique indexes are created with a plain `CREATE UNIQUE INDEX`,
-/// which fails outright if the table already contains rows that would
-/// violate the new constraint. That is exactly the state the pre-2.4 upsert
-/// race (`DELETE` then independent `INSERT`, no transaction, no unique
-/// constraint) could have left behind, so the migration must dedup existing
-/// duplicate rows before creating either index, or it can never be applied
-/// to a database that hit the race even once.
-///
-/// This test applies every migration up to (but not including)
-/// `m20260706_000003_policies_unique_scope` — i.e. the first five migrations
-/// registered in `Migrator::migrations()` — inserts two duplicate
-/// user-scope `policies` rows directly (bypassing the not-yet-created
-/// unique index), then applies the sixth migration and asserts it succeeds,
-/// dedups down to the most-recently-updated row, and leaves the index
-/// enforcing uniqueness going forward.
+/// Applies all but the last migration and seeds duplicates (as the old upsert race could leave),
+/// then applies the last: it must dedup to the newest row before creating the unique indexes.
 #[tokio::test]
 async fn policies_unique_migration_dedups_preexisting_duplicates() {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("connect in-memory sqlite");
 
-    // Apply every migration except the last one (policies_unique_scope), so
-    // the `policies` table exists but neither partial unique index does yet.
     Migrator::up(&db, Some(5))
         .await
         .expect("apply migrations up to (not including) policies_unique_scope");
@@ -514,9 +451,6 @@ async fn policies_unique_migration_dedups_preexisting_duplicates() {
     let older = "00000000-0000-0000-0000-0000000000e1";
     let newer = "00000000-0000-0000-0000-0000000000e2";
 
-    // Two duplicate rows for the same (tenant_id, 'user', scope_owner_id)
-    // tuple -- exactly what the pre-2.4 upsert race could produce. `newer`
-    // has a later `updated_at` and must be the row that survives dedup.
     db.execute_raw(stmt(
         &db,
         format!(
@@ -536,8 +470,6 @@ async fn policies_unique_migration_dedups_preexisting_duplicates() {
     .await
     .expect("insert newer duplicate user-scope policy");
 
-    // Also seed a tenant-scope duplicate pair (scope_owner_id IS NULL) to
-    // exercise the second dedup pass / second partial index.
     let tenant_older = "00000000-0000-0000-0000-0000000000e3";
     let tenant_newer = "00000000-0000-0000-0000-0000000000e4";
     db.execute_raw(stmt(
@@ -565,14 +497,10 @@ async fn policies_unique_migration_dedups_preexisting_duplicates() {
         "all four duplicate rows must be present before the dedup migration runs"
     );
 
-    // Apply the remaining migration (policies_unique_scope). This must not
-    // fail even though duplicates exist.
     Migrator::up(&db, Some(1))
         .await
         .expect("policies_unique_scope migration must dedup before creating the unique indexes");
 
-    // Exactly one row per group must survive, and it must be the
-    // most-recently-updated one.
     assert_eq!(
         count(
             &db,
@@ -633,8 +561,6 @@ async fn policies_unique_migration_dedups_preexisting_duplicates() {
         "the stale tenant-scope duplicate must have been deleted"
     );
 
-    // The partial unique indexes must now be live: a fresh duplicate insert
-    // is rejected.
     let dup_res = db
         .execute_raw(stmt(
             &db,
@@ -649,8 +575,6 @@ async fn policies_unique_migration_dedups_preexisting_duplicates() {
         "policies_user_scope_unique_idx must reject a fresh duplicate after the dedup migration: {dup_res:?}"
     );
 }
-
-// ── cascade delete (FK enforcement enabled) ──────────────────────────────────
 
 #[tokio::test]
 async fn deleting_file_cascades_to_versions_and_metadata() {
@@ -685,17 +609,12 @@ async fn deleting_file_cascades_to_versions_and_metadata() {
     );
 }
 
-// ── ADR-0006 content-hash modes: hash_mode / part_count / manifest ───────────
-
-/// AC6: a pre-existing `file_versions` row (inserted without the ADR-0006
-/// columns, exactly as P1/P2 code did) backfills to `hash_mode =
-/// 'whole-sha256'`, `part_count = NULL`, and has no `version_hash_manifest`
-/// row — driven entirely by the column DEFAULT, with no data migration.
+/// Rows inserted without the new columns backfill via column `DEFAULT` (`whole-sha256`, NULL
+/// `part_count`); there is no data migration.
 #[tokio::test]
 async fn content_hash_modes_backfill_existing_rows_to_whole_sha256() {
     let db = migrated_db().await;
     insert_file(&db, FILE).await;
-    // `insert_version` deliberately does NOT mention hash_mode/part_count.
     insert_version(&db, FILE, VERSION, 1).await;
 
     let row = db
@@ -733,8 +652,6 @@ async fn content_hash_modes_backfill_existing_rows_to_whole_sha256() {
     );
 }
 
-/// The cross-column presence CHECK rejects `part_count IS NULL` for a
-/// `multipart-composite-sha256` row.
 #[tokio::test]
 async fn content_hash_modes_rejects_multipart_without_part_count() {
     let db = migrated_db().await;
@@ -757,8 +674,6 @@ async fn content_hash_modes_rejects_multipart_without_part_count() {
     );
 }
 
-/// The cross-column presence CHECK rejects a non-NULL `part_count` for a
-/// `whole-sha256` row.
 #[tokio::test]
 async fn content_hash_modes_rejects_whole_with_part_count() {
     let db = migrated_db().await;
@@ -781,7 +696,6 @@ async fn content_hash_modes_rejects_whole_with_part_count() {
     );
 }
 
-/// The `hash_mode` CHECK rejects any value outside the two shipped modes.
 #[tokio::test]
 async fn content_hash_modes_rejects_unknown_hash_mode() {
     let db = migrated_db().await;
@@ -804,8 +718,6 @@ async fn content_hash_modes_rejects_unknown_hash_mode() {
     );
 }
 
-/// The `hash_algorithm = 'SHA-256'` CHECK is left untouched by ADR-0006 — a
-/// second algorithm is still rejected (AC5, schema half).
 #[tokio::test]
 async fn content_hash_modes_leaves_hash_algorithm_check_intact() {
     let db = migrated_db().await;

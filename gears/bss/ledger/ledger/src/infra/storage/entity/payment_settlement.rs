@@ -19,12 +19,13 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub payment_id: String,
     pub currency: String,
-    pub settled_minor: i64,
-    pub fee_minor: i64,
-    pub allocated_minor: i64,
-    pub refunded_minor: i64,
-    pub refunded_unallocated_minor: i64,
-    pub clawed_back_minor: i64,
+    pub currency_scale: i16,
+    pub settled: String,
+    pub fee: String,
+    pub allocated: String,
+    pub refunded: String,
+    pub refunded_unallocated: String,
+    pub clawed_back: String,
     pub version: i64,
 }
 

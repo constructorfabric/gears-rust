@@ -46,6 +46,15 @@ use toolkit_security::{PlatformSecurityContext, pep_properties};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`).
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
 /// The authenticated caller's tenant — also the only tenant the allow fake
 /// authorizes (its `In` constraint echoes it), so every body/query `tenant_id`
 /// uses it (a cross-tenant target is covered by `postgres_dual_control` + e2e).
@@ -72,9 +81,8 @@ fn canned_schedule() -> RecognitionScheduleView {
         status: "ACTIVE".to_owned(),
         version: 0,
         revenue_stream: "subscription".to_owned(),
-        currency: "USD".to_owned(),
-        total_deferred_minor: 1200,
-        recognized_minor: 0,
+        total_deferred: usd_cents(1200),
+        recognized: usd_cents(0),
         source_invoice_id: "INV-1".to_owned(),
         source_invoice_item_ref: "INV-1#1".to_owned(),
         po_allocation_group: None,
@@ -83,7 +91,7 @@ fn canned_schedule() -> RecognitionScheduleView {
         segments: vec![RecognitionScheduleSegmentView {
             segment_no: 1,
             period_id: "202606".to_owned(),
-            amount_minor: 1200,
+            money: usd_cents(1200),
             status: "PENDING".to_owned(),
         }],
     }
@@ -95,9 +103,8 @@ fn canned_summary() -> RecognitionScheduleSummaryView {
         status: "ACTIVE".to_owned(),
         version: 0,
         revenue_stream: "subscription".to_owned(),
-        currency: "USD".to_owned(),
-        total_deferred_minor: 1200,
-        recognized_minor: 0,
+        total_deferred: usd_cents(1200),
+        recognized: usd_cents(0),
         source_invoice_id: "INV-1".to_owned(),
         source_invoice_item_ref: "INV-1#1".to_owned(),
         po_allocation_group: None,
@@ -140,8 +147,7 @@ impl LedgerClientV1 for StubClient {
             entries: vec![RevenueDisaggregationEntry {
                 period_id: query.period_id.unwrap_or_else(|| "202606".to_owned()),
                 revenue_stream: "subscription".to_owned(),
-                recognized_minor: 1200,
-                currency: "USD".to_owned(),
+                recognized: usd_cents(1200),
             }],
         })
     }
@@ -221,7 +227,7 @@ impl LedgerClientV1 for StubClient {
         _ctx: &toolkit_security::SecurityContext,
         _tenant_id: Uuid,
         _account_id: Uuid,
-    ) -> Result<Option<i64>, CanonicalError> {
+    ) -> Result<Option<bss_ledger_sdk::PostedMoney>, CanonicalError> {
         unimplemented!("not exercised by the recognition router tests")
     }
     async fn list_accounts(

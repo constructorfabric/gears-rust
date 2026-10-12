@@ -9,6 +9,7 @@
 //! and a gear's contributed declarations are not admin-editable at all.
 
 use std::sync::Arc;
+use toolkit_macros::domain_model;
 
 use secrecy::ExposeSecret;
 use serde_json::{Map, Value};
@@ -52,6 +53,7 @@ pub mod conflict {
 }
 
 /// What an administrator supplies to declare a setting.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateDeclaration {
     pub value_type_id: String,
@@ -70,6 +72,7 @@ pub struct CreateDeclaration {
 }
 
 /// The outcome of a create: a new row, or a retired one revived.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Created {
     pub declaration: Declaration,
@@ -82,6 +85,7 @@ pub struct Created {
 }
 
 /// What the value type's traits and the author's wish resolve to.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DerivedClassification {
     pub has_secret_trait: bool,
@@ -89,6 +93,7 @@ pub struct DerivedClassification {
 }
 
 /// The class a field of an update request falls into.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldClass {
     /// Descriptive, or tightening a gate: applied at once.
@@ -369,6 +374,7 @@ fn optional_string(value: &Value) -> Option<String> {
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-lifecycle:p1
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-contributed-protection:p1
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-audit:p1
+#[domain_model]
 pub struct DeclarationAdmin<R, Cat, Val, S> {
     declarations: R,
     categories: Cat,

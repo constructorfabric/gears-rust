@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use toolkit_macros::domain_model;
 
 use serde_json::Value;
 use toolkit_db::secure::DBRunner;
@@ -21,6 +22,7 @@ use crate::domain::category::visibility;
 use crate::domain::error::DomainError;
 
 /// A declaration together with the trait set a client renders it by.
+#[domain_model]
 #[derive(Debug, Clone)]
 pub struct RenderedDeclaration {
     /// The declaration itself.
@@ -48,6 +50,7 @@ fn pair(declaration: Declaration, traits: &HashMap<String, Value>) -> RenderedDe
 }
 
 /// Reads over the declaration catalogue.
+#[domain_model]
 pub struct DeclarationService<R: DeclarationRepository> {
     repo: R,
     types: Arc<dyn TypesRegistryClient>,

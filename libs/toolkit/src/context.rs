@@ -10,8 +10,10 @@ use crate::{
     gear_config_required,
 };
 
+/// Database manager type, available with the `db` feature.
 #[cfg(feature = "db")]
 pub(crate) type DbManager = toolkit_db::DbManager;
+/// Database provider type, available with the `db` feature.
 #[cfg(feature = "db")]
 pub(crate) type DbProvider = toolkit_db::DBProvider<toolkit_db::DbError>;
 

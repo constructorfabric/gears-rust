@@ -31,8 +31,9 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
+use bss_ledger_sdk::{AccountClass, CurrencySpec, MappingStatus, PostedMoney, Side, SourceDocType};
 use chrono::NaiveDate;
+use rust_decimal::Decimal;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
@@ -48,7 +49,6 @@ use crate::domain::instant::to_naive_date;
 use crate::domain::model::{LineRecord, NewEntry, NewLine};
 use crate::domain::period::{period_end_utc, period_start_utc};
 use crate::domain::ports::metrics::LedgerMetricsPort;
-use crate::infra::currency_scale::CurrencyScaleResolver;
 use crate::infra::events::payloads::{LedgerFxRevaluationCompleted, LedgerFxRevaluationReversed};
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::fx::rate_source::RateSource;
@@ -114,7 +114,6 @@ pub struct UnrealizedRevaluationRun {
     posting: PostingService,
     repo: PaymentRepo,
     reference: ReferenceRepo,
-    resolver: CurrencyScaleResolver,
     rate_source: RateSource,
     /// Read-back of the original revaluation entries for the reversal (H3).
     journal: JournalRepo,
@@ -137,7 +136,6 @@ impl UnrealizedRevaluationRun {
     ) -> Self {
         let posting = PostingService::new(db.clone(), Arc::clone(&publisher));
         let reference = ReferenceRepo::new(db.clone());
-        let resolver = CurrencyScaleResolver::new(ReferenceRepo::new(db.clone()));
         let repo = PaymentRepo::new(db.clone());
         let journal = JournalRepo::new(db.clone());
         let recognition = RecognitionRepo::new(db.clone());
@@ -146,7 +144,6 @@ impl UnrealizedRevaluationRun {
             posting,
             repo,
             reference,
-            resolver,
             rate_source,
             journal,
             recognition,
@@ -235,7 +232,7 @@ impl UnrealizedRevaluationRun {
             DomainError::Internal(format!("malformed period_id for revaluation: {period_id}"))
         })?;
         let chart = load_chart(&self.reference, scope, tenant).await?;
-        let mut rate_cache: BTreeMap<String, i64> = BTreeMap::new();
+        let mut rate_cache: BTreeMap<String, Decimal> = BTreeMap::new();
 
         let mut entries = 0usize;
         let mut moved = 0usize;
@@ -284,14 +281,17 @@ impl UnrealizedRevaluationRun {
         grains: &[RevaluationGrain],
         as_of: OffsetDateTime,
         chart: &ChartIndex,
-        rate_cache: &mut BTreeMap<String, i64>,
+        rate_cache: &mut BTreeMap<String, Decimal>,
     ) -> Result<Option<usize>, DomainError> {
         // One functional currency per tenant/legal-entity (F5). A grain set that
         // mixes functional currencies is a multi-LE invariant breach (deferred,
         // decision 5) — fail loud rather than post a mixed-functional entry.
         // The caller (`run_scope`) only routes non-empty payer groups here, but
         // propagate defensively rather than index — an empty set is no movement.
-        let functional_ccy = grains
+        // The functional currency and its stored scale come from the grains'
+        // carried functional balances (stored metadata, never a fresh registry
+        // read); every grain must share them.
+        let functional_spec: CurrencySpec = grains
             .first()
             .ok_or_else(|| {
                 DomainError::Internal(format!(
@@ -299,42 +299,53 @@ impl UnrealizedRevaluationRun {
                     rev_scope.as_token()
                 ))
             })?
-            .functional_currency
+            .functional_balance
+            .currency()
             .clone();
         if grains
             .iter()
-            .any(|g| g.functional_currency != functional_ccy)
+            .any(|g| g.functional_balance.currency() != &functional_spec)
         {
             return Err(DomainError::Internal(format!(
-                "revaluation grains mix functional currencies for tenant {tenant} payer {payer} \
-                 scope {} (multi-LE not supported, decision 5)",
+                "revaluation grains mix functional currencies or scales for tenant {tenant} \
+                 payer {payer} scope {} (multi-LE not supported, decision 5)",
                 rev_scope.as_token()
             )));
         }
+        let functional_ccy = functional_spec.code().to_owned();
 
-        // Remeasure each grain at the period-end rate (one rate per txn currency).
+        // Remeasure each grain at the period-end rate (one rate per txn currency):
+        // `balance × rate` exactly, rounded once (HALF_EVEN) at the functional
+        // scale inside `translate_amount`. An identity pair is exact and requires
+        // the same stored scale.
         let mut positions: Vec<RevaluationPosition> = Vec::with_capacity(grains.len());
         for g in grains {
-            let remeasured = if g.currency == functional_ccy {
-                g.balance_minor
+            let txn_ccy = g.balance.currency().code().to_owned();
+            let remeasured = if txn_ccy == functional_ccy {
+                if g.balance.currency() != &functional_spec {
+                    return Err(DomainError::InconsistentScale(format!(
+                        "revaluation grain {txn_ccy} scale differs from its functional scale"
+                    )));
+                }
+                g.balance.clone()
             } else {
-                let rate_micro = if let Some(r) = rate_cache.get(&g.currency) {
+                let rate = if let Some(r) = rate_cache.get(&txn_ccy) {
                     *r
                 } else {
                     let resolved = self
                         .rate_source
-                        .resolve(scope, tenant, &g.currency, &functional_ccy, as_of)
+                        .resolve(scope, tenant, &txn_ccy, &functional_ccy, as_of)
                         .await?;
-                    rate_cache.insert(g.currency.clone(), resolved.rate_micro);
-                    resolved.rate_micro
+                    rate_cache.insert(txn_ccy.clone(), resolved.rate);
+                    resolved.rate
                 };
-                translate_amount(g.balance_minor, rate_micro)
+                translate_amount(&g.balance, rate, functional_spec.clone())
                     .map_err(|e| DomainError::Internal(format!("revaluation translate: {e}")))?
             };
             positions.push(RevaluationPosition {
                 normal_side: rev_scope.normal_side(),
-                carried_functional_minor: g.functional_balance_minor,
-                remeasured_functional_minor: remeasured,
+                carried_functional: g.functional_balance.clone(),
+                remeasured_functional: remeasured,
             });
         }
 
@@ -350,8 +361,7 @@ impl UnrealizedRevaluationRun {
         let mut moved = 0usize;
         for (g, leg) in grains.iter().zip(&reval.grain_lines) {
             let Some(leg) = leg else { continue };
-            let scale = self.scale_for(scope, tenant, &g.currency).await?;
-            lines.push(Self::grain_line(g, rev_scope, leg, scale));
+            lines.push(Self::grain_line(g, rev_scope, leg)?);
             moved += 1;
         }
         let fx_account = chart
@@ -361,14 +371,12 @@ impl UnrealizedRevaluationRun {
                     "no provisioned FX_UNREALIZED account for functional currency {functional_ccy}"
                 ))
             })?;
-        let fx_scale = self.scale_for(scope, tenant, &functional_ccy).await?;
         lines.push(Self::fx_unrealized_line(
             payer,
             fx_account,
-            &functional_ccy,
+            &functional_spec,
             &fx_unrealized,
-            fx_scale,
-        ));
+        )?);
 
         let entry = Self::build_entry(
             ctx,
@@ -395,7 +403,15 @@ impl UnrealizedRevaluationRun {
             functional_currency: functional_ccy.clone(),
             fx_unrealized_minor: fx_unrealized_signed(
                 fx_unrealized.side,
-                fx_unrealized.functional_minor,
+                crate::infra::v1_payload::v1_minor_units_for(
+                    &fx_unrealized.functional,
+                    "fx_unrealized_minor",
+                    &format_args!(
+                        "fx.revaluation_completed tenant {tenant} period {period_id} scope {} \
+                         payer {payer}",
+                        rev_scope.as_token()
+                    ),
+                ),
             ),
             grains_moved: i32::try_from(moved).unwrap_or(i32::MAX),
             posted_at_utc: entry.posted_at_utc,
@@ -505,7 +521,14 @@ impl UnrealizedRevaluationRun {
             // line; the reversal's net FX_UNREALIZED is the negation of the
             // original's (the reversal flips each leg's side).
             let payer_id = original.lines.first().map_or(tenant, |r| r.payer_tenant_id);
-            let fx_signed = reversal_fx_unrealized_signed(&lines);
+            let fx_signed = reversal_fx_unrealized_signed(
+                &lines,
+                &format_args!(
+                    "fx.revaluation_reversed of entry {} tenant {tenant} reval period \
+                     {reval_period_id}",
+                    original.entry_id
+                ),
+            )?;
             let entry = Self::build_entry(
                 ctx,
                 tenant,
@@ -562,31 +585,18 @@ impl UnrealizedRevaluationRun {
         r.map_err(|e| DomainError::Internal(format!("list revaluation grains: {e}")))
     }
 
-    /// Resolve a currency's minor-unit scale.
-    async fn scale_for(
-        &self,
-        scope: &AccessScope,
-        tenant: Uuid,
-        currency: &str,
-    ) -> Result<u8, DomainError> {
-        self.resolver
-            .resolve(scope, tenant, currency)
-            .await
-            .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))
-    }
-
-    /// Build a per-grain functional-only adjusting line. `currency` is the grain's
-    /// **transaction** currency (the projector's grain key), `amount_minor = 0`,
-    /// and the functional movement rides `functional_amount_minor` on `leg.side`
-    /// so the projector moves the grain's `functional_balance_minor` by the signed
-    /// delta (debit-normal grain rises on DR / falls on CR).
+    /// Build a per-grain functional-only adjusting line. The line's money is a
+    /// zero in the grain's **transaction** currency and stored scale (the
+    /// projector's grain key), and the functional movement rides
+    /// `functional_money` on `leg.side` so the projector moves the grain's
+    /// `functional_balance` by the signed delta (debit-normal grain rises on DR
+    /// / falls on CR).
     fn grain_line(
         g: &RevaluationGrain,
         rev_scope: RevaluationScope,
         leg: &RevaluationLine,
-        scale: u8,
-    ) -> NewLine {
-        NewLine {
+    ) -> Result<NewLine, DomainError> {
+        Ok(NewLine {
             line_id: Uuid::now_v7(),
             payer_tenant_id: g.payer_tenant_id,
             seller_tenant_id: None,
@@ -595,15 +605,12 @@ impl UnrealizedRevaluationRun {
             account_class: scope_account_class(rev_scope),
             gl_code: None,
             side: leg.side,
-            amount_minor: 0,
-            currency: g.currency.clone(),
-            currency_scale: scale,
+            money: zero_in(g.balance.currency())?,
             invoice_id: g.invoice_id.clone(),
             due_date: None,
             revenue_stream: None,
             mapping_status: MappingStatus::Resolved,
-            functional_amount_minor: Some(leg.functional_minor),
-            functional_currency: Some(g.functional_currency.clone()),
+            functional_money: Some(leg.functional.clone()),
             tax_jurisdiction: None,
             tax_filing_period: None,
             tax_rate_ref: None,
@@ -615,21 +622,21 @@ impl UnrealizedRevaluationRun {
             po_allocation_group: None,
             credit_grant_event_type: g.credit_grant_event_type.clone(),
             ar_status: None,
-        }
+        })
     }
 
-    /// Build the net `FX_UNREALIZED` functional-only contra line (`amount_minor =
-    /// 0`, `currency = functional_ccy`). It carries the SAME `payer` as the grain
-    /// lines (the `MixedPayer` invariant) and projects onto the `FX_UNREALIZED`
-    /// `account_balance` grain only; the reversal next period undoes it.
+    /// Build the net `FX_UNREALIZED` functional-only contra line (a zero in the
+    /// functional currency and scale, the functional movement on `fx.side`). It
+    /// carries the SAME `payer` as the grain lines (the `MixedPayer` invariant)
+    /// and projects onto the `FX_UNREALIZED` `account_balance` grain only; the
+    /// reversal next period undoes it.
     fn fx_unrealized_line(
         payer: Uuid,
         account_id: Uuid,
-        functional_ccy: &str,
+        functional: &CurrencySpec,
         fx: &RevaluationLine,
-        scale: u8,
-    ) -> NewLine {
-        NewLine {
+    ) -> Result<NewLine, DomainError> {
+        Ok(NewLine {
             line_id: Uuid::now_v7(),
             payer_tenant_id: payer,
             seller_tenant_id: None,
@@ -638,15 +645,12 @@ impl UnrealizedRevaluationRun {
             account_class: AccountClass::FxUnrealized,
             gl_code: None,
             side: fx.side,
-            amount_minor: 0,
-            currency: functional_ccy.to_owned(),
-            currency_scale: scale,
+            money: zero_in(functional)?,
             invoice_id: None,
             due_date: None,
             revenue_stream: None,
             mapping_status: MappingStatus::Resolved,
-            functional_amount_minor: Some(fx.functional_minor),
-            functional_currency: Some(functional_ccy.to_owned()),
+            functional_money: Some(fx.functional.clone()),
             tax_jurisdiction: None,
             tax_filing_period: None,
             tax_rate_ref: None,
@@ -658,7 +662,7 @@ impl UnrealizedRevaluationRun {
             po_allocation_group: None,
             credit_grant_event_type: None,
             ar_status: None,
-        }
+        })
     }
 
     /// Build the revaluation/reversal entry header. `period_id` is the period the
@@ -757,12 +761,6 @@ fn reverse_line(record: &LineRecord) -> Result<NewLine, DomainError> {
             record.mapping_status
         ))
     })?;
-    let currency_scale = u8::try_from(record.currency_scale).map_err(|_| {
-        DomainError::Internal(format!(
-            "reversal: bad currency_scale {}",
-            record.currency_scale
-        ))
-    })?;
     Ok(NewLine {
         line_id: Uuid::now_v7(),
         payer_tenant_id: record.payer_tenant_id,
@@ -772,15 +770,14 @@ fn reverse_line(record: &LineRecord) -> Result<NewLine, DomainError> {
         account_class,
         gl_code: record.gl_code.clone(),
         side: flipped,
-        amount_minor: record.amount_minor,
-        currency: record.currency.clone(),
-        currency_scale,
+        // Reversals reuse the stored amounts and stored currency metadata; the
+        // sides flip, the values never re-translate.
+        money: record.money.clone(),
         invoice_id: record.invoice_id.clone(),
         due_date: record.due_date,
         revenue_stream: record.revenue_stream.clone(),
         mapping_status,
-        functional_amount_minor: record.functional_amount_minor,
-        functional_currency: record.functional_currency.clone(),
+        functional_money: record.functional_money.clone(),
         tax_jurisdiction: record.tax_jurisdiction.clone(),
         tax_filing_period: record.tax_filing_period.clone(),
         tax_rate_ref: record.tax_rate_ref.clone(),
@@ -793,6 +790,12 @@ fn reverse_line(record: &LineRecord) -> Result<NewLine, DomainError> {
         credit_grant_event_type: record.credit_grant_event_type.clone(),
         ar_status: record.ar_status.clone(),
     })
+}
+
+/// A zero posting in a validated currency and scale.
+fn zero_in(spec: &CurrencySpec) -> Result<PostedMoney, DomainError> {
+    PostedMoney::try_new(Decimal::ZERO, spec.clone())
+        .map_err(|e| DomainError::Internal(format!("revaluation zero line: {e}")))
 }
 
 /// Signed functional value of a net `FX_UNREALIZED` contra leg for the event
@@ -810,16 +813,22 @@ const fn fx_unrealized_signed(side: Side, functional_minor: i64) -> i64 {
 /// negation of the original revaluation's (the reversal flips each leg's side) —
 /// for the `revaluation_reversed` event payload. `0` if no `FX_UNREALIZED` line is
 /// present (a degenerate entry; never on the real reversal path, which always
-/// negates the original's contra).
-fn reversal_fx_unrealized_signed(lines: &[NewLine]) -> i64 {
+/// negates the original's contra). `entity` names the reversal in the v1
+/// saturation warning.
+fn reversal_fx_unrealized_signed(
+    lines: &[NewLine],
+    entity: &dyn std::fmt::Display,
+) -> Result<i64, DomainError> {
     lines
         .iter()
         .find(|l| l.account_class == AccountClass::FxUnrealized)
-        .and_then(|l| {
-            l.functional_amount_minor
-                .map(|f| fx_unrealized_signed(l.side, f))
+        .and_then(|l| l.functional_money.as_ref().map(|f| (l.side, f)))
+        .map_or(Ok(0), |(side, f)| {
+            Ok(fx_unrealized_signed(
+                side,
+                crate::infra::v1_payload::v1_minor_units_for(f, "fx_unrealized_minor", entity),
+            ))
         })
-        .unwrap_or(0)
 }
 
 /// In-txn [`PostSidecar`] that publishes `billing.ledger.fx.revaluation_completed`
@@ -919,3 +928,7 @@ impl PostSidecar for RevaluationReversedSidecar {
 #[cfg(test)]
 #[path = "revaluation_run_tests.rs"]
 mod revaluation_run_tests;
+
+#[cfg(test)]
+#[path = "revaluation_run_guard_tests.rs"]
+mod revaluation_run_guard_tests;

@@ -47,6 +47,7 @@ use fnv::FnvHasher;
 use uuid::Uuid;
 
 use crate::domain::error::{DomainError, UnsupportedResource};
+use crate::domain::service_account::SA_QUOTA_MESSAGE;
 
 /// Stable, non-secret correlation handle for a provider-supplied error
 /// detail. The raw text can carry vendor SDK strings, hostnames, or
@@ -99,13 +100,20 @@ pub(crate) fn redact_provider_detail(detail: &str) -> (u64, usize) {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub(crate) enum RedactedProvisionFailure {
+    /// Provisioning outcome is ambiguous; the provider detail is redacted to a digest and length.
     #[error(
         "idp provision ambiguous outcome (provider detail redacted; digest=0x{digest:016x} len={len})"
     )]
-    Ambiguous { digest: u64, len: usize },
+    Ambiguous {
+        /// Digest of the redacted provider detail, for trace correlation.
+        digest: u64,
+        /// Byte length of the redacted provider detail.
+        len: usize,
+    },
 }
 
 impl RedactedProvisionFailure {
+    /// Build an [`Self::Ambiguous`] failure from the digest and length of the redacted provider detail.
     pub(crate) const fn ambiguous(digest: u64, len: usize) -> Self {
         Self::Ambiguous { digest, len }
     }
@@ -131,6 +139,7 @@ impl RedactedProvisionFailure {
 ///   message (provider detail kept private — see
 ///   `infra::canonical_mapping`).
 pub(crate) trait ProvisionFailureExt {
+    /// Convert this failure into a [`DomainError`] scoped to `tenant_id`.
     fn into_domain_error(self, tenant_id: Uuid) -> DomainError;
 }
 
@@ -304,6 +313,7 @@ impl ProvisionFailureExt for IdpProvisionFailure {
 /// to raw provider responses via the digest + length emitted on the
 /// `am.idp` `tracing::warn!` line.
 pub(crate) trait UserOperationFailureExt {
+    /// Convert this failure into a [`DomainError`] scoped to `tenant_id`.
     fn into_domain_error(self, tenant_id: Uuid) -> DomainError;
 }
 
@@ -568,6 +578,15 @@ fn log_service_account_failure(err: &IdpServiceAccountFailure, tenant_id: Uuid) 
             field_present = field.is_some(),
             "service-account provider rejected the request as invalid"
         ),
+        // Also caller-attributable (the tenant is full), so `debug!` like
+        // invalid input rather than the provider-trouble `warn!` stream.
+        IdpServiceAccountFailure::QuotaExceeded { .. } => tracing::debug!(
+            target: "am.idp",
+            tenant_id = %tenant_id,
+            failure,
+            detail_len,
+            "service-account provider refused the create: tenant quota reached"
+        ),
         // Routine and expected (it is how an idempotent revoke confirms
         // absence), so it earns no record of its own.
         IdpServiceAccountFailure::NotFound { .. } => {}
@@ -609,6 +628,9 @@ fn log_service_account_failure(err: &IdpServiceAccountFailure, tenant_id: Uuid) 
 ///   (HTTP 400). The provider retained no state; the violation is
 ///   attributed to the request as a whole, never to the adapter's own
 ///   field name.
+/// * `QuotaExceeded` → [`DomainError::ServiceAccountQuotaExceeded`]
+///   (HTTP 429, `service_accounts` subject). Uses the shared AM quota
+///   message; provider details and recovery advice are not forwarded.
 /// * `NotFound` → [`DomainError::ServiceAccountNotFound`] (HTTP 404)
 ///   carrying `resource` — see the parameter note below. `revoke` folds
 ///   the variant into success before reaching here.
@@ -637,6 +659,7 @@ fn log_service_account_failure(err: &IdpServiceAccountFailure, tenant_id: Uuid) 
 /// where the provider reporting `NotFound` is a contract violation
 /// rather than a real miss.
 pub(crate) trait ServiceAccountFailureExt {
+    /// Convert this failure into a [`DomainError`] for `tenant_id` and the named `resource`.
     fn into_domain_error(self, tenant_id: Uuid, resource: &str) -> DomainError;
 
     /// Map a failure from the non-retaining list operation. Provider
@@ -660,6 +683,11 @@ impl ServiceAccountFailureExt for IdpServiceAccountFailure {
                 detail: SA_INVALID_INPUT_MESSAGE.to_owned(),
             },
             // @cpt-end:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-invalid-input-return
+            // @cpt-begin:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-quota-exceeded-return
+            Self::QuotaExceeded { .. } => DomainError::ServiceAccountQuotaExceeded {
+                detail: SA_QUOTA_MESSAGE.to_owned(),
+            },
+            // @cpt-end:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-quota-exceeded-return
             // @cpt-begin:cpt-cf-account-management-algo-service-accounts-contract-invocation:p1:inst-algo-sa-contract-invocation-not-found-return
             Self::NotFound { .. } => DomainError::ServiceAccountNotFound {
                 detail: format!("service account not found in tenant {tenant_id}"),

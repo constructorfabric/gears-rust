@@ -29,6 +29,7 @@ pub struct Batch<'a> {
 }
 
 impl<'a> Batch<'a> {
+    /// Creates a batch over the given messages for the given partition.
     pub(crate) fn new(
         msgs: &'a [OutboxMessage],
         lease_deadline: Instant,

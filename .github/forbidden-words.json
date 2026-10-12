@@ -10,29 +10,46 @@
       "pattern": "\\bTODO\\b",
       "message": "Forgotten TODO in code",
       "caseSensitive": false,
-      "excludePaths": ["CHANGELOG.md", "**/CHANGELOG.*"]
+      "excludePaths": [
+        "CHANGELOG.md",
+        "**/CHANGELOG.*",
+        "studio-kit-gears/artifacts/*",
+        "studio-kit-gears/examples/*"
+      ]
     },
     {
       "pattern": "\\bFIXME\\b",
       "message": "Forgotten FIXME in code",
-      "caseSensitive": false
+      "caseSensitive": false,
+      "excludePaths": [
+        "studio-kit-gears/artifacts/*",
+        "studio-kit-gears/examples/*"
+      ]
     },
     {
       "pattern": "\\bXXX\\b",
       "message": "Temporary XXX marker left in code",
-      "caseSensitive": false
+      "caseSensitive": false,
+      "excludePaths": [
+        "studio-kit-gears/artifacts/*",
+        "studio-kit-gears/examples/*"
+      ]
     },
     {
       "pattern": "\\#\\[ignore\\]",
       "message": "Ignored test left in code",
       "caseSensitive": true,
-      "excludePaths": ["**/tests/**"]
+      "excludePaths": [
+        "**/tests/**"
+      ]
     },
     {
       "pattern": "\\#\\[cyberfabric\\]",
       "message": "No Cyberfabric here",
       "caseSensitive": true,
-      "excludePaths": ["**/tests/**"]
+      "excludePaths": [
+        "**/tests/**"
+      ]
     },
     {
       "pattern": "\\b(cyber\\s*fabric|cyber\\s*ware)\\b",

@@ -18,6 +18,7 @@ use crate::infra::storage::entity::setting_value::{self, Entity as ValueEntity};
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ValueRepo;
 
+/// Converts a stored setting value row to the domain type.
 pub(crate) fn to_domain(model: setting_value::Model) -> StoredValue {
     StoredValue {
         id: model.id,

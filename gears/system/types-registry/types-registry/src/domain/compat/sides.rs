@@ -4,10 +4,12 @@
 use serde_json::Value;
 
 /// The **old** side: the definition a candidate is measured against.
+#[toolkit::domain_model]
 #[derive(Clone, Copy, Debug)]
 pub struct BaselineDoc<'a>(&'a Value);
 
 /// The **new** side: the document under admission.
+#[toolkit::domain_model]
 #[derive(Clone, Copy, Debug)]
 pub struct CandidateDoc<'a>(&'a Value);
 

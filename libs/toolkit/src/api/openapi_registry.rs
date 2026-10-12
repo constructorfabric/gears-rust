@@ -232,53 +232,7 @@ impl OpenApiRegistryImpl {
 
             // Parameters
             for p in &spec.params {
-                let in_ = match p.location {
-                    operation_builder::ParamLocation::Path => ParameterIn::Path,
-                    operation_builder::ParamLocation::Query => ParameterIn::Query,
-                    operation_builder::ParamLocation::Header => ParameterIn::Header,
-                    operation_builder::ParamLocation::Cookie => ParameterIn::Cookie,
-                };
-                let required =
-                    if matches!(p.location, operation_builder::ParamLocation::Path) || p.required {
-                        Required::True
-                    } else {
-                        Required::False
-                    };
-
-                let schema_type = match p.param_type.as_str() {
-                    "integer" => SchemaType::Type(utoipa::openapi::schema::Type::Integer),
-                    "number" => SchemaType::Type(utoipa::openapi::schema::Type::Number),
-                    "boolean" => SchemaType::Type(utoipa::openapi::schema::Type::Boolean),
-                    _ => SchemaType::Type(utoipa::openapi::schema::Type::String),
-                };
-                let item_object = param_schema_object(schema_type, p.format.as_deref(), p.minimum);
-
-                let mut builder = ParameterBuilder::new()
-                    .name(&p.name)
-                    .parameter_in(in_)
-                    .required(required)
-                    .description(p.description.clone());
-
-                if p.array {
-                    // `style: form, explode: true` is the repeated-key encoding
-                    // (`?tag=a&tag=b`). Spelling it out matters: the OpenAPI
-                    // default for a query array is `form` with `explode: true`,
-                    // but generators differ on whether they assume it, and the
-                    // wire format has to be unambiguous for a client written
-                    // against this spec to interoperate.
-                    builder = builder
-                        .style(Some(utoipa::openapi::path::ParameterStyle::Form))
-                        .explode(Some(true))
-                        .schema(Some(Schema::Array(
-                            utoipa::openapi::schema::ArrayBuilder::new()
-                                .items(item_object)
-                                .build(),
-                        )));
-                } else {
-                    builder = builder.schema(Some(Schema::Object(item_object)));
-                }
-
-                op = op.parameter(builder.build());
+                op = op.parameter(build_parameter(p));
             }
 
             // Request body
@@ -534,6 +488,62 @@ fn truncate_json(v: &serde_json::Value) -> String {
     } else {
         s
     }
+}
+
+/// One `ParamSpec` as the document's parameter object.
+fn build_parameter(p: &operation_builder::ParamSpec) -> utoipa::openapi::path::Parameter {
+    let in_ = match p.location {
+        operation_builder::ParamLocation::Path => ParameterIn::Path,
+        operation_builder::ParamLocation::Query => ParameterIn::Query,
+        operation_builder::ParamLocation::Header => ParameterIn::Header,
+        operation_builder::ParamLocation::Cookie => ParameterIn::Cookie,
+    };
+    let required = if matches!(p.location, operation_builder::ParamLocation::Path) || p.required {
+        Required::True
+    } else {
+        Required::False
+    };
+
+    let schema_type = match p.param_type.as_str() {
+        "integer" => SchemaType::Type(utoipa::openapi::schema::Type::Integer),
+        "number" => SchemaType::Type(utoipa::openapi::schema::Type::Number),
+        "boolean" => SchemaType::Type(utoipa::openapi::schema::Type::Boolean),
+        _ => SchemaType::Type(utoipa::openapi::schema::Type::String),
+    };
+    let mut item_object = param_schema_object(schema_type, p.format.as_deref(), p.minimum);
+    // A closed set of values stays a string in the document; the `enum` is
+    // what tells a generated client which ones it may send.
+    if !p.enum_values.is_empty() {
+        item_object = ObjectBuilder::from(item_object)
+            .enum_values(Some(p.enum_values.clone()))
+            .build();
+    }
+
+    let mut builder = ParameterBuilder::new()
+        .name(&p.name)
+        .parameter_in(in_)
+        .required(required)
+        .description(p.description.clone());
+
+    if p.array {
+        // `style: form, explode: true` is the repeated-key encoding
+        // (`?tag=a&tag=b`). Spelling it out matters: the OpenAPI default for a
+        // query array is `form` with `explode: true`, but generators differ on
+        // whether they assume it, and the wire format has to be unambiguous
+        // for a client written against this spec to interoperate.
+        builder = builder
+            .style(Some(utoipa::openapi::path::ParameterStyle::Form))
+            .explode(Some(true))
+            .schema(Some(Schema::Array(
+                utoipa::openapi::schema::ArrayBuilder::new()
+                    .items(item_object)
+                    .build(),
+            )));
+    } else {
+        builder = builder.schema(Some(Schema::Object(item_object)));
+    }
+
+    builder.build()
 }
 
 /// Build the `OpenAPI` content object for a request body schema variant.

@@ -1,17 +1,8 @@
-//! `MultipartService` — multipart upload control-plane logic.
+//! `MultipartService` — multipart upload control-plane logic: initiate (server-authoritative
+//! plan with per-part signed sidecar URLs), report part, introspect, complete and abort.
 //!
-//! Owns the P2-M3 / multipart-coordinator flows: initiate (server-authoritative
-//! plan + per-part signed URLs), complete, and abort.
-//!
-//! The control-plane byte route (`upload_multipart_part`) has been removed as
-//! part of the multipart-coordinator feature — bytes now flow exclusively to
-//! the sidecar via the per-part signed URLs returned by `initiate_multipart_upload`
-//! (DESIGN §4.6, ADR-0003, FEATURE §8 migration).
-//!
-//! Holds its own copies of the shared dependencies (`Store`, `BackendRegistry`,
-//! `Authorizer`, `QuotaClient`, `Issuer`) so it does NOT reference `FileService`
-//! — that keeps the fan-in graph clean and avoids raising the HK score of
-//! `FileService`.
+//! Part bytes flow only to the sidecar via those signed URLs. The service holds its own
+//! copies of its dependencies rather than referencing `FileService`, to keep coupling low.
 
 // Domain terms (ETag, If-Match, FileStorage, GET/PUT, BLAKE3) appear in the docs.
 #![allow(clippy::doc_markdown)]
@@ -43,21 +34,14 @@ use crate::infra::metrics::NoopMetrics;
 use crate::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 use file_storage_sdk::ByteRange;
 
-/// Quota metric name (duplicated from service.rs; both refer to the same
-/// platform metric — no abstraction needed here).
+/// Quota metric name (same platform metric as in `service.rs`).
 const QUOTA_METRIC_NAME: &str = gts_id!("cf.qe.metric.type.v1~cf.qe.metric.file_storage_bytes.v1");
 
-/// Diff the plan's expected part numbers against the parts actually reported,
-/// returning the missing ones in ascending order.
+/// Diff the plan's expected part numbers against the reported parts, returning the missing
+/// ones in ascending order.
 ///
-/// `expected_count = ceil(declared_size / part_size)` mirrors
-/// [`compute_plan`]'s part count exactly, including its `declared_size == 0`
-/// special case (a single, zero-byte part) so a zero-byte upload's one
-/// expected part is never spuriously reported as "missing".
-///
-/// Item 3.3 (multipart `complete`'s richer contract) is the first caller;
-/// item 3.4 (introspect/resume) reuses this same helper rather than
-/// recompute the diff.
+/// `expected_count` mirrors [`compute_plan`], including `declared_size == 0` (one zero-byte
+/// part, never reported as missing).
 pub(crate) fn missing_part_numbers(
     session: &MultipartUploadSession,
     parts: &[MultipartPart],
@@ -74,18 +58,11 @@ pub(crate) fn missing_part_numbers(
         .collect()
 }
 
-/// Recompute a single part's `(offset, size)` from the session's
-/// deterministic `(declared_size, part_size)` columns — the same per-part
-/// math [`compute_plan`] applies when building the initiate-time plan, just
-/// evaluated for one `part_number` instead of materializing the whole plan
-/// (item 3.4 — introspect/resume reconstructs only the missing parts'
-/// bounds). `declared_size == 0` mirrors `compute_plan`'s single zero-byte
-/// part special case.
+/// Recompute one part's `(offset, size)` from the session's `(declared_size, part_size)`,
+/// matching [`compute_plan`] (`declared_size == 0` is a single zero-byte part).
 ///
-/// Uses saturating arithmetic as defense-in-depth against a corrupted
-/// session row, mirroring `compute_plan`'s own overflow guards; a
-/// `part_number` outside `[1, expected_count]` is never passed in practice
-/// (callers only invoke this for numbers `missing_part_numbers` returned).
+/// Saturating arithmetic guards against a corrupted session row; callers only pass numbers
+/// returned by `missing_part_numbers`.
 pub(crate) fn part_bounds(session: &MultipartUploadSession, part_number: u32) -> (u64, u64) {
     if session.declared_size == 0 {
         return (0, 0);
@@ -96,11 +73,8 @@ pub(crate) fn part_bounds(session: &MultipartUploadSession, part_number: u32) ->
     (offset, size)
 }
 
-/// The multipart-upload service (multipart-coordinator feature).
-///
-/// Extracted from `FileService` to reduce its Henry-Kafura coupling score.
-/// All multipart control-plane operations live here; the struct is wired
-/// alongside `FileService` in `gear.rs` and served under the same REST prefix.
+/// The multipart-upload service; wired alongside `FileService` in `gear.rs` under the same
+/// REST prefix.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 pub struct MultipartService {
     store: Arc<dyn MultipartStore>,
@@ -113,13 +87,9 @@ pub struct MultipartService {
     sidecar_base_url: String,
     /// Signed-URL TTL in seconds (shared with the session expiry).
     url_ttl_secs: i64,
-    /// Metrics port (P2 1.8 remediation). Defaults to a no-op implementation
-    /// (see [`Self::new`]); `gear.rs` opts into the real OTel-backed meter via
-    /// [`Self::with_metrics`].
+    /// Metrics port; no-op by default, see [`Self::with_metrics`].
     metrics: Arc<dyn FileStorageMetricsPort>,
-    /// Usage-reporting sink (P2 1.12 remediation). `None` disables reporting
-    /// (fire-and-forget no-op); `gear.rs` opts in via
-    /// [`Self::with_usage_reporter`] once a Usage Collector client is wired.
+    /// Usage-reporting sink; `None` disables reporting.
     usage_reporter: Option<Arc<dyn UsageReporter>>,
 }
 
@@ -146,32 +116,21 @@ impl MultipartService {
         }
     }
 
-    /// Install a real metrics port (P2 1.8 remediation). Kept as a builder
-    /// step rather than a `new()` parameter so existing
-    /// `MultipartService::new(...)` call sites across the integration-test
-    /// suite keep compiling unchanged; only `gear.rs` needs to opt in.
+    /// Install a real metrics port (builder step, so `new()` call sites stay unchanged).
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<dyn FileStorageMetricsPort>) -> Self {
         self.metrics = metrics;
         self
     }
 
-    /// Install a usage-reporting sink (P2 1.12 remediation). Same builder
-    /// shape as [`Self::with_metrics`] -- existing `MultipartService::new(...)`
-    /// call sites keep compiling unchanged.
+    /// Install a usage-reporting sink.
     #[must_use]
     pub fn with_usage_reporter(mut self, usage_reporter: Option<Arc<dyn UsageReporter>>) -> Self {
         self.usage_reporter = usage_reporter;
         self
     }
 
-    /// Fire-and-forget usage delta report. Failures are logged but never
-    /// propagated -- a failing usage reporter must not block file operations.
-    ///
-    /// Mirrors `FileService::report_usage` (kept private/independent per this
-    /// service's fan-in-isolation design -- see the module doc).
-    ///
-    /// @cpt-cf-file-storage-fr-usage-reporting
+    /// Fire-and-forget usage delta report; a failing reporter never blocks operations.
     fn report_usage(&self, delta: UsageDelta) {
         if let Some(reporter) = self.usage_reporter.clone() {
             tokio::spawn(async move {
@@ -180,14 +139,12 @@ impl MultipartService {
         }
     }
 
-    // ── private helpers ──────────────────────────────────────────────────────
-
     fn tenant_scope(ctx: &SecurityContext) -> AccessScope {
         AccessScope::for_tenant(ctx.subject_tenant_id())
     }
 
     fn backend_path(file_id: Uuid, version_id: Uuid) -> String {
-        format!("/{file_id}/{version_id}")
+        crate::domain::storage_layout::backend_path(file_id, version_id)
     }
 
     fn actor_kind(ctx: &SecurityContext) -> &'static str {
@@ -197,9 +154,6 @@ impl MultipartService {
         }
     }
 
-    /// Build a success audit entry for a file-scoped write operation.
-    ///
-    /// @cpt-cf-file-storage-fr-audit-trail
     fn audit_ok(
         ctx: &SecurityContext,
         file_id: Option<Uuid>,
@@ -217,9 +171,6 @@ impl MultipartService {
     }
 
     /// Resolve the effective policy for a given `(tenant_id, owner_id)` pair.
-    ///
-    /// @cpt-cf-file-storage-fr-allowed-types-policy
-    /// @cpt-cf-file-storage-fr-size-limits-policy
     async fn get_effective_policy_internal(
         &self,
         tenant_id: Uuid,
@@ -240,14 +191,8 @@ impl MultipartService {
         ))
     }
 
-    /// Run a quota preflight check for `additional_bytes` of new storage.
-    ///
-    /// At multipart initiate time this is called with the declared total size,
-    /// giving the quota service a precise figure rather than a pessimistic ceiling.
-    ///
-    /// **Fail-closed**: a failing quota client denies the request.
-    ///
-    /// @cpt-cf-file-storage-fr-storage-quota
+    /// Quota preflight for `additional_bytes` of new storage (the declared total size at
+    /// initiate). **Fail-closed**: a failing quota client denies the request.
     async fn check_quota_bytes(
         &self,
         tenant_id: Uuid,
@@ -270,13 +215,10 @@ impl MultipartService {
         }
     }
 
-    /// Best-effort compensation when session persistence fails after the backend
-    /// handle was already created and the pending version row was already inserted.
-    ///
-    /// Aborts the backend multipart handle and removes the pending version row so
-    /// they are not left as orphans. Both steps are best-effort: errors are logged
-    /// but not propagated — the caller's original error is returned instead, and
-    /// any remaining orphans are reclaimed by the orphan-reconciliation sweep.
+    /// Best-effort compensation when session persistence fails after the backend handle and
+    /// pending version row were created: abort the handle and delete the row. Errors are
+    /// logged, the caller's original error is returned, and leftovers are reclaimed by the
+    /// cleanup sweep.
     async fn compensate_failed_session_create(
         &self,
         ctx: &SecurityContext,
@@ -286,7 +228,6 @@ impl MultipartService {
         backend_path: &str,
         backend_handle: &str,
     ) {
-        // Best-effort: abort the backend handle.
         let backend = self.backends.default_backend();
         if let Err(abort_err) = backend.abort_multipart(backend_path, backend_handle).await {
             self.metrics
@@ -297,7 +238,6 @@ impl MultipartService {
                 "best-effort backend abort failed after session persistence error"
             );
         }
-        // Best-effort: remove the pending version row.
         if let Err(del_err) = self
             .store
             .delete_version(
@@ -323,12 +263,8 @@ impl MultipartService {
         }
     }
 
-    /// Mint one signed per-part upload URL (FEATURE §4). Shared by
-    /// [`Self::initiate_multipart_upload`] (fresh full-TTL tokens for every
-    /// planned part) and [`Self::introspect_multipart_upload`] (item 3.4:
-    /// resume tokens for the still-missing parts, with `exp` passed in by
-    /// the caller so it can be capped at the session's remaining
-    /// `expires_at` rather than a fresh full TTL).
+    /// Mint one signed per-part upload URL. `exp` is chosen by the caller: a fresh full TTL
+    /// at initiate, the session's remaining `expires_at` when resuming.
     #[allow(clippy::too_many_arguments)]
     fn mint_part_url(
         &self,
@@ -361,8 +297,7 @@ impl MultipartService {
                 backend_handle: backend_handle.to_owned(),
             },
             request_id: request_id.to_owned(),
-            // P2 1.11: content_type/etag are GET-only claims; a
-            // multipart-part token is always `op = multipart_part`.
+            // `content_type`/`etag` are GET-only claims.
             content_type: String::new(),
             etag: String::new(),
         };
@@ -373,25 +308,11 @@ impl MultipartService {
         ))
     }
 
-    // ── multipart upload (multipart-coordinator feature) ─────────────────────
-
-    /// `POST /files/{id}/multipart`: initiate a multipart upload session.
+    /// `POST /files/{id}/multipart`: validate, pre-register a `pending` version, create the
+    /// backend session and return the exact parts plan with one signed sidecar URL per part.
     ///
-    /// Server-authoritative: validates the intent, pre-registers a `pending`
-    /// version, creates the backend session, computes the **exact parts plan**,
-    /// and returns **one signed URL per part** pointing at the sidecar
-    /// (FEATURE §2, §3, §4; DESIGN §4.6).
-    ///
-    /// Policy/quota gates (FEATURE §7):
-    /// - Allowed MIME: `415`
-    /// - Declared size ≤ effective max: `413`
-    /// - Storage quota: `507`
-    ///
-    /// The complete-time total-size check is kept as defence-in-depth.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    /// @cpt-cf-file-storage-fr-size-limits-policy
-    /// @cpt-cf-file-storage-fr-storage-quota
+    /// Gates: MIME not allowed `415`, declared size over the effective max `413`, storage
+    /// quota `507`. The complete-time total-size check remains as defence-in-depth.
     #[tracing::instrument(skip_all)]
     pub async fn initiate_multipart_upload(
         &self,
@@ -414,13 +335,8 @@ impl MultipartService {
             return Err(DomainError::multipart_not_supported(backend.id()));
         }
 
-        // Validate the client-supplied `preferred_part_size` hint against a
-        // sane range *before* it can reach `compute_plan` (P2 remediation
-        // 2.11). Left unchecked, a near-`u64::MAX` value risks an arithmetic
-        // overflow in `compute_plan`/`round_up_to` and, on backends that
-        // don't hit that overflow, a huge `Vec::with_capacity` allocation.
-        // Rejecting is preferred over silently clamping so the client gets
-        // an explicit, actionable error.
+        // Reject (rather than clamp) an out-of-range hint before `compute_plan`: a huge value
+        // risks arithmetic overflow or a huge allocation.
         if let Some(preferred) = preferred_part_size
             && !(DEFAULT_MIN_PART_SIZE..=MAX_PART_SIZE).contains(&preferred)
         {
@@ -433,10 +349,7 @@ impl MultipartService {
             ));
         }
 
-        // Policy checks: allowed mime type and size (at initiate, against the
-        // declared total size — DESIGN §4.6 server-authoritative gate).
-        //
-        // @cpt-cf-file-storage-fr-size-limits-policy
+        // Policy gates against the declared total size.
         let tenant_id = ctx.subject_tenant_id();
         let policy = self
             .get_effective_policy_internal(tenant_id, file.owner_id)
@@ -448,11 +361,7 @@ impl MultipartService {
             backend.capabilities().max_size_bytes,
         );
 
-        // Gate: reject if the declared total size exceeds the effective limit.
-        // This is the DESIGN-aligned fix for CodeRabbit F2: validate up front at
-        // initiate time rather than deferring to complete time.
-        //
-        // @cpt-cf-file-storage-fr-size-limits-policy
+        // Reject up front if the declared size exceeds the effective limit.
         if let Some(limit) = effective_max
             && declared_size > limit
         {
@@ -462,11 +371,7 @@ impl MultipartService {
             ));
         }
 
-        // Quota check against the declared size (not the pessimistic effective_max).
-        // PRD §5.4: "check before accepting any operation that increases storage
-        // consumption" — the declared size is our best estimate at this stage.
-        //
-        // @cpt-cf-file-storage-fr-storage-quota
+        // Quota check against the declared size, not the pessimistic `effective_max`.
         self.check_quota_bytes(tenant_id, file.owner_id, declared_size)
             .await?;
 
@@ -476,12 +381,9 @@ impl MultipartService {
         let backend_path = Self::backend_path(file_id, version_id);
         let backend_id = backend.id().to_owned();
 
-        // Compute the server-authoritative parts plan (FEATURE §3).
-        // `backend_min_part_size` is not yet exposed by the BackendCapabilities
-        // API so we fall back to the `DEFAULT_MIN_PART_SIZE` constant.
+        // `BackendCapabilities` exposes no minimum part size, so `DEFAULT_MIN_PART_SIZE` applies.
         let (chosen_part_size, raw_parts) = compute_plan(declared_size, preferred_part_size, None)?;
 
-        // Pre-register the pending file_versions row.
         self.store
             .insert_pending_version(
                 file_id,
@@ -493,14 +395,12 @@ impl MultipartService {
             )
             .await?;
 
-        // Initiate the multipart upload on the backend.
         let backend_handle = backend.initiate_multipart(&backend_path).await?;
 
-        // Use the configured TTL for both the session row and the signed URLs.
+        // One TTL for both the session row and the signed URLs.
         let expires_at = now + time::Duration::seconds(self.url_ttl_secs.max(1));
 
-        // Persist the session row. On failure, best-effort compensate to avoid
-        // orphaning the backend handle and the pending version row.
+        // On failure, compensate so the backend handle and pending row are not orphaned.
         if let Err(err) = self
             .store
             .create_multipart_upload(
@@ -528,11 +428,8 @@ impl MultipartService {
             return Err(err);
         }
 
-        // Mint one signed URL per part (FEATURE §4).
-        // Each token carries the exact `size` claim the sidecar will enforce.
-        // P2 1.8: every part of the same upload shares one correlation id, so
-        // the sidecar's report-part callbacks for this upload all echo back
-        // the same `x-request-id`.
+        // One signed URL per part, each carrying the exact `size` claim the sidecar enforces.
+        // All parts share one request id so the sidecar's report-part callbacks correlate.
         let exp = expires_at.unix_timestamp();
         let request_id = Uuid::now_v7().to_string();
         let mut parts = Vec::with_capacity(raw_parts.len());
@@ -571,25 +468,13 @@ impl MultipartService {
         })
     }
 
-    /// `POST /files/{file_id}/versions/{version_id}/multipart/{upload_id}/parts/{part_number}/report`:
-    /// token-authenticated callback used by the sidecar to record a
-    /// successfully-written part (P2 0.2 group B — the "report part" fix).
+    /// Token-authenticated sidecar callback recording a successfully written part.
     ///
-    /// Before this existed, nothing ever called
-    /// `MultipartStore::upsert_multipart_part` in a real deployment, so
-    /// `complete_multipart_upload`'s `list_multipart_parts` was always
-    /// structurally empty. `claims` has already been verified by the caller
-    /// (mirrors `finalize_version`'s handler-level token verification) and
-    /// `claims.op == Op::MultipartPart` has already been asserted there; this
-    /// method re-validates the claims against the session so a valid token for
-    /// a *different* (or no-longer-`in_progress`) session cannot poison
-    /// another upload's part list. It also rejects a caller-supplied `size`
-    /// that does not match `claims.multipart.size` (the authoritative
-    /// per-part size minted into the token at initiate time) so a holder of
-    /// the signed token cannot forge a part's size and corrupt the summed
-    /// `version.size` computed by `complete_multipart_upload`.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
+    /// `claims` are already verified by the caller (including `op == MultipartPart`); this
+    /// re-validates them against the session so a token for a different or finished session
+    /// cannot touch another upload's part list. A caller-supplied `size` differing from
+    /// `claims.multipart.size` is rejected, so a token holder cannot forge a part size and
+    /// corrupt the version size summed at complete.
     pub async fn report_part(
         &self,
         claims: &Claims,
@@ -604,10 +489,7 @@ impl MultipartService {
             .await?
             .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
 
-        // Bind the report to the exact (file_id, version_id) the token
-        // authorizes — a foreign session is reported as "not found" rather
-        // than distinguishable, mirroring `complete_multipart_upload`'s
-        // same-shaped guard.
+        // A foreign session is reported as "not found", indistinguishable from a missing one.
         if session.file_id != claims.file_id || session.version_id != claims.version_id {
             return Err(DomainError::multipart_upload_not_found(upload_id));
         }
@@ -622,16 +504,8 @@ impl MultipartService {
         let part_number = i32::try_from(claims.multipart.part_number)
             .map_err(|_| DomainError::validation("part_number", "part_number overflows i32"))?;
 
-        // Security: this callback is `.anonymous()` + token-authenticated, so a
-        // holder of the signed part token could otherwise report an arbitrary
-        // `size` that `complete_multipart_upload` later sums into
-        // `version.size` unchecked. `claims.multipart.size` is the exact
-        // per-part size computed by `compute_plan` at initiate time (uniform
-        // for all parts except the last, which is legitimately smaller — see
-        // `compute_plan` in `multipart.rs`), so it is always the exact size
-        // this specific part must have; reject a mismatch rather than trust
-        // the caller-supplied value, and persist the authoritative claimed
-        // size instead of the (already-verified-equal) caller value.
+        // The callback is anonymous and token-authenticated, so the reported `size` must equal
+        // the planned per-part size in the token; the claimed value is what gets persisted.
         let claimed_size = i64::try_from(claims.multipart.size)
             .map_err(|_| DomainError::validation("size", "size overflows i64"))?;
         if size != claimed_size {
@@ -641,7 +515,6 @@ impl MultipartService {
             ));
         }
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-db-upsert
         self.store
             .upsert_multipart_part(
                 upload_id,
@@ -652,15 +525,9 @@ impl MultipartService {
                 OffsetDateTime::now_utc(),
             )
             .await
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-upload-part:p1:inst-part-db-upsert
     }
 
-    /// `POST /files/{id}/multipart/{upload_id}/complete`: finalize all parts.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    /// @cpt-cf-file-storage-fr-audit-trail
-    /// @cpt-dod:cpt-cf-file-storage-dod-multipart-complete:p1
-    /// @cpt-dod:cpt-cf-file-storage-dod-content-hash-modes-multipart-composite:p2
+    /// `POST /files/{id}/multipart/{upload_id}/complete`: assemble all parts and finalize.
     #[tracing::instrument(skip_all)]
     pub async fn complete_multipart_upload(
         &self,
@@ -669,7 +536,6 @@ impl MultipartService {
         upload_id: Uuid,
         if_match: Option<&str>,
     ) -> Result<CompletedMultipartUpload, DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-request
         let prefetch = Self::tenant_scope(ctx);
         let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
@@ -677,13 +543,8 @@ impl MultipartService {
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
             .await?;
 
-        // Optional If-Match precondition (item 3.3): unlike `bind`, `None`
-        // stays unconditional here (backward compatible with the pre-3.3
-        // contract) rather than requiring the header once content exists —
-        // `complete` is keyed by `upload_id`, not by a rebind of already-bound
-        // content, so there is no equivalent "must supply it to rebind"
-        // invariant to enforce. `*` (or omission) matches unconditionally; a
-        // concrete value must match the file's current content ETag.
+        // Optional `If-Match`: unlike `bind`, omission stays unconditional because `complete`
+        // is keyed by `upload_id`. `*` matches always; otherwise the file's content ETag.
         if let Some(m) = if_match {
             let m = m.trim();
             if m != "*" {
@@ -695,20 +556,15 @@ impl MultipartService {
                 }
             }
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-request
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-load-session
         let session = self
             .store
             .get_multipart_upload(upload_id)
             .await?
             .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
 
-        // Bind the session to the authorized path `file_id`. Authorization above
-        // checks the path file, but the session is loaded by `upload_id` alone —
-        // without this a caller could drive another file's upload (and corrupt
-        // state via a recomputed backend path). Reported as "not found" so a
-        // foreign `upload_id` is not distinguishable from a missing one.
+        // The session is loaded by `upload_id` alone: bind it to the authorized `file_id`, and
+        // report a foreign one as "not found" so it is indistinguishable from a missing one.
         if session.file_id != file_id {
             return Err(DomainError::multipart_upload_not_found(upload_id));
         }
@@ -720,23 +576,16 @@ impl MultipartService {
             ));
         }
 
-        // Defence-in-depth (P2 0.3 step 3): the session may still read as
-        // `in_progress` here even though `expires_at` has already passed, if
-        // the background sweep has not yet ticked. Reject explicitly rather
-        // than racing ahead of the next sweep and finalizing content that
-        // should have been aborted.
+        // The session can still read `in_progress` after `expires_at` because nothing flips it
+        // until `CleanupEngine::run_sweep` runs; reject expired sessions explicitly.
         if session.expires_at <= OffsetDateTime::now_utc() {
             return Err(DomainError::multipart_upload_not_in_progress(
                 upload_id, "expired",
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-load-session
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-load-parts
         let parts = self.store.list_multipart_parts(upload_id).await?;
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-load-parts
 
-        // Fetch the backend from the version row.
         let version = self.store.get_version(file_id, session.version_id).await?;
         let backend_id = version.as_ref().map_or_else(
             || self.backends.default_id().to_owned(),
@@ -745,27 +594,17 @@ impl MultipartService {
         let backend = self.backends.get(&backend_id)?;
         let backend_path = Self::backend_path(file_id, session.version_id);
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-missing-parts
-        // Reject with the specific missing part numbers before falling through
-        // to the coarser residual size check below (item 3.3) — a caller
-        // debugging a stalled upload gets an actionable list instead of an
-        // opaque size mismatch.
+        // Report the specific missing part numbers rather than an opaque size mismatch.
         let missing = missing_part_numbers(&session, &parts);
         if !missing.is_empty() {
             return Err(DomainError::multipart_parts_missing(upload_id, missing));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-missing-parts
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-size-verify
-        // Compute total assembled size from the parts that the sidecar wrote.
+        // Total size from the parts the sidecar reported.
         let total_size: i64 = parts.iter().map(|p| p.size).sum();
 
-        // Defence-in-depth: verify the assembled size matches `declared_size`
-        // (FEATURE §6, §7 — "Total assembled size = declared_size").
-        //
-        // The primary enforcement is per-part at the sidecar (the `size` claim
-        // in each token); this check catches residual mismatches (e.g. a
-        // missing/extra part).
+        // Defence-in-depth: the primary size enforcement is the per-part `size` claim at the
+        // sidecar; this catches residual mismatches (e.g. a missing or extra part).
         if session.declared_size > 0 {
             let expected = i64::try_from(session.declared_size).unwrap_or(i64::MAX);
             if total_size != expected {
@@ -775,10 +614,7 @@ impl MultipartService {
                 )));
             }
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-size-verify
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-policy-check
-        // Policy size check.
         let policy = self
             .get_effective_policy_internal(ctx.subject_tenant_id(), file.owner_id)
             .await?;
@@ -796,20 +632,10 @@ impl MultipartService {
                 "policy size limit",
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-policy-check
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-assemble
-        // Build the parts list for the backend, threading each part's byte
-        // offset and its already-computed SHA-256 digest (ADR-0006) — these
-        // are no longer discarded. The offset is the running sum of prior
-        // parts' sizes; parts are listed in ascending part-number order (the
-        // repo's `list_parts` `ORDER BY part_number`), which for any valid
-        // plan is identical to ascending offset order.
-        // @cpt-begin:cpt-cf-file-storage-algo-combine-part-hashes:p1:inst-combine-sort
-        // `parts` is already in ascending part_number order (`list_parts`'s
-        // `ORDER BY part_number`, verified gapless by the missing-parts diff
-        // above), which for any valid plan is identical to ascending offset
-        // order -- no separate sort step is needed here.
+        // Backend parts carry each part's offset (running sum of prior sizes) and SHA-256
+        // digest. `parts` is ascending by `part_number` and gapless (checked above), which for
+        // a valid plan is also ascending offset order, so no sort is needed.
         let mut backend_parts: Vec<(u32, u64, [u8; 32], String)> = Vec::with_capacity(parts.len());
         let mut running_offset: u64 = 0;
         for p in &parts {
@@ -830,14 +656,10 @@ impl MultipartService {
             ));
             running_offset += u64::try_from(p.size).unwrap_or(0);
         }
-        // @cpt-end:cpt-cf-file-storage-algo-combine-part-hashes:p1:inst-combine-sort
 
-        // Assemble on the backend, which builds the offset-manifest and its
-        // `root` from the per-part digests+offsets above — **no re-read of the
-        // assembled object** (ADR-0006). `root` becomes the version's
-        // `hash_value`; the manifest text is persisted in
-        // `version_hash_manifest` transactionally with the version row below.
-        // @cpt-begin:cpt-cf-file-storage-algo-combine-part-hashes:p1:inst-combine-sha256
+        // The backend builds the offset manifest and its `root` from the per-part digests;
+        // the assembled object is not re-read. `root` becomes the version's `hash_value` and
+        // the manifest is persisted with the version row below.
         let (manifest, root) = backend
             .complete_multipart(
                 &backend_path,
@@ -845,32 +667,15 @@ impl MultipartService {
                 &backend_parts,
             )
             .await?;
-        // @cpt-end:cpt-cf-file-storage-algo-combine-part-hashes:p1:inst-combine-sha256
-        // @cpt-begin:cpt-cf-file-storage-algo-combine-part-hashes:p1:inst-combine-return
         let content_hash = root.to_vec();
         let manifest_text = manifest.to_wire_string();
-        // @cpt-end:cpt-cf-file-storage-algo-combine-part-hashes:p1:inst-combine-return
         let part_count = i32::try_from(parts.len())
             .map_err(|_| DomainError::validation("part_count", "part count overflows i32"))?;
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-assemble
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-mime-validate
-        // Sniff the assembled object's leading bytes and validate against
-        // `session.declared_mime` -- the single-part finalize paths
-        // (`write.rs::finalize_upload`/`finalize_upload_by_token`) already do
-        // this; multipart-complete was the one finalize path that let a
-        // policy restricting MIME types be bypassed by declaring an allowed
-        // type at initiate and multipart-uploading arbitrary bytes (P2
-        // remediation item 1.10). Validation runs post-assembly (S3 part
-        // objects are not independently readable pre-complete, so the backend
-        // is the only place the *whole* assembled object can be sniffed).
-        //
-        // A zero-byte object has no bytes to sniff -- `mime::detect` on an
-        // empty slice never recognizes a signature, so the declared type is
-        // always accepted as-is for an empty upload, exactly like the
-        // single-part path's read-back handles empty content.
-        //
-        // @cpt-cf-file-storage-fr-content-type-validation
+        // Sniff the assembled object's prefix and validate it against `session.declared_mime`,
+        // so a MIME policy cannot be bypassed by declaring an allowed type and uploading other
+        // bytes. Runs post-assembly because only the backend can read the whole object. An
+        // empty object has nothing to sniff, so the declared type is accepted as-is.
         let mime_sniff_prefix = if total_size == 0 {
             Vec::new()
         } else {
@@ -883,12 +688,9 @@ impl MultipartService {
                 .await?
                 .to_vec()
         };
-        // On mismatch this fails **before** any DB finalize -- the assembled
-        // blob at `backend_path` becomes an orphan reclaimed by the
-        // orphan-reconciliation sweep, the same recovery story as the
-        // `!finalized`/`!completed` branches below (the backend object is
-        // always allowed to outlive a failed finalize; the sweep is the sole
-        // cleanup path for it).
+        // A mismatch fails before any DB finalize. The assembled blob is left for the cleanup
+        // sweep, like the `!finalized` / `!completed` branches below: the backend object may
+        // always outlive a failed finalize.
         let validated_mime = validate_and_resolve_mime(&session.declared_mime, &mime_sniff_prefix)?;
         enforce_size_ceiling_for_validated_mime(
             &policy,
@@ -897,10 +699,8 @@ impl MultipartService {
             backend.capabilities().max_size_bytes,
             total_size,
         )?;
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-mime-validate
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-finalize-version
-        // Finalize the version row (no separate audit row — complete below covers it).
+        // The `MultipartComplete` audit row below covers this finalize.
         let finalize_audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -922,19 +722,14 @@ impl MultipartService {
             )
             .await?;
         if !finalized {
-            // The pending version row disappeared (concurrent abort or cleanup)
-            // after the backend assembled the object. Fail loudly instead of
-            // reporting success with no bound version; the now-orphaned blob at
-            // `backend_path` is reclaimed by the orphan-reconciliation sweep.
+            // The pending row vanished (concurrent abort or cleanup) after assembly; fail
+            // rather than report success with no bound version.
             return Err(DomainError::conflict(format!(
                 "multipart upload {upload_id}: version row was removed before completion"
             )));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-finalize-version
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-db-session
-        // Mark the session completed and emit the main audit row.
-        // @cpt-cf-file-storage-fr-audit-trail
+        // Session CAS `in_progress -> completed`, plus the main audit row.
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -946,23 +741,15 @@ impl MultipartService {
             .complete_multipart_upload(upload_id, audit)
             .await?;
         if !completed {
-            // Concurrent complete/abort already transitioned the session out of
-            // `in_progress`. The backend object was already assembled above; the
-            // now-orphaned blob is reclaimed by the orphan-reconciliation sweep.
+            // A concurrent complete/abort already moved the session out of `in_progress`.
             return Err(DomainError::multipart_upload_not_in_progress(
                 upload_id,
                 session.state.as_str(),
             ));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-complete:p1:inst-complete-db-session
 
-        // @cpt-cf-file-storage-fr-usage-reporting
-        // Credit the assembled object's total bytes. Multipart finalize does
-        // not go through `FileService::finalize_upload`, so it needs its own
-        // credit call; `file_count_delta` is `0` because the file itself was
-        // already reported `+1` at `create_file` time (multipart uploads
-        // always target an existing file -- `initiate_multipart_upload`
-        // requires `file_id` to already resolve via `require_file`).
+        // Credit the assembled bytes; `file_count_delta` is `0` because the file was already
+        // counted at `create_file` time.
         self.report_usage(UsageDelta {
             tenant_id: file.tenant_id,
             owner_id: file.owner_id,
@@ -983,22 +770,11 @@ impl MultipartService {
         })
     }
 
-    /// `GET /files/{id}/multipart/{upload_id}`: introspect a multipart
-    /// upload session (item 3.4 — ship variant).
+    /// `GET /files/{id}/multipart/{upload_id}`: session state, received parts and missing
+    /// parts. Only a live (`in_progress`, unexpired) session gets resume URLs for the
+    /// missing parts.
     ///
-    /// Returns the session's current state, the parts already reported, and
-    /// the parts still missing. For a still-live session (`in_progress` and
-    /// not yet `expires_at`), each missing part also gets a freshly-minted
-    /// resume URL so a client can continue an interrupted upload without
-    /// re-initiating; a terminal (`completed`/`aborted`) or expired session
-    /// reports state/part-accounting only, with no URLs to act on.
-    ///
-    /// Authorized on `actions::WRITE`, not `READ`: introspect exists to let
-    /// the caller *resume* an upload (it hands out live upload URLs), so it
-    /// is gated the same as initiate/complete/abort rather than opened to a
-    /// read-capable-but-not-write principal.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
+    /// Authorized on `actions::WRITE`, not `READ`, because it hands out live upload URLs.
     #[tracing::instrument(skip_all)]
     pub async fn introspect_multipart_upload(
         &self,
@@ -1006,44 +782,32 @@ impl MultipartService {
         file_id: Uuid,
         upload_id: Uuid,
     ) -> Result<MultipartUploadStatus, DomainError> {
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-authz
         let prefetch = Self::tenant_scope(ctx);
         let file = self.store.require_file(&prefetch, file_id).await?;
         let _scope = self
             .authorizer
             .authorize(ctx, actions::WRITE, &file.gts_file_type, Some(file_id))
             .await?;
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-authz
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-load-session
         let session = self
             .store
             .get_multipart_upload(upload_id)
             .await?
             .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
 
-        // Bind the session to the authorized path `file_id` -- same masking
-        // guard `complete_multipart_upload` uses: a foreign `upload_id` is
-        // reported as "not found" rather than distinguishable.
+        // Same foreign-session masking as `complete_multipart_upload`.
         if session.file_id != file_id {
             return Err(DomainError::multipart_upload_not_found(upload_id));
         }
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-load-session
 
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-load-parts
         let parts = self.store.list_multipart_parts(upload_id).await?;
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-load-parts
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-diff
         let missing_numbers = missing_part_numbers(&session, &parts);
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-diff
 
         let now = OffsetDateTime::now_utc();
         let can_resume =
             session.state == MultipartUploadState::InProgress && session.expires_at > now;
 
-        // Only look up the backend when a resume URL might actually be
-        // minted -- an expired/terminal session skips this DB round trip
-        // entirely, mirroring the `can_resume`-gated cost elsewhere below.
+        // Skip the version lookup when no URL will be minted.
         let backend_id = if can_resume {
             let version = self.store.get_version(file_id, session.version_id).await?;
             version.map_or_else(|| self.backends.default_id().to_owned(), |v| v.backend_id)
@@ -1051,20 +815,15 @@ impl MultipartService {
             String::new()
         };
 
-        // Resume tokens are capped at the session's own remaining
-        // `expires_at`, never a fresh full TTL -- a resumed upload must not
-        // outlive the session it resumes (item 3.4 requirement).
+        // Resume tokens expire with the session, never a fresh full TTL.
         let exp = session.expires_at.unix_timestamp();
         let request_id = Uuid::now_v7().to_string();
         let backend_path = Self::backend_path(file_id, session.version_id);
 
         let mut missing = Vec::with_capacity(missing_numbers.len());
         for part_number in missing_numbers {
-            // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-recompute-bounds
             let (offset, size) = part_bounds(&session, part_number);
-            // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-recompute-bounds
             let upload_url = if can_resume {
-                // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-mint-urls
                 Some(self.mint_part_url(
                     file_id,
                     session.version_id,
@@ -1079,11 +838,8 @@ impl MultipartService {
                     &request_id,
                     now,
                 )?)
-                // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-mint-urls
             } else {
-                // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-no-urls
                 None
-                // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-no-urls
             };
             missing.push(MissingPart {
                 part_number,
@@ -1104,7 +860,6 @@ impl MultipartService {
 
         self.metrics
             .record_operation("introspect_multipart_upload", "ok");
-        // @cpt-begin:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-return
         Ok(MultipartUploadStatus {
             upload_id,
             version_id: session.version_id,
@@ -1117,13 +872,9 @@ impl MultipartService {
             received,
             missing,
         })
-        // @cpt-end:cpt-cf-file-storage-flow-multipart-introspect:p1:inst-introspect-return
     }
 
     /// `DELETE /files/{id}/multipart/{upload_id}`: abort a multipart upload.
-    ///
-    /// @cpt-cf-file-storage-fr-multipart-upload
-    /// @cpt-cf-file-storage-fr-audit-trail
     pub async fn abort_multipart_upload(
         &self,
         ctx: &SecurityContext,
@@ -1143,11 +894,7 @@ impl MultipartService {
             .await?
             .ok_or_else(|| DomainError::multipart_upload_not_found(upload_id))?;
 
-        // Bind the session to the authorized path `file_id`. Authorization above
-        // checks the path file, but the session is loaded by `upload_id` alone —
-        // without this a caller could drive another file's upload (and corrupt
-        // state via a recomputed backend path). Reported as "not found" so a
-        // foreign `upload_id` is not distinguishable from a missing one.
+        // Same foreign-session masking as `complete_multipart_upload`.
         if session.file_id != file_id {
             return Err(DomainError::multipart_upload_not_found(upload_id));
         }
@@ -1159,7 +906,6 @@ impl MultipartService {
             ));
         }
 
-        // Fetch the backend from the version row.
         let version = self.store.get_version(file_id, session.version_id).await?;
         let backend_id = version.as_ref().map_or_else(
             || self.backends.default_id().to_owned(),
@@ -1172,7 +918,6 @@ impl MultipartService {
             .abort_multipart(&backend_path, &session.backend_upload_handle)
             .await?;
 
-        // @cpt-cf-file-storage-fr-audit-trail
         let audit = Self::audit_ok(
             ctx,
             Some(file_id),
@@ -1180,31 +925,22 @@ impl MultipartService {
             serde_json::json!({ "upload_id": upload_id, "version_id": session.version_id }),
         );
 
-        // Mark the session aborted (CAS: in_progress → aborted).
+        // Session CAS `in_progress -> aborted`.
         let aborted = self.store.abort_multipart_upload(upload_id, audit).await?;
         if !aborted {
-            // A concurrent complete/abort transitioned the session out of
-            // `in_progress` between our snapshot read and this CAS. Surface a
-            // conflict and STOP — critically, we must not fall through to the
-            // pending-version delete below: had the race been a concurrent
-            // *complete*, that version is now finalized/bound and deleting it
-            // would corrupt the completed upload.
+            // Lost the race. Must not fall through to the delete below: after a concurrent
+            // *complete* that version is bound and deleting it would corrupt the upload.
             return Err(DomainError::multipart_upload_not_in_progress(
                 upload_id,
                 session.state.as_str(),
             ));
         }
 
-        // Delete the pending version row (no audit row — a pending version is
-        // an implementation detail, not a distinct audited file version). A
-        // DB error must not be swallowed; a missing row (`false`) is acceptable
-        // for an abort, since the pending version being already gone is the
-        // desired end state.
+        // DB errors propagate; an already-missing row (`false`) is the desired end state.
         self.store
             .delete_version(
                 file_id,
                 session.version_id,
-                // Deleted as part of abort — record as delete_version for completeness.
                 Self::audit_ok(
                     ctx,
                     Some(file_id),

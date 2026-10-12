@@ -444,6 +444,7 @@ impl BssLedgerGear {
         clippy::too_many_lines,
         reason = "the serve loop declares one ticker + one select arm per background job (tie-out, period-open, queue-applier, aged-alarm, recognition-run, rate-sync, revaluation-run, reconciliation, chain-verify); the per-job wiring is flat by design"
     )]
+    /// Runs the gear's background jobs (tie-out, period-open, queue-applier, aged-alarm, recognition, rate-sync, revaluation, reconciliation, chain-verify) until `cancel` fires; idles if the runtime is not configured.
     pub(crate) async fn serve(self: Arc<Self>, cancel: CancellationToken) -> anyhow::Result<()> {
         let Some(rt) = self.runtime.load_full() else {
             info!("bss-ledger: serve() with no runtime (unconfigured); idling until cancelled");

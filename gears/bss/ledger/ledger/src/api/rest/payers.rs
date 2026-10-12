@@ -189,7 +189,7 @@ async fn close_payer(
     });
     let facts = OperationFacts {
         kind: ApprovalKind::PayerClosure,
-        amount_usd_eq_minor: None,
+        amount: None,
         effective_at: None,
         has_outstanding_balance: has_balance,
     };

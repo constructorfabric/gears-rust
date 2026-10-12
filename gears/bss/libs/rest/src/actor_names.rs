@@ -7,7 +7,13 @@
 //! caller's own context and tenant: AM decides what this caller may see, and no
 //! privileged context is used.
 //!
-//! - No name is stored or cached. A rename shows on the next read.
+//! - Through [`ActorNames::from_hub`], a resolved name is kept in this process for `NAME_TTL`
+//!   (five minutes), for the caller
+//!   AM gave it to and for nobody else: the key is the caller's tenant and subject and the actor.
+//!   A rename shows within that time. A refused, absent or failed lookup is not kept, so a new
+//!   user's name shows on the next read, and nothing is kept for an anonymous caller. The cache
+//!   holds at most `NAME_CACHE_CAPACITY` names; a full cache drops its expired names, then all,
+//!   and one answer with more names than that keeps only that many.
 //! - The ids are deduplicated and read in chunks of `IdpUserPagination::MAX_TOP`,
 //!   at most four chunks at once, inside one 2 s budget for the response.
 //! - A read never fails because of AM: a refused, absent, failed or late lookup
@@ -20,8 +26,8 @@
 //! so the registration order of the gears cannot turn names off, and a process
 //! without AM reads every name as [`ActorName::Unavailable`].
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use account_management_sdk::{AccountManagementClient, IdpUserFilterField, IdpUserPagination};
@@ -51,8 +57,61 @@ const LOOKUP_BATCH_SIZE: usize = IdpUserPagination::MAX_TOP as usize;
 /// One budget for the whole response, queued lookups included.
 const LOOKUP_BUDGET: Duration = Duration::from_secs(2);
 
+/// How long a resolved name is reused for the caller it was resolved for.
+const NAME_TTL: Duration = Duration::from_secs(300);
+/// The most names one process keeps.
+const NAME_CACHE_CAPACITY: usize = 10_000;
+
 /// The label of a gear's system actor.
 pub const SYSTEM_LABEL: &str = "System";
+
+/// The caller a name was resolved for: its tenant and subject.
+type Caller = (Uuid, Uuid);
+
+/// A resolved name and the instant it stops being reused, by caller and actor.
+type Entries = HashMap<(Caller, Uuid), (String, tokio::time::Instant)>;
+
+/// Resolved names by caller and actor, each with the instant it stops being reused.
+#[derive(Default)]
+struct NameCache {
+    entries: Mutex<Entries>,
+}
+
+impl NameCache {
+    /// The names of `ids` this caller was given and that are still fresh at `now`.
+    fn fresh(&self, caller: Caller, ids: &[Uuid], now: tokio::time::Instant) -> Names {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        ids.iter()
+            .filter_map(|id| {
+                entries
+                    .get(&(caller, *id))
+                    .filter(|(_, until)| *until > now)
+                    .map(|(name, _)| (*id, ActorName::Resolved(name.clone())))
+            })
+            .collect()
+    }
+
+    /// Keep this caller's resolved names until `now + ttl`. Nothing else is kept, and the cache
+    /// never holds more than `NAME_CACHE_CAPACITY` names.
+    fn keep(&self, caller: Caller, names: &Names, now: tokio::time::Instant, ttl: Duration) {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if entries.len() + names.len() > NAME_CACHE_CAPACITY {
+            entries.retain(|_, (_, until)| *until > now);
+            if entries.len() + names.len() > NAME_CACHE_CAPACITY {
+                entries.clear();
+            }
+        }
+        // The names fit now, or the cache is empty and one answer holds more names than the
+        // cache: then only the first `NAME_CACHE_CAPACITY` are kept.
+        let resolved = names.iter().filter_map(|(id, name)| match name {
+            ActorName::Resolved(label) => Some((*id, label)),
+            _ => None,
+        });
+        for (id, label) in resolved.take(NAME_CACHE_CAPACITY) {
+            entries.insert((caller, id), (label.clone(), now + ttl));
+        }
+    }
+}
 
 /// A current name, or the reason that no name can be shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +272,10 @@ impl ActorDirectory for AmDirectory {
 pub struct ActorNames {
     directory: Arc<dyn ActorDirectory>,
     system_ids: BTreeSet<Uuid>,
+    /// Shared by every clone, so [`Self::with_system_ids`] keeps the gear's cache.
+    cache: Arc<NameCache>,
+    /// How long a resolved name is reused; `None` keeps nothing.
+    ttl: Option<Duration>,
 }
 
 /// The system ids; the directory is a trait object and is not shown.
@@ -262,16 +325,27 @@ impl ActorNames {
     /// AM through the process client hub. `system_ids` are the gear's own system actors.
     #[must_use]
     pub fn from_hub(hub: Arc<ClientHub>, system_ids: &[Uuid]) -> Self {
-        Self::with_directory(Arc::new(AmDirectory { hub }), system_ids)
+        Self::with_directory(Arc::new(AmDirectory { hub }), system_ids).caching_for(NAME_TTL)
     }
 
-    /// A given directory, for tests and transport-level fakes.
+    /// A given directory, for tests and transport-level fakes. It keeps no name: every read asks
+    /// the directory, unless [`Self::caching_for`] turns the cache on.
     #[must_use]
     pub fn with_directory(directory: Arc<dyn ActorDirectory>, system_ids: &[Uuid]) -> Self {
         Self {
             directory,
             system_ids: system_ids.iter().copied().collect(),
+            cache: Arc::new(NameCache::default()),
+            ttl: None,
         }
+    }
+
+    /// These names, keeping each resolved name for `ttl` for the caller it was resolved for.
+    /// [`Self::from_hub`] keeps them for `NAME_TTL`.
+    #[must_use]
+    pub fn caching_for(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
     }
 
     /// These names with `more` system actors beside the gear's own: a facade adds the system
@@ -297,7 +371,20 @@ impl ActorNames {
         let (system, unique): (BTreeSet<_>, BTreeSet<_>) =
             ids.into_iter().partition(|id| self.system_ids.contains(id));
         let unique: Vec<_> = unique.into_iter().collect();
-        let deadline = tokio::time::Instant::now() + LOOKUP_BUDGET;
+        let now = tokio::time::Instant::now();
+        // A name is reused only for the caller AM gave it to; an anonymous caller keeps nothing.
+        let caller = self
+            .ttl
+            .filter(|_| !ctx.is_anonymous())
+            .map(|ttl| ((ctx.subject_tenant_id(), ctx.subject_id()), ttl));
+        let cached = caller.map_or_else(Names::new, |(caller, _)| {
+            self.cache.fresh(caller, &unique, now)
+        });
+        let unique: Vec<_> = unique
+            .into_iter()
+            .filter(|id| !cached.contains_key(id))
+            .collect();
+        let deadline = now + LOOKUP_BUDGET;
         // Boxed where its lifetimes are concrete, so a `Send` handler's future does not have to
         // prove the borrowing closure `Send` for every lifetime.
         let mut names: BTreeMap<_, _> = stream::iter(unique.chunks(LOOKUP_BATCH_SIZE))
@@ -307,6 +394,10 @@ impl ActorNames {
             .boxed()
             .collect()
             .await;
+        if let Some((caller, ttl)) = caller {
+            self.cache.keep(caller, &names, now, ttl);
+        }
+        names.extend(cached);
         names.extend(system.into_iter().map(|id| (id, ActorName::System)));
         names
     }

@@ -1,8 +1,6 @@
 //! File Storage SDK
 //!
-//! Public API surface for the `file-storage` gear (control plane). The P1
-//! operations land incrementally; this crate currently pins the stable types
-//! other gears consume:
+//! Public API surface of the `file-storage` gear (control plane):
 //!
 //! - [`FileStorageClientV1`] — the inter-gear client trait (resolved from `ClientHub`)
 //! - model types ([`models`])

@@ -6,6 +6,9 @@ pub enum DomainError {
     #[error("Repo not found")]
     NotFound,
 
+    #[error("Sync session not found")]
+    SessionNotFound,
+
     #[error("Validation error on field '{field}': {message}")]
     Validation { field: String, message: String },
 
@@ -22,6 +25,17 @@ pub enum DomainError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    /// The run was told to stop (shutdown or an explicit cancel) before it
+    /// finished; its session ends `interrupted`, not `failed`.
+    #[error("the sync was interrupted before it finished")]
+    Cancelled,
+
+    #[error("{message}")]
+    Unavailable {
+        message: String,
+        retry_after_secs: Option<u64>,
+    },
+
     #[error("Internal error: {0}")]
     Internal(String),
 
@@ -36,6 +50,38 @@ impl DomainError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
+    }
+
+    #[must_use]
+    pub fn public_text(&self) -> String {
+        match self {
+            Self::NotFound
+            | Self::SessionNotFound
+            | Self::Validation { .. }
+            | Self::Conflict(_)
+            | Self::Cancelled
+            | Self::Unavailable { .. } => self.to_string(),
+            Self::Forbidden(_) => "access forbidden".to_owned(),
+            Self::AccessLost(_) => {
+                "GitHub refused the mirror's credentials for this repository".to_owned()
+            }
+            Self::Internal(msg) => crate::redact::redacted(msg),
+            Self::Database(_) => "a storage error stopped the work".to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Database(toolkit_db::DbError::Sea(e)) => [
+                sea_orm::DbBackend::Sqlite,
+                sea_orm::DbBackend::Postgres,
+                sea_orm::DbBackend::MySql,
+            ]
+            .into_iter()
+            .any(|backend| toolkit_db::contention::is_retryable_contention(backend, e)),
+            _ => false,
+        }
     }
 }
 
@@ -52,7 +98,11 @@ impl From<authz_resolver_sdk::EnforcerError> for DomainError {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a panic in these tests is the failure report"
+)]
 mod tests {
     use super::*;
 

@@ -75,12 +75,12 @@ As an alternative, you can fork the repository to your own GitHub account.
 
 Constructor Fabric Gears follows a spec-driven development (SDD) approach for large features. Gear development starts with specifications that live alongside the code. When you add features, make design decisions, or introduce upstream requirements, you must use the following templates and keep them aligned with the implementation:
 
-- **[Overview & Guide](./docs/spec-templates/README.md)** — Template system overview, governance, FDD ID conventions, and document placement rules
-- **[PRD.md](./docs/spec-templates/gears-sdlc/PRD/template.md)** — Product Requirements Document: vision, actors, capabilities, use cases, FR/NFR
-- **[DESIGN.md](./docs/spec-templates/gears-sdlc/DESIGN/template.md)** — Technical Design: architecture, principles, constraints, domain model, API contracts
-- **[ADR.md](./docs/spec-templates/gears-sdlc/ADR/template.md)** — Architecture Decision Record: decisions, options, trade-offs, consequences
-- **[FEATURE.md](./docs/spec-templates/gears-sdlc/FEATURE/template.md)** — Feature Specification: flows, algorithms, states, requirements
-- **[UPSTREAM_REQS.md](./docs/spec-templates/gears-sdlc/UPSTREAM_REQS/template.md)** — Upstream Requirements: technical requirements from other gears to this gear
+- **[Overview & Guide](./studio-kit-gears/artifacts/README.md)** — Template system overview, governance, FDD ID conventions, and document placement rules
+- **[PRD.md](./studio-kit-gears/artifacts/PRD/template.md)** — Product Requirements Document: vision, actors, capabilities, use cases, FR/NFR
+- **[DESIGN.md](./studio-kit-gears/artifacts/DESIGN/template.md)** — Technical Design: architecture, principles, constraints, domain model, API contracts
+- **[ADR.md](./studio-kit-gears/artifacts/ADR/template.md)** — Architecture Decision Record: decisions, options, trade-offs, consequences
+- **[FEATURE.md](./studio-kit-gears/artifacts/FEATURE/template.md)** — Feature Specification: flows, algorithms, states, requirements
+- **[UPSTREAM_REQS.md](./studio-kit-gears/artifacts/UPSTREAM_REQS/template.md)** — Upstream Requirements: technical requirements from other gears to this gear
 
 ### 2.3. Make Your Changes
 

@@ -34,18 +34,27 @@ use dto::{
 use std::sync::Arc;
 use support::{authz_failure, etag, header, require_authenticated, response, transaction};
 
+/// The approve and submit grants behind `caller_can_approve` (D-471). The two PDP questions are
+/// independent, so they are asked together: a unit list or card waits for one PDP round trip,
+/// not two.
 async fn approval_flag_scopes(
     enforcer: &PolicyEnforcer,
     ctx: &SecurityContext,
 ) -> Result<(toolkit_security::AccessScope, toolkit_security::AccessScope), CanonicalError> {
-    let approve = authz::grant_scope(enforcer, ctx, actions::APPROVE)
-        .await
-        .map_err(authz_failure)?;
-    let submit = authz::grant_scope(enforcer, ctx, actions::SUBMIT)
-        .await
-        .map_err(authz_failure)?;
-    Ok((approve, submit))
+    tokio::try_join!(
+        async {
+            authz::grant_scope(enforcer, ctx, actions::APPROVE)
+                .await
+                .map_err(authz_failure)
+        },
+        async {
+            authz::grant_scope(enforcer, ctx, actions::SUBMIT)
+                .await
+                .map_err(authz_failure)
+        },
+    )
 }
+
 use toolkit::api::{
     OpenApiRegistry,
     operation_builder::{OperationBuilder, OperationBuilderODataExt},
@@ -1386,16 +1395,24 @@ async fn list_approval_units(
     uri: axum::http::Uri,
 ) -> Result<Response, CanonicalError> {
     let ctx = require_authenticated(ctx)?;
-    let scope = authz::access_scope(
-        &enforcer,
-        &ctx,
-        &resource_types::APPROVAL_UNIT,
-        actions::READ,
-        None,
-        None,
-    )
-    .await
-    .map_err(authz_failure)?;
+    // The read grant and the two flag grants are independent PDP questions, asked at once: the
+    // list and the card wait for one round trip. A denied read still answers 403, and the flag
+    // grants never fail on a denial (`authz::grant_scope` reads it as no grant).
+    let (scope, (approve_scope, submit_scope)) = tokio::try_join!(
+        async {
+            authz::access_scope(
+                &enforcer,
+                &ctx,
+                &resource_types::APPROVAL_UNIT,
+                actions::READ,
+                None,
+                None,
+            )
+            .await
+            .map_err(authz_failure)
+        },
+        approval_flag_scopes(&enforcer, &ctx),
+    )?;
     let axum::extract::Query(query) =
         axum::extract::Query::<dto::PricingApprovalUnitQuery>::try_from_uri(&uri)
             .map_err(|e| support::invalid_because("query", "QUERY_INVALID", &e.body_text()))?;
@@ -1411,7 +1428,6 @@ async fn list_approval_units(
         query.cursor.as_deref(),
         query.orderby.as_deref(),
     )?;
-    let (approve_scope, submit_scope) = approval_flag_scopes(&enforcer, &ctx).await?;
     let request = approvals::UnitListRequest {
         filter,
         page,
@@ -1604,17 +1620,24 @@ async fn get_approval_unit(
     Path(id): Path<Uuid>,
 ) -> Result<Response, CanonicalError> {
     let ctx = require_authenticated(ctx)?;
-    let scope = authz::access_scope(
-        &enforcer,
-        &ctx,
-        &resource_types::APPROVAL_UNIT,
-        actions::READ,
-        None,
-        None,
-    )
-    .await
-    .map_err(authz_failure)?;
-    let (approve_scope, submit_scope) = approval_flag_scopes(&enforcer, &ctx).await?;
+    // The read grant and the two flag grants are independent PDP questions, asked at once: the
+    // list and the card wait for one round trip. A denied read still answers 403, and the flag
+    // grants never fail on a denial (`authz::grant_scope` reads it as no grant).
+    let (scope, (approve_scope, submit_scope)) = tokio::try_join!(
+        async {
+            authz::access_scope(
+                &enforcer,
+                &ctx,
+                &resource_types::APPROVAL_UNIT,
+                actions::READ,
+                None,
+                None,
+            )
+            .await
+            .map_err(authz_failure)
+        },
+        approval_flag_scopes(&enforcer, &ctx),
+    )?;
     let caller = ctx.clone();
     let body = transaction(&state.db.db(), move |tx| {
         let (scope, ctx) = (scope.clone(), caller.clone());

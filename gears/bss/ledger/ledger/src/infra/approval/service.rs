@@ -28,10 +28,19 @@
 
 use std::sync::Arc;
 
-use bss_ledger_sdk::SourceDocType;
+use crate::domain::exact_money::{map_exact_error, map_money_error};
+use crate::infra::approval::stored_intent::{
+    SnapshotBasis, StoredThresholdSnapshot, canonical_identity, check_threshold_snapshot,
+    decode_intent, encode_intent, validate_threshold_snapshot,
+};
+use crate::infra::currency_scale::CurrencyScaleResolver;
+use crate::infra::storage::repo::approval_repo::{ApprovalRow, InsertPendingError};
+use crate::infra::storage::repo::fx_repo::RateSnapshotRow;
+use bss_ledger_sdk::{CurrencySpec, PostedMoney, SourceDocType};
 
-use sea_orm::DbErr;
-use toolkit_db::secure::{AccessScope, TxConfig, is_unique_violation};
+use crate::infra::posting::error_transport::scale_error_to_domain;
+use crate::infra::posting::retry::{AttemptError, RetryOp, retry_transaction_for};
+use toolkit_db::secure::AccessScope;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -40,14 +49,14 @@ use crate::config::FxConfig;
 use crate::domain::approval::ApprovalState;
 use crate::domain::approval::intent::ApprovalIntent;
 use crate::domain::approval::policy::{
-    DualControlPolicy, OperationFacts, PolicyConfigError, PolicyVersion, effective_version,
-    requires_dual_control, resolve_policy, validate_config,
+    D2_DEFAULT_RULE, D2Thresholds, DualControlPolicy, OperationFacts, PolicyConfigError,
+    PolicyVersion, ValuationBasis, amount_gated, effective_version, requires_dual_control,
+    resolve_policy, valuation_basis,
 };
 use crate::domain::error::DomainError;
 use crate::domain::fx::translate::translate_amount;
 use crate::domain::instant::format_rfc3339;
 use crate::domain::instant::to_naive_date;
-use crate::domain::model::RepoError;
 use crate::domain::ports::metrics::LedgerMetricsPort;
 use crate::infra::fx::rate_source::RateSource;
 use crate::infra::storage::repo::{
@@ -83,10 +92,8 @@ pub struct ApprovalService {
     repo: ApprovalRepo,
     executor: Arc<dyn ApprovalExecutor>,
     metrics: Arc<dyn LedgerMetricsPort>,
-    // DC10 / FX: the dual-control threshold is held in the tenant's FUNCTIONAL
-    // (reporting) currency, so the gate translates a cross-currency comparand into
-    // it before the threshold compare. `source` resolves the rate; `reference`
-    // reads the tenant's functional currency.
+    // Preserve the existing eligible functional valuation before resolving the
+    // currency-specific threshold; derived kinds retain transaction basis.
     source: RateSource,
     reference: ReferenceRepo,
     // D2 (FX): reads the OPERATION's locked rate (the referenced posted entry's
@@ -119,11 +126,16 @@ impl ApprovalService {
     }
 
     /// Create (or idempotently return) a `PENDING` approval for an over-threshold
-    /// mutation. A retry with the same `(tenant, kind, business_key)` returns the
-    /// existing active record rather than a duplicate (DC13).
+    /// mutation. A retry with the same `(tenant, kind, business_key)` **and the
+    /// same intent** returns the existing active record rather than a duplicate
+    /// (DC13); a retry under that key carrying a *different* intent is refused,
+    /// never silently answered with the other intent's approval.
     ///
     /// # Errors
-    /// [`DomainError::Internal`] on a storage failure.
+    /// [`DomainError::ApprovalNotActionable`] when an active approval for the same
+    /// `(tenant, kind, business_key)` captured a different intent;
+    /// [`DomainError::Internal`] when the threshold snapshot is inconsistent with
+    /// its own captured policy, or on a storage failure.
     #[allow(clippy::too_many_arguments)] // a pending record carries several snapshot fields
     pub async fn create_pending(
         &self,
@@ -131,10 +143,15 @@ impl ApprovalService {
         scope: &AccessScope,
         intent: ApprovalIntent,
         reason_code: String,
-        threshold_snapshot: serde_json::Value,
-        amount_usd_eq_minor: Option<i64>,
+        threshold_snapshot: StoredThresholdSnapshot,
+        amount: Option<PostedMoney>,
         ttl_seconds: i64,
     ) -> Result<Uuid, DomainError> {
+        // Typed at the call site; serialized once, at the storage boundary.
+        let threshold_snapshot =
+            serde_json::to_value(check_threshold_snapshot(threshold_snapshot)?).map_err(|e| {
+                DomainError::Internal(format!("encode approval policy snapshot: {e}"))
+            })?;
         let tenant = ctx.subject_tenant_id();
         let kind = intent.kind();
         let business_key = intent.business_key();
@@ -145,21 +162,21 @@ impl ApprovalService {
             .read_active(scope, tenant, kind.as_str(), &business_key, now)
             .await?
         {
+            ensure_same_intent(&existing, &intent)?;
             return Ok(existing.approval_id);
         }
 
         let approval_id = Uuid::now_v7();
         let prepared_at = now;
         let expires_at = prepared_at + Duration::seconds(ttl_seconds);
-        let intent_json = serde_json::to_value(&intent)
-            .map_err(|e| DomainError::Internal(format!("serialize approval intent: {e}")))?;
+        let intent_json = encode_intent(&intent)?;
         let row = NewPendingApproval {
             approval_id,
             tenant,
             kind: kind.as_str().to_owned(),
             business_key: business_key.clone(),
             intent: intent_json,
-            amount_usd_eq_minor,
+            amount,
             threshold_snapshot,
             reason_code,
             prepared_by: ctx.subject_id(),
@@ -168,38 +185,38 @@ impl ApprovalService {
             expires_at,
         };
         let scope_owned = scope.clone();
-        let created = self
-            .db
-            .db()
-            .transaction_with_retry(TxConfig::serializable(), as_db_err, move |txn| {
-                let row = row.clone();
-                let scope = scope_owned.clone();
-                Box::pin(async move {
-                    // Lazy expiry pass (DC13/DC12): flip this tenant's lapsed
-                    // PENDING/NEEDS_REWORK rows to EXPIRED first, so an abandoned
-                    // approval past its TTL no longer occupies the active-uniqueness
-                    // slot and the insert below can claim it. This is the per-tenant
-                    // lazy complement to the cross-tenant TTL sweep job
-                    // (`expire_due_all`, wired in `module.rs`) — DC12 ships BOTH, so
-                    // a slot is freed on the next prepare even between sweep ticks.
-                    ApprovalRepo::expire_due(txn, &scope, tenant, now)
-                        .await
-                        .map_err(repo_to_db)?;
-                    ApprovalRepo::insert_pending(txn, &scope, row)
-                        .await
-                        .map_err(repo_to_db)?;
-                    Ok::<(), DbError>(())
-                })
+        let op = RetryOp::new("dual-control pending create", Some(tenant));
+        let created = retry_transaction_for(&self.db.db(), op, move |txn| {
+            let row = row.clone();
+            let scope = scope_owned.clone();
+            Box::pin(async move {
+                // Lazy expiry pass (DC13/DC12): flip this tenant's lapsed
+                // PENDING/NEEDS_REWORK rows to EXPIRED first, so an abandoned
+                // approval past its TTL no longer occupies the active-uniqueness
+                // slot and the insert below can claim it. This is the per-tenant
+                // lazy complement to the cross-tenant TTL sweep job
+                // (`expire_due_all`, wired in `module.rs`) — DC12 ships BOTH, so
+                // a slot is freed on the next prepare even between sweep ticks.
+                ApprovalRepo::expire_due(txn, &scope, tenant, now)
+                    .await
+                    .map_err(AttemptError::from)?;
+                ApprovalRepo::insert_pending(txn, &scope, row)
+                    .await
+                    .map_err(pending_insert_error)?;
+                Ok::<(), AttemptError>(())
             })
-            .await;
+        })
+        .await;
         if let Err(e) = created {
             // ONLY the DC13 active-uniqueness race is recoverable: a concurrent
             // preparer that both passed the read_active check and won the partial-
-            // unique index, leaving this caller the loser (23505). Any OTHER error
-            // (connection drop, CHECK violation, …) is a real failure — surface it,
-            // never mask it behind a re-read. Gate on the unique-violation
-            // discriminator; on a confirmed dup, return the winner idempotently.
-            if as_db_err(&e).is_some_and(is_unique_violation)
+            // unique index, leaving this caller the loser (23505). The repository
+            // names it (`InsertPendingError::ActiveExists`) and the attempt stops
+            // at once, without retry sleeps (see `pending_insert_error`); exhausted
+            // contention also lands here. Any OTHER error (connection drop, CHECK
+            // violation, …) is a real failure — surface it, never mask it behind a
+            // re-read. On a confirmed dup, return the winner idempotently.
+            if matches!(e, DomainError::ConcurrentModification(_))
                 && let Some(existing) = self
                     .repo
                     .read_active(
@@ -211,11 +228,10 @@ impl ApprovalService {
                     )
                     .await?
             {
+                ensure_same_intent(&existing, &intent)?;
                 return Ok(existing.approval_id);
             }
-            return Err(DomainError::Internal(format!(
-                "create pending approval: {e}"
-            )));
+            return Err(e);
         }
         self.metrics.dual_control_pending(kind.as_str());
         Ok(approval_id)
@@ -243,30 +259,56 @@ impl ApprovalService {
             .await?;
         let now = OffsetDateTime::now_utc();
         let policy = resolve_policy(&versions, now);
-        // DC10 / FX: value the comparand in the tenant's FUNCTIONAL (reporting)
-        // currency before the threshold compare — the threshold is denominated in
-        // functional minor. A single-currency tenant (or same-currency op) compares
-        // as-is; a cross-currency op translates at the OPERATION's own locked rate
-        // (design D2 — deterministic + anti-circumvention), falling back to the
-        // gate-time rate only when the operation carries no referenced snapshot.
-        let txn_ccy = intent.transaction_currency().map(str::to_owned);
-        let locked_rate_micro = self
-            .operation_locked_rate(ctx.subject_tenant_id(), &intent)
-            .await?;
+        if facts.kind != intent.kind() {
+            return Err(DomainError::InvalidRequest(
+                "approval facts kind differs from intent".into(),
+            ));
+        }
+        if let Some(direct) = intent.amount()? {
+            if let Some(comparand) = &facts.amount {
+                crate::domain::exact_money::matching_spec(&direct, comparand)?;
+                if direct != *comparand {
+                    return Err(DomainError::InvalidRequest(
+                        "approval facts differ from captured transaction amount".into(),
+                    ));
+                }
+            } else if amount_gated(intent.kind()) {
+                return Err(DomainError::InvalidRequest(
+                    "captured monetary intent requires amount facts".into(),
+                ));
+            }
+        }
+        let original_currency = facts.amount.as_ref().map(|v| v.currency().clone());
         let facts = self
-            .to_functional_facts(
-                scope,
-                ctx.subject_tenant_id(),
-                facts,
-                txn_ccy.as_deref(),
-                now,
-                locked_rate_micro,
-            )
+            .to_functional_facts(scope, ctx.subject_tenant_id(), facts, &intent, now)
             .await?;
-        if !requires_dual_control(&facts, policy, to_naive_date(now)) {
+        if !requires_dual_control(&facts, &policy, to_naive_date(now))
+            .map_err(policy_config_to_domain)?
+        {
             return Ok(None);
         }
-        let snapshot = threshold_snapshot(&policy, now);
+        let resolved = facts
+            .amount
+            .as_ref()
+            .map(|v| policy.d2_threshold(v.currency()))
+            .transpose()
+            .map_err(policy_config_to_domain)?;
+        let snapshot = threshold_snapshot(
+            &policy,
+            now,
+            effective_version(&versions, now).as_ref(),
+            if facts
+                .amount
+                .as_ref()
+                .map(bss_ledger_sdk::PostedMoney::currency)
+                == original_currency.as_ref()
+            {
+                SnapshotBasis::TransactionGate
+            } else {
+                SnapshotBasis::FunctionalGate
+            },
+            resolved.as_ref(),
+        );
         let id = self
             .create_pending(
                 ctx,
@@ -274,29 +316,21 @@ impl ApprovalService {
                 intent,
                 reason_code,
                 snapshot,
-                facts.amount_usd_eq_minor,
-                policy.pending_ttl_seconds,
+                facts.amount,
+                policy.pending_ttl_seconds(),
             )
             .await?;
         Ok(Some(id))
     }
 
-    /// The OPERATION's own locked FX `rate_micro` for the D2 threshold (design D2:
-    /// value at the operation's snapshot, not a fresh gate-time rate). Maps the intent
-    /// to its referenced posted entry — refund -> the payment's `PAYMENT_SETTLE`,
-    /// credit / debit note -> the invoice's `INVOICE_POST` — and reads that entry's
-    /// locked rate. `None` (⇒ gate-time fallback) for a single-currency operation, an
-    /// absent reference, or an intent with no rate-bearing reference (reverse /
-    /// material-backdating carry no currency — a separate documented residual).
-    ///
-    /// # Errors
-    /// [`DomainError::Internal`] on a storage failure.
+    /// Read the operation's locked evidence, preserving both historical specs.
     async fn operation_locked_rate(
         &self,
+        scope: &AccessScope,
         tenant: Uuid,
         intent: &ApprovalIntent,
-    ) -> Result<Option<i64>, DomainError> {
-        let (business_id, doc_type): (&str, SourceDocType) = match intent {
+    ) -> Result<Option<RateSnapshotRow>, DomainError> {
+        let (business_id, doc_type) = match intent {
             ApprovalIntent::Refund(i) => (i.payment_id.as_str(), SourceDocType::PaymentSettle),
             ApprovalIntent::RefundWithCreditNote(i) => {
                 (i.refund.payment_id.as_str(), SourceDocType::PaymentSettle)
@@ -309,70 +343,73 @@ impl ApprovalService {
             }
             _ => return Ok(None),
         };
-        // Internal valuation read: a plain tenant scope (the entry is tenant-secured).
-        let scope = AccessScope::for_tenant(tenant);
         self.journal
-            .locked_rate_micro_for(&scope, tenant, business_id, doc_type.as_str())
+            .locked_rate_evidence_for(scope, tenant, business_id, doc_type.as_str())
             .await
             .map_err(|e| DomainError::Internal(format!("operation locked-rate lookup: {e}")))
     }
 
-    /// Translate the comparand (`facts.amount_usd_eq_minor`, in `txn_currency`) into
-    /// the tenant's FUNCTIONAL (reporting) currency for the DC10 threshold compare.
-    /// Returns `facts` unchanged when there is no amount comparand, the caller did
-    /// not tag a transaction currency (a non-amount kind, or `Reverse` /
-    /// `RecognitionScheduleChange` whose currency is gate-time-derived), the tenant
-    /// is single-currency (no functional configured), or the operation currency
-    /// already IS the functional currency. Otherwise resolves the current rate and
-    /// translates the amount.
-    ///
-    /// # Errors
-    /// [`DomainError::FxRateUnavailable`] / [`DomainError::FxRateStaleNotAllowed`]
-    /// when a cross-currency op has no usable rate (the post would fail the same
-    /// way — the gate never silently mis-values the threshold); other
-    /// [`DomainError`] on a storage / translate fault.
+    /// Preserve derived transaction basis; other kinds use locked operation evidence
+    /// when present and the existing current-quote fallback only when absent.
     async fn to_functional_facts(
         &self,
         scope: &AccessScope,
         tenant: Uuid,
-        facts: OperationFacts,
-        txn_currency: Option<&str>,
+        mut facts: OperationFacts,
+        intent: &ApprovalIntent,
         now: OffsetDateTime,
-        locked_rate_micro: Option<i64>,
     ) -> Result<OperationFacts, DomainError> {
-        let (Some(amount), Some(txn_ccy)) = (facts.amount_usd_eq_minor, txn_currency) else {
+        if valuation_basis(facts.kind) == ValuationBasis::Transaction {
+            return Ok(facts);
+        }
+        let Some(amount) = facts.amount.as_ref() else {
             return Ok(facts);
         };
-        let Some(functional_ccy) = self
+        let Some(functional) = self
             .reference
             .functional_currency(scope, tenant)
             .await
-            .map_err(|e| {
-                DomainError::Internal(format!("dual-control functional-currency lookup: {e}"))
-            })?
+            .map_err(|e| DomainError::Internal(format!("dual-control functional currency: {e}")))?
         else {
-            // Single-currency tenant: the threshold currency IS the operation currency.
             return Ok(facts);
         };
-        if functional_ccy == txn_ccy {
+        if functional == amount.currency().code() {
             return Ok(facts);
         }
-        // D2: prefer the operation's OWN locked rate; fall back to the gate-time rate
-        // only when the operation carries no referenced snapshot (the documented
-        // residual). A missing/stale rate on the fallback fails here exactly as the
-        // post would.
-        let rate_micro = if let Some(locked) = locked_rate_micro {
-            locked
+        let locked = self.operation_locked_rate(scope, tenant, intent).await?;
+        let (rate, target) = if let Some(locked) = locked {
+            if locked.quote.base_currency.code() != amount.currency().code()
+                || locked.quote.quote_currency.code() != functional
+            {
+                return Err(DomainError::CurrencyMismatch(
+                    "operation locked FX pair differs from comparand/functional currency".into(),
+                ));
+            }
+            if locked.quote.base_currency.scale() != amount.currency().scale() {
+                return Err(DomainError::InconsistentScale(
+                    "operation locked FX base scale differs from comparand".into(),
+                ));
+            }
+            (locked.quote.rate, locked.quote.quote_currency)
         } else {
-            self.source
-                .resolve(scope, tenant, txn_ccy, &functional_ccy, now)
+            let resolver = CurrencyScaleResolver::new(self.reference.clone());
+            let scale = resolver
+                .resolve(scope, tenant, &functional)
+                .await
+                .map_err(scale_error_to_domain)?;
+            let target =
+                CurrencySpec::try_new(functional.clone(), scale).map_err(map_money_error)?;
+            let rate = self
+                .source
+                .resolve(scope, tenant, amount.currency().code(), &functional, now)
                 .await?
-                .rate_micro
+                .rate;
+            (rate, target)
         };
-        let functional_minor = translate_amount(amount, rate_micro)
-            .map_err(|e| DomainError::Internal(format!("dual-control FX translate: {e}")))?;
-        let mut facts = facts;
-        facts.amount_usd_eq_minor = Some(functional_minor);
+        facts.amount = Some(translate_amount(amount, rate, target).map_err(|e| match e {
+            crate::domain::fx::translate::FxTranslateError::Exact(e) => map_exact_error(e),
+            other => DomainError::Internal(format!("approval FX translation: {other}")),
+        })?);
         Ok(facts)
     }
 
@@ -400,61 +437,89 @@ impl ApprovalService {
     /// Write a new effective-dated dual-control threshold policy version for the
     /// caller's tenant (DC8). Validates the D2/A6/TTL ranges first (out-of-range →
     /// [`DomainError::DualControlPolicyOutOfRange`], never clamped — DC9/DC11), then
-    /// appends a `(tenant, version = max + 1)` row in one serializable txn. The
-    /// resolver picks the latest `effective_from` (highest `version` on a tie), so a
-    /// later write supersedes without mutating history. Returns the new `version`.
+    /// appends a `(tenant, version = max + 1)` row in one serializable txn, after
+    /// checking every threshold's scale against the currency registry on that
+    /// same txn. The resolver picks the latest `effective_from` (highest `version`
+    /// on a tie), so a later write supersedes without mutating history. Returns
+    /// the new `version`.
     ///
     /// # Errors
     /// [`DomainError::DualControlPolicyOutOfRange`] on an out-of-range threshold;
-    /// [`DomainError::Internal`] on a storage failure.
+    /// [`DomainError::InconsistentScale`] when a threshold's scale differs from the
+    /// registry (naming the currency and both scales); [`DomainError::InvalidRequest`]
+    /// for a currency with no registry scale; [`DomainError::Internal`] on a storage
+    /// failure.
     pub async fn set_policy(
         &self,
         ctx: &SecurityContext,
         scope: &AccessScope,
-        d2_threshold_minor: i64,
+        d2_thresholds: Vec<PostedMoney>,
         a6_backdating_biz_days: i32,
         pending_ttl_seconds: i64,
         effective_from: OffsetDateTime,
     ) -> Result<i64, DomainError> {
-        validate_config(
-            d2_threshold_minor,
-            a6_backdating_biz_days,
-            pending_ttl_seconds,
-        )
-        .map_err(policy_config_to_domain)?;
+        // Validated once, by type: no repeated currency, every value in range,
+        // A6 and the TTL within their limits.
+        let policy = D2Thresholds::try_new(d2_thresholds)
+            .and_then(|d2| {
+                DualControlPolicy::try_new(d2, a6_backdating_biz_days, pending_ttl_seconds)
+            })
+            .map_err(policy_config_to_domain)?;
         let tenant = ctx.subject_tenant_id();
         let created_at_utc = OffsetDateTime::now_utc();
         let scope_c = scope.clone();
-        let version = self
-            .db
-            .db()
-            .transaction_with_retry(TxConfig::serializable(), as_db_err, move |txn| {
-                let scope = scope_c.clone();
-                Box::pin(async move {
-                    let next = ApprovalRepo::max_policy_version(txn, &scope, tenant)
+        let op = RetryOp::new("dual-control policy write", Some(tenant));
+        let version = retry_transaction_for(&self.db.db(), op, move |txn| {
+            let scope = scope_c.clone();
+            let policy = policy.clone();
+            let resolver = CurrencyScaleResolver::new(self.reference.clone());
+            Box::pin(async move {
+                // Every threshold's scale must match the currency registry on this
+                // transaction: a threshold at a stale scale would make every D2
+                // lookup in its currency fail.
+                for value in policy.d2_thresholds().iter() {
+                    let currency = value.currency();
+                    let registered = resolver
+                        .resolve_in(txn, &scope, tenant, currency.code())
                         .await
-                        .map_err(repo_to_db)?
-                        .map_or(0, |v| v + 1);
-                    ApprovalRepo::insert_policy_row(
-                        txn,
-                        &scope,
-                        NewPolicyVersion {
-                            tenant,
-                            version: next,
-                            effective_from,
-                            d2_threshold_minor,
-                            a6_backdating_biz_days,
-                            pending_ttl_seconds,
-                            created_at_utc,
-                        },
-                    )
+                        .map_err(AttemptError::from)?;
+                    if registered != currency.scale() {
+                        return Err(AttemptError::Business(threshold_scale_mismatch(
+                            currency.code(),
+                            registered,
+                            currency.scale(),
+                        )));
+                    }
+                }
+                let next = ApprovalRepo::max_policy_version(txn, &scope, tenant)
                     .await
-                    .map_err(repo_to_db)?;
-                    Ok::<i64, DbError>(next)
-                })
+                    .map_err(AttemptError::from)?
+                    .map(|v| {
+                        v.checked_add(1).ok_or_else(|| {
+                            AttemptError::Business(DomainError::Internal(
+                                "policy version overflow".into(),
+                            ))
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                ApprovalRepo::insert_policy_row(
+                    txn,
+                    &scope,
+                    NewPolicyVersion {
+                        tenant,
+                        version: next,
+                        effective_from,
+                        policy,
+                        created_at_utc,
+                    },
+                )
+                .await
+                .map_err(AttemptError::from)?;
+                Ok::<i64, AttemptError>(next)
             })
-            .await
-            .map_err(|e| DomainError::Internal(format!("set dual-control policy txn: {e}")))?;
+        })
+        .await?;
         Ok(version)
     }
 
@@ -483,8 +548,8 @@ impl ApprovalService {
                 "approver must differ from preparer for approval {approval_id}"
             )));
         }
-        let intent: ApprovalIntent = serde_json::from_value(row.intent.clone())
-            .map_err(|e| DomainError::Internal(format!("deserialize approval intent: {e}")))?;
+        validate_threshold_snapshot(row.threshold_snapshot.clone())?;
+        let intent = decode_intent(row.intent.clone())?;
 
         // (0) Latch PENDING → APPROVING in its own txn. Once latched, the decision
         //     verbs (reject/cancel/request-changes — all keyed on PENDING) match no
@@ -498,6 +563,7 @@ impl ApprovalService {
                     scope,
                     approval_id,
                     ApprovalState::Pending,
+                    row.revision,
                     ApprovalState::Approving,
                 )
                 .await?
@@ -519,6 +585,7 @@ impl ApprovalService {
                     scope,
                     approval_id,
                     ApprovalState::Approving,
+                    row.revision,
                     ApprovalState::Pending,
                 )
                 .await
@@ -700,7 +767,7 @@ impl ApprovalService {
 
     /// Resubmit a `NEEDS_REWORK` approval back to `PENDING` with the preparer's
     /// edited intent, bumping `revision`. The kind cannot change. Re-evaluates the
-    /// threshold on the edited intent and re-snapshots the policy in force (DC17);
+    /// transaction threshold metadata and re-snapshots the policy in force (DC17);
     /// an approval, once required, is never dropped by shrinking the amount —
     /// resubmit always returns to `PENDING`, never auto-applies.
     ///
@@ -744,27 +811,40 @@ impl ApprovalService {
         // payment_id) under the still-frozen business_key, and the approver would
         // book the credit / reversal / chargeback to the swapped party: the executor
         // replays the stored body and `ApprovalDto` never surfaces the recipient.
-        let original_intent: ApprovalIntent = serde_json::from_value(row.intent.clone())
-            .map_err(|e| DomainError::Internal(format!("deserialize approval intent: {e}")))?;
+        validate_threshold_snapshot(row.threshold_snapshot.clone())?;
+        let original_intent = decode_intent(row.intent.clone())?;
         if !new_intent.same_target(&original_intent) {
             return Err(DomainError::ApprovalNotActionable(
                 "resubmit cannot change the approval target; only the amount may be edited"
                     .to_owned(),
             ));
         }
-        // DC17: re-evaluate the threshold against the EDITED intent and re-snapshot
-        // the policy in force NOW (not a stub). The recorded `threshold_snapshot`
-        // must reflect the policy that applied at resubmit time; the approval is
-        // never silently dropped (it always returns to PENDING, so an approver is
-        // still required even if the edited amount is now below threshold).
+        // DC17: capture current policy and edited transaction money without a new
+        // functional comparison. The captured basis states that this is a
+        // resubmission snapshot; approval remains required even below threshold.
         let versions = self.repo.read_policy_versions(scope, tenant).await?;
         let resolved_at = OffsetDateTime::now_utc();
         let policy = resolve_policy(&versions, resolved_at);
-        let new_threshold_snapshot = threshold_snapshot(&policy, resolved_at);
-        let new_amount_usd_eq_minor = new_intent.amount_minor();
-        let new_revision = row.revision + 1;
-        let intent_json = serde_json::to_value(&new_intent)
-            .map_err(|e| DomainError::Internal(format!("serialize approval intent: {e}")))?;
+        let new_amount = new_intent.amount()?;
+        let resolved = new_amount
+            .as_ref()
+            .map(|v| policy.d2_threshold(v.currency()))
+            .transpose()
+            .map_err(policy_config_to_domain)?;
+        let new_threshold_snapshot = threshold_snapshot(
+            &policy,
+            resolved_at,
+            effective_version(&versions, resolved_at).as_ref(),
+            SnapshotBasis::ResubmissionTransactionSnapshot,
+            resolved.as_ref(),
+        );
+        let new_threshold_snapshot = serde_json::to_value(new_threshold_snapshot)
+            .map_err(|e| DomainError::Internal(format!("encode approval policy snapshot: {e}")))?;
+        let expected_revision = row.revision;
+        let new_revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(|| DomainError::Internal("approval revision overflow".into()))?;
+        let intent_json = encode_intent(&new_intent)?;
         let body = decision_audit(
             "resubmitted",
             &row.kind,
@@ -776,48 +856,46 @@ impl ApprovalService {
         let scope_c = scope.clone();
         let now = OffsetDateTime::now_utc();
         let comment_id = Uuid::now_v7();
-        let applied = self
-            .db
-            .db()
-            .transaction_with_retry(TxConfig::serializable(), as_db_err, move |txn| {
-                let scope = scope_c.clone();
-                let intent_json = intent_json.clone();
-                let snapshot = new_threshold_snapshot.clone();
-                let body = body.clone();
-                Box::pin(async move {
-                    let rows = ApprovalRepo::resubmit(
-                        txn,
-                        &scope,
-                        tenant,
-                        approval_id,
-                        intent_json,
-                        snapshot,
-                        new_amount_usd_eq_minor,
-                        new_revision,
-                    )
-                    .await
-                    .map_err(repo_to_db)?;
-                    if rows == 0 {
-                        return Ok::<bool, DbError>(false);
-                    }
-                    ApprovalRepo::append_comment(
-                        txn,
-                        &scope,
-                        comment_id,
-                        approval_id,
-                        tenant,
-                        new_revision,
-                        caller,
-                        body,
-                        now,
-                    )
-                    .await
-                    .map_err(repo_to_db)?;
-                    Ok(true)
-                })
+        let op = RetryOp::new("dual-control resubmit", Some(tenant));
+        let applied = retry_transaction_for(&self.db.db(), op, move |txn| {
+            let scope = scope_c.clone();
+            let intent_json = intent_json.clone();
+            let snapshot = new_threshold_snapshot.clone();
+            let new_amount = new_amount.clone();
+            let body = body.clone();
+            Box::pin(async move {
+                let rows = ApprovalRepo::resubmit(
+                    txn,
+                    &scope,
+                    tenant,
+                    approval_id,
+                    intent_json,
+                    snapshot,
+                    new_amount,
+                    expected_revision,
+                )
+                .await
+                .map_err(AttemptError::from)?;
+                if rows == 0 {
+                    return Ok::<bool, AttemptError>(false);
+                }
+                ApprovalRepo::append_comment(
+                    txn,
+                    &scope,
+                    comment_id,
+                    approval_id,
+                    tenant,
+                    new_revision,
+                    caller,
+                    body,
+                    now,
+                )
+                .await
+                .map_err(AttemptError::from)?;
+                Ok(true)
             })
-            .await
-            .map_err(|e| DomainError::Internal(format!("approval resubmit txn: {e}")))?;
+        })
+        .await?;
         if !applied {
             return Err(DomainError::ApprovalNotActionable(format!(
                 "approval {approval_id} was not in NEEDS_REWORK (concurrent decision)"
@@ -829,10 +907,13 @@ impl ApprovalService {
 
     /// Append a free comment / question to an approval's thread (no state change).
     /// The author is the caller; authz (preparer or `entry_approve.v1`) is gated
-    /// at the REST layer.
+    /// at the REST layer. The comment is stamped with the revision read here; if
+    /// the approval moved on (for example a resubmit) before the write, it is
+    /// refused rather than stamped with the stale revision.
     ///
     /// # Errors
-    /// [`DomainError::ApprovalNotFound`] / [`DomainError::Internal`].
+    /// [`DomainError::ApprovalNotFound`]; [`DomainError::ApprovalNotActionable`] when the
+    /// revision changed before the comment was written; [`DomainError::Internal`].
     pub async fn add_comment(
         &self,
         ctx: &SecurityContext,
@@ -841,40 +922,60 @@ impl ApprovalService {
         body_text: String,
     ) -> Result<(), DomainError> {
         let tenant = ctx.subject_tenant_id();
-        let author = ctx.subject_id();
         let row = self
             .repo
             .read(scope, tenant, approval_id)
             .await?
             .ok_or_else(|| DomainError::ApprovalNotFound(format!("approval {approval_id}")))?;
-        let revision = row.revision;
+        self.append_comment_at(ctx, scope, approval_id, row.revision, body_text)
+            .await
+    }
+
+    /// Write a comment stamped with `revision`, re-checking inside the write
+    /// transaction that the approval is still at that revision.
+    async fn append_comment_at(
+        &self,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        approval_id: Uuid,
+        revision: i32,
+        body_text: String,
+    ) -> Result<(), DomainError> {
+        let tenant = ctx.subject_tenant_id();
+        let author = ctx.subject_id();
         let scope_c = scope.clone();
         let now = OffsetDateTime::now_utc();
         let comment_id = Uuid::now_v7();
-        self.db
-            .db()
-            .transaction_with_retry(TxConfig::serializable(), as_db_err, move |txn| {
-                let scope = scope_c.clone();
-                let body = body_text.clone();
-                Box::pin(async move {
-                    ApprovalRepo::append_comment(
-                        txn,
-                        &scope,
-                        comment_id,
-                        approval_id,
-                        tenant,
-                        revision,
-                        author,
-                        body,
-                        now,
-                    )
+        let op = RetryOp::new("dual-control comment", Some(tenant));
+        retry_transaction_for(&self.db.db(), op, move |txn| {
+            let scope = scope_c.clone();
+            let body = body_text.clone();
+            Box::pin(async move {
+                let current = ApprovalRepo::read_in_txn(txn, &scope, tenant, approval_id)
                     .await
-                    .map_err(repo_to_db)?;
-                    Ok::<(), DbError>(())
-                })
+                    .map_err(AttemptError::from)?;
+                if current.as_ref().map(|r| r.revision) != Some(revision) {
+                    return Err(AttemptError::Business(DomainError::ApprovalNotActionable(
+                        "comment revision changed".into(),
+                    )));
+                }
+                ApprovalRepo::append_comment(
+                    txn,
+                    &scope,
+                    comment_id,
+                    approval_id,
+                    tenant,
+                    revision,
+                    author,
+                    body,
+                    now,
+                )
+                .await
+                .map_err(AttemptError::from)?;
+                Ok::<(), AttemptError>(())
             })
-            .await
-            .map_err(|e| DomainError::Internal(format!("add comment txn: {e}")))?;
+        })
+        .await?;
         Ok(())
     }
 
@@ -888,7 +989,7 @@ impl ApprovalService {
         scope: &AccessScope,
         state: Option<&str>,
         kind: Option<&str>,
-    ) -> Result<Vec<crate::infra::storage::entity::dual_control_approval::Model>, DomainError> {
+    ) -> Result<Vec<ApprovalRow>, DomainError> {
         self.repo
             .list(scope, ctx.subject_tenant_id(), state, kind)
             .await
@@ -903,8 +1004,7 @@ impl ApprovalService {
         ctx: &SecurityContext,
         scope: &AccessScope,
         approval_id: Uuid,
-    ) -> Result<Option<crate::infra::storage::entity::dual_control_approval::Model>, DomainError>
-    {
+    ) -> Result<Option<ApprovalRow>, DomainError> {
         self.repo
             .read(scope, ctx.subject_tenant_id(), approval_id)
             .await
@@ -933,7 +1033,7 @@ impl ApprovalService {
         scope: &AccessScope,
         tenant: Uuid,
         approval_id: Uuid,
-    ) -> Result<crate::infra::storage::entity::dual_control_approval::Model, DomainError> {
+    ) -> Result<ApprovalRow, DomainError> {
         let row = self
             .repo
             .read(scope, tenant, approval_id)
@@ -973,34 +1073,33 @@ impl ApprovalService {
         scope: &AccessScope,
         approval_id: Uuid,
         expected: ApprovalState,
+        revision: i32,
         new_state: ApprovalState,
     ) -> Result<bool, DomainError> {
         let scope = scope.clone();
         let expected_s = expected.as_str();
         let new_s = new_state.as_str();
-        let applied = self
-            .db
-            .db()
-            .transaction_with_retry(TxConfig::serializable(), as_db_err, move |txn| {
-                let scope = scope.clone();
-                Box::pin(async move {
-                    let rows = ApprovalRepo::transition(
-                        txn,
-                        &scope,
-                        tenant,
-                        approval_id,
-                        expected_s,
-                        new_s,
-                        None,
-                        None,
-                    )
-                    .await
-                    .map_err(repo_to_db)?;
-                    Ok::<bool, DbError>(rows > 0)
-                })
+        let op = RetryOp::new("dual-control transition", Some(tenant));
+        let applied = retry_transaction_for(&self.db.db(), op, move |txn| {
+            let scope = scope.clone();
+            Box::pin(async move {
+                let rows = ApprovalRepo::transition(
+                    txn,
+                    &scope,
+                    tenant,
+                    approval_id,
+                    expected_s,
+                    revision,
+                    new_s,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(AttemptError::from)?;
+                Ok::<bool, AttemptError>(rows > 0)
             })
-            .await
-            .map_err(|e| DomainError::Internal(format!("approval latch txn: {e}")))?;
+        })
+        .await?;
         Ok(applied)
     }
 
@@ -1010,7 +1109,7 @@ impl ApprovalService {
         scope: &AccessScope,
         tenant: Uuid,
         approval_id: Uuid,
-    ) -> Result<crate::infra::storage::entity::dual_control_approval::Model, DomainError> {
+    ) -> Result<ApprovalRow, DomainError> {
         let row = self
             .repo
             .read(scope, tenant, approval_id)
@@ -1059,46 +1158,44 @@ impl ApprovalService {
         let approved_by = (new_state == ApprovalState::Approved).then_some(decider);
         let now = OffsetDateTime::now_utc();
         let comment_id = Uuid::now_v7();
-        let applied = self
-            .db
-            .db()
-            .transaction_with_retry(TxConfig::serializable(), as_db_err, move |txn| {
-                let scope = scope.clone();
-                let body = audit_body.clone();
-                Box::pin(async move {
-                    let rows = ApprovalRepo::transition(
-                        txn,
-                        &scope,
-                        tenant,
-                        approval_id,
-                        expected_s,
-                        new_s,
-                        approved_by,
-                        Some(now),
-                    )
-                    .await
-                    .map_err(repo_to_db)?;
-                    if rows == 0 {
-                        return Ok::<bool, DbError>(false);
-                    }
-                    ApprovalRepo::append_comment(
-                        txn,
-                        &scope,
-                        comment_id,
-                        approval_id,
-                        tenant,
-                        revision,
-                        decider,
-                        body,
-                        now,
-                    )
-                    .await
-                    .map_err(repo_to_db)?;
-                    Ok(true)
-                })
+        let op = RetryOp::new("dual-control decision", Some(tenant));
+        let applied = retry_transaction_for(&self.db.db(), op, move |txn| {
+            let scope = scope.clone();
+            let body = audit_body.clone();
+            Box::pin(async move {
+                let rows = ApprovalRepo::transition(
+                    txn,
+                    &scope,
+                    tenant,
+                    approval_id,
+                    expected_s,
+                    revision,
+                    new_s,
+                    approved_by,
+                    Some(now),
+                )
+                .await
+                .map_err(AttemptError::from)?;
+                if rows == 0 {
+                    return Ok::<bool, AttemptError>(false);
+                }
+                ApprovalRepo::append_comment(
+                    txn,
+                    &scope,
+                    comment_id,
+                    approval_id,
+                    tenant,
+                    revision,
+                    decider,
+                    body,
+                    now,
+                )
+                .await
+                .map_err(AttemptError::from)?;
+                Ok(true)
             })
-            .await
-            .map_err(|e| DomainError::Internal(format!("approval decision txn: {e}")))?;
+        })
+        .await?;
         if applied {
             Ok(())
         } else {
@@ -1106,6 +1203,22 @@ impl ApprovalService {
                 "approval {approval_id} was not in {expected_s} (concurrent decision or stale state)"
             )))
         }
+    }
+}
+
+/// Classify a pending insert failure for the retry loop. A lost DC13 race is
+/// deterministic (the winner's row is committed, so another attempt would hit
+/// the same index): it stops the attempt without a retry, and the branch after
+/// the loop reads the winner. Any other failure keeps its classification
+/// (contention retries, everything else stops).
+fn pending_insert_error(error: InsertPendingError) -> AttemptError {
+    match error {
+        InsertPendingError::ActiveExists => {
+            AttemptError::Business(DomainError::ConcurrentModification(
+                "an active approval already exists for the business key".into(),
+            ))
+        }
+        InsertPendingError::Repo(error) => error.into(),
     }
 }
 
@@ -1117,32 +1230,82 @@ fn parse_state(s: &str) -> Result<ApprovalState, DomainError> {
 
 /// The threshold-snapshot recorded on a pending approval: which policy values
 /// applied + when resolved (audit trail; DC8/DC17). Built identically by `gate`
-/// (on create) and `resubmit` (on re-evaluation against the edited intent), so the
+/// (on create) and `resubmit` (transaction policy provenance), so the
 /// recorded snapshot is never a stub.
-fn threshold_snapshot(policy: &DualControlPolicy, now: OffsetDateTime) -> serde_json::Value {
-    serde_json::json!({
-        "d2_threshold_minor": policy.d2_threshold_minor,
-        "a6_backdating_biz_days": policy.a6_backdating_biz_days,
-        "pending_ttl_seconds": policy.pending_ttl_seconds,
-        "resolved_at": format_rfc3339(now),
-    })
+fn threshold_snapshot(
+    policy: &DualControlPolicy,
+    now: OffsetDateTime,
+    version: Option<&PolicyVersion>,
+    basis: SnapshotBasis,
+    threshold: Option<&PostedMoney>,
+) -> StoredThresholdSnapshot {
+    use crate::infra::storage::money_text::StoredMoney;
+    StoredThresholdSnapshot {
+        d2_default: D2_DEFAULT_RULE.to_owned(),
+        d2_thresholds: policy
+            .d2_thresholds()
+            .iter()
+            .map(StoredMoney::from)
+            .collect(),
+        d2_threshold: threshold.map(StoredMoney::from),
+        policy_version: version.map(|v| v.version),
+        policy_effective_from: version.map(|v| format_rfc3339(v.effective_from)),
+        basis,
+        a6_backdating_biz_days: policy.a6_backdating_biz_days(),
+        pending_ttl_seconds: policy.pending_ttl_seconds(),
+        resolved_at: format_rfc3339(now),
+    }
 }
 
-/// Map a pure policy-config range rejection (DC9/DC11) to the domain error: an
-/// out-of-range D2/A6/TTL is `DualControlPolicyOutOfRange` (→ 409, no clamp).
+/// A D2 threshold submitted at a scale other than the currency registry's:
+/// names the currency and both scales, so a caller setting several thresholds
+/// can tell which one is stale.
+fn threshold_scale_mismatch(currency: &str, registered: u8, submitted: u8) -> DomainError {
+    DomainError::InconsistentScale(format!(
+        "D2 threshold currency {currency} is registered at scale {registered} \
+         but was submitted at scale {submitted}"
+    ))
+}
+
+/// Map distinct policy defects without collapsing metadata conflicts.
 fn policy_config_to_domain(e: PolicyConfigError) -> DomainError {
-    let detail = match e {
-        PolicyConfigError::D2OutOfRange(v) => {
-            format!("d2_threshold_minor {v} out of range [10000..100000000]")
+    match e {
+        PolicyConfigError::MetadataConflict {
+            currency,
+            configured_scale,
+            other_scale,
+        } => DomainError::InconsistentScale(format!(
+            "D2 threshold currency {currency} is configured at scale {configured_scale} \
+             but used at scale {other_scale}"
+        )),
+        PolicyConfigError::DuplicateCurrency(currency) => {
+            DomainError::InvalidRequest(format!("duplicate D2 currency {currency}"))
         }
-        PolicyConfigError::A6OutOfRange(v) => {
-            format!("a6_backdating_biz_days {v} out of range [1..30]")
+        PolicyConfigError::D2OutOfRange {
+            threshold,
+            min,
+            max,
+        } => DomainError::DualControlPolicyOutOfRange(format!(
+            "D2 threshold {threshold} (scale {}) outside [{}, {}]",
+            threshold.currency().scale(),
+            bss_ledger_sdk::canonical_decimal(min),
+            bss_ledger_sdk::canonical_decimal(max),
+        )),
+        PolicyConfigError::D2DefaultUnrepresentable(currency) => {
+            DomainError::DualControlPolicyOutOfRange(format!(
+                "default D2 threshold is not representable for {} at scale {}",
+                currency.code(),
+                currency.scale()
+            ))
         }
-        PolicyConfigError::TtlNotPositive(v) => format!("pending_ttl_seconds {v} must be > 0"),
-    };
-    DomainError::DualControlPolicyOutOfRange(detail)
+        PolicyConfigError::A6OutOfRange(v) => DomainError::DualControlPolicyOutOfRange(format!(
+            "a6_backdating_biz_days {v} out of range [1..30]"
+        )),
+        PolicyConfigError::TtlNotPositive(v) => {
+            DomainError::DualControlPolicyOutOfRange(format!("pending_ttl_seconds {v} must be > 0"))
+        }
+    }
 }
-
 /// The structured decision-audit body recorded on the append-only comment thread
 /// (the Slice-2 stand-in for `secured_audit_record`, DC7). `event_type` mirrors
 /// the design's `exception-resolution` audit class.
@@ -1166,19 +1329,16 @@ fn decision_audit(
     .to_string()
 }
 
-/// Retry-extractor: a wrapped `DbErr` is recognised as retryable serialization
-/// contention (mirrors `PostingService::as_db_err`).
-fn as_db_err(e: &DbError) -> Option<&DbErr> {
-    match e {
-        DbError::Sea(db_err) => Some(db_err),
-        _ => None,
+/// An active business key is idempotent only for the full canonical captured intent.
+fn ensure_same_intent(row: &ApprovalRow, intent: &ApprovalIntent) -> Result<(), DomainError> {
+    if canonical_identity(&decode_intent(row.intent.clone())?)? != canonical_identity(intent)? {
+        return Err(DomainError::ApprovalNotActionable(
+            "active approval has different captured intent".into(),
+        ));
     }
+    Ok(())
 }
 
-/// Encode a repo failure as a non-retryable `DbError` so the decision txn rolls
-/// back and surfaces as an internal fault (business outcomes are carried by the
-/// `bool`/`rows` path, not by error).
-#[allow(clippy::needless_pass_by_value)] // used as a `map_err` fn pointer (FnOnce(RepoError))
-fn repo_to_db(e: RepoError) -> DbError {
-    DbError::Sea(DbErr::Custom(format!("approval repo: {e:?}")))
-}
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod tests;

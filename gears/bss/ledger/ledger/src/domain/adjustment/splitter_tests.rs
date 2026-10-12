@@ -6,6 +6,18 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
+use crate::domain::exact_money::sum_posted;
+use bss_ledger_sdk::money::{CurrencySpec, PostedMoney};
+use rust_decimal::Decimal;
+/// Original USD fixtures expressed economically at their real scale of two.
+fn m(cents: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(cents, 2),
+        CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
 use crate::domain::error::DomainError;
 use crate::domain::status::SCHEDULE_STATUS_COMPLETED;
 
@@ -19,8 +31,8 @@ fn active(
     ScheduleStreamState {
         revenue_stream: stream.to_owned(),
         schedule_id: schedule_id.to_owned(),
-        total_deferred_minor: total_deferred,
-        recognized_minor: recognized,
+        total_deferred: m(total_deferred),
+        recognized: m(recognized),
         status: SCHEDULE_STATUS_ACTIVE.to_owned(),
         version: 1,
     }
@@ -31,8 +43,8 @@ fn completed(stream: &str, schedule_id: &str, total_deferred: i64) -> ScheduleSt
     ScheduleStreamState {
         revenue_stream: stream.to_owned(),
         schedule_id: schedule_id.to_owned(),
-        total_deferred_minor: total_deferred,
-        recognized_minor: total_deferred,
+        total_deferred: m(total_deferred),
+        recognized: m(total_deferred),
         status: SCHEDULE_STATUS_COMPLETED.to_owned(),
         version: 5,
     }
@@ -45,8 +57,8 @@ fn input(streams: &[ScheduleStreamState], amount: i64, requested_deferred: i64) 
         source_invoice_item_ref: "inv-1:item-1",
         po_allocation_group: Some("po-grp-1"),
         streams,
-        amount_minor_ex_tax: amount,
-        requested_deferred_minor: requested_deferred,
+        amount_ex_tax: m(amount),
+        requested_deferred: m(requested_deferred),
     }
 }
 
@@ -60,11 +72,11 @@ fn fully_recognized_split_has_zero_deferred() {
     // wholly-recognized note (requested_deferred = 0).
     let streams = [active("recurring", "sch-1", 600, 600)];
     let result = split(&input(&streams, 10_000, 0)).unwrap();
-    assert_eq!(result.recognized_part_minor, 10_000);
-    assert_eq!(result.deferred_part_minor, 0);
+    assert_eq!(result.recognized_part, m(10_000));
+    assert_eq!(result.deferred_part, m(0));
     assert_eq!(result.per_stream.len(), 1);
-    assert_eq!(result.per_stream[0].recognized_part_minor, 10_000);
-    assert_eq!(result.per_stream[0].deferred_part_minor, 0);
+    assert_eq!(result.per_stream[0].recognized_part, m(10_000));
+    assert_eq!(result.per_stream[0].deferred_part, m(0));
     assert_eq!(result.per_stream[0].revenue_stream, "recurring");
     assert_eq!(result.per_stream[0].schedule_id, "sch-1");
 }
@@ -74,10 +86,10 @@ fn fully_deferred_split_has_zero_recognized() {
     // One ACTIVE stream with 10_000 releasable; the whole note is deferred.
     let streams = [active("recurring", "sch-1", 12_000, 2_000)]; // releasable 10_000
     let result = split(&input(&streams, 10_000, 10_000)).unwrap();
-    assert_eq!(result.recognized_part_minor, 0);
-    assert_eq!(result.deferred_part_minor, 10_000);
-    assert_eq!(result.per_stream[0].deferred_part_minor, 10_000);
-    assert_eq!(result.per_stream[0].recognized_part_minor, 0);
+    assert_eq!(result.recognized_part, m(0));
+    assert_eq!(result.deferred_part, m(10_000));
+    assert_eq!(result.per_stream[0].deferred_part, m(10_000));
+    assert_eq!(result.per_stream[0].recognized_part, m(0));
 }
 
 #[test]
@@ -86,14 +98,21 @@ fn mixed_split_places_recognized_and_deferred_on_the_single_stream() {
     // reduces recognized revenue.
     let streams = [active("recurring", "sch-1", 9_000, 5_000)]; // releasable 4_000
     let result = split(&input(&streams, 10_000, 3_000)).unwrap();
-    assert_eq!(result.recognized_part_minor, 7_000);
-    assert_eq!(result.deferred_part_minor, 3_000);
+    assert_eq!(result.recognized_part, m(7_000));
+    assert_eq!(result.deferred_part, m(3_000));
     assert_eq!(result.per_stream.len(), 1);
-    assert_eq!(result.per_stream[0].recognized_part_minor, 7_000);
-    assert_eq!(result.per_stream[0].deferred_part_minor, 3_000);
+    assert_eq!(result.per_stream[0].recognized_part, m(7_000));
+    assert_eq!(result.per_stream[0].deferred_part, m(3_000));
     // recognized + deferred == the note amount.
     let s = &result.per_stream[0];
-    assert_eq!(s.recognized_part_minor + s.deferred_part_minor, 10_000);
+    assert_eq!(
+        sum_posted(
+            &[s.recognized_part.clone(), s.deferred_part.clone()],
+            m(0).currency().clone()
+        )
+        .unwrap(),
+        m(10_000)
+    );
 }
 
 #[test]
@@ -104,7 +123,7 @@ fn deferred_request_over_releasable_remainder_blocks() {
     let err = split(&input(&streams, 10_000, 5_000)).unwrap_err();
     assert!(
         matches!(err, DomainError::CreditNoteSplitAmbiguous(_)),
-        "deferred over releasable must block, got {err:?}"
+        "deferred over releasable must block"
     );
 }
 
@@ -123,8 +142,8 @@ fn wholly_recognized_note_with_no_schedule_state_is_ok() {
     // amount is recognized, no per-stream reduction.
     let streams: [ScheduleStreamState; 0] = [];
     let result = split(&input(&streams, 10_000, 0)).unwrap();
-    assert_eq!(result.recognized_part_minor, 10_000);
-    assert_eq!(result.deferred_part_minor, 0);
+    assert_eq!(result.recognized_part, m(10_000));
+    assert_eq!(result.deferred_part, m(0));
     assert!(result.per_stream.is_empty());
 }
 
@@ -137,16 +156,16 @@ fn multi_stream_full_drain_splits_per_stream() {
         active("usage", "sch-B", 10_000, 4_000), // releasable 6_000
     ];
     let result = split(&input(&streams, 10_000, 10_000)).unwrap();
-    assert_eq!(result.deferred_part_minor, 10_000);
-    assert_eq!(result.recognized_part_minor, 0);
+    assert_eq!(result.deferred_part, m(10_000));
+    assert_eq!(result.recognized_part, m(0));
     assert_eq!(result.per_stream.len(), 2);
     // Each stream is drained to its own releasable remainder, same stream/schedule.
     assert_eq!(result.per_stream[0].revenue_stream, "recurring");
     assert_eq!(result.per_stream[0].schedule_id, "sch-A");
-    assert_eq!(result.per_stream[0].deferred_part_minor, 4_000);
+    assert_eq!(result.per_stream[0].deferred_part, m(4_000));
     assert_eq!(result.per_stream[1].revenue_stream, "usage");
     assert_eq!(result.per_stream[1].schedule_id, "sch-B");
-    assert_eq!(result.per_stream[1].deferred_part_minor, 6_000);
+    assert_eq!(result.per_stream[1].deferred_part, m(6_000));
 }
 
 #[test]
@@ -158,13 +177,13 @@ fn multi_stream_single_releasable_target_places_on_that_stream() {
         active("usage", "sch-B", 8_000, 3_000), // releasable 5_000
     ];
     let result = split(&input(&streams, 7_000, 5_000)).unwrap();
-    assert_eq!(result.deferred_part_minor, 5_000);
-    assert_eq!(result.recognized_part_minor, 2_000);
+    assert_eq!(result.deferred_part, m(5_000));
+    assert_eq!(result.recognized_part, m(2_000));
     // Deferred + recognized remainder both land on the single live stream (sch-B).
-    assert_eq!(result.per_stream[0].deferred_part_minor, 0);
-    assert_eq!(result.per_stream[0].recognized_part_minor, 0);
-    assert_eq!(result.per_stream[1].deferred_part_minor, 5_000);
-    assert_eq!(result.per_stream[1].recognized_part_minor, 2_000);
+    assert_eq!(result.per_stream[0].deferred_part, m(0));
+    assert_eq!(result.per_stream[0].recognized_part, m(0));
+    assert_eq!(result.per_stream[1].deferred_part, m(5_000));
+    assert_eq!(result.per_stream[1].recognized_part, m(2_000));
 }
 
 #[test]
@@ -179,7 +198,7 @@ fn multi_stream_partial_deferred_split_is_indeterminable_and_blocks() {
     let err = split(&input(&streams, 10_000, 3_000)).unwrap_err();
     assert!(
         matches!(err, DomainError::CreditNoteSplitAmbiguous(_)),
-        "partial multi-stream deferred split must block, got {err:?}"
+        "partial multi-stream deferred split must block"
     );
 }
 
@@ -195,7 +214,7 @@ fn multi_stream_full_drain_with_recognized_remainder_blocks() {
     let err = split(&input(&streams, 12_000, 10_000)).unwrap_err();
     assert!(
         matches!(err, DomainError::CreditNoteSplitAmbiguous(_)),
-        "multi-stream drain with a recognized remainder must block, got {err:?}"
+        "multi-stream drain with a recognized remainder must block"
     );
 }
 
@@ -213,7 +232,7 @@ fn wholly_recognized_note_against_multi_stream_obligation_blocks() {
     let err = split(&input(&streams, 5_000, 0)).unwrap_err();
     assert!(
         matches!(err, DomainError::CreditNoteSplitAmbiguous(_)),
-        "recognized-only multi-stream note must block (no pro-rata), got {err:?}"
+        "recognized-only multi-stream note must block (no pro-rata)"
     );
 }
 
@@ -247,7 +266,10 @@ fn non_active_schedule_has_no_releasable_remainder() {
     // A COMPLETED schedule yields 0 releasable even though total_deferred > 0, so a
     // deferred request against it blocks (no live balance to reduce).
     let streams = [completed("recurring", "sch-1", 8_000)];
-    assert_eq!(streams[0].releasable_remaining_minor(), 0);
+    assert_eq!(
+        streams[0].releasable_remaining().unwrap(),
+        ExactAmount::from_decimal(Decimal::ZERO)
+    );
     let err = split(&input(&streams, 5_000, 1_000)).unwrap_err();
     assert!(matches!(err, DomainError::CreditNoteSplitAmbiguous(_)));
 }
@@ -268,7 +290,7 @@ fn split_basis_ref_is_deterministic_and_carries_the_basis() {
     assert!(a.split_basis_ref.contains("recurring"));
     assert!(a.split_basis_ref.contains("sch-1"));
     // releasable remainder (4_000) is recorded for audit/replay.
-    assert!(a.split_basis_ref.contains("rel=4000"));
+    assert!(a.split_basis_ref.contains("rel=40"));
 }
 
 #[test]
@@ -278,11 +300,166 @@ fn split_basis_ref_handles_no_po_group_and_no_streams() {
         source_invoice_item_ref: "inv-9:item-2",
         po_allocation_group: None,
         streams: &streams,
-        amount_minor_ex_tax: 500,
-        requested_deferred_minor: 0,
+        amount_ex_tax: m(500),
+        requested_deferred: m(0),
     };
     let result = split(&inp).unwrap();
     assert!(result.split_basis_ref.contains("inv-9:item-2"));
     assert!(result.split_basis_ref.contains("po=-"));
     assert!(result.split_basis_ref.contains("streams=none"));
+}
+
+#[test]
+fn fractional_full_drain_and_single_owner_remain_distinct() {
+    let streams = [active("a", "sa", 234, 100), active("b", "sb", 333, 100)];
+    let r = split(&input(&streams, 367, 367)).unwrap();
+    assert_eq!(r.per_stream[0].deferred_part, m(134));
+    assert_eq!(r.per_stream[1].deferred_part, m(233));
+    assert!(matches!(
+        split(&input(&streams, 366, 366)),
+        Err(DomainError::CreditNoteSplitAmbiguous(_))
+    ));
+    assert!(matches!(
+        split(&input(&streams, 368, 367)),
+        Err(DomainError::CreditNoteSplitAmbiguous(_))
+    ));
+    let streams = [active("a", "sa", 234, 234), active("b", "sb", 333, 100)];
+    let r = split(&input(&streams, 1234, 233)).unwrap();
+    assert_eq!(r.per_stream[1].recognized_part, m(1001));
+    assert_eq!(r.per_stream[1].deferred_part, m(233));
+    assert!(r.split_basis_ref.contains("rel=2.33"));
+    assert!(r.split_basis_ref.contains("USD:2"));
+}
+#[test]
+fn invalid_counter_pairs_fail_even_for_zero_and_inactive_state() {
+    for (total, recognized) in [(100, 101), (-1, 0), (100, -1)] {
+        for status in ["ACTIVE", "COMPLETED", "REPLACED", "CANCELLED"] {
+            let mut state = active("a", "sa", total, recognized);
+            state.status = status.to_owned();
+            assert!(matches!(
+                state.releasable_remaining(),
+                Err(DomainError::Internal(_))
+            ));
+            assert!(matches!(
+                split(&input(&[state], 0, 0)),
+                Err(DomainError::Internal(_))
+            ));
+        }
+    }
+}
+#[test]
+fn splitter_checks_zero_metadata_before_noop_or_inactive_return() {
+    for (code, scale) in [("EUR", 2), ("USD", 3)] {
+        let wrong = PostedMoney::try_new(
+            Decimal::ZERO,
+            CurrencySpec::try_new(code.to_owned(), scale).unwrap(),
+        )
+        .unwrap();
+        let named = |e: DomainError| {
+            if code == "EUR" {
+                assert!(matches!(e, DomainError::CurrencyMismatch(_)));
+            } else {
+                assert!(matches!(e, DomainError::InconsistentScale(_)));
+            }
+        };
+        let mut i = input(&[], 0, 0);
+        i.requested_deferred = wrong.clone();
+        named(split(&i).unwrap_err());
+        let mut state = completed("a", "sa", 0);
+        state.recognized = wrong.clone();
+        named(state.releasable_remaining().unwrap_err());
+        let mut state = active("a", "sa", 0, 0);
+        state.total_deferred = wrong.clone();
+        state.recognized = wrong;
+        named(split(&input(&[state], 0, 0)).unwrap_err());
+    }
+}
+#[test]
+fn exact_availability_can_exceed_posted_bounds_without_premature_failure() {
+    let max = PostedMoney::try_new(
+        "9999999999999999999999999999".parse().unwrap(),
+        m(0).currency().clone(),
+    )
+    .unwrap();
+    let mut a = active("a", "sa", 0, 0);
+    a.total_deferred = max.clone();
+    let mut b = active("b", "sb", 0, 0);
+    b.total_deferred = max.clone();
+    let streams = [a.clone(), b];
+    // Zero request remains a zero split despite the exact availability exceeding bounds.
+    assert_eq!(split(&input(&streams, 0, 0)).unwrap().deferred_part, m(0));
+    let mut i = input(&streams, 0, 0);
+    i.amount_ex_tax = max.clone();
+    i.requested_deferred = max.clone();
+    assert!(matches!(
+        split(&i),
+        Err(DomainError::CreditNoteSplitAmbiguous(_))
+    ));
+    let streams = [a];
+    let mut i = input(&streams, 0, 0);
+    i.amount_ex_tax = max.clone();
+    i.requested_deferred = max.clone();
+    assert_eq!(split(&i).unwrap().deferred_part, max);
+}
+
+#[test]
+fn large_fractional_availability_allows_bounded_zero_recognized_and_partial_outputs() {
+    let mut state = active("a", "sa", 0, 1);
+    state.total_deferred = PostedMoney::try_new(
+        "1000000000000000000000000000".parse().unwrap(),
+        m(0).currency().clone(),
+    )
+    .unwrap();
+    let expected = "999999999999999999999999999.99";
+    assert_eq!(
+        state
+            .releasable_remaining()
+            .unwrap()
+            .canonical_at_scale(2)
+            .unwrap(),
+        expected
+    );
+    let streams = [state];
+    for (amount, deferred) in [(0, 0), (1, 0), (1234, 34), (1234, 1234)] {
+        let result = split(&input(&streams, amount, deferred)).unwrap();
+        assert_eq!(result.recognized_part, m(amount - deferred));
+        assert_eq!(result.deferred_part, m(deferred));
+        assert_eq!(result.per_stream[0].deferred_part, m(deferred));
+        assert_eq!(result.per_stream[0].recognized_part, m(amount - deferred));
+        assert!(
+            result
+                .split_basis_ref
+                .contains(&format!("rel={expected}:ACTIVE:USD:2"))
+        );
+    }
+}
+
+#[test]
+fn large_fractional_availability_preserves_multi_stream_ambiguity_and_final_bounds() {
+    let mut a = active("a", "sa", 0, 1);
+    a.total_deferred = PostedMoney::try_new(
+        "1000000000000000000000000000".parse().unwrap(),
+        m(0).currency().clone(),
+    )
+    .unwrap();
+    let b = active("b", "sb", 1, 0);
+    let streams = [a.clone(), b];
+    // Both streams can absorb a bounded partial request: choosing one remains ambiguous.
+    assert!(matches!(
+        split(&input(&streams, 1, 1)),
+        Err(DomainError::CreditNoteSplitAmbiguous(_))
+    ));
+    assert_eq!(split(&input(&streams, 0, 0)).unwrap().deferred_part, m(0));
+    // Their exact availability sums to a valid posted integer, but full drain would
+    // emit a first-stream reduction with an invalid 29-digit coefficient.
+    let mut i = input(&streams, 0, 0);
+    i.amount_ex_tax = a.total_deferred.clone();
+    i.requested_deferred = a.total_deferred.clone();
+    assert!(matches!(split(&i), Err(DomainError::AmountOutOfRange(_))));
+    // Inactive valid state still has zero availability; recognized-only output fits.
+    a.status = "COMPLETED".to_owned();
+    let streams = [a];
+    let result = split(&input(&streams, 1, 0)).unwrap();
+    assert_eq!(result.recognized_part, m(1));
+    assert!(result.split_basis_ref.contains("rel=0:COMPLETED:USD:2"));
 }

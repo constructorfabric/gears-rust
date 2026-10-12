@@ -8,7 +8,7 @@
 //! ZERO — there is **no realized FX_GAIN_LOSS line** (realized FX is recognised at
 //! the cash in/out points: settle S2 / refund S3). These tests prove the
 //! carry-forward keeps each closing grain's functional column in lockstep with
-//! `balance_minor` for both dispute variants:
+//! `balance` for both dispute variants:
 //!
 //! - `cash_hold_dispute_carries_functional_forward_no_fx`: a USD-functional seller
 //!   settles 120 EUR @ 1.08 (CASH_CLEARING carries 129.60 USD); a CASH_HOLD dispute
@@ -38,7 +38,6 @@ use bss_ledger::config::{FxConfig, RecognitionConfig};
 use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::chargeback::{DisputePhase, FundsAtOpen};
 use bss_ledger::domain::payment::settlement::SettlementInput;
 use bss_ledger::domain::ports::metrics::NoopLedgerMetrics;
@@ -53,7 +52,9 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{FxRepo, NewFxRate, ReferenceRepo};
 use bss_ledger_sdk::AccountClass;
+use bss_ledger_sdk::{CurrencySpec, PostedMoney};
 use chrono::NaiveDate;
+use rust_decimal::Decimal;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
@@ -73,6 +74,42 @@ async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
         .await
         .unwrap()
         .map(|r| r.try_get_by_index::<i64>(0).unwrap())
+}
+
+/// A scale-2 posting in `code` from a cent count (`12_000` ⇒ `120`).
+fn money(cents: i64, code: &str) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(cents, 2),
+        CurrencySpec::try_new(code.to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// An EUR@2 posting from a cent count.
+fn eur(cents: i64) -> PostedMoney {
+    money(cents, "EUR")
+}
+
+/// A canonical stored-amount expectation (`"129.6"`, `"0"`), shaped like
+/// the `Option` that `scalar_text` returns.
+#[allow(clippy::unnecessary_wraps)] // compared directly with `scalar_text`'s `Option`
+fn txt(canonical: &str) -> Option<String> {
+    Some(canonical.to_owned())
+}
+
+/// Read one stored canonical decimal text column (`None` when no row).
+async fn scalar_text(conn: &DatabaseConnection, sql: &str) -> Option<String> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| r.try_get_by_index::<String>(0).unwrap())
+}
+
+/// Read one computed numeric column as an exact decimal (`None` when no row).
+async fn scalar_numeric(conn: &DatabaseConnection, sql: &str) -> Option<Decimal> {
+    scalar_text(conn, sql)
+        .await
+        .map(|t| Decimal::from_str_exact(&t).unwrap().normalize())
 }
 
 fn naive(y: i32, m: u32, d: u32) -> NaiveDate {
@@ -124,9 +161,9 @@ struct Chart {
 /// scales, the functional-currency source (S5-F3), an OPEN current-month period,
 /// the EUR dispute/payment chart, and the USD FX_GAIN_LOSS account (provisioned so
 /// the "no FX line" assertions are positive — the account EXISTS but stays
-/// untouched, not merely absent). Seeds the EUR→USD rate at `rate_micro`.
+/// untouched, not merely absent). Seeds the EUR→USD rate at `rate`.
 async fn setup(
-    rate_micro: i64,
+    rate: Decimal,
 ) -> (
     testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
     DatabaseConnection,
@@ -163,8 +200,7 @@ async fn setup(
             .upsert_currency_scale(CurrencyScaleRow {
                 tenant_id: c.tenant,
                 currency: ccy.to_owned(),
-                minor_units: 2,
-                plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+                currency_scale: 2,
                 source: "iso".to_owned(),
             })
             .await
@@ -244,7 +280,7 @@ async fn setup(
             base_currency: "EUR".to_owned(),
             quote_currency: "USD".to_owned(),
             provider: "ecb".to_owned(),
-            rate_micro,
+            rate,
             as_of: now,
             fallback_order: 0,
         })
@@ -262,12 +298,16 @@ fn fx_config() -> FxConfig {
 }
 
 /// Functional column net (DR − CR) over one entry — must be 0 for a carry-forward.
-async fn entry_functional_net(raw: &DatabaseConnection, tenant: Uuid, entry: Uuid) -> Option<i64> {
-    scalar_i64(
+async fn entry_functional_net(
+    raw: &DatabaseConnection,
+    tenant: Uuid,
+    entry: Uuid,
+) -> Option<Decimal> {
+    scalar_numeric(
         raw,
         &format!(
-            "SELECT COALESCE(SUM(CASE WHEN side='DR' THEN functional_amount_minor \
-             ELSE -functional_amount_minor END),0)::bigint \
+            "SELECT COALESCE(SUM(CASE WHEN side='DR' THEN functional_amount::numeric \
+             ELSE -(functional_amount::numeric) END),0)::text \
              FROM bss.ledger_journal_line WHERE tenant_id='{tenant}' AND entry_id='{entry}'"
         ),
     )
@@ -278,12 +318,12 @@ async fn acct_balance(
     raw: &DatabaseConnection,
     tenant: Uuid,
     account: Uuid,
-) -> (Option<i64>, Option<i64>) {
-    let bal = scalar_i64(raw, &format!(
-        "SELECT balance_minor FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{account}'"
+) -> (Option<String>, Option<String>) {
+    let bal = scalar_text(raw, &format!(
+        "SELECT balance FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{account}'"
     )).await;
-    let func = scalar_i64(raw, &format!(
-        "SELECT functional_balance_minor FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{account}'"
+    let func = scalar_text(raw, &format!(
+        "SELECT functional_balance FROM bss.ledger_account_balance WHERE tenant_id='{tenant}' AND account_id='{account}'"
     )).await;
     (bal, func)
 }
@@ -292,7 +332,7 @@ async fn acct_balance(
 #[ignore = "requires Docker (testcontainers)"]
 async fn cash_hold_dispute_carries_functional_forward_no_fx() {
     // EUR→USD @ 1.08 at settle.
-    let (_c, raw, provider, chart, _period) = setup(1_080_000).await;
+    let (_c, raw, provider, chart, _period) = setup(Decimal::new(108, 2)).await;
     let ctx = SecurityContext::anonymous();
     let scope = AccessScope::for_tenant(chart.tenant);
     let cfg = fx_config();
@@ -311,9 +351,8 @@ async fn cash_hold_dispute_carries_functional_forward_no_fx() {
             tenant_id: chart.tenant,
             payer_tenant_id: chart.payer,
             payment_id: "PAY-CB-1".to_owned(),
-            gross_minor: 12_000,
-            fee_minor: 0,
-            currency: "EUR".to_owned(),
+            gross: eur(12_000),
+            fee: eur(0),
             effective_at: None,
         },
     )
@@ -321,7 +360,7 @@ async fn cash_hold_dispute_carries_functional_forward_no_fx() {
     .expect("cross-currency settle must post");
     assert_eq!(
         acct_balance(&raw, chart.tenant, chart.cash).await,
-        (Some(12_000), Some(12_960)),
+        (txt("120"), txt("129.6")),
         "CASH_CLEARING carries 120.00 EUR / 129.60 USD after settle"
     );
 
@@ -339,8 +378,7 @@ async fn cash_hold_dispute_carries_functional_forward_no_fx() {
         cycle: 1,
         phase,
         funds_at_open: FundsAtOpen::Withheld, // ⇒ CASH_HOLD
-        disputed_amount_minor: 12_000,
-        currency: "EUR".to_owned(),
+        disputed_amount: eur(12_000),
         effective_at: None,
     };
 
@@ -351,21 +389,21 @@ async fn cash_hold_dispute_carries_functional_forward_no_fx() {
         .await
     {
         Ok(ChargebackOutcome::Recorded(p)) => p.entry_id,
-        other => panic!("opened must post inline: {other:?}"),
+        _ => panic!("opened must post inline"),
     };
     assert_eq!(
         entry_functional_net(&raw, chart.tenant, opened).await,
-        Some(0),
+        Some(Decimal::ZERO),
         "opened entry functional column balances (carry-forward, no FX)"
     );
     assert_eq!(
         acct_balance(&raw, chart.tenant, chart.cash).await,
-        (Some(0), Some(0)),
+        (txt("0"), txt("0")),
         "CASH_CLEARING closes to (0, 0) — the held cash AND its cost basis left"
     );
     assert_eq!(
         acct_balance(&raw, chart.tenant, chart.dispute_hold).await,
-        (Some(12_000), Some(12_960)),
+        (txt("120"), txt("129.6")),
         "DISPUTE_HOLD carries the 120.00 EUR / 129.60 USD cost basis forward"
     );
 
@@ -375,21 +413,21 @@ async fn cash_hold_dispute_carries_functional_forward_no_fx() {
         .await
     {
         Ok(ChargebackOutcome::Recorded(p)) => p.entry_id,
-        other => panic!("won must post inline: {other:?}"),
+        _ => panic!("won must post inline"),
     };
     assert_eq!(
         entry_functional_net(&raw, chart.tenant, won).await,
-        Some(0),
+        Some(Decimal::ZERO),
         "won entry functional column balances (carry-forward, no FX)"
     );
     assert_eq!(
         acct_balance(&raw, chart.tenant, chart.dispute_hold).await,
-        (Some(0), Some(0)),
+        (txt("0"), txt("0")),
         "DISPUTE_HOLD closes to (0, 0) on won"
     );
     assert_eq!(
         acct_balance(&raw, chart.tenant, chart.cash).await,
-        (Some(12_000), Some(12_960)),
+        (txt("120"), txt("129.6")),
         "CASH_CLEARING regains 120.00 EUR / 129.60 USD — cost basis round-tripped"
     );
 
@@ -409,7 +447,7 @@ async fn cash_hold_dispute_carries_functional_forward_no_fx() {
 #[ignore = "requires Docker (testcontainers)"]
 async fn ar_reclass_lost_writes_off_at_carried_basis_no_fx() {
     // EUR→USD @ 1.10 at invoice post.
-    let (_c, raw, provider, chart, period_id) = setup(1_100_000).await;
+    let (_c, raw, provider, chart, period_id) = setup(Decimal::new(110, 2)).await;
     let ctx = SecurityContext::anonymous();
     let scope = AccessScope::for_tenant(chart.tenant);
     let cfg = fx_config();
@@ -434,9 +472,8 @@ async fn ar_reclass_lost_writes_off_at_carried_basis_no_fx() {
             due_date: Some(naive(2026, 12, 1)),
             period_id,
             items: vec![InvoiceItem {
-                amount_minor_ex_tax: 12_000,
-                deferred_minor: 0,
-                currency: "EUR".to_owned(),
+                amount_ex_tax: eur(12_000),
+                deferred: eur(0),
                 revenue_stream: "subscription".to_owned(),
                 catalog_class: Some(AccountClass::Revenue),
                 contract_class: None,
@@ -457,19 +494,19 @@ async fn ar_reclass_lost_writes_off_at_carried_basis_no_fx() {
     .expect("cross-currency invoice must post");
 
     let ar_carried = || async {
-        let bal = scalar_i64(&raw, &format!(
-            "SELECT balance_minor FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{}' AND invoice_id='INV-CB-1'",
+        let bal = scalar_text(&raw, &format!(
+            "SELECT balance FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{}' AND invoice_id='INV-CB-1'",
             chart.tenant
         )).await;
-        let func = scalar_i64(&raw, &format!(
-            "SELECT functional_balance_minor FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{}' AND invoice_id='INV-CB-1'",
+        let func = scalar_text(&raw, &format!(
+            "SELECT functional_balance FROM bss.ledger_ar_invoice_balance WHERE tenant_id='{}' AND invoice_id='INV-CB-1'",
             chart.tenant
         )).await;
         (bal, func)
     };
     assert_eq!(
         ar_carried().await,
-        (Some(12_000), Some(13_200)),
+        (txt("120"), txt("132")),
         "AR carries 120.00 EUR / 132.00 USD"
     );
 
@@ -487,8 +524,7 @@ async fn ar_reclass_lost_writes_off_at_carried_basis_no_fx() {
         cycle: 1,
         phase,
         funds_at_open: FundsAtOpen::NotMoved, // ⇒ AR_RECLASS
-        disputed_amount_minor: 12_000,
-        currency: "EUR".to_owned(),
+        disputed_amount: eur(12_000),
         effective_at: None,
     };
 
@@ -499,16 +535,16 @@ async fn ar_reclass_lost_writes_off_at_carried_basis_no_fx() {
         .await
     {
         Ok(ChargebackOutcome::Recorded(p)) => p.entry_id,
-        other => panic!("opened must post inline: {other:?}"),
+        _ => panic!("opened must post inline"),
     };
     assert_eq!(
         entry_functional_net(&raw, chart.tenant, opened).await,
-        Some(0),
+        Some(Decimal::ZERO),
         "opened reclass nets functional to 0"
     );
     assert_eq!(
         ar_carried().await,
-        (Some(12_000), Some(13_200)),
+        (txt("120"), txt("132")),
         "AR carried unchanged by a reclass"
     );
 
@@ -519,21 +555,21 @@ async fn ar_reclass_lost_writes_off_at_carried_basis_no_fx() {
         .await
     {
         Ok(ChargebackOutcome::Recorded(p)) => p.entry_id,
-        other => panic!("lost must post inline: {other:?}"),
+        _ => panic!("lost must post inline"),
     };
     assert_eq!(
         entry_functional_net(&raw, chart.tenant, lost).await,
-        Some(0),
+        Some(Decimal::ZERO),
         "lost write-off functional balances"
     );
     assert_eq!(
         ar_carried().await,
-        (Some(0), Some(0)),
+        (txt("0"), txt("0")),
         "AR written off to (0, 0) in both columns"
     );
     assert_eq!(
         acct_balance(&raw, chart.tenant, chart.dispute_loss).await,
-        (Some(12_000), Some(13_200)),
+        (txt("120"), txt("132")),
         "DISPUTE_LOSS_EXPENSE booked at the 132.00 USD carried cost basis"
     );
     assert_eq!(

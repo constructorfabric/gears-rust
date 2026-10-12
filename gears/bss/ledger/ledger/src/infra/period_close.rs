@@ -36,9 +36,7 @@ use std::time::Duration;
 use coord::{CoordError, LeaseGuard, LeaseManager};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
-use toolkit_db::secure::{
-    AccessScope, DbTx, ScopeError, SecureEntityExt, SecureUpdateExt, TxConfig,
-};
+use toolkit_db::secure::{AccessScope, DbTx, ScopeError, SecureEntityExt, SecureUpdateExt};
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -50,7 +48,6 @@ use bss_ledger_sdk::{
 
 use crate::domain::error::DomainError;
 use crate::domain::fx::revaluation_mode::RevaluationMode;
-use crate::domain::model::RepoError;
 use crate::domain::status::{PERIOD_STATUS_CLOSED, PERIOD_STATUS_OPEN};
 use crate::infra::audit::secured_audit_sink::{AuditEventType, SecuredAuditSink};
 use crate::infra::events::payloads::{
@@ -58,6 +55,7 @@ use crate::infra::events::payloads::{
 };
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::jobs::tieout::TieOutJob;
+use crate::infra::posting::retry::{AttemptError, RetryOp, retry_transaction_for};
 use crate::infra::storage::entity::fiscal_period;
 use crate::infra::storage::repo::{
     ExceptionQueueRepo, FxRevaluationModeRepo, FxRevaluationRunRepo, PeriodCloseRepo,
@@ -140,37 +138,14 @@ enum ReopenTxnResult {
     Reopened,
 }
 
-/// Extractor for the retry helper: a wrapped `DbErr` (so a serialization failure
-/// surfaced at a statement or COMMIT is recognised as retryable).
-fn as_db_err(e: &DbError) -> Option<&sea_orm::DbErr> {
-    match e {
-        DbError::Sea(db_err) => Some(db_err),
-        _ => None,
-    }
-}
-
 /// Map a `SecureORM` error into `DbError`, preserving the inner `DbErr` so a
-/// serialization failure at a scoped read / flip stays retryable via
-/// [`as_db_err`].
+/// serialization failure at a scoped read / flip stays retryable in
+/// [`retry_transaction_for`].
 fn scope_to_db(e: ScopeError) -> DbError {
     match e {
         ScopeError::Db(db_err) => DbError::Sea(db_err),
         other => DbError::Other(anyhow::anyhow!("scope: {other}")),
     }
-}
-
-/// Map a repo error into `DbError`. The gate's `exception_queue` / `period_close`
-/// statements are serialised against peer closes by the `coord` lease, so the
-/// lost-retryability of a stringified repo error here is benign (a rare conflict
-/// fails the close; the caller retries). The post-vs-close race is caught by the
-/// tie-out reads + the flip, which preserve the retryable `DbErr` via
-/// [`scope_to_db`].
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "error adapter used as a map_err fn-pointer; takes the error by value to match the closure signature"
-)]
-fn repo_to_db(e: RepoError) -> DbError {
-    DbError::Other(anyhow::anyhow!("period-close repo: {e}"))
 }
 
 /// Closes a clean fiscal period after a single-active, gated pre-close check;
@@ -289,30 +264,30 @@ impl PeriodCloseService {
         // flag-gated); `None` ⇒ the gate is inert. Cheap to clone (`Arc`s + bools).
         let control = self.control.clone();
 
-        let result: Result<CloseTxnResult, DbError> = self
-            .db
-            .db()
-            .transaction_with_retry(TxConfig::serializable(), as_db_err, move |txn| {
-                let publisher = Arc::clone(&publisher);
-                let db = db.clone();
-                let pid = pid.clone();
-                let ctx = ctx.clone();
-                let control = control.clone();
-                Box::pin(async move {
-                    close_in_txn(
-                        &ctx,
-                        txn,
-                        &db,
-                        &publisher,
-                        control.as_ref(),
-                        tenant_id,
-                        legal_entity_id,
-                        &pid,
-                    )
-                    .await
-                })
+        // A repository's classified contention arrives as `RepoError::Conflict` →
+        // `AttemptError::Conflict` and retries like a driver serialization failure.
+        let op = RetryOp::new("period close", Some(tenant_id));
+        let result = retry_transaction_for(&self.db.db(), op, move |txn| {
+            let publisher = Arc::clone(&publisher);
+            let db = db.clone();
+            let pid = pid.clone();
+            let ctx = ctx.clone();
+            let control = control.clone();
+            Box::pin(async move {
+                close_in_txn(
+                    &ctx,
+                    txn,
+                    &db,
+                    &publisher,
+                    control.as_ref(),
+                    tenant_id,
+                    legal_entity_id,
+                    &pid,
+                )
+                .await
             })
-            .await;
+        })
+        .await;
 
         match result {
             Ok(CloseTxnResult::NotFound) => Err(DomainError::PeriodNotFound(period_id)),
@@ -330,7 +305,7 @@ impl PeriodCloseService {
                 period_id,
                 already_closed,
             }),
-            Err(e) => Err(DomainError::Internal(format!("close txn: {e}"))),
+            Err(e) => Err(e),
         }
     }
 
@@ -388,22 +363,20 @@ impl PeriodCloseService {
         let audit = Arc::clone(&self.audit);
         let pid = period_id.to_owned();
 
-        let result: Result<ReopenTxnResult, DbError> = self
-            .db
-            .db()
-            .transaction_with_retry(TxConfig::serializable(), as_db_err, move |txn| {
-                let audit = Arc::clone(&audit);
-                let pid = pid.clone();
-                Box::pin(async move {
-                    reopen_in_txn(txn, &audit, tenant_id, legal_entity_id, &pid, actor).await
-                })
+        let op = RetryOp::new("period reopen", Some(tenant_id));
+        let result = retry_transaction_for(&self.db.db(), op, move |txn| {
+            let audit = Arc::clone(&audit);
+            let pid = pid.clone();
+            Box::pin(async move {
+                reopen_in_txn(txn, &audit, tenant_id, legal_entity_id, &pid, actor).await
             })
-            .await;
+        })
+        .await;
 
         match result {
             Ok(ReopenTxnResult::NotFound) => Err(DomainError::PeriodNotFound(period_id.to_owned())),
             Ok(ReopenTxnResult::NoOp | ReopenTxnResult::Reopened) => Ok(()),
-            Err(e) => Err(DomainError::Internal(format!("reopen txn: {e}"))),
+            Err(e) => Err(e),
         }
     }
 
@@ -450,7 +423,7 @@ async fn close_in_txn(
     tenant_id: Uuid,
     legal_entity_id: Uuid,
     period_id: &str,
-) -> Result<CloseTxnResult, DbError> {
+) -> Result<CloseTxnResult, AttemptError> {
     let scope = AccessScope::for_tenant(tenant_id);
     let actor = ctx.subject_id();
     let actor_s = actor.to_string();
@@ -491,9 +464,7 @@ async fn close_in_txn(
 
     // 2b. OPEN close-blocking exceptions for the period (APPROVED_EXCEPTION rows
     // are not OPEN, so a Finance-acknowledged GL-writeoff variance is excluded).
-    let open = ExceptionQueueRepo::list_open_in_txn(txn, &scope, tenant_id, period_id)
-        .await
-        .map_err(repo_to_db)?;
+    let open = ExceptionQueueRepo::list_open_in_txn(txn, &scope, tenant_id, period_id).await?;
     if !open.is_empty() {
         let listed: Vec<String> = open
             .iter()
@@ -507,8 +478,9 @@ async fn close_in_txn(
     }
 
     // 2c. Recognition segments due `<=` this period that have not released.
-    let due_not_done =
-        RecognitionRepo::count_due_not_done_in_txn(txn, &scope, tenant_id, period_id).await?;
+    let due_not_done = RecognitionRepo::new(db.clone())
+        .count_due_not_done_in_txn(txn, &scope, tenant_id, period_id)
+        .await?;
     if due_not_done > 0 {
         reasons.push(format!(
             "{due_not_done} recognition segment(s) due <= {period_id} not DONE"
@@ -606,15 +578,12 @@ async fn close_in_txn(
                 tenant_id,
                 OffsetDateTime::now_utc(),
             )
-            .await
-            .map_err(repo_to_db)?
+            .await?
             .unwrap_or(RevaluationMode::fleet_default(
                 control.fx_revaluation_enforcement,
             ));
             let complete = if mode.revalues() {
-                FxRevaluationRunRepo::is_period_complete(txn, &scope, tenant_id, period_id)
-                    .await
-                    .map_err(repo_to_db)?
+                FxRevaluationRunRepo::is_period_complete(txn, &scope, tenant_id, period_id).await?
             } else {
                 // Mode A is exempt — the tenant's ERP revalues; nothing to require.
                 true
@@ -664,8 +633,7 @@ async fn close_in_txn(
             None,
             None,
         )
-        .await
-        .map_err(repo_to_db)?;
+        .await?;
         return Ok(CloseTxnResult::Blocked(reasons));
     }
 
@@ -702,8 +670,7 @@ async fn close_in_txn(
         None,
         Some(closed_at),
     )
-    .await
-    .map_err(repo_to_db)?;
+    .await?;
 
     // Emit `period.closed` ONLY on a real `OPEN→CLOSED` flip (`rows_affected > 0`),
     // never on an idempotent no-op (a concurrent peer beat us to the flip under the
@@ -754,7 +721,7 @@ async fn reopen_in_txn(
     legal_entity_id: Uuid,
     period_id: &str,
     actor: Uuid,
-) -> Result<ReopenTxnResult, DbError> {
+) -> Result<ReopenTxnResult, AttemptError> {
     let scope = AccessScope::for_tenant(tenant_id);
 
     let row = fiscal_period::Entity::find()
@@ -810,8 +777,7 @@ async fn reopen_in_txn(
         None,
         None,
     )
-    .await
-    .map_err(repo_to_db)?;
+    .await?;
 
     // Slice-6 `period-reopen` secured-audit record (NO-OP sink until Slice 6).
     let before_after = serde_json::json!({
@@ -835,3 +801,7 @@ async fn reopen_in_txn(
 
     Ok(ReopenTxnResult::Reopened)
 }
+
+#[cfg(test)]
+#[path = "period_close_retry_tests.rs"]
+mod retry_tests;

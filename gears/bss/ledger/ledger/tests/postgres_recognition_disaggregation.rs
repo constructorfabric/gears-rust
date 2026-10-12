@@ -12,7 +12,7 @@
 //!   revenue_stream)`); a run releases every due segment so EACH stream's
 //!   per-stream `CONTRACT_LIABILITY` balance drains to zero;
 //! - **disaggregation**: the report returns one entry per stream with the right
-//!   `recognized_minor`, at the `(period_id, revenue_stream)` grain.
+//!   `recognized`, at the `(period_id, revenue_stream)` grain.
 //!
 //! `LedgerLocalClient::new` is `pub(crate)`, so this out-of-crate test drives the
 //! `pub` services + repo directly (mirrors `postgres_recognition_run.rs`).
@@ -35,7 +35,6 @@ use std::sync::Arc;
 use bss_ledger::config::{FxConfig, RecognitionConfig};
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice, TaxBreakdown};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::recognition::input::{RecognitionInput, RecognitionTiming};
 use bss_ledger::infra::events::publisher::LedgerEventPublisher;
 use bss_ledger::infra::invoice_post::InvoicePostService;
@@ -55,6 +54,33 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Validated USD scale-2 money from canonical stored text (`"12.34"`).
+fn usd_text(text: &str) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        bss_ledger_sdk::parse_decimal(text).unwrap(),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Read one canonical decimal TEXT money column as USD scale-2 money.
+async fn scalar_money(conn: &DatabaseConnection, sql: &str) -> Option<bss_ledger_sdk::PostedMoney> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| usd_text(&r.try_get_by_index::<String>(0).unwrap()))
 }
 
 async fn scalar_i64(conn: &DatabaseConnection, sql: &str) -> Option<i64> {
@@ -154,8 +180,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: s.tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -223,9 +248,8 @@ fn recognized_item(
     item_ref: &str,
 ) -> InvoiceItem {
     InvoiceItem {
-        amount_minor_ex_tax: amount,
-        deferred_minor: 0,
-        currency: "USD".to_owned(),
+        amount_ex_tax: usd_cents(amount),
+        deferred: usd_cents(0),
         revenue_stream: stream.to_owned(),
         catalog_class: Some(AccountClass::Revenue),
         contract_class: None,
@@ -285,11 +309,15 @@ fn run_svc(provider: &DBProvider<DbError>, harness: &MetricsHarness) -> Recognit
     )
 }
 
-async fn bal(raw: &DatabaseConnection, s: &Seller, account: Uuid) -> Option<i64> {
-    scalar_i64(
+async fn bal(
+    raw: &DatabaseConnection,
+    s: &Seller,
+    account: Uuid,
+) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(
         raw,
         &format!(
-            "SELECT balance_minor FROM bss.ledger_account_balance \
+            "SELECT balance FROM bss.ledger_account_balance \
              WHERE tenant_id='{}' AND account_id='{}' AND currency='USD'",
             s.tenant, account
         ),
@@ -343,12 +371,12 @@ async fn per_stream_bundle_drains_each_stream_and_disaggregates() {
     // Each per-stream CONTRACT_LIABILITY account holds its own deferred total.
     assert_eq!(
         bal(&raw, &s, s.cl_sub).await,
-        Some(1000),
+        Some(usd_cents(1000)),
         "subscription CL deferred"
     );
     assert_eq!(
         bal(&raw, &s, s.cl_use).await,
-        Some(600),
+        Some(usd_cents(600)),
         "usage CL deferred"
     );
 
@@ -370,27 +398,27 @@ async fn per_stream_bundle_drains_each_stream_and_disaggregates() {
     // (fully released), and each stream's Revenue is fully recognized.
     assert_eq!(
         bal(&raw, &s, s.cl_sub).await,
-        Some(0),
+        Some(usd_cents(0)),
         "subscription CL fully drained"
     );
     assert_eq!(
         bal(&raw, &s, s.cl_use).await,
-        Some(0),
+        Some(usd_cents(0)),
         "usage CL fully drained"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue_sub).await,
-        Some(1000),
+        Some(usd_cents(1000)),
         "subscription recognized"
     );
     assert_eq!(
         bal(&raw, &s, s.revenue_use).await,
-        Some(600),
+        Some(usd_cents(600)),
         "usage recognized"
     );
 
     // (b) The disaggregation query returns one entry per (period, stream) with the
-    // right recognized_minor — over all periods (period_id = None). Ordered by
+    // right recognized money — over all periods (period_id = None). Ordered by
     // (period_id, revenue_stream): 202606/subscription, 202606/usage,
     // 202607/subscription, 202607/usage.
     let repo = RecognitionRepo::new(provider.clone());
@@ -398,14 +426,13 @@ async fn per_stream_bundle_drains_each_stream_and_disaggregates() {
         .list_revenue_disaggregation(&scope, s.tenant, None)
         .await
         .expect("disaggregation over all periods");
-    let got: Vec<(String, String, i64, String)> = all
+    let got: Vec<(String, String, bss_ledger_sdk::PostedMoney)> = all
         .iter()
         .map(|e| {
             (
                 e.period_id.clone(),
                 e.revenue_stream.clone(),
-                e.recognized_minor,
-                e.currency.clone(),
+                e.recognized.clone(),
             )
         })
         .collect();
@@ -415,60 +442,56 @@ async fn per_stream_bundle_drains_each_stream_and_disaggregates() {
             (
                 "202606".to_owned(),
                 "subscription".to_owned(),
-                500,
-                "USD".to_owned()
+                usd_cents(500)
             ),
-            (
-                "202606".to_owned(),
-                "usage".to_owned(),
-                300,
-                "USD".to_owned()
-            ),
+            ("202606".to_owned(), "usage".to_owned(), usd_cents(300)),
             (
                 "202607".to_owned(),
                 "subscription".to_owned(),
-                500,
-                "USD".to_owned()
+                usd_cents(500)
             ),
-            (
-                "202607".to_owned(),
-                "usage".to_owned(),
-                300,
-                "USD".to_owned()
-            ),
+            ("202607".to_owned(), "usage".to_owned(), usd_cents(300)),
         ],
-        "one entry per (period, stream) with Σ amount_minor, ordered"
+        "one entry per (period, stream) with Σ segment amount in USD@2, ordered"
     );
 
     // Per-stream totals across periods sum to each stream's deferred total.
-    let sub_total: i64 = all
+    let sub_total: rust_decimal::Decimal = all
         .iter()
         .filter(|e| e.revenue_stream == "subscription")
-        .map(|e| e.recognized_minor)
+        .map(|e| e.recognized.amount())
         .sum();
-    let use_total: i64 = all
+    let use_total: rust_decimal::Decimal = all
         .iter()
         .filter(|e| e.revenue_stream == "usage")
-        .map(|e| e.recognized_minor)
+        .map(|e| e.recognized.amount())
         .sum();
     assert_eq!(
-        sub_total, 1000,
+        sub_total,
+        usd_cents(1000).amount(),
         "subscription recognized in full across periods"
     );
-    assert_eq!(use_total, 600, "usage recognized in full across periods");
+    assert_eq!(
+        use_total,
+        usd_cents(600).amount(),
+        "usage recognized in full across periods"
+    );
 
     // (c) Narrowing to one period returns only that period's two streams.
     let p1 = repo
         .list_revenue_disaggregation(&scope, s.tenant, Some("202606"))
         .await
         .expect("disaggregation for 202606");
-    let p1_got: Vec<(String, i64)> = p1
+    let p1_got: Vec<(String, bss_ledger_sdk::PostedMoney)> = p1
         .iter()
-        .map(|e| (e.revenue_stream.clone(), e.recognized_minor))
+        .map(|e| (e.revenue_stream.clone(), e.recognized.clone()))
         .collect();
     assert_eq!(
         p1_got,
-        vec![("subscription".to_owned(), 500), ("usage".to_owned(), 300)],
+        vec![
+            ("subscription".to_owned(), usd_cents(500)),
+            ("usage".to_owned(), usd_cents(300))
+        ],
         "202606 narrows to that period's per-stream recognized revenue"
     );
 
@@ -549,10 +572,14 @@ async fn missed_close_disaggregates_under_the_open_period() {
     }
 
     // CONTRACT_LIABILITY fully drained; REVENUE fully recognized.
-    assert_eq!(bal(&raw, &s, s.cl_sub).await, Some(0), "CL fully drained");
+    assert_eq!(
+        bal(&raw, &s, s.cl_sub).await,
+        Some(usd_cents(0)),
+        "CL fully drained"
+    );
     assert_eq!(
         bal(&raw, &s, s.revenue_sub).await,
-        Some(1000),
+        Some(usd_cents(1000)),
         "revenue fully recognized"
     );
 
@@ -564,14 +591,13 @@ async fn missed_close_disaggregates_under_the_open_period() {
         .list_revenue_disaggregation(&scope, s.tenant, None)
         .await
         .expect("disaggregation over all periods");
-    let got: Vec<(String, String, i64, String)> = all
+    let got: Vec<(String, String, bss_ledger_sdk::PostedMoney)> = all
         .iter()
         .map(|e| {
             (
                 e.period_id.clone(),
                 e.revenue_stream.clone(),
-                e.recognized_minor,
-                e.currency.clone(),
+                e.recognized.clone(),
             )
         })
         .collect();
@@ -580,8 +606,7 @@ async fn missed_close_disaggregates_under_the_open_period() {
         vec![(
             "202606".to_owned(),
             "subscription".to_owned(),
-            1000,
-            "USD".to_owned()
+            usd_cents(1000)
         )],
         "all recognized revenue is reported under the ACTUAL open period 202606"
     );
@@ -600,16 +625,16 @@ async fn missed_close_disaggregates_under_the_open_period() {
         p_closed.is_empty(),
         "the closed planned period reports no recognized revenue"
     );
-    let p_open: Vec<(String, i64)> = repo
+    let p_open: Vec<(String, bss_ledger_sdk::PostedMoney)> = repo
         .list_revenue_disaggregation(&scope, s.tenant, Some("202606"))
         .await
         .expect("query 202606")
         .iter()
-        .map(|e| (e.revenue_stream.clone(), e.recognized_minor))
+        .map(|e| (e.revenue_stream.clone(), e.recognized.clone()))
         .collect();
     assert_eq!(
         p_open,
-        vec![("subscription".to_owned(), 1000)],
+        vec![("subscription".to_owned(), usd_cents(1000))],
         "the open period reports the full recognized revenue"
     );
 }

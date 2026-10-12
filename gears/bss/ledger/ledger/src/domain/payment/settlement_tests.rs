@@ -1,34 +1,45 @@
 use super::*;
 
+/// Preserve the original USD scale-2 economic fixtures, expressed in major units.
+fn fixture(value: i64) -> PostedMoney {
+    PostedMoney::try_new(
+        Decimal::new(value, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+fn expected(value: i64) -> Decimal {
+    Decimal::new(value, 2)
+}
+
 fn input(gross: i64, fee: i64) -> SettlementInput {
     SettlementInput {
         tenant_id: Uuid::now_v7(),
         payer_tenant_id: Uuid::now_v7(),
         payment_id: "PAY-1".to_owned(),
-        gross_minor: gross,
-        fee_minor: fee,
-        currency: "USD".to_owned(),
+        gross: fixture(gross),
+        fee: fixture(fee),
         effective_at: None,
     }
 }
 
-/// Σ of the debit-side line amounts (widened, mirroring the builder's i128).
-fn sum_dr(entry: &PostEntry) -> i128 {
+/// Σ of the debit-side amounts for these small scale-2 fixtures.
+fn sum_dr(entry: &PostEntry) -> Decimal {
     entry
         .lines
         .iter()
         .filter(|l| l.side == Side::Debit)
-        .map(|l| i128::from(l.amount_minor))
+        .map(|l| l.money.amount())
         .sum()
 }
 
 /// Σ of the credit-side line amounts.
-fn sum_cr(entry: &PostEntry) -> i128 {
+fn sum_cr(entry: &PostEntry) -> Decimal {
     entry
         .lines
         .iter()
         .filter(|l| l.side == Side::Credit)
-        .map(|l| i128::from(l.amount_minor))
+        .map(|l| l.money.amount())
         .sum()
 }
 
@@ -45,29 +56,29 @@ fn three_lines_with_fee() {
     let cash = &entry.lines[0];
     assert_eq!(cash.account_class, AccountClass::CashClearing);
     assert_eq!(cash.side, Side::Debit);
-    assert_eq!(cash.amount_minor, 970);
+    assert_eq!(cash.money.amount(), expected(970));
 
     // DR PSP_FEE_EXPENSE fee (30).
     let fee = &entry.lines[1];
     assert_eq!(fee.account_class, AccountClass::PspFeeExpense);
     assert_eq!(fee.side, Side::Debit);
-    assert_eq!(fee.amount_minor, 30);
+    assert_eq!(fee.money.amount(), expected(30));
 
     // CR UNALLOCATED gross (1000).
     let unalloc = &entry.lines[2];
     assert_eq!(unalloc.account_class, AccountClass::Unallocated);
     assert_eq!(unalloc.side, Side::Credit);
-    assert_eq!(unalloc.amount_minor, 1000);
+    assert_eq!(unalloc.money.amount(), expected(1000));
 
     // Balanced: Σ DR (1000) == Σ CR (1000).
-    assert_eq!(sum_dr(&entry), 1000);
-    assert_eq!(sum_cr(&entry), 1000);
+    assert_eq!(sum_dr(&entry), expected(1000));
+    assert_eq!(sum_cr(&entry), expected(1000));
     assert_eq!(sum_dr(&entry), sum_cr(&entry));
 
     // Every line carries the payer, currency, and seller.
     for l in &entry.lines {
         assert_eq!(l.payer_tenant_id, inp.payer_tenant_id);
-        assert_eq!(l.currency, "USD");
+        assert_eq!(l.money.currency().code(), "USD");
         assert_eq!(l.seller_tenant_id, Some(inp.tenant_id));
         assert_eq!(l.invoice_id, None);
     }
@@ -90,12 +101,12 @@ fn two_lines_when_fee_zero() {
     let cash = &entry.lines[0];
     assert_eq!(cash.account_class, AccountClass::CashClearing);
     assert_eq!(cash.side, Side::Debit);
-    assert_eq!(cash.amount_minor, 1000);
+    assert_eq!(cash.money.amount(), expected(1000));
 
     let unalloc = &entry.lines[1];
     assert_eq!(unalloc.account_class, AccountClass::Unallocated);
     assert_eq!(unalloc.side, Side::Credit);
-    assert_eq!(unalloc.amount_minor, 1000);
+    assert_eq!(unalloc.money.amount(), expected(1000));
 
     assert_eq!(sum_dr(&entry), sum_cr(&entry));
 }

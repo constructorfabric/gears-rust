@@ -45,7 +45,7 @@ use crate::domain::error::DomainError;
 use crate::domain::ports::metrics::LedgerMetricsPort;
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::recognition::runner::RecognitionRunner;
-use crate::infra::storage::repo::RecognitionRepo;
+use crate::infra::storage::repo::recognition_repo::RecognitionRepo;
 use time::OffsetDateTime;
 
 /// Lease TTL for a recognition run. Comfortably longer than the renewal period
@@ -70,7 +70,7 @@ pub struct RecognitionRunService {
     /// repos. See [`coord`] + the module-level note.
     lease: LeaseManager,
     /// Metrics sink: the run-duration histogram is emitted here (it brackets the
-    /// whole pass); the per-segment recognized-minor / over-recognition /
+    /// whole pass); the per-segment release-count / over-recognition /
     /// double-credit / queue-depth metrics are emitted inside the runner.
     metrics: Arc<dyn LedgerMetricsPort>,
 }
@@ -303,3 +303,7 @@ impl RecognitionRunService {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "run_service_tests.rs"]
+mod tests;

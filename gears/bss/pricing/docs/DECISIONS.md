@@ -139,10 +139,11 @@ and the sold-as bundle and grants (D-411), and drops quote and the Studio wiring
 | D-516 | M | A named book carries its identity beside its id | DECIDED 2026-10-02 · Owner, 2026-10-02 (ask 54); amends D-460, D-408 |
 | D-517 | M | Entries can be read by id | DECIDED 2026-10-02 · Owner, 2026-10-02 (ask 68); amends D-486; amended 2026-10-03 (the filter's length and its declaration) |
 | D-518 | M | The plan list, the plan counts, the book list and the settings answer 304 | DECIDED 2026-10-03 · Owner, 2026-10-03 (asks 56, 57); extends D-469; amended 2026-10-04 (`no-cache`, not `no-store`) |
-| D-519 | M | Every actor id a read shows carries its current name | DECIDED 2026-10-03 · Owner, 2026-10-02 (ask 32: names on the server, through AM); extends D-438, D-460, D-461 |
+| D-519 | M | Every actor id a read shows carries its current name | DECIDED 2026-10-03 · Owner, 2026-10-02 (ask 32: names on the server, through AM); extends D-438, D-460, D-461; amended 2026-10-04 (a resolved name is reused for five minutes per caller) |
 | D-520 | H | A scheduled price is cancelled through the prices unit | DECIDED 2026-10-03 · Owner, 2026-10-03; asks 19, 58a; amends D-390, D-393, D-422; amended 2026-10-03 (the event, the reads, the binding guard, the pairing CHECKs); amended 2026-10-04 (the pinned price's one-value status; the binding guard's scan noted as deferred) |
 | D-521 | H | A live price is ended through the prices unit | DECIDED 2026-10-03 · Owner, 2026-10-03; ask 58a; amends D-390, D-393; amended 2026-10-03 (the event) |
 | D-522 | H | A finished book can be archived, and archiving it releases its entries' SKU references (twin of products P-D-263) | DECIDED 2026-10-03 · Owner, 2026-10-03 ("archived"; ask 58b); amends D-408, D-444; extends D-407, D-442; amended 2026-10-03 (the submit's 409, the door's drive, the unarchive's answer, the op's reason, the mark's pairing); amended 2026-10-04 (the unarchive waits for open reference work; the plan revisions' references noted as deferred) |
+| D-523 | M | The PEP gate asks the PDP for the caller's tenant only (twin of products P-D-265) | DECIDED 2026-10-04 · Owner, 2026-10-04 (the approval lists under a root tenant) |
 
 ## Entries
 
@@ -2171,7 +2172,8 @@ an Account Management read per id of its own.
 - **The settings PUT.** A settings read is a PUT body without `version`, `updated_at` and `updated_by` (D-438), and the
   PUT refuses an unknown field. So that this stays true, the PUT accepts `updated_by_name` and ignores it: nothing
   breaks for a client that sends a read back.
-- **No storage, no cache.** Pricing stores no name and caches none. A renamed user reads the new name on the next read.
+- **No storage; a short cache (amended 2026-10-04).** Pricing stores no name. A renamed user reads the new name within five
+  minutes: the resolver (`cf-gears-bss-rest` `actor_names`, through `ActorNames::from_hub`) keeps a resolved name in process memory for five minutes, for the caller AM gave it to and nobody else: the key is the caller's tenant and subject and the actor. A refused, absent or failed lookup is not kept, and nothing is kept for an anonymous caller. The cache holds at most 10,000 names. A list or card that a caller reopens within five minutes asks AM nothing.
 - **Caching.** The names are part of the body. The weak `ETag` of `GET /plans` covers them (D-518), so a rename changes
   the tag. `GET /settings` keeps its strong version tag (D-518): a rename does not change it, and a revalidation keeps
   the copy the browser holds until the settings are written again. D-365 of the earlier register (commit `7da21fb75`)
@@ -2275,3 +2277,16 @@ A finished price book stayed on the Price Books screen for ever, and its entries
 **Deferred, noted 2026-10-04 (branch review): the plan revisions' references.** An archive releases the SKU references of the book's entries only. A superseded plan revision on the book does not refuse the archive (it is history), but its items keep the SKU references they hold in Products, and nothing releases them. So a SKU that such a revision names stays `SKU_REFERENCED` after the archive and cannot be retired. Releasing the references of superseded revisions belongs with plan retirement, which D-410 defers, and comes back with it.
 
 **Source:** Owner, 2026-10-03 ("archived"; ask 58b). Twin of products P-D-263. Amends D-408 and D-444; extends D-407 and D-442. The 2026-10-03 amendments: the branch review of the backlog asks. The 2026-10-04 amendment and note: the owner's answers to the branch review's questions ("ok" to the recommendations).
+
+#### D-523 [M] The PEP gate asks the PDP for the caller's tenant only (twin of products P-D-265)
+
+**Status:** DECIDED 2026-10-04.
+
+- **The cost.** `authz::access_scope` asked the PDP in the default tenant mode, `subtree`. For a collection the PDP then answers `IN(owner_tenant_id, every descendant of the subject's tenant)` (`docs/arch/authorization/AUTHZ_USAGE_SCENARIOS.md`, rule R8). Under a root tenant with thousands of descendants, deleted ones included, every scope check carried thousands of bind parameters and cost 100–250 ms, and the approval-unit list makes four (the access scope, the approve and submit flag scopes, the actor-name lookup). The PDP denies a list longer than its expansion cap.
+- **The rule.** Every request asks for `TenantMode::RootOnly` (rule R7, and R3 for a single row): the PDP answers `EQ(owner_tenant_id, subject tenant)` and resolves no descendant.
+- **Why no row changes.** The gear serves one tenant's catalog and no other tenant's (PRD: another tenant cannot obtain its data), and every repository pins the caller's tenant beside the scope. The subtree added no row; it only added the list.
+- **What it keeps.** An `EQ` is decidable in memory, so `scope_holds` still answers `caller_can_approve`. The write gate's membership assertion is unchanged: a write names the caller's tenant.
+- **Not taken.** The tenant-hierarchy capability (`InTenantSubtree` compiled against `tenant_closure`, scenario S01) would keep the subtree without the list, but it needs the closure table on the gear's connection and is not decidable in memory. No pricing door needs a subtree.
+- **The tests.** `authz_tests::every_request_asks_for_the_callers_tenant_only`: a collection read, a single-row read and a write each ask for `RootOnly`.
+
+**Source:** Owner, 2026-10-04, after the approval lists measured 1.5–4 s under a root tenant. Twin of products P-D-265.

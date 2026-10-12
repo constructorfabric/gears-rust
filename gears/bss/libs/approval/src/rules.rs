@@ -3,9 +3,17 @@
 use crate::model::{ApprovalError, Decision, ItemRef, Unit, UnitState, Verdict};
 use uuid::Uuid;
 
+/// Outcome of an eligible approve vote, as computed by [`evaluate_approve`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApproveStep {
-    NeedMore { have: u32, need: u32 },
+    /// The quorum is not met yet; the vote pends.
+    NeedMore {
+        /// Counted approvals, this vote included.
+        have: u32,
+        /// Approvals the quorum requires.
+        need: u32,
+    },
+    /// The vote meets the quorum; the unit's change applies.
     Apply,
 }
 

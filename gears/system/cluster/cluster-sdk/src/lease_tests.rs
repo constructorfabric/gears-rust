@@ -140,12 +140,17 @@ async fn the_clock_follows_virtual_time() {
     // The virtual clock is the one built to track `tokio::time::advance`; the
     // production `LeaseClock::new()` is the pure wall clock and deliberately does
     // not move under a paused runtime (that is the H3 fix).
+    const WALL_CLOCK_TOLERANCE_MS: u64 = 1_000;
+
     let clock = LeaseClock::virtual_clock();
     let before = clock.now_millis();
     tokio::time::advance(Duration::from_secs(30)).await;
     let after = clock.now_millis();
+    // The wall anchor is sampled before `before`, so real wall time spent between
+    // those reads reduces the observed delta (#4685 fixed the same skew in
+    // `the_production_clock_ignores_virtual_time_but_the_test_clock_tracks_it`).
     assert!(
-        after >= before + 30_000,
+        after.saturating_sub(before) >= 30_000_u64.saturating_sub(WALL_CLOCK_TOLERANCE_MS),
         "advancing virtual time by 30s must move the lease clock at least as far \
          ({before} -> {after})"
     );
@@ -167,13 +172,22 @@ async fn a_lease_lapses_when_virtual_time_passes_its_deadline() {
 async fn two_clocks_anchored_together_agree_across_an_advance() {
     // The property the cross-handle renew test rests on: a lease written through
     // one backend handle is evaluated identically by another.
+    //
+    // The clocks can only differ by the real wall time between their two anchor
+    // samples, which a preempted thread can stretch past a millisecond; bracket the
+    // anchors with wall reads so the bound is exact rather than a fixed guess.
+    let wall = LeaseClock::new();
+    let anchored_from = wall.now_millis();
     let first = LeaseClock::virtual_clock();
     let second = LeaseClock::virtual_clock();
+    let anchored_until = wall.now_millis();
     tokio::time::advance(Duration::from_mins(1)).await;
     let drift = first.now_millis().abs_diff(second.now_millis());
+    let anchor_window = anchored_until.saturating_sub(anchored_from);
     assert!(
-        drift <= 1,
-        "clocks anchored together must agree, drift {drift}ms"
+        drift <= anchor_window,
+        "clocks anchored together must agree up to the wall time between their \
+         anchors, drift {drift}ms > window {anchor_window}ms"
     );
 }
 

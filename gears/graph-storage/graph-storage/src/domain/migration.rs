@@ -16,6 +16,7 @@
 
 use graph_storage_sdk::models::{MigrationSpec, MigrationStep};
 use serde_json::Value;
+use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
 
@@ -40,6 +41,7 @@ enum Step {
 }
 
 /// A compiled migration for one type.
+#[domain_model]
 #[derive(Clone, Debug)]
 pub struct Plan {
     type_id: String,
@@ -235,7 +237,7 @@ mod tests {
 
     fn spec(steps: Vec<MigrationStep>) -> MigrationSpec {
         MigrationSpec {
-            type_id: "gts.acme.gs._.thing.v1~".to_owned(),
+            type_id: toolkit_gts::gts_id!("acme.gs._.thing.v1~").to_owned(),
             steps,
         }
     }

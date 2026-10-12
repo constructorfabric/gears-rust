@@ -7,11 +7,11 @@ use super::batch::Batch;
 use super::handler::{HandlerResult, LeasedHandler, OutboxMessage, TransactionalHandler};
 use super::store::OutboxStore;
 use super::subscription::TraceMailbox;
-use super::taskward::stop_deadline;
 use super::trace::TraceAdvance;
 use super::types::{LeaseConfig, OutboxError};
 use crate::Db;
 use sea_orm::{ConnectionTrait, DatabaseExecutor, FromQueryResult, Statement, TransactionTrait};
+use toolkit_taskward::stop_deadline;
 
 /// Context for processing a single partition's batch.
 pub struct ProcessContext<'a> {

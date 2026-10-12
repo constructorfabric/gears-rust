@@ -177,6 +177,7 @@ impl Accepted {
 /// The port lives in the domain, so its error type does too; the outbox
 /// transport ([`OperationDispatch`]'s implementation) maps the underlying
 /// `toolkit_db` failure into [`Backend`](Self::Backend).
+#[toolkit::domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum OutboxError {
     /// The underlying outbox operation failed — starting it, building the record,

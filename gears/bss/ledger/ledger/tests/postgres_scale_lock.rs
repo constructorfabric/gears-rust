@@ -14,7 +14,6 @@
 )]
 
 use bss_ledger::domain::model::{CurrencyScaleRow, RepoError};
-use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use sea_orm::{ConnectionTrait, Database, Statement, TransactionTrait};
@@ -51,8 +50,7 @@ async fn scale_locked_once_postings_exist() {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -77,9 +75,9 @@ async fn scale_locked_once_postings_exist() {
         seed.execute_raw(pg(format!(
             "INSERT INTO bss.ledger_journal_line
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id,
-                 account_class, side, amount_minor, currency, currency_scale, mapping_status)
+                 account_class, side, amount, currency, currency_scale, mapping_status)
              VALUES ('{line}','{entry}','{tenant}','202606','{tenant}','{tenant}',
-                     '{class}','{side}', 1000, 'USD', 2, 'RESOLVED')"
+                     '{class}','{side}', '10', 'USD', 2, 'RESOLVED')"
         )))
         .await
         .unwrap();
@@ -91,8 +89,7 @@ async fn scale_locked_once_postings_exist() {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
             currency: "USD".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -103,8 +100,7 @@ async fn scale_locked_once_postings_exist() {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
             currency: "USD".to_owned(),
-            minor_units: 3,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 3,
             source: "iso".to_owned(),
         })
         .await
@@ -119,8 +115,7 @@ async fn scale_locked_once_postings_exist() {
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
             currency: "EUR".to_owned(),
-            minor_units: 2,
-            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
@@ -131,7 +126,7 @@ async fn scale_locked_once_postings_exist() {
     // exists — USD has a posted line, so re-denominating its scale must fail.
     let raw_update = raw
         .execute_raw(pg(format!(
-            "UPDATE bss.ledger_currency_scale_registry SET minor_units = 3 \
+            "UPDATE bss.ledger_currency_scale_registry SET currency_scale = 3 \
              WHERE tenant_id = '{tenant}' AND currency = 'USD'"
         )))
         .await;
@@ -142,7 +137,7 @@ async fn scale_locked_once_postings_exist() {
 
     // The trigger fires only on a genuine change: a same-value UPDATE passes.
     raw.execute_raw(pg(format!(
-        "UPDATE bss.ledger_currency_scale_registry SET minor_units = 2 \
+        "UPDATE bss.ledger_currency_scale_registry SET currency_scale = 2 \
          WHERE tenant_id = '{tenant}' AND currency = 'USD'"
     )))
     .await
@@ -150,7 +145,7 @@ async fn scale_locked_once_postings_exist() {
 
     // And a currency with no postings can be re-denominated by direct SQL.
     raw.execute_raw(pg(format!(
-        "UPDATE bss.ledger_currency_scale_registry SET minor_units = 3 \
+        "UPDATE bss.ledger_currency_scale_registry SET currency_scale = 3 \
          WHERE tenant_id = '{tenant}' AND currency = 'EUR'"
     )))
     .await

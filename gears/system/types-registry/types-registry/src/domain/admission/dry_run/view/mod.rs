@@ -30,6 +30,7 @@ use overlay::{GraphView, Overlay};
 
 /// One dry-run pass's view of the registry: the snapshot underneath, plus what
 /// the pass has decided so far.
+#[toolkit::domain_model]
 pub struct AdmissionView {
     base: Arc<dyn Stores>,
     state: Mutex<Overlay>,
@@ -41,6 +42,7 @@ pub struct AdmissionView {
 /// edit what is inside. That is the tentative layer, expressed as the only two
 /// operations it has. Restoring it is atomic, because it replaces the overlay
 /// whole rather than replaying an undo list that could stop halfway.
+#[toolkit::domain_model]
 #[derive(Debug)]
 pub struct CandidateLayer(Overlay);
 

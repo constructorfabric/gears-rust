@@ -13,6 +13,7 @@ use crate::domain::model::audit_envelope::AuditEnvelope;
 /// catch-all `DomainError`; the transport maps the underlying failure into one
 /// of these, and `DomainError: From<OutboxError>` lets a service surface it with
 /// `?` (payload-too-large as a client validation error, the rest as internal).
+#[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum OutboxError {
     /// The event could not be serialized to its JSON wire form.
@@ -152,6 +153,7 @@ pub struct ThreadSummaryTaskPayload {
 /// domain-owned lets the [`OutboxEnqueuer`] port
 /// speak only domain types; the actual wake protocol lives in `toolkit-db`,
 /// behind this newtype.
+#[domain_model]
 #[derive(Debug)]
 #[must_use = "a Wake wakes no sequencer until fired; call .fire() after the transaction commits"]
 pub struct Wake(toolkit_db::outbox::Wake);

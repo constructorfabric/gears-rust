@@ -202,6 +202,7 @@ const UNANSWERABLE_TOLERANCE: Duration = Duration::from_secs(30);
 /// consumer groups - not topics or events, per `IngestServiceImpl`'s same
 /// D1/D3 change), plus `SpecificationManager`/`BackendResolver` for topic
 /// resolution and event reads.
+#[domain_model]
 pub struct DeliveryServiceImpl<R> {
     repo: Arc<R>,
     heartbeat_interval: Duration,

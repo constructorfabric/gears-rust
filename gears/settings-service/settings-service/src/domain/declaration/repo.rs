@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use toolkit_db::secure::DBRunner;
+use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -22,6 +23,7 @@ use crate::domain::error::DomainError;
 /// on them by accident.
 // The flags are separate facts an administrator reads back one by one; a
 // state enum would only re-encode them.
+#[domain_model]
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declaration {
@@ -95,6 +97,7 @@ pub struct Declaration {
 /// A declaration about to be inserted, every column decided.
 // The flags are separate facts an administrator reads back one by one; a
 // state enum would only re-encode them.
+#[domain_model]
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclarationDraft {
@@ -138,6 +141,7 @@ pub struct DeclarationDraft {
 ///
 /// Nothing here alters a live setting's resolution: the Schema Default, the
 /// value type and the scope class are absent on purpose.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclarationMetadata {
     /// `standard` or `advanced`.

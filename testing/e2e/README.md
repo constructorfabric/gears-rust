@@ -288,7 +288,7 @@ shared:                              # used by `make e2e-local` with no SUITE=
 sidecars:                           # named build+env, referenced by name
   file-storage:
     build: [cargo, build, -p, cf-gears-file-storage, --bin, sidecar]
-    env: { FS_SIDECAR_BINARY: target/debug/sidecar }
+    env: { FS_SIDECAR_BINARY: target/debug/sidecar, FS_SIDECAR_INTERNAL_TOKEN: dev-file-storage-internal-secret }
 ```
 
 **Per-suite manifest — `testing/e2e/suites/<suite>/e2e.yaml`:**

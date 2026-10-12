@@ -1,0 +1,31 @@
+[package]
+name = "cf-gears-bss-money"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "One money representation for the BSS gears: validated decimals in major units with a currency scale, exact fraction arithmetic, HALF_EVEN rounding at the declared points, proportional allocation, and the canonical decimal text for wire, storage and hashes"
+
+[lib]
+name = "bss_money"
+
+[features]
+default = []
+# Exact fraction arithmetic and proportional allocation over big integers.
+exact = ["dep:bigdecimal"]
+# `#[serde(with = "bss_money::serde_text")]` for canonical decimal text fields.
+serde = ["dep:serde"]
+
+[dependencies]
+rust_decimal = { workspace = true }  # the bounded decimal carrier (96-bit coefficient)
+thiserror = { workspace = true }
+bigdecimal = { workspace = true, optional = true } # `num_bigint::BigInt` for the exact fractions
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

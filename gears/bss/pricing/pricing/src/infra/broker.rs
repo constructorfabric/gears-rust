@@ -16,11 +16,12 @@ use super::{
 use anyhow::Context;
 use bss_products_sdk::PRICING_SYSTEM_ACTOR;
 use event_broker_sdk::ProducerOutboxHandle;
+use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 /// Every pricing event type this producer declares.
-const EVENT_TYPE_WILDCARD: &str = "gts.cf.core.events.event.v1~cf.bss.pricing.*";
+const EVENT_TYPE_WILDCARD: &str = gts_id!("cf.core.events.event.v1~cf.bss.pricing.*");
 
 /// The identity the producer presents to the broker: pricing's system actor, no tenant.
 fn producer_system_actor() -> anyhow::Result<SecurityContext> {

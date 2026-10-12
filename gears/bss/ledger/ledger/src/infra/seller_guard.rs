@@ -43,6 +43,7 @@ pub(crate) struct AmTenantTypeReader {
 }
 
 impl AmTenantTypeReader {
+    /// Creates a reader that resolves tenant types through the Account Management client.
     pub(crate) fn new(am: Arc<dyn AccountManagementClient>) -> Self {
         Self { am }
     }
@@ -71,6 +72,7 @@ pub(crate) struct SellerGuard {
 }
 
 impl SellerGuard {
+    /// Creates a guard that treats tenants whose type is in `seller_types` as sellers, resolving types via `tenant_types`.
     pub(crate) fn new(
         tenant_types: Arc<dyn TenantTypeReader>,
         seller_types: impl IntoIterator<Item = String>,

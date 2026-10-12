@@ -4,12 +4,12 @@
 //! Tenant-scoped via `SecureORM`; the resource col is the business
 //! `credit_note_id` (mirrors `recognition_schedule`'s `schedule_id`).
 //!
-//! `amount_minor` is incl-tax; `recognized_part_minor` + `deferred_part_minor`
+//! `amount` is incl-tax; `recognized_part` + `deferred_part`
 //! are the ex-tax split parts recorded by the `RecognizedDeferredSplitter`
-//! (Phase 1, Group B) — they do NOT sum to `amount_minor`, so there is
+//! (Phase 1, Group B) — they do NOT sum to `amount`, so there is
 //! deliberately no `recognized + deferred == amount` CHECK. The headroom cap
 //! lives on `invoice_exposure`; the deferred-portion schedule reduction
-//! (`recognized_minor <= total_deferred_minor`) is guarded on
+//! (`recognized <= total_deferred`) is guarded on
 //! `recognition_schedule` (Slice 4), both written under the lock order.
 
 use sea_orm::entity::prelude::*;
@@ -34,9 +34,10 @@ pub struct Model {
     pub origin_invoice_item_ref: Option<String>,
     pub revenue_stream: String,
     pub currency: String,
-    pub amount_minor: i64,
-    pub recognized_part_minor: i64,
-    pub deferred_part_minor: i64,
+    pub currency_scale: i16,
+    pub amount: String,
+    pub recognized_part: String,
+    pub deferred_part: String,
     pub split_basis_ref: Option<String>,
     pub reason_code: String,
     pub created_at_utc: OffsetDateTime,

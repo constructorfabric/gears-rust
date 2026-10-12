@@ -1,21 +1,22 @@
 //! Slice 5 remediation (codex#1): widen the immutable snapshot identity
-//! `uq_fx_rate_snapshot_lock` to include `rate_micro`.
+//! `uq_fx_rate_snapshot_lock` to include canonical `rate` and both stored scales.
+//! Fresh m026 identity already includes the scales; down restores that identity.
 //!
 //! The lock key was `(tenant, base, quote, provider, as_of, fallback_order)` —
 //! it did NOT include the rate value. The `ledger_fx_rate` "latest known" store
 //! is keyed `(tenant, base, quote, provider)` and `upsert_rate` OVERWRITES
-//! `rate_micro` + `as_of` on conflict, and the ingest endpoint is idempotent on
+//! `rate` + `as_of` on conflict, and the ingest endpoint is idempotent on
 //! `(tenant, base, quote, provider, as_of)` — so a provider/manual CORRECTION of
 //! the rate at the SAME `as_of` is a supported operation. Under the old key the
 //! snapshot freeze (read-first dedupe + this UNIQUE) would REUSE the prior
 //! snapshot row for the corrected rate: the posting path translates lines at the
-//! corrected `rate_micro` but stamps a `rate_snapshot_ref` pointing at the STALE
+//! corrected `rate` but stamps a `rate_snapshot_ref` pointing at the STALE
 //! rate, so the audit snapshot no longer reproduces the posted functional amount.
 //!
-//! Adding `rate_micro` to the identity makes a corrected rate freeze a NEW,
+//! Adding `rate` to the identity makes a corrected rate freeze a NEW,
 //! distinct snapshot (a fresh `rate_id`) while an identical re-lock (same rate)
 //! still dedupes — the audit snapshot always reproduces the rate that was posted.
-//! The repo's read-first lookup is widened with `rate_micro` in lockstep.
+//! The repo's read-first lookup is widened with `rate` in lockstep.
 //!
 //! Postgres-only: the constraint is a named table constraint there, droppable +
 //! re-addable in place; `SQLite` (non-production test backend) declares it inline
@@ -29,7 +30,7 @@ use sea_orm_migration::prelude::*;
 pub struct Migration;
 
 // ---------------------------------------------------------------------------
-// Postgres variant — drop + re-add the named UNIQUE with `rate_micro` appended.
+// Postgres variant — both specs plus canonical rate distinguish frozen evidence.
 // ---------------------------------------------------------------------------
 
 const PG_UP_STATEMENTS: &[&str] = &[
@@ -37,7 +38,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
         DROP CONSTRAINT uq_fx_rate_snapshot_lock",
     "ALTER TABLE bss.ledger_fx_rate_snapshot
         ADD CONSTRAINT uq_fx_rate_snapshot_lock UNIQUE
-        (tenant_id, base_currency, quote_currency, provider, as_of, fallback_order, rate_micro)",
+        (tenant_id, base_currency, base_currency_scale, quote_currency, quote_currency_scale, provider, as_of, fallback_order, rate)",
 ];
 
 const PG_DOWN_STATEMENTS: &[&str] = &[
@@ -45,7 +46,7 @@ const PG_DOWN_STATEMENTS: &[&str] = &[
         DROP CONSTRAINT uq_fx_rate_snapshot_lock",
     "ALTER TABLE bss.ledger_fx_rate_snapshot
         ADD CONSTRAINT uq_fx_rate_snapshot_lock UNIQUE
-        (tenant_id, base_currency, quote_currency, provider, as_of, fallback_order)",
+        (tenant_id, base_currency, base_currency_scale, quote_currency, quote_currency_scale, provider, as_of, fallback_order)",
 ];
 
 // ---------------------------------------------------------------------------

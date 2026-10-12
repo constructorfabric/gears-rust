@@ -22,7 +22,7 @@ use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
 use chrono::NaiveDate;
-use sea_orm::{ConnectionTrait, Database, Statement};
+use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use time::OffsetDateTime;
@@ -32,6 +32,33 @@ use uuid::Uuid;
 
 fn pg(sql: impl Into<String>) -> Statement {
     Statement::from_string(sea_orm::DatabaseBackend::Postgres, sql.into())
+}
+
+/// A USD scale-2 posting from a cent count (`1234` ⇒ `12.34`): the old
+/// minor-unit fixtures expressed as validated major-unit money.
+fn usd_cents(minor: i64) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        rust_decimal::Decimal::new(minor, 2),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Validated USD scale-2 money from canonical stored text (`"12.34"`).
+fn usd_text(text: &str) -> bss_ledger_sdk::PostedMoney {
+    bss_ledger_sdk::PostedMoney::try_new(
+        bss_ledger_sdk::parse_decimal(text).unwrap(),
+        bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Read one canonical decimal TEXT money column as USD scale-2 money.
+async fn scalar_money(conn: &DatabaseConnection, sql: &str) -> Option<bss_ledger_sdk::PostedMoney> {
+    conn.query_one_raw(pg(sql.to_owned()))
+        .await
+        .unwrap()
+        .map(|r| usd_text(&r.try_get_by_index::<String>(0).unwrap()))
 }
 
 fn account(tenant: Uuid, account_id: Uuid, class: AccountClass, normal: Side) -> AccountRow {
@@ -80,15 +107,12 @@ fn line(account: Uuid, class: AccountClass, side: Side, amount: i64, payer: Uuid
         account_class: class,
         gl_code: None,
         side,
-        amount_minor: amount,
-        currency: "USD".to_owned(),
-        currency_scale: 2,
+        money: usd_cents(amount),
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: MappingStatus::Resolved,
-        functional_amount_minor: None,
-        functional_currency: None,
+        functional_money: None,
         tax_jurisdiction: None,
         tax_filing_period: None,
         tax_rate_ref: None,
@@ -103,11 +127,9 @@ fn line(account: Uuid, class: AccountClass, side: Side, amount: i64, payer: Uuid
     }
 }
 
-async fn balance(raw: &sea_orm::DatabaseConnection, sql: &str) -> Option<i64> {
-    raw.query_one_raw(pg(sql.to_owned()))
-        .await
-        .unwrap()
-        .map(|row| row.try_get_by_index::<i64>(0).unwrap())
+/// Read one canonical decimal TEXT balance column as USD scale-2 money.
+async fn balance(raw: &DatabaseConnection, sql: &str) -> Option<bss_ledger_sdk::PostedMoney> {
+    scalar_money(raw, sql).await
 }
 
 /// Read `(original_posted_at, due_date)` for an `ar_invoice_balance` row typed,
@@ -171,7 +193,7 @@ async fn projects_deltas_and_enforces_no_negative() {
     normal_sides.insert(ar, Side::Debit);
     normal_sides.insert(cash, Side::Credit);
 
-    let projector = BalanceProjector::new();
+    let projector = BalanceProjector::new(sea_orm::DbBackend::Postgres);
 
     // Project DR AR 1000 / CR CASH 1000 → both normal-side-positive (+1000).
     let lines1 = vec![
@@ -194,32 +216,26 @@ async fn projects_deltas_and_enforces_no_negative() {
     assert_eq!(
         balance(
             &raw,
-            &format!(
-                "SELECT balance_minor FROM bss.ledger_account_balance WHERE account_id='{ar}'"
-            )
+            &format!("SELECT balance FROM bss.ledger_account_balance WHERE account_id='{ar}'")
         )
         .await,
-        Some(1000)
+        Some(usd_cents(1000))
     );
     assert_eq!(
         balance(
             &raw,
-            &format!(
-                "SELECT balance_minor FROM bss.ledger_account_balance WHERE account_id='{cash}'"
-            )
+            &format!("SELECT balance FROM bss.ledger_account_balance WHERE account_id='{cash}'")
         )
         .await,
-        Some(1000)
+        Some(usd_cents(1000))
     );
     assert_eq!(
         balance(
             &raw,
-            &format!(
-                "SELECT balance_minor FROM bss.ledger_ar_payer_balance WHERE account_id='{ar}'"
-            )
+            &format!("SELECT balance FROM bss.ledger_ar_payer_balance WHERE account_id='{ar}'")
         )
         .await,
-        Some(1000)
+        Some(usd_cents(1000))
     );
 
     // Project CR AR 1500 (overpay) → AR account_balance would go -500 → guard.
@@ -323,7 +339,7 @@ async fn projects_ar_invoice_and_tax_subgrains() {
     let e = entry(tenant);
     let r = run_project(
         &provider,
-        &BalanceProjector::new(),
+        &BalanceProjector::new(sea_orm::DbBackend::Postgres),
         &scope,
         &e,
         &[ar_line, tax_line],
@@ -338,33 +354,29 @@ async fn projects_ar_invoice_and_tax_subgrains() {
         balance(
             &raw,
             &format!(
-                "SELECT balance_minor FROM bss.ledger_ar_invoice_balance WHERE account_id='{ar}' AND invoice_id='INV-1'"
+                "SELECT balance FROM bss.ledger_ar_invoice_balance WHERE account_id='{ar}' AND invoice_id='INV-1'"
             )
         )
         .await,
-        Some(1000)
+        Some(usd_cents(1000))
     );
     // tax_subbalance grain populated for (tax, US-CA, 2026Q2).
     assert_eq!(
         balance(
             &raw,
-            &format!(
-                "SELECT balance_minor FROM bss.ledger_tax_subbalance WHERE account_id='{tax}'"
-            )
+            &format!("SELECT balance FROM bss.ledger_tax_subbalance WHERE account_id='{tax}'")
         )
         .await,
-        Some(200)
+        Some(usd_cents(200))
     );
     // The TAX line also writes its account_balance grain (+200, CR on CR-normal).
     assert_eq!(
         balance(
             &raw,
-            &format!(
-                "SELECT balance_minor FROM bss.ledger_account_balance WHERE account_id='{tax}'"
-            )
+            &format!("SELECT balance FROM bss.ledger_account_balance WHERE account_id='{tax}'")
         )
         .await,
-        Some(200)
+        Some(usd_cents(200))
     );
 }
 
@@ -417,7 +429,7 @@ async fn projects_unallocated_balance_and_enforces_no_negative() {
     normal_sides.insert(cash, Side::Debit);
     normal_sides.insert(unalloc, Side::Credit);
 
-    let projector = BalanceProjector::new();
+    let projector = BalanceProjector::new(sea_orm::DbBackend::Postgres);
 
     // Settlement: DR CASH_CLEARING 1000 / CR UNALLOCATED 1000 → +1000 unapplied.
     let lines1 = vec![
@@ -446,12 +458,12 @@ async fn projects_unallocated_balance_and_enforces_no_negative() {
         balance(
             &raw,
             &format!(
-                "SELECT balance_minor FROM bss.ledger_unallocated_balance \
+                "SELECT balance FROM bss.ledger_unallocated_balance \
                  WHERE payer_tenant_id='{payer}' AND account_id='{unalloc}' AND currency='USD'"
             )
         )
         .await,
-        Some(1000),
+        Some(usd_cents(1000)),
         "unallocated_balance rises by gross"
     );
 
@@ -476,12 +488,12 @@ async fn projects_unallocated_balance_and_enforces_no_negative() {
         balance(
             &raw,
             &format!(
-                "SELECT balance_minor FROM bss.ledger_unallocated_balance \
+                "SELECT balance FROM bss.ledger_unallocated_balance \
                  WHERE payer_tenant_id='{payer}' AND account_id='{unalloc}' AND currency='USD'"
             )
         )
         .await,
-        Some(600),
+        Some(usd_cents(600)),
         "DR UNALLOCATED nets the unapplied-cash balance down"
     );
 
@@ -538,7 +550,7 @@ async fn stamps_ar_invoice_original_posted_at_and_due_date_first_write_wins() {
     let mut normal_sides = HashMap::new();
     normal_sides.insert(ar, Side::Debit);
 
-    let projector = BalanceProjector::new();
+    let projector = BalanceProjector::new(sea_orm::DbBackend::Postgres);
 
     // First write: INVOICE_POST DR AR 1000 with due_date d at posted_at t1.
     let t1 = parse_rfc3339("2026-06-01T10:00:00Z").unwrap();
@@ -604,10 +616,10 @@ async fn stamps_ar_invoice_original_posted_at_and_due_date_first_write_wins() {
     assert_eq!(
         balance(
             &raw,
-            &format!("SELECT balance_minor FROM bss.ledger_ar_invoice_balance WHERE account_id='{ar}' AND invoice_id='INV-P'")
+            &format!("SELECT balance FROM bss.ledger_ar_invoice_balance WHERE account_id='{ar}' AND invoice_id='INV-P'")
         )
         .await,
-        Some(600),
+        Some(usd_cents(600)),
         "AR invoice balance nets to 600"
     );
 }

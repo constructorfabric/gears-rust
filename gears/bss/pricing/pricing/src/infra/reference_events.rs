@@ -11,6 +11,7 @@ use event_broker_sdk::TypedEvent;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use toolkit_db::secure::DBRunner;
+use toolkit_gts::gts_id;
 use uuid::Uuid;
 // @cpt-begin:cpt-cf-bss-pricing-algo-read-contract-events-typed-events:p1:inst-read-contract-events-typed-events-1
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,9 +25,9 @@ pub struct PriceBookEntryReferenceLost {
 }
 impl TypedEvent for PriceBookEntryReferenceLost {
     const TYPE_ID: &'static str =
-        "gts.cf.core.events.event.v1~cf.bss.pricing.price_book_entry_reference_lost.v1~";
+        gts_id!("cf.core.events.event.v1~cf.bss.pricing.price_book_entry_reference_lost.v1~");
     const SUBJECT_TYPE: &'static str =
-        "gts.cf.core.events.subject.v1~cf.bss.pricing.price_book_entry.v1~";
+        gts_id!("cf.core.events.subject.v1~cf.bss.pricing.price_book_entry.v1~");
     const SOURCE: &'static str = SOURCE;
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.price_book_entry_id.to_string())
@@ -74,8 +75,9 @@ pub struct PlanReferenceLost {
 }
 impl TypedEvent for PlanReferenceLost {
     const TYPE_ID: &'static str =
-        "gts.cf.core.events.event.v1~cf.bss.pricing.plan_reference_lost.v1~";
-    const SUBJECT_TYPE: &'static str = "gts.cf.core.events.subject.v1~cf.bss.pricing.plan_item.v1~";
+        gts_id!("cf.core.events.event.v1~cf.bss.pricing.plan_reference_lost.v1~");
+    const SUBJECT_TYPE: &'static str =
+        gts_id!("cf.core.events.subject.v1~cf.bss.pricing.plan_item.v1~");
     const SOURCE: &'static str = SOURCE;
     fn subject(&self) -> Cow<'_, str> {
         Cow::Owned(self.item_id.to_string())

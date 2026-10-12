@@ -200,6 +200,260 @@ async fn mysql_duplicate_insert_is_classified_as_unique_violation() -> Result<()
     assert_duplicate_insert_is_unique_violation(db).await
 }
 
+// ── FK-violation-with-a-confusable-message regression ──────────────────────────
+
+#[cfg(any(feature = "pg", feature = "mysql"))]
+#[derive(Iden)]
+enum FkParentTbl {
+    #[iden = "error_classify_fk_parent"]
+    Table,
+    Id,
+}
+
+#[cfg(any(feature = "pg", feature = "mysql"))]
+#[derive(Iden)]
+enum FkChildTbl {
+    #[iden = "error_classify_fk_child"]
+    Table,
+    Id,
+    TenantId,
+    ParentId,
+}
+
+#[cfg(any(feature = "pg", feature = "mysql"))]
+struct CreateFkClassifyTables;
+
+#[cfg(any(feature = "pg", feature = "mysql"))]
+impl mig::MigrationName for CreateFkClassifyTables {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "m002_create_fk_classify"
+    }
+}
+
+#[cfg(any(feature = "pg", feature = "mysql"))]
+#[async_trait::async_trait]
+impl mig::MigrationTrait for CreateFkClassifyTables {
+    async fn up(&self, manager: &mig::SchemaManager) -> Result<(), mig::DbErr> {
+        manager
+            .create_table(
+                mig::Table::create()
+                    .table(FkParentTbl::Table)
+                    .if_not_exists()
+                    .col(
+                        mig::ColumnDef::new(FkParentTbl::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                mig::Table::create()
+                    .table(FkChildTbl::Table)
+                    .if_not_exists()
+                    .col(
+                        mig::ColumnDef::new(FkChildTbl::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(mig::ColumnDef::new(FkChildTbl::TenantId).uuid().not_null())
+                    .col(mig::ColumnDef::new(FkChildTbl::ParentId).uuid().not_null())
+                    .foreign_key(
+                        sea_query::ForeignKey::create()
+                            // Deliberately named so a real FK-violation message
+                            // (both Postgres's and MySQL's echo the constraint
+                            // name verbatim) contains "duplicate key" -- the
+                            // exact confusable text `is_unique_violation`'s
+                            // string fallback matches on. This reproduces the
+                            // bug this test guards against: an authoritative,
+                            // non-matching `sql_err()` result
+                            // (`ForeignKeyConstraintViolation`) must
+                            // short-circuit to `false` rather than still
+                            // falling through to that fallback.
+                            .name("totally not a duplicate key issue")
+                            .from(FkChildTbl::Table, FkChildTbl::ParentId)
+                            .to(FkParentTbl::Table, FkParentTbl::Id),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &mig::SchemaManager) -> Result<(), mig::DbErr> {
+        manager
+            .drop_table(mig::Table::drop().table(FkChildTbl::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(mig::Table::drop().table(FkParentTbl::Table).to_owned())
+            .await
+    }
+}
+
+#[cfg(any(feature = "pg", feature = "mysql"))]
+mod fk_ent_child {
+    use sea_orm::entity::prelude::*;
+    use uuid::Uuid;
+
+    #[derive(Debug, Clone, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "error_classify_fk_child")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        pub tenant_id: Uuid,
+        pub parent_id: Uuid,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+#[cfg(any(feature = "pg", feature = "mysql"))]
+impl ScopableEntity for fk_ent_child::Entity {
+    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
+        Some(fk_ent_child::Column::TenantId)
+    }
+    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
+        Some(fk_ent_child::Column::Id)
+    }
+    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
+        None
+    }
+    fn type_col() -> Option<<Self as EntityTrait>::Column> {
+        None
+    }
+    fn resolve_property(property: &str) -> Option<<Self as EntityTrait>::Column> {
+        match property {
+            p if p == pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
+            p if p == pep_properties::RESOURCE_ID => Self::resource_col(),
+            _ => None,
+        }
+    }
+    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
+        vec![fk_ent_child::Column::TenantId, fk_ent_child::Column::Id]
+    }
+}
+
+/// Regression test (P2 remediation, toolkit-db `is_unique_violation`): a real
+/// foreign-key violation whose `sql_err()` resolves authoritatively to
+/// `Some(SqlErr::ForeignKeyConstraintViolation(_))` must classify as
+/// `is_unique_violation() == false`, even when its message text happens to
+/// contain a unique-violation-sounding phrase.
+///
+/// Postgres and `MySQL` are exercised (see the `mysql_*` variant below): both
+/// engines' FK-violation messages echo the constraint name verbatim
+/// (Postgres: `violates foreign key constraint "..."`; `MySQL`: `CONSTRAINT
+/// ... FOREIGN KEY`), which lets the migration above force that phrase into
+/// a *genuine*, live database error rather than a hand-built one --
+/// `SQLite`'s equivalent message ("FOREIGN KEY constraint failed") carries
+/// no such name, so it cannot reproduce the confusable-message half of this
+/// scenario.
+///
+/// Before the fix, `is_unique_violation` fell through to its string fallback
+/// on *any* non-unique `sql_err()` result, so this exact error -- a real FK
+/// violation -- would have been misclassified as a unique-constraint
+/// conflict. `is_foreign_key_violation` is asserted too, since it must not
+/// regress in the process.
+#[cfg(feature = "pg")]
+#[tokio::test]
+async fn pg_foreign_key_violation_with_confusable_message_is_not_unique_violation() -> Result<()> {
+    let dut = common::bring_up_postgres().await?;
+    let config = DbConnConfig {
+        dsn: Some(toolkit_utils::SecretString::new(dut.url)),
+        ..Default::default()
+    };
+    let db = build_db(config, None).await?;
+    run_migrations_for_testing(&db, vec![Box::new(CreateFkClassifyTables)])
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    let tenant_id = Uuid::new_v4();
+    let scope = AccessScope::for_tenants(vec![tenant_id]);
+    let conn = db.conn().expect("conn");
+
+    // No row in `error_classify_fk_parent` has this id -- the insert below
+    // must fail the foreign key, not succeed.
+    let orphan_parent_id = Uuid::new_v4();
+    let am = fk_ent_child::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(tenant_id),
+        parent_id: Set(orphan_parent_id),
+    };
+    let err = secure_insert::<fk_ent_child::Entity>(am, &scope, &conn)
+        .await
+        .expect_err("insert referencing a nonexistent parent must be rejected by the database");
+
+    assert!(
+        err.is_foreign_key_violation(),
+        "must still be recognised as a foreign-key violation; classifier saw: {err}"
+    );
+    assert!(
+        !err.is_unique_violation(),
+        "a real foreign-key violation must never classify as a unique-constraint \
+         violation, even with a confusable message; classifier saw: {err}"
+    );
+
+    Ok(())
+}
+
+/// `MySQL` counterpart of
+/// [`pg_foreign_key_violation_with_confusable_message_is_not_unique_violation`]:
+/// `InnoDB`'s own FK-violation message (`Cannot add or update a child row: a
+/// foreign key constraint fails (..., CONSTRAINT "totally not a duplicate
+/// key issue" FOREIGN KEY ...)`) also echoes the constraint name verbatim,
+/// reproducing the same confusable-text scenario against `sea_orm`'s `MySQL`
+/// error numbers 1216/1217/1451/1452/1557/1761/1762 (`sql_err()` ->
+/// `SqlErr::ForeignKeyConstraintViolation`) instead of Postgres's SQLSTATE
+/// `23503`.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn mysql_foreign_key_violation_with_confusable_message_is_not_unique_violation() -> Result<()>
+{
+    let dut = common::bring_up_mysql().await?;
+    let config = DbConnConfig {
+        dsn: Some(toolkit_utils::SecretString::new(dut.url)),
+        ..Default::default()
+    };
+    let db = build_db(config, None).await?;
+    run_migrations_for_testing(&db, vec![Box::new(CreateFkClassifyTables)])
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    let tenant_id = Uuid::new_v4();
+    let scope = AccessScope::for_tenants(vec![tenant_id]);
+    let conn = db.conn().expect("conn");
+
+    // No row in `error_classify_fk_parent` has this id -- the insert below
+    // must fail the foreign key, not succeed.
+    let orphan_parent_id = Uuid::new_v4();
+    let am = fk_ent_child::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(tenant_id),
+        parent_id: Set(orphan_parent_id),
+    };
+    let err = secure_insert::<fk_ent_child::Entity>(am, &scope, &conn)
+        .await
+        .expect_err("insert referencing a nonexistent parent must be rejected by the database");
+
+    assert!(
+        err.is_foreign_key_violation(),
+        "must still be recognised as a foreign-key violation; classifier saw: {err}"
+    );
+    assert!(
+        !err.is_unique_violation(),
+        "a real foreign-key violation must never classify as a unique-constraint \
+         violation, even with a confusable message; classifier saw: {err}"
+    );
+
+    Ok(())
+}
+
 /// Provoke a real `SQLITE_BUSY` and assert `is_retryable_contention` still says
 /// "retry me".
 ///

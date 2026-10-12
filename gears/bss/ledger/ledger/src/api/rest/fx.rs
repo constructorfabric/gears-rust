@@ -81,10 +81,11 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
              `tenant_id`. This is the SECONDARY ingest path — the primary is the \
              `RateProviderV1` adapter pull driven by the background rate-sync job. \
              Upsert-keyed on `(tenant, base, quote, provider)`: re-posting the same \
-             tuple overwrites the quote (`rate_micro` / `as_of` / `fallback_order`), \
+             tuple overwrites the quote (`rate` / `as_of` / `fallback_order`), \
              so it is idempotent on `(tenant, base, quote, provider, as_of)`. \
-             Rejected (400) on an empty/oversized currency or provider code, a \
-             non-positive `rate_micro`, a negative `fallback_order`, or an identity \
+             `rate` is plain decimal text (quote major units per base major unit), \
+             kept exactly. Rejected (400) on an empty/oversized currency or provider \
+             code, a malformed or non-positive `rate`, a negative `fallback_order`, or an identity \
              (`base == quote`) pair. `(ledger, provision)` PEP gate against the \
              body's `tenant_id`.",
         )
@@ -211,13 +212,13 @@ async fn ingest_fx_rate(
 
     // Validate the body BEFORE the write (returns the defaulted `fallback_order`),
     // then move it into the row parameter object.
-    let fallback_order = body.validate()?;
+    let (rate, fallback_order) = body.validate()?;
     let upsert = NewFxRate {
         tenant_id,
         base_currency: body.base_currency,
         quote_currency: body.quote_currency,
         provider: body.provider,
-        rate_micro: body.rate_micro,
+        rate,
         as_of: body.as_of,
         fallback_order,
     };
@@ -234,7 +235,7 @@ async fn ingest_fx_rate(
             base_currency: upsert.base_currency,
             quote_currency: upsert.quote_currency,
             provider: upsert.provider,
-            rate_micro: upsert.rate_micro,
+            rate: bss_ledger_sdk::canonical_decimal(upsert.rate),
             as_of: upsert.as_of,
             fallback_order: upsert.fallback_order,
         }),

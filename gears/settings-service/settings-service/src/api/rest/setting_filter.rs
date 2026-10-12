@@ -30,6 +30,7 @@ pub(crate) struct SettingFilter {
     pub(crate) declarations: Option<Expr>,
 }
 
+/// A `$filter` validation failure, reported against the `$filter` field.
 pub(crate) fn unsupported(message: impl Into<String>) -> DomainError {
     DomainError::Validation {
         field: "$filter".to_owned(),

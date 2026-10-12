@@ -1,4 +1,4 @@
-//! `EcbRateProvider` — HTTP fetch + XML parse + `rate_micro` conversion over the
+//! `EcbRateProvider` — HTTP fetch + XML parse + `rate` conversion over the
 //! ECB daily reference-rate feed. Direct pairs only (design O-3): a requested
 //! pair the feed does not publish is omitted, never synthesized or inverted.
 
@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use bss_ledger_sdk::{CurrencyPair, ProviderRate, RateProviderError, RateProviderV1};
-use bss_rate_provider_sdk::conversion::rate_to_micro;
+use bss_rate_provider_sdk::conversion::parse_rate;
 use bss_rate_provider_sdk::currency::normalize_currency;
 use bss_rate_provider_sdk::error::map_http_error;
 use bss_rate_provider_sdk::fetch::fetch_and_parse;
@@ -343,11 +343,11 @@ pub fn ecb_rates_to_provider_rates(
         {
             continue;
         }
-        match rate_to_micro(rate_str) {
-            Ok(rate_micro) => out.push(ProviderRate {
+        match parse_rate(rate_str) {
+            Ok(rate) => out.push(ProviderRate {
                 base: ECB_BASE.to_owned(),
                 quote: quote.clone(),
-                rate_micro,
+                rate,
                 as_of,
                 provider: provider.to_owned(),
             }),

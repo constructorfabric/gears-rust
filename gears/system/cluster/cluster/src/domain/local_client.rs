@@ -55,6 +55,7 @@ use crate::domain::registry::ProfileRegistry;
 /// nothing, and every method answers [`ClusterError::ProfileNotBound`] — the
 /// correct answer, and one the frozen error model already has a variant for
 /// (invariant I3).
+#[toolkit::domain_model]
 #[derive(Debug)]
 pub struct LocalClusterClient {
     profiles: Arc<ProfileRegistry>,

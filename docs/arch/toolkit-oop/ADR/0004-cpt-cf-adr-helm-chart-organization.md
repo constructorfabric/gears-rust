@@ -57,12 +57,23 @@ chart), while remaining publishable to OCI registries.
 * A `toolkit-platform` umbrella chart in `deploy/helm/toolkit-platform/` aggregates all gear charts as conditional
   dependencies (`condition: <gear>.enabled`), with preset values files for common deployment scenarios (minimal,
   production, dev).
-* CI must run `helm dependency build` for each gear chart (resolving the `toolkit-common` library) and for the umbrella
-  chart (resolving all gear sub-charts).
+* CI must resolve the `toolkit-common` library for each gear chart and the umbrella's sub-charts before
+  `helm lint`/`package` (via `helm dependency update`; see the Chart.lock amendment below).
 * Published charts (OCI registry) must include the resolved `toolkit-common` dependency, so users can `helm install`
   without access to the monorepo.
 * Gear developers adding a new gear must create a `chart/` directory following the established pattern. The library
   chart handles 90% of the boilerplate.
+
+> **Amended (chart path):** the co-located chart now lives at `<gear-source-dir>/deploy/helm/<name>/`
+> (e.g. `apps/cf-gears-flight-control/deploy/helm/flight-control`), not `gears/<name>/chart/`. The
+> co-location principle is unchanged; only the subdirectory name differs. See DESIGN.md § 3.9 for the
+> authoritative layout.
+
+> **Amended (dependency resolution):** all chart dependencies are currently local `file://` references at a
+> fixed version, so `Chart.lock` pins nothing useful and is gitignored. CI/local resolution uses
+> `helm dependency update` (see `deploy/helm/update-helm-deps.sh`). If `toolkit-common` is later published to a
+> registry (versioned remote dependency), commit `Chart.lock` and switch to `helm dependency build` for
+> reproducible installs.
 
 > **Amended by [ADR-0009 (Instance-Addressable Discovery)](0009-cpt-cf-adr-instance-addressable-discovery.md).**
 > This layout assumed **one chart = one gear = one `Deployment` + `Service`**. A gear that runs in differentiated
@@ -79,7 +90,7 @@ chart), while remaining publishable to OCI registries.
 ### Confirmation
 
 * CI validation: `helm lint` and `helm template` pass for every gear chart and the umbrella chart.
-* Integration test: `helm install toolkit-platform` with `values-minimal.yaml` successfully deploys the Flight Control
+* Integration test: `helm install toolkit-platform` with default values successfully deploys the Flight Control
   control plane (directory + edge + authn) in a test k8s cluster.
 * New gear check: a newly scaffolded gear's chart renders correctly with only `Chart.yaml`, `values.yaml`, and 2-3
   template files that include `toolkit-common` helpers.
@@ -123,7 +134,7 @@ Umbrella in `deploy/helm/toolkit-platform/`.
 * Good, because one-command install via umbrella chart with preset values files.
 * Good, because each gear directory is self-describing — `chart/` is right there next to `src/`.
 * Good, because library chart enforces conventions (labels, annotations, probes) across all gears automatically.
-* Neutral, because requires `helm dependency build` step in CI (standard practice, but adds a step).
+* Neutral, because requires a `helm dependency update` step in CI (standard practice, but adds a step).
 * Bad, because the library chart path (`file://` reference) must be maintained — changing the directory structure
   requires updating all `Chart.yaml` files.
 * Bad, because slightly more complex than pure co-located — developers must understand the library chart indirection.

@@ -228,16 +228,33 @@ async fn seed(
     status: Option<(&'static str, i64, bool)>,
 ) -> Uuid {
     let run_id = Uuid::now_v7();
+    let repo = ReconciliationRunRepo::new(provider.clone());
     provider
         .transaction(move |txn| {
+            let repo = repo.clone();
             Box::pin(async move {
                 let scope = AccessScope::for_tenant(tenant);
-                ReconciliationRunRepo::start(txn, &scope, tenant, run_id, "202609", "AR_DERIVED")
+                repo.start(txn, &scope, tenant, run_id, "202609", "AR_DERIVED")
                     .await
                     .map_err(|e| DbError::Other(anyhow::anyhow!("{e}")))?;
-                if let Some((status, variance, within)) = status {
-                    ReconciliationRunRepo::finalize(
-                        txn, &scope, tenant, run_id, status, variance, within, None, None,
+                if let Some((status, variance_cents, within)) = status {
+                    // A USD scale-2 bucket from the cent count; zero ⇒ no bucket.
+                    let by_currency = if variance_cents == 0 {
+                        Vec::new()
+                    } else {
+                        vec![
+                            bss_ledger_sdk::PostedMoney::try_new(
+                                rust_decimal::Decimal::new(variance_cents, 2),
+                                bss_ledger_sdk::CurrencySpec::try_new("USD".to_owned(), 2).unwrap(),
+                            )
+                            .unwrap(),
+                        ]
+                    };
+                    let variance = crate::domain::reconciliation::ReconciliationVariance::Money {
+                        by_currency,
+                    };
+                    repo.finalize(
+                        txn, &scope, tenant, run_id, status, &variance, within, None, None,
                     )
                     .await
                     .map_err(|e| DbError::Other(anyhow::anyhow!("{e}")))?;
